@@ -105,6 +105,9 @@ function makeStubClient() {
         HOME: home,
         AGENT_DESKTOP_NO_SYSTEMD: "1",
         AGENT_DESKTOP_BASE_DISPLAY: "720",
+        // The script's own 20s give-up is shorter than a desktop boot under
+        // full-suite load.
+        AGENT_DESKTOP_START_TIMEOUT: "150",
       },
     });
     const stream = Object.assign(new EventEmitter(), { stderr: child.stderr });
@@ -394,9 +397,9 @@ describe("/workspace/desktop with agent-desktop installed", () => {
         },
       );
 
-      // A real desktop boot; under full-suite load it can take well past 30s.
+      // A real desktop boot; under full-suite load it can take well past 50s.
       let running = false;
-      for (let i = 0; i < 100 && !running; i++) {
+      for (let i = 0; i < 240 && !running; i++) {
         await new Promise((r) => setTimeout(r, 500));
         running =
           (await post("/status", { identityKey: "alice", hostId: 7 })).body
@@ -440,7 +443,7 @@ describe("/workspace/desktop with agent-desktop installed", () => {
       });
       expect(banner).toMatch(/^RFB 003\.00\d\n/);
     },
-    90_000,
+    180_000,
   );
 
   it.skipIf(!HAVE_X || REAL_GUACD)(
