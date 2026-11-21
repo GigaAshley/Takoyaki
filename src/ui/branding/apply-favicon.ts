@@ -22,7 +22,18 @@
 // disposition (trusted operator config).
 
 import { useEffect } from "react";
+import { CLIENT_BUILD_ID } from "../lib/client-build-id.js";
 import { useBrandingConfig } from "./branding-store";
+
+/**
+ * Browsers cache favicons by URL for a very long time, so a changed icon at the
+ * same path (a new default, or an operator replacing theirs) keeps showing the
+ * old one. Stamping the build id onto the URL makes each deploy a new URL.
+ */
+export function versionedFaviconHref(path: string, buildId: string = CLIENT_BUILD_ID): string {
+  if (!buildId) return path;
+  return `${path}${path.includes("?") ? "&" : "?"}v=${encodeURIComponent(buildId)}`;
+}
 
 /**
  * Hook: on mount and whenever branding.faviconPath changes, rewrite the href
@@ -43,7 +54,7 @@ export function useBrandingFavicon(): void {
   useEffect(() => {
     const links = document.querySelectorAll<HTMLLinkElement>('link[rel="icon"]');
     for (const link of links) {
-      link.href = branding.faviconPath;
+      link.href = versionedFaviconHref(branding.faviconPath);
     }
   }, [branding.faviconPath]);
 }
