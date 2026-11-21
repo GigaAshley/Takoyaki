@@ -1083,7 +1083,7 @@ not something agents drive.
   same for that file: it opens in a new **file pane** (each drag opens
   another, even for a file already open). Dragging the green **monitor**
   button beside a conversation's task pill does the same for that agent's
-  virtual desktop: it opens in a new **desktop pane**. Each open conversation pane has a **task pill** (relay rooms: a **badge** per participant), each
+  virtual desktop: it opens in a new **desktop pane**. Each open conversation pane has a **task pill** (relay rooms: a **room pill**), each
   open app pane its **app bar**, each remote-desktop pane its
   **remote-desktop bar**, each file pane its **file bar**, and each desktop
   pane its **desktop bar** (all below); dragging it to a different spot in
@@ -1538,10 +1538,14 @@ crown, then gear.
   where holding the pill opens the menu instead. Hovering
   shows the full task line, then the agent's name, roles and project. On a phone the round **back to
   conversations** (←) button floats level with it at the top left, in the
-  same solid dark look. (Relay rooms show a badge for every other member
-  instead — people first, with their picture or initial, then agents, each
-  agent's with its memory pie under it. When they don't all fit, every badge
-  drops to just its picture; hovering or press-and-hold shows the name.)
+  same solid dark look. (A relay room has a **room pill** instead: its
+  faces and name, hovering shows the full name and who's in it, a tap does
+  nothing; it drags like a task pill, and its ⋯ / right-click menu has Move
+  to new tab, Rename…, Move to, Leave and Close. Beside it, a badge for every
+  other member — people first, with their picture or initial, then agents,
+  each agent's with its memory pie under it; they drop to a line under the
+  pill when there's no room beside it, and to just pictures when they don't
+  fit — hovering or press-and-hold shows the name.)
   *Agent-side:* keep `task:` current, silently. Rules already covered.
 
 - **Round buttons beside the task pill.** Just to the right of the pill,

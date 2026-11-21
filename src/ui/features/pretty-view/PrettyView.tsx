@@ -86,7 +86,10 @@ import { buildIdentityHostsFromFleet } from "@/state/identities-store";
 import {
   getFleetSessionsSnapshot,
   subscribeConversationStore,
+  useRelayRoomSession,
 } from "@/state/conversation-store";
+import { RoomPill } from "./RoomPill";
+import type { RelayRoomFace } from "@/api/sessions-api";
 import {
   listRolesForHost,
   type Identity,
@@ -409,6 +412,9 @@ export interface PrettyViewProps {
   // filters items per-surface (e.g. "Move to new tab" is desktop-only,
   // "Switch to (terminal/chat) view" is admin-only).
   identityBadgeContextMenuItems?: RowKebabMenuItem[];
+  /** Relay rooms: the room pill's menu (Move to new tab, Rename…, Move to,
+   *  Leave, Close). Absent → the pill shows no menu. */
+  roomMenuItems?: RowKebabMenuItem[];
   // Phase 137 Plan 03 (D-16): per-user voice preferences for the speak
   // flow. fallbackVoice is the last voice candidate after the identity's and
   // role's voices, before the TTS provider's default (voice-candidates.ts).
@@ -743,6 +749,7 @@ export function PrettyView({
   onUnregisterSendInterrupt,
   tabId,
   identityBadgeContextMenuItems,
+  roomMenuItems,
   userPrefs = {},
   archived,
   onAgentArchived,
@@ -826,6 +833,35 @@ export function PrettyView({
   // store, so this read is a defensive belt-and-suspenders that also lets
   // Slice 2 mount the anchor without waiting for adapter work.
   const viewingUserMxid = useViewingUserMxid();
+  // Relay rooms: the room pill reads the room's sidebar entry (name, faces)
+  // and the live member list (hover names; faces until the entry loads).
+  const relayRoomSession = useRelayRoomSession(source.kind === "relay" ? source.roomId : null);
+  const [roomPillEl, setRoomPillEl] = useState<HTMLDivElement | null>(null);
+  // The room pill's faces come from the room's sidebar entry (join order, as
+  // on its row); until that loads, from the live member list.
+  const roomPillOthers = useMemo(() => {
+    const p = chatSurfaceAdapter.participants;
+    if (!p) return [] as RelayRoomFace[];
+    return [
+      ...p.humans
+        .filter((h) => h.mxid !== viewingUserMxid)
+        .map((h): RelayRoomFace => ({
+          mxid: h.mxid,
+          kind: "human",
+          name: h.displayName,
+          userId: h.userId,
+          avatarPath: h.avatarPath ?? null,
+        })),
+      ...p.agents.map((a): RelayRoomFace => ({ mxid: a.mxid, kind: "agent", name: a.identityKey })),
+    ];
+  }, [chatSurfaceAdapter.participants, viewingUserMxid]);
+  const roomPillFaces: readonly RelayRoomFace[] =
+    relayRoomSession?.roomFaces && relayRoomSession.roomFaces.length > 0
+      ? relayRoomSession.roomFaces
+      : roomPillOthers.slice(0, 2);
+  const roomPillOthersCount =
+    relayRoomSession?.roomOthersCount ?? Math.max(roomPillOthers.length, roomPillFaces.length);
+  const roomPillMemberNames = useMemo(() => roomPillOthers.map((f) => f.name), [roomPillOthers]);
   const fleetIdentityHosts = useFleetIdentityHosts();
   const [messages, setMessages] = useState<StreamEvent[]>([]);
   // shape-interrupt-button: eventIds of prompts the transcript shows were
@@ -4860,7 +4896,20 @@ export function PrettyView({
           adapter flips isReady=true when the first participants frame
           arrives. */}
       {source.kind === "relay" && (
+        <RoomPill
+          ref={setRoomPillEl}
+          roomId={source.kind === "relay" ? source.roomId : ""}
+          title={relayRoomSession?.roomTitle || (source.kind === "relay" ? source.roomTitle : null) || null}
+          faces={roomPillFaces}
+          othersCount={roomPillOthersCount}
+          memberNames={roomPillMemberNames}
+          tabId={tabId}
+          menuItems={roomMenuItems ?? []}
+        />
+      )}
+      {source.kind === "relay" && (
         <MultiBadgeAnchor
+          avoidEl={roomPillEl}
           participants={
             chatSurfaceAdapter.participants ?? { humans: [], agents: [] }
           }

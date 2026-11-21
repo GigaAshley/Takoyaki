@@ -3234,6 +3234,27 @@ export function useRelayRoomTitles(): ReadonlyMap<string, string> {
   );
 }
 
+/** A relay room's entry in the session list (title, faces), if it has one. */
+export function useRelayRoomSession(roomId: string | null | undefined): FleetSession | undefined {
+  const sessions = useSyncExternalStore(subscribe, getFleetSessionsSnapshot, getFleetSessionsSnapshot);
+  if (!roomId) return undefined;
+  return sessions.find((s) => s.kind === "relay-room" && s.roomId === roomId);
+}
+
+/** The project a relay room is filed in (slug), or null. */
+export function useRoomProjectSlug(roomId: string | null | undefined): string | null {
+  return useSyncExternalStore(
+    subscribe,
+    () => (roomId ? (state.roomProjectAssignments.get(roomId) ?? null) : null),
+    () => (roomId ? (state.roomProjectAssignments.get(roomId) ?? null) : null),
+  );
+}
+
+/** The user's machines, as the sidebar knows them (null before load). */
+export function useHostTree(): HostFolder | null {
+  return useSyncExternalStore(subscribe, () => state.hostTree, () => state.hostTree);
+}
+
 // ─── Phase 66 Plan 05 — cross-store accessors for identities-store enrichment ─
 // The identities-store's fetchOnce needs to construct an identityHosts map
 // (identityKey → hostId) from the fleet-sessions snapshot before it calls

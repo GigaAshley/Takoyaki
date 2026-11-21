@@ -231,4 +231,51 @@ describe("MultiBadgeAnchor — people in the room", () => {
     const names = Array.from(container.querySelectorAll(".sr-only")).map((n) => n.textContent);
     expect(names).toEqual(expect.arrayContaining(["Zoey", "Sam", "Nelly"]));
   });
+
+  describe("beside the room pill", () => {
+    function pill(rect: { left: number; right: number; top: number; bottom: number }) {
+      const el = document.createElement("div");
+      el.getBoundingClientRect = () =>
+        ({ ...rect, width: rect.right - rect.left, height: rect.bottom - rect.top, x: rect.left, y: rect.top, toJSON: () => ({}) }) as DOMRect;
+      return el;
+    }
+    function renderWithPill(el: HTMLElement) {
+      return render(
+        <MultiBadgeAnchor
+          avoidEl={el}
+          participants={{ humans: [ZOEY, NOPIC, ME] as HumanParticipant[], agents: [{ mxid: "@nelly:hs", identityKey: "nelly" }] }}
+          viewingUserMxid={VIEWER}
+          fleetIdentityHosts={{ nelly: 5 }}
+          isReady={true}
+        />,
+      );
+    }
+
+    it("stays on the top line, with names, when it fits beside the pill", () => {
+      stubLayout(1200, 300);
+      const { container } = renderWithPill(pill({ left: 500, right: 700, top: 12, bottom: 52 }));
+      const row = container.querySelector('[data-testid="multi-badge-anchor"]') as HTMLElement;
+      expect(row.getAttribute("data-below")).toBe("false");
+      expect(row.getAttribute("data-tight")).toBe("false");
+      expect(row.style.top).toBe("");
+    });
+
+    it("drops to the line under the pill when they'd overlap, keeping names if they fit there", () => {
+      stubLayout(390, 200);
+      const { container } = renderWithPill(pill({ left: 120, right: 300, top: 12, bottom: 52 }));
+      const row = container.querySelector('[data-testid="multi-badge-anchor"]') as HTMLElement;
+      expect(row.getAttribute("data-below")).toBe("true");
+      expect(row.getAttribute("data-tight")).toBe("false");
+      expect(row.style.top).toBe("58px");
+    });
+
+    it("under the pill, still goes to pictures only when even that line is too narrow", () => {
+      stubLayout(390, 700);
+      const { container } = renderWithPill(pill({ left: 120, right: 300, top: 12, bottom: 52 }));
+      const row = container.querySelector('[data-testid="multi-badge-anchor"]') as HTMLElement;
+      expect(row.getAttribute("data-below")).toBe("true");
+      expect(row.getAttribute("data-tight")).toBe("true");
+      expect(row.style.maxWidth).toBe(`${390 - 20 - 16}px`);
+    });
+  });
 });

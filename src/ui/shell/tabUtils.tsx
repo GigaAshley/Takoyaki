@@ -48,6 +48,7 @@ import { AppPane } from "./AppPane";
 import { DesktopPane } from "./DesktopPane";
 import { FilePane } from "./FilePane";
 import { RemotePane } from "./RemotePane";
+import { useRelayRoomPaneMenu } from "./relay-room-pane-menu";
 
 function hostToSSHHost(h: Host): SSHHost {
   return {
@@ -177,6 +178,48 @@ function TerminalTabContent({
 //
 // No CommandHistoryProvider here: TerminalTabContent provides its own, and
 // IdentitySessionPane provides its own (per Task 1 implementation).
+/**
+ * An open relay room: the shared chat surface with a relay source, plus the
+ * room's pill handle — it knows its pane (drag) and how to close, and carries
+ * the room's menu.
+ */
+function RelayRoomPane({
+  tab,
+  roomId,
+  isVisible,
+  onCloseTab,
+}: {
+  tab: Tab;
+  roomId: string;
+  isVisible: boolean;
+  onCloseTab?: (id: string) => void;
+}) {
+  const menu = useRelayRoomPaneMenu({
+    tabId: tab.id,
+    roomId,
+    title: tab.relayRoomTitle ?? null,
+    onCloseTab,
+  });
+  return (
+    <Suspense fallback={null}>
+      <PrettyView
+        source={{
+          kind: "relay",
+          roomId,
+          roomTitle: tab.relayRoomTitle ?? null,
+        }}
+        hostId={0}
+        tmuxSession=""
+        className="h-full w-full"
+        isVisible={isVisible}
+        tabId={tab.id}
+        roomMenuItems={menu.items}
+      />
+      {menu.modals}
+    </Suspense>
+  );
+}
+
 function TerminalOrIdentitySessionPane({
   tab,
   host,
@@ -250,19 +293,12 @@ function TerminalOrIdentitySessionPane({
       // pre-Slice-4 mount UX (PrettyView isn't lazy at this call site,
       // so the boundary is harmless; matches surrounding pattern).
       return (
-        <Suspense fallback={null}>
-          <PrettyView
-            source={{
-              kind: "relay",
-              roomId: tab.relayRoomId,
-              roomTitle: tab.relayRoomTitle ?? null,
-            }}
-            hostId={0}
-            tmuxSession=""
-            className="h-full w-full"
-            isVisible={isVisible}
-          />
-        </Suspense>
+        <RelayRoomPane
+          tab={tab}
+          roomId={tab.relayRoomId}
+          isVisible={isVisible}
+          onCloseTab={onCloseTab}
+        />
       );
     }
   }

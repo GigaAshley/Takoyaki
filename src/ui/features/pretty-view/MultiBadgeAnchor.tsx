@@ -71,6 +71,9 @@ import type {
 } from "./sources/relay-room-api";
 
 export interface MultiBadgeAnchorProps {
+  /** The room pill: the badges keep clear of it, dropping to the line
+   *  under it when they'd overlap. */
+  avoidEl?: HTMLElement | null;
   /** Participants — humans + agents. Both arrays may be empty. */
   participants: { humans: HumanParticipant[]; agents: AgentParticipant[] };
   /**
@@ -394,6 +397,11 @@ const TIGHT_CLASS =
 const ROW_LEFT_RESERVE_PX = 72;
 /** The row's own distance from the pane's right edge (right-5). */
 const ROW_RIGHT_OFFSET_PX = 20;
+/** Space kept between the room pill and the badges on the top line. */
+const ROW_PILL_GAP_PX = 8;
+/** On the line under the pill: left margin, and the gap below the pill. */
+const ROW_BELOW_LEFT_PX = 16;
+const ROW_BELOW_GAP_PX = 6;
 
 // Phase 97 Finding 4/5 UAT follow-up (2026-09-10): the participant cell
 // wrappers were `h-[N] w-[220px]` with `IdentityBadge` absolute-positioned
@@ -412,6 +420,7 @@ const CELL_BASE_CLASS =
   "[&_.pv-identity-badge]:right-auto [&_.pv-identity-badge]:z-auto";
 
 export function MultiBadgeAnchor({
+  avoidEl = null,
   participants,
   viewingUserMxid,
   fleetIdentityHosts,
@@ -452,9 +461,14 @@ export function MultiBadgeAnchor({
       return `${known?.displayName ?? "?"}:${fleetIdentityHosts[a.identityKey] ?? "-"}`;
     }),
   ].join("|");
+  // Below the pill: when the room pill and the badges won't both fit on the
+  // top line, the badges drop to a line just under it (the pill keeps the
+  // top line). Pictures-only (tight) still applies on whichever line.
+  const [belowTop, setBelowTop] = useState<number | null>(null);
   useLayoutEffect(() => {
     setTight(false);
     setRowMaxWidth(null);
+    setBelowTop(null);
     fullWidth.current = 0;
   }, [memberKey, drawKey]);
   useLayoutEffect(() => {
@@ -462,7 +476,6 @@ export function MultiBadgeAnchor({
     const pane = root?.offsetParent as HTMLElement | null | undefined;
     if (!root || !pane) return;
     const check = () => {
-      const available = pane.clientWidth - ROW_LEFT_RESERVE_PX - ROW_RIGHT_OFFSET_PX;
       if (!tight) {
         // The row grows leftward, where overflow isn't always counted in
         // its scroll width — so also add up the badges themselves.
@@ -472,34 +485,46 @@ export function MultiBadgeAnchor({
           cells.reduce((w, c) => w + c.getBoundingClientRect().width, 0) +
           gap * Math.max(0, cells.length - 1);
         fullWidth.current = Math.max(root.scrollWidth, summed);
-        if (fullWidth.current > available) {
-          // eslint-disable-next-line no-console
-          console.info({
-            operation: "relay_room_badges_tight",
-            members: totalCells,
-            fullWidth: fullWidth.current,
-            available,
-          });
-          setRowMaxWidth(Math.max(0, available));
-          setTight(true);
-        }
-      } else if (fullWidth.current > 0 && fullWidth.current <= available) {
-        setRowMaxWidth(null);
-        setTight(false);
-      } else {
-        // Still tight: pictures wrap onto another line rather than run off.
-        setRowMaxWidth(Math.max(0, available));
       }
+      const paneRect = pane.getBoundingClientRect();
+      const pillRect = avoidEl?.getBoundingClientRect() ?? null;
+      const hasPill = pillRect !== null && pillRect.width > 0;
+      // Top line: from the pill's right edge (or the left reserve) to the
+      // row's right margin.
+      const topAvailable = hasPill
+        ? pane.clientWidth - ROW_RIGHT_OFFSET_PX - (pillRect.right - paneRect.left) - ROW_PILL_GAP_PX
+        : pane.clientWidth - ROW_LEFT_RESERVE_PX - ROW_RIGHT_OFFSET_PX;
+      const fitsTop = fullWidth.current > 0 && fullWidth.current <= topAvailable;
+      const below = hasPill && !fitsTop;
+      const available = below
+        ? pane.clientWidth - ROW_RIGHT_OFFSET_PX - ROW_BELOW_LEFT_PX
+        : topAvailable;
+      setBelowTop(below ? pillRect!.bottom - paneRect.top + ROW_BELOW_GAP_PX : null);
+      const needTight = fullWidth.current > available;
+      if (needTight !== tight) {
+        // eslint-disable-next-line no-console
+        console.info({
+          operation: needTight ? "relay_room_badges_tight" : "relay_room_badges_names",
+          members: totalCells,
+          fullWidth: fullWidth.current,
+          available,
+          below,
+        });
+        setTight(needTight);
+      }
+      // Pictures wrap within the line rather than run off it.
+      setRowMaxWidth(needTight ? Math.max(0, available) : null);
     };
     check();
     if (typeof ResizeObserver === "undefined") return;
     const ro = new ResizeObserver(check);
     ro.observe(pane);
+    if (avoidEl) ro.observe(avoidEl);
     // While names show, a badge changing size (a font or picture loading)
     // can make the row overflow — watch the badges themselves too.
     if (!tight) for (const c of Array.from(root.children)) ro.observe(c);
     return () => ro.disconnect();
-  }, [tight, memberKey, drawKey, isReady]);
+  }, [tight, memberKey, drawKey, isReady, avoidEl]);
 
   // Warning 2: loading discrimination. `isReady={false}` renders a subtle
   // placeholder so the relay tab does not appear empty during the
@@ -541,14 +566,19 @@ export function MultiBadgeAnchor({
       data-testid="multi-badge-anchor"
       data-tight={tight ? "true" : "false"}
       className={cn(ROOT_ANCHOR_CLASS, tight && TIGHT_CLASS, className)}
-      style={tight && rowMaxWidth !== null ? { maxWidth: rowMaxWidth } : undefined}
+      data-below={belowTop !== null ? "true" : "false"}
+      style={{
+        ...(tight && rowMaxWidth !== null ? { maxWidth: rowMaxWidth } : {}),
+        ...(belowTop !== null ? { top: belowTop } : {}),
+      }}
     >
+      {/* Member badges are not drag handles: the room pill is the room's
+          handle (no tabId reaches the badges). */}
       {agentsSorted.map((a) => (
         <AgentBadgeCell
           key={a.mxid}
           agent={a}
           fleetIdentityHosts={fleetIdentityHosts}
-          tabId={tabId}
           relayRoomId={relayRoomId}
           relayRoomTitle={relayRoomTitle}
           tight={tight}
@@ -559,7 +589,6 @@ export function MultiBadgeAnchor({
           key={h.mxid}
           human={h}
           tight={tight}
-          tabId={tabId}
           relayRoomId={relayRoomId}
           relayRoomTitle={relayRoomTitle}
         />

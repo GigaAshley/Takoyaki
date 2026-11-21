@@ -160,8 +160,10 @@ beforeEach(() => {
   vi.clearAllMocks();
 });
 
-describe("MultiBadgeAnchor — Phase 97 Plan 06 tabId drag-source threading", () => {
-  it("Test 1: with tabId prop, every rendered IdentityBadge receives that tabId", () => {
+// The room pill is the room's drag handle now; member badges never are, even
+// when the room's tab id is known.
+describe("MultiBadgeAnchor — member badges are not drag handles", () => {
+  it("Test 1: even with the room's tabId, no badge receives it and the person badge isn't draggable", () => {
     const { container } = render(
       <MultiBadgeAnchor
         participants={{
@@ -180,10 +182,10 @@ describe("MultiBadgeAnchor — Phase 97 Plan 06 tabId drag-source threading", ()
     // 3 agents draw as agent badges; the person draws as a person badge.
     expect(badges.length).toBe(3);
     for (const badge of badges) {
-      expect(badge.getAttribute("data-tabid")).toBe(TAB_ID);
+      expect(badge.getAttribute("data-tabid")).toBe("");
     }
     const person = container.querySelector('[data-testid="relay-room-person-badge"]');
-    expect(person?.getAttribute("draggable")).toBe("true");
+    expect(person?.getAttribute("draggable")).toBe("false");
   });
 
   it("Test 2: without tabId prop, IdentityBadges receive no tabId (pre-plan regression floor)", () => {
@@ -211,7 +213,7 @@ describe("MultiBadgeAnchor — Phase 97 Plan 06 tabId drag-source threading", ()
     expect(person?.getAttribute("draggable")).toBe("false");
   });
 
-  it("Test 3: mixed participant list — HumanBadgeCell + AgentBadgeCell fallback + AgentBadgeWithMeter branches all receive tabId", () => {
+  it("Test 3: mixed participant list — no branch (person, agent fallback, agent with pie) is a drag handle", () => {
     const { container } = render(
       <MultiBadgeAnchor
         participants={{
@@ -230,7 +232,7 @@ describe("MultiBadgeAnchor — Phase 97 Plan 06 tabId drag-source threading", ()
     );
     expect(humanCell).not.toBeNull();
     const humanBadge = humanCell?.querySelector('[data-testid="relay-room-person-badge"]');
-    expect(humanBadge?.getAttribute("draggable")).toBe("true");
+    expect(humanBadge?.getAttribute("draggable")).toBe("false");
     expect(humanBadge?.textContent).toContain("Riley");
 
     // bare-agent cell — plain IdentityBadge inside AgentBadgeCell fallback
@@ -242,7 +244,7 @@ describe("MultiBadgeAnchor — Phase 97 Plan 06 tabId drag-source threading", ()
     const bareAgentBadge = bareAgentCell?.querySelector(
       '[data-testid="identity-badge-spy"]',
     );
-    expect(bareAgentBadge?.getAttribute("data-tabid")).toBe(TAB_ID);
+    expect(bareAgentBadge?.getAttribute("data-tabid")).toBe("");
     // Fallback branch: no appendage.
     expect(
       bareAgentCell?.querySelector('[data-appendage="true"]'),
@@ -256,7 +258,7 @@ describe("MultiBadgeAnchor — Phase 97 Plan 06 tabId drag-source threading", ()
     const nellyBadge = nellyCell?.querySelector(
       '[data-testid="identity-badge-spy"]',
     );
-    expect(nellyBadge?.getAttribute("data-tabid")).toBe(TAB_ID);
+    expect(nellyBadge?.getAttribute("data-tabid")).toBe("");
     // AgentBadgeWithMeter branch: has appendage.
     expect(nellyCell?.querySelector('[data-appendage="true"]')).not.toBeNull();
   });
@@ -289,11 +291,7 @@ describe("MultiBadgeAnchor — Phase 97 Plan 06 tabId drag-source threading", ()
     }
   });
 
-  it("Test 5 (integration shape): the tabId prop threads through to the AgentBadgeWithMeter branch's inner IdentityBadge (D-05 room-drag source parity)", () => {
-    // This mirrors what PrettyView.tsx's relay-case mount will produce once
-    // it passes tabId={tabId}: every participant badge becomes a drag source
-    // carrying the room tab's tabId in dataTransfer via IdentityBadge's
-    // isDragSource gate.
+  it("Test 5: an agent with a pie still gets no tabId (the pill is the handle)", () => {
     const { container } = render(
       <MultiBadgeAnchor
         participants={{
@@ -311,7 +309,7 @@ describe("MultiBadgeAnchor — Phase 97 Plan 06 tabId drag-source threading", ()
       container.querySelectorAll('[data-testid="identity-badge-spy"]'),
     );
     expect(badges.length).toBe(1);
-    expect(badges[0].getAttribute("data-tabid")).toBe(TAB_ID);
+    expect(badges[0].getAttribute("data-tabid")).toBe("");
     expect(badges[0].getAttribute("data-identity-key")).toBe("nelly");
     // The badge sits inside the AgentBadgeWithMeter drawer wrapper.
     const cell = container.querySelector(
