@@ -47,17 +47,17 @@ vi.mock("@/api/compose-drafts-api", () => ({
   flushComposeDraftKeepalive: vi.fn(),
 }));
 
-const useSessionIdentityMock = vi.fn(() => ({
+const useSessionIdentityMock = vi.fn((_name?: unknown) => ({
   identity: null as unknown,
   identityHue: null as number | null,
 }));
-const sessionMatchKeyMock = vi.fn(() => null as string | null);
+const sessionMatchKeyMock = vi.fn((_name?: unknown) => null as string | null);
 
 vi.mock("@/features/terminal/session-hue", () => ({
   sessionMatchKey: (name: string | null | undefined) =>
-    sessionMatchKeyMock(name as unknown as never),
+    sessionMatchKeyMock(name),
   useSessionIdentity: (name: string | null | undefined) =>
-    useSessionIdentityMock(name as unknown as never),
+    useSessionIdentityMock(name),
 }));
 
 // TaskPill mock — the harness pane's handle (replaced the harness badge).
@@ -215,7 +215,7 @@ describe("relay room files in the conversation", () => {
     );
     const { getByText } = mount();
     expect(getByText("plan.txt").closest("a")?.getAttribute("href")).toContain("/file/.relay-room/");
-    expect(getByText("mine.txt").closest("a")?.getAttribute("href")).toContain(encodeURIComponent("$own"));
+    expect(getByText("mine.txt").closest("a")?.getAttribute("href")).toContain(encodeURIComponent(encodeURIComponent("$own")));
   });
 
   it("paperclip → staged chip → Send hands the files and text to the room", async () => {

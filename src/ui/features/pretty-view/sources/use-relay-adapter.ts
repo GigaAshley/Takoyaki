@@ -249,6 +249,12 @@ export function useRelayAdapter(
     useState<ChatSurfaceParticipants>(EMPTY_PARTICIPANTS);
   const [error, setError] = useState<RelayRoomError>(null);
   const [pendingSends, setPendingSends] = useState<PendingSend[]>([]);
+  // Files being sent (and the text waiting behind them). Kept apart from
+  // pendingSends so a reconnect or hiding the pane never wipes their
+  // sending / not-sent marks; cleared only when the room changes.
+  const [fileSends, setFileSends] = useState<PendingSend[]>([]);
+  // Batches run one after another, so two quick sends never interleave.
+  const batchChainRef = useRef<Promise<void>>(Promise.resolve());
   const [hasOlder, setHasOlder] = useState<boolean>(false);
   const [loadOlderStatus, setLoadOlderStatus] = useState<
     "idle" | "loading" | "error"
@@ -412,48 +418,34 @@ export function useRelayAdapter(
   // Files go one at a time, in order; the text only goes once every file
   // has. The first failure marks that file and everything after it — later
   // files and the text — not sent, so nothing arrives out of order or
-  // without its files.
-  const sendFiles = useCallback(
-    async (files: File[], caption: string): Promise<void> => {
-      const room = roomIdRef.current;
-      const base = Date.now();
-      const fileEntries: Array<PendingSend & { source: File }> = files.map((f, i) => ({
-        mqid: newMqid(),
-        content: f.name,
-        sentAt: base + i,
-        state: "sending",
-        timer: null,
-        file: { filename: f.name, size: f.size, mimetype: f.type || "application/octet-stream" },
-        source: f,
-      }));
-      const text = caption.trim().length > 0 ? caption : null;
-      const textEntry: PendingSend | null = text
-        ? { mqid: newMqid(), content: text, sentAt: base + files.length, state: "sending", timer: null }
-        : null;
-      const seeded: PendingSend[] = fileEntries.map(({ source: _s, ...p }) => p);
-      if (textEntry) seeded.push(textEntry);
-      setPendingSends((prev) => [...prev, ...seeded]);
-
+  // without its files. Each batch waits for the one before it.
+  const runFileBatch = useCallback(
+    async (
+      room: string,
+      fileEntries: Array<PendingSend & { source: File }>,
+      textEntry: PendingSend | null,
+    ): Promise<void> => {
       const failFrom = (index: number, reason: string) => {
         const doomed = new Set<string>(fileEntries.slice(index).map((e) => e.mqid));
         if (textEntry) doomed.add(textEntry.mqid);
         // eslint-disable-next-line no-console
         console.info({ operation: "relay_room_send_files_failed", roomId: room, failedAt: index, reason });
-        setPendingSends((prev) =>
+        setFileSends((prev) =>
           prev.map((p) => (doomed.has(p.mqid) ? { ...p, state: "failed", timer: null } : p)),
         );
       };
 
       for (let i = 0; i < fileEntries.length; i++) {
         const entry = fileEntries[i];
+        if (roomIdRef.current !== room) return;
         try {
           const sent = await sendRelayRoomFile(room, entry.source, entry.mqid);
-          setPendingSends((prev) => prev.filter((p) => p.mqid !== entry.mqid));
-          const viewingMxid = viewingUserMxidRef.current;
+          if (roomIdRef.current !== room) return;
+          setFileSends((prev) => prev.filter((p) => p.mqid !== entry.mqid));
           const synth: MatrixEvent = {
             event_id: sent.eventId,
             type: "m.room.message",
-            sender: viewingMxid,
+            sender: viewingUserMxidRef.current,
             origin_server_ts: entry.sentAt,
             content: sent.content,
             unsigned: { transaction_id: entry.mqid },
@@ -476,7 +468,15 @@ export function useRelayAdapter(
       }
 
       if (textEntry === null) return;
-      const ws = wsRef.current;
+      // The room's connection may be reconnecting (or the pane hidden):
+      // wait a little for it rather than dropping the text.
+      const deadline = Date.now() + PENDING_SEND_TIMEOUT_MS_NORMAL;
+      let ws = wsRef.current;
+      while ((ws === null || ws.readyState !== WebSocket.OPEN) && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 250));
+        if (roomIdRef.current !== room) return;
+        ws = wsRef.current;
+      }
       if (ws === null || ws.readyState !== WebSocket.OPEN) {
         failFrom(fileEntries.length, "ws_not_open");
         return;
@@ -488,19 +488,49 @@ export function useRelayAdapter(
         failFrom(fileEntries.length, "ws_send_threw");
         return;
       }
+      // From here it's an ordinary text send: acked / echoed / timed out.
       const timerHandle = setTimeout(
         () => flipToFailed(textEntry.mqid, "timeout"),
         PENDING_SEND_TIMEOUT_MS_NORMAL,
       );
-      setPendingSends((prev) => {
-        const present = prev.some((p) => p.mqid === textEntry.mqid);
-        return present
-          ? prev.map((p) => (p.mqid === textEntry.mqid ? { ...p, timer: timerHandle } : p))
-          : [...prev, { ...textEntry, timer: timerHandle }];
-      });
+      setFileSends((prev) => prev.filter((p) => p.mqid !== textEntry.mqid));
+      setPendingSends((prev) => [...prev, { ...textEntry, timer: timerHandle }]);
     },
     [flipToFailed],
   );
+
+  const sendFiles = useCallback(
+    (files: File[], caption: string): Promise<void> => {
+      const room = roomIdRef.current;
+      const base = Date.now();
+      const fileEntries: Array<PendingSend & { source: File }> = files.map((f, i) => ({
+        mqid: newMqid(),
+        content: f.name,
+        sentAt: base + i,
+        state: "sending",
+        timer: null,
+        file: { filename: f.name, size: f.size, mimetype: f.type || "application/octet-stream" },
+        source: f,
+      }));
+      const text = caption.trim().length > 0 ? caption : null;
+      const textEntry: PendingSend | null = text
+        ? { mqid: newMqid(), content: text, sentAt: base + files.length, state: "sending", timer: null }
+        : null;
+      const seeded: PendingSend[] = fileEntries.map(({ source: _s, ...p }) => p);
+      if (textEntry) seeded.push(textEntry);
+      setFileSends((prev) => [...prev, ...seeded]);
+      const run = batchChainRef.current.then(() => runFileBatch(room, fileEntries, textEntry));
+      batchChainRef.current = run.catch(() => {});
+      return run;
+    },
+    [runFileBatch],
+  );
+
+  // A different room starts with nothing in flight.
+  useEffect(() => {
+    setFileSends([]);
+    batchChainRef.current = Promise.resolve();
+  }, [roomId]);
 
   // ── fetchOlder — Promise-returning wrapper (adapter contract) ────────────
   // The adapter contract signature is `() => Promise<void>` (no argument).
@@ -853,7 +883,7 @@ export function useRelayAdapter(
     // event — no double-render window because both setState calls batch.
     // If the pending times out or fails, its `state` flips to "failed"
     // but it stays in pendingSends so the failure bubble persists (D-14).
-    for (const p of pendingSends) {
+    for (const p of [...pendingSends, ...fileSends]) {
       out.push({
         type: "message",
         role: "user",
@@ -882,7 +912,7 @@ export function useRelayAdapter(
     out.sort((a, b) => (a.ts ?? 0) - (b.ts ?? 0));
     return out;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [history, pendingSends]);
+  }, [history, pendingSends, fileSends]);
 
   // Memoize the returned object so consumers checking reference equality
   // (React.memo, useCallback deps that include the adapter object) don't see

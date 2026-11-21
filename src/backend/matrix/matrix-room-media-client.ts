@@ -6,13 +6,14 @@
 // retrying once with a fresh token on 401 — so the chat server itself
 // decides what the user may see and post. Never logs a token or file bytes.
 
+import { Readable } from "node:stream";
 import { databaseLogger } from "../utils/logger.js";
 import { getMatrixAdminCreds } from "./matrix-admin-creds-store.js";
 import { ensureUserToken, evictUserToken } from "./matrix-admin-client.js";
 
 const REQUEST_TIMEOUT_MS = 30_000;
 /** Uploads and downloads move real bytes; give them longer. */
-const TRANSFER_TIMEOUT_MS = 5 * 60_000;
+const TRANSFER_TIMEOUT_MS = 10 * 60_000;
 
 const ERR_CREDS_MISSING = "matrix_admin_creds_missing";
 const ERR_NON_2XX = "matrix_media_non_2xx";
@@ -33,7 +34,8 @@ export function parseMxc(mxc: string): { server: string; mediaId: string } | nul
 interface AsUserInit {
   method: string;
   headers?: Record<string, string>;
-  body?: Buffer | string;
+  /** A stream body can only be sent once: no retry on 401 (the token is evicted). */
+  body?: Buffer | string | Readable;
   timeoutMs?: number;
 }
 
@@ -56,12 +58,17 @@ async function fetchAsUser(
     const timeoutId = setTimeout(() => controller.abort(), init.timeoutMs ?? REQUEST_TIMEOUT_MS);
     let response: Response;
     try {
+      const streamed = init.body instanceof Readable;
       response = await fetch(`${creds.homeserverBase}${path}`, {
         method: init.method,
         headers: { Authorization: `Bearer ${tok.token}`, ...(init.headers ?? {}) },
-        ...(init.body !== undefined ? { body: init.body } : {}),
+        ...(init.body === undefined
+          ? {}
+          : streamed
+            ? { body: Readable.toWeb(init.body as Readable) as unknown as RequestInit["body"], duplex: "half" }
+            : { body: init.body as Buffer | string }),
         signal: controller.signal,
-      });
+      } as RequestInit);
     } catch (err: unknown) {
       clearTimeout(timeoutId);
       if (err instanceof DOMException && err.name === "AbortError") {
@@ -72,6 +79,11 @@ async function fetchAsUser(
     }
     // Headers are in; a long body read is governed by the caller.
     clearTimeout(timeoutId);
+    if (response.status === 401 && attempt === 0 && init.body instanceof Readable) {
+      void response.body?.cancel().catch(() => {});
+      evictUserToken(mxid);
+      return { ok: false, status: 401, error: ERR_NON_2XX };
+    }
     if (response.status === 401 && attempt === 0) {
       void response.body?.cancel().catch(() => {});
       evictUserToken(mxid);
@@ -117,10 +129,14 @@ export async function getMediaConfigAsUser(
   return last;
 }
 
-/** POST /_matrix/media/v3/upload as the user → the file's mxc URI. */
+/**
+ * POST /_matrix/media/v3/upload as the user → the file's mxc URI. `body` is
+ * the file's bytes, or a stream of exactly `size` bytes (never buffered).
+ */
 export async function uploadMediaAsUser(
   mxid: string,
-  bytes: Buffer,
+  body: Buffer | Readable,
+  size: number,
   filename: string,
   contentType: string,
 ): Promise<{ ok: true; mxc: string } | MediaErr> {
@@ -129,8 +145,8 @@ export async function uploadMediaAsUser(
     `/_matrix/media/v3/upload?filename=${encodeURIComponent(filename)}`,
     {
       method: "POST",
-      headers: { "Content-Type": contentType, "Content-Length": String(bytes.byteLength) },
-      body: bytes,
+      headers: { "Content-Type": contentType, "Content-Length": String(size) },
+      body,
       timeoutMs: TRANSFER_TIMEOUT_MS,
     },
     "matrix_media_upload",

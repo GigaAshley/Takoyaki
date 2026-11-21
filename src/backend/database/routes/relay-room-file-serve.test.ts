@@ -17,6 +17,7 @@ vi.mock("../../utils/logger.js", () => ({
 }));
 
 import { dispatchRoomFile, serveRoomFileGet, serveRoomFilePost } from "./relay-room-file-serve.js";
+import { attachmentDisposition } from "../../utils/sftp-file-response.js";
 
 const PATH = "/!room:hs/$ev:hs/whatever.bin";
 
@@ -51,6 +52,30 @@ describe("room file content types", () => {
       disposition: "attachment",
     });
     expect(dispatchRoomFile("blob", null).disposition).toBe("attachment");
+  });
+});
+
+describe("download names", () => {
+  it("keep any script via the UTF-8 form, with an ASCII fallback", () => {
+    expect(attachmentDisposition("报告 📄.zip")).toBe(
+      `attachment; filename="_____.zip"; filename*=UTF-8''${encodeURIComponent("报告 📄.zip")}`.replace("_____", "__ __"),
+    );
+    expect(attachmentDisposition('a"b.zip')).toBe(`attachment; filename="a_b.zip"; filename*=UTF-8''a%22b.zip`);
+  });
+  it("a non-Latin name downloads instead of failing", async () => {
+    files.openRoomFile.mockResolvedValue({
+      ok: true,
+      post: { name: "报告.zip", mimetype: "application/zip", size: 2, mxc: "mxc://hs/z", encrypted: false },
+      response: new Response("PK", { status: 200 }),
+    });
+    await serve(
+      (req, res) => void serveRoomFileGet(req, res, "u1", PATH),
+      async (base) => {
+        const res = await fetch(`${base}/x`);
+        expect(res.status).toBe(200);
+        expect(res.headers.get("content-disposition")).toContain("filename*=UTF-8''");
+      },
+    );
   });
 });
 

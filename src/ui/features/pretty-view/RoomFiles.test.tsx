@@ -41,13 +41,13 @@ describe("room file address", () => {
     const url = buildRoomFileUrl(ROOM, "$ev1:hs", "my notes.txt");
     expect(parseSkynetFileUrl(url)).toEqual({
       host: ".relay-room",
-      path: `/${ROOM}/$ev1:hs/my notes.txt`,
+      path: `/${encodeURIComponent(ROOM)}/${encodeURIComponent("$ev1:hs")}/my notes.txt`,
     });
   });
 
   it("a slash in a file's name can't add path segments", () => {
     const url = buildRoomFileUrl(ROOM, "$ev1", "a/b.txt");
-    expect(parseSkynetFileUrl(url)?.path).toBe(`/${ROOM}/$ev1/a_b.txt`);
+    expect(parseSkynetFileUrl(url)?.path).toBe(`/${encodeURIComponent(ROOM)}/%24ev1/a_b.txt`);
   });
 
   it("reads name, size and type from a file post", () => {
@@ -59,6 +59,17 @@ describe("room file address", () => {
     expect(f).toMatchObject({ name: "clip.mp4", size: 99, mimetype: "video/mp4" });
     expect(f?.url).not.toBeNull();
     expect(roomFileFromContent({ msgtype: "m.text", body: "hi" }, ROOM, "$t")).toBeNull();
+  });
+
+  it("a post's own caption (body beside a separate file name) is kept", () => {
+    const f = roomFileFromContent(
+      { msgtype: "m.image", filename: "cat.png", body: "look at this", url: "mxc://hs/c" },
+      ROOM,
+      "$c",
+    );
+    expect(f?.name).toBe("cat.png");
+    expect(f?.caption).toBe("look at this");
+    expect(roomFileFromContent({ msgtype: "m.image", body: "cat.png", url: "mxc://hs/c" }, ROOM, "$c")?.caption).toBeUndefined();
   });
 });
 
@@ -96,6 +107,30 @@ describe("RoomFileChip", () => {
     api.getRelayRoomFileStatus.mockResolvedValue("not_found");
     render(<RoomFileChip file={ref()} />);
     expect(await screen.findByTestId("room-file-unavailable")).toHaveTextContent("No longer available");
+  });
+
+  it("shows a post's own caption under the chip", () => {
+    render(<RoomFileChip file={ref({ caption: "the Q3 numbers" })} />);
+    expect(screen.getByTestId("room-file-caption")).toHaveTextContent("the Q3 numbers");
+  });
+
+  it("checks only a few files at a time", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    api.getRelayRoomFileStatus.mockImplementation(async () => {
+      await gate;
+      return "ok";
+    });
+    render(
+      <>
+        {[1, 2, 3, 4, 5].map((i) => (
+          <RoomFileChip key={i} file={ref({ eventId: `$e${i}` })} />
+        ))}
+      </>,
+    );
+    await waitFor(() => expect(api.getRelayRoomFileStatus).toHaveBeenCalledTimes(3));
+    release();
+    await waitFor(() => expect(api.getRelayRoomFileStatus).toHaveBeenCalledTimes(5));
   });
 
   it("a check that couldn't run leaves the file openable", async () => {

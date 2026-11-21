@@ -187,6 +187,8 @@ export type RoomFileRef = {
   mimetype: string | null;
   url: string | null;
   unavailable?: "encrypted" | "missing";
+  /** Text written inside the post itself (its body, when it names the file separately). */
+  caption?: string;
 };
 
 export type MessageEvent = {

@@ -154,7 +154,7 @@ describe("relay room files — showing posts", () => {
     expect(m.roomFile?.name).toBe("cat.png");
     expect(m.roomFile?.size).toBe(12);
     expect(m.roomFile?.url).toContain("/file/.relay-room/");
-    expect(m.roomFile?.url).toContain(encodeURIComponent("$pic"));
+    expect(m.roomFile?.url).toContain(encodeURIComponent(encodeURIComponent("$pic")));
   });
 
   it("an encrypted attachment still shows, as a file that can't be opened", () => {
@@ -204,6 +204,9 @@ describe("relay room files — sendFiles", () => {
       done = result.current.sendFiles!([file("a.txt"), file("b.txt")], "here you go");
     });
     // Three bubbles on the user's side straight away, all sending.
+    await act(async () => {
+      await flush();
+    });
     const pending = result.current.messages.filter((m) => m.type === "message");
     expect(pending).toHaveLength(3);
     expect(pending.every((m) => m.type === "message" && m.pendingState === "sending")).toBe(true);
@@ -249,5 +252,57 @@ describe("relay room files — sendFiles", () => {
     });
     expect(instances[0].sent.some((s) => s.includes("send_message"))).toBe(false);
     expect(result.current.messages.filter((m) => m.type === "message")).toHaveLength(1);
+  });
+
+  it("a second send waits for the first, so files and text never interleave", async () => {
+    let releaseA!: () => void;
+    const order: string[] = [];
+    sendRelayRoomFile.mockImplementation(async (_room: string, f: File) => {
+      order.push(f.name);
+      if (f.name === "a.bin") await new Promise<void>((r) => { releaseA = r; });
+      return { eventId: `$${f.name}`, content: { msgtype: "m.file", body: f.name, url: "mxc://hs/x" } };
+    });
+    const { result } = open();
+    let a!: Promise<void>;
+    let b!: Promise<void>;
+    act(() => {
+      a = result.current.sendFiles!([file("a.bin")], "first");
+      b = result.current.sendFiles!([file("b.bin")], "second");
+    });
+    await act(async () => {
+      await flush();
+    });
+    expect(order).toEqual(["a.bin"]);
+    await act(async () => {
+      releaseA();
+      await a;
+      await b;
+    });
+    expect(order).toEqual(["a.bin", "b.bin"]);
+    const texts = instances[0].sent.map((x) => JSON.parse(x)).filter((p) => p.type === "send_message").map((p) => p.body);
+    expect(texts).toEqual(["first", "second"]);
+  });
+
+  it("a reconnect mid-send keeps the marks: a failure still shows as not sent", async () => {
+    let reject!: (e: Error) => void;
+    sendRelayRoomFile.mockImplementation(
+      () => new Promise((_res, rej) => { reject = rej; }),
+    );
+    const { result } = open();
+    let done!: Promise<void>;
+    act(() => {
+      done = result.current.sendFiles!([file("a.txt")], "caption");
+    });
+    await act(async () => {
+      await flush();
+    });
+    act(() => instances[0].simulateClose());
+    expect(result.current.messages.filter((m) => m.type === "message")).toHaveLength(2);
+    await act(async () => {
+      reject(new RelayRoomFileSendError("host_unreachable"));
+      await done;
+    });
+    const failed = result.current.messages.filter((m) => m.type === "message" && m.pendingState === "failed");
+    expect(failed).toHaveLength(2);
   });
 });

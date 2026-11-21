@@ -21,6 +21,7 @@ import {
   checkRoomFile,
   cleanFileName,
   describeFilePost,
+  exactly,
   msgtypeForMime,
   openRoomFile,
   parseRoomFilePath,
@@ -47,6 +48,13 @@ beforeEach(() => {
 describe("room file addresses", () => {
   it("parse to the room and the post", () => {
     expect(parseRoomFilePath(`/${ROOM}/$ev:hs/cat.png`)).toEqual(ADDR);
+  });
+  it("decode ids that were encoded once more (a post id may hold a slash)", () => {
+    const ev = "$abc/def+g=";
+    expect(parseRoomFilePath(`/${encodeURIComponent(ROOM)}/${encodeURIComponent(ev)}/x.png`)).toEqual({
+      roomId: ROOM,
+      eventId: ev,
+    });
   });
   it("refuse anything that isn't a room and an event", () => {
     expect(parseRoomFilePath("/home/ubuntu/x")).toBeNull();
@@ -130,9 +138,28 @@ describe("opening a room file", () => {
   });
 });
 
+describe("a streamed body", () => {
+  it("must be exactly its declared size", async () => {
+    const { Readable } = await import("node:stream");
+    const read = (src: string, size: number) =>
+      new Promise<string>((resolve, reject) => {
+        const chunks: Buffer[] = [];
+        Readable.from([Buffer.from(src)])
+          .pipe(exactly(size))
+          .on("data", (c: Buffer) => chunks.push(c))
+          .on("end", () => resolve(Buffer.concat(chunks).toString()))
+          .on("error", reject);
+      });
+    expect(await read("abc", 3)).toBe("abc");
+    await expect(read("abcd", 3)).rejects.toThrow("body_longer_than_declared");
+    await expect(read("ab", 3)).rejects.toThrow("body_shorter_than_declared");
+  });
+});
+
 describe("sending a room file", () => {
   const file = (size = 10) => ({
-    bytes: Buffer.alloc(size, 1),
+    body: Buffer.alloc(size, 1),
+    size,
     filename: "pic.png",
     contentType: "image/png",
     txnId: "txn-1",
@@ -169,7 +196,7 @@ describe("sending a room file", () => {
     media.uploadMediaAsUser.mockResolvedValue({ ok: true, mxc: "mxc://hs/new" });
     media.sendRoomEventAsUser.mockResolvedValue({ ok: true, eventId: "$sent" });
     await sendRoomFile("u1", ROOM, { ...file(), contentType: "not a type" });
-    expect(media.uploadMediaAsUser.mock.calls[0][3]).toBe("application/octet-stream");
+    expect(media.uploadMediaAsUser.mock.calls[0][4]).toBe("application/octet-stream");
     expect(await sendRoomFile("u1", ROOM, { ...file(), txnId: "bad id/" })).toMatchObject({
       errorClass: "invalid_txn_id",
     });

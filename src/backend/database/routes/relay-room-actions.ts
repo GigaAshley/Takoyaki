@@ -140,36 +140,6 @@ export const RELAY_ROOM_FILE_CONTENT_TYPE = "application/x-relay-room-file";
 /** Ceiling when the chat server names no upload limit of its own. */
 const UPLOAD_CEILING_BYTES = 1024 * 1024 * 1024;
 
-/** Read the request body, giving up past `maxBytes`. */
-function readBody(req: Request, maxBytes: number): Promise<Buffer | "too_large"> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let total = 0;
-    let done = false;
-    req.on("data", (chunk: Buffer) => {
-      if (done) return;
-      total += chunk.byteLength;
-      if (total > maxBytes) {
-        done = true;
-        req.pause();
-        resolve("too_large");
-        return;
-      }
-      chunks.push(chunk);
-    });
-    req.on("end", () => {
-      if (done) return;
-      done = true;
-      resolve(Buffer.concat(chunks));
-    });
-    req.on("error", (err) => {
-      if (done) return;
-      done = true;
-      reject(err);
-    });
-  });
-}
-
 router.get("/:roomId/upload-limit", authenticateJWT, async (req: Request, res: Response) => {
   const caller = await resolveCaller(req, res, "relay_room_upload_limit_denied");
   if (caller === null) return;
@@ -194,19 +164,21 @@ router.post("/:roomId/files", authenticateJWT, async (req: Request, res: Respons
   const limit = await getRoomUploadLimit(caller.userId, caller.roomId);
   const maxBytes =
     limit.ok === true && limit.maxUploadBytes !== null ? limit.maxUploadBytes : UPLOAD_CEILING_BYTES;
+  // The body streams straight through to the chat server, so its size must
+  // be declared up front (and is held to exactly that).
   const declared = Number(req.headers["content-length"]);
-  if (Number.isFinite(declared) && declared > maxBytes) {
+  if (req.headers["content-length"] === undefined || !Number.isInteger(declared) || declared < 0) {
+    res.status(411).json({ error: "length_required" });
+    return;
+  }
+  if (declared > maxBytes) {
     res.status(413).json({ error: "too_large" });
     return;
   }
   try {
-    const bytes = await readBody(req, maxBytes);
-    if (bytes === "too_large") {
-      res.status(413).json({ error: "too_large" });
-      return;
-    }
     const result = await sendRoomFile(caller.userId, caller.roomId, {
-      bytes,
+      body: declared === 0 ? Buffer.alloc(0) : req,
+      size: declared,
       filename,
       contentType,
       txnId,

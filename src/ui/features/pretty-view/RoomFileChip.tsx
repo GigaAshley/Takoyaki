@@ -2,7 +2,8 @@
 // every file in the app is: the same file chip (pictures inline), opening
 // the file window, draggable into a file pane. A post whose file can't be
 // opened — encrypted, or gone from the chat server — shows as a quiet chip
-// with its name and a note instead of vanishing.
+// with its name and a note instead of vanishing. A caption written inside
+// the post (another client's picture-with-text) shows under the chip.
 
 import { useEffect, useState } from "react";
 import { FileWarning } from "lucide-react";
@@ -10,14 +11,33 @@ import type { RoomFileRef } from "@/api/claude-session-api";
 import { getRelayRoomFileStatus } from "@/api/relay-room-files-api";
 import { FileChip } from "./FileChip";
 
-/** One status check per posted file per page load. */
+/** One status check per posted file per page load, a few at a time. */
 const statusCache = new Map<string, Promise<string>>();
+const MAX_CHECKS_AT_ONCE = 3;
+let checksRunning = 0;
+const checkQueue: Array<() => void> = [];
+
+function limited<T>(run: () => Promise<T>): Promise<T> {
+  return new Promise<T>((resolve) => {
+    const start = () => {
+      checksRunning++;
+      void run()
+        .then(resolve)
+        .finally(() => {
+          checksRunning--;
+          checkQueue.shift()?.();
+        });
+    };
+    if (checksRunning < MAX_CHECKS_AT_ONCE) start();
+    else checkQueue.push(start);
+  });
+}
 
 function checkStatus(file: RoomFileRef): Promise<string> {
   const key = `${file.roomId}\n${file.eventId}`;
   let p = statusCache.get(key);
   if (!p) {
-    p = getRelayRoomFileStatus(file.roomId, file.eventId);
+    p = limited(() => getRelayRoomFileStatus(file.roomId, file.eventId));
     statusCache.set(key, p);
   }
   return p;
@@ -26,6 +46,8 @@ function checkStatus(file: RoomFileRef): Promise<string> {
 /** Test seam: forget every status check. */
 export function __resetRoomFileStatusCacheForTest(): void {
   statusCache.clear();
+  checkQueue.length = 0;
+  checksRunning = 0;
 }
 
 function noteFor(reason: string): string {
@@ -81,19 +103,32 @@ export function RoomFileChip({ file, onOpenEditor, dragOrigin }: RoomFileChipPro
     };
   }, [file.url, file.roomId, file.eventId]);
 
+  const caption = file.caption ? (
+    <div data-testid="room-file-caption" className="mt-1.5 whitespace-pre-wrap">
+      {file.caption}
+    </div>
+  ) : null;
   if (file.url === null || gone !== null) {
-    return <UnavailableFileChip name={file.name} reason={gone ?? file.unavailable ?? "missing"} />;
+    return (
+      <>
+        <UnavailableFileChip name={file.name} reason={gone ?? file.unavailable ?? "missing"} />
+        {caption}
+      </>
+    );
   }
   const url = file.url;
   return (
-    <FileChip
-      url={url}
-      filename={file.name}
-      {...(file.size !== null ? { size: file.size } : {})}
-      dragOrigin={dragOrigin}
-      onOpen={() =>
-        onOpenEditor?.({ messageEventId: file.eventId, url, filename: file.name })
-      }
-    />
+    <>
+      <FileChip
+        url={url}
+        filename={file.name}
+        {...(file.size !== null ? { size: file.size } : {})}
+        dragOrigin={dragOrigin}
+        onOpen={() =>
+          onOpenEditor?.({ messageEventId: file.eventId, url, filename: file.name })
+        }
+      />
+      {caption}
+    </>
   );
 }

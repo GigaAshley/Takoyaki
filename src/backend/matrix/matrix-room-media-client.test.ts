@@ -45,7 +45,7 @@ describe("matrix room media client", () => {
 
   it("uploads with the user's token and returns the mxc", async () => {
     fetchMock.mockResolvedValueOnce(json({ content_uri: "mxc://hs/new" }));
-    const r = await uploadMediaAsUser("@u:hs", Buffer.from("abc"), "a b.png", "image/png");
+    const r = await uploadMediaAsUser("@u:hs", Buffer.from("abc"), 3, "a b.png", "image/png");
     expect(r).toEqual({ ok: true, mxc: "mxc://hs/new" });
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe("http://hs/_matrix/media/v3/upload?filename=a%20b.png");

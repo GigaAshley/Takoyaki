@@ -18,6 +18,7 @@ import type { ReadableStream as NodeWebReadableStream } from "node:stream/web";
 import { classifyByExtension } from "../../utils/editable-file-whitelist.js";
 import { sniffTextBytes } from "../../utils/editable-file-byte-sniff.js";
 import {
+  attachmentDisposition,
   COMMON_RESPONSE_HEADERS,
   dispatchByExtensionOnly,
   extractExtension,
@@ -80,8 +81,7 @@ export async function serveRoomFileGet(
   const contentRange = upstream.headers.get("content-range");
   if (upstream.status === 206 && contentRange) headers["content-range"] = contentRange;
   if (dispatch.disposition === "attachment") {
-    const safe = opened.post.name.replace(/["\\\r\n]/g, "_");
-    headers["content-disposition"] = `attachment; filename="${safe}"`;
+    headers["content-disposition"] = attachmentDisposition(opened.post.name);
   }
   res.set(headers);
   res.status(upstream.status === 206 ? 206 : 200);

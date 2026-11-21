@@ -154,7 +154,11 @@ describe("relay room Leave / Rename routes", () => {
   });
 
   it("files: sends the body's bytes with the name, type and txn id", async () => {
-    files.sendRoomFile.mockResolvedValue({ ok: true, sent: { eventId: "$e", content: { msgtype: "m.file" } } });
+    let streamed = "";
+    files.sendRoomFile.mockImplementation(async (_u: string, _r: string, f: { body: NodeJS.ReadableStream }) => {
+      for await (const c of f.body) streamed += c.toString();
+      return { ok: true, sent: { eventId: "$e", content: { msgtype: "m.file" } } };
+    });
     const res = await fetch(
       `${base}/relay-room/${ROOM}/files?filename=a.txt&type=text%2Fplain&txnId=t1`,
       { method: "POST", headers: { "Content-Type": "application/x-relay-room-file" }, body: "hello" },
@@ -164,8 +168,8 @@ describe("relay room Leave / Rename routes", () => {
     const [userId, roomId, f] = files.sendRoomFile.mock.calls[0];
     expect(userId).toBe("user-1");
     expect(roomId).toBe("!room:hs");
-    expect(f.bytes.toString()).toBe("hello");
-    expect(f).toMatchObject({ filename: "a.txt", contentType: "text/plain", txnId: "t1" });
+    expect(f).toMatchObject({ size: 5, filename: "a.txt", contentType: "text/plain", txnId: "t1" });
+    expect(streamed).toBe("hello");
   });
 
   it("files: a body past the room's limit is 413 and never sent", async () => {

@@ -232,6 +232,17 @@ export function extractExtension(filename: string): string | null {
   return filename.slice(dotIdx + 1).toLowerCase();
 }
 
+/**
+ * `Content-Disposition: attachment` for `filename`: an ASCII-only fallback
+ * name plus the RFC 5987 UTF-8 form, so names in any script (CJK, emoji…)
+ * survive — a raw non-Latin-1 character would make the header invalid.
+ */
+export function attachmentDisposition(filename: string): string {
+  const ascii = filename.replace(/[^\x20-\x7e]|["\\]/g, "_") || "file";
+  const utf8 = encodeURIComponent(filename).replace(/['()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${utf8}`;
+}
+
 export interface SendSftpFileOptions {
   req: Request;
   res: Response;
@@ -293,8 +304,7 @@ export async function sendSftpFile(opts: SendSftpFileOptions): Promise<void> {
   };
   if (attachment) {
     // filename= exposes the basename by design — a save-as dialog needs it.
-    const safeFilename = filename.replace(/["\\\r\n]/g, "_");
-    headers["content-disposition"] = `attachment; filename="${safeFilename}"`;
+    headers["content-disposition"] = attachmentDisposition(filename);
   }
   if (rangeParsed) {
     headers["content-range"] = `bytes ${streamStart}-${streamEnd}/${size}`;

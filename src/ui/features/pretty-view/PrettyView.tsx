@@ -5592,7 +5592,9 @@ export function PrettyView({
               }
               return ret.outcome;
             }}
-            onRetryBatch={() => {
+            // Agent conversations only: a room's error chip is a file that
+            // can't go (too big), not an upload to retry.
+            onRetryBatch={isRelaySource ? undefined : () => {
               void uploads.retryBatch();
             }}
             className="shrink-0"

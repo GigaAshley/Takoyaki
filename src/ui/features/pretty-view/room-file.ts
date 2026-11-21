@@ -19,9 +19,17 @@ export function isRoomFileMsgtype(msgtype: unknown): boolean {
   return typeof msgtype === "string" && MEDIA_MSGTYPES.has(msgtype);
 }
 
+/**
+ * The room and post ids are encoded once more inside the path (some post
+ * ids contain "/", which would otherwise split into extra segments); the
+ * server decodes them back.
+ */
 export function buildRoomFileUrl(roomId: string, eventId: string, name: string): string {
   const safeName = name.replace(/[/\\]/g, "_") || "file";
-  return buildSkynetFileUrl(RELAY_ROOM_FILE_HOST, `/${roomId}/${eventId}/${safeName}`);
+  return buildSkynetFileUrl(
+    RELAY_ROOM_FILE_HOST,
+    `/${encodeURIComponent(roomId)}/${encodeURIComponent(eventId)}/${safeName}`,
+  );
 }
 
 /** The file a room message carries, or null when it isn't a file post. */
@@ -31,10 +39,11 @@ export function roomFileFromContent(
   eventId: string,
 ): RoomFileRef | null {
   if (!isRoomFileMsgtype(content.msgtype)) return null;
-  const name =
-    (typeof content.filename === "string" && content.filename.trim()) ||
-    (typeof content.body === "string" && content.body.trim()) ||
-    "file";
+  const filename = typeof content.filename === "string" ? content.filename.trim() : "";
+  const body = typeof content.body === "string" ? content.body.trim() : "";
+  const name = filename || body || "file";
+  // With a separate file name, the body is the post's own caption.
+  const caption = filename && body && body !== filename ? body : undefined;
   const info = (content.info ?? {}) as Record<string, unknown>;
   const hasUrl = typeof content.url === "string" && content.url.startsWith("mxc://");
   const encrypted = !hasUrl && content.file !== undefined;
@@ -45,6 +54,7 @@ export function roomFileFromContent(
     size: typeof info.size === "number" ? info.size : null,
     mimetype: typeof info.mimetype === "string" ? info.mimetype : null,
     url: hasUrl ? buildRoomFileUrl(roomId, eventId, name) : null,
+    ...(caption ? { caption } : {}),
     ...(hasUrl ? {} : { unavailable: encrypted ? ("encrypted" as const) : ("missing" as const) }),
   };
 }

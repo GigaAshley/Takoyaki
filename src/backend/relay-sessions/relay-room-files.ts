@@ -4,7 +4,7 @@
  * A room's file has an ordinary Skynet file address, under a reserved host
  * segment that no real machine can use as a file URL host:
  *
- *   /file/.relay-room/<roomId>/<eventId>/<filename>
+ *   /file/.relay-room/<roomId>/<eventId>/<filename>   (ids encoded once more)
  *
  * so the chat's file chips, the file window, file panes and download all
  * work on it unchanged. The file routes hand those addresses here.
@@ -18,6 +18,7 @@
  * message as the user — the same message shape agents send.
  */
 
+import { Transform, type Readable } from "node:stream";
 import { databaseLogger } from "../utils/logger.js";
 import {
   getMediaConfigAsUser,
@@ -55,11 +56,19 @@ export interface RoomFileAddress {
   eventId: string;
 }
 
-/** `/<roomId>/<eventId>/<name>` → the room and event; null otherwise. */
+/** `/<roomId>/<eventId>/<name>` (ids encoded) → the room and event; null otherwise. */
 export function parseRoomFilePath(absolutePath: string): RoomFileAddress | null {
   const segs = absolutePath.split("/").filter((s) => s.length > 0);
   if (segs.length < 2) return null;
-  const [roomId, eventId] = segs;
+  // The ids arrive encoded once more than the path (a post id may hold "/").
+  let roomId: string;
+  let eventId: string;
+  try {
+    roomId = decodeURIComponent(segs[0]);
+    eventId = decodeURIComponent(segs[1]);
+  } catch {
+    return null;
+  }
   if (!EVENT_ID_RE.test(eventId)) return null;
   if (!roomId.startsWith("!")) return null;
   return { roomId, eventId };
@@ -226,24 +235,44 @@ export interface SentRoomFile {
   content: Record<string, unknown>;
 }
 
-/** Upload `bytes` and post them into the room, as the user. */
+/** Pass exactly `size` bytes through; anything else is an error (never buffered). */
+export function exactly(size: number): Transform {
+  let seen = 0;
+  return new Transform({
+    transform(chunk: Buffer, _enc, cb) {
+      seen += chunk.byteLength;
+      if (seen > size) cb(new Error("body_longer_than_declared"));
+      else cb(null, chunk);
+    },
+    flush(cb) {
+      cb(seen === size ? null : new Error("body_shorter_than_declared"));
+    },
+  });
+}
+
+/**
+ * Upload a file and post it into the room, as the user. `body` is the
+ * file's bytes, or a stream of exactly `size` bytes passed straight through
+ * to the chat server.
+ */
 export async function sendRoomFile(
   userId: string,
   roomId: string,
-  file: { bytes: Buffer; filename: string; contentType: string; txnId: string },
+  file: { body: Buffer | Readable; size: number; filename: string; contentType: string; txnId: string },
 ): Promise<{ ok: true; sent: SentRoomFile } | RoomFileFailure | { ok: false; errorClass: "invalid_txn_id"; status: 400 }> {
   if (!TXN_ID_RE.test(file.txnId)) return { ok: false, errorClass: "invalid_txn_id", status: 400 };
   const mxid = await resolveRoomCallerMxid(userId, roomId);
   if (mxid === null) return fail("not_found");
   const limit = await getRoomUploadLimit(userId, roomId);
-  if (limit.ok === true && limit.maxUploadBytes !== null && file.bytes.byteLength > limit.maxUploadBytes) {
+  if (limit.ok === true && limit.maxUploadBytes !== null && file.size > limit.maxUploadBytes) {
     return fail("too_large");
   }
   const filename = cleanFileName(file.filename);
   const mime = /^[a-z0-9.+-]+\/[a-z0-9.+-]+$/i.test(file.contentType)
     ? file.contentType.toLowerCase()
     : "application/octet-stream";
-  const up = await uploadMediaAsUser(mxid, file.bytes, filename, mime);
+  const body = Buffer.isBuffer(file.body) ? file.body : file.body.pipe(exactly(file.size));
+  const up = await uploadMediaAsUser(mxid, body, file.size, filename, mime);
   if (up.ok === false) {
     databaseLogger.warn("relay room file upload failed", {
       operation: "relay_room_file_upload_failed",
@@ -259,7 +288,7 @@ export async function sendRoomFile(
     body: filename,
     filename,
     url: up.mxc,
-    info: { mimetype: mime, size: file.bytes.byteLength },
+    info: { mimetype: mime, size: file.size },
   };
   const sent = await sendRoomEventAsUser(mxid, roomId, content, file.txnId);
   if (sent.ok === false) {
@@ -277,7 +306,7 @@ export async function sendRoomFile(
     userId,
     roomId,
     eventId: sent.eventId,
-    size: file.bytes.byteLength,
+    size: file.size,
     msgtype: content.msgtype,
   });
   return { ok: true, sent: { eventId: sent.eventId, content } };
