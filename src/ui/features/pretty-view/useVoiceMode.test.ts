@@ -1807,6 +1807,7 @@ describe("useVoiceMode — interruptions", () => {
     act(() => ctx.onstatechange?.());
     await flush();
     ctx.state = "running";
+    const mic = freshMic();
     const origPush = MockAudioContext.instances.push.bind(MockAudioContext.instances);
     MockAudioContext.instances.push = (c: MockAudioContext) => {
       c.resume = vi.fn(() => new Promise<undefined>(() => {}));
@@ -1820,7 +1821,9 @@ describe("useVoiceMode — interruptions", () => {
       MockAudioContext.instances.push = origPush;
     }
     expect(ctx.close).toHaveBeenCalled();
-    expect(getUserMedia).toHaveBeenCalledTimes(1);
+    // The mic taken first is let go.
+    expect(getUserMedia).toHaveBeenCalledTimes(2);
+    expect(mic.stop).toHaveBeenCalled();
   });
 
   it("a pause the user made before the call does not carry on by itself", async () => {
