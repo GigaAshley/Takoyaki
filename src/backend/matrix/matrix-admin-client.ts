@@ -1226,6 +1226,14 @@ export function __resetUserTokenCacheForTests(): void {
 }
 
 /**
+ * Drop `mxid`'s cached token — for callers outside this module that got a
+ * 401 with it and want ensureUserToken to mint a fresh one.
+ */
+export function evictUserToken(mxid: string): void {
+  userTokenCache.delete(mxid);
+}
+
+/**
  * Get a cached token for `mxid` if it is present AND not yet expired.
  * Returns null on miss or expiry (expired entries are evicted).
  */

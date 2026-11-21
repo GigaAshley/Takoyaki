@@ -30,6 +30,8 @@
  * import + a single call site + the kind marker on the interface change).
  */
 
+import type { RoomFace } from "../../relay-sessions/relay-room-faces.js";
+
 /**
  * Harness-derived session row shape. Mirrors the TmuxSessionRow interface in
  * `sessions.ts` (must stay in sync — the handler passes rows constructed
@@ -63,6 +65,11 @@ export interface RelayRoomSessionRow {
   lastActivityAt: string | null;
   createdAt: string;
   updatedAt: string;
+  /** Stacked faces for the sidebar row: up to two members besides the
+   * viewer, in join order. Absent when the members couldn't be read. */
+  roomFaces?: RoomFace[];
+  /** Members besides the viewer (faces + the "+N"). */
+  roomOthersCount?: number;
 }
 
 /**

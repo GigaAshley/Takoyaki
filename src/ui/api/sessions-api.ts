@@ -47,6 +47,20 @@ export interface RemoteTmuxSession {
   lastActivityAt?: string | null;
   createdAt?: string;
   updatedAt?: string;
+  // Relay-room rows: the stacked faces (up to two members besides the
+  // viewer, in join order) and how many members besides the viewer there
+  // are. Absent when the backend couldn't read the room's members.
+  roomFaces?: RelayRoomFace[];
+  roomOthersCount?: number;
+}
+
+/** One stacked face on a relay-room row (mirrors the backend's RoomFace). */
+export interface RelayRoomFace {
+  mxid: string;
+  kind: "human" | "agent";
+  name: string;
+  userId?: string;
+  avatarPath?: string | null;
 }
 
 /**

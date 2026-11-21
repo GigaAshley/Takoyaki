@@ -57,6 +57,7 @@ import { getIdentityLastSend } from "../../fleet-status/identity-send-log-store.
 // logs a warning and swallows on failure (best-effort merge — better to
 // return harness-only than 500 the entire endpoint).
 import { listActiveRelayRoomSessions } from "../../relay-sessions/relay-room-sessions-store.js";
+import { loadRoomFacesForViewer } from "../../relay-sessions/relay-room-faces.js";
 import {
   mergeRelayRoomsIntoFlat,
   type RelayRoomSessionRow,
@@ -731,15 +732,26 @@ router.get("/list", authenticateJWT, async (req: Request, res: Response) => {
     let relayRows: RelayRoomSessionRow[] = [];
     try {
       const active = await listActiveRelayRoomSessions(userId);
-      relayRows = active.map((r) => ({
-        kind: "relay-room" as const,
-        id: r.id,
-        roomId: r.roomId,
-        roomTitle: r.roomTitle,
-        lastActivityAt: r.lastActivityAt,
-        createdAt: r.createdAt,
-        updatedAt: r.updatedAt,
-      }));
+      // Stacked faces for each room row (best-effort, time-boxed).
+      const facesByRoom = await loadRoomFacesForViewer(
+        userId,
+        active.map((r) => r.roomId),
+      );
+      relayRows = active.map((r) => {
+        const faces = facesByRoom.get(r.roomId);
+        return {
+          kind: "relay-room" as const,
+          id: r.id,
+          roomId: r.roomId,
+          roomTitle: r.roomTitle,
+          lastActivityAt: r.lastActivityAt,
+          createdAt: r.createdAt,
+          updatedAt: r.updatedAt,
+          ...(faces !== undefined
+            ? { roomFaces: faces.faces, roomOthersCount: faces.othersCount }
+            : {}),
+        };
+      });
     } catch (e) {
       databaseLogger.warn(
         "[phase-89] listActiveRelayRoomSessions failed — returning harness rows only (best-effort merge)",

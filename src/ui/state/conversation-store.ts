@@ -51,6 +51,7 @@ import { useSyncExternalStore } from "react";
 import type { Host, HostFolder, Tab, TabType } from "@/types/ui-types";
 import { setIdentityPinned } from "@/api/user-preferences-api";
 import type { Identity } from "@/api/identities-api";
+import type { RelayRoomFace } from "@/api/sessions-api";
 import { sessionMatchKey } from "@/features/terminal/session-hue";
 import {
   readUserScopedCache,
@@ -173,6 +174,9 @@ export type ConversationRow = {
   kind?: "harness" | "relay-room";
   roomId?: string;
   roomTitle?: string | null;
+  // Relay-room rows: stacked faces + members besides the viewer (the "+N").
+  roomFaces?: RelayRoomFace[];
+  roomOthersCount?: number;
   // Sidebar unread mark: the agent finished a turn this user hasn't seen
   // (attention-store). Set on agent rows at snapshot time; absent otherwise.
   unread?: boolean;
@@ -303,6 +307,8 @@ export type FleetSession = {
   lastActivityAt?: string | null;
   createdAt?: string;
   updatedAt?: string;
+  roomFaces?: RelayRoomFace[];
+  roomOthersCount?: number;
 };
 
 type SnapshotForTest = ConversationList & {
@@ -694,6 +700,20 @@ function resolveLastMessageAt(
   return getSessionLastMessageAt(key);
 }
 
+/** The stacked-faces fields a relay-room row copies from its fleet session. */
+function relayRoomFacesFields(
+  session: FleetSession | undefined,
+): Pick<ConversationRow, "roomFaces" | "roomOthersCount"> {
+  if (!session || !Array.isArray(session.roomFaces)) return {};
+  return {
+    roomFaces: session.roomFaces,
+    roomOthersCount:
+      typeof session.roomOthersCount === "number"
+        ? session.roomOthersCount
+        : session.roomFaces.length,
+  };
+}
+
 function rowFromTab(tab: Tab, sessionRoleByKey: Map<string, string | null>): ConversationRow {
   // Phase 91 UAT fix 2026-09-09 (user): relay-room tabs have no host and
   // no tmux session — carry their kind + roomId + roomTitle onto the row so
@@ -727,6 +747,7 @@ function rowFromTab(tab: Tab, sessionRoleByKey: Map<string, string | null>): Con
       kind: "relay-room",
       roomId: tab.relayRoomId,
       roomTitle: tab.relayRoomTitle ?? null,
+      ...relayRoomFacesFields(matchingSession),
       ...(fleetLastActivityAt !== undefined && fleetLastActivityAt !== null
         ? { lastMessageAt: new Date(fleetLastActivityAt).getTime() }
         : injectedLastMessageAt !== null
@@ -1108,6 +1129,7 @@ function computeSnapshot(): ConversationList {
         kind: "relay-room",
         roomId: session.roomId,
         roomTitle: session.roomTitle ?? null,
+        ...relayRoomFacesFields(session),
         ...(session.lastActivityAt !== undefined && session.lastActivityAt !== null
           ? { lastMessageAt: new Date(session.lastActivityAt).getTime() }
           : { lastMessageAt: null }),
@@ -1943,6 +1965,46 @@ export function removeFleetSession(hostId: number, sessionName: string): void {
   } catch {
     // Silent — cache-write failure is non-fatal; next getSessionList() fetch
     // on the next page load will re-persist the fresh (post-kill) snapshot.
+  }
+}
+
+/**
+ * A relay room the user just left: drop its fleet session (and its cached
+ * copy) at once, so the row leaves the sidebar without waiting for the next
+ * /sessions/list. No-op when the room isn't there.
+ */
+export function removeRelayRoomSession(roomId: string): void {
+  const next = state.fleetSessions.filter(
+    (s) => !(s.kind === "relay-room" && s.roomId === roomId),
+  );
+  if (next.length === state.fleetSessions.length) return;
+  state = { ...state, fleetSessions: next };
+  notify();
+  try {
+    writeFleetSessionsCache(next);
+  } catch {
+    // Silent — same policy as removeFleetSession.
+  }
+}
+
+/**
+ * A relay room the user just renamed: show the new name on its row (and,
+ * via the relay-room title sync in AppShell, on its open panes) at once.
+ */
+export function setRelayRoomTitle(roomId: string, title: string): void {
+  let changed = false;
+  const next = state.fleetSessions.map((s) => {
+    if (s.kind !== "relay-room" || s.roomId !== roomId || s.roomTitle === title) return s;
+    changed = true;
+    return { ...s, roomTitle: title };
+  });
+  if (!changed) return;
+  state = { ...state, fleetSessions: next };
+  notify();
+  try {
+    writeFleetSessionsCache(next);
+  } catch {
+    // Silent — same policy as removeFleetSession.
   }
 }
 

@@ -117,6 +117,8 @@ import { useTrappedWork } from "@/state/trapped-work-store";
 import { cn } from "@/lib/utils";
 import { armOutboundDrag, mintDragId } from "@/shell/cross-window-drag";
 import { promptAndRenameIdentity } from "@/shell/rename-identity";
+import { confirmAndLeaveRelayRoom, promptAndRenameRelayRoom } from "./relay-room-row-actions";
+import { RelayRoomFaces } from "./RelayRoomFaces";
 import type { ConversationRow as ConversationRowShape } from "@/state/conversation-store";
 import { specForTab, encodeWorkspaceSpec } from "@/lib/tab-url";
 import {
@@ -566,6 +568,16 @@ function PrettyConversationRowImpl({
         testId: "pv-row-kebab-item-rename",
       });
     }
+    // Relay rooms: Rename… sets the room's real name for every member.
+    const relayRoomId = row.kind === "relay-room" ? row.roomId : undefined;
+    const relayRoomTitle = row.roomTitle || row.label;
+    if (relayRoomId) {
+      items.push({
+        label: "Rename…",
+        onClick: () => promptAndRenameRelayRoom({ roomId: relayRoomId, currentTitle: relayRoomTitle }),
+        testId: "pv-row-kebab-item-rename-room",
+      });
+    }
     // Move to — drill-in submenu. Pinned and every project are destinations
     // of the same kind: a row is in at most one of them (pinned and in-a-
     // project are mutually exclusive), so they share one list with a
@@ -648,6 +660,15 @@ function PrettyConversationRowImpl({
         testId: "pv-row-kebab-item-kill",
       });
     }
+    // Leave — relay rooms: the user really leaves the room (after a confirm).
+    if (relayRoomId) {
+      items.push({
+        label: "Leave",
+        onClick: () => confirmAndLeaveRelayRoom({ roomId: relayRoomId, title: relayRoomTitle }),
+        danger: true,
+        testId: "pv-row-kebab-item-leave-room",
+      });
+    }
     // Archive — gated on `onArchive` being provided. The panel
     // provides it only for fleet-synthetic identity-backed rows.
     if (onArchive) {
@@ -723,7 +744,13 @@ function PrettyConversationRowImpl({
             Phase 104 Plan 03: `.pv-avatar` now hosts ONLY the trapped-work
             indicator (Plan 02). The prior Pin + Monitor bounty-count badges
             were retired alongside the bounty-count wire in this plan. */}
-        <div className="pv-avatar" data-testid="pcrow-avatar">
+        <div
+          className={cn(
+            "pv-avatar",
+            !identity && row.kind === "relay-room" && (row.roomFaces?.length ?? 0) > 1 && "pv-avatar--faces",
+          )}
+          data-testid="pcrow-avatar"
+        >
           {identity ? (
             // Phase 66 Plan 05: hostId threading — Plan 03's GET /:id/avatar
             // requires hostId query param. `rowHostIdNum` above is
@@ -744,6 +771,9 @@ function PrettyConversationRowImpl({
               style={{ width: "100%", height: "100%", objectFit: "cover", borderRadius: "999px" }}
               initialClassName="pv-avatar-initial"
             />
+          ) : row.kind === "relay-room" && row.roomFaces && row.roomFaces.length > 0 ? (
+            // Relay rooms: the other members' faces, stacked, with "+N".
+            <RelayRoomFaces faces={row.roomFaces} othersCount={row.roomOthersCount ?? row.roomFaces.length} />
           ) : (
             <span className="pv-avatar-fallback-icon" aria-hidden="true">
               {tabIcon(row.type)}

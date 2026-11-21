@@ -101,6 +101,11 @@ vi.mock("../../relay-sessions/relay-room-sessions-store.js", () => ({
 // We return two candidate hosts with autoTmux: true.
 // ---------------------------------------------------------------------------
 
+// Stacked faces for relay rows — none here, so relay rows carry no faces.
+vi.mock("../../relay-sessions/relay-room-faces.js", () => ({
+  loadRoomFacesForViewer: vi.fn(async () => new Map()),
+}));
+
 vi.mock("../db/index.js", () => ({
   db: {
     select: vi.fn().mockReturnThis(),

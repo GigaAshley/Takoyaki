@@ -99,6 +99,10 @@ import {
   type ArchivedTabLiveDetail,
 } from "@/features/archived-view/archived-identity";
 import {
+  RELAY_ROOM_LEFT_EVENT,
+  type RelayRoomLeftDetail,
+} from "@/features/pretty-conversations/relay-room-row-actions";
+import {
   updateHostTree,
   updateOpenTabs,
   updateFleetSessions,
@@ -3213,6 +3217,24 @@ export function AppShell({
     };
     window.addEventListener(AGENT_ARCHIVED_EVENT, onArchived);
     return () => window.removeEventListener(AGENT_ARCHIVED_EVENT, onArchived);
+  }, []);
+
+  // Leaving a relay room closes every open pane of it in this window.
+  useEffect(() => {
+    const onLeft = (e: Event) => {
+      const { roomId } = (e as CustomEvent<RelayRoomLeftDetail>).detail;
+      for (const t of tabsRef.current) {
+        if (t.sessionKind !== "relay-room" || t.relayRoomId !== roomId) continue;
+        systemLogger.info(`[relay-room] closing pane of left room tabId=${t.id}`, {
+          operation: "relay_room_left_pane_closed",
+          tabId: t.id,
+          roomId,
+        });
+        doCloseTabRef.current(t.id);
+      }
+    };
+    window.addEventListener(RELAY_ROOM_LEFT_EVENT, onLeft);
+    return () => window.removeEventListener(RELAY_ROOM_LEFT_EVENT, onLeft);
   }, []);
   useEffect(() => {
     const unsub = subscribeToDragAccepts((tabId) => {

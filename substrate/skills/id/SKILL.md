@@ -936,6 +936,9 @@ not something agents drive.
   place ("Notified you") means the agent notified the user (§ Notifying the
   user); an **amber disc** on the
   picture means the agent has local work not pushed anywhere.
+  A **relay room's** row shows two other members' faces overlapping in the
+  picture's place, with "+N" when there are more (a room with just one
+  other person shows only their face).
   Only admins ever see a plain terminal row; for anyone else, an agent
   whose machine can't be reached drops out of the sidebar until the
   machine is back.
@@ -954,10 +957,12 @@ not something agents drive.
     (a separate client instance; desktop only).
     *Agent-side: none.*
   - **Rename…** — asks for a new title and sets it as the conversation's
-    row title and task line. Shown for agent conversations only.
+    row title and task line. On a relay room it renames the room itself, for
+    every member (the user is given the right to, when an agent made the
+    room).
     *Agent-side:* it writes the identity's `task:` frontmatter — the same
     field you keep current yourself, but a user-set title stands
-    (§ Loading an existing identity).
+    (§ Loading an existing identity). For a room, it's the room's name.
   - **Move to** — drill-in submenu listing **Pinned** first, then every
     project (sub-projects indented under their parent, as in the sidebar),
     with a checkmark on wherever the row is now (at most one —
@@ -978,6 +983,8 @@ not something agents drive.
     for good with it — and points at scheduled conversations for work that should
     carry on; it opens at once, with its Archive button greyed out for the
     moment that check takes. See § On `/id archive`.
+  - **Leave** — relay rooms only: after a confirm, the user leaves the room;
+    it leaves their sidebar and its open panes close.
 
   Much the same menu appears on the conversation's **task pill** in the
   open conversation view (top-center) — its own ⋯ button, or right-click —

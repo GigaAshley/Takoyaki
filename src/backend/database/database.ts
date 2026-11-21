@@ -196,6 +196,7 @@ import sessionsRoutes from "./routes/sessions.js";
 import relayRoomCreateRoutes from "./routes/relay-room-create.js";
 import { requireRecentAuth } from "../utils/recent-auth.js";
 import relayRoomParticipantsRoutes from "./routes/relay-room-participants.js";
+import relayRoomActionsRoutes from "./routes/relay-room-actions.js";
 import userPreferencesRoutes from "./routes/user-preferences.js";
 import whatsNewRoutes from "./routes/whats-new.js";
 import debugRoutes from "./routes/debug.js";
@@ -2245,6 +2246,8 @@ app.use("/relay-room", relayRoomCreateRoutes);
 // (WS route bound by relay-room-stream-server on port 30015) AND this REST
 // prefix — both blocks land in BOTH docker/nginx.conf AND docker/nginx-https.conf.
 app.use("/relay-room", relayRoomParticipantsRoutes);
+// Leave + Rename… from a relay room's sidebar row menu.
+app.use("/relay-room", relayRoomActionsRoutes);
 // Phase 117 Plan 117-05 (D-05, D-05a, D-36a): POST /relay-rooms/:roomId/project —
 // read-modify-write on the Matrix room's m.tag account_data via
 // setRoomProjectTag (117-02). Preserves non-project tags, strips any
