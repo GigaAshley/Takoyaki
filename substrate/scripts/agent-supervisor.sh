@@ -1,0 +1,5303 @@
+#!/bin/bash
+# agent-supervisor.sh — keep this box's /id-running Claude Code sessions alive + relay-reachable.
+#
+# One lean, idempotent supervisor. Each targeted identity gets a tmux session (named after the
+# identity, spaces slugified to hyphens) running `claude` + `/id <name>`. Covers boot + crash +
+# sleep recovery: a session that vanished (reboot/crash) or whose claude died is (re)launched;
+# a live one is left alone. On bring-up, launches are STAGGERED (one at a time) so a box with many
+# identities never forks N sessions at once.
+#
+# Canonical copy lives in the app's source repo at substrate/scripts/agent-supervisor.sh and is
+# distributed to every managed host (including the app's own host) by the fleet
+# substrate distributor (see src/backend/distributor/catalog.ts). Installed per-box at
+# ~/.local/bin/agent-supervisor and run as a systemd --user service. Config:
+# ~/.claude/agent-supervisor.conf (a sourced bash file). Do NOT hand-edit the installed copy
+# — edits are made in the repo and land on all boxes via the next distributor sweep.
+#
+# Usage:
+#   agent-supervisor.sh            # loop forever, reconcile every CHECK_INTERVAL sec (systemd ExecStart)
+#   agent-supervisor.sh --once     # one reconcile pass, then exit
+#   DRY_RUN=1 agent-supervisor.sh --once   # report what it WOULD do, touch nothing
+#
+# Config file (~/.claude/agent-supervisor.conf), sourced as bash (all keys optional):
+#   # CHECK_INTERVAL=30            # seconds between reconcile passes in loop mode
+#   # STAGGER_SECONDS=8            # extra gap between launches during a bring-up
+#   # CLAUDE_MODEL="opus"          # value for claude's --model flag; empty string omits the flag entirely
+#   # DORMANCY="off"               # dormancy is ON by default; this is the per-box escape hatch
+#   # IDLE_THRESHOLD_MINUTES=30    # idle minutes before an identity is swept dormant
+#
+# Identity list is derived from disk on every reconcile — every subfolder of
+# $IDENTITIES_DIR (~/fleet/identities by default) whose <name>/<name>.md file
+# exists is supervised. No config-array to maintain. (The legacy MODE=A branch
+# that supervised a static IDENTITIES=(...) array was retired 2026-09-11 —
+# early-testing scaffolding, unused fleet-wide since 2026-08-06.)
+set -uo pipefail
+
+CONF="${AGENT_SUPERVISOR_CONF:-$HOME/.claude/agent-supervisor.conf}"
+IDENTITIES_DIR="${AGENT_IDENTITIES_DIR:-$HOME/fleet/identities}"
+# Sibling of IDENTITIES_DIR per D-02; kept as a separate variable so retire_identity does not
+# derive the archive path from IDENTITIES_DIR + '/archive' (which would resolve to
+# `~/fleet/identities/archive/` — wrong tree).
+IDENTITIES_ARCHIVE_DIR="${AGENT_IDENTITIES_ARCHIVE_DIR:-$HOME/fleet/identities-archive}"
+# Phase 133 D-16 + D-18: role folder + role-archive sibling. Roles are per-box
+# (id-skill invariant), so the archival gesture is scoped to this box's disk.
+# Env-overridable for test hermeticity (same discipline as AGENT_IDENTITIES_DIR /
+# AGENT_IDENTITIES_ARCHIVE_DIR — see substrate/scripts/tests/*.test.sh for
+# scratch-dir setup patterns).
+ROLES_DIR="${AGENT_ROLES_DIR:-$HOME/fleet/roles}"
+ROLES_ARCHIVE_DIR="${AGENT_ROLES_ARCHIVE_DIR:-$HOME/fleet/roles-archive}"
+# app-archive shape: apps live per-host at ~/fleet/apps/<slug>/ with an
+# adjacent archive sibling at ~/fleet/apps-archive/. Env-overridable for
+# test hermeticity (same discipline as AGENT_IDENTITIES_DIR / AGENT_ROLES_DIR).
+APPS_DIR="${AGENT_APPS_DIR:-$HOME/fleet/apps}"
+APPS_ARCHIVE_DIR="${AGENT_APPS_ARCHIVE_DIR:-$HOME/fleet/apps-archive}"
+# app-archive shape: absolute path to the archive-app.sh script distributed
+# to every managed host by the fleet substrate distributor. Env-overridable
+# for test hermeticity (tests stub the script).
+APP_ARCHIVE_SCRIPT="${AGENT_APP_ARCHIVE_SCRIPT:-$HOME/.claude/skills/app-development/archive-app.sh}"
+# convo-scoped apps: app-units.sh owns how an app is run under systemd (install /
+# uninstall / stash / restore). Used to stop + stash a conversation's apps when the
+# identity retires, restore them when it is un-archived, and restore current-style
+# (socket + relay + marker) sidebar apps on un-archive.
+APP_UNITS_SCRIPT="${AGENT_APP_UNITS_SCRIPT:-$HOME/.claude/skills/app-development/app-units.sh}"
+# project-scoped apps: move-app.sh carries out "Move to" (sidebar ↔ project, out of a
+# conversation) when the app drops .move-requested into the app's folder.
+APP_MOVE_SCRIPT="${AGENT_APP_MOVE_SCRIPT:-$HOME/.claude/skills/app-development/move-app.sh}"
+# un-archive host-side shape: systemctl binary + user-systemd unit dir + the
+# lock file shared with create-app.sh so port-collision checks are safe
+# against concurrent creates. Used by scan_app_unarchive_requested_sentinels
+# only; env-overridable for test hermeticity (tests stub the binary + unit
+# dir; the lock file can point at a scratch path).
+SYSTEMCTL_BIN="${AGENT_SYSTEMCTL_BIN:-systemctl}"
+SYSTEMD_UNIT_DIR="${AGENT_SYSTEMD_UNIT_DIR:-$HOME/.config/systemd/user}"
+APP_CREATE_LOCK="${AGENT_APP_CREATE_LOCK:-$HOME/fleet/.create-lock}"
+SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*"; }
+
+# Per-tick snapshot of all tmux session names, populated once by snapshot_sessions() at the top of
+# reconcile() and consumed by match_session() as an in-memory lookup. Replaces 88× per-tick
+# `tmux ls` invocations with a single call. Keys are lowercased session names; values are the
+# real (case-preserved) session names — match_session's case-insensitive lookup needs that map.
+declare -A SESSIONS_SNAPSHOT=()
+
+# Per-tick snapshot of "does this session have a claude/node process on any of its pane ttys?",
+# populated once by snapshot_claude_running() at the top of reconcile(). Consumed via
+# claude_running_cached() in the reconcile alive-check hot path (one lookup per identity instead
+# of a tmux+ps roundtrip per identity). The FRESH probe claude_running() is retained unchanged
+# for the double-probe re-check and the drive()/wait_for_claude() polling loop — those callers
+# need real-time state, not a snapshot taken up to a tick ago.
+declare -A CLAUDE_RUNNING_SNAPSHOT=()
+
+# Per-tick snapshot of each session's foreground pane command (e.g. "bash", "dash", "claude"),
+# filled by the same tmux list-panes call as CLAUDE_RUNNING_SNAPSHOT. The dormant branch reads it
+# to spot a dormant session still running a full shell, without a tmux call per identity.
+declare -A PANE_CMD_SNAPSHOT=()
+# Same call: each session's pane tty without /dev/ (e.g. "pts/5"). Ties a session to the claude
+# process on that tty for the background-work reminders.
+declare -A PANE_TTY_SNAPSHOT=()
+
+# The shell a dormant identity's tmux session runs. A dormant session only has to exist (the app
+# looks for it, and a wake types the launch command into it), so it runs the smallest shell on the
+# box: an idle dash costs ~0.1 MB of private memory against ~1.9 MB for an interactive bash. Empty
+# when dash isn't installed — dormant sessions then keep whatever shell they have.
+DORMANT_SHELL="$(command -v dash 2>/dev/null || true)"
+
+# Per-tick snapshot of schedule_peek results across all identities, populated by
+# snapshot_schedule_peek() at the top of reconcile() via ONE python subprocess (vs. one fork
+# per identity). Keys are identity names; values are non-empty (a "due" detail string) IFF the
+# identity has a wakeup spec firing within FALSE_KILL_MINUTES. schedule_peek() reads this map.
+declare -A SCHEDULE_PEEK_SNAPSHOT=()
+
+# Per-tick snapshot of matrix_peek results across all dormant identities. Populated by
+# snapshot_matrix_peek() at the top of reconcile() via xargs -P 20 parallel matrix_peek calls.
+# Serial baseline for 80 dormant identities is ~4.75s wall (60ms/curl × 80); parallel drops it
+# to ~0.5s. Zero rate-limit hits observed on this fleet's Synapse at either -P 20 or -P 80;
+# -P 20 is the empirical sweet spot (marginally faster than -P 80 and lighter on the homeserver).
+declare -A MATRIX_PEEK_SNAPSHOT=()
+
+# ---- config ----
+# IDENTITIES is derived from disk in resolve_identities() on every reconcile;
+# initialized empty here.
+IDENTITIES=()
+CHECK_INTERVAL=15
+STAGGER_SECONDS=8
+MEMORY_CAP="disabled"    # 2026-08-08 fleet policy (caught by two operators): cap mechanism was unsafe
+                         # at scale (below WSS = thrash; cgroup child-inheritance broke a second instance's
+                         # builds). Session-dormancy replaces it for idle reclamation (bounty
+                         # session-dormancy-pilot). "auto" is still a VALID value below for
+                         # anyone who wants the historic zram-detect behavior; it's just no longer
+                         # the DEFAULT — a stale conf without an explicit MEMORY_CAP now inherits
+                         # "disabled", not the old 80M trap. Per-box overrides: MEMORY_CAP="auto"
+                         # (historic zram-detect), MEMORY_CAP="150M" (explicit), etc.
+CLAUDE_MODEL="opus"      # Model passed as `--model <value>` to every claude launch. Per-box override
+                         # in $CONF: CLAUDE_MODEL="sonnet" (or any alias/full id the installed Claude
+                         # Code accepts), or CLAUDE_MODEL="" to omit the flag entirely and inherit
+                         # whatever the harness's own default is.
+[ -f "$CONF" ] && . "$CONF"
+
+# ---- dormancy (2026-08-07) — ON fleet-wide by default since 2026-09-14.
+# It was opt-in through its pilot (bounty session-dormancy-pilot); the pilot is over and
+# idle reclamation is the fleet's answer to memory pressure now that MEMORY_CAP is disabled, so a
+# box with no DORMANCY line should GET dormancy rather than silently run every identity forever.
+# The knob survives as an escape hatch — per-box $CONF: DORMANCY="off". Per-identity opt-out is
+# the .no-dormancy sentinel (user-initiated only), which is unaffected by this default.
+DORMANCY="${DORMANCY:-on}"
+IDLE_THRESHOLD_MINUTES="${IDLE_THRESHOLD_MINUTES:-30}"     # pilot 10; prod default 30 (user 2026-08-08: idle-check triple-guard is conservative enough that 30 is safe)
+FALSE_KILL_MINUTES="${FALSE_KILL_MINUTES:-5}"              # wake within this many min of kill = flagged
+DORMANCY_STATE_DIR="${DORMANCY_STATE_DIR:-$HOME/.claude/agent-supervisor-state}"
+METRICS_LOG="${METRICS_LOG:-$HOME/.claude/agent-supervisor-metrics.jsonl}"
+MEM_SAMPLES_LOG="${MEM_SAMPLES_LOG:-$HOME/.claude/agent-supervisor-mem-samples.jsonl}"
+METRICS_MAX_BYTES="${METRICS_MAX_BYTES:-52428800}"          # rotate METRICS_LOG / MEM_SAMPLES_LOG past this size (50 MB), keeping one .1
+
+# ---- archive scan (Phase 94) — daily sweep for 180-day dormant identities ----
+# Threshold is uniform per D-08; NOT a conf variable (locked no-knob per shape).
+ARCHIVE_THRESHOLD_DAYS=180
+# shellcheck disable=SC2034  # used by Wave 3 run_archive_scan (94-03-PLAN.md)
+ARCHIVE_THRESHOLD_SECONDS=$((ARCHIVE_THRESHOLD_DAYS * 24 * 60 * 60))
+# shellcheck disable=SC2034  # used by Wave 3 run_archive_scan_if_due (94-03-PLAN.md)
+ARCHIVE_SCAN_MARKER="${DORMANCY_STATE_DIR}/archive-scan-last-ran"
+# shellcheck disable=SC2034  # used by Wave 3 run_archive_scan_if_due (94-03-PLAN.md)
+ARCHIVE_SCAN_INTERVAL=$((24 * 60 * 60))    # 86400s — D-01 daily cadence
+
+# ---- resolve the claude binary (a --user service may lack ~/.local/bin on PATH) ----
+CLAUDE="${AGENT_SUPERVISOR_CLAUDE:-}"   # explicit override (non-standard install paths; also testable)
+if [ -z "$CLAUDE" ]; then
+  for c in "$HOME/.local/bin/claude" /usr/local/bin/claude /usr/bin/claude; do
+    [ -x "$c" ] && { CLAUDE="$c"; break; }
+  done
+  [ -z "$CLAUDE" ] && CLAUDE="$(command -v claude 2>/dev/null || true)"
+fi
+if [ -z "$CLAUDE" ]; then log "claude binary not found — cannot supervise"; exit 1; fi
+
+# ---- tmux is mandatory: sessions ARE tmux sessions. Fail LOUD if it's missing (otherwise the
+#      launch silently no-ops — `tmux: command not found` — and nothing ever comes up). ----
+if ! command -v tmux >/dev/null 2>&1; then
+  log "tmux not found on PATH — cannot supervise. Install it (Debian/Ubuntu: sudo apt install -y tmux; Fedora/atomic: rpm-ostree install tmux or a distrobox)."
+  exit 1
+fi
+# ⚠️ Every tmux call below is wrapped in `timeout -k 5 10 tmux …`. The reconcile loop is
+# sequential per identity; a single stuck tmux child (server unresponsive to a specific pane,
+# copy-mode, wedged buffer) would hang the entire loop indefinitely. Caught 2026-08-10: one agent's
+# supervisor stuck 20h on a hanging `tmux send-keys deco cd`, blocking every identity's
+# matrix_peek/schedule_peek so no dormant agent could wake. 10s bounded, SIGKILL 5s after.
+
+# ---- fleet baseline: ensure Agent Teams (resumable sub-agents) is on for every future session ----
+# CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 must be set user-wide so sub-agents are resumable everywhere.
+# We assert it in ~/.claude/settings.json (read at each claude launch). Idempotent + best-effort:
+# a safe merge that preserves every existing key, and never fails the supervisor. Runs once at start;
+# a session already running won't pick it up until relaunched, but every new session will.
+ensure_agent_teams_env() {
+  command -v node >/dev/null 2>&1 || return 0
+  node -e '
+    const fs=require("fs"),os=require("os"),p=require("path");
+    const f=p.join(os.homedir(),".claude","settings.json");
+    try{ fs.mkdirSync(p.dirname(f),{recursive:true}); }catch(e){ process.exit(0); }
+    let d={}; try{ d=JSON.parse(fs.readFileSync(f,"utf8")); }catch(e){}
+    if(typeof d!=="object"||!d||Array.isArray(d)) d={};
+    d.env=(d.env&&typeof d.env==="object")?d.env:{};
+    if(d.env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS==="1"){ console.log("noop"); process.exit(0); }
+    d.env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS="1";
+    try{ fs.writeFileSync(f,JSON.stringify(d,null,2)+"\n"); console.log("set"); }catch(e){ console.log("skip"); }
+  ' 2>/dev/null | grep -q '^set$' && log "ensured CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 in settings.json (new sessions will pick it up)"
+  return 0
+}
+
+# ---- fleet baseline: ensure inotifywait is present for file-watch ----
+# file-watch shells out to inotifywait; without it, every identity on the box falls back to a
+# 2s mtime poll (works, but 2s-granular and misses same-second edits). Best-effort + idempotent in
+# the shape of ensure_agent_teams_env: never fails the supervisor, silent no-op once present.
+# Requires non-interactive root — a --user service has no TTY, so a sudo that would prompt is
+# treated as "can't" and skipped rather than left to hang. Boxes that can't install keep the
+# documented polling fallback (e.g. Bazzite, where the harness user's sudo is command-scoped).
+ensure_inotifywait() {
+  command -v inotifywait >/dev/null 2>&1 && return 0
+
+  local SUDO=""
+  if [ "$(id -u)" != 0 ]; then
+    sudo -n true 2>/dev/null || {
+      log "inotifywait missing and no non-interactive root — file-watch will use 2s polling"
+      return 0
+    }
+    SUDO="sudo -n"
+  fi
+
+  if command -v apt-get >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y inotify-tools >/dev/null 2>&1
+  elif command -v dnf >/dev/null 2>&1; then
+    $SUDO dnf install -y inotify-tools >/dev/null 2>&1
+  else
+    log "inotifywait missing and no known package manager — file-watch will use 2s polling"
+    return 0
+  fi
+
+  if command -v inotifywait >/dev/null 2>&1; then
+    log "installed inotify-tools — file-watch now event-driven"
+  else
+    log "inotify-tools install did not take — file-watch will use 2s polling"
+  fi
+  return 0
+}
+
+# ---- source-of-truth prompt skipping ----
+# Modern Claude Code fires two blocking prompts on the resume path that the scrape loop in drive()
+# has to answer by hand:
+#   (1) folder-trust ("Is this a project you created or one you trust?") — regression vs a fresh
+#       launch, where --dangerously-skip-permissions covers it. Answered at source via the
+#       per-workdir .projects[<cwd>].hasTrustDialogAccepted flag in ~/.claude.json.
+#   (2) resume-summary ("Resuming the full session will consume …") — fires when session age >
+#       CLAUDE_CODE_RESUME_THRESHOLD_MINUTES (default 70) or token-count > CLAUDE_CODE_RESUME_TOKEN_THRESHOLD
+#       (default 100000). Answered at source via the two env vars below.
+#   (3) cold-resume usage limit ("this will use N% of your usage limit", 2.1.304+) — not gated by
+#       those env vars. Answered at source via the top-level resumeReturnDismissed flag in
+#       ~/.claude.json (dismiss_resume_return_dialog(), which also covers (2)).
+# Compaction is NOT configured here: the fleet settings.json written by the distributor
+# (run-bootstrap.ts SETTINGS_MERGE_JQ) is the one place — idle compaction off, near-limit
+# compaction at 95% of the 1M window.
+# Scrape kept as defense-in-depth for (1) and (2): if a future release changes env-var names or
+# the config key, the scrape still catches the prompt.
+CLAUDE_LAUNCH_ENV="CLAUDE_CODE_RESUME_THRESHOLD_MINUTES=99999999 CLAUDE_CODE_RESUME_TOKEN_THRESHOLD=99999999"
+
+# Flags passed to every `claude` launch. Consolidated so all 4 launch sites (redrive+drive × resume+fresh)
+# stay in sync — an inline-per-site spelling means a flag can silently fall off some but not others
+# (2026-09-04, user: fleet came back on Sonnet by default after supervisor relaunches because --model opus
+# was never wired in). Adding a flag = one edit here, applies everywhere.
+#
+# The model flag is conditional on $CLAUDE_MODEL (see § config) so a box can pin a different model or
+# opt out of pinning altogether — an empty value omits `--model` and lets the harness pick its own default.
+CLAUDE_LAUNCH_FLAGS="${CLAUDE_MODEL:+--model $CLAUDE_MODEL }--dangerously-skip-permissions"
+# Silent when sourced as a library: this is a module-scope log, so under LIB_ONLY it lands inside
+# the test driver's $(...) captures and corrupts every asserted value.
+[ "${AGENT_SUPERVISOR_LIB_ONLY:-0}" = 1 ] || \
+  log "claude-model: $([ -n "$CLAUDE_MODEL" ] && echo "pinned to '$CLAUDE_MODEL'" || echo "unpinned (CLAUDE_MODEL empty) — harness default applies")"
+
+# ---- desktop MCP: one host-wide desktop server shared by every supervised session ----
+# desktop-mcp (substrate/scripts/desktop-mcp.py, run by desktop-mcp.service as `desktop-mcp serve`)
+# gives each agent screenshot/click/type/key + browser tools against its own X display (allocated
+# and started lazily by agent-desktop). It speaks MCP over HTTP on 127.0.0.1, so a session that
+# never touches the desktop costs nothing — a stdio server was a process per session, used or not.
+# Same shape as relay MCP below: one shared config whose headers are the literals ${FLEET_IDENTITY}
+# and ${DESKTOP_MCP_SECRET} (claude expands them from the launch env; the secret comes from
+# `desktop-mcp secret <name>`), health-checked and started if needed before each launch, because a
+# session that finds the server down at launch never retries.
+#
+# X-Fleet-Path carries the session's own ${PATH}, so apps the agent starts with the launch tool
+# find the same programs its shell does (as when each session ran its own server).
+#
+# The config also sets a per-server `timeout`: claude gives up on an HTTP MCP call after 60s by
+# default (a stdio call has no such limit), and a first browser call — desktop start, browser
+# server start, maybe a Chromium install — can take longer. Every call is bounded server-side.
+#
+# ⚠️ Computed JUST-IN-TIME at each launch call-site (via compute_mcp_flags below), NOT cached at
+# supervisor startup. Startup-caching had a distributor race: if the supervisor restarted a beat
+# before `desktop-mcp` was written to disk, the flag was permanently absent from launches for that
+# supervisor's whole lifetime. Just-in-time means every launch reflects live filesystem state —
+# self-healing in both directions (binary appears → next launch picks it up; binary removed → next
+# launch drops it).
+DESKTOP_MCP_BIN="$HOME/.local/bin/desktop-mcp"
+# The wake-up scheduler; snapshot_schedule_peek loads its schedule engine.
+WAKEUP_SCHEDULER_BIN="${AGENT_SUPERVISOR_WAKEUP_SCHEDULER:-$HOME/.local/bin/wakeup-scheduler}"
+DESKTOP_MCP_CONFIG="$HOME/.claude/desktop-mcp.json"
+DESKTOP_MCP_PORT="${DESKTOP_MCP_PORT:-7794}"
+DESKTOP_MCP_UNIT="desktop-mcp.service"
+DESKTOP_MCP_WAIT_SEC="${DESKTOP_MCP_WAIT_SEC:-5}"
+DESKTOP_MCP_CALL_TIMEOUT_MS=1800000
+CURL_BIN="${AGENT_CURL_BIN:-curl}"
+
+# write_mcp_config <path> <json> — rewrite only on change, atomically: a launch reading the shared
+# file mid-rewrite must never see it half-written.
+write_mcp_config() {
+  local path="$1" want="$2"
+  [ "$(cat "$path" 2>/dev/null)" = "$want" ] && return 0
+  mkdir -p "$(dirname "$path")" \
+    && printf '%s\n' "$want" > "$path.tmp.$$" \
+    && mv -f "$path.tmp.$$" "$path" || { rm -f "$path.tmp.$$"; return 1; }
+  [ "${AGENT_SUPERVISOR_LIB_ONLY:-0}" = 1 ] || log "mcp: wrote $path"
+  return 0
+}
+mcp_server_healthy() {
+  "$CURL_BIN" -sf -m 1 "http://127.0.0.1:$1/health" >/dev/null 2>&1
+}
+# ensure_mcp_server_up <label> <port> <unit> <wait-sec> <what-the-launch-loses> — 0 once the server
+# answers; starts the unit and waits if it doesn't.
+ensure_mcp_server_up() {
+  local label="$1" port="$2" unit="$3" wait="$4" loses="$5"
+  mcp_server_healthy "$port" && return 0
+  log "$label: not answering on 127.0.0.1:$port — starting $unit"
+  timeout -k 2 10 "$SYSTEMCTL_BIN" --user start "$unit" >/dev/null 2>&1 \
+    || log "WARN: $label: systemctl --user start $unit failed"
+  local i=0 tries=$((wait * 5))
+  while [ "$i" -lt "$tries" ]; do
+    mcp_server_healthy "$port" && { log "$label: up after $((i * 200))ms"; return 0; }
+    sleep 0.2
+    i=$((i + 1))
+  done
+  log "ERROR: $label: still not answering after ${wait}s — this launch gets $loses"
+  return 1
+}
+# `<VAR>=<key>` for an identity's launch env, or nothing when the server's binary isn't installed (a
+# key nobody checks is harmless, so this doesn't wait on the server). Inline in the launch line.
+mcp_secret_env() {
+  local var="$1" bin="$2" name="$3" key
+  [ -x "$bin" ] || return 0
+  key="$(timeout -k 2 5 "$bin" secret "$name" 2>/dev/null)" || return 0
+  [[ "$key" =~ ^[0-9a-f]{64}$ ]] && printf '%s=%s' "$var" "$key"
+  return 0
+}
+
+ensure_desktop_mcp_config() {
+  [ -x "$DESKTOP_MCP_BIN" ] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  local want
+  # shellcheck disable=SC2016  # the ${...} are for claude to expand, not this shell
+  want="$(jq -n --arg url "http://127.0.0.1:$DESKTOP_MCP_PORT/mcp" --arg who '${FLEET_IDENTITY}' \
+    --arg key '${DESKTOP_MCP_SECRET}' --arg path '${PATH}' --argjson timeout "$DESKTOP_MCP_CALL_TIMEOUT_MS" \
+    '{mcpServers:{desktop:{type:"http",url:$url,timeout:$timeout,headers:{"X-Fleet-Identity":$who,"X-Fleet-Desktop-Key":$key,"X-Fleet-Path":$path}}}}')" || return 1
+  write_mcp_config "$DESKTOP_MCP_CONFIG" "$want"
+}
+ensure_desktop_mcp_up() {
+  ensure_mcp_server_up desktop-mcp "$DESKTOP_MCP_PORT" "$DESKTOP_MCP_UNIT" "$DESKTOP_MCP_WAIT_SEC" "NO desktop tools"
+}
+
+# ---- relay MCP: one host-wide relay server shared by every supervised session ----
+# relay-mcp (substrate/scripts/relay-mcp.py, run by relay-mcp.service) speaks MCP over HTTP on
+# 127.0.0.1, so sessions connect to the one process instead of each spawning a copy. The config
+# is the same file for every identity: its headers are the literals ${FLEET_IDENTITY} and
+# ${RELAY_MCP_SECRET}, which claude expands from the env this script sets on every launch
+# (compute_mcp_env — the secret is the identity's key from `relay-mcp secret <name>`).
+#
+# A claude session that finds the server down at launch marks it failed and never retries on its
+# own (verified on 2.1.286), so before each launch the server is health-checked, started if
+# needed, and only passed to claude once it answers. A restart while sessions are connected is
+# invisible to them (the server is stateless), so only launch time matters. Just-in-time like the
+# desktop flag, for the same distributor-race reason.
+RELAY_MCP_BIN="$HOME/.local/bin/relay-mcp"
+RELAY_MCP_CONFIG="$HOME/.claude/relay-mcp.json"
+RELAY_MCP_PORT="${RELAY_MCP_PORT:-7793}"
+RELAY_MCP_UNIT="relay-mcp.service"
+RELAY_MCP_WAIT_SEC="${RELAY_MCP_WAIT_SEC:-5}"
+ensure_relay_mcp_config() {
+  [ -x "$RELAY_MCP_BIN" ] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  local want
+  # shellcheck disable=SC2016  # the ${...} are for claude to expand, not this shell
+  want="$(jq -n --arg url "http://127.0.0.1:$RELAY_MCP_PORT/mcp" --arg who '${FLEET_IDENTITY}' \
+    --arg key '${RELAY_MCP_SECRET}' \
+    '{mcpServers:{relay:{type:"http",url:$url,headers:{"X-Fleet-Identity":$who,"X-Fleet-Relay-Key":$key}}}}')" || return 1
+  write_mcp_config "$RELAY_MCP_CONFIG" "$want"
+}
+ensure_relay_mcp_up() {
+  ensure_mcp_server_up relay-mcp "$RELAY_MCP_PORT" "$RELAY_MCP_UNIT" "$RELAY_MCP_WAIT_SEC" \
+    "NO relay tools (curl fallback in the agent-relay skill still works)"
+}
+# The MCP keys for an identity's launch env (`RELAY_MCP_SECRET=… DESKTOP_MCP_SECRET=…`), each
+# only when its server is installed. Inline in the launch line.
+compute_mcp_env() {
+  mcp_secret_env RELAY_MCP_SECRET "$RELAY_MCP_BIN" "$1"
+  local d
+  d="$(mcp_secret_env DESKTOP_MCP_SECRET "$DESKTOP_MCP_BIN" "$1")"
+  [ -n "$d" ] && printf ' %s' "$d"
+  return 0
+}
+# Every --mcp-config file for a launch, as one flag (claude's --mcp-config is variadic). Prints
+# nothing when there are none. Called inline at every claude-launch send-keys line, i.e. inside
+# $(...): the helpers' log lines go to stderr (the journal) so they can't land in the command.
+compute_mcp_flags() {
+  local paths=()
+  ensure_desktop_mcp_config >&2 && ensure_desktop_mcp_up >&2 && paths+=("$DESKTOP_MCP_CONFIG")
+  ensure_relay_mcp_config >&2 && ensure_relay_mcp_up >&2 && paths+=("$RELAY_MCP_CONFIG")
+  [ "${#paths[@]}" -gt 0 ] && printf -- '--mcp-config %s' "${paths[*]}"
+  return 0
+}
+
+# ---- desktop teardown: an identity's desktop must not outlive its claude ----
+# agent-desktop@<identity>.service runs independently of the tmux session (Restart=on-failure,
+# nothing ever stops it), so without these it survives both dormancy and archive. A dormant
+# identity's desktop comes back lazily on the next desktop-mcp call or Desktop-tab start.
+AGENT_DESKTOP_BIN="${AGENT_DESKTOP_BIN:-$HOME/.local/bin/agent-desktop}"
+# Must match CONTROL_LEASE_SECONDS / VNC_PORT_BASE in agent-desktop.
+DESKTOP_CONTROL_LEASE_SECONDS=90
+DESKTOP_VNC_PORT_BASE=15900
+# `ss` binary for the viewer-connected probe; env-overridable for test hermeticity.
+SS_BIN="${AGENT_SS_BIN:-ss}"
+
+# stop_identity_desktop <name> <reason> — best-effort; never fails the caller. Skips identities
+# that never allocated a desktop (no desktop/display file) so the common case costs one stat.
+stop_identity_desktop() {
+  local name="$1" reason="$2"
+  local ddir="$IDENTITIES_DIR/$name/desktop"
+  [ -f "$ddir/display" ] || return 0
+  [ -x "$AGENT_DESKTOP_BIN" ] || return 0
+  if timeout -k 5 30 "$AGENT_DESKTOP_BIN" down --identity "$name" >/dev/null 2>&1; then
+    log "'$name' desktop stopped ($reason)"
+  else
+    log "WARN: '$name' desktop stop failed ($reason)"
+  fi
+  return 0
+}
+
+# desktop_in_use <name> — true while a human holds a fresh control lease on the desktop, or a VNC
+# client (the Desktop tab's view-only stream, tunnelled to the loopback port) is connected.
+desktop_in_use() {
+  local ddir="$IDENTITIES_DIR/$1/desktop" mtime n
+  if [ -f "$ddir/control-lock" ] && mtime="$(stat -c %Y "$ddir/control-lock" 2>/dev/null)" \
+     && [ $(( $(date +%s) - mtime )) -lt "$DESKTOP_CONTROL_LEASE_SECONDS" ]; then
+    return 0
+  fi
+  n="$(cat "$ddir/display" 2>/dev/null)"
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "$(timeout -k 2 5 "$SS_BIN" -Htn state established "( sport = :$((DESKTOP_VNC_PORT_BASE + n)) )" 2>/dev/null)" ]
+}
+
+# desktop_unit_settled <unit> — true once the unit has been up DESKTOP_START_GRACE_SECONDS, so a
+# desktop just started from the Desktop tab isn't reaped before the tab's viewer connects.
+DESKTOP_START_GRACE_SECONDS=120
+desktop_unit_settled() {
+  local since
+  since="$(timeout -k 2 5 "$SYSTEMCTL_BIN" --user show -p ActiveEnterTimestamp --value "$1" 2>/dev/null)"
+  [ -n "$since" ] || return 0
+  since="$(date -d "$since" +%s 2>/dev/null)" || return 0
+  [ $(( $(date +%s) - since )) -ge "$DESKTOP_START_GRACE_SECONDS" ]
+}
+
+# reap_desktops — stop running agent-desktop@ units that nothing should be holding open:
+#   - orphan: the identity no longer exists ($id/$id.md gone — archived or deleted by hand);
+#     backstop for retire's own stop.
+#   - dormant: the identity is .dormant and the desktop isn't in use — covers a desktop kept at
+#     dormancy because the user was on it, and one started from the Desktop tab while dormant.
+# Stops are --no-block so a hung Xvnc can't stall the reconcile tick.
+reap_desktops() {
+  command -v "$SYSTEMCTL_BIN" >/dev/null 2>&1 || return 0
+  local unit id why
+  while read -r unit _; do
+    case "$unit" in agent-desktop@*.service) ;; *) continue ;; esac
+    id="$(systemd-escape --unescape --instance -- "$unit" 2>/dev/null)" || continue
+    [ -n "$id" ] || continue
+    if [ ! -f "$IDENTITIES_DIR/$id/$id.md" ]; then
+      why="identity gone"
+    elif [ -f "$IDENTITIES_DIR/$id/.dormant" ] && ! desktop_in_use "$id" \
+         && desktop_unit_settled "$unit"; then
+      why="identity dormant"
+    else
+      continue
+    fi
+    if [ "${DRY_RUN:-0}" = 1 ]; then log "DRY_RUN would stop desktop $unit ($why)"; continue; fi
+    if timeout -k 5 10 "$SYSTEMCTL_BIN" --user stop --no-block "$unit" 2>/dev/null; then
+      log "'$id' desktop stopped ($why): $unit"
+    else
+      log "WARN: '$id' desktop stop failed ($why): $unit"
+    fi
+  done < <(timeout -k 5 10 "$SYSTEMCTL_BIN" --user list-units 'agent-desktop@*' --state=active,activating --no-legend --plain 2>/dev/null)
+  return 0
+}
+
+# ---- stray-process teardown: nothing an identity started may outlive its archive ----
+# Retire's tmux kill only reaches processes on the pane. Anything the agent backgrounded into its
+# own session (`npm exec vite &`, `setsid`, `nohup`) survives, keeps its working directory inside
+# the archived folder, and can write back to the old live path — recreating a folder with no
+# <name>.md that the app shows as a broken conversation. Processes are matched by working
+# directory, not command line, so a peer merely naming a path in its argv is never touched.
+PROC_DIR="${AGENT_PROC_DIR:-/proc}"
+STRAY_KILL_GRACE=5        # seconds between SIGTERM and SIGKILL
+STRAY_REAP_MIN_AGE=120    # reap_archived_strays spares younger processes (an agent briefly cd'd into an archive to read it)
+
+# procs_with_cwd_under <dir> [min-age-seconds] — PIDs of this user's processes whose working
+# directory is <dir> or inside it (a deleted cwd still counts), excluding this shell. Other
+# users' processes are unreadable and skipped. One find over /proc per call — runs every tick.
+procs_with_cwd_under() {
+  local dir="${1%/}" min_age="${2:-0}" self="$BASHPID" p pid cwd age
+  [ -n "$dir" ] || return 0
+  while IFS=$'\t' read -r p cwd; do
+    pid="${p##*/}"
+    case "$pid" in ''|*[!0-9]*|"$$"|"$self") continue ;; esac
+    cwd="${cwd% (deleted)}"
+    case "$cwd" in "$dir"|"$dir"/*) ;; *) continue ;; esac
+    if [ "$min_age" -gt 0 ]; then
+      age="$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')"
+      case "$age" in ''|*[!0-9]*) continue ;; esac
+      [ "$age" -ge "$min_age" ] || continue
+    fi
+    printf '%s\n' "$pid"
+  done < <(find "$PROC_DIR" -mindepth 2 -maxdepth 2 -path "$PROC_DIR/[0-9]*/cwd" -printf '%h\t%l\n' 2>/dev/null)
+}
+
+# kill_procs_under <dir> <label> <reason> [min-age-seconds] — SIGTERM every process working
+# inside <dir>, SIGKILL whatever is left after STRAY_KILL_GRACE seconds. Best-effort; never fails.
+kill_procs_under() {
+  local dir="$1" label="$2" reason="$3" min_age="${4:-0}" pids pid alive i what=""
+  pids="$(procs_with_cwd_under "$dir" "$min_age")"
+  [ -n "$pids" ] || return 0
+  for pid in $pids; do
+    what="$what ${pid}[$(ps -o args= -p "$pid" 2>/dev/null | cut -c1-120)]"
+  done
+  if [ "${DRY_RUN:-0}" = 1 ]; then log "DRY_RUN would kill stray process(es) of '$label' ($reason):$what"; return 0; fi
+  log "'$label' killing stray process(es) ($reason):$what"
+  # shellcheck disable=SC2086  # word-split the PID list on purpose
+  kill $pids 2>/dev/null
+  for ((i = 0; i < STRAY_KILL_GRACE * 2; i++)); do
+    alive=""
+    for pid in $pids; do kill -0 "$pid" 2>/dev/null && alive="$alive $pid"; done
+    [ -n "$alive" ] || break
+    sleep 0.5
+  done
+  if [ -n "$alive" ]; then
+    # shellcheck disable=SC2086
+    kill -9 $alive 2>/dev/null
+    log "WARN: '$label' stray process(es) ignored SIGTERM for ${STRAY_KILL_GRACE}s — SIGKILLed:$alive"
+  fi
+  return 0
+}
+
+# reap_archived_strays — backstop for retire's own kill: nothing should be running inside an
+# archived identity's folder (e.g. a retire that ran before this existed, or a straggler).
+reap_archived_strays() {
+  [ -d "$IDENTITIES_ARCHIVE_DIR" ] || return 0
+  kill_procs_under "$IDENTITIES_ARCHIVE_DIR" "identities-archive" "working inside an archived identity" "$STRAY_REAP_MIN_AGE"
+}
+
+# ---- memory cap (2026-08-06) — wrap claude launches in a systemd scope with MemoryHigh ----
+# Rationale: claude's baseline is ~500 MB RSS per session (Ink React TUI + Node/V8, architectural).
+# On boxes with zram-primary swap, reclaim under a soft MemoryHigh ceiling is cheap enough (LZO
+# decompress on fault-in ≈ ms) to sit comfortably below the natural working set. One mini PC
+# sweep (bounty cgroup-memory-high-idle-paging-prototype): idle pressure knee at 80M/60M, chose 80M
+# → ~85% RAM cut per agent with imperceptible cost. On boxes WITHOUT zram, the same ceiling would
+# push cold pages to NVMe on every reclaim, making DM response times perceptibly slow — so we
+# auto-skip in that case and run naked.
+#
+# The wrapper is inserted BEFORE the CLAUDE_LAUNCH_ENV in the send-keys lines below, with `env`
+# in between so the shell command-scoped env assignment still applies to claude (not to
+# systemd-run). Empty MEMORY_WRAPPER = no change vs pre-2026-08-06 behavior.
+#
+# Per-box override in $CONF: MEMORY_CAP="disabled" (never wrap) or MEMORY_CAP="150M" (explicit).
+MEMORY_WRAPPER=""
+resolve_memory_wrapper() {
+  local target
+  case "$MEMORY_CAP" in
+    disabled|off|0|"")
+      log "memory-cap: disabled (MEMORY_CAP='$MEMORY_CAP') — claude runs unconstrained"
+      return ;;
+    auto)
+      # read /proc/swaps directly — kernel-provided, no PATH dependency (swapon isn't always on
+      # the --user service's PATH; /proc/swaps always is). Format: header line + one line per swap
+      # device with Filename in column 1; we just need "/dev/zram" to appear as a device.
+      if awk 'NR>1 && $1 ~ /^\/dev\/zram/ {found=1; exit} END {exit !found}' /proc/swaps 2>/dev/null; then
+        target="80M"
+      else
+        log "memory-cap: no zram in /proc/swaps — claude runs unconstrained (add zram to enable the 80M ceiling)"
+        return
+      fi ;;
+    *)
+      target="$MEMORY_CAP" ;;   # explicit override like "150M" or "400M"
+  esac
+  if ! command -v systemd-run >/dev/null 2>&1; then
+    log "memory-cap: systemd-run missing — cannot apply MemoryHigh=$target, claude runs unconstrained"
+    return
+  fi
+  MEMORY_WRAPPER="systemd-run --scope --user --quiet -p MemoryHigh=$target -p MemorySwapMax=infinity"
+  log "memory-cap: MemoryHigh=$target will wrap future claude launches"
+}
+
+# Idempotent per-workdir trust flag. Matches ensure_agent_teams_env in shape (node, safe fallback).
+# Called before every claude launch so a brand-new resolved workdir (e.g. a new identity's first
+# resume, or ViewModelShell that was never trusted) is set before drive() types the launch.
+accept_trust_for_workdir() {
+  local wd="$1"
+  [ -n "$wd" ] || return 0
+  command -v node >/dev/null 2>&1 || return 0
+  node -e '
+    const fs=require("fs"),os=require("os"),p=require("path");
+    const f=p.join(os.homedir(),".claude.json");
+    const wd=process.argv[1];
+    let d={}; try{ d=JSON.parse(fs.readFileSync(f,"utf8")); }catch(e){}
+    if(typeof d!=="object"||!d||Array.isArray(d)) d={};
+    d.projects=(d.projects&&typeof d.projects==="object")?d.projects:{};
+    d.projects[wd]=(d.projects[wd]&&typeof d.projects[wd]==="object")?d.projects[wd]:{};
+    if(d.projects[wd].hasTrustDialogAccepted===true){ console.log("noop"); process.exit(0); }
+    d.projects[wd].hasTrustDialogAccepted=true;
+    try{ fs.writeFileSync(f,JSON.stringify(d,null,2)+"\n"); console.log("set"); }catch(e){ console.log("skip"); }
+  ' "$wd" 2>/dev/null | grep -q '^set$' && log "accepted trust for workdir '$wd' in ~/.claude.json (dialog will not render)"
+  return 0
+}
+
+# Idempotent user-wide "never ask again" for the resume dialogs. From 2.1.304 a resume of a quiet
+# session can open a blocking "this will use N% of your usage limit" dialog that the resume-threshold
+# env vars don't gate; only the top-level resumeReturnDismissed flag in ~/.claude.json suppresses it
+# (it also suppresses the resume-summary dialog). Same shape as accept_trust_for_workdir, but written
+# via temp file + rename so a failed write can't truncate the file. Called before every launch so a
+# harness rewrite of the file that drops the key is repaired on the next wake.
+dismiss_resume_return_dialog() {
+  command -v node >/dev/null 2>&1 || return 0
+  node -e '
+    const fs=require("fs"),os=require("os"),p=require("path");
+    const f=p.join(os.homedir(),".claude.json");
+    let d={}; try{ d=JSON.parse(fs.readFileSync(f,"utf8")); }catch(e){ if(fs.existsSync(f)){ console.log("skip"); process.exit(0); } }
+    if(typeof d!=="object"||!d||Array.isArray(d)){ console.log("skip"); process.exit(0); }
+    if(d.resumeReturnDismissed===true){ console.log("noop"); process.exit(0); }
+    d.resumeReturnDismissed=true;
+    const t=f+".supervisor-"+process.pid+".tmp";
+    try{ fs.writeFileSync(t,JSON.stringify(d,null,2)+"\n",{mode:0o600}); fs.renameSync(t,f); console.log("set"); }
+    catch(e){ try{ fs.unlinkSync(t); }catch(_){} console.log("skip"); }
+  ' 2>/dev/null | grep -q '^set$' && log "set resumeReturnDismissed in ~/.claude.json (resume usage-limit dialog will not render)"
+  return 0
+}
+
+# ---- identity list for this pass ----
+# Walks $IDENTITIES_DIR/*/ each reconcile; every folder with a matching
+# <name>/<name>.md gets supervised. Empty stubs (bare `/id` scaffolds without
+# the .md) are skipped so a partially-birthed identity doesn't get launched
+# prematurely.
+resolve_identities() {
+  IDENTITIES=()
+  local d name
+  for d in "$IDENTITIES_DIR"/*/; do
+    [ -d "$d" ] || continue
+    name="$(basename "$d")"
+    [ -f "$d/$name.md" ] || continue
+    IDENTITIES+=("$name")
+  done
+}
+
+slug() { printf '%s' "$1" | tr ' ' '-'; }   # canonical session name: spaces -> hyphens, case preserved
+
+# ---- project members: derived `members:` list in each project.md ----
+# Every live identity's `project:` frontmatter is the source of truth for membership; this
+# rewrites the `members:` key in ~/fleet/projects/<slug>/project.md to the sorted list of
+# identity names (folder name = relay localpart) that point at it. Running it every tick is
+# what keeps it correct from every angle — app moves, an agent editing its own frontmatter,
+# spawn-into-project, archive / un-archive — without any of those writers knowing about the
+# field. Archived identities aren't under $IDENTITIES_DIR, so they drop off on their own.
+# Combined with file-watch's project-file target, a change reaches every live member at its next turn.
+#
+# Writes only when the list changed (steady state touches nothing), atomically (tmp + rename,
+# which file-watch handles as DELETE_SELF → re-arm). Only the `members:` key is replaced;
+# every other byte of the file is kept. A project.md with no frontmatter is left alone. A
+# rewrite that would push the closing `---` past FLEET_STATUS's 4096-char frontmatter read cap
+# is refused and logged — past the cap the app loses displayName AND the `users:` visibility
+# gate (which then falls open), far worse than a stale members list.
+FLEET_PROJECTS_DIR="${AGENT_FLEET_PROJECTS_DIR:-$HOME/fleet/projects}"
+PROJECT_FRONTMATTER_CAP="${PROJECT_FRONTMATTER_CAP:-4096}"
+sync_project_members() {
+  [ -d "$FLEET_PROJECTS_DIR" ] || return 0
+  local out
+  out=$(python3 - "$IDENTITIES_DIR" "$FLEET_PROJECTS_DIR" "${DRY_RUN:-0}" "$PROJECT_FRONTMATTER_CAP" <<'PY' 2>&1
+import os, re, sys
+ident_dir, proj_dir, dry_run, cap = sys.argv[1], sys.argv[2], sys.argv[3] == "1", int(sys.argv[4])
+SLUG = re.compile(r"^[a-z0-9-]{1,64}$")
+NOTE = "  # auto-maintained by agent-supervisor from identities' project: — edits are overwritten"
+
+def fences(lines):
+    idx = [i for i, ln in enumerate(lines) if ln.rstrip("\r\n") == "---"]
+    return (idx[0], idx[1]) if len(idx) >= 2 and idx[0] == 0 else (None, None)
+
+def project_of(path):
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            lines = f.readlines()
+    except OSError:
+        return None
+    a, b = fences(lines)
+    if a is None:
+        return None
+    for ln in lines[a + 1:b]:
+        m = re.match(r"^project:\s*(.*?)\s*(#.*)?$", ln.rstrip("\r\n"))
+        if m:
+            v = (m.group(1) or "").strip().strip('"').strip("'").strip()
+            return v if SLUG.match(v) else None
+    return None
+
+members = {}
+try:
+    names = sorted(os.listdir(ident_dir))
+except OSError:
+    names = []
+for name in names:
+    p = project_of(os.path.join(ident_dir, name, name + ".md"))
+    if p:
+        members.setdefault(p, []).append(name)
+
+try:
+    slugs = sorted(os.listdir(proj_dir))
+except OSError:
+    slugs = []
+for slug in slugs:
+    if slug == "archive" or not SLUG.match(slug):
+        continue
+    path = os.path.join(proj_dir, slug, "project.md")
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        continue
+    lines = text.splitlines(keepends=True)
+    a, b = fences(lines)
+    if a is None:
+        continue
+    fm = lines[a + 1:b]
+    # Drop any existing members: key (flow `members: [..]` or block header + `  - x` items,
+    # blank/comment lines inside the block included) and remember where it sat.
+    kept, at, i = [], None, 0
+    while i < len(fm):
+        if re.match(r"^members:(\s|$)", fm[i]):
+            at = len(kept)
+            i += 1
+            if not re.match(r"^members:\s*\[", fm[i - 1]):
+                while i < len(fm) and (re.match(r"^\s+-", fm[i]) or not fm[i].strip() or fm[i].lstrip().startswith("#")):
+                    i += 1
+            continue
+        kept.append(fm[i])
+        i += 1
+    want = members.get(slug, [])
+    if want:
+        block = ["members:" + NOTE + "\n"] + ["  - %s\n" % n for n in want]
+    else:
+        block = ["members: []" + NOTE + "\n"]
+    if at is None:
+        at = len(kept)
+        if kept and not kept[-1].endswith("\n"):
+            kept[-1] += "\n"
+    new_fm = kept[:at] + block + kept[at:]
+    if new_fm == fm:
+        continue
+    new_lines = lines[:a + 1] + new_fm + lines[b:]
+    head = "".join(new_lines[:a + 1 + len(new_fm) + 1])
+    if len(head) > cap:
+        print("WARN project '%s': members list (%d) would push frontmatter past %d chars — not written" % (slug, len(want), cap))
+        continue
+    if dry_run:
+        print("DRY_RUN would set project '%s' members=%s" % (slug, ",".join(want) or "(none)"))
+        continue
+    tmp = path + ".members.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("".join(new_lines))
+        os.chmod(tmp, os.stat(path).st_mode & 0o7777)
+        # Someone else (the app moving the project, a hand edit) may have
+        # written the file since we read it; replacing it now would undo
+        # their edit. Leave it for the next tick, which starts from theirs.
+        with open(path, encoding="utf-8") as f:
+            if f.read() != text:
+                os.remove(tmp)
+                print("project '%s' changed during members rewrite — retrying next tick" % slug)
+                continue
+        os.replace(tmp, path)
+        print("project '%s' members → %s" % (slug, ",".join(want) or "(none)"))
+    except OSError as e:
+        try: os.remove(tmp)
+        except OSError: pass
+        print("ERROR project '%s' members write failed: %s" % (slug, e))
+PY
+)
+  [ -n "$out" ] && while IFS= read -r _l; do log "project-members: $_l"; done <<< "$out"
+  return 0
+}
+
+# ---- archive scan (Phase 94) — coordinator detection ----
+# is_coordinator <identity_file_path>
+# Returns 0 IFF the file has `coordinator: true` as a top-level key on its own line
+# BETWEEN the first two `---` frontmatter delimiters (unquoted true, not commented,
+# not in body prose). MUST match substrate/skills/id/SKILL.md L379-387 verbatim —
+# any drift here silently retires coordinators. See Pitfall 6 in Phase 94 RESEARCH.
+is_coordinator() {
+  local identity_file="$1"
+  [ -f "$identity_file" ] || return 1
+  awk '/^---$/{f++} f==1 && /^coordinator: true$/{found=1; exit} END{exit !found}' "$identity_file"
+}
+
+# ---- Phase 133 D-07: identity_has_role <identity_file_path> <role_name> ----
+# Returns 0 IFF <role_name> is one of the roles listed under the identity
+# file's `roles:` frontmatter key, as parsed by _extract_frontmatter_roles (the
+# canonical parser — see substrate/scripts/tests/fixtures/
+# roles_frontmatter_reference.py). The singular `role:` key is NOT read.
+# Membership is EXACT list-element equality, so "foo" does NOT match
+# "foo-bar" nor vice-versa (Pitfall 2 substring-safety).
+identity_has_role() {
+  local identity_file="$1" want_role="$2"
+  [ -f "$identity_file" ] || return 1
+  _extract_frontmatter_roles "$identity_file" 2>/dev/null \
+    | python3 -c 'import sys, json; sys.exit(0 if sys.argv[1] in json.load(sys.stdin) else 1)' "$want_role" \
+    2>/dev/null
+}
+
+# ---- archive scan (Phase 94) — freshness signal reader ----
+# get_freshness_epoch <name> <iddir>
+# Prints the epoch of the identity's last-active signal:
+#   - mtime of $iddir/relay-state/since if it exists (D-06 — cursor is rewritten
+#     every ~30s any session is up, per substrate/skills/agent-relay/recv.sh L235)
+#   - else mtime of $iddir itself (D-07 fallback — brand-new identity that has
+#     never woken; the folder's own mtime is a sensible substitute)
+# Prints 0 if both stat calls fail (should be unreachable — iddir came from the
+# scan's for-loop over existing dirs — but keep the safe default).
+get_freshness_epoch() {
+  local name="$1" iddir="$2"
+  local cursor_file="$iddir/relay-state/since"
+  local mtime
+  if [ -f "$cursor_file" ]; then
+    mtime=$(stat -c %Y "$cursor_file" 2>/dev/null)
+  else
+    mtime=$(stat -c %Y "$iddir" 2>/dev/null)
+  fi
+  printf '%s' "${mtime:-0}"
+}
+
+# ---- workspace repo cleanup at retire time ----
+# clean_workspace_repos(name, iddir)
+#
+# Between STEP 4a (sentinel delete) and STEP 4b (folder move), scan the identity's
+# workspace/ tree for safely-re-clonable git repositories and delete them so they
+# don't inflate the archived folder. A repository is safe to delete when it has a
+# network remote AND has no local-only work of any kind.
+#
+# Scans up to 3 levels of nesting below <iddir>/workspace/. When a repo is found,
+# recursion stops for its subtree — a repo containing nested repos is treated as
+# one unit: outer safe → whole tree comes down together; outer unsafe → whole
+# tree preserved (nested repos never independently rescued from within a dirty
+# outer).
+#
+# Never blocks retire. Unsafe repos and errors log at WARN and are left in place;
+# retire proceeds normally regardless.
+#
+# Return: 0 always.
+
+# _workspace_repo_safety_reason(repo_root)
+#
+# Print an empty string if the repo is safe to delete; otherwise print a short
+# non-empty reason. Fails closed: any check that cannot run produces a non-empty
+# reason (repo treated as unsafe).
+#
+# Safety gate — ALL must hold for the empty-string "safe" result:
+#   (1) `origin` remote exists AND URL is a network scheme (http/https/git/ssh/scp-like)
+#       — a filesystem-path origin is unsafe (not durable re-clone source).
+#   (2) Working tree has no uncommitted changes (staged or unstaged).
+#   (3) Working tree has no untracked files that aren't gitignored.
+#       (2+3 are folded into one `git status --porcelain` check — empty output covers both.)
+#   (4) Every local branch's upstream-track is not "ahead" — no unpushed commits.
+#   (5) Every local branch has an upstream configured AND upstream is not "[gone]".
+#   (6) No stash entries.
+_workspace_repo_safety_reason() {
+  local repo="$1"
+
+  # Must have a .git DIRECTORY (submodules use .git files — auto-excluded).
+  if [ ! -d "$repo/.git" ]; then
+    printf 'no-git-dir'
+    return 0
+  fi
+
+  # Bounded git operations — a hung repo must never stall retire.
+  local git_tmo=(timeout -k 5 20)
+
+  # HEAD must be a symbolic ref (i.e. checked out on a branch), NOT detached.
+  # A detached HEAD could hold commits unreachable from any local branch — the
+  # branch-enumeration step below would then wave through those local-only commits.
+  # Shape philosophy: "anything that MIGHT be local-only work is treated as local-only."
+  if ! "${git_tmo[@]}" git -C "$repo" symbolic-ref -q HEAD >/dev/null 2>&1; then
+    printf 'detached-head'
+    return 0
+  fi
+
+  # (1) origin remote must be a network URL.
+  local origin_url
+  if ! origin_url=$("${git_tmo[@]}" git -C "$repo" remote get-url origin 2>/dev/null); then
+    printf 'no-origin-remote'
+    return 0
+  fi
+  case "$origin_url" in
+    /*|./*|../*|file:*)
+      printf 'origin-is-filesystem-path'
+      return 0
+      ;;
+    https://*|http://*|git://*|ssh://*|*@*:*)
+      : # network — proceed
+      ;;
+    *)
+      printf 'origin-unknown-scheme'
+      return 0
+      ;;
+  esac
+
+  # (2)+(3) working tree clean AND no non-ignored untracked files.
+  # -c forces showUntrackedFiles=normal so a repo-config override cannot mask untracked.
+  local status_out
+  if ! status_out=$("${git_tmo[@]}" git -c status.showUntrackedFiles=normal \
+      -C "$repo" status --porcelain 2>/dev/null); then
+    printf 'git-status-failed'
+    return 0
+  fi
+  if [ -n "$status_out" ]; then
+    local entry_count
+    entry_count=$(printf '%s\n' "$status_out" | wc -l | tr -d ' ')
+    printf 'working-tree-dirty-%s-entries' "$entry_count"
+    return 0
+  fi
+
+  # (6) no stash entries. Fail-closed on any git-stash-list failure (timeout, corrupt
+  # refs/stash, etc.) — the shape's paranoid-fail-closed commitment forbids silent skips.
+  local stash_out stash_count
+  if ! stash_out=$("${git_tmo[@]}" git -C "$repo" stash list 2>/dev/null); then
+    printf 'stash-list-failed'
+    return 0
+  fi
+  if [ -n "$stash_out" ]; then
+    stash_count=$(printf '%s\n' "$stash_out" | wc -l | tr -d ' ')
+    printf '%s-stash-entries' "$stash_count"
+    return 0
+  fi
+
+  # (4)+(5) every local branch: has an upstream, upstream is a REMOTE-tracking ref,
+  # upstream not gone, and no commits ahead. Shape wording: "upstream still exists
+  # on the remote" — a branch whose upstream points at another LOCAL branch (e.g.
+  # `git branch --set-upstream-to=main feature`) does not satisfy that; treat as
+  # unsafe so any ahead-count on the local upstream doesn't hide local-only work.
+  local branch_info
+  if ! branch_info=$("${git_tmo[@]}" git -C "$repo" for-each-ref \
+      --format='%(refname:short)|%(upstream)|%(upstream:track)' \
+      refs/heads 2>/dev/null); then
+    printf 'branch-enum-failed'
+    return 0
+  fi
+  if [ -z "$branch_info" ]; then
+    printf 'no-local-branches'
+    return 0
+  fi
+  local branch upstream track
+  while IFS='|' read -r branch upstream track; do
+    [ -z "$branch" ] && continue
+    if [ -z "$upstream" ]; then
+      printf 'branch-%s-has-no-upstream' "$branch"
+      return 0
+    fi
+    case "$upstream" in
+      refs/remotes/*)
+        : # remote upstream — proceed with track check
+        ;;
+      *)
+        printf 'branch-%s-non-remote-upstream' "$branch"
+        return 0
+        ;;
+    esac
+    case "$track" in
+      '')
+        : # up-to-date — safe
+        ;;
+      *'[gone]'*)
+        printf 'branch-%s-upstream-gone' "$branch"
+        return 0
+        ;;
+      *ahead*)
+        printf 'branch-%s-ahead-%s' "$branch" "$track"
+        return 0
+        ;;
+      *behind*)
+        : # only behind — safe (nothing local to lose)
+        ;;
+      *)
+        printf 'branch-%s-unknown-track-%s' "$branch" "$track"
+        return 0
+        ;;
+    esac
+  done <<< "$branch_info"
+
+  # All six checks passed.
+  printf ''
+  return 0
+}
+
+clean_workspace_repos() {
+  local name="$1"
+  local iddir="$2"
+  local wsdir="$iddir/workspace"
+
+  # Nothing to do if no workspace/.
+  [ -d "$wsdir" ] || return 0
+
+  # Refuse to follow a symlinked workspace/. Shape: "no symlinks followed to elsewhere
+  # on the disk." A symlink here could point outside the identity folder entirely.
+  if [ -L "$wsdir" ]; then
+    log "WARN: '$name' workspace-cleanup: workspace is a symlink — refusing to follow"
+    return 0
+  fi
+
+  # Find candidate .git DIRECTORIES up to 3 levels of nesting below wsdir.
+  #   repo at workspace/foo/       → .git at depth 2
+  #   repo at workspace/foo/bar/   → .git at depth 3
+  #   repo at workspace/a/b/c/     → .git at depth 4
+  # -maxdepth 4 captures repo roots at nesting levels 1, 2, and 3 as specified
+  # in the shape. Deeper repos are intentionally out of scope.
+  #
+  # Capture find's stderr rather than dropping it: an unreadable subdirectory is
+  # exactly the "unchecked" case the shape wants surfaced with a WARN, not silently
+  # skipped. Any repo below the unreadable dir will not be seen by find and will
+  # simply travel with the archive folder — safe outcome, but observability matters.
+  local find_err
+  find_err=$(mktemp)
+  local -a git_dirs=()
+  local g
+  while IFS= read -r -d '' g; do
+    git_dirs+=("$g")
+  done < <(find "$wsdir" -maxdepth 4 -name .git -type d -print0 2>"$find_err" | sort -z)
+  if [ -s "$find_err" ]; then
+    local errline
+    while IFS= read -r errline; do
+      [ -z "$errline" ] && continue
+      log "WARN: '$name' workspace-cleanup: scan error — $errline"
+    done < "$find_err"
+  fi
+  rm -f "$find_err"
+
+  [ "${#git_dirs[@]}" -eq 0 ] && return 0
+
+  # Convert each .git dir to its repo root, and prune descendants — a repo whose
+  # root is inside another discovered repo is NOT independently scanned.
+  local -a repo_roots=()
+  local root existing skip
+  for g in "${git_dirs[@]}"; do
+    root="${g%/.git}"
+    skip=0
+    for existing in "${repo_roots[@]}"; do
+      case "$root/" in
+        "$existing/"*) skip=1; break ;;
+      esac
+    done
+    [ "$skip" -eq 0 ] && repo_roots+=("$root")
+  done
+
+  # Evaluate each candidate; delete safe ones, log the unsafe ones with a reason.
+  local reason
+  for root in "${repo_roots[@]}"; do
+    reason=$(_workspace_repo_safety_reason "$root")
+    if [ -z "$reason" ]; then
+      if rm -rf "$root" 2>/dev/null; then
+        log "'$name' workspace-cleanup: deleted safe repo at $root"
+      else
+        log "WARN: '$name' workspace-cleanup: rm -rf FAILED at $root — leaving in place"
+      fi
+    else
+      log "WARN: '$name' workspace-cleanup: skipped repo at $root — $reason"
+    fi
+  done
+
+  return 0
+}
+
+# ---- dependency-folder cleanup at retire time ----
+# clean_workspace_dependency_dirs(name, iddir)
+#
+# Runs after clean_workspace_repos. Repos it kept (local-only work) and plain non-repo folders
+# can still hold re-downloadable dependency trees — a kept repo's node_modules is ~1.5 GB of
+# nothing anyone could lose. Delete those so they don't inflate the archived folder.
+#
+# A folder is deleted only when its NAME is a known re-downloadable kind, it holds no git repo
+# of its own (a fork cloned into node_modules, a `pip install -e` checkout under venv/src), AND:
+#   - inside a git repo: git reports it ignored AND it holds no tracked files. The ignore check
+#     proves no work is in it; a force-added (tracked) node_modules is left alone.
+#   - outside any git repo: the name alone decides.
+#
+# Never follows symlinks, never descends into a matched folder or .git. Never blocks retire.
+#
+# Return: 0 always.
+# Build-output names (dist/build/target) are deliberately absent: they can hold artifacts
+# nothing can rebuild.
+_WS_DEP_DIR_NAMES=(node_modules .venv venv __pycache__ .pytest_cache .mypy_cache .ruff_cache
+                   .tox .next .nuxt .svelte-kit .turbo .parcel-cache)
+
+clean_workspace_dependency_dirs() {
+  local name="$1"
+  local iddir="$2"
+  local wsdir="$iddir/workspace"
+
+  [ -d "$wsdir" ] || return 0
+  [ -L "$wsdir" ] && return 0  # clean_workspace_repos already WARNed
+  # Physical path, so it compares cleanly with git's (symlink-resolved) --show-toplevel.
+  wsdir=$(cd "$wsdir" 2>/dev/null && pwd -P) || return 0
+
+  local git_tmo=(timeout -k 5 20)
+  local -a name_expr=()
+  local n
+  for n in "${_WS_DEP_DIR_NAMES[@]}"; do
+    [ "${#name_expr[@]}" -gt 0 ] && name_expr+=(-o)
+    name_expr+=(-name "$n")
+  done
+
+  # Collect first, delete after — deleting mid-find would race the traversal.
+  local -a matches=()
+  local m
+  while IFS= read -r -d '' m; do
+    matches+=("$m")
+  done < <(timeout -k 5 60 find "$wsdir" -maxdepth 8 \
+             \( -name .git -prune \) -o \
+             \( -type d \( "${name_expr[@]}" \) -prune -print0 \) 2>/dev/null)
+
+  [ "${#matches[@]}" -eq 0 ] && return 0
+
+  local dir top rel reason tracked nested
+  for dir in "${matches[@]}"; do
+    [ -L "$dir" ] && continue
+    [ -d "$dir" ] || continue
+    reason=""
+    # A repo nested inside (fork in node_modules, pip -e checkout in venv/src) may hold local-only
+    # work the parent's ignore rules know nothing about. Fail closed if the scan itself fails.
+    if ! nested=$(timeout -k 5 60 find "$dir" -name .git -print -quit 2>/dev/null); then
+      reason="nested-scan-failed"
+    elif [ -n "$nested" ]; then
+      reason="contains-git-repo"
+    fi
+    if [ -n "$reason" ]; then
+      log "'$name' workspace-cleanup: kept dependency dir at $dir — $reason"
+      continue
+    fi
+    top=$("${git_tmo[@]}" git -C "${dir%/*}" rev-parse --show-toplevel 2>/dev/null) || top=""
+    if [ -z "$top" ]; then
+      # git found no repo — but if a .git sits between here and the workspace, git just failed
+      # (timeout, safe.directory, corrupt repo). Fail closed: never fall back to name-only there.
+      local up="${dir%/*}"
+      while :; do
+        if [ -e "$up/.git" ]; then reason="git-check-failed"; break; fi
+        [ "$up" = "$wsdir" ] && break
+        up="${up%/*}"
+      done
+    else
+      case "$top/" in
+        "$wsdir/"*) ;;
+        *) reason="repo-outside-workspace" ;;
+      esac
+    fi
+    if [ -n "$reason" ]; then
+      :
+    elif [ -n "$top" ]; then
+      rel="${dir#"$top"/}"
+      if ! "${git_tmo[@]}" git -C "$top" check-ignore -q -- "$rel" 2>/dev/null; then
+        reason="not-gitignored"
+      elif ! tracked=$("${git_tmo[@]}" git -C "$top" --literal-pathspecs ls-files -- "$rel" 2>/dev/null); then
+        reason="ls-files-failed"
+      elif [ -n "$tracked" ]; then
+        reason="has-tracked-files"
+      fi
+    fi
+    if [ -n "$reason" ]; then
+      log "'$name' workspace-cleanup: kept dependency dir at $dir — $reason"
+      continue
+    fi
+    if rm -rf "$dir" 2>/dev/null; then
+      log "'$name' workspace-cleanup: deleted dependency dir at $dir"
+    else
+      log "WARN: '$name' workspace-cleanup: rm -rf FAILED at $dir — leaving in place"
+    fi
+  done
+
+  return 0
+}
+
+# ---- retire action (Phase 94 base; Phase 115 reorder) ----
+# retire_identity(name)
+#
+# Executes the four-step retire in the Phase 115 D-13 order:
+#   STEP 0: stop the ambient monitor + its watcher children (so nothing injects mid-retire)
+#   STEP 1: matrix deactivate  (was Phase 94 step 3)
+#   STEP 2: graceful harness exit  (NEW in Phase 115)
+#   STEP 3: tmux kill-session  (was Phase 94 step 2)
+#   STEP 4a: delete .archive-requested sentinel  (Phase 115 D-12 option b — BEFORE folder move)
+#   STEP 4b: move folder to archive/  (was Phase 94 step 1)
+#
+# Rationale (D-13): the old order (move → kill → matrix) was a hard-stop sequence — folder-move
+# starved watchers into death, tmux kill terminated the pane cold. The new order lets each layer
+# flush BEFORE the next tears it down: matrix deactivate first (idempotent per Synapse; can be
+# re-tried from top on failure without racing anything since the identity is still on disk);
+# then a graceful harness exit that lets ambient-monitor's _harness_watch fire, SIGTERM its four
+# watcher children (including recv.sh, which flushes its cursor to disk); then a bounded tmux
+# kill-session as the hard-stop backstop; then sentinel-delete + folder-move to seal the retire.
+#
+# The graceful-exit step (STEP 2) sends /exit (bracketed paste + Enter), SIGTERMs any survivors
+# on the pane tty, and waits an ADDITIONAL GRACE_WAIT seconds (= ambient-monitor.py:81 GRACE_SECONDS + 1) so
+# ambient-monitor completes its own SIGTERM-fanout window before STEP 3's tmux kill lands
+# (RESEARCH §4: without this wait, tmux kill-session would SIGHUP ambient-monitor mid-cleanup,
+# defeating the whole ordering).
+#
+# Idempotency (D-13 retry-from-top): each step handles the case where a prior partial run
+# already completed that step. Re-running from the top after any partial failure is safe:
+#   - matrix deactivate: 401 M_UNKNOWN_TOKEN → treat as idempotent success (A4).
+#   - graceful exit / tmux kill: no-op if session gone.
+#   - sentinel delete: silent if not present.
+#   - folder move: State 2 (already in archive/) → skip; State 3 (collision) → abort.
+#
+# Return contract: 0 on full success; 1 on {step 1 fatal, step 3 not applicable — no-op is
+# still success, step 4b collision/anomaly}. STEP 2 is best-effort and NEVER gates the retire
+# (a stuck harness could otherwise block retire forever; STEP 3 is the hard-stop backstop).
+#
+# Phase 133 D-13/D-13a/D-14 refactor: retire_identity() is atomic from the caller's perspective.
+# Steps 1 (matrix deactivate) and 4b (folder move) carry inline 3-attempt exponential-backoff
+# retries (2s / 4s sleeps between attempts — worst-case per-step wall-time ~6s of sleep + 3
+# curl/mv attempts). Steps 2 and 3 keep single-attempt behavior (step 2 already carries an 11s
+# GRACE_WAIT; step 3 is idempotent no-op when the session is gone). The retire either succeeds
+# outright (having recovered inline from transient failures) or fails terminally in one call,
+# with no cross-tick state written by this function or its callers. The former cross-tick
+# failure counters (in $DORMANCY_STATE_DIR) and the sentinel drop after N consecutive failures
+# in the callers are all removed per Phase 133 D-14.
+# wait_ambient_monitor_exit <name> <max-seconds>: block until no ambient-monitor for <name> is
+# running, polling every 0.5s, for at most <max-seconds>. Matches on the launch argv shape
+# (`ambient-monitor <dir> --inject-to`), so a name that prefixes another identity's never
+# matches it, and excludes this shell's own PIDs (pgrep -f would otherwise match itself).
+# Prints a short outcome for the caller's log line. Never fails.
+wait_ambient_monitor_exit() {
+  local name="$1" max="$2" pattern ticks=0 limit
+  pattern="ambient-monitor $IDENTITIES_DIR/$name --inject-to"
+  limit=$(( max * 2 ))
+  while pgrep -f -- "$pattern" 2>/dev/null | grep -vwqE "^($$|$BASHPID)$"; do
+    if [ "$ticks" -ge "$limit" ]; then
+      printf 'still running after %ss cap — proceeding' "$max"
+      return 0
+    fi
+    sleep 0.5
+    ticks=$((ticks + 1))
+  done
+  printf 'exited after ~%s.%ss' "$((ticks / 2))" "$(( (ticks % 2) * 5 ))"
+  return 0
+}
+
+# retire_identity_apps <name> <iddir> — convo-scoped apps: stop every app under
+# <iddir>/apps/ and stash its systemd units inside the app folder (app-units.sh stash +
+# uninstall). The stash keeps the app's port reserved while the identity is archived and
+# lets restore_identity_apps put it back on the same port. Logs, never fails.
+retire_identity_apps() {
+  local name="$1" iddir="$2" d slug
+  [ -d "$iddir/apps" ] || return 0
+  if [ ! -f "$APP_UNITS_SCRIPT" ]; then
+    log "WARN: '$name' retire: $APP_UNITS_SCRIPT missing — conversation apps under $iddir/apps left with their units installed"
+    return 0
+  fi
+  for d in "$iddir"/apps/*/; do
+    [ -d "$d" ] || continue
+    slug="$(basename "$d")"
+    [[ "$slug" =~ ^[a-z][a-z0-9-]*$ ]] || continue
+    # Stash first (it reserves the port and is what un-archive restores from),
+    # then always uninstall — the folder is about to move, and units left
+    # behind would point at a path that no longer exists.
+    if ! bash "$APP_UNITS_SCRIPT" stash "$slug" "${d%/}" >/dev/null 2>&1; then
+      log "WARN: '$name' retire: could not stash conversation app '$slug' — it will not come back on un-archive; uninstalling anyway"
+    fi
+    if bash "$APP_UNITS_SCRIPT" uninstall "$slug" >/dev/null 2>&1 \
+       || bash "$APP_UNITS_SCRIPT" uninstall "$slug" >/dev/null 2>&1; then
+      log "'$name' retire: conversation app '$slug' stopped, units stashed"
+    else
+      log "WARN: '$name' retire: could not uninstall conversation app '$slug' — run app-units.sh uninstall $slug by hand"
+    fi
+  done
+}
+
+# restore_identity_apps <name> <iddir> — inverse of retire_identity_apps, run after an
+# identity folder is moved back to the live tree: reinstall each stashed conversation app
+# on its old port (app-units.sh restore). Logs, never fails.
+restore_identity_apps() {
+  local name="$1" iddir="$2" d slug
+  [ -d "$iddir/apps" ] || return 0
+  [ -f "$APP_UNITS_SCRIPT" ] || { log "WARN: '$name' un-archive: $APP_UNITS_SCRIPT missing — conversation apps not restored"; return 0; }
+  for d in "$iddir"/apps/*/; do
+    [ -d "$d" ] || continue
+    slug="$(basename "$d")"
+    [[ "$slug" =~ ^[a-z][a-z0-9-]*$ ]] || continue
+    ls "$d"app-"$slug"*.archived >/dev/null 2>&1 || continue
+    if bash "$APP_UNITS_SCRIPT" restore "$slug" "${d%/}" >/dev/null 2>&1; then
+      log "'$name' un-archive: conversation app '$slug' restored"
+    else
+      log "WARN: '$name' un-archive: conversation app '$slug' could not be restored — run app-units.sh restore $slug ${d%/} by hand"
+    fi
+  done
+}
+
+# retire_deactivate_account — STEP 1 + 1b of retire_identity, split out so every failure path
+# returns through one place (retire_identity re-starts the ambient monitor on failure). Reads
+# $name / $iddir / $archdir from the caller (retire_identity) via bash dynamic scoping.
+# Returns 0 when the account is confirmed off, 1 otherwise.
+retire_deactivate_account() {
+  # =============================================================================================
+  # STEP 1 (Phase 115 D-13): Matrix deactivate — FIRST, using credentials from the LIVE tree.
+  # =============================================================================================
+  # Reads relay.json from $iddir (LIVE tree — the folder has NOT moved yet in the new order).
+  # Idempotent per Synapse: an already-deactivated account returns 401 M_UNKNOWN_TOKEN which we
+  # treat as success (A4). D-16 discipline: any non-idempotent failure fails LOUD and aborts;
+  # do NOT silently succeed the rest of the retire — the identity's Matrix account would remain
+  # live indefinitely with no signal.
+  log "'$name' retire step 1 (matrix deactivate) starting"
+  local relay_json="$iddir/relay.json"
+  if [ ! -f "$relay_json" ]; then
+    # State 2 (D-13 retry-from-partial): active absent, archive present — the folder was already
+    # moved by a prior partial run. Fall through to check for relay.json in archdir as a fallback,
+    # so step 1 remains idempotent across partial-retry states.
+    if [ -f "$archdir/relay.json" ]; then
+      relay_json="$archdir/relay.json"
+      log "'$name' retire step 1: relay.json not in live tree — reading from archdir (State 2 resume)"
+    else
+      log "ERROR: '$name' retire step 1 (matrix deactivate) FAILED: relay.json not found at $iddir or $archdir — sentinel retained"
+      return 1
+    fi
+  fi
+  local base mxid password access_token
+  base=$(jq -r '.base // empty' "$relay_json" 2>/dev/null)
+  mxid=$(jq -r '.user_id // empty' "$relay_json" 2>/dev/null)
+  password=$(jq -r '.password // empty' "$relay_json" 2>/dev/null)
+  access_token=$(jq -r '.access_token // empty' "$relay_json" 2>/dev/null)
+  if [ -z "$base" ] || [ -z "$mxid" ] || [ -z "$password" ] || [ -z "$access_token" ]; then
+    log "ERROR: '$name' retire step 1 (matrix deactivate) FAILED: relay.json missing required fields (base/user_id/password/access_token) — sentinel retained"
+    return 1
+  fi
+  # Build deactivate body via jq --arg so credentials are JSON-escaped (prevents injection
+  # from passwords containing '"' or '\' — T-94-02-05 mitigation). Never string-interpolate
+  # $password or $access_token into a JSON literal. Full MXID in UIA user field (A3).
+  local body
+  body=$(jq -nc --arg u "$mxid" --arg p "$password" \
+    '{"auth":{"type":"m.login.password","user":$u,"password":$p},"erase":true}')
+  local resp http_code
+  # Phase 133 D-13/D-13a: inline 3-attempt exponential backoff on transient failures (5xx +
+  # empty http_code / network error). Delay math: sleep 2^attempt after attempts 1 and 2 (2s
+  # then 4s); attempt 3 does not sleep (loop ends). Worst-case wall time: ~6s of sleep + 3×
+  # (curl --max-time 30) ≈ 96s. Permanent client errors (non-401 4xx) hard-fail on the FIRST
+  # attempt — retrying a 400 would just re-fail three times uselessly and inflate the retire
+  # time. Pre-curl validation (relay.json existence + jq field extraction) stays OUTSIDE the
+  # loop above — missing files / fields are also terminal, not transient.
+  #
+  # Phase 115 hotfix (2026-09-17 sky-UAT): $base in relay.json already contains the
+  # "/_matrix/client/v3" prefix (fleet convention — see recv.sh's $BASE/account/whoami pattern;
+  # verified 100% of production identities). Append only the trailing endpoint to avoid a
+  # double-prefix 404. Prior code did `$base/_matrix/client/v3/account/deactivate` which
+  # produced `.../_matrix/client/v3/_matrix/client/v3/account/deactivate` → 404.
+  local _step1_ok=0
+  local _attempt _delay
+  for _attempt in 1 2 3; do
+    resp=$(curl -sS -w '\n%{http_code}' --max-time 30 \
+      -X POST "$base/account/deactivate" \
+      -H "Authorization: Bearer $access_token" \
+      -H "Content-Type: application/json" \
+      -d "$body" 2>/dev/null)
+    http_code=$(printf '%s\n' "$resp" | tail -1)
+    case "$http_code" in
+      200)
+        log "'$name' retire step 1 (matrix deactivate) success (http=$http_code)"
+        _step1_ok=1
+        break
+        ;;
+      401)
+        # A 401 is either a dead token (a prior run already deactivated the account) or a
+        # rejected password (the account is still on). Deactivate-with-erase deletes the
+        # account's profile, so a 404 profile is what confirms the account is off.
+        local _pcode
+        _pcode=$(_account_profile_code "$base" "$mxid" "$access_token")
+        case "$_pcode" in
+          404)
+            log "'$name' retire step 1 (matrix deactivate) success (http=$http_code — account confirmed off: no profile)"
+            _step1_ok=1
+            break
+            ;;
+          200)
+            log "ERROR: '$name' retire step 1 (matrix deactivate) FAILED: the chat server rejected the saved token or password (http=$http_code) and $mxid is still on — check relay.json's token and password; sentinel retained"
+            return 1
+            ;;
+          *)
+            log "ERROR: '$name' retire step 1 (matrix deactivate) FAILED: got http=$http_code and couldn't confirm $mxid is off (profile http=$_pcode) — sentinel retained, retrying next pass"
+            return 1
+            ;;
+        esac
+        ;;
+      4*)
+        # Non-401 4xx: a client-side error we cannot recover from automatically (bad endpoint,
+        # malformed body, authorization issue beyond token expiry). Permanent — NO retry.
+        # Log $base and $mxid only — never $access_token or $password (T-94-02-04 / T-115-04-03).
+        log "ERROR: '$name' retire step 1 (matrix deactivate) FAILED http=$http_code for $mxid at $base — sentinel retained"
+        return 1
+        ;;
+      5*|"")
+        # Transient: fall through to the retry-sleep block below.
+        log "'$name' retire step 1 (matrix deactivate) attempt $_attempt/3 transient failure (http=$http_code) — will retry"
+        ;;
+      *)
+        # Unexpected code — treat as permanent (no retry).
+        log "ERROR: '$name' retire step 1 (matrix deactivate) FAILED http=$http_code for $mxid at $base — unexpected code, sentinel retained"
+        return 1
+        ;;
+    esac
+    if [ "$_attempt" -lt 3 ]; then
+      _delay=$((2 ** _attempt))
+      log "'$name' retire step 1 (matrix deactivate) sleeping ${_delay}s before attempt $((_attempt + 1))/3"
+      sleep "$_delay"
+    fi
+  done
+  if [ "$_step1_ok" != 1 ]; then
+    log "ERROR: '$name' retire step 1 (matrix deactivate) FAILED after 3 attempts (last http=$http_code) for $mxid at $base — sentinel retained"
+    return 1
+  fi
+  # STEP 1b: the saved token is usually one the backend minted by logging in as the agent.
+  # Those belong to the admin account, so the deactivate above leaves them working; log this
+  # one out so it can't keep acting as a switched-off account. Best effort — never blocks.
+  local _logout_code
+  _logout_code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
+    -X POST "$base/logout" -H "Authorization: Bearer $access_token" 2>/dev/null)
+  case "$_logout_code" in
+    200) log "'$name' retire step 1b: saved chat token logged out" ;;
+    401) log "'$name' retire step 1b: saved chat token was already invalid" ;;
+    *)   log "WARNING: '$name' retire step 1b: logging out the saved chat token failed (http=$_logout_code) — it may keep working" ;;
+  esac
+  return 0
+}
+
+# stop_ambient_monitor <name> <max-seconds> — stop the identity's ambient-monitor and so every
+# watcher child (relay receiver, wakeup-scheduler, file-watch, inbox-watcher). SIGTERM first: the
+# monitor finishes any paste in flight, then forwards SIGTERM with a grace window so the receiver
+# flushes its cursor. If it is still up after <max-seconds>, SIGKILL its children's process groups
+# (each child runs in its own) and then the monitor. Matches on the launch argv shape like
+# wait_ambient_monitor_exit, excluding this shell's own PIDs.
+# Sets STOPPED_MONITOR_SESSION to the tmux session the monitor was injecting into (read from its
+# own --inject-to argument — exact, unlike the reconcile-time session snapshot), empty when no
+# monitor was running, and STOPPED_MONITOR_OUTCOME to a short phrase for the caller's log line.
+# Never fails.
+STOPPED_MONITOR_SESSION=""
+STOPPED_MONITOR_OUTCOME=""
+stop_ambient_monitor() {
+  local name="$1" max="$2" pattern pid pids child
+  STOPPED_MONITOR_SESSION=""
+  STOPPED_MONITOR_OUTCOME="none running"
+  pattern="ambient-monitor $IDENTITIES_DIR/$name --inject-to"
+  pids="$(pgrep -f -- "$pattern" 2>/dev/null | grep -vwE "^($$|$BASHPID)$")"
+  [ -n "$pids" ] || return 0
+  for pid in $pids; do
+    [ -n "$STOPPED_MONITOR_SESSION" ] || STOPPED_MONITOR_SESSION="$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null \
+      | awk 'prev == "--inject-to" { print; exit } { prev = $0 }')"
+    kill "$pid" 2>/dev/null
+  done
+  STOPPED_MONITOR_OUTCOME="$(wait_ambient_monitor_exit "$name" "$max")"
+  case "$STOPPED_MONITOR_OUTCOME" in
+    still*)
+      for pid in $pids; do
+        for child in $(pgrep -P "$pid" 2>/dev/null); do kill -KILL -- "-$child" 2>/dev/null; done
+        kill -KILL "$pid" 2>/dev/null
+      done
+      STOPPED_MONITOR_OUTCOME="still running after ${max}s — SIGKILLed it and its children"
+      ;;
+  esac
+  return 0
+}
+
+retire_identity() {
+  local name="$1"
+  local iddir="$IDENTITIES_DIR/$name"
+  local archdir="$IDENTITIES_ARCHIVE_DIR/$name"
+
+  # A birth that landed mid-pass launches now, not after every queued retire (see helper).
+  launch_newborns_midtick
+
+  # =============================================================================================
+  # STEP 0: stop the ambient monitor (and with it every watcher child) BEFORE the account goes off.
+  # =============================================================================================
+  # Step 1 kills the agent's chat token; a receiver still running would see M_UNKNOWN_TOKEN, fail
+  # its relogin and inject an "AUTH DEAD" event — which landed in the compose box together with
+  # step 2's /exit paste, so the harness got "/exit<task-notification>…" as one ordinary message,
+  # never exited, and every archived conversation ended on it. With the monitor gone first,
+  # nothing can inject into the pane during the retire. The monitor is never restarted while the
+  # harness runs during a retire (the alive-check's repair skips .archive-requested identities), so if step 1 fails we restart it ourselves
+  # — otherwise the agent would sit deaf until the next retry succeeds.
+  # The restart is rate-limited to once per 15 minutes: the scan retries a failed retire every
+  # tick, and each fresh monitor resets its children's own alert limits (recv.sh's AUTH DEAD is
+  # once per 15 min per process) and truncates ambient-monitor.log. Between restarts a retire
+  # that keeps failing leaves the agent deaf — it is being archived, so that is the lesser cost.
+  local _s0_restarted="$DORMANCY_STATE_DIR/$name.retire-monitor-restarted"
+  stop_ambient_monitor "$name" 20
+  log "'$name' retire step 0 (stop ambient monitor): ${STOPPED_MONITOR_OUTCOME}"
+
+  if ! retire_deactivate_account; then
+    if [ -n "$STOPPED_MONITOR_SESSION" ]; then
+      if [ -n "$(find "$_s0_restarted" -mmin -15 2>/dev/null)" ]; then
+        log "'$name' retire step 1 failed — ambient monitor NOT restarted (already restarted after a failed retire in the last 15 min); agent is deaf until the retire succeeds or the next restart"
+      else
+        log "'$name' retire step 1 failed — restarting ambient monitor so the agent keeps hearing until the retry"
+        mkdir -p "$DORMANCY_STATE_DIR" 2>/dev/null; touch "$_s0_restarted" 2>/dev/null
+        start_ambient_monitor "$name" "$STOPPED_MONITOR_SESSION" || true
+      fi
+    fi
+    return 1
+  fi
+  rm -f "$_s0_restarted" 2>/dev/null
+
+  # =============================================================================================
+  # STEP 2 (Phase 115 D-13/D-14 NEW): Graceful harness exit.
+  # =============================================================================================
+  # Phase 133 D-13a: NO inline retry wrap on this step. GRACE_WAIT (11s) already gives ambient-
+  # monitor room to clean up; wrapping in a 3× retry would just re-fire the same graceful-exit
+  # burst against a pane that either already exited (waste) or is genuinely stuck (a 3× retry
+  # will not un-stick it). Do NOT add a for _attempt in 1 2 3 loop here.
+  # Send /exit to the claude REPL via bracketed paste + Enter, wait, then SIGTERM survivors.
+  # After the /exit burst, wait an additional GRACE_WAIT seconds so ambient-monitor's
+  # _harness_watch fires (once/sec poll → ≤1s to detect), its _do_shutdown SIGTERMs the four
+  # watcher children (relay receiver, wakeup-scheduler, file-watch, inbox-watcher), and
+  # they exit before STEP 3's tmux kill-session lands. STEP 2 NEVER gates the retire — a stuck
+  # harness or a missing tmux session must not block retire; STEP 3 is the backstop.
+  local slugname actual
+  slugname="$(slug "$name")"
+  actual="$(match_session "$slugname" || true)"
+  # ⚠ Must match ambient-monitor.py:81 GRACE_SECONDS+1 — bump in lockstep.
+  local GRACE_WAIT=11
+  if [ -z "$actual" ]; then
+    log "'$name' retire step 2 (graceful exit): no live tmux session; skipping graceful exit"
+  else
+    local _ex_tmp; _ex_tmp=$(mktemp)
+    printf '%s' "/exit" > "$_ex_tmp"
+    timeout -k 5 10 tmux load-buffer -t "$actual" "$_ex_tmp" 2>/dev/null
+    timeout -k 5 10 tmux paste-buffer -p -t "$actual" 2>/dev/null
+    rm -f "$_ex_tmp"
+    sleep 0.5
+    timeout -k 5 10 tmux send-keys -t "$actual" Enter 2>/dev/null
+    log "'$name' retire step 2 (graceful exit): /exit paste + Enter sent to pane"
+    sleep 3
+    # hard fallback: kill any claude/node still on the pane tty so we're back at a shell
+    local tty pid killed=0
+    tty="$(timeout -k 5 10 tmux list-panes -t "=$actual" -F '#{pane_tty}' 2>/dev/null | head -1)"
+    if [ -n "$tty" ]; then
+      # shellcheck disable=SC2009  # pgrep does not support -t (tty filter) the same way.
+      for pid in $(ps -t "${tty#/dev/}" -o pid=,comm= 2>/dev/null | grep -iE 'claude|node' | awk '{print $1}'); do
+        kill "$pid" 2>/dev/null   # SIGTERM (default signal)
+        killed=$((killed+1))
+      done
+    fi
+    if [ "$killed" -gt 0 ]; then
+      log "'$name' retire step 2 (graceful exit): SIGTERM'd $killed survivor(s) on tty ${tty:-?}"
+    else
+      log "'$name' retire step 2 (graceful exit): no survivors after /exit — pane at shell"
+    fi
+    # RESEARCH §4: after harness dies, ambient-monitor's _harness_watch fires ≤1s later, then
+    # _do_shutdown SIGTERMs its children with a 10s grace window and exits once they're down.
+    # Wait for that exit — capped at GRACE_WAIT — before STEP 3 tears the tmux session down.
+    # Waiting the full cap unconditionally cost ~11s per identity, serially, and a bulk archive
+    # (22 identities) held up every launch behind it for minutes; children normally exit in <1s.
+    local waited
+    waited="$(wait_ambient_monitor_exit "$name" "$GRACE_WAIT")"
+    log "'$name' retire step 2 (graceful exit) — ambient-monitor cleanup: ${waited}"
+  fi
+  log "'$name' retire step 2 (graceful exit) done"
+
+  # =============================================================================================
+  # STEP 3 (Phase 115 D-13; was Phase 94 step 2): tmux kill-session — hard-stop backstop.
+  # =============================================================================================
+  # Phase 133 D-13a: NO inline retry wrap on this step. tmux kill-session is idempotent — if the
+  # session is already gone (which it will be after step 2's graceful exit in the happy path),
+  # kill-session returns non-zero and we treat that as success (session dead = goal reached).
+  # Do NOT add a for _attempt in 1 2 3 loop here.
+  # EXCEPTION to the "never kill" rule (see "SAFETY: the supervisor NEVER kills a session" below):
+  # this function IS the permanent-removal case. Unlike the keep-alive loop which only recovers
+  # sessions, retire deliberately tears down a session that will never be relaunched on this host.
+  # kill-session is the correct call here (not /exit + poll — that keeps the shell session alive).
+  # Case-insensitive match preserved via match_session (Pitfall 3 lock: -t "$actual" not -t "=name").
+  if [ -n "$actual" ]; then
+    if timeout -k 5 10 tmux kill-session -t "$actual" 2>/dev/null; then
+      log "'$name' retire step 3 (tmux kill-session) success: killed tmux session '$actual'"
+    else
+      # Session likely died between graceful-exit and kill (STEP 2 already SIGTERM'd survivors;
+      # ambient-monitor's cleanup may have taken the pane with it). Idempotent no-op → success.
+      log "'$name' retire step 3 (tmux kill-session) success: session likely already gone (no-op)"
+    fi
+  else
+    log "'$name' retire step 3 (tmux kill-session) success: no tmux session found (no-op)"
+  fi
+
+  # =============================================================================================
+  # STEP 4a (Phase 115 D-12 option b): Delete the .archive-requested sentinel BEFORE folder move.
+  # =============================================================================================
+  # Deleting the sentinel BEFORE the move means a mid-move crash leaves the sentinel in place for
+  # the next tick to retry the whole retire from step 1 (D-15 retry semantics). Silent if not
+  # present (the 180-day dormancy path never wrote it, so this is a no-op for that trigger path).
+  rm -f "$iddir/.archive-requested" 2>/dev/null || true
+  log "'$name' retire step 4a: sentinel .archive-requested deleted (if present)"
+
+  # STEP 4a¼: stop the identity's virtual desktop while its folder (state dir, serve.pid) is still
+  # in place. Never blocks retire; reap_desktops catches a failed stop on a later tick.
+  stop_identity_desktop "$name" "retire"
+
+  # STEP 4a¼b: stop the identity's conversation apps and stash their units inside each app
+  # folder, so they leave with the folder and come back on un-archive. Before 4a⅓ — the app
+  # processes work inside the identity folder and would otherwise be SIGTERM'd (and restarted
+  # by systemd). Never blocks retire.
+  retire_identity_apps "$name" "$iddir"
+
+  # STEP 4a⅓: kill anything the agent left running outside its tmux session (a backgrounded dev
+  # server, a setsid'd watcher) before the folder moves out from under it.
+  kill_procs_under "$iddir" "$name" "retire"
+
+  # =============================================================================================
+  # STEP 4a½: Workspace repo cleanup — delete safely-re-clonable repos so they don't inflate the
+  # archived folder. Fires uniformly for both trigger paths (dormancy sweep AND sentinel drop).
+  # Never blocks retire — unsafe repos and errors log at WARN and are left in place; the folder
+  # move in STEP 4b carries them along. Then strip re-downloadable dependency folders
+  # (node_modules etc.) from whatever was kept.
+  # =============================================================================================
+  clean_workspace_repos "$name" "$iddir"
+  clean_workspace_dependency_dirs "$name" "$iddir"
+
+  # =============================================================================================
+  # STEP 4b (Phase 115 D-13; was Phase 94 step 1): Move identity folder to archive sibling.
+  # =============================================================================================
+  # Create the archive sibling location on demand (first retire on any box creates it).
+  #
+  # Phase 133 D-13/D-13a: inline 3-attempt exponential backoff wraps ONLY the State 1 mv path
+  # (2s/4s sleeps between attempts; State 1 mv failures are the transient fs-race case — EBUSY,
+  # cross-device link during a live mv). State 2 is idempotent success and breaks out on the
+  # first pass. State 3 (collision) and State 4 (anomaly) are hard anomalies, NOT transient —
+  # they hard-fail on the first attempt without retry (retrying a collision would just re-fail
+  # three times uselessly). The former cross-tick failure-counter comment on State 3 has been
+  # removed: the counter mechanism was deleted in Phase 133 D-14.
+  mkdir -p "$IDENTITIES_ARCHIVE_DIR" 2>/dev/null
+
+  local _step4b_ok=0
+  local _attempt _delay
+  for _attempt in 1 2 3; do
+    if [ -d "$iddir" ] && [ ! -d "$archdir" ]; then
+      # State 1 (normal path): active present, archive absent — do the move.
+      if mv "$iddir" "$archdir" 2>/dev/null; then
+        log "'$name' retire step 4b (folder move) success: moved to archive/"
+        _step4b_ok=1
+        break
+      fi
+      # mv failed — fall through to the retry-sleep block below (transient fs race).
+      log "'$name' retire step 4b (folder move) attempt $_attempt/3 transient failure (mv to archive/ failed) — will retry"
+    elif [ ! -d "$iddir" ] && [ -d "$archdir" ]; then
+      # State 2 (retry from prior partial run): active absent, archive present — idempotent success.
+      log "'$name' retire step 4b (folder move) success: folder already in archive/ (State 2 resume)"
+      _step4b_ok=1
+      break
+    elif [ -d "$iddir" ] && [ -d "$archdir" ]; then
+      # State 3 (collision — impossible per D-16 since un-archive is out of scope, but planner-defensive):
+      # both active and archive/ exist. NOT transient — abort on the first attempt.
+      log "ERROR: '$name' retire step 4b (folder move) FAILED: collision — both active and archive/ folders exist; refusing to mv"
+      restore_identity_apps "$name" "$iddir"   # identity stays live → so do its apps
+      return 1
+    else
+      # State 4 (anomaly): active absent, archive absent — nothing to retire. NOT transient.
+      log "ERROR: '$name' retire step 4b (folder move) FAILED: neither active nor archive/ folder exists (anomaly)"
+      return 1
+    fi
+
+    if [ "$_attempt" -lt 3 ]; then
+      _delay=$((2 ** _attempt))
+      log "'$name' retire step 4b (folder move) sleeping ${_delay}s before attempt $((_attempt + 1))/3"
+      sleep "$_delay"
+    fi
+  done
+  if [ "$_step4b_ok" != 1 ]; then
+    log "ERROR: '$name' retire step 4b (folder move) FAILED after 3 attempts — sentinel already deleted, live folder remains"
+    restore_identity_apps "$name" "$iddir"   # identity stays live → so do its apps
+    return 1
+  fi
+
+  log "'$name' retire complete (matrix + graceful-exit + tmux + sentinel-delete + folder-move)"
+  return 0
+}
+
+# ---- archive scan (Phase 94) — daily scan dispatcher ----
+# run_archive_scan()
+#
+# The daily archive-scan branch (D-01 cadence, D-15 silent-by-design). Walks ALL identity
+# directories under $IDENTITIES_DIR/*/. For each identity, applies four guards in order:
+#
+#   (1) require .md file exists         — an empty stub is not a retire candidate
+#   (2) skip if .pinned present         — D-03 guard (Phase 92 sentinel)
+#   (3) skip if .no-dormancy present    — D-04 guard (existing always-on affordance)
+#   (4) skip if is_coordinator returns 0 — D-05 guard (strict frontmatter check, Pitfall 6)
+#   (5) compute age; skip if < ARCHIVE_THRESHOLD_SECONDS — D-06/D-07/D-08 freshness
+#   (6) invoke retire_identity(name)    — atomic from this caller's POV per Phase 133 D-14
+#
+# Phase 133 D-14: the former cross-tick failure counter (a file in $DORMANCY_STATE_DIR) and the
+# stuck-sentinel drop after 3 consecutive daily-pass failures are REMOVED. retire_identity()
+# now recovers inline from transient failures via per-step exponential backoff (D-13a on steps
+# 1 + 4b); a terminal retire failure is logged LOUDLY and the identity is retried on the next
+# daily pass (the identity is still on disk because retire_identity returned before step 4b).
+#
+# D-15 silent discipline: routine per-identity skip/retire log lines are diagnostic plumbing
+# (not announcements). Only the terminal ERROR: retire-failed line carries the ERROR: prefix.
+run_archive_scan() {
+  log "archive-scan: starting scan"
+  mkdir -p "$IDENTITIES_ARCHIVE_DIR" 2>/dev/null
+  local now; now=$(date +%s)
+  local d name
+  for d in "$IDENTITIES_DIR"/*/; do
+    [ -d "$d" ] || continue                          # guard against nullglob miss (no match → literal *)
+    name="$(basename "$d")"
+    [ -f "$d/$name.md" ] || continue                 # require real identity file (same check as resolve_identities)
+
+    # Guard D-03 (pinned): skip silently — D-15 silent discipline for routine skip path.
+    [ -f "$d/.pinned" ] && continue
+    # Guard D-04 (no-dormancy): skip silently.
+    [ -f "$d/.no-dormancy" ] && continue
+    # Guard D-05 (coordinator): is_coordinator returns 0 if the identity has `coordinator: true`
+    # in frontmatter (strict awk detection from Wave 1 — Pitfall 6 lock). Skip silently.
+    if is_coordinator "$d/$name.md"; then continue; fi
+
+    # Freshness D-06/D-07: get_freshness_epoch returns cursor mtime or folder mtime as fallback.
+    local fresh; fresh=$(get_freshness_epoch "$name" "$d")
+    # D-08: threshold 180 days in seconds (constant declared in Wave 1 constants block at L72).
+    local age=$(( now - fresh ))
+    if [ "$age" -lt "$ARCHIVE_THRESHOLD_SECONDS" ]; then continue; fi
+
+    # This identity is dormant for >= 180 days — retire it.
+    # D-15 carve-out: the RETIRE event IS worth naming in the log (diagnostic plumbing).
+    log "archive-scan: '$name' dormant for $((age / 86400))d — retiring"
+
+    # Phase 133 D-14: no cross-tick counter, no stuck-sentinel drop. retire_identity is atomic
+    # from this caller's POV — it either succeeds outright (having recovered inline from
+    # transient failures per D-13a) or fails terminally in one call.
+    if retire_identity "$name"; then
+      log "archive-scan: '$name' retire succeeded"
+    else
+      log "ERROR: archive-scan: '$name' retire FAILED — will retry next daily pass"
+    fi
+  done
+  log "archive-scan: scan complete"
+}
+
+# ---- archive scan (Phase 94) — 24h cadence gate ----
+# run_archive_scan_if_due()
+#
+# Fast-path gate: reads mtime of $ARCHIVE_SCAN_MARKER; if < ARCHIVE_SCAN_INTERVAL seconds
+# have elapsed since the last scan, returns immediately (no-op on most reconcile ticks).
+# When the 24h boundary is crossed, invokes run_archive_scan() and then UNCONDITIONALLY
+# touches the marker (Pitfall 5 lock: cadence gate resets regardless of individual retire
+# outcomes — if the marker only updated on clean scans, a persistent failure would cause
+# the scan to re-run on every 15s tick and starve the keep-alive loop).
+#
+# Called at the TOP of reconcile(), BEFORE resolve_identities (D-01 insertion point per
+# RESEARCH § D-01 map). The walk inside run_archive_scan() sweeps all identity folders on disk
+# independently of resolve_identities' own walk.
+run_archive_scan_if_due() {
+  mkdir -p "$DORMANCY_STATE_DIR" 2>/dev/null         # ensure marker directory exists
+  local last=0
+  [ -f "$ARCHIVE_SCAN_MARKER" ] && last=$(stat -c %Y "$ARCHIVE_SCAN_MARKER" 2>/dev/null || echo 0)
+  local now; now=$(date +%s)
+  if [ $((now - last)) -lt "$ARCHIVE_SCAN_INTERVAL" ]; then return 0; fi
+  log "archive-scan: 24h elapsed since last run — running now"
+  run_archive_scan
+  touch "$ARCHIVE_SCAN_MARKER"   # UNCONDITIONAL — Pitfall 5 lock (cadence gate, not success gate)
+}
+
+# ---- user-initiated archive scan (Phase 115 D-10/D-11/D-15) ----
+# scan_archive_requested_sentinels()
+#
+# Sibling of run_archive_scan_if_due(). Walks $IDENTITIES_DIR/*/ every reconcile tick (~15s
+# cadence, NOT gated by the 24h ARCHIVE_SCAN_INTERVAL) and invokes retire_identity(name)
+# on any identity whose folder contains a `.archive-requested` sentinel.
+#
+# Phase 115 D-11: BYPASSES the .pinned/.no-dormancy/is_coordinator/freshness guards that
+# gate the 180-day run_archive_scan() daily path. Rationale: those guards protect against
+# AUTOMATED retire from surprising the user. A direct click on "Archive" in the app's
+# context menu is not automated — if the user clicked archive on a pinned/coordinator/
+# no-dormancy identity, they meant it. Guard bypass lives at the CALLER (this function
+# doesn't call the four guards); retire_identity() itself remains guard-agnostic so no
+# force-flag parameter is added to it (RESEARCH §3 recommendation).
+#
+# Phase 133 D-14 failure semantics: on any step failure inside retire_identity(), the
+# .archive-requested sentinel is retained (step 4a's rm -f is inside retire_identity and only
+# runs after steps 1-3 succeed AND step 4a itself; on earlier abort the sentinel stays put).
+# The former cross-tick per-user counter file (in $DORMANCY_STATE_DIR) and the stuck-sentinel
+# drop after 3 consecutive per-tick failures are REMOVED — retire_identity() recovers inline
+# from transient failures via per-step exponential backoff (D-13a on steps 1 + 4b), so a
+# failure here is terminal (permanent 4xx, State 3 collision, or 3 exhausted transient
+# attempts). The next reconcile tick re-fires the scanner and picks the identity up again
+# from the on-disk .archive-requested sentinel — no counter bookkeeping, no cross-tick state.
+# The former stuck-sentinel skip guard (which read a legacy sentinel in the archive folder
+# to short-circuit hammering a known-broken retire) is also REMOVED per D-14: legacy
+# stuck-sentinels on pre-Phase-133 boxes are archaeology (D-21) and the operator's fresh
+# click drops a fresh .archive-requested that should retry regardless.
+scan_archive_requested_sentinels() {
+  local d name
+  for d in "$IDENTITIES_DIR"/*/; do
+    [ -d "$d" ] || continue                          # guard against nullglob miss (no match → literal *)
+    name="$(basename "$d")"
+    [ -f "$d/.archive-requested" ] || continue
+
+    # D-11: BYPASS guards. Do NOT check .pinned, .no-dormancy, is_coordinator, or freshness.
+    # A direct user click is not automated — the guards exist to protect against AUTOMATED
+    # retire surprises. If the user clicked archive on a pinned identity, they meant it.
+    log "'$name' user-initiated archive: .archive-requested detected, invoking retire_identity"
+
+    # Phase 133 D-14: no cross-tick counter, no stuck-sentinel drop. retire_identity is atomic
+    # from this caller's POV — it either succeeds outright (having recovered inline from
+    # transient failures per D-13a) or fails terminally in one call. A terminal failure keeps
+    # the .archive-requested sentinel in place, so the next reconcile tick retries naturally.
+    if retire_identity "$name"; then
+      log "'$name' user-initiated archive: retire_identity succeeded"
+    else
+      log "ERROR: '$name' user-initiated archive: retire_identity FAILED — sentinel retained; next tick will retry"
+    fi
+  done
+}
+
+# ---- user-initiated role archive scanner (Phase 133 D-01/D-05/D-06/D-07/D-08/D-09/D-10/D-12) ----
+# scan_role_archive_requested_sentinels()
+#
+# Sibling of scan_archive_requested_sentinels. Walks $ROLES_DIR/*/ every
+# reconcile tick (~15s cadence). For each role folder carrying a
+# `.archive-requested` sentinel:
+#
+#   1. FRESH ENUMERATION (D-07): walk $IDENTITIES_DIR/*/ and collect every
+#      identity whose `roles:` frontmatter lists <role_name> via
+#      identity_has_role(). No snapshot; the disk walk IS the state.
+#
+#   2. FAIL-SOFT CASCADE (D-08): invoke retire_identity(name) on each
+#      enumerated identity. Do NOT abort on individual failures — try every
+#      identity, accumulate failures. Guards (.pinned / .no-dormancy /
+#      coordinator: true) are BYPASSED (D-10) — the scanner doesn't check
+#      them, uniform with the user-initiated identity archive path.
+#
+#   3. CONDITIONAL FOLDER MOVE (D-09): if ALL enumerated identities retired
+#      cleanly, mv $ROLES_DIR/<name>/ to $ROLES_ARCHIVE_DIR/<name>/ and
+#      clean up the sentinel that travelled with the folder. If ANY failed,
+#      keep the role folder in the live tree; emit a LOUD ERROR: log line
+#      naming each failed identity (mirrors the D-15 silent-by-design
+#      carve-out that the removed retire-stuck logging used to occupy).
+#
+#   4. SENTINEL ALWAYS DELETED (D-06): whether cascade succeeded, partially
+#      succeeded, or fully failed, remove the sentinel at end-of-tick. No
+#      cross-tick persistence of the archival intent. Operator retries via a
+#      fresh UI click (D-11), which drops a fresh sentinel and the scanner
+#      naturally picks up only identities not-yet-retired.
+#
+# D-12: empty cascade is the same code path — zero identities → for-loop is
+# zero-iteration → failed stays 0 → folder move happens immediately.
+#
+# D-18: per-box scope — no cross-box coordination. Scanner runs on the box
+# holding the role.
+#
+# D-15 silent discipline exception: the LOUD ERROR: log lines on partial
+# failure are the ONE explicit carve-out (same status as the removed
+# retire-stuck logging in the D-14 refactor). Underlying per-step error
+# details live inside retire_identity()'s own per-step ERROR: log lines,
+# already emitted upstream — cascade partial-failure line references those
+# rather than re-emitting the text ("see per-step retire logs above").
+scan_role_archive_requested_sentinels() {
+  local d role_name identity_dir identity_name
+  for d in "$ROLES_DIR"/*/; do
+    [ -d "$d" ] || continue                          # nullglob-miss guard
+    role_name="$(basename "$d")"
+    [ -f "$d/.archive-requested" ] || continue
+
+    log "role '$role_name' archive: .archive-requested detected — cascading"
+
+    # Destination guard — checked BEFORE the cascade so nothing is retired
+    # when the move can't happen. `mv dir/ existing-dir` nests the role
+    # inside the old archive (roles-archive/<name>/<name>/) and reports
+    # success. An archived role of the same name blocks this archive; the
+    # user has to un-archive or remove the old one first.
+    if [ -e "$ROLES_ARCHIVE_DIR/$role_name" ]; then
+      log "ERROR: role '$role_name' archive REFUSED: $ROLES_ARCHIVE_DIR/$role_name already exists (an archived role with this name). No identities retired; role stays live. Sentinel deleted."
+      rm -f "$d/.archive-requested" 2>/dev/null
+      continue
+    fi
+
+    # D-07: fresh enumeration on every scan.
+    local to_retire=()
+    for identity_dir in "$IDENTITIES_DIR"/*/; do
+      [ -d "$identity_dir" ] || continue
+      identity_name="$(basename "$identity_dir")"
+      [ -f "$identity_dir/$identity_name.md" ] || continue
+      if identity_has_role "$identity_dir/$identity_name.md" "$role_name"; then
+        to_retire+=("$identity_name")
+      fi
+    done
+
+    log "role '$role_name' cascade: ${#to_retire[@]} identities hold this role"
+
+    # D-08 fail-soft cascade + D-10 guards bypassed (scanner doesn't check them).
+    local failed=0 total=${#to_retire[@]} failed_names=""
+    local ident
+    if [ "$total" -gt 0 ]; then
+      for ident in "${to_retire[@]}"; do
+        if retire_identity "$ident"; then
+          log "role '$role_name' cascade: identity '$ident' retired cleanly"
+        else
+          failed=$((failed + 1))
+          failed_names="$failed_names $ident"
+          log "ERROR: role '$role_name' cascade: identity '$ident' FAILED to retire (see per-step retire logs above)"
+        fi
+      done
+    fi
+
+    # D-09: folder moves only if ALL identities retired cleanly.
+    # D-06: sentinel deleted regardless of cascade outcome.
+    # D-12: empty cascade — failed=0 total=0 → folder move fires immediately.
+    if [ "$failed" -eq 0 ]; then
+      mkdir -p "$ROLES_ARCHIVE_DIR" 2>/dev/null
+      if mv "$d" "$ROLES_ARCHIVE_DIR/$role_name" 2>/dev/null; then
+        # Sentinel travelled with the folder into the archive — clean it up there.
+        rm -f "$ROLES_ARCHIVE_DIR/$role_name/.archive-requested" 2>/dev/null
+        log "role '$role_name' cascade complete: $total identities retired, folder moved to archive"
+      else
+        # All-clean cascade but move failed — anomaly. Log LOUD, still delete the live sentinel (D-06).
+        log "ERROR: role '$role_name' cascade: all identities retired but folder move FAILED — role folder retained in live tree"
+        rm -f "$d/.archive-requested" 2>/dev/null
+      fi
+    else
+      # D-09 partial failure — role folder stays live; sentinel still deleted (D-06).
+      log "ERROR: role '$role_name' cascade PARTIAL: $failed/$total identities failed:${failed_names}. Role folder retained in live tree. Retry via UI."
+      rm -f "$d/.archive-requested" 2>/dev/null
+    fi
+  done
+}
+
+# ---- user-initiated app archive scanner (app-archive shape) ----
+# scan_app_archive_requested_sentinels()
+#
+# Sibling of scan_archive_requested_sentinels + scan_role_archive_requested_sentinels.
+# Walks $APPS_DIR/*/ every reconcile tick and invokes archive-app.sh on any
+# app folder carrying a `.archive-requested` sentinel.
+#
+# The heavy lifting (stop + disable systemd unit, stash unit inside folder,
+# move folder to $APPS_ARCHIVE_DIR/<slug>/) lives entirely in
+# $APP_ARCHIVE_SCRIPT (~/.claude/skills/app-development/archive-app.sh) —
+# this scanner is just the trigger. archive-app.sh's own preconditions
+# (no existing archive slot at target, folder must exist) still apply.
+#
+# Failure semantics parallel to identity + role archive:
+#   - Sentinel retained on any failure (archive-app.sh non-zero exit) so
+#     the next reconcile tick retries.
+#   - Sentinel deleted only after archive-app.sh reports success.
+#     archive-app.sh moves the folder as its final step, so on success the
+#     sentinel travels with the folder into the archive tree — we then
+#     rm it from $APPS_ARCHIVE_DIR/<slug>/ to keep the archived tree clean
+#     (parallel to the role-archive rm in scan_role_archive_requested_sentinels).
+#   - No cross-tick counter; no stuck-sentinel drop. archive-app.sh is
+#     idempotent enough that a repeated invocation on a partial state is
+#     safe (the "already archived" precondition check fires and refuses,
+#     which surfaces the anomaly).
+scan_app_archive_requested_sentinels() {
+  local d slug rc output
+  for d in "$APPS_DIR"/*/; do
+    [ -d "$d" ] || continue
+    slug="$(basename "$d")"
+    [ -f "$d/.archive-requested" ] || continue
+
+    if [ ! -x "$APP_ARCHIVE_SCRIPT" ]; then
+      log "ERROR: '$slug' user-initiated app archive: archive-app.sh not found or not executable at $APP_ARCHIVE_SCRIPT — sentinel retained; next tick will retry"
+      continue
+    fi
+
+    log "'$slug' user-initiated app archive: .archive-requested detected, invoking archive-app.sh"
+    rc=0
+    output="$("$APP_ARCHIVE_SCRIPT" "$slug" 2>&1)" || rc=$?
+    if [ -n "$output" ]; then
+      while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        log "  archive-app.sh[$slug]: $line"
+      done <<< "$output"
+    fi
+    if [ "$rc" -eq 0 ]; then
+      # archive-app.sh's atomic final step is `mv $APPS_DIR/$slug $APPS_ARCHIVE_DIR/$slug`
+      # (see substrate/skills/app-development/archive-app.sh). mv preserves
+      # hidden files, so the .archive-requested sentinel travels with the
+      # folder into the archive tree — this rm cleans it up there. If a
+      # future refactor of archive-app.sh changes the folder-relocation
+      # semantics to something that DROPS hidden files (rsync without
+      # --exclude=none, for instance), the sentinel would fail to arrive
+      # and this rm would become a no-op — harmless but the semantics
+      # should be re-verified in that case.
+      rm -f "$APPS_ARCHIVE_DIR/$slug/.archive-requested" 2>/dev/null || true
+      log "'$slug' user-initiated app archive: archive-app.sh succeeded"
+    else
+      log "ERROR: '$slug' user-initiated app archive: archive-app.sh FAILED (rc=$rc) — sentinel retained; next tick will retry"
+    fi
+  done
+}
+
+# ---- project-scoped apps: Move to + archived projects ----
+# scan_app_move_requested_sentinels()
+#
+# Every reconcile tick, walks every live app folder — sidebar ($APPS_DIR/*/), conversation
+# ($IDENTITIES_DIR/*/apps/*/) and project ($FLEET_PROJECTS_DIR/*/apps/*/, not the archive
+# folder) — for a `.move-requested` file the app drops when someone picks Move to. It holds
+# one JSON object: {"to":"sidebar","users":[...]|null} or {"to":"project","project":"<slug>"}.
+# The file is removed before the move runs (a failed move is not retried every tick); the
+# failure reason lands in `.move-failed` in the app's folder. After a conversation app moves
+# away, its agent is told in its conversation (inbox event).
+scan_app_move_requested_sentinels() {
+  local f d slug owner args rc output title dest_label line
+  for f in "$APPS_DIR"/*/.move-requested "$IDENTITIES_DIR"/*/apps/*/.move-requested \
+           "$FLEET_PROJECTS_DIR"/*/apps/*/.move-requested; do
+    [ -f "$f" ] || continue
+    case "$f" in "$FLEET_PROJECTS_DIR"/archive/*) continue ;; esac
+    d="${f%/.move-requested}"
+    slug="$(basename "$d")"
+    [[ "$slug" =~ ^[a-z][a-z0-9-]*$ ]] || { rm -f "$f"; continue; }
+    owner=""
+    case "$d" in "$IDENTITIES_DIR"/*/apps/*) owner="${d#"$IDENTITIES_DIR"/}"; owner="${owner%%/*}" ;; esac
+
+    # One argument per line: the destination words for move-app.sh, or nothing on a bad file.
+    args="$(python3 - "$f" <<'PY' 2>/dev/null
+import json, re, sys
+try:
+    req = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+if not isinstance(req, dict):
+    sys.exit(0)
+to = req.get("to")
+if to == "sidebar":
+    print("sidebar")
+    users = req.get("users")
+    if isinstance(users, list) and users and all(isinstance(u, str) and re.fullmatch(r"[^,\s]+", u) for u in users):
+        print("--users")
+        print(",".join(users))
+    elif users is None:
+        print("--everyone")
+    else:
+        sys.exit(0)
+elif to == "project" and isinstance(req.get("project"), str) and re.fullmatch(r"[a-z0-9-]{1,64}", req["project"]) and req["project"] != "archive":
+    print("project")
+    print(req["project"])
+PY
+)"
+    rm -f "$f"
+    if [ -z "$args" ]; then
+      log "ERROR: app '$slug' move: unreadable .move-requested — dropped"
+      continue
+    fi
+    if [ ! -f "$APP_MOVE_SCRIPT" ]; then
+      log "ERROR: app '$slug' move: $APP_MOVE_SCRIPT missing — request dropped"
+      printf 'move-app.sh is missing on this machine\n' > "$d/.move-failed" 2>/dev/null || true
+      continue
+    fi
+    title="$(python3 -c 'import json,sys; print(str(json.load(open(sys.argv[1])).get("title") or sys.argv[2]))' "$d/app.json" "$slug" 2>/dev/null || printf '%s' "$slug")"
+    local -a argv=()
+    mapfile -t argv <<< "$args"
+    log "app '$slug' move: .move-requested detected (to: ${argv[*]})"
+    rc=0
+    output="$(bash "$APP_MOVE_SCRIPT" "$slug" "${argv[@]}" 2>&1)" || rc=$?
+    while IFS= read -r line; do [ -n "$line" ] && log "  move-app.sh[$slug]: $line"; done <<< "$output"
+    if [ "$rc" -ne 0 ]; then
+      log "ERROR: app '$slug' move FAILED (rc=$rc) — the app stays where it was"
+      printf '%s\n' "$output" | tail -5 > "$d/.move-failed" 2>/dev/null || true
+      continue
+    fi
+    rm -f "$APPS_DIR/$slug/.move-failed" "$FLEET_PROJECTS_DIR"/*/apps/"$slug"/.move-failed 2>/dev/null || true
+    log "app '$slug' move COMPLETE"
+    if [ -n "$owner" ] && [ -d "$IDENTITIES_DIR/$owner" ]; then
+      if [ "${argv[0]}" = project ]; then dest_label="the project '${argv[1]}'"; else dest_label="the sidebar"; fi
+      title="$(printf '%s' "$title" | tr '<>\r\n' '    ' | cut -c1-120)"
+      inbox_drop "$owner" "$(printf '<task-notification>\n<summary>App moved — delivered by the app</summary>\n<event>[app %s] Your conversation app "%s" was moved to %s from its menu. It is no longer one of your conversation apps; its address and data are unchanged. Nothing for you to do.</event>\n</task-notification>' "$slug" "$title" "$dest_label")" \
+        || log "WARN: app '$slug' move: could not tell '$owner' its app moved"
+    fi
+  done
+}
+
+# retire_archived_project_apps()
+#
+# Archiving a project moves its folder into $FLEET_PROJECTS_DIR/archive/, apps and all. Every
+# tick, any installed app unit whose folder was a project app's and is now gone is matched to
+# its folder under the archive; its units are stashed there (reserving the port) and removed,
+# so nothing keeps running from a folder that moved. A unit whose folder isn't found in the
+# archive either is left alone (an app being created writes its units just before its folder).
+retire_archived_project_apps() {
+  local unit dir slug rest found cand
+  [ -d "$FLEET_PROJECTS_DIR/archive" ] || return 0
+  for unit in "$SYSTEMD_UNIT_DIR"/app-*.service; do
+    [ -f "$unit" ] || continue
+    dir="$(sed -n 's/^WorkingDirectory=//p' "$unit" | head -1)"
+    case "$dir" in "$FLEET_PROJECTS_DIR"/*/apps/*) ;; *) continue ;; esac
+    case "$dir" in "$FLEET_PROJECTS_DIR"/archive/*) continue ;; esac
+    [ -d "$dir" ] && continue
+    rest="${dir#"$FLEET_PROJECTS_DIR"/*/apps/}"
+    slug="${rest%%/*}"
+    [[ "$slug" =~ ^[a-z][a-z0-9-]*$ ]] || continue
+    [ "$unit" = "$SYSTEMD_UNIT_DIR/app-$slug.service" ] || continue
+    found=""
+    for cand in "$FLEET_PROJECTS_DIR"/archive/*/apps/"$slug"; do
+      [ -d "$cand" ] && found="$cand"
+    done
+    [ -n "$found" ] || continue
+    if ! bash "$APP_UNITS_SCRIPT" stash "$slug" "$found" >/dev/null 2>&1; then
+      log "WARN: project app '$slug' (archived with its project): could not stash units into $found; uninstalling anyway"
+    fi
+    if bash "$APP_UNITS_SCRIPT" uninstall "$slug" >/dev/null 2>&1; then
+      log "project app '$slug' archived with its project: stopped, units stashed in $found"
+    else
+      log "WARN: project app '$slug' archived with its project: could not uninstall — run app-units.sh uninstall $slug by hand"
+    fi
+  done
+}
+
+# ============================================================================
+# UN-ARCHIVE HOST-SIDE SHAPE — three scanners paralleling the archive scanners.
+# ============================================================================
+# Reverse of the archive gesture: an operator (agent hand-drop today, UI +
+# endpoint later per shape 2) leaves `.unarchive-requested` inside the target
+# ARCHIVE folder (`~/fleet/identities-archive/<name>/`, `~/fleet/roles-archive/
+# <name>/`, or `~/fleet/apps-archive/<slug>/`), and the corresponding scanner
+# runs the type-specific reverse-of-archive body on the next reconcile tick.
+#
+# Shape governance: shape-unarchive-host-side.md alongside the campaign
+# artifact. Endpoints + frontend live in shape-unarchive-frontend-backend.
+
+# ---- extract frontmatter roles from an identity file ----
+# _account_profile_code <base> <mxid> [token]
+# Prints the HTTP status of the account's profile lookup: 200 = the account is on, 404 = it has
+# no profile (deactivate-with-erase deletes it). Asks without a token first; a server that
+# requires a login for profile lookups (401/403) is asked again with the token, if given.
+_account_profile_code() {
+  local base="$1" mxid="$2" token="${3:-}" url code
+  url="$base/profile/$(jq -rn --arg u "$mxid" '$u|@uri')"
+  code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$url" 2>/dev/null)
+  if { [ "$code" = 401 ] || [ "$code" = 403 ]; } && [ -n "$token" ]; then
+    code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
+      -H "Authorization: Bearer $token" "$url" 2>/dev/null)
+  fi
+  printf '%s' "$code"
+}
+
+# _extract_frontmatter_display_name <identity_file_path>
+# Prints the identity's `displayName:` frontmatter value (quotes and trailing comment removed,
+# control characters dropped, at most 100 UTF-16 units like the backend's check), or nothing when
+# absent or unreadable.
+# Used to give a reactivated chat account its name back — archiving's erase deletes it.
+_extract_frontmatter_display_name() {
+  [ -f "$1" ] || return 0
+  python3 - "$1" <<'PYEOF' 2>/dev/null || true
+import re, sys
+lines = open(sys.argv[1], encoding="utf-8", errors="replace").read().lstrip("\ufeff").replace("\r\n", "\n").split("\n")
+if lines and lines[0].strip() == "---":
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        m = re.match(r"^displayName:\s*(.*)$", line)
+        if not m:
+            continue
+        v = m.group(1).strip()
+        q = re.match(r"^([\"'])(.*?)\1", v)
+        if q:
+            v = q.group(2)
+        else:
+            v = re.sub(r"\s+#.*$", "", v)
+        v = re.sub(r"[\x00-\x1f\x7f]", "", v).strip()
+        while len(v.encode("utf-16-le")) > 200:  # the backend caps at 100 UTF-16 units
+            v = v[:-1]
+        sys.stdout.write(v)
+        break
+PYEOF
+}
+
+# _extract_frontmatter_roles <identity_file_path>
+# Prints a JSON array of role names on stdout (never with a trailing newline).
+# Reads ONLY the `roles:` key (the singular `role:` is not read). The embedded
+# Python is a verbatim copy of the canonical parser in
+# substrate/scripts/tests/fixtures/roles_frontmatter_reference.py — keep in sync;
+# tests/roles-frontmatter-conformance.test.sh runs every case against it. It
+# accepts scalar, quoted, flow, bare-comma and block (indented or not) forms,
+# trailing comments, CRLF; drops names failing ^[a-z0-9][a-z0-9_-]{0,63}$ and
+# dedupes keeping order.
+# Returns 0 on parse success (even if no roles field found — prints []); 1 when
+# the file is missing/unreadable or has no ---...--- frontmatter block (still
+# prints []), so the unarchive pre-flight can refuse a malformed file.
+# Zero external YAML dependency — stdlib-only embedded Python. PyYAML is NOT a
+# substrate-baseline dependency and must not be introduced.
+_extract_frontmatter_roles() {
+  local path="$1"
+  [ -f "$path" ] || { printf '%s' '[]'; return 1; }
+  python3 - "$path" <<'PYEOF'
+import sys, re, json
+
+ROLES_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+def parse_roles_frontmatter(text):
+    lines = text.lstrip("\ufeff").replace("\r\n", "\n").split("\n")
+    if not lines or lines[0].strip() != "---":
+        return []
+    end = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            end = i
+            break
+    if end is None:
+        return []
+
+    def clean(s):
+        s = re.sub(r"\s+#.*$", "", s).strip()
+        return s.strip("\"'").strip()
+
+    raw = []
+    for i in range(1, end):
+        m = re.match(r"^roles:(.*)$", lines[i])
+        if not m:
+            continue
+        inline = re.sub(r"(^|\s)#.*$", "", m.group(1)).strip()
+        if inline in ("~", "null", "Null", "NULL"):
+            break  # YAML null (`roles: ~` / `roles: null`): zero roles
+        if inline:
+            if inline.startswith("[") and inline.endswith("]"):
+                inline = inline[1:-1]
+            raw = [clean(p) for p in inline.split(",")]
+        else:
+            for j in range(i + 1, end):
+                s = lines[j].strip()
+                if not s or s.startswith("#"):
+                    continue
+                m2 = re.match(r"^-\s*(.*)$", s)
+                if not m2:
+                    break
+                raw.append(clean(m2.group(1)))
+        break
+
+    out = []
+    for r in raw:
+        if r and ROLES_SLUG_RE.match(r) and r not in out:
+            out.append(r)
+    return out
+
+
+def has_frontmatter(text):
+    lines = text.lstrip("\ufeff").replace("\r\n", "\n").split("\n")
+    if not lines or lines[0].strip() != "---":
+        return False
+    return any(ln.strip() == "---" for ln in lines[1:])
+
+
+try:
+    with open(sys.argv[1], encoding="utf-8-sig", errors="replace") as f:
+        text = f.read()
+except OSError:
+    print('[]', end=''); sys.exit(1)
+
+print(json.dumps(parse_roles_frontmatter(text)), end='')
+sys.exit(0 if has_frontmatter(text) else 1)
+PYEOF
+}
+
+# _prepend_unarchive_banner(path, ts)
+#
+# Prepend a one-line un-archive banner to an identity file's body (right after
+# the YAML frontmatter block). Called by scan_identity_unarchive_requested_sentinels
+# as Step 7, after the folder has been moved back to the live tree.
+#
+# Shape rationale (shape-unarchive-wake-up-smoothing.md): the agent coming back
+# from un-archive otherwise has no in-session signal that anything happened;
+# the banner reaches it with the identity file, which every fresh /id load reads.
+# Wording stays general — no mention of specific body sections — so the banner
+# makes sense regardless of what shape the agent's notes happen to be in. The
+# banner carries the un-archive timestamp so an agent can judge how long they
+# were away. No idempotence machinery: if the agent follows the banner's
+# "delete once caught up" instruction, banners never stack.
+#
+# Returns 0 on successful prepend, 1 on error (no frontmatter found, read or
+# write failure). Caller should log but NOT abort — the un-archive is otherwise
+# complete at this point and the folder-move already succeeded.
+_prepend_unarchive_banner() {
+  local path="$1" ts="$2"
+  [ -f "$path" ] || return 1
+  python3 - "$path" "$ts" <<'PYEOF'
+import sys, os, tempfile
+
+path, ts = sys.argv[1], sys.argv[2]
+
+with open(path, 'r', encoding='utf-8') as f:
+    text = f.read()
+
+# Preserve the file's line-ending convention. Split on '\n' and remember if the
+# original file ends with a newline so we can round-trip without silent drift.
+lines = text.split('\n')
+trailing_newline = text.endswith('\n')
+
+# Find the frontmatter close line (second '---' at column 0). Line 0 must be
+# the opener; if it isn't, bail — identity files should always have frontmatter
+# per the id-skill convention, so a missing frontmatter is a signal that
+# something upstream is wrong, not a case to tolerate silently.
+if not lines or lines[0].strip() != '---':
+    sys.exit(1)
+fm_close = None
+for i in range(1, len(lines)):
+    if lines[i].strip() == '---':
+        fm_close = i
+        break
+if fm_close is None:
+    sys.exit(1)
+
+banner = (
+    f"> ⚠️ **You were unarchived at {ts}.** The state of the world "
+    "may have moved since you were archived — what you have in context "
+    "and in this file could be out of date. Delete this banner once you've "
+    "caught up."
+)
+
+# Inject: [frontmatter...] [blank] [banner] [blank] [rest-of-body...]
+new_lines = lines[:fm_close + 1] + ['', banner, ''] + lines[fm_close + 1:]
+new_text = '\n'.join(new_lines)
+if trailing_newline and not new_text.endswith('\n'):
+    new_text += '\n'
+
+# Atomic write via same-dir temp + rename.
+d = os.path.dirname(path) or '.'
+fd, tmp = tempfile.mkstemp(prefix='.unarchive-banner.', dir=d)
+try:
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        f.write(new_text)
+    os.replace(tmp, path)
+except Exception:
+    try: os.unlink(tmp)
+    except OSError: pass
+    raise
+PYEOF
+}
+
+# ---- user-initiated identity un-archive scanner (one-path un-archive shape) ----
+# scan_identity_unarchive_requested_sentinels()
+#
+# Walks $IDENTITIES_ARCHIVE_DIR/*/ every reconcile tick and un-archives any
+# archived identity whose folder carries a `.unarchive-requested` flag. The flag
+# is the ONLY trigger: the front-end button and agents drop the same one. See
+# .planning/campaigns/un-archiving/shape-unarchive-one-path-supervisor-reactivation.md.
+#
+# Archiving switches the chat (Matrix) account off, which erases its password on
+# the chat server. Only the backend holds the chat admin credentials, so the
+# supervisor asks it — via the identity-reactivate agent service (request files
+# in $SERVICE_REQUESTS_DIR, see substrate/scripts/fleet-service for the wire
+# protocol) — to reactivate the account. The backend generates a fresh password
+# and returns it in the response; the supervisor saves it into the archived
+# relay.json and logs in normally to get a fresh access_token. The work spans
+# several ticks; progress is kept in $d/.unarchive-reactivate (the pending
+# request uuid, or the literal "saved" once the new password is in relay.json).
+#
+# Per-identity flow (all steps LOG; secrets never logged):
+#
+#   Pre-flight 1 (name collision) and Pre-flight 2 (every role live) — refuse.
+#
+#   Account step:
+#     a. whoami with relay.json's access_token → 200: account live and this box
+#        holds a working login (crash recovery) → go to the folder steps.
+#     b. state "saved" → password login with relay.json's password → token
+#        saved, go to the folder steps. Rejected → refuse. Other → retry.
+#     c. state <uuid> → read <uuid>.response.json if present:
+#          ok        → save password into relay.json, state "saved", log in next tick
+#          transient → drop the request, file a new one next tick
+#          account_active → state "saved" (try this box's password)
+#          other     → refuse with the backend's reason
+#        No response after UNARCHIVE_REQUEST_STALE_SECS → drop it, re-file.
+#     d. no state → try a login with relay.json's password (an earlier attempt
+#        may already have saved the new one); rejected → file a request naming
+#        relay.json's user_id (never a password).
+#
+#   Folder steps: .dormant unless .no-dormancy, clear the flag + state + any old
+#   refusal note, mv archive → live, restore the conversation's apps, prepend
+#   the "you were unarchived" banner.
+#
+#   Refuse = write the reason to $d/.unarchive-refused (the front end's wait and
+#   asking agents read it), drop any pending request, delete the flag. The front
+#   end's wait treats "archive folder present, flag gone" as refused.
+#
+# ACCEPTED CAVEAT: room memberships do NOT survive reactivation (archive's
+# deactivate uses erase=true). The backend re-joins the agents directory room;
+# other rooms are not restored. New DMs work naturally.
+SERVICE_REQUESTS_DIR="${AGENT_SERVICE_REQUESTS_DIR:-$HOME/fleet/service-requests}"
+UNARCHIVE_REQUEST_STALE_SECS="${AGENT_UNARCHIVE_REQUEST_STALE_SECS:-600}"
+
+# _unarchive_drop_request <uuid> — remove every file of one service request.
+_unarchive_drop_request() {
+  local uuid="$1"
+  [[ "$uuid" =~ ^[A-Za-z0-9-]+$ ]] || return 0
+  rm -f -- "${SERVICE_REQUESTS_DIR:?}/${uuid:?}".* 2>/dev/null || true
+}
+
+# _unarchive_refuse <archive-dir> <name> <reason>
+_unarchive_refuse() {
+  local d="$1" name="$2" reason="$3" st
+  log "ERROR: '$name' un-archive REFUSED: $reason"
+  st=$(cat "$d/.unarchive-reactivate" 2>/dev/null || true)
+  [ "$st" = "saved" ] || _unarchive_drop_request "$st"
+  rm -f "${d:?}/.unarchive-reactivate"
+  printf '%s\n' "$reason" > "$d/.unarchive-refused.tmp.$$" \
+    && mv -f "$d/.unarchive-refused.tmp.$$" "$d/.unarchive-refused"
+  rm -f "${d:?}/.unarchive-requested"
+}
+
+# _unarchive_relay_set <relay.json> [jq args...] <jq-filter> — atomic 0600 rewrite.
+_unarchive_relay_set() {
+  local f="$1"; shift
+  local tmp="$f.tmp.$$"
+  if ( umask 077; jq "$@" "$f" > "$tmp" ) && mv -f "$tmp" "$f"; then
+    chmod 600 "$f"
+    return 0
+  fi
+  rm -f "${tmp:?}"
+  return 1
+}
+
+# _unarchive_login <relay.json> <base> <mxid> <name> — password login with the
+# password saved in relay.json; on success saves the fresh access_token.
+#   returns 0 = logged in, 1 = transient failure, 3 = password rejected (or none saved)
+_unarchive_login() {
+  local relay="$1" base="$2" mxid="$3" name="$4"
+  local password body resp http newtok
+  password=$(jq -r '.password // empty' "$relay" 2>/dev/null)
+  [ -n "$password" ] || return 3
+  body=$(jq -n --arg u "$mxid" --arg p "$password" \
+    '{type:"m.login.password", identifier:{type:"m.id.user", user:$u}, password:$p}')
+  resp=$(curl -sS -w '\n%{http_code}' --max-time 15 -X POST \
+    -H 'Content-Type: application/json' --data-binary @- "$base/login" <<<"$body" 2>/dev/null)
+  http=$(printf '%s\n' "$resp" | tail -1)
+  case "$http" in
+    200)
+      newtok=$(printf '%s\n' "$resp" | sed '$d' | jq -r '.access_token // empty' 2>/dev/null)
+      if [ -z "$newtok" ]; then
+        log "ERROR: '$name' un-archive: login returned no access_token — retrying next tick"
+        return 1
+      fi
+      # shellcheck disable=SC2016  # jq variables, not shell
+      if ! _unarchive_relay_set "$relay" --arg t "$newtok" '.access_token = $t | .token = $t'; then
+        log "ERROR: '$name' un-archive: could not save the new chat login into relay.json — retrying next tick"
+        return 1
+      fi
+      log "'$name' un-archive: logged in with the saved password; fresh access_token saved"
+      return 0
+      ;;
+    401|403)
+      log "'$name' un-archive: login with the saved password rejected (http $http)"
+      return 3
+      ;;
+    *)
+      log "'$name' un-archive: login attempt failed http=$http (transient) — retrying next tick"
+      return 1
+      ;;
+  esac
+}
+
+# _unarchive_account_step <archive-dir> <name>
+#   returns 0 = account live and relay.json holds a working token (continue)
+#           1 = waiting (try again next tick)
+#           2 = refused (already reported via _unarchive_refuse)
+_unarchive_account_step() {
+  local d="$1" name="$2"
+  local relay="$d/relay.json"
+  if [ ! -f "$relay" ]; then
+    _unarchive_refuse "$d" "$name" "the archived identity has no saved chat login (relay.json is missing)"
+    return 2
+  fi
+  local base mxid token
+  base=$(jq -r '.base // empty' "$relay" 2>/dev/null)
+  mxid=$(jq -r '.user_id // empty' "$relay" 2>/dev/null)
+  token=$(jq -r '.access_token // .token // empty' "$relay" 2>/dev/null)
+  if [ -z "$base" ] || [ -z "$mxid" ]; then
+    _unarchive_refuse "$d" "$name" "the archived identity's saved chat login is missing its server or account"
+    return 2
+  fi
+
+  # a. Already live with a working login? A working token alone doesn't prove it: a token the
+  #    fleet admin issued by logging in as this account survives archiving's deactivate, so
+  #    whoami answers 200 for a switched-off account. Deactivate-with-erase deletes the
+  #    account's profile, so the profile lookup (404) is what tells a switched-off account apart.
+  if [ -n "$token" ]; then
+    local code pcode
+    code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
+      -H "Authorization: Bearer $token" "$base/account/whoami" 2>/dev/null)
+    if [ "$code" = "200" ]; then
+      pcode=$(_account_profile_code "$base" "$mxid" "$token")
+      case "$pcode" in
+        200)
+          log "'$name' un-archive: chat login already works — proceeding to folder move"
+          return 0
+          ;;
+        404)
+          log "'$name' un-archive: saved token answers but the account is switched off on the chat server (no profile) — reactivating"
+          ;;
+        *)
+          log "'$name' un-archive: account profile check failed http=$pcode (transient) — retrying next tick"
+          return 1
+          ;;
+      esac
+    fi
+  fi
+
+  local state
+  state=$(cat "$d/.unarchive-reactivate" 2>/dev/null || true)
+
+  # b. New password saved — log in with it.
+  if [ "$state" = "saved" ]; then
+    _unarchive_login "$relay" "$base" "$mxid" "$name"
+    case $? in
+      0) rm -f "${d:?}/.unarchive-reactivate"; return 0 ;;
+      3)
+        _unarchive_refuse "$d" "$name" "the chat account is active but logging in with this box's saved password failed — ask a box maintainer to switch the account off so it can be reactivated again"
+        return 2
+        ;;
+      *) return 1 ;;
+    esac
+  fi
+
+  # c. A reactivation request is pending.
+  if [[ "$state" =~ ^[A-Za-z0-9-]+$ ]]; then
+    local resp_file="$SERVICE_REQUESTS_DIR/$state.response.json"
+    if [ -f "$resp_file" ]; then
+      local okv code msg pw
+      okv=$(jq -r '.ok' "$resp_file" 2>/dev/null)
+      if [ "$okv" = "true" ]; then
+        pw=$(jq -r '.result.password // empty' "$resp_file" 2>/dev/null)
+        if [ -z "$pw" ]; then
+          log "ERROR: '$name' un-archive: reactivation response carried no password — asking again next tick"
+          _unarchive_drop_request "$state"
+          rm -f "${d:?}/.unarchive-reactivate"
+          return 1
+        fi
+        # shellcheck disable=SC2016  # jq variables, not shell
+        if ! _unarchive_relay_set "$relay" --arg p "$pw" '.password = $p'; then
+          log "ERROR: '$name' un-archive: could not save the new chat password into relay.json — retrying next tick"
+          return 1
+        fi
+        printf 'saved\n' > "$d/.unarchive-reactivate"
+        _unarchive_drop_request "$state"
+        log "'$name' un-archive: chat account reactivated by the backend; new password saved — logging in next tick"
+        return 1
+      fi
+      code=$(jq -r '.error.code // "unknown"' "$resp_file" 2>/dev/null)
+      msg=$(jq -r '.error.message // empty' "$resp_file" 2>/dev/null)
+      _unarchive_drop_request "$state"
+      rm -f "${d:?}/.unarchive-reactivate"
+      case "$code" in
+        matrix_unavailable|expired|queue_full|internal|unknown_service|not_configured)
+          log "'$name' un-archive: reactivation request failed ($code) — will ask again next tick"
+          return 1
+          ;;
+        account_active)
+          # Already live (e.g. reactivated earlier but this box never got the
+          # reply). Try the password this box has; step b refuses if it's wrong.
+          printf 'saved\n' > "$d/.unarchive-reactivate"
+          log "'$name' un-archive: chat account already active — trying this box's saved password next tick"
+          return 1
+          ;;
+        *)
+          _unarchive_refuse "$d" "$name" "the backend refused to reactivate the chat account ($code)${msg:+: $msg}"
+          return 2
+          ;;
+      esac
+    fi
+    local age=$(( $(date +%s) - $(stat -c %Y "$d/.unarchive-reactivate" 2>/dev/null || date +%s) ))
+    if [ "$age" -ge "$UNARCHIVE_REQUEST_STALE_SECS" ]; then
+      log "'$name' un-archive: reactivation request $state unanswered after ${age}s — dropping it and asking again"
+      _unarchive_drop_request "$state"
+      rm -f "${d:?}/.unarchive-reactivate"
+    fi
+    return 1
+  fi
+
+  # d. Account may already be live with the password this box has (an earlier
+  # attempt saved it, then was refused or interrupted) — try that first.
+  _unarchive_login "$relay" "$base" "$mxid" "$name"
+  case $? in
+    0) return 0 ;;
+    1) return 1 ;;
+  esac
+
+  # File a reactivation request (names the account and its display name — never a password).
+  local display_name
+  display_name=$(_extract_frontmatter_display_name "$d/$name.md")
+  mkdir -p "$SERVICE_REQUESTS_DIR" 2>/dev/null || true
+  local uuid
+  uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null)
+  if [ -z "$uuid" ]; then
+    log "ERROR: '$name' un-archive: could not generate a request id — retrying next tick"
+    return 1
+  fi
+  if jq -cn --arg a "$mxid" --arg n "$display_name" --arg t "$(date -u +%FT%TZ)" \
+      '{service:"identity-reactivate", requested_at:$t,
+        input:({account:$a} + (if $n == "" then {} else {display_name:$n} end))}' \
+      > "$SERVICE_REQUESTS_DIR/$uuid.json.tmp.$$" \
+    && mv -f "$SERVICE_REQUESTS_DIR/$uuid.json.tmp.$$" "$SERVICE_REQUESTS_DIR/$uuid.json"; then
+    printf '%s\n' "$uuid" > "$d/.unarchive-reactivate"
+    log "'$name' un-archive: asked the backend to reactivate $mxid (request $uuid)"
+  else
+    _unarchive_drop_request "$uuid"
+    log "ERROR: '$name' un-archive: could not write the reactivation request — retrying next tick"
+  fi
+  return 1
+}
+
+scan_identity_unarchive_requested_sentinels() {
+  local d name
+  for d in "$IDENTITIES_ARCHIVE_DIR"/*/; do
+    [ -d "$d" ] || continue                          # nullglob-miss guard
+    d="${d%/}"
+    name="$(basename "$d")"
+    [ -f "$d/.unarchive-requested" ] || continue
+
+    log "'$name' un-archive: .unarchive-requested detected"
+    # A refusal note from an earlier attempt no longer applies.
+    rm -f "${d:?}/.unarchive-refused"
+
+    # Pre-flight 1: name collision.
+    if [ -e "$IDENTITIES_DIR/$name" ]; then
+      _unarchive_refuse "$d" "$name" "a live identity named '$name' already exists on this box"
+      continue
+    fi
+
+    # Pre-flight 2: every role the identity held must be live.
+    local ident_file="$d/$name.md"
+    if [ ! -f "$ident_file" ]; then
+      _unarchive_refuse "$d" "$name" "the archived identity file $name.md is missing"
+      continue
+    fi
+    local roles_json
+    if ! roles_json=$(_extract_frontmatter_roles "$ident_file"); then
+      _unarchive_refuse "$d" "$name" "couldn't read the roles in $name.md"
+      continue
+    fi
+    local missing=() role
+    while IFS= read -r role; do
+      [ -z "$role" ] && continue
+      [ -d "$ROLES_DIR/$role" ] || missing+=("$role")
+    done < <(printf '%s' "$roles_json" | jq -r '.[]?' 2>/dev/null)
+    if [ "${#missing[@]}" -gt 0 ]; then
+      _unarchive_refuse "$d" "$name" "un-archive role(s) ${missing[*]} first — this identity depends on them"
+      continue
+    fi
+
+    # Account step (may span several ticks).
+    if ! _unarchive_account_step "$d" "$name"; then continue; fi
+
+    # Step 4: Conditional .dormant write (preserve pre-archive .no-dormancy).
+    # Checked write: moving the identity live without .dormant would defeat the
+    # "un-archive comes back dormant" invariant — abort with the flag retained.
+    if [ -f "$d/.no-dormancy" ]; then
+      log "'$name' un-archive step 4: .no-dormancy present in archive — always-on intent preserved, skipping .dormant write"
+    else
+      if ! : > "$d/.dormant"; then
+        log "ERROR: '$name' un-archive step 4 (.dormant write) FAILED at $d/.dormant — flag retained; next tick will retry"
+        continue
+      fi
+      log "'$name' un-archive step 4: .dormant written in archive folder"
+    fi
+
+    # Step 5: clear the flag, progress state and any old refusal note BEFORE
+    # the mv (archive-side discipline).
+    rm -f "${d:?}/.unarchive-refused" "${d:?}/.unarchive-reactivate" "${d:?}/.unarchive-requested"
+
+    # Step 6: mv archive → live.
+    mkdir -p "$IDENTITIES_DIR" 2>/dev/null || true
+    if ! mv "$d" "$IDENTITIES_DIR/$name"; then
+      log "ERROR: '$name' un-archive step 6 (mv archive→live) FAILED — flag already deleted; identity retained in archive tree with its chat account live + .dormant written. Investigate manually; drop a fresh .unarchive-requested to retry once the collision is resolved."
+      continue
+    fi
+    log "'$name' un-archive COMPLETE: folder moved to live tree"
+    restore_identity_apps "$name" "$IDENTITIES_DIR/$name"
+
+    # Step 7: Prepend un-archive banner (non-fatal).
+    local live_ident_file="$IDENTITIES_DIR/$name/$name.md"
+    local unarchive_ts
+    unarchive_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    if _prepend_unarchive_banner "$live_ident_file" "$unarchive_ts"; then
+      log "'$name' un-archive step 7: in-session banner prepended to identity file (ts=$unarchive_ts)"
+    else
+      log "WARN: '$name' un-archive step 7 (banner prepend) FAILED — un-archive is otherwise complete; agent won't see the in-session un-archive banner. Investigate: $live_ident_file"
+    fi
+  done
+}
+
+# ---- user-initiated role un-archive scanner (un-archive host-side shape) ----
+# scan_role_unarchive_requested_sentinels()
+#
+# Sibling of scan_role_archive_requested_sentinels. Walks $ROLES_ARCHIVE_DIR/*/
+# every reconcile tick and reverses the archive for any archived role whose
+# folder carries a `.unarchive-requested` sentinel.
+#
+# Body is simple by design: no cascade to identities (identities retired
+# alongside the role during archive stay retired until independently
+# un-archived per shape scope).
+#
+#   Pre-flight (name collision, permanent-refuse):
+#     If $ROLES_DIR/$name already exists → LOUD ERROR log, delete the
+#     `.unarchive-requested` sentinel, skip. Operator resolves manually.
+#
+#   Body:
+#     rm .unarchive-requested (archive-side discipline: sentinel deleted
+#     BEFORE the mv, mirroring role-archive scanner's D-06 posture) →
+#     mv $ROLES_ARCHIVE_DIR/$name $ROLES_DIR/$name.
+scan_role_unarchive_requested_sentinels() {
+  local d name
+  for d in "$ROLES_ARCHIVE_DIR"/*/; do
+    [ -d "$d" ] || continue                          # nullglob-miss guard
+    name="$(basename "$d")"
+    [ -f "$d/.unarchive-requested" ] || continue
+
+    log "role '$name' user-initiated un-archive: .unarchive-requested detected"
+
+    # Pre-flight: name collision refuse.
+    if [ -e "$ROLES_DIR/$name" ]; then
+      log "ERROR: role '$name' un-archive REFUSED: live role already exists at $ROLES_DIR/$name — resolve the collision manually. Sentinel deleted."
+      rm -f "$d/.unarchive-requested"
+      continue
+    fi
+
+    # Delete sentinel BEFORE mv (mirrors archive-side ordering discipline).
+    rm -f "$d/.unarchive-requested"
+
+    # mkdir -p guards against a fresh box / test scratch dir where $ROLES_DIR
+    # doesn't exist yet; parity with retire_identity + the app un-archive scanner.
+    mkdir -p "$ROLES_DIR" 2>/dev/null || true
+    if ! mv "$d" "$ROLES_DIR/$name"; then
+      log "ERROR: role '$name' un-archive: mv archive→live FAILED — sentinel already deleted; role retained in archive tree. Investigate manually; drop a fresh .unarchive-requested to retry once the collision is resolved."
+      continue
+    fi
+    log "role '$name' un-archive COMPLETE: folder moved to live tree"
+  done
+}
+
+# ---- user-initiated app un-archive scanner (un-archive host-side shape) ----
+# scan_app_unarchive_requested_sentinels()
+#
+# Sibling of scan_app_archive_requested_sentinels. Walks $APPS_ARCHIVE_DIR/*/
+# every reconcile tick and reverses the archive for any archived app whose
+# folder carries a `.unarchive-requested` sentinel.
+#
+# Folds the standalone restore-app.sh's logic into the supervisor (the script
+# is removed from the app-development skill in the same shape). Preserves the
+# flock discipline against concurrent create-app.sh port grabs.
+#
+# Per-app flow:
+#
+#   Pre-flight (permanent-refuse — LOUD log + sentinel deleted):
+#     - Live folder collision at $APPS_DIR/$slug
+#     - Unit-file collision at $SYSTEMD_UNIT_DIR/app-$slug.service
+#     - Stashed unit missing at $arch_dir/app-$slug.service.archived
+#       (can't reconstruct the port without it — the operator may need to
+#       re-create fresh instead of restoring)
+#     - Stashed unit doesn't declare PORT= (same reason)
+#
+#   Under $APP_CREATE_LOCK (flock -x, 30s wait):
+#     Port collision check → sentinel delete → mv archive→live → install
+#     unit file (cp stash → $SYSTEMD_UNIT_DIR, rm stash from moved-back
+#     folder). Same locked sequence create-app.sh + archive-app.sh use so
+#     concurrent create-and-restore cannot race on port assignment.
+#
+#   Outside lock (best-effort — folder is live either way):
+#     daemon-reload → enable+start → is-active check → WARN log on any
+#     failure. Sentinel is already gone by this point (deleted inside the
+#     lock, before the mv, mirroring the identity + role un-archive scanner
+#     discipline).
+# unarchive_current_style_app <slug> <archive-dir> — un-archive a sidebar app whose stash
+# holds the current five-unit layout. Same discipline as the old-style path below:
+# pre-flight refusals delete the sentinel; under the create lock, refuse a port another
+# installed app now holds, delete the sentinel, move the folder back, then let
+# app-units.sh reinstall + start every unit on the stashed port.
+unarchive_current_style_app() {
+  local slug="$1" d="$2" live_dir="$APPS_DIR/$1" port
+  if [ -e "$live_dir" ]; then
+    log "ERROR: app '$slug' un-archive REFUSED: live folder already exists at $live_dir. Sentinel deleted."
+    rm -f "$d/.unarchive-requested"; return 0
+  fi
+  if [ -e "$SYSTEMD_UNIT_DIR/app-$slug.socket" ] || [ -e "$SYSTEMD_UNIT_DIR/app-$slug.service" ]; then
+    log "ERROR: app '$slug' un-archive REFUSED: units for app-$slug are already installed. Sentinel deleted."
+    rm -f "$d/.unarchive-requested"; return 0
+  fi
+  port=$(sed -n 's/^ListenStream=127\.0\.0\.1:\([0-9][0-9]*\)$/\1/p' "$d/app-$slug.socket.archived" | head -1)
+  if [ -z "$port" ]; then
+    log "ERROR: app '$slug' un-archive REFUSED: could not read the port from $d/app-$slug.socket.archived. Sentinel deleted."
+    rm -f "$d/.unarchive-requested"; return 0
+  fi
+  local rc=0
+  (
+    exec 200>"$APP_CREATE_LOCK"
+    flock -x -w 30 200 || exit 42
+    if cat "$SYSTEMD_UNIT_DIR"/app-*.socket 2>/dev/null | grep -Fxq -- "ListenStream=127.0.0.1:$port" \
+       || cat "$SYSTEMD_UNIT_DIR"/app-*.service 2>/dev/null | grep -Fxq -- "Environment=PORT=$port"; then
+      exit 43
+    fi
+    rm -f "$d/.unarchive-requested"
+    mkdir -p "$APPS_DIR" 2>/dev/null || true
+    mv "$d" "$live_dir" || exit 44
+    exit 0
+  )
+  rc=$?
+  case "$rc" in
+    0) ;;
+    42) log "ERROR: app '$slug' un-archive: could not acquire $APP_CREATE_LOCK within 30s. Sentinel retained; next tick will retry."; return 0 ;;
+    43) log "ERROR: app '$slug' un-archive REFUSED: port $port is now in use by another app on this box. Sentinel deleted."; rm -f "$d/.unarchive-requested"; return 0 ;;
+    44) log "ERROR: app '$slug' un-archive: mv archive→live FAILED — sentinel already deleted; folder retained in archive tree."; return 0 ;;
+    *)  log "ERROR: app '$slug' un-archive: locked sequence rc=$rc (unexpected) — investigate."; return 0 ;;
+  esac
+  if bash "$APP_UNITS_SCRIPT" restore "$slug" "$live_dir" >/dev/null 2>&1; then
+    log "app '$slug' un-archive COMPLETE: folder moved back, units restored on port $port"
+  else
+    log "WARN: app '$slug' un-archive: folder moved back but app-units.sh restore failed — run it by hand: app-units.sh restore $slug $live_dir"
+  fi
+}
+
+scan_app_unarchive_requested_sentinels() {
+  local d slug
+  for d in "$APPS_ARCHIVE_DIR"/*/; do
+    [ -d "$d" ] || continue                          # nullglob-miss guard
+    slug="$(basename "$d")"
+    [ -f "$d/.unarchive-requested" ] || continue
+
+    log "app '$slug' user-initiated un-archive: .unarchive-requested detected"
+
+    local live_dir="$APPS_DIR/$slug"
+    local unit_file="$SYSTEMD_UNIT_DIR/app-$slug.service"
+    local stashed_unit="$d/app-$slug.service.archived"
+
+    # Current-style apps (socket + relay + marker watch + boot check) stash a .socket;
+    # app-units.sh restores all of their units. Old-style apps continue below.
+    if [ -f "$d/app-$slug.socket.archived" ]; then
+      unarchive_current_style_app "$slug" "${d%/}"
+      continue
+    fi
+
+    # -----------------------------------------------------------------------
+    # Pre-flight — every failure is permanent-refuse (sentinel deleted).
+    # -----------------------------------------------------------------------
+    if [ -e "$live_dir" ]; then
+      log "ERROR: app '$slug' un-archive REFUSED: live folder already exists at $live_dir. Sentinel deleted."
+      rm -f "$d/.unarchive-requested"
+      continue
+    fi
+    if [ -e "$unit_file" ]; then
+      log "ERROR: app '$slug' un-archive REFUSED: systemd unit already installed at $unit_file. Sentinel deleted."
+      rm -f "$d/.unarchive-requested"
+      continue
+    fi
+    if [ ! -f "$stashed_unit" ]; then
+      log "ERROR: app '$slug' un-archive REFUSED: no stashed unit at $stashed_unit — cannot reconstruct port. Sentinel deleted. Operator may need to re-create the app fresh."
+      rm -f "$d/.unarchive-requested"
+      continue
+    fi
+    local archived_port
+    archived_port=$(grep -m1 '^Environment=PORT=' "$stashed_unit" | sed 's/^Environment=PORT=//' | tr -d '\r\n' || true)
+    if [ -z "$archived_port" ]; then
+      log "ERROR: app '$slug' un-archive REFUSED: could not read PORT from $stashed_unit. Sentinel deleted."
+      rm -f "$d/.unarchive-requested"
+      continue
+    fi
+
+    # -----------------------------------------------------------------------
+    # Locked sequence: port-collision → sentinel-delete → mv → install.
+    # Exits:
+    #   0  ok
+    #   42 lock timeout (transient — sentinel retained for next-tick retry)
+    #   43 port collision (permanent-refuse — sentinel deleted by handler)
+    #   44 mv failed after sentinel-delete (sentinel already gone, folder
+    #      still in archive; operator investigates)
+    #   45 install (cp) failed after mv (folder moved, unit not installed;
+    #      operator investigates)
+    # -----------------------------------------------------------------------
+    local lock_rc=0
+    (
+      exec 200>"$APP_CREATE_LOCK"
+      if ! flock -x -w 30 200; then
+        exit 42
+      fi
+      # Port collision check. -Fxq (literal + exact-line + quiet) so a
+      # port like "3040" isn't ever interpreted as a BRE pattern (safe
+      # against latent surprises if unit files ever grow non-numeric ports).
+      if compgen -G "$SYSTEMD_UNIT_DIR/app-*.service" > /dev/null; then
+        local used_ports
+        used_ports=$(grep -h '^Environment=PORT=' "$SYSTEMD_UNIT_DIR"/app-*.service 2>/dev/null \
+                     | sed 's/^Environment=PORT=//' | sort -u)
+        if printf '%s\n' "$used_ports" | grep -Fxq -- "$archived_port"; then
+          exit 43
+        fi
+      fi
+      # Sentinel delete BEFORE mv (archive-side discipline).
+      rm -f "$d/.unarchive-requested"
+      mkdir -p "$APPS_DIR" 2>/dev/null || true
+      if ! mv "$d" "$live_dir"; then
+        exit 44
+      fi
+      # Install unit file: cp from moved-back folder, rm the stash.
+      local moved_stash="$live_dir/app-$slug.service.archived"
+      mkdir -p "$SYSTEMD_UNIT_DIR" 2>/dev/null || true
+      if ! cp "$moved_stash" "$unit_file"; then
+        exit 45
+      fi
+      rm -f "$moved_stash"
+      exit 0
+    )
+    lock_rc=$?
+    case "$lock_rc" in
+      0)
+        log "app '$slug' un-archive: folder moved, unit installed at $unit_file (port $archived_port)"
+        ;;
+      42)
+        log "ERROR: app '$slug' un-archive: could not acquire $APP_CREATE_LOCK within 30s. Sentinel retained; next tick will retry."
+        continue
+        ;;
+      43)
+        log "ERROR: app '$slug' un-archive REFUSED: port $archived_port is now in use by another app on this box. Archive that one first or delete the archived app. Sentinel deleted."
+        rm -f "$d/.unarchive-requested"
+        continue
+        ;;
+      44)
+        log "ERROR: app '$slug' un-archive: mv archive→live FAILED — sentinel already deleted; folder retained in archive tree. Drop a fresh .unarchive-requested to retry once the collision is resolved."
+        continue
+        ;;
+      45)
+        log "ERROR: app '$slug' un-archive: install unit file FAILED — folder already moved to live tree, unit NOT installed. Investigate manually; the app cannot start until $unit_file is present."
+        continue
+        ;;
+      *)
+        log "ERROR: app '$slug' un-archive: locked-sequence subshell rc=$lock_rc (unexpected). Sentinel state may be inconsistent — investigate."
+        continue
+        ;;
+    esac
+
+    # -----------------------------------------------------------------------
+    # Best-effort systemd wiring — folder is live either way at this point.
+    # -----------------------------------------------------------------------
+    if ! "$SYSTEMCTL_BIN" --user daemon-reload 2>/dev/null; then
+      log "WARN: app '$slug' un-archive: systemctl daemon-reload failed. Operator may need to run it manually."
+    fi
+    if ! "$SYSTEMCTL_BIN" --user enable --now "app-$slug.service" 2>/dev/null; then
+      log "WARN: app '$slug' un-archive: systemctl enable --now failed. Operator may need to systemctl --user enable --now app-$slug.service manually."
+    fi
+    sleep 2
+    if "$SYSTEMCTL_BIN" --user is-active --quiet "app-$slug.service" 2>/dev/null; then
+      log "app '$slug' un-archive: systemd unit active (running) on port $archived_port"
+    else
+      log "WARN: app '$slug' un-archive: systemd unit did NOT reach active state on port $archived_port — check journalctl --user -u app-$slug -n 50 --no-pager"
+    fi
+
+    log "app '$slug' un-archive COMPLETE"
+  done
+}
+
+# Find the ACTUAL existing tmux session name matching $1 CASE-INSENSITIVELY (tmux names are
+# case-sensitive, but a human may name a session 'hilda' for identity 'Hilda' — a case difference
+# must NOT cause a duplicate). Prints the real session name if found, else nothing.
+#
+# Reads from SESSIONS_SNAPSHOT, populated once per reconcile by snapshot_sessions() from a
+# single tmux ls call. In-memory lookup — no tmux invocation per identity.
+match_session() {
+  local want; want="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  local real="${SESSIONS_SNAPSHOT[$want]:-}"
+  [ -n "$real" ] && { printf '%s' "$real"; return 0; }
+  return 1
+}
+
+# snapshot_sessions: one tmux ls per reconcile tick, populate SESSIONS_SNAPSHOT for match_session.
+# Called at the top of reconcile(). Clears any prior snapshot first so a session that disappeared
+# between ticks doesn't stay visible.
+snapshot_sessions() {
+  SESSIONS_SNAPSHOT=()
+  local s
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    SESSIONS_SNAPSHOT["$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]')"]="$s"
+  done < <(timeout -k 5 10 tmux ls -F '#{session_name}' 2>/dev/null)
+}
+
+# SAFETY: the supervisor NEVER kills a session. Sessions are SHELL sessions (claude runs inside,
+# so a crashed claude drops back to a shell prompt and the session persists — the normal case).
+# Liveness is "is a live claude process on the session's tty", NOT "does the session exist".
+# Recovery re-drives claude INTO the existing session (no kill). A double-probe before any action
+# means a transient misread can never spuriously drive a live agent.
+#
+# is a claude/node process on the session's pane tty? (ps over the tty lists claude even when a
+# child bash is momentarily foreground, so this doesn't false-negative during tool calls.)
+#
+# Fresh probe (no snapshot): used by the double-probe re-check in reconcile after `sleep 2`, and
+# by wait_for_claude()/drive() where sub-second freshness matters. The reconcile hot-path uses
+# claude_running_cached() instead, which reads CLAUDE_RUNNING_SNAPSHOT populated once per tick.
+claude_running() {
+  local tty; tty="$(timeout -k 5 10 tmux list-panes -t "=$1" -F '#{pane_tty}' 2>/dev/null | head -1)"
+  [ -n "$tty" ] && ps -t "${tty#/dev/}" -o comm= 2>/dev/null | grep -qiE 'claude|node'
+}
+
+# claude_running_cached: lookup on the per-tick snapshot. Returns 0 iff snapshot_claude_running()
+# recorded a claude/node process for this session's tty on THIS reconcile's snapshot pass.
+# Use this in the reconcile alive-check hot path only; never in a polling loop.
+claude_running_cached() {
+  [ -n "${CLAUDE_RUNNING_SNAPSHOT[$1]:-}" ]
+}
+
+# snapshot_claude_running: one ps sweep + one tmux list-panes sweep per tick. Builds
+# CLAUDE_RUNNING_SNAPSHOT[<session_name>]=1 for every session whose pane tty currently hosts a
+# claude/node process. Called at the top of reconcile() right after snapshot_sessions().
+# Semantics match claude_running(): claude/node substring match against ps comm field,
+# case-insensitive; a session with no pane or no tty is absent from the snapshot.
+snapshot_claude_running() {
+  CLAUDE_RUNNING_SNAPSHOT=()
+  local -A _tty_has_claude=()
+  local line ttyf comm comm_lc
+  while IFS= read -r line; do
+    ttyf="${line%% *}"; comm="${line#* }"
+    [ "$ttyf" = "?" ] && continue
+    comm_lc="${comm,,}"
+    case "$comm_lc" in
+      *claude*|*node*) _tty_has_claude["$ttyf"]=1 ;;
+    esac
+  done < <(ps -eo tty,comm= 2>/dev/null)
+  PANE_CMD_SNAPSHOT=()
+  PANE_TTY_SNAPSHOT=()
+  local sess tty pcmd
+  while IFS=' ' read -r sess tty pcmd; do
+    [ -n "$sess" ] && [ -n "$tty" ] || continue
+    PANE_CMD_SNAPSHOT["$sess"]="$pcmd"
+    tty="${tty#/dev/}"
+    PANE_TTY_SNAPSHOT["$sess"]="$tty"
+    [ -n "${_tty_has_claude[$tty]:-}" ] && CLAUDE_RUNNING_SNAPSHOT["$sess"]=1
+  done < <(timeout -k 5 10 tmux list-panes -a -F '#{session_name} #{pane_tty} #{pane_current_command}' 2>/dev/null)
+}
+
+# minimize_dormant_pane <name> <session>: swap a dormant session's idle shell for DORMANT_SHELL
+# and drop its scrollback (the dead claude's screen history, held in the tmux server's memory).
+# The session itself stays — only the shell inside it is replaced. Leaves the pane alone unless it
+# is provably idle: its foreground command is a plain shell, that shell has no child processes,
+# and nobody is attached to the session. Safe to call repeatedly; a no-op once the pane already
+# runs DORMANT_SHELL.
+minimize_dormant_pane() {
+  local name="$1" sess="$2"
+  [ -n "$DORMANT_SHELL" ] || return 0
+  local info pcmd ppid attached cwd
+  # "=<session>:" — exact session name, its active pane. (A bare "=<session>" as a pane target
+  # silently matches nothing on tmux 3.4: display-message prints an empty line and exits 0.)
+  info="$(timeout -k 5 10 tmux display-message -p -t "=$sess:" '#{pane_current_command}|#{pane_pid}|#{session_attached}|#{pane_current_path}' 2>/dev/null)" || return 0
+  IFS='|' read -r pcmd ppid attached cwd <<<"$info"
+  [ "$pcmd" = "${DORMANT_SHELL##*/}" ] && return 0
+  case "$pcmd" in
+    bash|sh|zsh) ;;
+    *) return 0 ;;                                   # something other than a bare shell is in front
+  esac
+  [ "${attached:-1}" = 0 ] || return 0               # someone is looking at this terminal
+  [ -n "$ppid" ] || return 0
+  pgrep -P "$ppid" >/dev/null 2>&1 && return 0       # the shell is still running something
+  [ -d "$cwd" ] || cwd="$HOME"
+  if [ "${DRY_RUN:-0}" = 1 ]; then
+    log "DRY_RUN would swap '$name' dormant shell ($pcmd) for $DORMANT_SHELL"
+    return 0
+  fi
+  if timeout -k 5 10 tmux respawn-pane -k -t "=$sess:" -c "$cwd" "$DORMANT_SHELL" 2>/dev/null; then
+    timeout -k 5 10 tmux clear-history -t "=$sess:" 2>/dev/null
+    log "'$name' dormant: swapped idle $pcmd for $DORMANT_SHELL and cleared scrollback (session '$sess')"
+    metric event=dormant-shell-minimized identity="$name" session="$sess" from="$pcmd"
+  else
+    log "WARNING: '$name' dormant: respawn-pane to $DORMANT_SHELL failed (session '$sess') — keeping $pcmd"
+  fi
+}
+
+# wait_for_claude: poll claude_running() up to N seconds with short backoff. Returns 0 the moment
+# it sees claude/node on the pane's tty, 1 if the whole budget elapses with no sighting. Used by
+# drive() to confirm the launch command actually spawned claude (as opposed to being eaten by
+# typeahead garbage — a terminal Device Attributes response echoing at the prompt has been seen
+# to collapse `env ... claude ...` into `;`-separated garbage, so `0c` becomes the command name
+# and claude never launches). Cheap: single ps per iteration.
+wait_for_claude() {
+  local sess="$1" budget="${2:-8}" spent=0
+  while [ "$spent" -lt "$budget" ]; do
+    claude_running "$sess" && return 0
+    sleep 1; spent=$((spent+1))
+  done
+  return 1
+}
+
+# wait_for_claude_ready <session> <session_id> [budget_secs]: returns 0 once claude can take typed
+# input, 1 if the budget runs out. wait_for_claude only proves the process exists; claude takes
+# several more seconds to reach its compose box, and keys typed before then lose their Enter (the
+# app's dormant send waits on .resume-complete, so dropping that marker early loses the user's
+# message). Ready = claude's own ~/.claude/sessions/<pid>.json names this session and carries a
+# "status" field: it writes the file without one at startup and adds status once the REPL is up.
+# Matching the session id keeps a stale file from a SIGKILLed claude whose pid got reused from
+# counting. Deliberately not a pane scrape — that depends on pane size and rendering. The budget
+# is checked between polls, so a hung tmux can overrun it by up to one 3s poll.
+CLAUDE_SESSIONS_DIR="${CLAUDE_SESSIONS_DIR:-$HOME/.claude/sessions}"
+wait_for_claude_ready() {
+  local sess="$1" sid="$2" budget="${3:-20}" tty pid f deadline
+  deadline=$(( $(date +%s) + budget ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    tty="$(timeout -k 1 2 tmux list-panes -t "=$sess" -F '#{pane_tty}' 2>/dev/null | head -1)"
+    if [ -n "$tty" ]; then
+      for pid in $(ps -t "${tty#/dev/}" -o pid=,comm= 2>/dev/null | awk 'tolower($2) ~ /claude|node/ {print $1}'); do
+        f="$CLAUDE_SESSIONS_DIR/$pid.json"
+        grep -qF "\"sessionId\":\"$sid\"" "$f" 2>/dev/null \
+          && grep -qE '"status"[[:space:]]*:[[:space:]]*"[a-z]' "$f" 2>/dev/null \
+          && return 0
+      done
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
+# _check_id_first_turn <jsonl-path> <identity-name>
+# Predicate: does the first user-role line of the jsonl match "/id NAME" as a real slash-command
+# user turn? Three byte-string checks (per Tina 2026-08-29 consult on the app's approach —
+# zero JSON.parse, ~40× cheaper and tolerant to Claude Code byte-shape drift):
+#   1. Line is a real user turn: contains "type":"user" AND NOT tool_result / "content":[ /
+#      <local-command-caveat> / <local-command-stdout> (harness-synthesized turns fool a naive check).
+#   2. Slash-command wrapper: contains <command-name>/id</command-name>.
+#   3. Strict-delimiter args match: <command-args>NAME followed by <, whitespace, or line end —
+#      refuses <command-args>storyteller< to match identity "story" (prefix-collision guard).
+# How far into a session file to look for its first user turn (the `/id` load). The user turn is
+# always the first one, but Claude Code writes metadata records and hook attachments ahead of it,
+# and attachments of several KB push it well past 4KB (seen at byte 8262). Same cap as
+# HISTORY_HEAD_BYTES in agent-history-file.ts and DISCOVERY_HEAD_BYTES in the Python sweeps, so the
+# supervisor and the app pick the same file.
+SESSION_HEAD_BYTES=65536
+_check_id_first_turn() {
+  local path="$1" name="$2"
+  local line
+  # First user-role line (within SESSION_HEAD_BYTES — /id is always the first user turn on a fresh session)
+  line=$(head -c "$SESSION_HEAD_BYTES" "$path" 2>/dev/null | grep -m1 '"type":"user"')
+  [ -z "$line" ] && return 1
+  case "$line" in
+    *'"tool_result"'*|*'"content":['*|*'<local-command-caveat>'*|*'<local-command-stdout>'*) return 1 ;;
+  esac
+  case "$line" in
+    *'<command-name>/id</command-name>'*) ;;
+    *) return 1 ;;
+  esac
+  # grep -E for the strict delimiter — ${name} followed by <, whitespace, or end-of-line
+  printf '%s' "$line" | grep -qE "<command-args>${name}(<|[[:space:]]|$)"
+}
+
+# submit_id: paste `/id NAME` into the pane and verify it actually landed as a user turn in
+# Claude Code's per-session jsonl file. See `_check_id_first_turn` above for the predicate,
+# and Tina's 2026-08-29 consult (event $xA63ie79SXO17I5x7_k5dq_vUNya5Z5hmLQNK_gYBLg) for the
+# full design rationale.
+#
+# Approach:
+#   1. Snapshot pre-existing jsonls under ~/.claude/projects/<sanitized-cwd>/
+#      (see _claude_project_name for how Claude Code names that folder).
+#   2. Wait for Ink's compose prompt, then load-buffer + paste-buffer + Enter (attempt 2 C-c's first).
+#   3. Poll for a NEW jsonl appearing (not in the snapshot) — or a snapshot jsonl that had no
+#      user turn yet (this harness's own startup-written file) — whose first user-role line
+#      matches the /id NAME predicate. Neither can contain scrollback → this is a genuine
+#      YES/NO signal, not a pane-scrape heuristic.
+#   4. Each attempt polls up to SUBMIT_ID_WAIT (60s), returning the moment /id lands — a slow
+#      start (jsonl ~25s after the paste) must not trigger a re-paste, which loads the identity
+#      twice. If `/id NAME` is still sitting UNSENT in the compose box after
+#      SUBMIT_ID_UNSENT_AFTER (15s), the Enter was lost: press Enter once and keep polling. The
+#      landing check runs once more right before a re-paste. Two attempts; second failure → LOUD
+#      log + return 1 so drive() bails and ends the harness (end_unloaded_harness, at most once
+#      per UNLOADED_RETRY_MINUTES) for a clean relaunch.
+#
+# REPLACES the prior pane-scrape state-machine (7c54898), which false-positived on tmux
+# scrollback: when a pane is reused across relaunches it retains the prior session's /id NAME
+# text, and the scrape check called it SUBMITTED without ever pasting. Three
+# agents landed at empty compose that way on 2026-08-29. A new file can't have scrollback.
+SUBMIT_ID_WAIT="${SUBMIT_ID_WAIT:-60}"
+SUBMIT_ID_UNSENT_AFTER="${SUBMIT_ID_UNSENT_AFTER:-15}"
+
+# _id_unsent_in_compose <session> <name>: true if `/id NAME` is sitting in Claude Code's compose
+# box — the lines between the last two horizontal rules (─) on screen — i.e. pasted, not submitted.
+# A submitted /id moves up into the transcript, above the rules, so it never matches.
+_id_unsent_in_compose() {
+  local sess="$1" name="$2"
+  timeout -k 5 10 tmux capture-pane -pt "$sess" -S -15 2>/dev/null | awk -v want="/id $name" '
+    /^─+/ { n++; if (n >= 2) { prev = cur }; cur = ""; next }
+    { cur = cur "\n" $0 }
+    END { blk = (n >= 2) ? prev : ""; exit !(index(blk, want) > 0) }'
+}
+
+# _id_landed <project_dir> <before_snapshot> <unprompted_existing> <name>: prints the jsonl the
+# /id landed in and returns 0, or returns 1.
+_id_landed() {
+  local project_dir="$1" before="$2" unprompted="$3" name="$4" now new path
+  now=$(ls -1 "$project_dir"/*.jsonl 2>/dev/null | sort -u)
+  new=$(comm -23 <(printf '%s\n' "$now") <(printf '%s\n' "$before") 2>/dev/null | grep -v '^$')
+  for path in $new $unprompted; do
+    _check_id_first_turn "$path" "$name" && { printf '%s' "$path"; return 0; }
+  done
+  return 1
+}
+
+submit_id() {
+  local name="$1" sess="$2" cwd="$3"
+  [ -n "$cwd" ] || { log "ERROR: '$name' submit_id: cwd argument missing — cannot resolve project dir"; return 1; }
+  local sanitized project_dir
+  sanitized=$(_claude_project_name "$cwd")
+  project_dir="$PROJECTS_DIR/$sanitized"
+  mkdir -p "$project_dir" 2>/dev/null  # Claude Code creates it; ensure it exists so our ls doesn't error
+  local before_snapshot
+  before_snapshot=$(ls -1 "$project_dir"/*.jsonl 2>/dev/null | sort -u)
+  local before_count
+  before_count=$(printf '%s\n' "$before_snapshot" | grep -c '\.jsonl$' || true)
+  # Newer Claude Code writes its session jsonl at STARTUP (mode/permission-mode/system lines),
+  # before any prompt — so on a fast box this harness's own file is already in the snapshot and
+  # `/id` lands in it, not in a "new" file. Pre-existing files with NO user turn yet are therefore
+  # watched too: a prior session's file always has a user turn (its own /id), so scrollback-proof
+  # detection still holds. Without this, the /id was missed and re-pasted — a double /id load.
+  local unprompted_existing="" _f
+  for _f in $before_snapshot; do
+    head -c "$SESSION_HEAD_BYTES" "$_f" 2>/dev/null | grep -q '"type":"user"' || unprompted_existing="$unprompted_existing $_f"
+  done
+  log "'$name' submit_id: watching $project_dir (${before_count} existing jsonls before submit, $(printf '%s' "$unprompted_existing" | wc -w) without a user turn yet)"
+
+  # submit_id only runs on a FRESH launch, whose compose box is empty — so attempt 1 sends no C-c.
+  # A C-c that lands while Ink is still mounting KILLS claude (the redrive below then costs ~10s),
+  # so instead wait for Ink's compose prompt (❯) before pasting. Bounded: after ~8s, paste anyway.
+  # A retry (attempt 2) still C-c's first, to clear whatever the failed attempt left in the compose.
+  local _ready=0
+  while [ "$_ready" -lt 16 ]; do
+    timeout -k 5 10 tmux capture-pane -pt "$sess" -S -15 2>/dev/null | grep -q '❯' && break
+    sleep 0.5; _ready=$((_ready+1))
+  done
+  [ "$_ready" -ge 16 ] && log "'$name' submit_id: compose prompt not seen after 8s — pasting anyway"
+
+  local attempt max=2 landed
+  for attempt in $(seq 1 $max); do
+    if [ "$attempt" -gt 1 ]; then
+      # Last look before re-pasting: a /id that landed just after the poll ended must not be
+      # pasted a second time.
+      if landed="$(_id_landed "$project_dir" "$before_snapshot" "$unprompted_existing" "$name")"; then
+        log "'$name' submit_id: /id landed late in $(basename "$landed") (before attempt $attempt) — not re-pasting"
+        return 0
+      fi
+      log "'$name' submit_id attempt $attempt: C-c + load-buffer /id $name + paste-buffer + Enter"
+      timeout -k 5 10 tmux send-keys -t "$sess" C-c 2>/dev/null
+      sleep 0.5
+    else
+      log "'$name' submit_id attempt $attempt: load-buffer /id $name + paste-buffer + Enter (fresh compose, no C-c)"
+    fi
+    # 2026-09-02 Ink-mount race guard: if our C-c hit Ink mid-mount, claude exited. Self-correcting
+    # fix — relaunch with an 8s extended settle, then FALL THROUGH to the paste (do NOT `continue`).
+    # 2026-09-08 fix: the previous `continue` looped back to the top and fired another C-c on the
+    # just-relaunched (still mid-mount) claude, killing it again. On the second death, max attempts
+    # was hit and we bailed — but redrive_claude had already re-typed a THIRD launch, leaving a
+    # naked harness with no /id pasted. Falling through instead: the just-relaunched claude has
+    # a fresh empty compose (no C-c needed), so we paste /id directly. If the paste doesn't land
+    # in this iteration's poll window, attempt 2 does a normal C-c on a now-fully-mounted claude.
+    if ! claude_running "$sess"; then
+      log "'$name' submit_id attempt $attempt: claude DIED after our C-c (Ink was mid-mount) — relaunching with 8s extended settle, then pasting on the fresh compose"
+      redrive_claude "$name" "$sess" "" "$cwd"
+      if ! wait_for_claude "$sess" 8; then
+        log "ERROR: '$name' submit_id: post-C-c-death relaunch failed — bailing"
+        return 1
+      fi
+      sleep 8
+      # fall through to paste — the fresh Ink mount has an empty compose, no C-c needed
+    fi
+    local _tmp
+    _tmp=$(mktemp)
+    printf '%s' "/id $name" > "$_tmp"
+    timeout -k 5 10 tmux load-buffer -t "$sess" "$_tmp" 2>/dev/null
+    timeout -k 5 10 tmux paste-buffer -p -t "$sess" 2>/dev/null
+    rm -f "$_tmp"
+    sleep 0.5
+    timeout -k 5 10 tmux send-keys -t "$sess" Enter 2>/dev/null
+
+    # Poll for a NEW jsonl appearing whose first user-turn matches /id NAME
+    local t0 now unsent_logged=""
+    t0=$(date +%s)
+    while :; do
+      sleep 0.5
+      if landed="$(_id_landed "$project_dir" "$before_snapshot" "$unprompted_existing" "$name")"; then
+        log "'$name' submit_id: /id landed in $(basename "$landed") (attempt $attempt, $(( $(date +%s) - t0 ))s after paste)"
+        return 0
+      fi
+      now=$(date +%s)
+      if [ $((now - t0)) -ge "$SUBMIT_ID_WAIT" ]; then
+        log "'$name' submit_id attempt $attempt: ${SUBMIT_ID_WAIT}s elapsed, no jsonl with matching /id"
+        break
+      fi
+      if [ $((now - t0)) -ge "$SUBMIT_ID_UNSENT_AFTER" ] && [ -z "$unsent_logged" ] && _id_unsent_in_compose "$sess" "$name"; then
+        # The text is there but the Enter was lost: press it again rather than C-c + re-paste,
+        # which could kill a still-mounting Ink or cut into a load that's just starting.
+        unsent_logged=1
+        log "'$name' submit_id attempt $attempt: '/id $name' still unsent in the compose box after ${SUBMIT_ID_UNSENT_AFTER}s — pressing Enter"
+        timeout -k 5 10 tmux send-keys -t "$sess" Enter 2>/dev/null
+      fi
+    done
+  done
+
+  log "ERROR: '$name' submit_id: no jsonl with /id $name after $max attempts — bailing"
+  log "  project dir: $project_dir"
+  log "  pane tail: $(timeout -k 5 10 tmux capture-pane -pt "$sess" -S -10 2>/dev/null | tr '\n' '|' | tail -c 400)"
+  return 1
+}
+
+# ---- ambient monitor ownership (2026-09-14) -------------------------------------------------
+# The supervisor OWNS each identity's ambient monitor. Previously the agent started it — driven
+# by the id skill's on-wake instructions plus a pasted re-arm nudge on every resume. Since the
+# supervisor is the only thing that ever brings a harness up (fresh / recover / dormant-wake),
+# it is the natural owner, and the agent is relieved of the job entirely.
+#
+# Our added responsibility is deliberately TINY: start the process, then stay out of the way.
+# We do NOT handle, inspect, reformat, or route events — the monitor injects its own wake lines
+# straight into the harness pane (it is given the pane and the harness PID and does the rest).
+# Keeping the supervisor out of the event path is a hard rule of the shape; if event policy ever
+# starts accumulating here, the separation that keeps each watcher legible has decayed.
+#
+# Lifecycle is unchanged in substance: the monitor watches the harness PID we hand it and shuts
+# down cleanly when that process goes, so it can never outlive the session it serves. Its own
+# death-wake reporting and the harness-watch handle its children. The one check we do make is
+# presence: the alive-check starts a monitor for any live harness that has none
+# (repair_ambient_monitor), since a harness we didn't bring up would otherwise never get one.
+#
+# NOTE ON REAPING: launched with setsid + full detach so it is NOT a child of the reconcile loop.
+# A child would need waiting on, and a supervisor restart would orphan it to init anyway; the
+# harness-watch inside the monitor is what guarantees cleanup, not process parentage.
+AMBIENT_MONITOR="${AGENT_SUPERVISOR_AMBIENT_MONITOR:-$HOME/.local/bin/ambient-monitor}"
+
+# resolve_harness_pid <session> — PID of the claude process on the session's pane tty.
+# Prefers the pane shell's direct claude child (same fact do_kill_dormant polls), falling back to
+# a tty scan for the case where claude sits under an intermediate wrapper (e.g. a memory-cap scope).
+resolve_harness_pid() {
+  local sess="$1" pane_pid pid
+  pane_pid=$(timeout -k 5 10 tmux display-message -p -t "$sess" '#{pane_pid}' 2>/dev/null)
+  if [ -n "$pane_pid" ]; then
+    pid=$(pgrep -P "$pane_pid" -x claude 2>/dev/null | head -1)
+    [ -n "$pid" ] && { printf '%s' "$pid"; return 0; }
+  fi
+  local tty; tty="$(timeout -k 5 10 tmux list-panes -t "=$sess" -F '#{pane_tty}' 2>/dev/null | head -1)"
+  if [ -n "$tty" ]; then
+    pid=$(ps -t "${tty#/dev/}" -o pid=,comm= 2>/dev/null | awk '$2=="claude"{print $1; exit}')
+    [ -n "$pid" ] && { printf '%s' "$pid"; return 0; }
+  fi
+  return 1
+}
+
+# start_ambient_monitor <identity> <session>
+# Called at the tail of every successful drive() — the one place all three launch paths converge,
+# so there is exactly one launch call site rather than three that can drift apart. Also called by
+# repair_ambient_monitor (alive-check) and the retire step-1 failure path.
+start_ambient_monitor() {
+  local name="$1" sess="$2"
+  [ "${DRY_RUN:-0}" = 1 ] && { log "DRY_RUN would start ambient monitor for '$name'"; return 0; }
+  if [ ! -x "$AMBIENT_MONITOR" ]; then
+    log "ERROR: '$name' ambient monitor NOT STARTED — $AMBIENT_MONITOR missing or not executable. Identity is DEAF (no relay, no schedule, no file-watch, no inbox) until this is fixed."
+    return 1
+  fi
+  local hpid
+  if ! hpid="$(resolve_harness_pid "$sess")"; then
+    log "ERROR: '$name' ambient monitor NOT STARTED — could not resolve harness PID on session '$sess'. Identity is DEAF until the next successful launch."
+    return 1
+  fi
+  local logf="$IDENTITIES_DIR/$name/ambient-monitor.log"
+  # Truncate rather than append: this log is a diagnostic for the CURRENT session, and an
+  # append across every wake forever would grow unbounded on always-on identities.
+  setsid nohup "$AMBIENT_MONITOR" "$IDENTITIES_DIR/$name" \
+      --inject-to "$sess" --harness-pid "$hpid" \
+      > "$logf" 2>&1 < /dev/null & disown
+  log "'$name' ambient monitor started (harness_pid=$hpid, session='$sess', log=$logf)"
+  metric event=ambient-monitor-start identity="$name" session="$sess" harness_pid="$hpid"
+  return 0
+}
+
+# _is_interactive_prompt <pane-text>: true if claude is waiting on a choice, not at its REPL.
+# drive() withholds the ambient monitor on these screens (it would type wake lines + Enter into
+# the choice), and so does the alive-check's repair.
+_is_interactive_prompt() {
+  case "$1" in
+    *"Resume from summary"*|*"Resume full session"*|*"of your 5-hour usage limit"*|*"Yes, I trust this folder"*|*"Enter to confirm"*) return 0 ;;
+  esac
+  return 1
+}
+
+# snapshot_ambient_monitors: one ps sweep per tick. Builds AMBIENT_MONITOR_SNAPSHOT[<identity>]
+# = space-separated harness PIDs that a running monitor for that identity is bound to (the
+# `--harness-pid` argument of `ambient-monitor <dir> --inject-to <sess> --harness-pid <pid>`).
+# Called at the top of reconcile() next to snapshot_claude_running().
+declare -A AMBIENT_MONITOR_SNAPSHOT=()
+snapshot_ambient_monitors() {
+  AMBIENT_MONITOR_SNAPSHOT=()
+  local args name hpid
+  while IFS= read -r args; do
+    case "$args" in *"ambient-monitor $IDENTITIES_DIR/"*" --inject-to "*) ;; *) continue ;; esac
+    name="${args#*ambient-monitor "$IDENTITIES_DIR"/}"; name="${name%% *}"
+    hpid="$(printf '%s\n' "$args" | sed -nE 's/.* --harness-pid ([0-9]+).*/\1/p')"
+    [ -n "$name" ] && AMBIENT_MONITOR_SNAPSHOT["$name"]+="${hpid:-0} "
+  done < <(ps -eo args= 2>/dev/null)
+}
+
+# ambient_monitor_bound <name> <harness-pid>: true if a monitor for <name> watches <harness-pid>.
+# Fresh probe (no snapshot) — used to confirm a snapshot miss before repairing, since a monitor
+# can be started mid-tick after the snapshot was taken (e.g. a newborn launched mid-pass).
+ambient_monitor_bound() {
+  local name="$1" hpid="$2" pid
+  for pid in $(pgrep -f -- "ambient-monitor $IDENTITIES_DIR/$name --inject-to" 2>/dev/null | grep -vwE "^($$|$BASHPID)$"); do
+    tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null \
+      | awk -v want="$hpid" 'prev == "--harness-pid" && $0 == want { found=1 } { prev = $0 } END { exit !found }' \
+      && return 0
+  done
+  return 1
+}
+
+# repair_ambient_monitor <name> <session>: the alive-check's monitor repair. start_ambient_monitor
+# only runs when the supervisor itself brings a harness up, so a claude relaunched by hand, or one
+# a drive() left behind after it bailed past the launch (e.g. submit_id giving up on a slow start),
+# would otherwise run with no monitor and be DEAF until someone noticed. Any live identity without
+# a monitor bound to its CURRENT harness PID gets one started here.
+#   - Rate-limited to once per MONITOR_REPAIR_MINUTES per identity, so a monitor that keeps dying
+#     isn't restarted every tick (each start truncates ambient-monitor.log, wiping the evidence).
+#   - Skipped while .archive-requested is present: retire step 0 stops the monitor on purpose and
+#     owns its own rate-limited restart.
+MONITOR_REPAIR_MINUTES="${MONITOR_REPAIR_MINUTES:-10}"
+repair_ambient_monitor() {
+  local name="$1" sess="$2" hpid p
+  [ -e "$IDENTITIES_DIR/$name/.archive-requested" ] && return 0
+  # Cheap path: the snapshot has a monitor whose harness is still alive. A monitor outlives its
+  # harness by ~1s at most (its own harness-watch), so a live bound PID means it's this harness's.
+  for p in ${AMBIENT_MONITOR_SNAPSHOT[$name]:-}; do
+    [ "$p" != 0 ] && kill -0 "$p" 2>/dev/null && return 0
+  done
+  hpid="$(resolve_harness_pid "$sess")" || return 0      # can't tell which harness — leave it alone
+  ambient_monitor_bound "$name" "$hpid" && return 0
+  local marker="$DORMANCY_STATE_DIR/$name.monitor-repaired" quiet="$DORMANCY_STATE_DIR/$name.monitor-repair-held"
+  if [ -n "$(find "$marker" -mmin "-$MONITOR_REPAIR_MINUTES" 2>/dev/null)" ]; then
+    # Said once per window, not every tick.
+    if [ -z "$(find "$quiet" -mmin "-$MONITOR_REPAIR_MINUTES" 2>/dev/null)" ]; then
+      touch "$quiet" 2>/dev/null
+      log "WARNING: '$name' has NO ambient monitor for harness_pid=$hpid — not repairing (already repaired in the last ${MONITOR_REPAIR_MINUTES} min); identity is DEAF until the next repair. See $IDENTITIES_DIR/$name/ambient-monitor.log"
+    fi
+    return 0
+  fi
+  # A pane waiting on a choice gets no monitor — drive() withholds it there too, since the
+  # monitor's injected lines + Enter would answer the prompt. Left for a human, as drive() leaves it.
+  if _is_interactive_prompt "$(timeout -k 5 10 tmux capture-pane -pt "$sess" -S -40 2>/dev/null)"; then
+    return 0
+  fi
+  if [ "${DRY_RUN:-0}" = 1 ]; then
+    log "DRY_RUN would repair the ambient monitor for '$name' (harness_pid=$hpid)"
+    return 0
+  fi
+  log "WARNING: '$name' alive with NO ambient monitor for harness_pid=$hpid (session '$sess') — ambient monitor REPAIRED by alive-check"
+  metric event=ambient-monitor-repair identity="$name" session="$sess" harness_pid="$hpid"
+  mkdir -p "$DORMANCY_STATE_DIR" 2>/dev/null; touch "$marker" 2>/dev/null; rm -f "$quiet" 2>/dev/null
+  start_ambient_monitor "$name" "$sess" || true
+}
+
+# end_unloaded_harness <name> <session>: stop a claude that came up but never loaded its identity
+# (submit_id gave up), so the next alive-check finds it dead and relaunches it — resuming, if the
+# /id did land late, since resolve_session then finds that session. SIGTERM, then SIGKILL after 5s.
+UNLOADED_RETRY_MINUTES="${UNLOADED_RETRY_MINUTES:-10}"
+end_unloaded_harness() {
+  local name="$1" sess="$2" hpid i=0
+  if ! hpid="$(resolve_harness_pid "$sess")"; then
+    log "'$name' end_unloaded_harness: no harness on session '$sess' — nothing to end"
+    return 0
+  fi
+  kill "$hpid" 2>/dev/null
+  while kill -0 "$hpid" 2>/dev/null && [ "$i" -lt 10 ]; do sleep 0.5; i=$((i+1)); done
+  if kill -0 "$hpid" 2>/dev/null; then
+    kill -KILL "$hpid" 2>/dev/null
+    log "'$name' end_unloaded_harness: harness_pid=$hpid ignored SIGTERM for 5s — SIGKILLed"
+  else
+    log "'$name' end_unloaded_harness: harness_pid=$hpid ended"
+  fi
+  metric event=harness-ended-unloaded identity="$name" session="$sess" harness_pid="$hpid"
+  return 0
+}
+
+# launch_line <name> <resume-id|""> <cwd|""> — the command typed into the pane to start claude.
+# It cd's into <cwd> itself, so claude starts where launch() chose (and submit_id watches the
+# matching project dir) whatever directory the pane's shell was left in. `cd … &&` means a
+# missing dir fails loud at the prompt instead of starting claude somewhere else.
+launch_line() {
+  local name="$1" resume="$2" cwd="$3" pre="" res=""
+  # Single-quoted POSIX-style: the line may be typed into DORMANT_SHELL (dash), which can't read
+  # the $'...' quoting bash's printf %q produces for unusual characters.
+  [ -n "$cwd" ] && pre="cd '${cwd//\'/\'\\\'\'}' && "
+  [ -n "$resume" ] && res="--resume $resume "
+  printf '%s' "${pre}$MEMORY_WRAPPER env FLEET_IDENTITY=$name $(compute_mcp_env "$name") $CLAUDE_LAUNCH_ENV $CLAUDE ${res}$CLAUDE_LAUNCH_FLAGS $(compute_mcp_flags)"
+}
+
+# redrive_claude: clear whatever's in the pane's input buffer / at the shell prompt (C-c to abort
+# any partial line, Enter to advance to a fresh prompt), then re-fire the launch command. Used
+# once after wait_for_claude times out — deals with the typeahead-garbage failure mode by giving
+# bash a fresh prompt to type the command into. The `resume` arg is optional; empty = fresh path.
+redrive_claude() {
+  local name="$1" sess="$2" resume="${3:-}" cwd="${4:-}"
+  log "'$name' redrive: clearing pane (C-c + Enter) then re-firing claude launch"
+  timeout -k 5 10 tmux send-keys -t "$sess" C-c 2>/dev/null
+  sleep 0.3
+  timeout -k 5 10 tmux send-keys -t "$sess" Enter 2>/dev/null
+  sleep 0.5
+  if [ -n "$resume" ]; then
+    timeout -k 5 10 tmux send-keys -t "$sess" -l "$(launch_line "$name" "$resume" "$cwd")" 2>/dev/null
+  else
+    timeout -k 5 10 tmux send-keys -t "$sess" -l "$(launch_line "$name" "" "$cwd")" 2>/dev/null
+  fi
+  timeout -k 5 10 tmux send-keys -t "$sess" Enter 2>/dev/null
+}
+
+# ---- session discovery: find an identity's most-recent OWN Claude Code session --------------
+# A crash/reboot should bring an agent back WHERE IT WAS, mid-work — not fresh in $HOME. Claude
+# Code stores each session at $HOME/.claude/projects/<mangled-cwd>/<sessionId>.jsonl and records
+# the `/id <name>` LOAD command that started it. A session BELONGS to identity X if its first real
+# `/id` load names X — prose mentions of a name do NOT carry the <command-name> tag, so they can't
+# misattribute (this distinction is the whole trick: a naive grep-for-name picks the wrong, newer
+# file). We take the newest session X owns and resume it in the cwd that session recorded. Match on
+# the identity name case-insensitively (mirrors match_session), so 'Hilda'/'hilda' never diverge.
+PROJECTS_DIR="${AGENT_PROJECTS_DIR:-$HOME/.claude/projects}"
+_lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+# identity a session belongs to = args of its first real /id load (ignore save/reset/blank).
+# Bounded to the first SESSION_HEAD_BYTES — the /id load is always the FIRST user message in the
+# session, though hook attachments written ahead of it can push it several KB in. Bounding the
+# read means files that DON'T contain a /id load (bounty-scratch sessions, ad-hoc claude
+# invocations) cost at most 64KB of I/O each instead of the entire file, which for multi-MB
+# transcripts is the difference between milliseconds and near-nothing per file.
+session_owner() {
+  head -c "$SESSION_HEAD_BYTES" "$1" 2>/dev/null \
+    | grep -F -m5 '<command-name>/id</command-name>' \
+    | grep -oE '<command-args>[^<]*</command-args>' \
+    | sed -E 's/<command-args>([^<]*)<\/command-args>/\1/' \
+    | grep -vixE 'save|reset' | grep -v '^[[:space:]]*$' | head -1
+}
+session_cwd() { grep -m1 -o '"cwd":"[^"]*"' "$1" 2>/dev/null | sed 's/"cwd":"//;s/"$//'; }
+# _physical_path <dir> — <dir> with symlinks resolved, or <dir> unchanged if it can't be entered.
+# Claude Code names a session's project dir after its physical cwd, so on a box where $HOME sits
+# behind a symlink (Fedora Atomic / Bazzite: /home -> /var/home) the mangled name must come from
+# the resolved path. A no-op on boxes with no symlink in the path.
+_physical_path() { (cd "$1" 2>/dev/null && pwd -P) || printf '%s' "$1"; }
+# _claude_project_name <cwd> — the ~/.claude/projects/ folder name Claude Code uses for <cwd>:
+# the physical path with every non-alphanumeric character turned into "-". Same rule as
+# claudeProjectFolderName() in src/backend/claude-session/agent-history-file.ts.
+_claude_project_name() { printf '%s' "$(_physical_path "$1")" | sed 's/[^a-zA-Z0-9]/-/g'; }
+# Expected project dir for an identity: Claude Code stores sessions at
+# ~/.claude/projects/<mangled-cwd>/ (see _claude_project_name). The
+# supervisor always launches an identity's claude in ~/fleet/identities/<name>/workspace/
+# (see launch()), so that identity's sessions land under a predictable directory. Same
+# mangling rule as submit_id() uses.
+_expected_project_dir() {
+  local name="$1"
+  local mangled
+  mangled=$(_claude_project_name "$IDENTITIES_DIR/$name/workspace")
+  printf '%s/%s' "$PROJECTS_DIR" "$mangled"
+}
+# Scan ONE directory's *.jsonl files mtime-desc, return newest OWNED by $1 on stdout,
+# empty if none. Bounded to sub-second even on a corpus of tens of files because there's
+# no fork per file — one `find -printf`, one sort, then a bounded SESSION_HEAD_BYTES head-read per file
+# until the first identity match. Used by resolve_session and _newest_jsonl_for as the
+# expected-project-dir fast path.
+_scan_dir_newest_owned() {
+  local want_lower="$1" project_dir="$2" mtime file owner best=""
+  [ -d "$project_dir" ] || { printf ''; return 0; }
+  while IFS=$'\t' read -r mtime file; do
+    [ -f "$file" ] || continue
+    owner="$(session_owner "$file")"
+    [ -n "$owner" ] || continue
+    if [ "$(_lower "$owner")" = "$want_lower" ]; then
+      best="$file"
+      break
+    fi
+  done < <(find "$project_dir" -maxdepth 1 -type f -name '*.jsonl' -printf '%T@\t%p\n' 2>/dev/null | sort -rn)
+  printf '%s' "$best"
+}
+# prints "<cwd>\t<sessionId>" for the newest session OWNED by $1; returns 1 if the identity has none.
+#
+# TWO-STAGE STRATEGY (fast path + safety-net slow path):
+#
+#   Stage 1 (fast): Look ONLY in the identity's expected project dir. Because the
+#   supervisor always launches an identity's claude in ~/fleet/identities/<name>/workspace/,
+#   Claude Code stores that identity's sessions under a deterministic mangled dir name.
+#   Scanning that one dir (typically 1-50 files) mtime-desc + break-on-first-match is
+#   sub-second even on a busy box. This handles ~100% of identities on this box today.
+#
+#   Stage 2 (slow, safety net): If stage 1 finds nothing (identity never ran in its
+#   workspace, or the expected dir is empty), fall back to a full scan across all
+#   project dirs. Birth-time cutoff shrinks the corpus — a transcript created before the
+#   identity folder was born cannot contain this identity's /id load. `mv` within the
+#   same filesystem preserves inode + birth time, so archive → unarchive round-trips
+#   preserve the cutoff too. `stat -c %W` returns 0 on filesystems without birth-time
+#   support; filter is skipped in that case with no correctness impact.
+#
+#   The full scan uses `find -printf` (one kernel walk, no per-file stat fork), sorts
+#   mtime-desc, and breaks on first match — same primitives as stage 1. In the pathological
+#   case (identity that hasn't run in a long time, expected dir empty), this can still
+#   walk thousands of files at up to SESSION_HEAD_BYTES per read, so stage 1 is the load-bearing win.
+#
+#   Replaces the prior naive "iterate every file, keep the max" that couldn't break early
+#   and forked stat+grep+sed per file — measured at ~47s per identity on a 4000-file box.
+main_session_file() {
+  local name="$1" want project_dir best="" mtime file owner cutoff
+  local -a find_filter=()
+  want="$(_lower "$name")"
+  # Stage 1: expected project dir fast path.
+  project_dir="$(_expected_project_dir "$name")"
+  best="$(_scan_dir_newest_owned "$want" "$project_dir")"
+  if [ -z "$best" ]; then
+    # Stage 2: broader scan, birth-time filtered.
+    cutoff="$(stat -c %W "$IDENTITIES_DIR/$name" 2>/dev/null || echo 0)"
+    if [ "${cutoff:-0}" -gt 0 ]; then
+      find_filter=(-newermt "@$cutoff")
+    fi
+    while IFS=$'\t' read -r mtime file; do
+      [ -f "$file" ] || continue
+      owner="$(session_owner "$file")"
+      [ -n "$owner" ] || continue
+      if [ "$(_lower "$owner")" = "$want" ]; then
+        best="$file"
+        break
+      fi
+    done < <(find "$PROJECTS_DIR/" -maxdepth 2 -type f -name '*.jsonl' "${find_filter[@]}" -printf '%T@\t%p\n' 2>/dev/null | sort -rn)
+  fi
+  [ -n "$best" ] || return 1
+  printf '%s' "$best"
+}
+
+# prints "<cwd>\t<sessionId>" for the identity's newest owned session (see main_session_file).
+resolve_session() {
+  local best
+  best="$(main_session_file "$1")" || return 1
+  printf '%s\t%s\n' "$(session_cwd "$best")" "$(basename "$best" .jsonl)"
+}
+
+# drive claude into an EXISTING session ($2), for identity $1. If $3 (a sessionId) is given, RESUME
+# that conversation — it restores the agent's working context AND it's already the right identity,
+# so NO /id is sent. Otherwise start fresh and send `/id <name>`. The caller launches the session in
+# the correct working directory, which is what lets --resume find the session (Claude scopes
+# sessions per directory). Blind-drive past the trust dialog either way (harmless at an idle prompt).
+drive() {
+  local name="$1" sess="$2" resume="${3:-}" cwd="${4:-}"
+  # Fallback: if cwd wasn't passed (older call sites), query it from the pane. submit_id needs it
+  # to compute PROJECTS_DIR/<sanitized-cwd>/ for jsonl detection; empty cwd = jsonl watch fails safe.
+  if [ -z "$cwd" ]; then
+    cwd=$(timeout -k 5 5 tmux display-message -p -t "$sess" '#{pane_current_path}' 2>/dev/null)
+    [ -z "$cwd" ] && cwd="$HOME"
+  fi
+  # supervisor is about to touch this pane — clear the "hands off" marker for any consumer polling
+  # it (e.g. the app's DormancyOverlay). Refresh happens at each terminal branch below.
+  rm -f "$IDENTITIES_DIR/$name/.resume-complete" 2>/dev/null
+  if [ -n "$resume" ]; then
+    # RESUME path. The working dir is already trusted (this identity ran here before), so there's no
+    # folder-trust dialog to clear — hence NO Enter blind-drive and NO /id (the identity is already
+    # in the restored context).
+    # bash command-scoped assignment — vars apply to this claude only, not the shell.
+    timeout -k 5 10 tmux send-keys -t "$sess" -l "$(launch_line "$name" "$resume" "$cwd")" 2>/dev/null
+    timeout -k 5 10 tmux send-keys -t "$sess" Enter 2>/dev/null
+    # ⚠️ VERIFY CLAUDE ACTUALLY LAUNCHED (2026-08-29, user witnessed a live failure on one box).
+    # send-keys drops bytes into the pane and returns 0 whether or not they became a viable command.
+    # A terminal Device Attributes response echoing at the shell prompt as literal `1;2c0;276;0c`
+    # got prefixed onto the env-claude line; bash parsed with `;` as command separators, `0c` became
+    # the command name, claude never launched, then the prompt scrape below
+    # ran against a bare bash prompt (and, while the re-arm nudge still existed, it was pasted into
+    # bash). Fix:
+    # check the pane's tty for the claude/node process (reuses claude_running()) — if it's not there
+    # within ~8s, ONCE clear the pane and re-drive, then re-verify. Second failure = log LOUD and
+    # SKIP everything below (no prompt scrape, no ambient-monitor start — leave the pane alone for a
+    # human to see the mess). Alive-check on the next supervisor tick will flag the identity dead
+    # and try again.
+    if ! wait_for_claude "$sess" 8; then
+      log "WARNING: '$name' claude did NOT launch after resume drive — attempting one retry with typeahead clear"
+      log "  pane tail: $(timeout -k 5 10 tmux capture-pane -pt "$sess" -S -10 2>/dev/null | tr '\n' '|' | tail -c 400)"
+      redrive_claude "$name" "$sess" "$resume" "$cwd"
+      if ! wait_for_claude "$sess" 8; then
+        log "ERROR: '$name' claude STILL did not launch after retry — bailing out of drive() before starting the ambient monitor against a broken pane. Session '$sess' left as-is for inspection. Alive-check will re-attempt on next tick."
+        log "  pane tail: $(timeout -k 5 10 tmux capture-pane -pt "$sess" -S -10 2>/dev/null | tr '\n' '|' | tail -c 400)"
+        return 1
+      fi
+      log "'$name' claude launched on retry"
+    fi
+    # PROMPT-SCRAPE removed 2026-09-01 (was ~15s wait+scrape+answer for two prompts).
+    # Both prompts are killed at source and have been reliably suppressed since:
+    #   - trust-folder: hasTrustDialogAccepted=true in ~/.claude.json (accept_trust_for_workdir()
+    #     is called before every launch) + --dangerously-skip-permissions
+    #   - resume-summary: CLAUDE_CODE_RESUME_THRESHOLD_MINUTES + CLAUDE_CODE_RESUME_TOKEN_THRESHOLD
+    #     both pinned to 99999999 in CLAUDE_LAUNCH_ENV
+    # The 15s scrape loop was pure "in case a future release renames those keys" paranoia and ran
+    # empty on every wake.
+    # SAFETY NET: the post-drive scrape below still fires as an observable-outcome check — if a
+    # regression puts one of those prompts back on screen, we WARN in the log so a stuck agent is
+    # findable rather than silently relay-deaf. (Agent will hang until we notice + re-enable the
+    # answer path — accepted tradeoff for ~15s of wake wall-time savings.)
+    # Blocks reconcile (drive() runs identities one at a time) for as long as claude takes to come
+    # up — a few seconds normally, the full budget if it never reports.
+    local _ready_t0=$SECONDS _ready_budget=20
+    if wait_for_claude_ready "$sess" "$resume" "$_ready_budget"; then
+      log "'$name' claude ready (status reported) $((SECONDS-_ready_t0))s after launch check"
+    else
+      log "WARNING: '$name' claude did not report a status within ${_ready_budget}s of resume — dropping .resume-complete anyway so the app's pending send isn't held forever; it may lose its Enter. If an interactive-prompt warning follows, that prompt is why (session '$sess')"
+    fi
+    sleep 1                                     # brief settle so claude's Ink renders past the initial paint before the observable-outcome scrape
+    pane="$(timeout -k 5 10 tmux capture-pane -pt "$sess" -S -40 2>/dev/null)"
+    case "$pane" in
+      *"Resume from summary"*|*"Resume full session"*|*"of your 5-hour usage limit"*|*"Yes, I trust this folder"*|*"Enter to confirm"*)  # keep in step with _is_interactive_prompt
+        log "WARNING: '$name' still sitting at an interactive prompt after resume — NOT at a REPL, will be relay-deaf until cleared. Prompt source-suppression (env vars + hasTrustDialogAccepted + resumeReturnDismissed) may have regressed; restore the scrape+answer loop if this fires more than once (session '$sess')";;
+      *)
+        # THE RE-ARM-YOUR-MONITORS NUDGE IS RETIRED (2026-09-14). It existed because a resume
+        # restored the conversation but not the previous session's background Monitors, leaving a
+        # resumed agent alive-but-DEAF — so we pasted in a line telling it to relaunch them itself.
+        # The agent no longer owns its watchers; the supervisor starts them below. Nothing to
+        # re-arm, nothing to tell the agent, one less paste into a freshly-woken Ink.
+        start_ambient_monitor "$name" "$sess"
+        # supervisor's hands are OFF this pane — drop the marker with a UTC timestamp inside so
+        # consumers (the app's DormancyOverlay) can distinguish this-wake from a stale prior-wake
+        # marker via freshness check (marker_ts > wake_trigger_ts).
+        #
+        # The marker is dropped even if start_ambient_monitor failed: it means "supervisor is done
+        # touching this pane", which is true either way, and a DEAF identity is already LOUD in the
+        # log. Withholding it would additionally wedge the app's overlay on a pane nobody is driving.
+        date -u +%Y-%m-%dT%H:%M:%SZ > "$IDENTITIES_DIR/$name/.resume-complete"
+        ;;
+    esac
+    return 0
+  fi
+  # FRESH path: blind-drive past the folder-trust dialog with Enter (overshoot is harmless at an empty
+  # prompt) — the claude-spawn-job pattern, version/timing-agnostic — then load the identity.
+  # Env-var prefix is harmless on a fresh launch (there's no session to summarize) but cheap insurance
+  # if a fresh claude ever picks up an older recorded session unexpectedly.
+  log "'$name' drive fresh: typing claude launch command into pane '$sess'"
+  timeout -k 5 10 tmux send-keys -t "$sess" -l "$(launch_line "$name" "" "$cwd")" 2>/dev/null
+  timeout -k 5 10 tmux send-keys -t "$sess" Enter 2>/dev/null
+  # ⚠️ VERIFY CLAUDE ACTUALLY LAUNCHED — same failure mode as the resume path above (see the block
+  # in the `if [ -n "$resume" ]` branch for the full story). On second failure, bail without pasting
+  # /id into what's likely a bare bash prompt.
+  if ! wait_for_claude "$sess" 8; then
+    log "WARNING: '$name' claude did NOT launch after fresh drive — attempting one retry with typeahead clear"
+    log "  pane tail: $(timeout -k 5 10 tmux capture-pane -pt "$sess" -S -10 2>/dev/null | tr '\n' '|' | tail -c 400)"
+    redrive_claude "$name" "$sess" "" "$cwd"
+    if ! wait_for_claude "$sess" 8; then
+      log "ERROR: '$name' claude STILL did not launch after fresh retry — bailing out of drive() to avoid pasting /id into a broken pane. Session '$sess' left as-is for inspection. Alive-check will re-attempt on next tick."
+      log "  pane tail: $(timeout -k 5 10 tmux capture-pane -pt "$sess" -S -10 2>/dev/null | tr '\n' '|' | tail -c 400)"
+      return 1
+    fi
+    log "'$name' claude launched on retry"
+  fi
+  # Trust-dialog scrape (replaces the historical 6s SETTLE_SECONDS blind-Enter train + 2s
+  # pre-loop hedge). The dialog is source-suppressed via hasTrustDialogAccepted=true (written
+  # by accept_trust_for_workdir() before every launch, see log line above) + the
+  # --dangerously-skip-permissions flag — so on the common path there is nothing to clear.
+  # We keep a scrape-based safety net: if a prompt regression puts the trust dialog back on
+  # screen, we WARN loud (findable in the log) and fall back to a small bounded blind-Enter
+  # burst; alive-check on the next tick can then retry cleanly if submit_id still fails.
+  # Same pattern as the resume path above at the "Resume from summary" / "Yes, I trust this
+  # folder" case block.
+  sleep 1                                      # brief settle so claude's Ink renders past initial paint before scrape
+  _fresh_pane="$(timeout -k 5 10 tmux capture-pane -pt "$sess" -S -40 2>/dev/null)"
+  case "$_fresh_pane" in
+    *"Yes, I trust this folder"*|*"Enter to confirm"*|*"Do you trust the files"*)
+      log "WARNING: '$name' drive fresh: trust-dialog scrape matched a prompt string — hasTrustDialogAccepted source-suppression may have regressed. Falling back to bounded blind-Enter burst (3× 500ms) as a one-shot safety net; if this fires more than once, restore the historical 6s SETTLE_SECONDS blind-Enter train. Pane tail: $(printf '%s' "$_fresh_pane" | tr '\n' '|' | tail -c 400)"
+      local _i=0
+      while [ "$_i" -lt 3 ]; do
+        timeout -k 5 10 tmux send-keys -t "$sess" Enter 2>/dev/null
+        sleep 0.5; _i=$((_i+1))
+      done
+      ;;
+    *)
+      : # normal path — no prompt on screen, proceed straight to submit_id
+      ;;
+  esac
+  # ⚠️ VERIFY CLAUDE SURVIVED before pasting /id — this class of failure has been observed
+  # live (2026-09-02, one agent): wait_for_claude passed cleanly above, then the fresh
+  # claude ended up dead — pane back at bash prompt. Old behavior: submit_id's leading C-c +
+  # paste of `/id name` landed IN BASH, producing `-bash: /id: No such file or directory`
+  # visible in the pane, no jsonl written, submit_id looped its full budget with no
+  # signal. Silent from the log's POV (submit_id error is generic; the actual "claude died
+  # between wait_for_claude and submit" is invisible without this check). Fix: a second
+  # aliveness probe here catches that gap and bails LOUD, so alive-check can retry cleanly
+  # on the next tick + we have logs to root-cause next occurrence.
+  if ! claude_running "$sess"; then
+    log "ERROR: '$name' drive fresh: claude DIED between wait_for_claude and submit_id — bailing before pasting /id into bash. Alive-check will re-attempt on next tick."
+    log "  pane tail: $(timeout -k 5 10 tmux capture-pane -pt "$sess" -S -20 2>/dev/null | tr '\n' '|' | tail -c 600)"
+    return 1
+  fi
+  # SUBMIT /id via submit_id() helper — handles the leading-newline race (2026-08-21 taylor bug +
+  # 2026-08-29 user report) + never-landed-paste + submission verification with a state-machine
+  # recovery loop (up to 3 attempts). See submit_id() near the top of this file for the full state
+  # machine. On final failure, submit_id returns 1 and we bail from drive() (same shape as
+  # wait_for_claude) rather than leaving a broken /id-in-compose pane pretending to be alive.
+  local _ended="$DORMANCY_STATE_DIR/$name.unloaded-ended"
+  if ! submit_id "$name" "$sess" "$cwd"; then
+    # Ending the harness is what makes the next tick retry: left running, the alive-check would
+    # see claude alive and never re-drive it — an agent up without its identity loaded. Bounded to
+    # once per UNLOADED_RETRY_MINUTES: a cause that never clears (a login screen, a jsonl format
+    # change) would otherwise relaunch every tick, each cycle blocking reconcile for ~2 minutes.
+    if [ -n "$(find "$_ended" -mmin "-$UNLOADED_RETRY_MINUTES" 2>/dev/null)" ]; then
+      log "ERROR: '$name' drive fresh: submit_id failed AGAIN within ${UNLOADED_RETRY_MINUTES} min of the last relaunch — leaving the harness running for a human to inspect (session '$sess'). The identity may not be loaded."
+    else
+      log "ERROR: '$name' drive fresh: submit_id failed — ending the harness so the alive-check relaunches it next tick."
+      mkdir -p "$DORMANCY_STATE_DIR" 2>/dev/null; touch "$_ended" 2>/dev/null
+      end_unloaded_harness "$name" "$sess"
+    fi
+    return 1
+  fi
+  rm -f "$_ended" 2>/dev/null
+  # Supervisor owns the ambient monitor — start it now that the identity is loaded. Same call as
+  # the resume path above; this is the second and last of the two convergence points.
+  start_ambient_monitor "$name" "$sess"
+  # supervisor's hands are OFF this pane — same marker as the resume path above.
+  date -u +%Y-%m-%dT%H:%M:%SZ > "$IDENTITIES_DIR/$name/.resume-complete"
+}
+
+# COMPACTION (Condense): the one way an agent gets more room besides Claude Code's own automatic
+# compaction near the limit. The agent drops `<identity>/.compact-requested` itself, or the app
+# drops it when the user presses Condense conversation; its contents, if any, are the user's
+# guidance for what the summary should keep. The supervisor carries it out in two steps, both
+# through the identity's inbox so they serialize with every other paste into the pane (and so a
+# dormant identity is woken by the inbox wake trigger, the same tick):
+#   1. once the agent is at rest at its prompt (or asleep), deliver `/compact [guidance]` and
+#      write `.compacting` holding the request time;
+#   2. on a later tick, once a compaction boundary newer than that time has landed in the
+#      agent's session file, deliver the "Compaction done" event so the agent always takes a
+#      turn afterwards, then remove `.compacting`.
+# The event comes in the supervisor's event envelope, never as plain text, so the agent can't
+# mistake it for the user answering something. `.compact-requested` or `.compacting` present =
+# the app shows "Condensing…".
+COMPACT_TIMEOUT_SECONDS="${COMPACT_TIMEOUT_SECONDS:-900}"
+# A request an awake agent never comes to rest for (or one stuck behind a dialog) is dropped
+# after this long, so the app's "Condensing…" and its disabled button can't hang forever.
+COMPACT_REQUEST_TIMEOUT_SECONDS="${COMPACT_REQUEST_TIMEOUT_SECONDS:-1800}"
+COMPACT_GUIDANCE_MAX_BYTES="${COMPACT_GUIDANCE_MAX_BYTES:-2000}"
+
+# inbox_drop <name> <payload>: one message file into the identity's inbox, per the inbox-watcher
+# dropper contract (timestamp-hex name, written aside then renamed into place). Sets
+# INBOX_LAST_DROP to the file's name, so a caller can tell later whether it has been delivered.
+INBOX_LAST_DROP=""
+inbox_drop() {
+  local name="$1" payload="$2" inbox="$IDENTITIES_DIR/$1/inbox" fname
+  INBOX_LAST_DROP=""
+  mkdir -p "$inbox" || return 1
+  fname="$(date -u +%Y%m%dT%H%M%S%3N)-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n').msg"
+  printf '%s' "$payload" > "$inbox/$fname.tmp" && mv "$inbox/$fname.tmp" "$inbox/$fname" || return 1
+  INBOX_LAST_DROP="$fname"
+}
+
+# agent_at_rest <session>: the harness is at its prompt and not mid-turn. Reads only the bottom
+# of the visible pane (the input box and footer), so "esc to interrupt" in the agent's own
+# output can't make it look busy forever. Claude Code shows "esc to interrupt" in the footer
+# while a turn or a compaction runs. A selection dialog (numbered options under ❯, "Enter to
+# select") is NOT at rest: the Enter after /compact would pick an option for the user.
+agent_at_rest() {
+  local pane bottom
+  pane="$(timeout -k 5 10 tmux capture-pane -pt "$1" 2>/dev/null)" || return 1
+  bottom="$(printf '%s\n' "$pane" | grep -v '^[[:space:]]*$' | tail -n 6)"
+  printf '%s' "$bottom" | grep -q '❯' || return 1
+  printf '%s' "$bottom" | grep -qF 'esc to interrupt' && return 1
+  printf '%s\n' "$pane" | grep -v '^[[:space:]]*$' | tail -n 15 \
+    | grep -qE '❯[[:space:]]*[0-9]+\.|Enter to select|Esc to cancel' && return 1
+  return 0
+}
+
+# compaction_landed <session-file> <since-iso>: a compaction boundary at or after <since-iso>.
+compaction_landed() {
+  local file="$1" since="$2"
+  grep -F '"compact_boundary"' "$file" 2>/dev/null \
+    | jq -r 'select(.type == "system" and .subtype == "compact_boundary") | .timestamp // empty' 2>/dev/null \
+    | awk -v s="$since" '$0 >= s { found = 1 } END { exit found ? 0 : 1 }'
+}
+
+compaction_done_event() {
+  printf '%s' "<task-notification>
+<summary>Compaction done ($1) — delivered by agent-supervisor</summary>
+<event>Compaction done. This is not a message from the user and answers nothing you asked. Re-load yourself first, as your summary says, then carry on with work you were already cleared to do. If you were waiting on the user, keep waiting.</event>
+</task-notification>"
+}
+
+# start_compaction <name>: step 1 — deliver the compaction and mark it in flight.
+start_compaction() {
+  local name="$1" d="$IDENTITIES_DIR/$1" guidance cmd since
+  # Control characters are dropped (an ESC sequence could end the bracketed paste early).
+  guidance="$(head -c "$COMPACT_GUIDANCE_MAX_BYTES" "$d/.compact-requested" 2>/dev/null \
+    | iconv -f UTF-8 -t UTF-8 -c 2>/dev/null | tr '\r\n\t' '   ' | tr -d '\000-\037\177' \
+    | sed -E 's/ +/ /g; s/^ //; s/ $//')"
+  cmd="/compact"
+  [ -n "$guidance" ] && cmd="/compact $guidance"
+  since="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+  if ! { printf '%s\n' "$since" > "$d/.compacting.tmp" && mv "$d/.compacting.tmp" "$d/.compacting"; }; then
+    log "ERROR: '$name' compaction: could not write .compacting — request left for the next tick"
+    return 1
+  fi
+  if ! inbox_drop "$name" "$cmd"; then
+    rm -f "$d/.compacting"
+    log "ERROR: '$name' compaction: inbox drop failed — request left for the next tick"
+    return 1
+  fi
+  rm -f "$d/.compact-requested"
+  log "'$name' compaction: delivered /compact via inbox (guidance ${#guidance} chars, since $since)"
+  metric event=compact-start identity="$name" guidance_chars="${#guidance}"
+}
+
+# compaction_progress <name>: step 2 — once the compaction has landed, deliver the event.
+compaction_progress() {
+  local name="$1" d="$IDENTITIES_DIR/$1" since file age
+  since="$(head -n1 "$d/.compacting" 2>/dev/null)"
+  if [ -n "$since" ] && file="$(main_session_file "$name")" && compaction_landed "$file" "$since"; then
+    if inbox_drop "$name" "$(compaction_done_event "$name")"; then
+      rm -f "$d/.compacting"
+      log "'$name' compaction: landed — 'Compaction done' event delivered via inbox"
+      metric event=compact-done identity="$name"
+    else
+      log "ERROR: '$name' compaction: landed but the event's inbox drop failed — retrying next tick"
+    fi
+    return 0
+  fi
+  age=$(( $(date +%s) - $(stat -c %Y "$d/.compacting" 2>/dev/null || date +%s) ))
+  if [ "$age" -ge "$COMPACT_TIMEOUT_SECONDS" ]; then
+    rm -f "$d/.compacting"
+    log "WARNING: '$name' compaction: nothing landed ${age}s after /compact was delivered — giving up, no event sent"
+    metric event=compact-timeout identity="$name" age_s="$age"
+  fi
+}
+
+# handle_compaction <name> <session-or-empty>: called once per identity per tick.
+handle_compaction() {
+  local name="$1" sess="$2" d="$IDENTITIES_DIR/$1"
+  # An agent still running the old id skill asks for a reset by dropping .recycle-requested.
+  # Restarting is gone; treat it as a compaction request so the agent isn't left idle.
+  if [ -f "$d/.recycle-requested" ]; then
+    if [ -f "$d/.compact-requested" ] || [ -f "$d/.compacting" ]; then
+      rm -f "$d/.recycle-requested"
+    else
+      mv "$d/.recycle-requested" "$d/.compact-requested" 2>/dev/null || rm -f "$d/.recycle-requested"
+    fi
+    log "'$name' compaction: old-style reset request taken as a compaction request"
+  fi
+  if [ -f "$d/.compacting" ]; then
+    [ "${DRY_RUN:-0}" = 1 ] || compaction_progress "$name"
+    # A request arriving while one is in flight is the same request (e.g. a double press).
+    if [ -f "$d/.compact-requested" ] && [ -f "$d/.compacting" ]; then
+      rm -f "$d/.compact-requested"
+      log "'$name' compaction: request while one is in flight — dropped as a duplicate"
+    fi
+    return 0
+  fi
+  [ -f "$d/.compact-requested" ] || return 0
+  if [ "${DRY_RUN:-0}" = 1 ]; then log "DRY_RUN would compact '$name'"; return 0; fi
+  local req_age
+  req_age=$(( $(date +%s) - $(stat -c %Y "$d/.compact-requested" 2>/dev/null || date +%s) ))
+  if [ "$req_age" -ge "$COMPACT_REQUEST_TIMEOUT_SECONDS" ]; then
+    rm -f "$d/.compact-requested"
+    log "WARNING: '$name' compaction: request waited ${req_age}s without the agent coming to rest — dropped"
+    metric event=compact-request-expired identity="$name" age_s="$req_age"
+    return 0
+  fi
+  if [ ! -f "$d/.dormant" ]; then
+    # Awake: wait for a live harness at rest. A dormant identity needs no check — the inbox
+    # drop wakes it, and the inbox is drained at its fresh prompt.
+    [ -n "$sess" ] && claude_running_cached "$sess" || return 0
+    agent_at_rest "$sess" || return 0
+  fi
+  start_compaction "$name"
+}
+
+# bring identity $1 up in session $3 (mode $2 = fresh|recover). Fresh: $3 is the slug and the
+# session is created; recover: $3 is the existing (matched) session name.
+# resolve_launch_target <name>: where to start the identity and whether to resume. Sets
+# LAUNCH_CWD and LAUNCH_RESUME (empty = fresh /id). Shared by launch() and do_wake() so a wake
+# gets the same workdir rules (missing recorded dir → workspace/; no session → workspace/,
+# created if absent) as a launch.
+resolve_launch_target() {
+  local name="$1"
+  # Discover this identity's real working dir + latest session, so we resume in the RIGHT place
+  # rather than fresh in $HOME. For a truly-first-ever launch (no prior session), use the identity's
+  # workspace/ sub-folder by convention, creating it if missing.
+  # Convention-not-string: both coord and supervisor derive the path from $name; nothing is parsed
+  # from a config file. If workspace/ doesn't exist, the supervisor creates it (logged as a WARNING:
+  # workspace/ is supposed to exist from identity creation, so its absence means something went wrong
+  # at spawn time). $HOME is left only for a resume whose recorded workdir and workspace/ are both gone.
+  local cwd="$HOME" resume="" disc
+  if disc="$(resolve_session "$name")"; then
+    cwd="${disc%%$'\t'*}"; resume="${disc#*$'\t'}"
+    log "'$name' launch target: resolve_session picked token=${resume:0:8} cwd='$cwd'"
+    if [ ! -d "$cwd" ]; then
+      # Keep the resume: `claude --resume <id>` finds the session from any directory, and a fresh
+      # start would lose the agent's whole context. Only the starting directory changes.
+      local _missing="$cwd"
+      if [ -d "$IDENTITIES_DIR/$name/workspace" ]; then cwd="$IDENTITIES_DIR/$name/workspace"; else cwd="$HOME"; fi
+      log "'$name' recorded workdir '$_missing' missing — resuming in '$cwd' instead"
+    fi
+  elif [ -d "$IDENTITIES_DIR/$name/workspace" ]; then
+    cwd="$IDENTITIES_DIR/$name/workspace"
+    log "'$name' launch target: resolve_session found no prior session — using convention workdir '$cwd'"
+  elif mkdir -p "$IDENTITIES_DIR/$name/workspace" 2>/dev/null; then
+    cwd="$IDENTITIES_DIR/$name/workspace"
+    log "WARNING: '$name' launch target: no prior session and workspace/ was missing — created '$cwd'"
+  else
+    log "ERROR: '$name' launch target: no prior session and could not create $IDENTITIES_DIR/$name/workspace — fresh /id in \$HOME"
+  fi
+  LAUNCH_CWD="$cwd"; LAUNCH_RESUME="$resume"
+}
+
+launch() {
+  local name="$1" mode="$2" sess="$3" created=0
+  if [ "${DRY_RUN:-0}" = 1 ]; then log "DRY_RUN would $mode '$name' (tmux session '$sess')"; return 0; fi
+  resolve_launch_target "$name"
+  local cwd="$LAUNCH_CWD" resume="$LAUNCH_RESUME"
+  if ! timeout -k 5 10 tmux has-session -t "=$sess" 2>/dev/null; then
+    timeout -k 5 10 tmux new-session -d -s "$sess" -c "$cwd"     # empty SHELL session in the identity's workdir
+    created=1
+  fi
+  # An existing session's shell may sit anywhere; the launch line cd's into $cwd itself.
+  # A freshly-created login shell needs a moment to source its profile and be ready for input, or
+  # the typed launch command is lost to a race. (A recover targets an already-idle shell — no wait.)
+  [ "$created" = 1 ] && sleep 3
+  if [ -n "$resume" ]; then
+    log "${mode}ing '$name' (session '$sess') — RESUME ${resume:0:8} in $cwd"
+  else log "${mode}ing '$name' (session '$sess') — fresh /id in $cwd"; fi
+  accept_trust_for_workdir "$cwd"                 # source-of-truth: kill the folder-trust prompt
+  dismiss_resume_return_dialog                    # source-of-truth: kill the resume usage-limit prompt
+  drive "$name" "$sess" "$resume" "$cwd"
+  log "'$name' ${mode} done"
+}
+
+# =============================================================================================
+# DORMANCY (2026-08-07) — kill idle claude, wake on Matrix DM / scheduled fire / sentinel-delete / inbox drop
+# =============================================================================================
+# Gated by $DORMANCY (default "on" since 2026-09-14). DORMANCY="off" = no behavior change vs. the
+# pre-2026-08-07 supervisor.
+# Design: bounty session-dormancy-pilot. Pilot target: one mini PC (three agents),
+# IDLE_THRESHOLD_MINUTES=10 for iteration speed; prod default 120.
+#
+# Wake paths (all in-supervisor):
+#   1. matrix_peek — supervisor does its OWN /sync per dormant identity, distinct device from the
+#      identity's receiver (which is dead-with-session). New event → wake.
+#   2. schedule_peek — supervisor reads $IDENTITIES_DIR/<name>/wakeups/*/wakeup.json, computes
+#      next fire, wakes when due — or, for a sensor wake-up, when a fire is waiting in its
+#      fires/ folder. Identity's own scheduler picks up on resume.
+#   3. sentinel-delete — external actor (the app, hand) rm's .dormant → sentinel-check below fails
+#      → falls through to existing alive-check → claude is dead → recover path relaunches.
+#      FREE — no code, natural fallout of the sentinel check.
+#   4. inbox_has_files — shape-agent-supervisor-inbox: any process on this box can drop a
+#      message file into $IDENTITIES_DIR/<name>/inbox/ following the dropper contract
+#      (timestamp-hex-prefixed .msg filename, write-and-rename atomic). When the identity is
+#      dormant, this check fires and the normal do_wake path brings the harness back up — the
+#      fresh ambient-monitor's inbox-watcher child then drains the pending files via its
+#      catch-up-on-startup sweep. The dropper's responsibility ends at the file; the
+#      supervisor handles liveness transparently.
+
+# sample_memory (2026-08-08) — append one JSON line to $MEM_SAMPLES_LOG per reconcile cycle
+# so the dormancy dashboard can plot memory over time alongside kill/wake events. Same schema
+# as `free -k` MemTotal/Used/Free/Available. Called at the TOP of reconcile so we get a
+# sample once per CHECK_INTERVAL (30s default).
+sample_memory() {
+  local ts
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  local line
+  line=$(free -k | awk -v ts="$ts" '/^Mem:/ {
+    printf "{\"ts\":\"%s\",\"mem_total_kb\":%d,\"mem_used_kb\":%d,\"mem_free_kb\":%d,\"mem_available_kb\":%d}\n", ts, $2, $3, $4, $7
+  }')
+  [ -n "$line" ] && printf '%s\n' "$line" >> "$MEM_SAMPLES_LOG"
+}
+
+# rotate_if_big <file> — once <file> passes METRICS_MAX_BYTES, move it to <file>.1 (replacing
+# the previous .1) so the append-only jsonl logs stay bounded at ~2x the cap. Called once per
+# reconcile tick; a writer mid-append lands its line in the .1 file, which is fine.
+rotate_if_big() {
+  local f="$1" size
+  size=$(stat -c %s "$f" 2>/dev/null) || return 0
+  [ "$size" -gt "$METRICS_MAX_BYTES" ] || return 0
+  mv -f "$f" "$f.1" && log "rotated $f ($size bytes) to $f.1"
+}
+
+metric() {
+  # metric event=<kind> k=v k=v ...  → append one JSON line to $METRICS_LOG
+  local ts kv v k
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  kv="\"ts\":\"$ts\""
+  while [ $# -gt 0 ]; do
+    k="${1%%=*}"; v="${1#*=}"
+    case "$v" in
+      ''|*[!0-9-]*) kv="$kv,\"$k\":$(printf '%s' "$v" | jq -Rs .)" ;;
+      *)            kv="$kv,\"$k\":$v" ;;
+    esac
+    shift
+  done
+  printf '{%s}\n' "$kv" >> "$METRICS_LOG"
+}
+
+# find the most-recent .jsonl transcript owned by this identity, considering subagent
+# transcripts under <parent-file>/subagents/ too. Returns full path via stdout, empty if
+# none. Used by idle_check to see how long since this identity did anything.
+#
+# TWO-STAGE STRATEGY mirrors resolve_session (see the comment there for full rationale):
+#
+#   Stage 1: scan the identity's expected project dir for owned parents (fast: single
+#   directory, typically 1-50 files). For each owned parent, also consider its subagent
+#   dir — a foregrounded Agent tool call writes there and its mtime can outrun the
+#   parent's own (2026-08-10 Tiffany fix: killed 0.4s after subagent's last write during
+#   a valid gsd-executor run). Return the max mtime file across owned-parents and their
+#   subagents.
+#
+#   Stage 2: only if stage 1 found nothing owned. Broader birth-time-filtered scan
+#   across all project dirs — same primitives as resolve_session's slow path.
+_newest_jsonl_for() {
+  local name="$1" want project_dir mtime file owner best="" best_m=0 sub_dir sf m cutoff
+  local -a find_filter=()
+  want="$(_lower "$name")"
+  # Stage 1: expected project dir fast path.
+  project_dir="$(_expected_project_dir "$name")"
+  if [ -d "$project_dir" ]; then
+    while IFS=$'\t' read -r mtime file; do
+      [ -f "$file" ] || continue
+      owner="$(session_owner "$file")"
+      [ -n "$owner" ] || continue
+      [ "$(_lower "$owner")" = "$want" ] || continue
+      m=${mtime%.*}
+      [ "$m" -gt "$best_m" ] && { best_m=$m; best=$file; }
+      sub_dir="${file%.jsonl}/subagents"
+      if [ -d "$sub_dir" ]; then
+        for sf in "$sub_dir"/*.jsonl; do
+          [ -f "$sf" ] || continue
+          m=$(stat -c %Y "$sf" 2>/dev/null || echo 0)
+          [ "$m" -gt "$best_m" ] && { best_m=$m; best=$sf; }
+        done
+      fi
+    done < <(find "$project_dir" -maxdepth 1 -type f -name '*.jsonl' -printf '%T@\t%p\n' 2>/dev/null | sort -rn)
+  fi
+  if [ -z "$best" ]; then
+    # Stage 2: broader scan, birth-time filtered.
+    cutoff="$(stat -c %W "$IDENTITIES_DIR/$name" 2>/dev/null || echo 0)"
+    if [ "${cutoff:-0}" -gt 0 ]; then
+      find_filter=(-newermt "@$cutoff")
+    fi
+    while IFS=$'\t' read -r mtime file; do
+      [ -f "$file" ] || continue
+      owner="$(session_owner "$file")"
+      [ -n "$owner" ] || continue
+      [ "$(_lower "$owner")" = "$want" ] || continue
+      m=${mtime%.*}
+      [ "$m" -gt "$best_m" ] && { best_m=$m; best=$file; }
+      sub_dir="${file%.jsonl}/subagents"
+      if [ -d "$sub_dir" ]; then
+        for sf in "$sub_dir"/*.jsonl; do
+          [ -f "$sf" ] || continue
+          m=$(stat -c %Y "$sf" 2>/dev/null || echo 0)
+          [ "$m" -gt "$best_m" ] && { best_m=$m; best=$sf; }
+        done
+      fi
+    done < <(find "$PROJECTS_DIR/" -maxdepth 2 -type f -name '*.jsonl' "${find_filter[@]}" -printf '%T@\t%p\n' 2>/dev/null | sort -rn)
+  fi
+  printf '%s' "$best"
+}
+
+# ---- background-work reminders ----
+# Background commands and monitors are for short work. Once any of an awake agent's has been
+# running BG_NOTICE_MINUTES, the agent gets one notice listing every such command, repeated every
+# BG_NOTICE_MINUTES while any keeps running. A reminder only: nothing here stops, edits or blocks
+# what an agent runs. Found from the agent's claude process down — its direct children are the
+# Bash and Monitor tools' shells:
+#   - a Bash-tool shell writes to <tmp>/<project>/<session-id>/tasks/<task-id>.output; it counts
+#     when the session record (or a helper sub-agent's record beside it) marks that task as
+#     backgrounded — started in the background or moved there at its timeout. A foreground
+#     command has no such mark, so it is never reported.
+#   - a Monitor shell's output goes back to claude over a socket.
+# A Monitor watching a WebSocket or an MCP source has no shell, so it is not reported; Claude Code
+# stops every monitor within 30 minutes anyway.
+# No notice is sent until the agent has taken a turn since the last one, so an agent that can't
+# act (out of usage, stuck) comes back to one current notice, not a pile; nor while the pane shows
+# a dialog (the notice's Enter would pick an option) or a compaction is in flight.
+BG_NOTICE_MINUTES="${BG_NOTICE_MINUTES:-15}"
+BG_NOTICE_COMMAND_MAX_CHARS=400
+PS_BIN="${AGENT_PS_BIN:-ps}"
+declare -A CLAUDE_PID_BY_TTY=() PROC_CHILDREN=() PROC_AGE=()
+PROC_SNAPSHOT_OK=0
+
+# snapshot_procs — one ps per tick: every process's age and children, and the top-level claude
+# on each tty (a claude whose parent is also claude is a child harness, not the agent).
+# PROC_SNAPSHOT_OK=1 only when ps answered and showed at least one claude; on a failed or empty
+# sweep the reminders skip the tick instead of mistaking it for "nothing running".
+snapshot_procs() {
+  CLAUDE_PID_BY_TTY=(); PROC_CHILDREN=(); PROC_AGE=(); PROC_SNAPSHOT_OK=0
+  local -A comm_of=() ppid_of=() tty_of=()
+  local out pid ppid age tty comm
+  out="$(timeout -k 5 10 "$PS_BIN" -eo pid=,ppid=,etimes=,tty=,comm= 2>/dev/null)" || return 0
+  while read -r pid ppid age tty comm; do
+    [ -n "$comm" ] || continue
+    PROC_AGE["$pid"]="$age"
+    PROC_CHILDREN["$ppid"]+=" $pid"
+    comm_of["$pid"]="$comm"; ppid_of["$pid"]="$ppid"; tty_of["$pid"]="$tty"
+  done <<<"$out"
+  for pid in "${!comm_of[@]}"; do
+    [ "${comm_of[$pid]}" = claude ] || continue
+    [ "${tty_of[$pid]}" != "?" ] || continue
+    [ "${comm_of[${ppid_of[$pid]}]:-}" = claude ] && continue
+    CLAUDE_PID_BY_TTY["${tty_of[$pid]}"]="$pid"
+  done
+  [ "${#CLAUDE_PID_BY_TTY[@]}" -gt 0 ] && PROC_SNAPSHOT_OK=1
+  return 0
+}
+
+# _task_id_of <pid> <fd> — the task id when that fd writes to a task output file.
+_task_id_of() {
+  local link
+  link="$(readlink "$PROC_DIR/$1/fd/$2" 2>/dev/null)" || return 1
+  case "$link" in */tasks/*.output) ;; *) return 1 ;; esac
+  link="${link##*/}"; printf '%s' "${link%.output}"
+}
+
+# bg_work_candidates <session> — one line per child shell of the session's claude that has run
+# BG_NOTICE_MINUTES or more: "task<TAB>pid<TAB>age<TAB>task-id<TAB>session-file" or
+# "monitor<TAB>pid<TAB>age<TAB>task-id-if-known". Whether a task is really backgrounded is decided
+# later.
+bg_work_candidates() {
+  local sess="$1" tty claude pid age link sdir min
+  tty="${PANE_TTY_SNAPSHOT[$sess]:-}"
+  [ -n "$tty" ] || return 0
+  claude="${CLAUDE_PID_BY_TTY[$tty]:-}"
+  [ -n "$claude" ] || return 0
+  min=$((BG_NOTICE_MINUTES * 60))
+  for pid in ${PROC_CHILDREN[$claude]:-}; do
+    age="${PROC_AGE[$pid]:-0}"
+    [ "$age" -ge "$min" ] 2>/dev/null || continue
+    link="$(readlink "$PROC_DIR/$pid/fd/1" 2>/dev/null)" || continue
+    case "$link" in
+      */tasks/*.output)
+        sdir="${link%/tasks/*}"
+        printf 'task\t%s\t%s\t%s\t%s\n' "$pid" "$age" "$(_task_id_of "$pid" 1)" \
+          "$PROJECTS_DIR/$(basename "$(dirname "$sdir")")/$(basename "$sdir").jsonl" ;;
+      socket:*)
+        grep -qF 'shell-snapshots' "$PROC_DIR/$pid/cmdline" 2>/dev/null \
+          && printf 'monitor\t%s\t%s\t%s\n' "$pid" "$age" "$(_task_id_of "$pid" 2)" ;;
+    esac
+  done
+}
+
+# bg_task_input <session-file> <task-id> — when the task was backgrounded, prints
+# "<helper 0|1><TAB><task-id><TAB><the Bash call's input as JSON>"; nothing for a foreground task.
+bg_task_input() {
+  local file="$1" id="$2" f tuid input
+  for f in "$file" "${file%.jsonl}"/subagents/*.jsonl; do
+    [ -f "$f" ] || continue
+    tuid="$(grep -F "\"backgroundTaskId\":\"$id\"" "$f" 2>/dev/null \
+      | jq -r --arg id "$id" 'select(.type == "user" and .toolUseResult.backgroundTaskId? == $id)
+          | .message.content[]? | select(.type? == "tool_result") | .tool_use_id' 2>/dev/null | head -n1)"
+    [ -n "$tuid" ] || continue
+    input="$(grep -F "\"$tuid\"" "$f" 2>/dev/null \
+      | jq -c --arg t "$tuid" 'select(.type == "assistant") | .message.content[]?
+          | select(.type? == "tool_use" and .id == $t) | .input' 2>/dev/null | head -n1)"
+    printf '%s\t%s\t%s\n' "$([ "$f" = "$file" ] && echo 0 || echo 1)" "$id" "${input:-{\}}"
+    return 0
+  done
+  return 1
+}
+
+# bg_monitor_input <session-file> <pid> <task-id-if-known> — the Monitor call a monitor shell is
+# running, matched on its command (the most recent match):
+# "<helper 0|1><TAB><task-id or empty><TAB><input JSON>". Falls back to the command read off the
+# shell itself when no record matches.
+bg_monitor_input() {
+  local file="$1" pid="$2" id="${3:-}" cmd="" f input="" helper=0 m tuid rid
+  local -a argv=()
+  mapfile -d '' -t argv < "$PROC_DIR/$pid/cmdline" 2>/dev/null
+  # The tool runs `bash -c "<setup> && eval '<command>' < /dev/null && pwd -P >| <file>"`, with each
+  # single quote in <command> written as '"'"'.
+  if [ "${#argv[@]}" -ge 3 ] && [[ "${argv[2]}" == *"&& eval '"* ]]; then
+    cmd="${argv[2]#*&& eval \'}"
+    cmd="${cmd%\' < /dev/null && pwd -P >| *}"
+    cmd="${cmd//\'\"\'\"\'/\'}"
+  fi
+  if [ -n "$file" ] && [ -n "$cmd" ]; then
+    for f in "$file" "${file%.jsonl}"/subagents/*.jsonl; do
+      [ -f "$f" ] || continue
+      m="$(grep -F '"name":"Monitor"' "$f" 2>/dev/null \
+        | jq -c --arg c "$cmd" 'select(.type == "assistant") | .message.content[]?
+            | select(.type? == "tool_use" and .name == "Monitor" and .input.command? == $c) | {id, input}' 2>/dev/null | tail -n1)"
+      [ -n "$m" ] || continue
+      input="$(printf '%s' "$m" | jq -c .input)"
+      helper="$([ "$f" = "$file" ] && echo 0 || echo 1)"
+      tuid="$(printf '%s' "$m" | jq -r .id)"
+      rid="$(grep -F "\"$tuid\"" "$f" 2>/dev/null | jq -r --arg t "$tuid" 'select(.type == "user")
+          | select(any(.message.content[]?; .tool_use_id? == $t)) | .toolUseResult.taskId? // empty' 2>/dev/null | head -n1)"
+      [ -n "$id" ] || id="$rid"
+    done
+  fi
+  [ -n "$input" ] || input="$(jq -cn --arg c "$cmd" '{command: $c}')"
+  printf '%s\t%s\t%s\n' "$helper" "$id" "$input"
+}
+
+# _bg_duration <seconds> — "40m" / "3h 05m".
+_bg_duration() {
+  local s="$1"
+  if [ "$s" -ge 3600 ]; then printf '%dh %02dm' $((s / 3600)) $((s % 3600 / 60)); else printf '%dm' $((s / 60)); fi
+}
+
+# _bg_clean <text> — one line, control characters dropped, capped by characters (never mid
+# character: a broken UTF-8 file is discarded by the inbox), and with nothing that could end the
+# notice's envelope early or read as a relay message line in the app.
+_bg_clean() {
+  printf '%s' "$1" | tr '\n\t' '  ' | tr -d '\000-\037\177' \
+    | sed -E 's#<(/?)(task-notification|event|summary)#‹\1\2#g; s#\[room#[ room#g' \
+    | jq -Rr --argjson max "$BG_NOTICE_COMMAND_MAX_CHARS" 'if length > $max then .[0:$max] + "…" else . end' 2>/dev/null
+}
+
+# bg_notice_entry <kind> <pid> <age> <task-id> <helper> <input-json> — one entry of the notice.
+bg_notice_entry() {
+  local kind="$1" pid="$2" age="$3" id="$4" helper="$5" input="$6" cmd desc what stop
+  cmd="$(_bg_clean "$(printf '%s' "$input" | jq -r '.command // ""' 2>/dev/null)")"
+  desc="$(_bg_clean "$(printf '%s' "$input" | jq -r '.description // ""' 2>/dev/null)")"
+  if [ "$kind" = task ]; then what="Background command (task $id, process $pid"
+  elif [ -n "$id" ]; then what="Monitor (task $id, process $pid"
+  else what="Monitor (process $pid"
+  fi
+  if [ -n "$id" ]; then stop="use your task-stop tool (task $id), or kill process $pid and its child processes"
+  else stop="kill process $pid and its child processes"
+  fi
+  [ "$helper" = 1 ] && what="$what, started by one of your helper sub-agents"
+  printf -- '- %s), running %s:\n    %s\n' "$what" "$(_bg_duration "$age")" "${cmd:-(command not recorded)}"
+  [ -n "$desc" ] && printf '  Description: %s\n' "$desc"
+  printf '  To stop it: %s.\n' "$stop"
+}
+
+bg_notice_event() {
+  local name="$1" entries="$2" can_sleep="$3" sleep_line=""
+  [ "$can_sleep" = 1 ] && sleep_line="
+While any of these runs you can't go dormant."
+  printf '%s' "<task-notification>
+<summary>Background work check ($name) — delivered by agent-supervisor</summary>
+<event>Background work check. This is not a message from the user and answers nothing you asked.
+
+These background commands and monitors have been running for ${BG_NOTICE_MINUTES} minutes or more:
+$entries
+Background commands and monitors are for short work. Check each one is still doing what you meant:
+- Has the thing it is waiting for already happened? A wait that looks for a running process by a pattern (such as pgrep -f, or ps piped to grep) can match its own command line and never end.
+- Can its condition ever come true? Check the exact file, process or output it waits on.
+- Is it waiting for keyboard input? A background command never gets any.
+If it is broken or no longer needed, stop it.$sleep_line
+
+Anything meant to run longer than about two hours does not belong in a background command or monitor — see \"Background commands and monitors are for short work\" in the id skill's fleet directives (a one-time sensor for a wait, an app for something the user comes back to, its own service plus a sensor for a long job).
+
+If it is legitimate and working, leave it running: reply with just \"ok\" and nothing else. This check comes again every ${BG_NOTICE_MINUTES} minutes while it runs.</event>
+</task-notification>"
+}
+
+# _bg_turn_since <session-file> <iso-time> — true when the agent has replied (an assistant entry
+# that isn't an API error) at or after <iso-time>. Reads only the file's tail.
+_bg_turn_since() {
+  [ -f "$1" ] || return 1
+  tail -c 1048576 "$1" 2>/dev/null | grep -F '"type":"assistant"' \
+    | jq -r 'select(.type == "assistant" and (.isApiErrorMessage // false) == false) | .timestamp // empty' 2>/dev/null \
+    | awk -v s="$2" '$0 >= s { found = 1 } END { exit found ? 0 : 1 }'
+}
+
+# _bg_pane_blocked <session> — the pane shows a dialog or interactive prompt, where the notice's
+# Enter would choose something for the user. Mid-turn ("esc to interrupt") is fine: it queues.
+_bg_pane_blocked() {
+  local pane
+  pane="$(timeout -k 5 10 tmux capture-pane -pt "$1" 2>/dev/null)" || return 0
+  _is_interactive_prompt "$pane" && return 0
+  printf '%s\n' "$pane" | grep -v '^[[:space:]]*$' | tail -n 15 \
+    | grep -qE '❯[[:space:]]*[0-9]+\.|Enter to select|Esc to cancel'
+}
+
+# remind_background_work <name> <session> <dormancy-exempt 0|1> — send the notice when due.
+# State in $DORMANCY_STATE_DIR/<name>.bg-notice:
+#   1 when work was last checked (epoch)   2 when the last notice was sent (ISO, empty if none)
+#   3 items listed in it                   4 items found to be foreground at that check
+# Due when an item not seen at the last check has appeared, or BG_NOTICE_MINUTES after it.
+remind_background_work() {
+  local name="$1" sess="$2" exempt="${3:-0}" state="$DORMANCY_STATE_DIR/$1.bg-notice"
+  [ "$PROC_SNAPSHOT_OK" = 1 ] || return 0
+  local cands checked="" sent="" listed="" fg="" kind pid age id file key due=0 now main=""
+  cands="$(bg_work_candidates "$sess")"
+  if [ -z "$cands" ]; then rm -f "$state"; return 0; fi
+  [ -f "$state" ] && { IFS= read -r checked; IFS= read -r sent; IFS= read -r listed; IFS= read -r fg; } < "$state"
+  while IFS=$'\t' read -r kind pid age id file; do
+    key="$kind:${id:-$pid}"
+    case " $listed $fg " in *" $key "*) ;; *) due=1 ;; esac
+  done <<<"$cands"
+  now="$(date +%s)"
+  [ "$due" = 1 ] || [ $(( now - ${checked:-0} )) -ge $((BG_NOTICE_MINUTES * 60)) ] || return 0
+  [ -e "$IDENTITIES_DIR/$name/.compacting" ] && return 0
+  main="$(main_session_file "$name" 2>/dev/null)" || main=""
+  [ -n "$sent" ] && [ -n "$main" ] && ! _bg_turn_since "$main" "$sent" && return 0
+  _bg_pane_blocked "$sess" && return 0
+  mkdir -p "$DORMANCY_STATE_DIR" 2>/dev/null
+  if ! : > "$state.tmp" 2>/dev/null; then
+    log "ERROR: '$name' background work check: can't write $state.tmp — not sending"
+    return 0
+  fi
+
+  local entries="" n=0 info helper rest input list="" newlisted="" newfg=""
+  while IFS=$'\t' read -r kind pid age id file; do
+    if [ "$kind" = task ]; then
+      if ! info="$(bg_task_input "$file" "$id")"; then newfg="$newfg task:$id"; continue; fi
+    else
+      info="$(bg_monitor_input "$main" "$pid" "$id")"
+    fi
+    helper="${info%%$'\t'*}"; rest="${info#*$'\t'}"; id="${rest%%$'\t'*}"; input="${rest#*$'\t'}"
+    entries="$entries$(bg_notice_entry "$kind" "$pid" "$age" "$id" "$helper" "$input")"$'\n'
+    n=$((n + 1)); list="$list ${kind}:${id:-$pid}($(_bg_duration "$age"))"
+    newlisted="$newlisted $kind:${id:-$pid}"
+    # A monitor whose id was only found in the record is keyed by pid in the candidates.
+    [ "$kind" = monitor ] && newlisted="$newlisted monitor:$pid"
+  done <<<"$cands"
+
+  local sent_iso="$sent"
+  if [ "$n" -gt 0 ]; then
+    local can_sleep=0
+    [ "$DORMANCY" = on ] && [ "$exempt" = 0 ] && can_sleep=1
+    if [ "${DRY_RUN:-0}" = 1 ]; then
+      log "DRY_RUN would send '$name' a background work check:$list"
+    elif inbox_drop "$name" "$(bg_notice_event "$name" "$entries" "$can_sleep")"; then
+      sent_iso="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+      log "'$name' background work check sent via inbox:$list"
+      metric event=bg-work-notice identity="$name" items="$n"
+    else
+      rm -f "$state.tmp"
+      log "ERROR: '$name' background work check: inbox drop failed — retrying next tick"
+      return 0
+    fi
+  fi
+  if ! { printf '%s\n%s\n%s\n%s\n' "$now" "$sent_iso" "${newlisted# }" "${newfg# }" > "$state.tmp" \
+         && mv "$state.tmp" "$state"; }; then
+    log "ERROR: '$name' background work check: state not saved"
+  fi
+  return 0
+}
+
+# idle_check: two conditions REQUIRED, either alone insufficient.
+#  (a) claude code footer shows zero shells, zero monitors AND zero background agents. If a
+#      non-zero shell/monitor/background count appears in the last 10 lines, not idle. A running
+#      monitor is the agent waiting to be woken by an event; going dormant would kill it. (Monitors
+#      expire on their own, so they can't hold an agent awake indefinitely.) Unparseable pane →
+#      not idle (safe default).
+#  (b) transcript .jsonl mtime > IDLE_THRESHOLD_MINUTES.
+# Returns 0 = idle, non-zero = not idle.
+idle_check() {
+  local name="$1" sess="$2"
+  local pane; pane="$(timeout -k 5 10 tmux capture-pane -pt "$sess" -S -20 2>/dev/null | tail -10)" || return 1
+  # match ANY non-zero "N shells", "N monitors" or "N background" phrase → not idle
+  printf '%s' "$pane" | grep -qE '([1-9][0-9]* shell|[1-9][0-9]* monitor|[1-9][0-9]* background)' && return 1
+  local newest; newest="$(_newest_jsonl_for "$name")"
+  [ -n "$newest" ] || return 1
+  local now m idle_s threshold_s
+  now=$(date +%s)
+  m=$(stat -c %Y "$newest" 2>/dev/null || echo 0)
+  idle_s=$((now - m))
+  threshold_s=$((IDLE_THRESHOLD_MINUTES * 60))
+  [ "$idle_s" -ge "$threshold_s" ]
+}
+
+# pending_check: right before killing, is anything imminent that would wake immediately?
+# Returns 0 = clear to kill, non-zero = something pending.
+pending_check() {
+  local name="$1"
+  # matrix_peek intentionally NOT called here (user 2026-09-12). A LIVE identity's receiver
+  # is already processing messages — supervisor doesn't need to double-check the relay to
+  # decide whether to sweep to dormant. If a message races the sweep, the dormant-branch peek
+  # catches it on the next tick (~30s) and wakes the identity. Dropping this call also kills
+  # the state-churn false-positive class (registry-room m.room.member events from other
+  # identity mints were perma-blocking sweep across the fleet) and slashes supervisor→
+  # homeserver polling by ~90% (only dormant identities poll now, not live ones).
+  # schedule_peek stays: don't kill an identity right before a scheduled wake fires — the
+  # in-session wakeup-scheduler Monitor dies with the session and the fire would be missed.
+  schedule_peek "$name" && return 1
+  # A compaction asked for or under way, or anything waiting in the inbox (the /compact itself,
+  # the "Compaction done" event, a message): putting the agent to sleep now would lose it.
+  [ -e "$IDENTITIES_DIR/$name/.compact-requested" ] && return 1
+  [ -e "$IDENTITIES_DIR/$name/.compacting" ] && return 1
+  inbox_has_files "$name" && return 1
+  return 0
+}
+
+# matrix_peek: returns 0 if THIS identity has new events since it went dormant on ANY of its
+# Matrix accounts. Enumerates BY CONTENT: any *.json file at <idroot>/ or <idroot>/*/ that
+# contains base + user_id + password keys counts as a relay account. State dir is derived
+# from the cred file's stem — <stem>-state/ as a sibling folder (so relay.json → relay-state/,
+# relay-work.json → relay-work-state/, <subdir>/relay.json → <subdir>/relay-state/).
+# This matches ambient-monitor.py's discovery so both scripts agree on which files are creds
+# and where each account's state lives.
+#
+# For each discovered account _matrix_peek_one REUSES that account's own recv.sh token +
+# since cursor (from <state-dir>/{token,since}). Why cursor-reuse: the receiver's cursor was
+# captured at time-of-dormancy, so /sync?since=<that> returns EXACTLY the events that arrived
+# while dormant — no need for a separate supervisor-owned device, no fresh-login/first-seed
+# issues (which caused the earlier design to be blind to invites arriving before its own first
+# sync). Since the receiver died with the CC session, there's no concurrent user of the token.
+# Supervisor does NOT write back to since — receiver picks up from the same cursor on wake
+# and backfills naturally.
+#
+# Peek cost is kept flat (2026-10-10 — the frozen cursor made every peek re-serialize the whole
+# since-dormancy backlog, ~200KB × 172 accounts every tick, Synapse 25-68% CPU):
+#   (1) Supervisor-private peek cursor in <state-dir>/peek-since, one line "<receiver-since>
+#       <peek-since>". Starts at the receiver's since; advanced to next_batch after every QUIET
+#       peek (never on wake — a wake that fails to launch must be re-seen next tick). The
+#       receiver-since column binds it to one dormancy: once the receiver advances its own
+#       cursor (it ran), the stored peek cursor is discarded and peeking restarts from the
+#       receiver's since. A server error while on the peek cursor deletes the file (falls back
+#       to the receiver's since next tick). recv.sh never reads this file.
+#   (2) Sync filter: only m.room.message / m.room.encrypted from other senders in timelines,
+#       no state / ephemeral / presence / account data. Invites still arrive (verified live
+#       against Synapse 2026-10-10).
+#
+# On 401 (token expired/revoked) for a given account, _matrix_peek_one falls back to fresh login
+# using THAT account's cred-file password + saves the NEW token back to THAT account's own
+# state-dir/token (matches recv.sh's own 401 behavior — that path is proven; per-account isolation
+# ensures a stale primary token doesn't clobber a healthy secondary and vice versa).
+#
+# The enumerator does NOT early-return on wake — it iterates every account so each one's own 401
+# refresh runs each cycle (no cursor rot on quiet-but-stale-token accounts).
+_matrix_peek_one() {
+  local name="$1"
+  local rj="$2"
+  local rs="$3"
+  # Account label mirrors ambient-monitor.py's labeling: filename stem at top level,
+  # "<subdir>/<stem>" one deep. Used in metric lines only — no behavior depends on it.
+  local account stem parent_dir
+  stem=$(basename "$rj" .json)
+  parent_dir=$(dirname "$rj")
+  if [ "$parent_dir" = "$IDENTITIES_DIR/$name" ]; then
+    account="$stem"
+  else
+    account="$(basename "$parent_dir")/$stem"
+  fi
+  [ -f "$rj" ] || return 1
+  [ -d "$rs" ] || return 1
+  local base mxid self tok since
+  base=$(jq -r '.base' "$rj")
+  mxid=$(jq -r '.user_id' "$rj")
+  self="$mxid"                              # for sender != self comparison, keep full mxid
+  tok=$(cat "$rs/token" 2>/dev/null)
+  since=$(cat "$rs/since" 2>/dev/null)
+  # Missing state is only expected on a brand-new identity whose receiver never ran; safe default
+  # is "no wake" (receiver will seed on first wake anyway).
+  [ -n "$tok" ] && [ -n "$since" ] || { metric event=matrix-peek identity="$name" account="$account" result=no-state; return 1; }
+  local pf="$rs/peek-since" peek_since="$since" pbase="" pcur=""
+  if [ -f "$pf" ]; then
+    read -r pbase pcur < "$pf" || true
+    [ "$pbase" = "$since" ] && [ -n "$pcur" ] && peek_since="$pcur"
+  fi
+  local filter
+  filter=$(jq -rn --arg self "$self" '{
+      presence:{not_types:["*"]}, account_data:{not_types:["*"]},
+      room:{state:{types:[]}, ephemeral:{not_types:["*"]}, account_data:{not_types:["*"]},
+            timeline:{types:["m.room.message","m.room.encrypted"], not_senders:[$self], limit:5}}
+    } | tojson | @uri')
+  local resp; resp=$(curl -sS --max-time 15 -H "Authorization: Bearer $tok" \
+    "$base/sync?timeout=0&since=$peek_since&filter=$filter" 2>/dev/null)
+  # 401 → re-login with password, save new token back to receiver's location so the receiver
+  # inherits the fresh token on wake (mirrors recv.sh's own re-login pattern).
+  if echo "$resp" | jq -e '.errcode == "M_UNKNOWN_TOKEN"' >/dev/null 2>&1; then
+    local pass user lr new_tok
+    pass=$(jq -r '.password' "$rj")
+    user="${mxid#@}"; user="${user%%:*}"
+    lr=$(curl -sS --max-time 10 -X POST -H 'Content-Type: application/json' \
+      -d "$(jq -nc --arg u "$user" --arg p "$pass" \
+        '{type:"m.login.password",identifier:{type:"m.id.user",user:$u},password:$p}')" \
+      "$base/login" 2>/dev/null)
+    new_tok=$(echo "$lr" | jq -r '.access_token // empty')
+    if [ -n "$new_tok" ]; then
+      printf '%s' "$new_tok" > "$rs/token"
+      metric event=matrix-peek identity="$name" account="$account" result=token-refreshed
+    else
+      metric event=matrix-peek identity="$name" account="$account" result=relogin-fail
+    fi
+    return 1                                # skip this cycle; next cycle uses fresh token
+  fi
+  # Any other server error while on the peek cursor: drop it so the next tick falls back to
+  # the receiver's since. Otherwise a cursor the server rejects (e.g. after a DB restore)
+  # would be retried forever — it is only rebound when the receiver runs, which needs a wake.
+  if echo "$resp" | jq -e 'has("errcode")' >/dev/null 2>&1; then
+    [ "$peek_since" != "$since" ] && rm -f "$pf"
+    metric event=matrix-peek identity="$name" account="$account" result=error \
+      errcode="$(echo "$resp" | jq -r '.errcode' 2>/dev/null)"
+    return 1
+  fi
+  # Count wake signals: (1) new MESSAGE events (m.room.message / m.room.encrypted) in JOINED
+  # rooms from senders != self; (2) any pending entry in .rooms.invite. State events
+  # (m.room.member, m.room.name, m.room.topic, etc.) do NOT wake — e.g. registry-room
+  # membership churn from other identity mints is background noise, not a message for me
+  # (user 2026-09-12).
+  # Why invites DO wake now (was: they didn't): the previous comment justified skipping
+  # invites with "recv.sh auto-accepts them silently on the next real wake" — true for LIVE
+  # identities, but recv.sh isn't running while the identity is dormant. So a fresh DM room
+  # (peer creates room + invite + opener in one motion) sat in .rooms.invite indefinitely
+  # for a dormant target because the opener never lands in .rooms.join (target isn't a
+  # member) and the invite itself was ignored — a black-hole for first-contact DMs to
+  # dormant agents. Fix: treat presence of ANY invite as a wake signal. On wake, recv.sh's
+  # existing invite-handling (join + /rooms/.../messages?dir=b&limit=10 backfill + surface
+  # opener) fires normally — supervisor doesn't touch the invite itself, so recv.sh's
+  # backfill path (which catches the pre-join opener) still runs on the woken session.
+  # Registry-room false-wake is not a concern here: a dormant identity was live at its own
+  # mint and its recv.sh accepted the one registry invite then, so registry re-invites
+  # never appear in .rooms.invite of a dormant identity. Empty-invite false-wake (peer
+  # invites and never messages) is theoretically possible but ~never happens in practice.
+  local ec
+  ec=$(echo "$resp" | jq --arg self "$self" \
+    '([.rooms.join // {} | to_entries[] | .value.timeline.events[]?
+       | select(.sender != $self and (.type == "m.room.message" or .type == "m.room.encrypted"))
+      ] | length)
+     + (.rooms.invite // {} | length)' 2>/dev/null)
+  if [ "${ec:-0}" -gt 0 ]; then
+    metric event=matrix-peek identity="$name" account="$account" result=wake events="${ec:-0}"
+    return 0
+  fi
+  local nb
+  nb=$(echo "$resp" | jq -r '.next_batch // empty' 2>/dev/null)
+  if [ -n "$nb" ] && [ "$nb" != "$peek_since" ]; then
+    { printf '%s %s\n' "$since" "$nb" > "$pf.tmp.$$" && mv -f "$pf.tmp.$$" "$pf"; } || rm -f "$pf.tmp.$$"
+  fi
+  metric event=matrix-peek identity="$name" account="$account" result=quiet
+  return 1
+}
+
+matrix_peek() {
+  local name="$1"
+  local idroot="$IDENTITIES_DIR/$name"
+  local wake=1
+  # nullglob so an empty *.json glob yields zero iterations, not a literal '*' string.
+  # Save & restore prior nullglob state so we don't leak the option to the caller.
+  local restore_nullglob
+  restore_nullglob=$(shopt -p nullglob)
+  shopt -s nullglob
+  local rj rs rc stem
+  for rj in "$idroot"/*.json "$idroot"/*/*.json; do
+    # Content filter: only files with base + user_id + password count as cred files.
+    # Filters out wake-up specs (name/schedule/instruction), relay-state/*.json (login/req
+    # bodies), and any unrelated JSON that lands in the identity tree.
+    jq -e 'type == "object" and (has("base") and has("user_id") and has("password"))
+           and (.base | type == "string" and length > 0)
+           and (.user_id | type == "string" and length > 0)
+           and (.password | type == "string" and length > 0)' \
+      "$rj" >/dev/null 2>&1 || continue
+    stem=$(basename "$rj" .json)
+    rs="$(dirname "$rj")/${stem}-state"
+    _matrix_peek_one "$name" "$rj" "$rs"; rc=$?
+    # Do NOT break on wake — remaining accounts still need their own 401-refresh cycle to run
+    # so stale tokens on quiet accounts don't rot. wake tracks the "any account woke" bit.
+    [ "$rc" -eq 0 ] && wake=0
+  done
+  eval "$restore_nullglob"
+  return "$wake"
+}
+
+# matrix_peek_cached: reconcile hot-path lookup on the per-tick snapshot populated by
+# snapshot_matrix_peek(). Returns 0 iff matrix_peek() reported a wake for this identity on
+# THIS reconcile pass. Callers that need real-time freshness should call matrix_peek() directly
+# — but the reconcile dormant-branch never needed real-time (the snapshot is < 1s stale in
+# parallel mode, which is well below the tick cadence).
+matrix_peek_cached() {
+  [ -n "${MATRIX_PEEK_SNAPSHOT[$1]:-}" ]
+}
+
+# snapshot_matrix_peek: parallelize matrix_peek across all currently-dormant identities via
+# xargs -P 20. Was ~4.75s serial for ~80 dormant on this box; parallel drops it to ~0.5s.
+# Side effects (token refresh on 401) still happen per-account, run inside each worker.
+#
+# Concurrency knob: MATRIX_PEEK_PARALLEL (default 20). Empirical test 2026-09-17 showed
+# -P 20 and -P 80 both zero rate-limits on this fleet's Synapse; -P 20 was marginally
+# faster and lighter on the homeserver worker pool, so it's the default.
+snapshot_matrix_peek() {
+  MATRIX_PEEK_SNAPSHOT=()
+  [ "$DORMANCY" = "on" ] || return 0
+  local dormant_list=() name
+  for name in "${IDENTITIES[@]}"; do
+    [ -f "$IDENTITIES_DIR/$name/.dormant" ] || continue
+    [ -f "$IDENTITIES_DIR/$name/.no-dormancy" ] && continue    # exempt: identity opted out
+    dormant_list+=("$name")
+  done
+  [ ${#dormant_list[@]} -eq 0 ] && return 0
+  local par="${MATRIX_PEEK_PARALLEL:-20}"
+  local tmpdir
+  tmpdir=$(mktemp -d)
+  # Export the functions the worker calls + the env vars they read. Set -u/pipefail carry
+  # into the subshell; matrix_peek + _matrix_peek_one are already -u-safe.
+  export -f matrix_peek _matrix_peek_one metric
+  export IDENTITIES_DIR METRICS_LOG SELF_PATH
+  # Each worker writes a sentinel file `<name>` to tmpdir on wake. Non-wake writes nothing.
+  # The worker exits 0 regardless so an individual failure doesn't abort xargs.
+  printf '%s\n' "${dormant_list[@]}" | xargs -P "$par" -I{} bash -c '
+    if matrix_peek "$1" >/dev/null 2>&1; then
+      : > "$2/$1"
+    fi
+    exit 0
+  ' _ {} "$tmpdir"
+  # Collect wakes
+  for name in "${dormant_list[@]}"; do
+    [ -e "$tmpdir/$name" ] && MATRIX_PEEK_SNAPSHOT["$name"]=1
+  done
+  rm -rf "$tmpdir"
+}
+
+# schedule_peek: returns 0 if the identity has a wakeup spec firing within FALSE_KILL_MINUTES.
+# Lookup on SCHEDULE_PEEK_SNAPSHOT populated once per reconcile tick by snapshot_schedule_peek().
+# The heavy lifting (interpreter start + JSON parse + spec walk) runs ONCE for the whole fleet
+# instead of once per identity — was ~5s/tick on this box, now ~100ms total.
+schedule_peek() {
+  [ -n "${SCHEDULE_PEEK_SNAPSHOT[$1]:-}" ]
+}
+
+# inbox_has_files — fourth dormant-wake kind (shape-agent-supervisor-inbox).
+# Returns 0 iff the identity has at least one valid-shape message file waiting in
+# its inbox folder. Called from the reconcile dormant branch alongside
+# matrix_peek_cached / schedule_peek. No snapshot needed: for most identities the
+# inbox folder won't exist at all (trivial no-op), and for identities with an inbox
+# a directory iteration is sub-millisecond.
+#
+# "Valid shape" matches the dropper contract: compact UTC timestamp (18 chars,
+# YYYYMMDDTHHMMSSmmm with year starting "20"), dash, 8 lowercase hex chars,
+# ".msg" extension. Operator stray notes (<name>.txt, README.md), mid-write temp
+# files (<name>.msg.tmp), and other non-matching filenames do NOT wake the
+# identity — same load-bearing name-shape filter the ambient-monitor's fifth
+# child uses for its own event processing.
+#
+# Returns on first match (short-circuits — don't iterate the whole folder when
+# we only need "any?").
+inbox_has_files() {
+  local name="$1"
+  local inbox="$IDENTITIES_DIR/$name/inbox"
+  [ -d "$inbox" ] || return 1
+  local f bn restore_nullglob
+  restore_nullglob=$(shopt -p nullglob)
+  shopt -s nullglob
+  for f in "$inbox"/*.msg; do
+    bn="${f##*/}"
+    if [[ "$bn" =~ ^20[0-9]{6}T[0-9]{9}-[0-9a-f]{8}\.msg$ ]]; then
+      eval "$restore_nullglob"
+      return 0
+    fi
+  done
+  eval "$restore_nullglob"
+  return 1
+}
+
+# snapshot_schedule_peek: one python subprocess per tick that receives the whole fleet's wakedirs
+# on stdin and emits a JSON dict of {name: detail_or_empty} on stdout. detail is a non-empty
+# "spec=... type=... next_fire=... overdue_s=..." string IFF at least one of the identity's specs
+# fires within FALSE_KILL_MINUTES. Empty string = not due. Per-identity errors go to stderr and
+# get logged as a metric each.
+#
+# Every schedule kind is evaluated by the scheduler's own engine (loaded from
+# $WAKEUP_SCHEDULER_BIN), so the peek can't drift from what actually fires. Any
+# exception in a single identity's block is caught and recorded as an error
+# metric for that identity; other identities in the batch are unaffected.
+#
+# NOTE: wakeup-scheduler.py writes time.time() (a FLOAT) into .state/<slug>.last. Use float() to
+# parse (bug: 2026-08-07 pilot, int() on '1786106092.3482552' silently swallowed all wakes).
+snapshot_schedule_peek() {
+  SCHEDULE_PEEK_SNAPSHOT=()
+  local name input="["
+  local first=1
+  for name in "${IDENTITIES[@]}"; do
+    local wd="$IDENTITIES_DIR/$name/wakeups"
+    [ -d "$wd" ] || continue
+    [ $first -eq 1 ] || input+=","
+    first=0
+    input+="{\"name\":\"$name\",\"wakedir\":\"$wd\"}"
+  done
+  input+="]"
+  [ "$input" = "[]" ] && return 0
+  local py_out py_err
+  py_err=$(mktemp)
+  py_out=$(python3 - "$FALSE_KILL_MINUTES" "$input" "$WAKEUP_SCHEDULER_BIN" <<'PY' 2>"$py_err"
+import importlib.util, json, os, sys, time, glob
+from importlib.machinery import SourceFileLoader
+
+window_min = int(sys.argv[1])
+now = time.time()
+soon = now + window_min * 60
+
+# The schedule engine lives in the scheduler itself. Load the installed copy so
+# this peek and the scheduler can never disagree about when a spec fires.
+_loader = SourceFileLoader("wakeup_scheduler_engine", sys.argv[3])
+_mod_spec = importlib.util.spec_from_loader(_loader.name, _loader)
+eng = importlib.util.module_from_spec(_mod_spec)
+_loader.exec_module(eng)
+BOX_ZONE = eng.local_zone()
+
+def _read_num(path, cast=float):
+    try: return cast(open(path).read().strip())
+    except Exception: return None
+
+def _peek_one(wakedir):
+    """Returns (detail_or_empty_string, list_of_errors)."""
+    errors = []
+    # One folder per wake-up: <wakedir>/<slug>/wakeup.json, state in <slug>/.state/.
+    for spec_path in glob.glob(os.path.join(wakedir, '*', 'wakeup.json')):
+        try:
+            folder = os.path.dirname(spec_path)
+            key = os.path.basename(folder)               # same state key as the scheduler
+            if key.startswith('.'): continue
+            with open(spec_path) as f: spec = json.load(f)
+            if not spec.get('enabled', True): continue
+            sch = spec.get('schedule')
+            # Same load gate as wakeup-scheduler.py _load_specs (a sensor wake-up
+            # loads even with an empty instruction).
+            is_sensor = isinstance(sch, dict) and sch.get('type') == eng.SENSOR_TYPE
+            if not sch or not (spec.get('instruction') or is_sensor): continue
+            if eng.schedule_error(sch): continue          # the scheduler won't fire it either
+            base = os.path.join(folder, '.state', key)
+            t = sch.get('type')
+            if t == eng.SENSOR_TYPE:
+                # A one-time sensor that already handed its fire over delivers nothing more.
+                if sch.get('once') is True and os.path.exists(base + '.fired') \
+                        and os.path.getmtime(spec_path) <= os.path.getmtime(base + '.fired'):
+                    continue
+                # A waiting sensor fire is due now — the scheduler delivers it on its next poll.
+                # Through the fire controls when the engine has them: duplicates it would
+                # drop, bundles still inside their window and tripped triggers don't wake.
+                if sch.get('once') is not True and hasattr(eng, 'sensor_deliverable_count'):
+                    n = eng.sensor_deliverable_count(folder, spec_path, soon)
+                else:
+                    n = len(eng.pending_fires(folder))
+                if n:
+                    return (f"spec={key} type=sensor pending_fires={n} overdue_s=0", errors)
+                # A broken sensor its owner hasn't been told about yet is due too.
+                if hasattr(eng, 'sensor_broken_due') and eng.sensor_broken_due(folder, key, now):
+                    return (f"spec={key} type=sensor broken=1 overdue_s=0", errors)
+                continue
+            if t == 'one_shot':
+                if os.path.exists(base + '.fired') and os.path.getmtime(spec_path) <= os.path.getmtime(base + '.fired'):
+                    continue
+                zi, tz_err = eng._zone(spec)
+                if tz_err: continue
+                next_fire, _, at_err = eng._parse_at_ts(sch.get('at'), zi)
+                if at_err: continue
+            else:
+                # Reference: `.last` (real fire) if present, else `.anchored` (first sight)
+                # — the same fallback as the scheduler. Never-seen specs can't be due.
+                ref = _read_num(base + '.last')
+                if ref is None: ref = _read_num(base + '.anchored')
+                if ref is None: continue
+                count = sch.get('count')
+                if count is not None and (_read_num(base + '.runs', int) or 0) >= count: continue
+                next_fire = eng.next_fire(sch, ref, BOX_ZONE)
+            if next_fire is not None and next_fire <= soon:
+                return (f"spec={key} type={t} next_fire={int(next_fire)} overdue_s={int(now-next_fire)}", errors)
+        except Exception as e:
+            errors.append(f"spec={spec_path} {type(e).__name__}: {e}")
+            continue
+    return ("", errors)
+
+try:
+    identities = json.loads(sys.argv[2])
+except Exception as e:
+    print(f"BATCH-PARSE-FAIL: {type(e).__name__}: {e}", file=sys.stderr)
+    print("{}")
+    sys.exit(2)
+
+out = {}
+for ent in identities:
+    try:
+        name = ent["name"]; wakedir = ent["wakedir"]
+        detail, errs = _peek_one(wakedir)
+        out[name] = detail
+        for err in errs:
+            print(f"ERROR name={name} {err}", file=sys.stderr)
+    except Exception as e:
+        print(f"ERROR name={ent.get('name','?')} outer: {type(e).__name__}: {e}", file=sys.stderr)
+        out[ent.get("name","?")] = ""
+print(json.dumps(out))
+PY
+)
+  local rc=$?
+  if [ $rc -ne 0 ] && [ $rc -ne 2 ]; then
+    log "WARNING: snapshot_schedule_peek: python exited $rc — treating all identities as not-due for this tick"
+    log "  stderr: $(tr '\n' '|' < "$py_err" | tail -c 500)"
+    rm -f "$py_err"
+    return 0
+  fi
+  # Parse the JSON dict into SCHEDULE_PEEK_SNAPSHOT. Any per-identity detail becomes the map value.
+  local n d
+  while IFS=$'\t' read -r n d; do
+    [ -n "$n" ] || continue
+    [ -n "$d" ] && SCHEDULE_PEEK_SNAPSHOT["$n"]="$d"
+  done < <(printf '%s' "$py_out" | jq -r 'to_entries[] | [.key, .value] | @tsv' 2>/dev/null)
+  # Emit per-identity metrics — one for each due entry, one per stderr ERROR line.
+  for n in "${!SCHEDULE_PEEK_SNAPSHOT[@]}"; do
+    metric event=schedule-peek identity="$n" result=due detail="${SCHEDULE_PEEK_SNAPSHOT[$n]}"
+  done
+  if [ -s "$py_err" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        ERROR\ name=*)
+          local ename
+          ename="${line#ERROR name=}"; ename="${ename%% *}"
+          metric event=schedule-peek identity="$ename" result=error detail="$line"
+          ;;
+        BATCH-PARSE-FAIL*)
+          log "ERROR: snapshot_schedule_peek: $line"
+          ;;
+      esac
+    done < "$py_err"
+  fi
+  rm -f "$py_err"
+}
+
+# do_kill_dormant: send /exit at REPL, blind-Enter through any confirms, poll for bare shell prompt,
+# drop the .dormant sentinel. Called only after idle_check + pending_check both pass.
+do_kill_dormant() {
+  local name="$1" sess="$2"
+  # supervisor is about to touch this pane — drop the "hands off" marker; it'll be re-dropped by
+  # drive() at the end of the next wake.
+  rm -f "$IDENTITIES_DIR/$name/.resume-complete" 2>/dev/null
+  local rss_before
+  rss_before=$(ps -o rss= -C claude 2>/dev/null | awk '{s+=$1}END{print s+0}')
+  metric event=kill-start identity="$name" session="$sess" rss_kb_before="$rss_before"
+  local sentinel="$IDENTITIES_DIR/$name/.dormant"
+  # Write .dormant BEFORE the /exit paste — otherwise there is a window where claude has exited
+  # but the sentinel is not yet on disk, and an external observer (an app pane attaching mid-kill)
+  # sees "no claude AND no sentinel" and paints the inactive fallback banner. Rolled back in the
+  # poll-fail branch below. Reconcile itself is safe: do_kill_dormant runs synchronously inside
+  # the iteration, so no re-entry for this identity during the kill window.
+  date -u +%Y-%m-%dT%H:%M:%SZ > "$sentinel"
+  # Use bracketed paste for the /exit text (avoids Ink's race with plain send-keys), then Enter
+  local _t; _t=$(mktemp); printf '/exit' > "$_t"
+  timeout -k 5 10 tmux load-buffer -t "$sess" "$_t" 2>/dev/null
+  timeout -k 5 10 tmux paste-buffer -p -t "$sess" 2>/dev/null
+  rm -f "$_t"
+  sleep 0.5
+  timeout -k 5 10 tmux send-keys -t "$sess" Enter 2>/dev/null
+  # Blind Enter x3 spaced 2s for any monitor-kill confirmation prompts
+  local i=0; while [ "$i" -lt 3 ]; do sleep 2; timeout -k 5 10 tmux send-keys -t "$sess" Enter 2>/dev/null; i=$((i+1)); done
+  # Poll: is claude still a child of this pane's shell? — up to 30s.
+  # (2026-08-19 rewrite, Sandy diagnosis after yolanda/vicky/sandy kill-fail cluster.) The prior
+  # design polled the pane TEXT for a bare-shell-prompt regex (`[$#]$` on the last visible line).
+  # That's a fragile proxy: it misses when the exit-hint line ("claude --resume <id>") or a
+  # blank line lands as tail-1, so kill-fail fired even though /exit had already completed in
+  # ~5-15s. Metrics from the prior week: every successful kill on this box completed in 5-14s
+  # (median 10s, max 14s, N=50) — so bumping the poll ceiling from 30s→90s on 2026-08-12
+  # didn't help, because the ceiling was never the actual problem. The real question is
+  # "did claude exit," and the direct answer is "does the pane's shell still have a claude
+  # child?" — a boolean process fact, not a pane-text guess. 30s is generously enough (3× the
+  # observed p90). Poll every 1s so success is snappy.
+  local pane_pid; pane_pid=$(timeout -k 5 10 tmux display-message -p -t "$sess" '#{pane_pid}' 2>/dev/null)
+  if [ -z "$pane_pid" ]; then
+    rm -f "$sentinel"
+    log "'$name' dormancy KILL: could not resolve pane_pid for session '$sess' — aborting kill (sentinel rolled back)"
+    metric event=kill-fail identity="$name" reason=no-pane-pid
+    return 1
+  fi
+  local waited=0 ok=0
+  while [ "$waited" -lt 30 ]; do
+    sleep 1; waited=$((waited+1))
+    # No claude among the pane shell's direct children → claude exited.
+    if ! pgrep -P "$pane_pid" -x claude >/dev/null 2>&1; then ok=1; break; fi
+  done
+  if [ "$ok" != 1 ]; then
+    # Roll back the pre-written sentinel — claude genuinely survived 30s of /exit. Reconcile's
+    # alive-check handles it as usual next tick.
+    rm -f "$sentinel"
+    log "'$name' dormancy KILL: claude still a child of pane $pane_pid after 30s — aborting kill (sentinel rolled back)"
+    metric event=kill-fail identity="$name" reason=claude-still-running
+    return 1
+  fi
+  local rss_after; rss_after=$(ps -o rss= -C claude 2>/dev/null | awk '{s+=$1}END{print s+0}')
+  local reclaimed=$((rss_before - rss_after))
+  log "'$name' dormant (kill ok, reclaimed ~${reclaimed}KB total-claude-rss, sentinel dropped)"
+  metric event=kill-done identity="$name" session="$sess" rss_kb_after="$rss_after" reclaimed_kb="$reclaimed"
+  minimize_dormant_pane "$name" "$sess"
+  # The desktop goes dormant with claude — unless the user is on it right now (reap_desktops
+  # stops it on a later tick once they leave).
+  if desktop_in_use "$name"; then
+    log "'$name' desktop left running (user is viewing or controlling it)"
+  else
+    stop_identity_desktop "$name" "dormant"
+  fi
+}
+
+# do_wake: remove .dormant, call drive() with --resume. Reuses the existing --resume path verbatim
+# (trust dialog, resume-summary Down+Enter, ambient-monitor start).
+# drive() ALREADY scrapes for the ❯ prompt as part of its dialog-handling; if drive() returns 0
+# and its ambient-monitor-start log line appears, we're at REPL. So
+# no need for a redundant 60s verify poll here — we just check pane state at the end and LOUD-log
+# any mismatch. If the wake FAILS (drive() couldn't resume), the sentinel is already removed and
+# next reconcile cycle sees dead claude + no sentinel → existing recover path relaunches. That's
+# the built-in graceful-failure of the mechanism.
+do_wake() {
+  local name="$1" sess="$2" trigger="$3"
+  local sentinel="$IDENTITIES_DIR/$name/.dormant"
+  local t0 t1 latency
+  t0=$(date +%s)
+  metric event=wake-start identity="$name" trigger="$trigger"
+  rm -f "$sentinel"
+  # resolve_session prints "<cwd>\t<sessionId>" (tab-separated) — need the SECOND field
+  resolve_launch_target "$name"
+  local sid="$LAUNCH_RESUME" wcwd="$LAUNCH_CWD"
+  accept_trust_for_workdir "$wcwd"
+  if [ -z "$sid" ]; then
+    log "'$name' dormancy WAKE ($trigger): no session to --resume — fresh /id"
+    drive "$name" "$sess" "" "$wcwd"
+  else
+    drive "$name" "$sess" "$sid" "$wcwd"
+  fi
+  # Brief settle before verify — drive() just finished driving the pane; Ink needs a beat to render
+  # the ❯ input line. Without this settle, verify sometimes runs before the prompt paints.
+  sleep 2
+  t1=$(date +%s)
+  latency=$((t1 - t0))
+  # Final pane check: did we reach ❯ REPL? Search a WIDE window — the ❯ input line sits ABOVE
+  # the 3-line Claude Code footer, so a naive `tail -3` misses it. Grep the full capture.
+  local pane; pane="$(timeout -k 5 10 tmux capture-pane -pt "$sess" -S -15 2>/dev/null)"
+  if printf '%s' "$pane" | grep -q '❯'; then
+    log "'$name' woken in ${latency}s (trigger=$trigger)"
+    metric event=wake-done identity="$name" trigger="$trigger" latency_s="$latency"
+  else
+    log "WARNING: '$name' dormancy WAKE post-drive() shows no ❯ prompt (trigger=$trigger, latency=${latency}s). Sentinel already removed; next cycle will alive-check-relaunch."
+    metric event=wake-verify-fail identity="$name" trigger="$trigger" latency_s="$latency"
+    return 1
+  fi
+}
+
+reconcile() {
+  rotate_if_big "$METRICS_LOG"                     # keep the append-only jsonl logs bounded
+  rotate_if_big "$MEM_SAMPLES_LOG"
+  sample_memory                                    # dashboard sampler — one line per cycle
+  snapshot_sessions                                # one tmux ls per tick; match_session reads from the snapshot. MUST run before archive-scan (which calls match_session via retire_identity).
+  snapshot_claude_running                          # one ps + one tmux list-panes -a per tick; claude_running_cached reads from CLAUDE_RUNNING_SNAPSHOT.
+  snapshot_procs                                   # one ps per tick; remind_background_work finds each claude's child shells from it.
+  snapshot_ambient_monitors                        # one ps per tick; repair_ambient_monitor reads from AMBIENT_MONITOR_SNAPSHOT.
+  run_archive_scan_if_due                          # Phase 94: daily archive-scan branch (24h gate; fast-path no-op on most ticks)
+  scan_archive_requested_sentinels                 # Phase 115 D-10: user-initiated archive-scan (every tick, no gate, bypasses .pinned/.no-dormancy/coordinator/freshness)
+  scan_role_archive_requested_sentinels            # Phase 133 D-01/D-05: user-initiated ROLE archive (every tick, no gate, cascades retire_identity per D-08, moves role folder per D-09 if all-clean)
+  scan_app_archive_requested_sentinels             # app-archive shape: user-initiated APP archive (every tick, invokes archive-app.sh from the app-development skill on any folder carrying .archive-requested)
+  scan_identity_unarchive_requested_sentinels      # one-path un-archive: flag → backend reactivates chat account → login → .dormant + mv archive→live
+  scan_role_unarchive_requested_sentinels          # un-archive host-side shape: user-initiated role UN-archive (folder mv only, no identity cascade)
+  scan_app_move_requested_sentinels                # project-scoped apps: Move to (sidebar ↔ project, out of a conversation) via move-app.sh
+  retire_archived_project_apps                     # project-scoped apps: stop + stash the apps of a project that was archived
+  scan_app_unarchive_requested_sentinels           # un-archive host-side shape: user-initiated app UN-archive (folded-in restore-app.sh: port-collision check under create-lock, mv archive→live, systemd reinstall + enable+start)
+  reap_desktops                                    # stop agent-desktop@ units of gone identities, and of dormant ones nobody is viewing
+  reap_archived_strays                             # kill processes still working inside an archived identity's folder
+  resolve_identities
+  sync_project_members                             # rewrite each project.md's derived `members:` list from identities' project: frontmatter (writes only on change)
+  snapshot_schedule_peek                           # one python subprocess per tick over the fleet; schedule_peek reads from SCHEDULE_PEEK_SNAPSHOT. MUST run AFTER resolve_identities (needs IDENTITIES populated).
+  snapshot_matrix_peek                             # parallel curls (default -P 20) to Matrix homeservers for all dormant identities; matrix_peek_cached reads from MATRIX_PEEK_SNAPSHOT.
+  if [ "${#IDENTITIES[@]}" -eq 0 ]; then log "no identities to supervise (no <name>/<name>.md folders under $IDENTITIES_DIR)"; return 0; fi
+  local name slugname actual launched=0
+  for name in "${IDENTITIES[@]}"; do
+    slugname="$(slug "$name")"
+    actual="$(match_session "$slugname")"      # existing session (any case) or empty
+    # Compaction request (Condense): the agent or the app asked for this identity to be
+    # compacted. Handled before dormancy so a sleeping agent is woken for it via its inbox.
+    handle_compaction "$name" "$actual"
+
+    # ---- DORMANCY exemption sentinel (2026-08-09) ----------------------
+    # `<identity>/.no-dormancy` opts a specific identity out of dormancy entirely — the
+    # supervisor treats this identity as if DORMANCY=off for this pass, regardless of the
+    # box-wide setting. Whoever wrote the file wants this one always-on; no auth check.
+    # Edge: if the identity is currently .dormant (flag added while already asleep), clear
+    # the .dormant sentinel so the normal alive-check below relaunches it this tick.
+    local exempt=0
+    if [ -f "$IDENTITIES_DIR/$name/.no-dormancy" ]; then
+      exempt=1
+      if [ -f "$IDENTITIES_DIR/$name/.dormant" ]; then
+        if [ "${DRY_RUN:-0}" = 1 ]; then
+          log "DRY_RUN would clear '$name' .dormant (exempt via .no-dormancy)"
+        else
+          log "'$name' .no-dormancy present but .dormant sentinel found — clearing so alive-check relaunches"
+          rm -f "$IDENTITIES_DIR/$name/.dormant"
+        fi
+      fi
+    fi
+
+    # ---- DORMANCY (2026-08-07) — only when DORMANCY=on -----------------
+    # Dormant path: identity has .dormant sentinel + claude intentionally dead. Check wake triggers;
+    # if triggered → do_wake. Otherwise skip (do NOT fall through to the alive-check below, which
+    # would auto-relaunch and defeat dormancy). Sentinel-delete wake is handled by falling out of
+    # this if-block entirely: no sentinel = normal branch = alive-check sees dead claude = relaunch.
+    if [ "$DORMANCY" = "on" ] && [ "$exempt" = 0 ]; then
+      local dormant_sentinel="$IDENTITIES_DIR/$name/.dormant"
+      if [ -f "$dormant_sentinel" ]; then
+        local _trig=""
+        if matrix_peek_cached "$name";   then _trig="matrix"
+        elif schedule_peek "$name"; then _trig="schedule"
+        elif inbox_has_files "$name"; then _trig="inbox"
+        fi
+        if [ -n "$_trig" ]; then
+          if [ -n "$actual" ]; then
+            do_wake "$name" "$actual" "$_trig"
+            launched=$((launched+1)); sleep "${STAGGER_SECONDS:-8}"
+          else
+            log "'$name' dormancy WAKE ($_trig) but no tmux session — ABSENT branch will handle next cycle"
+            rm -f "$dormant_sentinel"
+          fi
+          continue
+        fi
+        # Dormant + no wake trigger + no tmux session (the post-reboot case): create a bare-shell
+        # tmux session so the app can still see + wake this identity. Restores the invariant that
+        # every supervised identity has a tmux session — dormant or not — so a reboot-since-sleep
+        # and dormant-on-current-uptime look identical from any external observer. No claude is
+        # launched; the session is just an empty shell in the identity's workdir, ready for a
+        # later wake trigger's do_wake (which types the launch command into the existing shell).
+        if [ -z "$actual" ]; then
+          local _wd="$HOME" _disc
+          if _disc="$(resolve_session "$name")"; then
+            _wd="${_disc%%$'\t'*}"
+            [ -d "$_wd" ] || _wd="$HOME"
+          fi
+          if [ "${DRY_RUN:-0}" = 1 ]; then
+            log "DRY_RUN would create bare-shell tmux '$slugname' for dormant '$name' (cwd=$_wd)"
+          elif timeout -k 5 10 tmux new-session -d -s "$slugname" -c "$_wd" ${DORMANT_SHELL:+"$DORMANT_SHELL"} 2>/dev/null; then
+            log "'$name' dormant: created bare tmux session '$slugname' for app visibility (cwd=$_wd)"
+          fi
+        elif [ -n "$DORMANT_SHELL" ] && [ "${PANE_CMD_SNAPSHOT[$actual]:-}" != "${DORMANT_SHELL##*/}" ]; then
+          # A dormant session still on a full shell — left over from before dormant sessions were
+          # minimized, or from a kill whose shell wasn't idle yet. Swap it once it's provably idle.
+          minimize_dormant_pane "$name" "$actual"
+        fi
+        [ "${VERBOSE:-0}" = 1 ] && log "'$name' dormant, no wake trigger"
+        continue
+      fi
+    fi
+
+    if [ -n "$actual" ]; then
+      # a session already exists (possibly different case) -> check claude on THAT session.
+      # Hot-path lookup on the per-tick snapshot — the double-probe below re-checks with the
+      # FRESH claude_running() to catch transient misreads.
+      if claude_running_cached "$actual"; then
+        remind_background_work "$name" "$actual" "$exempt"
+        # DORMANCY idle-check: active session that meets both idleness signals + nothing pending
+        # → kill + mark dormant. Only when DORMANCY=on; otherwise this whole block is skipped and
+        # behavior is identical to pre-dormancy supervisor.
+        if [ "$DORMANCY" = "on" ] && [ "$exempt" = 0 ] && idle_check "$name" "$actual" && pending_check "$name"; then
+          if [ "${DRY_RUN:-0}" = 1 ]; then
+            log "DRY_RUN would kill+dormant '$name' (idle >${IDLE_THRESHOLD_MINUTES}min, nothing pending)"
+          else
+            log "'$name' idle >${IDLE_THRESHOLD_MINUTES}min + nothing pending — going dormant"
+            do_kill_dormant "$name" "$actual"
+            launched=$((launched+1)); sleep "${STAGGER_SECONDS:-8}"
+          fi
+          continue
+        fi
+        repair_ambient_monitor "$name" "$actual"
+        [ "${VERBOSE:-0}" = 1 ] && log "'$name' (session '$actual') alive — skip"
+        continue
+      fi
+      # Not detected live. Double-probe to rule out a transient misread before taking ANY action.
+      sleep 2
+      if claude_running "$actual"; then
+        [ "${VERBOSE:-0}" = 1 ] && log "'$name' alive on re-probe — skip"
+        continue
+      fi
+      log "'$name' (session '$actual') present but claude DEAD — recovering in place"
+      launch "$name" recover "$actual"
+    else
+      log "'$name' (session '$slugname') ABSENT — launching"
+      launch "$name" fresh "$slugname"
+    fi
+    launched=$((launched+1))
+    # stagger: the blind-drive already spaces launches ~SETTLE apart; add a small extra gap so a
+    # many-identity box never forks them all at once.
+    [ "${DRY_RUN:-0}" = 1 ] || sleep "${STAGGER_SECONDS:-8}"
+  done
+  [ "$launched" -eq 0 ] && [ "${VERBOSE:-0}" = 1 ] && log "all supervised identities alive"
+  return 0
+}
+
+# ---- new-identity early wake ----
+# The between-tick sleep ends early when a new identity folder lands in $IDENTITIES_DIR, so a
+# freshly-born identity is launched on the very next reconcile instead of waiting out the
+# remainder of CHECK_INTERVAL. Nothing here launches anything — the single-threaded reconcile
+# loop stays the only actor; this only shortens the nap between passes. Births land as one
+# atomic `mv` from a staging dir outside $IDENTITIES_DIR, so a top-level moved_to/create of a
+# directory is exactly the birth signal. The newborn is then launched first (launch_newborns). Un-archive (mv archive→live) also triggers it.
+# Everything reconcile schedules is wall-clock gated (idle threshold, 24h archive scan), so an
+# early pass changes no cadence. Missing inotifywait or NEW_IDENTITY_WAKE=off → plain sleep.
+NEW_IDENTITY_WAKE="${NEW_IDENTITY_WAKE:-on}"
+NEW_IDENTITY_MIN_GAP="${NEW_IDENTITY_MIN_GAP:-2}"   # floor between passes so a burst of births can't spin reconcile
+IDENTITY_LISTING_AT_TICK=""
+
+identity_listing() {
+  local d
+  for d in "$IDENTITIES_DIR"/*/; do [ -d "$d" ] && basename "$d"; done | LC_ALL=C sort
+}
+
+# Prints the first identity folder present now but absent from the listing taken at the top of
+# the last tick (catches births that landed mid-reconcile, before the watch was armed).
+new_identity_since_tick() {
+  LC_ALL=C comm -13 <(printf '%s\n' "$IDENTITY_LISTING_AT_TICK") <(identity_listing) | grep -v '^$'
+}
+
+# Names that caused the last early wake; launched by launch_newborns before the next reconcile.
+EARLY_WAKE_NAMES=""
+
+# Newborn fast path: launch the identities that triggered an early wake BEFORE the reconcile pass,
+# instead of waiting for the pass to work through its snapshots (matrix peek over every dormant
+# identity, tmux/ps snapshots, sentinel scans) and reach them in alphabetical order — ~5-13s on a
+# loaded box. Same thread, same launch() as the ABSENT branch; the pass that follows then sees the
+# newborn alive and skips it. Only a plain newborn qualifies — anything with a tmux session or a
+# dormant/archive sentinel is left for reconcile's normal handling (an un-archived identity
+# arrives .dormant, so it is never fast-pathed).
+launch_newborns() {
+  local names="$EARLY_WAKE_NAMES" name sess n=0
+  EARLY_WAKE_NAMES=""
+  [ "${DRY_RUN:-0}" = 1 ] && return 0
+  for name in $names; do
+    [ -f "$IDENTITIES_DIR/$name/$name.md" ] || continue
+    [ -e "$IDENTITIES_DIR/$name/.dormant" ] && continue
+    [ -e "$IDENTITIES_DIR/$name/.archive-requested" ] && continue
+    sess="$(slug "$name")"
+    timeout -k 5 10 tmux ls -F '#{session_name}' 2>/dev/null | tr '[:upper:]' '[:lower:]' | grep -qxF "$(_lower "$sess")" && continue
+    [ "$n" -gt 0 ] && sleep "${STAGGER_SECONDS:-8}"
+    log "'$name' (session '$sess') newborn — launching ahead of reconcile (fast path)"
+    launch "$name" fresh "$sess"
+    n=$((n+1))
+  done
+  return 0
+}
+
+# launch_newborns_midtick: the newborn fast path for births that land DURING a long reconcile
+# pass. retire_identity calls it before each retire, so a bulk archive (dozens of identities,
+# seconds each, serially) can't hold a freshly-born identity's launch until the pass ends.
+# Same launch_newborns as between ticks; afterwards the session/claude snapshots are retaken so
+# the rest of this pass sees the newborn as alive instead of ABSENT and launching it twice.
+# No-op outside the main loop (IDENTITY_LISTING_AT_TICK unset: --once, tests).
+launch_newborns_midtick() {
+  [ -n "$IDENTITY_LISTING_AT_TICK" ] || return 0
+  local fresh; fresh="$(new_identity_since_tick)"
+  [ -n "$fresh" ] || return 0
+  EARLY_WAKE_NAMES="$fresh"
+  launch_newborns
+  snapshot_sessions
+  snapshot_claude_running
+  return 0
+}
+
+wait_for_next_tick() {
+  local total="${CHECK_INTERVAL:-30}"
+  if [ "$NEW_IDENTITY_WAKE" != on ] || ! command -v inotifywait >/dev/null 2>&1 || [ ! -d "$IDENTITIES_DIR" ]; then
+    sleep "$total"; return 0
+  fi
+  local gap="$NEW_IDENTITY_MIN_GAP"; [ "$gap" -gt "$total" ] && gap="$total"
+  sleep "$gap"
+  local deadline=$(( $(date +%s) + total - gap ))
+  local out err pid rc remaining ev f i newname
+  out="$(mktemp)"; err="$(mktemp)"
+  while :; do
+    remaining=$(( deadline - $(date +%s) ))
+    [ "$remaining" -ge 1 ] || break
+    : >"$out"; : >"$err"
+    inotifywait -e create -e moved_to -t "$remaining" --format '%e %f' "$IDENTITIES_DIR" >"$out" 2>"$err" &
+    pid=$!
+    # Arm first, then diff the listing — closes the window between reconcile's last look and the watch.
+    i=0; while [ "$i" -lt 40 ] && ! grep -q 'Watches established' "$err" 2>/dev/null && kill -0 "$pid" 2>/dev/null; do sleep 0.05; i=$((i+1)); done
+    newname="$(new_identity_since_tick)"
+    if [ -n "$newname" ]; then
+      kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+      EARLY_WAKE_NAMES="$newname"
+      log "new identity '$(printf '%s' "$newname" | head -1)' landed during reconcile — next pass now (early wake)"
+      break
+    fi
+    wait "$pid"; rc=$?
+    if [ "$rc" -ne 0 ]; then
+      # 2 = timeout (normal end of interval); anything else = watcher failed — sleep out the rest.
+      [ "$rc" -ne 2 ] && { remaining=$(( deadline - $(date +%s) )); [ "$remaining" -ge 1 ] && sleep "$remaining"; }
+      break
+    fi
+    read -r ev f <"$out"
+    case "$ev" in
+      *ISDIR*) case "$f" in .*) ;; *)
+        EARLY_WAKE_NAMES="$(new_identity_since_tick)"; [ -n "$EARLY_WAKE_NAMES" ] || EARLY_WAKE_NAMES="$f"
+        log "new identity '$f' appeared — next pass now (early wake)"; break ;; esac ;;
+    esac
+    # a plain file or dot-dir at the top level — not a birth; keep waiting out the interval
+  done
+  rm -f "$out" "$err"
+  return 0
+}
+
+# ---- LIB_ONLY guard (Phase 94-04) ----
+# When sourced by the test driver (AGENT_SUPERVISOR_LIB_ONLY=1), stop here: all function
+# definitions above are now available in the caller's environment, but the reconcile loop
+# below is NOT executed. This is the correct hook point — after all archive-scan helpers
+# (is_coordinator, get_freshness_epoch, retire_identity, run_archive_scan,
+# run_archive_scan_if_due) are defined, before the infinite reconcile loop starts.
+# Has no effect during normal fleet execution (the variable is never set there).
+# shellcheck disable=SC2015  # A && return || true: intentional — `return` is valid when sourced;
+#                              `|| true` is a no-op fallback when executed directly (not sourced).
+[ "${AGENT_SUPERVISOR_LIB_ONLY:-0}" = 1 ] && return 0 2>/dev/null || true
+
+# ---- main ----
+ensure_agent_teams_env
+ensure_inotifywait
+resolve_memory_wrapper
+
+# scheduled-agents scheduler — now owned by scheduled-agents-scheduler.service
+# (systemd user unit, bootstrapped by run-bootstrap.ts Step 1c). No in-process
+# launch here anymore. Rationale: agent-supervisor's own restart-on-byte-change
+# is gated on agent-supervisor.sh changing, so an in-process child running
+# wakeup-scheduler would hold pre-update bytes indefinitely across
+# wakeup-scheduler.py source changes. Under systemd ownership, the
+# wakeup-scheduler catalog row's restart hook targets this unit directly,
+# so a byte change on the script bounces JUST the scheduled-agents scheduler
+# (per-identity wake-up schedulers under this supervisor stay harness-bound
+# and accept the staleness trade-off).
+#
+# Transitional note: on the first sweep after this ship lands on any given
+# box, the OLD in-process-spawned scheduler (orphaned by systemd's
+# KillMode=process when agent-supervisor restarts to pick up new bytes)
+# stays running until the systemd-launched scheduler's _single_instance
+# guard kills it. Newest-wins.
+
+case "${1:-}" in
+  --once) VERBOSE=1 reconcile ;;
+  *)
+    log "agent-supervisor up: interval=${CHECK_INTERVAL}s, claude=$CLAUDE"
+    # sweep any stale .resume-complete markers left in identity folders across a crash/reboot.
+    # markers are only meaningful between drive()'s end-touch and the next drive-start / kill-start
+    # rm — a fresh supervisor process starts with a clean slate. belt-and-suspenders alongside the
+    # freshness-timestamp check consumers use to distinguish this-wake from prior-wake.
+    for d in "$IDENTITIES_DIR"/*/; do rm -f "$d/.resume-complete" 2>/dev/null; done
+    while :; do IDENTITY_LISTING_AT_TICK="$(identity_listing)"; launch_newborns; reconcile; wait_for_next_tick; done
+    ;;
+esac

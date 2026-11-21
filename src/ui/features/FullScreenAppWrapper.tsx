@@ -1,0 +1,148 @@
+import React, { useEffect, useState } from "react";
+import { TabProvider } from "@/shell/TabContext.tsx";
+import { CommandHistoryProvider } from "@/features/terminal/command-history/CommandHistoryContext.tsx";
+import { getSSHHosts, getUserInfo } from "@/main-axios.ts";
+import type { SSHHost } from "@/types";
+import { PrettyLandingCard } from "@/features/pretty-view/PrettyLandingCard.tsx";
+import { Toaster } from "@/components/sonner.tsx";
+import { dbHealthMonitor } from "@/lib/db-health-monitor.ts";
+import { useTranslation } from "react-i18next";
+import { RefreshCw } from "lucide-react";
+
+interface FullScreenAppWrapperProps {
+  hostId?: string;
+  /**
+   * "screen" (default) — a standalone page, 100vh tall. "parent" — fill the
+   * containing pane instead; a 100vh box inside a pane overhangs it, and
+   * anything that sizes itself from the box (a remote display's resolution,
+   * the keyboard toolbar's drag bounds) then reaches past the pane.
+   */
+  fill?: "screen" | "parent";
+  children: (hostConfig: SSHHost | null, loading: boolean) => React.ReactNode;
+}
+
+export const FullScreenAppWrapper: React.FC<FullScreenAppWrapperProps> = ({
+  hostId,
+  fill = "screen",
+  children,
+}) => {
+  const { t } = useTranslation();
+  const heightClass = fill === "parent" ? "h-full" : "h-screen";
+  // The outer frame is `min-h-svh`; in a pane, override it so the whole
+  // chain sizes to the pane rather than the screen.
+  const providerClass = fill === "parent" ? "h-full min-h-0" : undefined;
+  const [hostConfig, setHostConfig] = useState<SSHHost | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [, setIsAdmin] = useState(false);
+
+  useEffect(() => {
+    const handleSessionExpired = () => {
+      setIsAuthenticated(false);
+      setIsAdmin(false);
+      setHostConfig(null);
+    };
+
+    dbHealthMonitor.on("session-expired", handleSessionExpired);
+    return () => dbHealthMonitor.off("session-expired", handleSessionExpired);
+  }, []);
+
+  useEffect(() => {
+    const checkAuth = async () => {
+      try {
+        const userInfo = await getUserInfo();
+        if (userInfo) {
+          setIsAuthenticated(true);
+        }
+      } catch {
+        setIsAuthenticated(false);
+      } finally {
+        setAuthLoading(false);
+      }
+    };
+
+    checkAuth();
+  }, []);
+
+  useEffect(() => {
+    const fetchHost = async () => {
+      if (!hostId || !isAuthenticated) {
+        setLoading(false);
+        return;
+      }
+
+      try {
+        const hosts = await getSSHHosts();
+        const host = hosts.find((h) => h.id === parseInt(hostId, 10));
+        if (host) {
+          setHostConfig(host);
+        }
+      } catch (error) {
+        console.error("Failed to fetch host:", error);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    if (!authLoading && isAuthenticated) {
+      fetchHost();
+    }
+  }, [hostId, isAuthenticated, authLoading]);
+
+  if (authLoading) {
+    return (
+      <div
+        className={`w-full ${heightClass} overflow-hidden flex flex-col items-center justify-center gap-4`}
+        style={{ backgroundColor: "var(--k-bg)" }}
+      >
+        <RefreshCw
+          className="size-8 animate-spin"
+          style={{ color: "var(--foreground)" }}
+        />
+        <p className="text-sm" style={{ color: "var(--foreground-secondary)" }}>
+          {t("common.loading")}
+        </p>
+      </div>
+    );
+  }
+
+  if (!isAuthenticated) {
+    return (
+      <div className={`flex w-full ${providerClass ?? "min-h-svh"}`}>
+        <TabProvider>
+          <CommandHistoryProvider>
+            <div
+              className={`w-full ${heightClass} overflow-hidden flex items-center justify-center`}
+              style={{ backgroundColor: "var(--k-bg)" }}
+            >
+              <PrettyLandingCard />
+              <Toaster
+                position="bottom-right"
+                richColors={false}
+                closeButton
+                duration={5000}
+                offset={20}
+              />
+            </div>
+          </CommandHistoryProvider>
+        </TabProvider>
+      </div>
+    );
+  }
+
+  return (
+    <div className={`flex w-full ${providerClass ?? "min-h-svh"}`}>
+      <TabProvider>
+        <CommandHistoryProvider>
+          <div
+            className={`w-full ${heightClass} overflow-hidden`}
+            style={{ backgroundColor: "var(--k-bg)" }}
+          >
+            {children(hostConfig, loading)}
+          </div>
+        </CommandHistoryProvider>
+      </TabProvider>
+    </div>
+  );
+};

@@ -1,0 +1,3575 @@
+/* eslint-disable react-hooks/exhaustive-deps */
+import {
+  useEffect,
+  useRef,
+  useState,
+  useImperativeHandle,
+  forwardRef,
+  useCallback,
+  useMemo,
+  lazy,
+  Suspense,
+} from "react";
+import { useXTerm } from "react-xtermjs";
+import { FitAddon } from "@xterm/addon-fit";
+import { ClipboardAddon } from "@xterm/addon-clipboard";
+import { RobustClipboardProvider } from "@/lib/clipboard-provider";
+import { isIosPwa } from "@/lib/is-ios-pwa";
+import { Unicode11Addon } from "@xterm/addon-unicode11";
+import { WebLinksAddon } from "@xterm/addon-web-links";
+import { useTranslation } from "react-i18next";
+import { getBasePath } from "@/lib/base-path";
+import {
+  getCookie,
+  logActivity,
+  getSnippets,
+  deleteCommandFromHistory,
+  getCommandHistory,
+  getHostPassword,
+} from "@/main-axios.ts";
+import { TOTPDialog } from "@/ssh/dialogs/TOTPDialog.tsx";
+// Lazy-loaded: SSHAuthDialog pulls @uiw/react-codemirror + @codemirror/*
+// (388 KB uncompressed). Deferring to first-open saves that from cold-shell
+// for every user; the dialog is manually invoked on SSH auth failure only.
+const SSHAuthDialog = lazy(() =>
+  import("@/ssh/dialogs/SSHAuthDialog.tsx").then((m) => ({ default: m.SSHAuthDialog })),
+);
+import { PassphraseDialog } from "@/ssh/dialogs/PassphraseDialog.tsx";
+import { WarpgateDialog } from "@/ssh/dialogs/WarpgateDialog.tsx";
+import { OPKSSHDialog } from "@/ssh/dialogs/OPKSSHDialog.tsx";
+import { HostKeyVerificationDialog } from "@/ssh/dialogs/HostKeyVerificationDialog.tsx";
+import { TmuxSessionPicker } from "@/ssh/dialogs/TmuxSessionPicker.tsx";
+import {
+  DEFAULT_TERMINAL_CONFIG,
+  TERMINAL_FONTS,
+} from "@/lib/terminal-themes.ts";
+import "./terminal-global-styles.ts";
+// PrettyView, MessageQueueDrawer, IdentityBadge, IdentityModal, useIdentities,
+// listMessageQueueItems all removed — now owned by IdentitySessionPane.
+// Phase 34 Plan 06: PTY-idle feeder RETIRED — fleet-status channel now
+// sources the working signal from the box-side session JSON, not PTY scraping.
+import { useTheme } from "@/components/theme-provider.tsx";
+import { useCommandTracker } from "@/features/terminal/command-history/useCommandTracker.ts";
+import { highlightTerminalOutput } from "@/lib/terminal-syntax-highlighter.ts";
+import { useCommandHistory } from "@/features/terminal/command-history/CommandHistoryContext.tsx";
+import { registerPane, type PaneSnapshot } from "@/lib/diag-registry";
+import { CommandAutocomplete } from "./command-history/CommandAutocomplete.tsx";
+import { SimpleLoader } from "@/lib/SimpleLoader.tsx";
+import { useConfirmation } from "@/hooks/use-confirmation.ts";
+import {
+  ConnectionLogProvider,
+  useConnectionLog,
+} from "@/ssh/connection-log/ConnectionLogContext.tsx";
+import { ConnectionLog } from "@/ssh/connection-log/ConnectionLog.tsx";
+import { toast } from "sonner";
+import { Button } from "@/components/button";
+import { resolveSkynetThemeColors } from "./terminal-theme.ts";
+import type { TerminalHandle, TerminalHostConfig } from "./terminal-types.ts";
+export type { TerminalHandle, IdentityPaneHandle, TerminalHostConfig } from "./terminal-types.ts";
+import { Toolbar } from "@/features/keyboard/Toolbar.tsx";
+import { makeSshAdapter } from "@/features/keyboard/sshAdapter.ts";
+import {
+  EMPTY_MODIFIERS,
+  type ModifierState,
+} from "@/features/keyboard/inputAdapter.ts";
+import { useIsMobile } from "@/hooks/use-mobile.ts";
+import { createLogDedup } from "@/lib/log-dedup";
+// Phase 111 SKEW-09: version-drift detection on this WS lane.
+import { CLIENT_BUILD_ID } from "@/lib/client-build-id";
+import {
+  lockSkewedSession,
+  getSkewLockedSnapshot,
+} from "@/state/skew-lock-store";
+
+// Phase 31 Plan 02: dedup instances for hot-path ref transitions.
+// visibilityDedup — isVisibleRef flap is the confirmed hot path (D-17 opt-in).
+// wsMsgDedup     — per-frame [ws-msg] dispatch; collapses hot types (e.g. "data").
+// Both are module-scoped so they survive component remounts (each component
+// instance gets its own closure over these shared instances — identical
+// lifecycle to a module-level const, appropriate for a single-tab app).
+const visibilityDedup = createLogDedup({ N: 3, W: 5000 });
+const wsMsgDedup = createLogDedup({ N: 3, W: 5000 });
+
+// quick-260812-x5f — debounced hidden-pane WS close (~60s).
+// user 2026-08-12: voice-record + send + immediately switching to another
+// session broke because the SSH WS was closed immediately on isVisible=false
+// (quick-260809-eqk regression for the nav-away case). A 60s grace window
+// lets in-flight nav-away work (queued sends, pending fetches, transcription
+// pipelines) finish before the WS is ripped out.
+// See bounty: debounced-hidden-pane-ws-drop.
+// NOTE: this constant is intentionally DUPLICATED from PrettyView.tsx — the
+// two files stay independent per bounty guidance (no shared helper invented).
+const HIDDEN_PANE_WS_CLOSE_DEBOUNCE_MS = 60_000;
+
+type HostKeyVerificationData = Omit<
+  React.ComponentProps<typeof HostKeyVerificationDialog>,
+  "isOpen" | "scenario" | "onAccept" | "onReject" | "backgroundColor"
+>;
+
+interface SSHTerminalProps {
+  hostConfig: TerminalHostConfig;
+  isVisible: boolean;
+  attach: boolean;
+  title?: string;
+  showTitle?: boolean;
+  splitScreen?: boolean;
+  onClose?: () => void;
+  onTitleChange?: (title: string) => void;
+  onTmuxSessionChange?: (sessionName: string | null) => void;
+  initialPath?: string;
+  executeCommand?: string;
+  // Named tmux session to attach on connect. Combined with allowCreateTmux:
+  //   allowCreateTmux=true  -> attach or create (New Session dialog).
+  //   allowCreateTmux=false -> attach-only. Missing session triggers a
+  //                            tmux_session_missing WS event and the
+  //                            disconnect overlay paints an inline error.
+  targetTmuxSession?: string | null;
+  allowCreateTmux?: boolean;
+  hostName?: string;
+  // Fires when the backend reports the target session doesn't exist on the
+  // host. AppShell uses this to delete the tab from server-persisted
+  // open_tabs so a broken tab doesn't rehydrate on next login.
+  onTmuxSessionMissing?: (sessionName: string) => void;
+  onOpenFileManager?: (path?: string) => void;
+  previewTheme?: string | null;
+}
+
+const TerminalInner = forwardRef<TerminalHandle, SSHTerminalProps>(
+  function SSHTerminal(
+    {
+      hostConfig,
+      isVisible,
+      attach,
+      splitScreen = false,
+      onClose,
+      onTmuxSessionChange,
+      initialPath,
+      executeCommand,
+      targetTmuxSession,
+      allowCreateTmux,
+      hostName,
+      onTmuxSessionMissing,
+      onOpenFileManager,
+      previewTheme,
+    },
+    ref,
+  ) {
+    const { t } = useTranslation();
+    const { instance: terminal, ref: xtermRef } = useXTerm();
+    const commandHistoryContext = useCommandHistory();
+    const { confirmWithToast } = useConfirmation();
+    const { theme: appTheme } = useTheme();
+    const { addLog, isExpanded: isConnectionLogExpanded } = useConnectionLog();
+
+    const savedTheme = localStorage.getItem(
+      `terminal_theme_host_${hostConfig.id}`,
+    );
+    const config = {
+      ...DEFAULT_TERMINAL_CONFIG,
+      ...hostConfig.terminalConfig,
+      theme:
+        savedTheme ||
+        hostConfig.terminalConfig?.theme ||
+        DEFAULT_TERMINAL_CONFIG.theme,
+    };
+
+    const activeTheme = previewTheme || config.theme;
+    const themeColors = resolveSkynetThemeColors(activeTheme, appTheme);
+    const backgroundColor = themeColors.background;
+    const fitAddonRef = useRef<FitAddon | null>(null);
+    const webSocketRef = useRef<WebSocket | null>(null);
+    // Phase 41 Plan 02: ref pair for per-pane PrettyView send REMOVED — hoisted
+    // to IdentitySessionPane wrapper which owns these for identity panes. Terminal
+    // is now only rendered for non-identity panes and does not own PrettyView state.
+    // Bounty pretty-view-per-pane-cost-diag: rolling counter of SSH WS
+    // bytes received since the last diag emit (measured as raw JSON string
+    // length of each event.data, which approximates the payload cost since
+    // most volume is `{type:"data", data:"<tmux output>"}` and JSON overhead
+    // is small relative to a full tmux frame). Snapshot fn reads + resets.
+    const wsBytesRef = useRef<number>(0);
+    // Terminal render-broken-after-initial-attach diag (2026-09-03, user):
+    // desktop-only bug where switch-into-terminal renders the initial buffer
+    // dump but subsequent frames silently don't paint (Ctrl-L confirmed the
+    // write pipeline, not the paint layer, is stuck). These refs let a repro
+    // distinguish stale-closure (hypothesis A) vs multi-handler-race
+    // (hypothesis B) without another deploy round-trip.
+    //   mountIdRef       — fixed at mount so log lines correlate within one
+    //                       Terminal lifetime across remounts.
+    //   setupListenersCountRef — increments each setupWebSocketListeners
+    //                       call so we can see if two paths (setup-effect +
+    //                       pause-effect attemptReconnection) both fire.
+    //   dataFrameCountRef — counts {type:"data"} arrivals so we can tell
+    //                       whether xterm write attempts are actually
+    //                       happening after the initial buffer dump or
+    //                       stopping cold.
+    const mountIdRef = useRef<string>(
+      Math.random().toString(36).slice(2, 8),
+    );
+    const setupListenersCountRef = useRef<number>(0);
+    const dataFrameCountRef = useRef<number>(0);
+    const resizeTimeout = useRef<NodeJS.Timeout | null>(null);
+    const wasDisconnectedBySSH = useRef(false);
+    const pingIntervalRef = useRef<NodeJS.Timeout | null>(null);
+    const pongReceivedRef = useRef(true);
+    const pongTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+    const [isConnected, setIsConnected] = useState(false);
+    const [isConnecting, setIsConnecting] = useState(false);
+    const [isFitted, setIsFitted] = useState(false);
+    const [connectionError, setConnectionError] = useState<string | null>(null);
+    const connectionErrorRef = useRef<string | null>(null);
+    const [showDisconnectedOverlay, setShowDisconnectedOverlay] =
+      useState(false);
+    // Idle state deliberately not tracked anymore: patch 26 removed the visual
+    // pulse. Backend still emits {type:"idle"} messages; frontend ignores them.
+
+    const updateConnectionError = useCallback((error: string | null) => {
+      connectionErrorRef.current = error;
+      setConnectionError(error);
+    }, []);
+
+    const [, setIsAuthenticated] = useState(false);
+    const [totpRequired, setTotpRequired] = useState(false);
+    const [totpPrompt, setTotpPrompt] = useState<string>("");
+    const [isPasswordPrompt, setIsPasswordPrompt] = useState(false);
+    const [showAuthDialog, setShowAuthDialog] = useState(false);
+    const [authDialogReason, setAuthDialogReason] = useState<
+      "no_keyboard" | "auth_failed" | "timeout"
+    >("no_keyboard");
+    const [showPassphraseDialog, setShowPassphraseDialog] = useState(false);
+    const [, setKeyboardInteractiveDetected] = useState(false);
+    const [warpgateAuthRequired, setWarpgateAuthRequired] = useState(false);
+    const [warpgateAuthUrl, setWarpgateAuthUrl] = useState<string>("");
+    const [warpgateSecurityKey, setWarpgateSecurityKey] = useState<string>("");
+    const warpgateTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+    const [opksshDialog, setOpksshDialog] = useState<{
+      isOpen: boolean;
+      authUrl: string;
+      requestId: string;
+      stage: "chooser" | "waiting" | "authenticating" | "completed" | "error";
+      error?: string;
+      providers?: Array<{ alias: string; issuer: string }>;
+    } | null>(null);
+    const opksshTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+    const opksshFailedRef = useRef(false);
+    const currentHostIdRef = useRef<number | null>(null);
+    const currentHostConfigRef = useRef<TerminalHostConfig | null>(null);
+
+    const [hostKeyVerification, setHostKeyVerification] = useState<{
+      isOpen: boolean;
+      scenario: "new" | "changed";
+      data: HostKeyVerificationData;
+    } | null>(null);
+
+    const sessionIdRef = useRef<string | null>(null);
+    const isAttachingSessionRef = useRef<boolean>(false);
+
+    // Mobile toolbar plumbing: sticky modifier state is owned by Toolbar.tsx
+    // but must be readable from the xterm.js custom-key handler so iOS
+    // soft-keyboard letter presses can compose with a sticky Ctrl/Alt/Shift.
+    const stickyModsRef = useRef<ModifierState>({ ...EMPTY_MODIFIERS });
+    const clearStickyModsRef = useRef<() => void>(() => {});
+    const compositionInProgressRef = useRef(false);
+    const recentlySentRef = useRef<{ chars: string; expiresAt: number }>({
+      chars: "",
+      expiresAt: 0,
+    });
+    const isMobile = useIsMobile();
+    // Consumed on first connectToHost call so retries don't re-attempt a stale session
+    const pendingRestoredSessionIdRef = useRef<string | null>(
+      hostConfig.restoredSessionId ?? null,
+    );
+    const [tmuxSessionPicker, setTmuxSessionPicker] = useState<{
+      sessions: Array<{
+        name: string;
+        created: number;
+        lastActivity: number;
+        windows: number;
+        attachedClients: number;
+      }>;
+    } | null>(null);
+    const tmuxSessionNameRef = useRef<string | null>(null);
+    const [tmuxSessionName, setTmuxSessionName] = useState<string | null>(null);
+    // Phase 41 Plan 02: all identity-pane state and component mounts REMOVED
+    // and hoisted to IdentitySessionPane wrapper (src/ui/shell/IdentitySessionPane.tsx).
+    // Terminal is now only rendered for non-identity panes (direct workstation-style
+    // SSH). Identity panes route through IdentitySessionPane which conditionally mounts
+    // Terminal when the user summons it (toggle).
+    //
+    // Removed from this file:
+    //   - pretty-mode toggle state + related auto-activate logic
+    //   - message-queue open state
+    //   - identity modal open state
+    //   - per-pane PrettyView send/interrupt ref pair
+    //   - idle state (was null-in-production since Phase 34)
+    //   - identity-lookup / color-hue derivation (only used by removed JSX blocks)
+    //   - PrettyView, MessageQueueDrawer, IdentityBadge, IdentityModal JSX blocks
+    //   - toggle-mode + toggle-queue from useImperativeHandle (owned by wrapper)
+    //
+    const [isTmuxAttached, setIsTmuxAttached] = useState(false);
+    const tmuxCopyModeHintShownRef = useRef(false);
+
+    const isVisibleRef = useRef<boolean>(false);
+    // quick-260809-ih9: prevIsVisibleRef edge detector for the pause effect
+    // below. Initialized to current isVisible so initial mount
+    // (prev === isVisible) does NOT fire the visible branch's reopen. Only
+    // true false→true transitions (pane returning after being hidden)
+    // trigger reopen. Mirrors PrettyView.tsx quick-260809-cnx pattern at
+    // L1181-L1185. The init value MUST stay `isVisible` (the prop), NOT
+    // `false` — initializing to `false` would make initial mount see
+    // !prev && isVisible = true and reproduce the exact bug this patch
+    // fixes (first-session-post-page-load stuck on "Reconnecting…").
+    const prevIsVisibleRef = useRef<boolean>(isVisible);
+    const isFittingRef = useRef(false);
+    const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+    // quick-260812-x5f: pending debounced-close timer handle.
+    // Set when isVisible=false schedules a WS close; cleared on isVisible=true
+    // (race-safe cancellation) and on unmount (no timer leak).
+    const hiddenPaneCloseTimerRef = useRef<NodeJS.Timeout | null>(null);
+    const reconnectAttempts = useRef(0);
+    const maxReconnectAttempts = 8;
+    const isUnmountingRef = useRef(false);
+    const shouldNotReconnectRef = useRef(false);
+    const isReconnectingRef = useRef(false);
+    const isConnectingRef = useRef(false);
+    const wasConnectedRef = useRef(false);
+    const wasSessionExpiredRef = useRef(false);
+
+    useEffect(() => {
+      isUnmountingRef.current = false;
+      if (shouldNotReconnectRef.current !== false) { console.info(`[ws] shouldNotReconnectRef-transition edge=${shouldNotReconnectRef.current}→false trigger=setup-effect-mount hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`); }
+      shouldNotReconnectRef.current = false;
+      isReconnectingRef.current = false;
+      if (isConnectingRef.current !== false) { console.info(`[ws] isConnectingRef-transition edge=${isConnectingRef.current}→false trigger=setup-effect-mount hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`); }
+      isConnectingRef.current = false;
+      reconnectAttempts.current = 0;
+      if (wasConnectedRef.current !== false) { console.info(`[ws] wasConnectedRef-transition edge=${wasConnectedRef.current}→false trigger=setup-effect-mount hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`); }
+      wasConnectedRef.current = false;
+      if (isAttachingSessionRef.current !== false) { console.info(`[ws] isAttachingSessionRef-transition edge=${isAttachingSessionRef.current}→false trigger=setup-effect-mount hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`); }
+      isAttachingSessionRef.current = false;
+
+      return () => {};
+    }, [hostConfig.id]);
+
+    // Patch #156: hard-gate this effect on isIosPwa(). On Chrome desktop /
+    // Android / non-PWA Safari, WebSockets actually stay alive across tab
+    // switches, and force-reconnecting them on visibility=visible races the
+    // server's session-attachment path — the old WS's queued ws.on("close")
+    // detachWs can arrive AFTER the new WS attaches, causing destroySession
+    // to fire and the new socket to receive `disconnected`, surfacing the
+    // Reconnect/Close overlay. The patch #143 v2 rationale below is still
+    // accurate for the iOS-PWA case — the OS silently kills WSes during
+    // backgrounding and readyState lies on resume — so we keep that
+    // behavior intact when isIosPwa() is true and no-op everywhere else.
+    //
+    // Patch #143 v2: iOS PWA backgrounding fix — cancel scheduled reconnects
+    // when the tab is hidden (throttled iOS tab burns the 8-attempt budget)
+    // and UNCONDITIONALLY reset + reconnect on foreground. The v1
+    // `readyState === OPEN` guard has been removed: iOS resumes JS with the
+    // old WS ref still reading OPEN even when the queued close event hasn't
+    // delivered yet, which caused the ~50s "1/8..8/8" auto-reconnect flash
+    // followed by the manual overlay. Opening a fresh WS is idempotent —
+    // if the old one was genuinely alive it closes cleanly, tmux reattach
+    // handles restoration, no user-visible harm. Deliberately does NOT clear
+    // the xterm buffer (tmux repaint on reattach handles restoration;
+    // clearing was the visible-flicker cause in the manual overlay path).
+    // Target-terminated cases (wasDisconnectedBySSH === true) also attempt
+    // reconnect on foreground rather than requiring a manual click: the
+    // backend sends `{type:"disconnected"}` for both real target death AND
+    // for the WS-idle-timeout that fires when a mobile tab suspends, and
+    // the caller cannot distinguish them. On foreground we optimistically
+    // reconnect — if the tmux session is still alive (the common case) we
+    // reattach silently; if the target truly is dead, connectToHost fails
+    // exactly like the manual Reconnect button would have.
+    useEffect(() => {
+      if (!isIosPwa()) return;
+      const handleVisibilityChange = () => {
+        if (document.hidden) {
+          if (reconnectTimeoutRef.current !== null) {
+            clearTimeout(reconnectTimeoutRef.current);
+            reconnectTimeoutRef.current = null;
+          }
+          reconnectAttempts.current = 0;
+          isReconnectingRef.current = false;
+          return;
+        }
+        // visible branch
+        if (isUnmountingRef.current) return;
+        // quick-260809-eqk: pane hidden → do not open WS from foreground event.
+        // The WS-pause effect above owns the reopen path (fires on isVisible→true).
+        // Without this guard, an iOS PWA foreground event on a currently-hidden
+        // pane would reopen its WS behind the pause effect's back — single-knob
+        // isVisibleRef gate per bounty design (mirror of PrettyView.tsx iter-1
+        // guard at ~line 986).
+        if (!isVisibleRef.current) {
+          console.warn(`[pause-gate] blocked-visibilitychange-ios-pwa hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'} reason=hidden`);
+          return;
+        }
+        if (shouldNotReconnectRef.current !== false) { console.info(`[ws] shouldNotReconnectRef-transition edge=${shouldNotReconnectRef.current}→false trigger=visibilitychange-visible hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`); }
+        shouldNotReconnectRef.current = false;
+        isReconnectingRef.current = false;
+        if (isConnectingRef.current !== false) { console.info(`[ws] isConnectingRef-transition edge=${isConnectingRef.current}→false trigger=visibilitychange-visible hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`); }
+        isConnectingRef.current = false;
+        reconnectAttempts.current = 0;
+        if (wasConnectedRef.current !== false) { console.info(`[ws] wasConnectedRef-transition edge=${wasConnectedRef.current}→false trigger=visibilitychange-visible hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`); }
+        wasConnectedRef.current = false;
+        wasDisconnectedBySSH.current = false;
+        updateConnectionError(null);
+        setShowDisconnectedOverlay(false);
+        if (terminal) {
+          console.info(`[reopen] fired hostId=${hostConfig.id} path=direct-caller callSite="visibilitychange-ios-pwa"`);
+          connectToHost(terminal.cols, terminal.rows);
+        }
+      };
+      document.addEventListener("visibilitychange", handleVisibilityChange);
+      return () => {
+        document.removeEventListener("visibilitychange", handleVisibilityChange);
+      };
+    }, [terminal, updateConnectionError]);
+
+    const connectionAttemptIdRef = useRef(0);
+    const totpTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+    const connectionTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+    const activityLoggedRef = useRef(false);
+    const [commandHistoryTrackingEnabled, setCommandHistoryTrackingEnabled] =
+      useState<boolean>(
+        () => localStorage.getItem("commandHistoryTracking") === "true",
+      );
+
+    useEffect(() => {
+      const handleCommandHistoryTrackingChanged = () => {
+        setCommandHistoryTrackingEnabled(
+          localStorage.getItem("commandHistoryTracking") === "true",
+        );
+      };
+
+      window.addEventListener(
+        "commandHistoryTrackingChanged",
+        handleCommandHistoryTrackingChanged,
+      );
+
+      return () => {
+        window.removeEventListener(
+          "commandHistoryTrackingChanged",
+          handleCommandHistoryTrackingChanged,
+        );
+      };
+    }, []);
+
+    const { trackInput, getCurrentCommand, updateCurrentCommand } =
+      useCommandTracker({
+        hostId: hostConfig.id,
+        enabled: commandHistoryTrackingEnabled,
+        onCommandExecuted: (command) => {
+          if (!autocompleteHistory.current.includes(command)) {
+            autocompleteHistory.current = [
+              command,
+              ...autocompleteHistory.current,
+            ];
+          }
+        },
+      });
+
+    const getCurrentCommandRef = useRef(getCurrentCommand);
+    const updateCurrentCommandRef = useRef(updateCurrentCommand);
+
+    useEffect(() => {
+      getCurrentCommandRef.current = getCurrentCommand;
+      updateCurrentCommandRef.current = updateCurrentCommand;
+    }, [getCurrentCommand, updateCurrentCommand]);
+
+    const [showAutocomplete, setShowAutocomplete] = useState(false);
+    const [autocompleteSuggestions, setAutocompleteSuggestions] = useState<
+      string[]
+    >([]);
+    const [autocompleteSelectedIndex, setAutocompleteSelectedIndex] =
+      useState(0);
+    const [autocompletePosition, setAutocompletePosition] = useState({
+      top: 0,
+      left: 0,
+    });
+    const autocompleteHistory = useRef<string[]>([]);
+    const currentAutocompleteCommand = useRef<string>("");
+
+    const showAutocompleteRef = useRef(false);
+    const autocompleteSuggestionsRef = useRef<string[]>([]);
+    const autocompleteSelectedIndexRef = useRef(0);
+
+    const [showHistoryDialog] = useState(false);
+    const [, setCommandHistory] = useState<string[]>([]);
+    const [, setIsLoadingHistory] = useState(false);
+
+    const setIsLoadingRef = useRef(commandHistoryContext.setIsLoading);
+    const setCommandHistoryContextRef = useRef(
+      commandHistoryContext.setCommandHistory,
+    );
+
+    useEffect(() => {
+      setIsLoadingRef.current = commandHistoryContext.setIsLoading;
+      setCommandHistoryContextRef.current =
+        commandHistoryContext.setCommandHistory;
+    }, [
+      commandHistoryContext.setIsLoading,
+      commandHistoryContext.setCommandHistory,
+    ]);
+
+    useEffect(() => {
+      if (showHistoryDialog && hostConfig.id) {
+        setIsLoadingHistory(true);
+        setIsLoadingRef.current(true);
+        getCommandHistory(hostConfig.id!)
+          .then((history) => {
+            setCommandHistory(history);
+            setCommandHistoryContextRef.current(history);
+          })
+          .catch((error) => {
+            console.error(`[ws] load-history-failed hostId=${hostConfig.id} err="${error instanceof Error ? error.message : String(error)}"`);
+            setCommandHistory([]);
+            setCommandHistoryContextRef.current([]);
+          })
+          .finally(() => {
+            setIsLoadingHistory(false);
+            setIsLoadingRef.current(false);
+          });
+      }
+    }, [showHistoryDialog, hostConfig.id]);
+
+    useEffect(() => {
+      const autocompleteEnabled =
+        localStorage.getItem("commandAutocomplete") === "true";
+
+      if (hostConfig.id && autocompleteEnabled) {
+        getCommandHistory(hostConfig.id!)
+          .then((history) => {
+            autocompleteHistory.current = history;
+          })
+          .catch((error) => {
+            console.error(`[ws] load-autocomplete-failed hostId=${hostConfig.id} err="${error instanceof Error ? error.message : String(error)}"`);
+            autocompleteHistory.current = [];
+          });
+      } else {
+        autocompleteHistory.current = [];
+      }
+    }, [hostConfig.id]);
+
+    useEffect(() => {
+      showAutocompleteRef.current = showAutocomplete;
+    }, [showAutocomplete]);
+
+    useEffect(() => {
+      autocompleteSuggestionsRef.current = autocompleteSuggestions;
+    }, [autocompleteSuggestions]);
+
+    useEffect(() => {
+      autocompleteSelectedIndexRef.current = autocompleteSelectedIndex;
+    }, [autocompleteSelectedIndex]);
+
+    const activityLoggingRef = useRef(false);
+    const sudoPromptShownRef = useRef(false);
+
+    const lastSentSizeRef = useRef<{ cols: number; rows: number } | null>(null);
+    const pendingSizeRef = useRef<{ cols: number; rows: number } | null>(null);
+    const notifyTimerRef = useRef<NodeJS.Timeout | null>(null);
+    const lastFittedSizeRef = useRef<{ cols: number; rows: number } | null>(
+      null,
+    );
+    const DEBOUNCE_MS = 140;
+
+    const logTerminalActivity = async () => {
+      if (
+        !hostConfig.id ||
+        activityLoggedRef.current ||
+        activityLoggingRef.current
+      ) {
+        return;
+      }
+
+      activityLoggingRef.current = true;
+      activityLoggedRef.current = true;
+
+      try {
+        const hostName =
+          hostConfig.name || `${hostConfig.username}@${hostConfig.ip}`;
+        await logActivity("terminal", hostConfig.id, hostName);
+      } catch (err) {
+        console.warn(`[ws] log-activity-failed hostId=${hostConfig.id} err="${err instanceof Error ? err.message : String(err)}"`);
+        activityLoggedRef.current = false;
+      } finally {
+        activityLoggingRef.current = false;
+      }
+    };
+
+    useEffect(() => {
+      const _isVisRefOld = isVisibleRef.current;
+      const _isVisRefNext = isVisible;
+      if (_isVisRefOld !== _isVisRefNext) {
+        const _isVisMsg = `[ws] isVisibleRef-transition edge=${_isVisRefOld}→${_isVisRefNext} trigger=isVisible-prop hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`;
+        if (visibilityDedup.shouldEmit(`ws-isVisibleRef-${_isVisRefNext}`, () => _isVisMsg).emit) console.info(_isVisMsg);
+      }
+      isVisibleRef.current = isVisible;
+    }, [isVisible]);
+
+    // quick-260809-eqk — Terminal-SSH WS-pause lifecycle effect
+    // (iteration 2 of hidden-pane-cost-mitigation-empirical-rotation).
+    //
+    // PURPOSE: close the Terminal-side SSH WebSocket when this pane is hidden
+    // (isVisible=false) and reopen it when the pane becomes visible again
+    // (isVisible=false→true). Iteration 1 (patch #344, quick-260808-b74, commit
+    // 4a3c21c) applied this same pattern to PrettyView's Claude-session WS and
+    // measured ~10-13 → ~5 WS frames/30s per hidden pane; this iteration
+    // targets the equivalent drop for hidden Terminal panes' SSH WS + xterm
+    // write stream + reconnect chatter.
+    //
+    // TEMPLATE: mirrors PrettyView.tsx iteration-1 shape verbatim so the diff
+    // reads as a copy. Close-when-hidden clears any pending reconnect timer
+    // first (belt: `isVisibleRef.current` guard added to `attemptReconnection`
+    // below is the second layer); reopen-when-visible resets the reconnect
+    // budget and calls `attemptReconnection()` directly — Terminal already
+    // has that dedicated reconnect entrypoint with full guard logic
+    // (isReconnectingRef, isConnectingRef, wasDisconnectedBySSH,
+    // maxReconnectAttempts), so we reuse it rather than inventing a new
+    // connect path or bumping a setRetryKey-style state (which is
+    // PrettyView's shape but not present in Terminal).
+    //
+    // ACCEPTED TRADEOFF: the main WS-setup effect at line ~2903 stays gated on
+    // `attach` (NOT `isVisible`) so URL-restored active-set members open their
+    // WS on mount even offscreen. This pause effect then immediately closes it
+    // — tmux persists across WS disconnects, so no session state is lost.
+    // The brief open→close cycle is the price of preserving the URL-restore
+    // contract (bounty url-restore-loads-only-selected-session-not-full-active-set).
+    //
+    // INITIAL-MOUNT NO-OP: on the first effect run isVisible flips
+    // false→true (isVisibleRef starts false at line 321); the WS-setup effect
+    // at line ~2903 is already opening the WS on mount via connectToHost —
+    // do not double-trigger. The visible branch below is a no-op when
+    // readyState is OPEN or CONNECTING.
+    //
+    // quick-260812-x5f — the close-on-hide is now DEBOUNCED by
+    // HIDDEN_PANE_WS_CLOSE_DEBOUNCE_MS (60s) so voice-record+send+nav-away
+    // and other in-flight nav-away work can complete before the WS is
+    // ripped out. Cancellation on isVisible=true is race-safe: if the
+    // timer already fired and close() ran, the existing reopen path on
+    // the next visible=false→true edge handles reconnection unchanged.
+    useEffect(() => {
+      // quick-260809-ih9: capture prev isVisible before mutating the ref.
+      // The visible branch below is gated on `!prev && isVisible` so it
+      // ONLY fires on genuine false→true transitions (pane returning after
+      // being hidden), not on initial mount. See the ref declaration above
+      // for the full WHY — TL;DR: firing on initial mount races with the
+      // WS-setup effect at ~L3000 and leaves the first session stuck on
+      // "Reconnecting…" because attemptReconnection's setTimeout captures
+      // a still-null `terminal` closure.
+      const prev = prevIsVisibleRef.current;
+      prevIsVisibleRef.current = isVisible;
+
+      // quick-260812-x5f: race-safe cancellation — fire on EVERY isVisible=true
+      // observation (not just the false→true edge) so any pending debounced-close
+      // is cancelled regardless of whether prev-gated reopen fires.
+      if (isVisible && hiddenPaneCloseTimerRef.current !== null) {
+        clearTimeout(hiddenPaneCloseTimerRef.current);
+        hiddenPaneCloseTimerRef.current = null;
+        console.info(`[ws-pause] hidden-pane-close-cancelled hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`);
+      }
+
+      if (!isVisible) {
+        // Pane became hidden — schedule a debounced WS close after HIDDEN_PANE_WS_CLOSE_DEBOUNCE_MS.
+        // Clear any pending debounce timer first so a re-enter of the hidden
+        // state RESTARTS the 60s window from scratch (bounty scenario c).
+        if (hiddenPaneCloseTimerRef.current !== null) {
+          clearTimeout(hiddenPaneCloseTimerRef.current);
+          hiddenPaneCloseTimerRef.current = null;
+        }
+        // NOTE: this branch stays always-firing (no edge gate). Its
+        // readyState guard makes it a safe no-op when ws is null (initial
+        // mount case). Keeping it always-firing preserves close-on-hide
+        // for URL-restored offscreen panes that somehow have an active ws
+        // (belt+suspenders).
+        const ws = webSocketRef.current;
+        if (
+          ws !== null &&
+          (ws.readyState === WebSocket.OPEN ||
+            ws.readyState === WebSocket.CONNECTING)
+        ) {
+          console.info(`[ws-pause] hidden-pane-close-scheduled hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'} delayMs=${HIDDEN_PANE_WS_CLOSE_DEBOUNCE_MS}`);
+          hiddenPaneCloseTimerRef.current = setTimeout(() => {
+            hiddenPaneCloseTimerRef.current = null;
+            // Re-check readyState inside the callback — if the WS was already
+            // closed by another path during the 60s window, no-op.
+            if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+              // Clear any in-flight reconnect timer first so it doesn't fire
+              // while hidden and immediately reopen (the isVisibleRef guard on
+              // attemptReconnection is the belt; this clearTimeout is the
+              // suspenders — mirrors PrettyView.tsx pattern).
+              if (reconnectTimeoutRef.current !== null) {
+                clearTimeout(reconnectTimeoutRef.current);
+                reconnectTimeoutRef.current = null;
+              }
+              console.info(`[ws-pause] hidden-pane-close-fired hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'} debounced=true`);
+              ws.close();
+              // onclose fires → the existing close handling path runs. The
+              // isVisibleRef guard added to attemptReconnection short-circuits
+              // any auto-reconnect scheduling while hidden.
+            }
+          }, HIDDEN_PANE_WS_CLOSE_DEBOUNCE_MS);
+        }
+      } else if (!prev && isVisible) {
+        // quick-260809-ih9: gate reopen on genuine false→true edge only.
+        // Initial mount (prev === isVisible === true) must NOT fire this
+        // branch — it races with the WS-setup effect at ~L3000, which
+        // would then see isReconnectingRef=true (set by attemptReconnection
+        // below) and return early. attemptReconnection's setTimeout also
+        // captures a null `terminal` closure at initial mount (xterm.js
+        // instance not yet created), so `if (terminal && hostConfig)` at
+        // ~L1105 skips connectToHost and the WS never opens. Result
+        // before this gate: first session post page load stuck on
+        // "Reconnecting…" until user nav-away-then-back. Setup effect owns
+        // initial-mount WS open; pause effect owns transitions.
+        //
+        // Pane became visible after being hidden — reopen the WS if it is
+        // gone or closing.
+        const ws = webSocketRef.current;
+        if (
+          attach &&
+          (ws === null ||
+            ws.readyState === WebSocket.CLOSING ||
+            ws.readyState === WebSocket.CLOSED)
+        ) {
+          // Fresh budget for this re-show (mirrors the iOS PWA
+          // visibilitychange handler's "Fresh budget" pattern at line 383).
+          reconnectAttempts.current = 0;
+          console.info(`[reopen] fired hostId=${hostConfig.id} path=visibilitychange`);
+          attemptReconnection();
+          // attemptReconnection() reuses the existing patch #148 reconnect
+          // machinery (isReconnectingRef, backoff, maxReconnectAttempts,
+          // etc.) — no new connect path invented.
+        }
+        // If WS is already OPEN or CONNECTING (e.g. a stray previously
+        // opened socket), no-op — don't interfere with the WS-setup effect.
+      }
+      return () => {
+        // Unmount cleanup: clear the pending debounce timer so no timer leaks
+        // into unmounted components (bounty scenario e).
+        if (hiddenPaneCloseTimerRef.current !== null) {
+          clearTimeout(hiddenPaneCloseTimerRef.current);
+          hiddenPaneCloseTimerRef.current = null;
+        }
+      };
+    }, [isVisible]); // eslint-disable-line react-hooks/exhaustive-deps
+    // deps: [isVisible] only. Reads only refs (webSocketRef,
+    // reconnectTimeoutRef, reconnectAttempts, hiddenPaneCloseTimerRef) and
+    // calls attemptReconnection (a stable function reference in this file —
+    // declared as `function` at line ~945, not `useCallback`).
+    // Adding `attach` to deps would re-fire this effect on the attach flip,
+    // which is already handled by the main WS-setup effect at line ~2903 —
+    // deliberate separation of concerns.
+
+    // Bounty pretty-view-per-pane-cost-diag: register with the diag registry
+    // so the interval emitter can query this pane's cost snapshot. Keyed
+    // on hostConfig.id + hostConfig.instanceId (stable across the mount).
+    // Snapshot fn closes over refs to read latest tmuxSessionName +
+    // isVisible + xterm buffer + bytes counter.
+    useEffect(() => {
+      const key = `terminal:${hostConfig.id}:${hostConfig.instanceId ?? ""}`;
+      const snapshotFn = (): PaneSnapshot => {
+        const bytesSinceLast = wsBytesRef.current;
+        wsBytesRef.current = 0;
+        const scrollback = terminal?.buffer?.active?.length ?? 0;
+        const domNodeCount = xtermRef.current
+          ? xtermRef.current.querySelectorAll("*").length
+          : 0;
+        return {
+          kind: "terminal",
+          paneId: key,
+          hostId: hostConfig.id,
+          tmuxSession: tmuxSessionNameRef.current,
+          isVisible: isVisibleRef.current,
+          wsBytesSinceLast: bytesSinceLast,
+          scrollbackLines: scrollback,
+          domNodeCount,
+        };
+      };
+      return registerPane(key, snapshotFn);
+    }, [hostConfig.id, hostConfig.instanceId, terminal]);
+
+    useEffect(() => {
+      const checkAuth = () => {
+        setIsAuthenticated((prev) => {
+          if (!prev) {
+            return true;
+          }
+          return prev;
+        });
+      };
+
+      checkAuth();
+
+      const authCheckInterval = setInterval(checkAuth, 5000);
+
+      return () => clearInterval(authCheckInterval);
+    }, []);
+
+    function hardRefresh() {
+      try {
+        if (
+          terminal &&
+          typeof (
+            terminal as { refresh?: (start: number, end: number) => void }
+          ).refresh === "function"
+        ) {
+          (
+            terminal as { refresh?: (start: number, end: number) => void }
+          ).refresh(0, terminal.rows - 1);
+        }
+      } catch (error) {
+        console.error(`[ws] op-failed hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'} err="${error instanceof Error ? error.message : String(error)}"`);
+      }
+    }
+
+    function performFit() {
+      if (
+        !fitAddonRef.current ||
+        !terminal ||
+        !isVisible ||
+        isFittingRef.current
+      ) {
+        return;
+      }
+
+      isFittingRef.current = true;
+
+      try {
+        fitAddonRef.current.fit();
+        if (terminal && terminal.cols > 0 && terminal.rows > 0) {
+          const lastSize = lastFittedSizeRef.current;
+          if (
+            !lastSize ||
+            lastSize.cols !== terminal.cols ||
+            lastSize.rows !== terminal.rows
+          ) {
+            scheduleNotify(terminal.cols, terminal.rows);
+            lastFittedSizeRef.current = {
+              cols: terminal.cols,
+              rows: terminal.rows,
+            };
+          }
+        }
+        setIsFitted(true);
+      } finally {
+        isFittingRef.current = false;
+      }
+    }
+
+    function handleTotpSubmit(code: string) {
+      if (webSocketRef.current && code) {
+        if (totpTimeoutRef.current) {
+          clearTimeout(totpTimeoutRef.current);
+          totpTimeoutRef.current = null;
+        }
+        webSocketRef.current.send(
+          JSON.stringify({
+            type: isPasswordPrompt ? "password_response" : "totp_response",
+            data: { code },
+          }),
+        );
+        setTotpRequired(false);
+        setTotpPrompt("");
+        setIsPasswordPrompt(false);
+      }
+    }
+
+    function handleTotpCancel() {
+      if (totpTimeoutRef.current) {
+        clearTimeout(totpTimeoutRef.current);
+        totpTimeoutRef.current = null;
+      }
+      setTotpRequired(false);
+      setTotpPrompt("");
+      if (onClose) onClose();
+    }
+
+    function handleWarpgateContinue() {
+      if (webSocketRef.current) {
+        if (warpgateTimeoutRef.current) {
+          clearTimeout(warpgateTimeoutRef.current);
+          warpgateTimeoutRef.current = null;
+        }
+        webSocketRef.current.send(
+          JSON.stringify({
+            type: "warpgate_auth_continue",
+            data: {},
+          }),
+        );
+        setWarpgateAuthRequired(false);
+        setWarpgateAuthUrl("");
+        setWarpgateSecurityKey("");
+      }
+    }
+
+    function handleWarpgateCancel() {
+      if (warpgateTimeoutRef.current) {
+        clearTimeout(warpgateTimeoutRef.current);
+        warpgateTimeoutRef.current = null;
+      }
+      setWarpgateAuthRequired(false);
+      setWarpgateAuthUrl("");
+      setWarpgateSecurityKey("");
+      if (onClose) onClose();
+    }
+
+    function handleWarpgateOpenUrl() {
+      if (warpgateAuthUrl) {
+        window.open(warpgateAuthUrl, "_blank", "noopener,noreferrer");
+      }
+    }
+
+    function handleAuthDialogSubmit(credentials: {
+      password?: string;
+      sshKey?: string;
+      keyPassword?: string;
+    }) {
+      if (webSocketRef.current && terminal) {
+        webSocketRef.current.send(
+          JSON.stringify({
+            type: "reconnect_with_credentials",
+            data: {
+              cols: terminal.cols,
+              rows: terminal.rows,
+              password: credentials.password,
+              sshKey: credentials.sshKey,
+              keyPassword: credentials.keyPassword,
+              hostConfig: {
+                ...hostConfig,
+                password: credentials.password,
+                key: credentials.sshKey,
+                keyPassword: credentials.keyPassword,
+              },
+            },
+          }),
+        );
+        setShowAuthDialog(false);
+        setIsConnecting(true);
+      }
+    }
+
+    function handleAuthDialogCancel() {
+      setShowAuthDialog(false);
+      if (onClose) onClose();
+    }
+
+    function handlePassphraseSubmit(passphrase: string) {
+      if (webSocketRef.current && terminal) {
+        webSocketRef.current.send(
+          JSON.stringify({
+            type: "reconnect_with_credentials",
+            data: {
+              cols: terminal.cols,
+              rows: terminal.rows,
+              keyPassword: passphrase,
+              hostConfig: {
+                ...hostConfig,
+                keyPassword: passphrase,
+              },
+            },
+          }),
+        );
+        setShowPassphraseDialog(false);
+        setIsConnecting(true);
+      }
+    }
+
+    function handlePassphraseCancel() {
+      setShowPassphraseDialog(false);
+      if (onClose) onClose();
+    }
+
+    function scheduleNotify(cols: number, rows: number) {
+      if (!(cols > 0 && rows > 0)) return;
+      pendingSizeRef.current = { cols, rows };
+      if (notifyTimerRef.current) clearTimeout(notifyTimerRef.current);
+      notifyTimerRef.current = setTimeout(() => {
+        const next = pendingSizeRef.current;
+        const last = lastSentSizeRef.current;
+        if (!next) return;
+        if (last && last.cols === next.cols && last.rows === next.rows) return;
+        if (webSocketRef.current?.readyState === WebSocket.OPEN) {
+          webSocketRef.current.send(
+            JSON.stringify({ type: "resize", data: next }),
+          );
+          lastSentSizeRef.current = next;
+        }
+      }, DEBOUNCE_MS);
+    }
+
+    useImperativeHandle(
+      ref,
+      () => ({
+        disconnect: () => {
+          isUnmountingRef.current = true;
+          if (shouldNotReconnectRef.current !== true) { console.info(`[ws] shouldNotReconnectRef-transition edge=${shouldNotReconnectRef.current}→true trigger=unmount-cleanup hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`); }
+          shouldNotReconnectRef.current = true;
+          isReconnectingRef.current = false;
+          if (pingIntervalRef.current) {
+            clearInterval(pingIntervalRef.current);
+            pingIntervalRef.current = null;
+          }
+          if (pongTimeoutRef.current) {
+            clearTimeout(pongTimeoutRef.current);
+            pongTimeoutRef.current = null;
+          }
+          if (reconnectTimeoutRef.current) {
+            clearTimeout(reconnectTimeoutRef.current);
+            reconnectTimeoutRef.current = null;
+          }
+          if (connectionTimeoutRef.current) {
+            clearTimeout(connectionTimeoutRef.current);
+            connectionTimeoutRef.current = null;
+          }
+          if (totpTimeoutRef.current) {
+            clearTimeout(totpTimeoutRef.current);
+            totpTimeoutRef.current = null;
+          }
+          if (warpgateTimeoutRef.current) {
+            clearTimeout(warpgateTimeoutRef.current);
+            warpgateTimeoutRef.current = null;
+          }
+          if (webSocketRef.current?.readyState === WebSocket.OPEN) {
+            webSocketRef.current.send(JSON.stringify({ type: "disconnect" }));
+          }
+          sessionIdRef.current = null;
+          webSocketRef.current?.close();
+          setIsConnected(false);
+          setIsConnecting(false);
+        },
+        reconnect: () => {
+          isUnmountingRef.current = false;
+          if (shouldNotReconnectRef.current !== false) { console.info(`[ws] shouldNotReconnectRef-transition edge=${shouldNotReconnectRef.current}→false trigger=manual-reconnect hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`); }
+          shouldNotReconnectRef.current = false;
+          isReconnectingRef.current = false;
+          if (isConnectingRef.current !== false) { console.info(`[ws] isConnectingRef-transition edge=${isConnectingRef.current}→false trigger=manual-reconnect hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`); }
+          isConnectingRef.current = false;
+          reconnectAttempts.current = 0;
+          wasDisconnectedBySSH.current = false;
+          if (wasConnectedRef.current !== false) { console.info(`[ws] wasConnectedRef-transition edge=${wasConnectedRef.current}→false trigger=manual-reconnect hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`); }
+          wasConnectedRef.current = false;
+          updateConnectionError(null);
+          setShowDisconnectedOverlay(false);
+          if (terminal) {
+            terminal.clear();
+            const cols = terminal.cols;
+            const rows = terminal.rows;
+            console.info(`[reopen] fired hostId=${hostConfig.id} path=direct-caller callSite="handleReconnectClick"`);
+            connectToHost(cols, rows);
+          }
+        },
+        fit: () => {
+          if (!fitAddonRef.current || !terminal || isFittingRef.current) return;
+          isFittingRef.current = true;
+          try {
+            fitAddonRef.current.fit();
+            if (terminal.cols > 0 && terminal.rows > 0) {
+              const lastSize = lastFittedSizeRef.current;
+              if (
+                !lastSize ||
+                lastSize.cols !== terminal.cols ||
+                lastSize.rows !== terminal.rows
+              ) {
+                scheduleNotify(terminal.cols, terminal.rows);
+                lastFittedSizeRef.current = {
+                  cols: terminal.cols,
+                  rows: terminal.rows,
+                };
+              }
+            }
+            setIsFitted(true);
+          } finally {
+            isFittingRef.current = false;
+          }
+        },
+        sendInput: (data: string, messageQueueItemId?: string) => {
+          if (webSocketRef.current?.readyState === 1) {
+            const payload: {
+              type: "input";
+              data: string;
+              messageQueueItemId?: string;
+            } = { type: "input", data };
+            if (messageQueueItemId) payload.messageQueueItemId = messageQueueItemId;
+            webSocketRef.current.send(JSON.stringify(payload));
+          }
+        },
+        // Phase 41 Plan 02: toggleMessageQueue and togglePrettyMode REMOVED from
+        // Terminal's useImperativeHandle. Identity panes expose these via
+        // IdentitySessionPane's wrapper useImperativeHandle. Non-identity terminal
+        // panes (the only panes Terminal now serves) do not have a message queue
+        // or pretty mode to toggle — AppShell calls these via the identity-pane
+        // ref path (IdentitySessionPane) or the ref is null for non-identity panes.
+        notifyResize: () => {
+          try {
+            const cols = terminal?.cols ?? undefined;
+            const rows = terminal?.rows ?? undefined;
+            if (typeof cols === "number" && typeof rows === "number") {
+              scheduleNotify(cols, rows);
+              hardRefresh();
+            }
+          } catch (error) {
+            console.error(`[ws] op-failed hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'} err="${error instanceof Error ? error.message : String(error)}"`);
+          }
+        },
+        refresh: () => hardRefresh(),
+        openFileManager: () => {
+          if (webSocketRef.current?.readyState === WebSocket.OPEN) {
+            webSocketRef.current.send(JSON.stringify({ type: "get_cwd" }));
+          } else {
+            onOpenFileManager?.("/");
+          }
+        },
+      }),
+      [terminal],
+    );
+
+    function getUseRightClickCopyPaste() {
+      return getCookie("rightClickCopyPaste") !== "false";
+    }
+
+    function attemptReconnection() {
+      // quick-260809-eqk: hidden panes must not fight the WS-pause effect.
+      // The pause effect above closes the WS on isVisible→false; without
+      // this guard, the onclose handler / patch #148-analog auto-reconnect
+      // logic would re-schedule + re-open behind our back while hidden.
+      // The pause effect owns the reopen path (fires on isVisible→true).
+      if (!isVisibleRef.current) {
+        console.warn(`[pause-gate] blocked-reconnect hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'} reason=hidden`);
+        return;
+      }
+      if (
+        isUnmountingRef.current ||
+        shouldNotReconnectRef.current ||
+        isReconnectingRef.current ||
+        isConnectingRef.current ||
+        wasDisconnectedBySSH.current ||
+        reconnectTimeoutRef.current !== null
+      ) {
+        return;
+      }
+
+      if (reconnectAttempts.current >= maxReconnectAttempts) {
+        setIsConnecting(false);
+        if (shouldNotReconnectRef.current !== true) { console.info(`[ws] shouldNotReconnectRef-transition edge=${shouldNotReconnectRef.current}→true trigger=max-reconnect-attempts hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`); }
+        shouldNotReconnectRef.current = true;
+        setShowDisconnectedOverlay(true);
+        addLog({
+          type: "error",
+          stage: "connection",
+          message: t("terminal.maxReconnectAttemptsReached"),
+        });
+        return;
+      }
+
+      isReconnectingRef.current = true;
+
+      if (terminal && !isAttachingSessionRef.current) {
+        terminal.clear();
+      }
+
+      reconnectAttempts.current++;
+
+      addLog({
+        type: "info",
+        stage: "connection",
+        message: t("terminal.reconnecting", {
+          attempt: reconnectAttempts.current,
+          max: maxReconnectAttempts,
+        }),
+      });
+
+      // R-54-07: full-jitter — random draw in [0, capMs) prevents the 10-tab Chrome-restore herd from re-clumping on the reconnect ladder. Cap (8s) and exponential base (2s * 2^(attempt-1)) unchanged.
+      const capMs = Math.min(
+        2000 * Math.pow(2, reconnectAttempts.current - 1),
+        8000,
+      );
+      const delay = Math.floor(Math.random() * capMs);
+
+      reconnectTimeoutRef.current = setTimeout(() => {
+        reconnectTimeoutRef.current = null;
+
+        if (
+          isUnmountingRef.current ||
+          shouldNotReconnectRef.current ||
+          wasDisconnectedBySSH.current
+        ) {
+          isReconnectingRef.current = false;
+          return;
+        }
+
+        if (reconnectAttempts.current > maxReconnectAttempts) {
+          isReconnectingRef.current = false;
+          return;
+        }
+
+        if (terminal && hostConfig) {
+          if (!isAttachingSessionRef.current) {
+            terminal.clear();
+          }
+          const cols = terminal.cols;
+          const rows = terminal.rows;
+          connectToHost(cols, rows);
+        }
+
+        isReconnectingRef.current = false;
+      }, delay);
+    }
+
+    async function connectToHost(cols: number, rows: number) {
+      if (isConnectingRef.current) {
+        return;
+      }
+
+      if (isConnectingRef.current !== true) { console.info(`[ws] isConnectingRef-transition edge=${isConnectingRef.current}→true trigger=connectToHost-entry hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`); }
+      isConnectingRef.current = true;
+      connectionAttemptIdRef.current++;
+      if (wasConnectedRef.current !== false) { console.info(`[ws] wasConnectedRef-transition edge=${wasConnectedRef.current}→false trigger=connectToHost-entry hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`); }
+      wasConnectedRef.current = false;
+
+      if (!isReconnectingRef.current) {
+        reconnectAttempts.current = 0;
+        if (shouldNotReconnectRef.current !== false) { console.info(`[ws] shouldNotReconnectRef-transition edge=${shouldNotReconnectRef.current}→false trigger=connectToHost-entry hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`); }
+        shouldNotReconnectRef.current = false;
+      }
+
+      const isDev =
+        process.env.NODE_ENV === "development" &&
+        (window.location.port === "3000" ||
+          window.location.port === "5173" ||
+          window.location.port === "");
+
+      let baseWsUrl: string;
+
+      if (isDev) {
+        baseWsUrl = `${window.location.protocol === "https:" ? "wss" : "ws"}://localhost:30002`;
+      } else {
+        baseWsUrl = `${getBasePath()}/ssh/websocket/`;
+      }
+
+      // Phase 111 SKEW-09 (D-08): stamp handshake with CLIENT_BUILD_ID so
+      // backend terminal.ts handshake gate can refuse mismatched clients
+      // with 4409. Picks `?` vs `&` correctly in case the base URL already
+      // carries a query string.
+      baseWsUrl += baseWsUrl.includes("?")
+        ? `&build=${encodeURIComponent(CLIENT_BUILD_ID)}`
+        : `?build=${encodeURIComponent(CLIENT_BUILD_ID)}`;
+
+      // Phase 111 SKEW-09: don't open a new WS if the shell has already
+      // been skew-locked by another lane — the tab is about to reload.
+      if (getSkewLockedSnapshot().locked) {
+        setIsConnecting(false);
+        isConnectingRef.current = false;
+        return;
+      }
+
+      if (
+        webSocketRef.current &&
+        webSocketRef.current.readyState !== WebSocket.CLOSED
+      ) {
+        webSocketRef.current.close();
+      }
+
+      if (pingIntervalRef.current) {
+        clearInterval(pingIntervalRef.current);
+        pingIntervalRef.current = null;
+      }
+      if (connectionTimeoutRef.current) {
+        clearTimeout(connectionTimeoutRef.current);
+        connectionTimeoutRef.current = null;
+      }
+
+      const ws = new WebSocket(baseWsUrl);
+      webSocketRef.current = ws;
+      wasDisconnectedBySSH.current = false;
+      updateConnectionError(null);
+      shouldNotReconnectRef.current = false;
+      isReconnectingRef.current = false;
+      setIsConnecting(true);
+
+      setupWebSocketListeners(ws, cols, rows);
+    }
+
+    function setupWebSocketListeners(
+      ws: WebSocket,
+      cols: number,
+      rows: number,
+    ) {
+      setupListenersCountRef.current += 1;
+      // Terminal render-broken diag: count listener attachments per mount.
+      // >1 within a single mount = hypothesis B (multi-handler race) is live.
+      console.info(
+        `[term-diag] setupListeners mountId=${mountIdRef.current} ` +
+          `hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'} ` +
+          `callCount=${setupListenersCountRef.current} wsReadyState=${ws.readyState}`,
+      );
+      ws.addEventListener("open", () => {
+        console.info(`[ws] open hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'} wsUrl=${ws.url} readyState=${ws.readyState}`);
+        connectionTimeoutRef.current = setTimeout(() => {
+          if (
+            !isConnected &&
+            !totpRequired &&
+            !isPasswordPrompt &&
+            !connectionErrorRef.current
+          ) {
+            if (terminal) {
+              terminal.clear();
+            }
+            const timeoutMessage = t("terminal.connectionTimeout");
+            updateConnectionError(timeoutMessage);
+            addLog({
+              type: "error",
+              stage: "connection",
+              message: timeoutMessage,
+            });
+            if (webSocketRef.current) {
+              webSocketRef.current.close();
+            }
+            if (reconnectAttempts.current > 0) {
+              attemptReconnection();
+            } else {
+              setIsConnecting(false);
+              if (shouldNotReconnectRef.current !== true) { console.info(`[ws] shouldNotReconnectRef-transition edge=${shouldNotReconnectRef.current}→true trigger=connection-timeout hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`); }
+              shouldNotReconnectRef.current = true;
+            }
+          }
+        }, 35000);
+
+        currentHostIdRef.current = hostConfig.id;
+        currentHostConfigRef.current = hostConfig;
+
+        // Consume the pending restored session ID once; retries get null so they create fresh connections
+        const restoredSessionId = pendingRestoredSessionIdRef.current;
+        pendingRestoredSessionIdRef.current = null;
+
+        if (restoredSessionId) {
+          sessionIdRef.current = restoredSessionId;
+          if (isAttachingSessionRef.current !== true) { console.info(`[ws] isAttachingSessionRef-transition edge=${isAttachingSessionRef.current}→true trigger=ws-open-attach hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`); }
+          isAttachingSessionRef.current = true;
+
+          ws.send(
+            JSON.stringify({
+              type: "attachSession",
+              data: {
+                sessionId: restoredSessionId,
+                cols,
+                rows,
+                tabInstanceId: hostConfig.instanceId,
+              },
+            }),
+          );
+        } else {
+          if (isAttachingSessionRef.current !== false) { console.info(`[ws] isAttachingSessionRef-transition edge=${isAttachingSessionRef.current}→false trigger=ws-open-connect hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`); }
+          isAttachingSessionRef.current = false;
+          ws.send(
+            JSON.stringify({
+              type: "connectToHost",
+              data: {
+                cols,
+                rows,
+                hostConfig,
+                initialPath,
+                executeCommand,
+                targetTmuxSession: targetTmuxSession ?? undefined,
+                tmuxAllowCreate: allowCreateTmux ?? false,
+              },
+            }),
+          );
+        }
+        terminal.onData((data) => {
+          trackInput(data);
+          ws.send(JSON.stringify({ type: "input", data }));
+          // Record what xterm.js just sent so our iOS multi-char input
+          // intercept can strip duplicate prefixes (e.g. when iOS fires
+          // a keydown for "T" + an input event with data="Testing").
+          const now = Date.now();
+          recentlySentRef.current =
+            now < recentlySentRef.current.expiresAt
+              ? {
+                  chars: recentlySentRef.current.chars + data,
+                  expiresAt: now + 150,
+                }
+              : { chars: data, expiresAt: now + 150 };
+        });
+
+        pongReceivedRef.current = true;
+        pingIntervalRef.current = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            if (!pongReceivedRef.current) {
+              console.warn(`[ws] pong-timeout hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'} readyState=${ws.readyState}`);
+              ws.close();
+              return;
+            }
+            pongReceivedRef.current = false;
+            ws.send(JSON.stringify({ type: "ping" }));
+          }
+        }, 30000);
+      });
+
+      ws.addEventListener("message", (event) => {
+        // Ignore messages from a stale socket. On mobile foreground the
+        // visibility handler opens a fresh WS via connectToHost, which closes
+        // the previous one — but a queued `{type:"disconnected"}` from the
+        // old socket can still fire and would pop the Connection Lost overlay
+        // AFTER the new socket has already reconnected and rendered content.
+        if (ws !== webSocketRef.current) {
+          // Terminal render-broken diag: loud-log the bail so we can see if
+          // this guard is silently eating post-attach data frames — that
+          // would confirm hypothesis B (multi-handler race, stale-socket
+          // guard bailing on the wrong socket).
+          console.warn(
+            `[term-diag] stale-socket-guard-bailed mountId=${mountIdRef.current} ` +
+              `hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'} ` +
+              `ws.readyState=${ws.readyState} currentReadyState=${webSocketRef.current?.readyState ?? 'null'} ` +
+              `listenerCallCount=${setupListenersCountRef.current}`,
+          );
+          return;
+        }
+        // Bounty pretty-view-per-pane-cost-diag: count bytes for the diag
+        // emit. Raw string length is close enough at 30s cadence.
+        if (typeof event.data === "string") {
+          wsBytesRef.current += event.data.length;
+        }
+        try {
+          const msg = JSON.parse(event.data);
+          // Phase 111 SKEW-09 (D-09 idle-tab lane): per-message drift detection.
+          // Backend terminal.ts monkey-patches ws.send to piggyback
+          // `build: <SERVER_BUILD_ID>` on every JSON envelope (Plan 05 Task 3).
+          // Mismatched build => bundle is stale => fire the shell-level lock
+          // and drop the frame. Backward compat: frames without `build` are
+          // no-ops (typeof check short-circuits).
+          if (
+            msg &&
+            typeof msg === "object" &&
+            typeof msg.build === "string" &&
+            msg.build !== CLIENT_BUILD_ID
+          ) {
+            lockSkewedSession({
+              reason: "ws_message_tag_mismatch",
+              clientBuild: CLIENT_BUILD_ID,
+              serverBuild: msg.build,
+            });
+            return; // drop frame — session is skew-locked
+          }
+          // [ws-msg] dispatch — one line per frame, dedup-collapsed for hot types (D-13/D-17)
+          const wsMsgKey = `[ws-msg] received type=${msg.type}`;
+          const wsMsgLine = `[ws-msg] received type=${msg.type} hostId=${hostConfig.id ?? 'null'} sessionId=${tmuxSessionNameRef.current ?? 'null'} readyState=${ws.readyState}`;
+          if (wsMsgDedup.shouldEmit(wsMsgKey, () => wsMsgLine).emit) console.info(wsMsgLine);
+          if (msg.type === "pong") {
+            pongReceivedRef.current = true;
+            return;
+          }
+          // idle frames intentionally ignored — pane-level PrettyView owns this signal (Phase 41-02 a997630f, quick-260821-kyf)
+          if (msg.type === "data") {
+            // Terminal render-broken diag: shared write-with-diag helper so
+            // both branches (string and non-string msg.data) log the same
+            // way. Captures the state that would distinguish hypothesis A
+            // (stale terminal closure — DOM disconnected / terminal disposed)
+            // from healthy writes, plus a try/catch to catch dispose-throws.
+            const writeWithDiag = (outputData: string) => {
+              dataFrameCountRef.current += 1;
+              const domConnected = xtermRef.current?.isConnected ?? null;
+              const termRows = terminal?.rows ?? -1;
+              const termCols = terminal?.cols ?? -1;
+              const suspicious =
+                domConnected !== true ||
+                !terminal ||
+                termRows <= 0 ||
+                termCols <= 0;
+              if (suspicious) {
+                console.warn(
+                  `[term-diag] write-suspicious mountId=${mountIdRef.current} ` +
+                    `hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'} ` +
+                    `frameNum=${dataFrameCountRef.current} bytes=${outputData.length} ` +
+                    `domConnected=${domConnected} termRows=${termRows} termCols=${termCols} ` +
+                    `hasTerminal=${!!terminal} listenerCallCount=${setupListenersCountRef.current}`,
+                );
+              } else if (
+                dataFrameCountRef.current <= 3 ||
+                dataFrameCountRef.current % 100 === 0
+              ) {
+                // Sample: first 3 frames + every 100th so a healthy stream
+                // shows a lightweight heartbeat without spamming the log.
+                console.info(
+                  `[term-diag] write-ok mountId=${mountIdRef.current} ` +
+                    `hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'} ` +
+                    `frameNum=${dataFrameCountRef.current} bytes=${outputData.length} ` +
+                    `termRows=${termRows} termCols=${termCols}`,
+                );
+              }
+              try {
+                terminal.write(outputData);
+              } catch (e) {
+                console.error(
+                  `[term-diag] write-threw mountId=${mountIdRef.current} ` +
+                    `hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'} ` +
+                    `frameNum=${dataFrameCountRef.current} err="${e instanceof Error ? e.message : String(e)}"`,
+                );
+              }
+            };
+
+            if (typeof msg.data === "string") {
+              const syntaxHighlightingEnabled =
+                localStorage.getItem("terminalSyntaxHighlighting") === "true";
+
+              const outputData = syntaxHighlightingEnabled
+                ? highlightTerminalOutput(msg.data)
+                : msg.data;
+
+              writeWithDiag(outputData);
+              const sudoPasswordPattern =
+                /(?:\[sudo\][^\n]*:\s*$|sudo:[^\n]*password[^\n]*required|password for [^\n]*:\s*$|Password:\s*$)/i;
+              const hasSudoPw =
+                hostConfig.terminalConfig?.sudoPassword ||
+                hostConfig.password ||
+                hostConfig.hasSudoPassword ||
+                hostConfig.hasPassword;
+              if (
+                config.sudoPasswordAutoFill &&
+                sudoPasswordPattern.test(msg.data) &&
+                hasSudoPw &&
+                !sudoPromptShownRef.current
+              ) {
+                sudoPromptShownRef.current = true;
+                confirmWithToast(
+                  t("terminal.sudoPasswordPopupTitle"),
+                  async () => {
+                    // Fetch password on-demand from server
+                    let passwordToFill =
+                      hostConfig.terminalConfig?.sudoPassword ||
+                      hostConfig.password;
+                    if (!passwordToFill && hostConfig.id) {
+                      passwordToFill =
+                        (await getHostPassword(
+                          hostConfig.id,
+                          "sudoPassword",
+                        )) ||
+                        (await getHostPassword(hostConfig.id, "password")) ||
+                        undefined;
+                    }
+                    if (
+                      passwordToFill &&
+                      webSocketRef.current &&
+                      webSocketRef.current.readyState === WebSocket.OPEN
+                    ) {
+                      webSocketRef.current.send(
+                        JSON.stringify({
+                          type: "input",
+                          data: passwordToFill + "\n",
+                        }),
+                      );
+                    }
+                    setTimeout(() => {
+                      sudoPromptShownRef.current = false;
+                    }, 3000);
+                  },
+                  t("common.confirm"),
+                  t("common.cancel"),
+                  { confirmOnEnter: true },
+                );
+                setTimeout(() => {
+                  sudoPromptShownRef.current = false;
+                }, 15000);
+              }
+            } else {
+              const syntaxHighlightingEnabled =
+                localStorage.getItem("terminalSyntaxHighlighting") === "true";
+
+              const stringData = String(msg.data);
+              const outputData = syntaxHighlightingEnabled
+                ? highlightTerminalOutput(stringData)
+                : stringData;
+
+              writeWithDiag(outputData);
+            }
+          } else if (msg.type === "error") {
+            const errorMessage = msg.message || t("terminal.unknownError");
+
+            addLog({
+              type: "error",
+              stage: "connection",
+              message: errorMessage,
+            });
+
+            if (
+              errorMessage.toLowerCase().includes("connection") ||
+              errorMessage.toLowerCase().includes("timeout") ||
+              errorMessage.toLowerCase().includes("network")
+            ) {
+              updateConnectionError(errorMessage);
+              setIsConnected(false);
+              if (terminal) {
+                terminal.clear();
+              }
+              setIsConnecting(false);
+              wasDisconnectedBySSH.current = false;
+              return;
+            }
+
+            if (
+              (errorMessage.toLowerCase().includes("auth") &&
+                errorMessage.toLowerCase().includes("failed")) ||
+              errorMessage.toLowerCase().includes("permission denied") ||
+              (errorMessage.toLowerCase().includes("invalid") &&
+                (errorMessage.toLowerCase().includes("password") ||
+                  errorMessage.toLowerCase().includes("key"))) ||
+              errorMessage.toLowerCase().includes("incorrect password")
+            ) {
+              updateConnectionError(errorMessage);
+              setIsConnecting(false);
+              shouldNotReconnectRef.current = true;
+              if (webSocketRef.current) {
+                webSocketRef.current.close();
+              }
+              return;
+            }
+
+            updateConnectionError(errorMessage);
+            setIsConnecting(false);
+          } else if (msg.type === "connected") {
+            opksshFailedRef.current = false;
+            if (wasConnectedRef.current !== true) { console.info(`[ws] wasConnectedRef-transition edge=${wasConnectedRef.current}→true trigger=ws-open hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`); }
+            wasConnectedRef.current = true;
+            setIsConnected(true);
+            setIsConnecting(false);
+            if (isConnectingRef.current !== false) { console.info(`[ws] isConnectingRef-transition edge=${isConnectingRef.current}→false trigger=ws-connected hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`); }
+            isConnectingRef.current = false;
+            updateConnectionError(null);
+            if (connectionTimeoutRef.current) {
+              clearTimeout(connectionTimeoutRef.current);
+              connectionTimeoutRef.current = null;
+            }
+            if (reconnectAttempts.current > 0) {
+              addLog({
+                type: "success",
+                stage: "connection",
+                message: t("terminal.reconnected"),
+              });
+            } else {
+              addLog({
+                type: "success",
+                stage: "connection",
+                message: t("terminal.connected"),
+              });
+            }
+            reconnectAttempts.current = 0;
+            isReconnectingRef.current = false;
+
+            logTerminalActivity();
+
+            setTimeout(async () => {
+              const terminalConfig = {
+                ...DEFAULT_TERMINAL_CONFIG,
+                ...hostConfig.terminalConfig,
+              };
+
+              if (
+                terminalConfig.environmentVariables &&
+                terminalConfig.environmentVariables.length > 0
+              ) {
+                for (const envVar of terminalConfig.environmentVariables) {
+                  if (envVar.key && envVar.value && ws.readyState === 1) {
+                    ws.send(
+                      JSON.stringify({
+                        type: "input",
+                        data: `export ${envVar.key}="${envVar.value}"\n`,
+                      }),
+                    );
+                  }
+                }
+              }
+
+              if (terminalConfig.startupSnippetId) {
+                try {
+                  const snippets = await getSnippets();
+                  const snippet = snippets.find(
+                    (s: { id: number }) =>
+                      s.id === terminalConfig.startupSnippetId,
+                  );
+                  if (snippet && ws.readyState === 1) {
+                    ws.send(
+                      JSON.stringify({
+                        type: "input",
+                        data: snippet.content + "\n",
+                      }),
+                    );
+                  }
+                } catch (err) {
+                  console.warn(`[ws] snippet-failed hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'} err="${err instanceof Error ? err.message : String(err)}"`);
+                }
+              }
+
+              if (terminalConfig.autoMosh && ws.readyState === 1) {
+                ws.send(
+                  JSON.stringify({
+                    type: "input",
+                    data: terminalConfig.moshCommand + "\n",
+                  }),
+                );
+              }
+            }, 100);
+          } else if (msg.type === "session_ended") {
+            wasDisconnectedBySSH.current = true;
+            setIsConnected(false);
+            setIsConnecting(false);
+            shouldNotReconnectRef.current = true;
+            if (onClose) {
+              onClose();
+            }
+          } else if (msg.type === "disconnected") {
+            wasDisconnectedBySSH.current = true;
+            if (shouldNotReconnectRef.current !== true) { console.info(`[ws] shouldNotReconnectRef-transition edge=${shouldNotReconnectRef.current}→true trigger=ws-disconnected hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`); }
+            shouldNotReconnectRef.current = true;
+            setIsConnected(false);
+            setIsConnecting(false);
+            if (msg.graceful) {
+              if (wasConnectedRef.current !== false) { console.info(`[ws] wasConnectedRef-transition edge=${wasConnectedRef.current}→false trigger=ws-disconnected-graceful hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`); }
+              wasConnectedRef.current = false;
+              if (onClose) onClose();
+            } else if (wasConnectedRef.current) {
+              if (wasConnectedRef.current !== false) { console.info(`[ws] wasConnectedRef-transition edge=${wasConnectedRef.current}→false trigger=ws-disconnected-nongraceful hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`); }
+              wasConnectedRef.current = false;
+              // On iOS PWA, a non-graceful `disconnected` is almost always
+              // the WS-idle teardown triggered by a mobile-tab suspend, not
+              // real target death. Skip the manual Connection Lost overlay
+              // and auto-reconnect: if the tab is currently visible, kick
+              // connectToHost immediately; if still hidden, clear the
+              // "don't reconnect" flags so the visibilitychange handler
+              // reconnects on foreground. If the target is genuinely dead
+              // the fresh WS will fail and the connection-error banner will
+              // surface it.
+              if (isIosPwa()) {
+                if (shouldNotReconnectRef.current !== false) { console.info(`[ws] shouldNotReconnectRef-transition edge=${shouldNotReconnectRef.current}→false trigger=ios-pwa-disconnected-recovery hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`); }
+                shouldNotReconnectRef.current = false;
+                wasDisconnectedBySSH.current = false;
+                if (!document.hidden && terminal) {
+                  console.info(`[reopen] fired hostId=${hostConfig.id} path=direct-caller callSite="ios-pwa-disconnected"`);
+                  connectToHost(terminal.cols, terminal.rows);
+                }
+              } else {
+                setShowDisconnectedOverlay(true);
+              }
+            } else if (!connectionErrorRef.current) {
+              updateConnectionError(
+                msg.message || t("terminal.connectionRejected"),
+              );
+            }
+          } else if (msg.type === "totp_required") {
+            setTotpRequired(true);
+            setTotpPrompt(msg.prompt || t("terminal.totpCodeLabel"));
+            setIsPasswordPrompt(false);
+            if (connectionTimeoutRef.current) {
+              clearTimeout(connectionTimeoutRef.current);
+              connectionTimeoutRef.current = null;
+            }
+            if (totpTimeoutRef.current) {
+              clearTimeout(totpTimeoutRef.current);
+            }
+            totpTimeoutRef.current = setTimeout(() => {
+              setTotpRequired(false);
+              if (webSocketRef.current) {
+                webSocketRef.current.close();
+              }
+            }, 180000);
+          } else if (msg.type === "totp_retry") {
+            // Existing prompt remains visible while the backend asks for another code.
+          } else if (msg.type === "password_required") {
+            setTotpRequired(true);
+            setTotpPrompt(msg.prompt || t("common.password"));
+            setIsPasswordPrompt(true);
+            if (connectionTimeoutRef.current) {
+              clearTimeout(connectionTimeoutRef.current);
+              connectionTimeoutRef.current = null;
+            }
+            if (totpTimeoutRef.current) {
+              clearTimeout(totpTimeoutRef.current);
+            }
+            totpTimeoutRef.current = setTimeout(() => {
+              setTotpRequired(false);
+              if (webSocketRef.current) {
+                webSocketRef.current.close();
+              }
+            }, 180000);
+          } else if (msg.type === "warpgate_auth_required") {
+            setWarpgateAuthRequired(true);
+            setWarpgateAuthUrl(msg.url || "");
+            setWarpgateSecurityKey(msg.securityKey || "N/A");
+            if (connectionTimeoutRef.current) {
+              clearTimeout(connectionTimeoutRef.current);
+              connectionTimeoutRef.current = null;
+            }
+            if (warpgateTimeoutRef.current) {
+              clearTimeout(warpgateTimeoutRef.current);
+            }
+            warpgateTimeoutRef.current = setTimeout(() => {
+              setWarpgateAuthRequired(false);
+              if (webSocketRef.current) {
+                webSocketRef.current.close();
+              }
+            }, 300000);
+          } else if (msg.type === "opkssh_auth_required") {
+            if (connectionTimeoutRef.current) {
+              clearTimeout(connectionTimeoutRef.current);
+              connectionTimeoutRef.current = null;
+            }
+            if (opksshFailedRef.current) {
+              setOpksshDialog(null);
+              if (opksshTimeoutRef.current) {
+                clearTimeout(opksshTimeoutRef.current);
+                opksshTimeoutRef.current = null;
+              }
+              updateConnectionError(t("terminal.opksshAuthFailed"));
+              addLog({
+                type: "error",
+                stage: "auth",
+                message: t("terminal.opksshAuthFailed"),
+              });
+            } else {
+              opksshFailedRef.current = true;
+              if (webSocketRef.current) {
+                webSocketRef.current.send(
+                  JSON.stringify({
+                    type: "opkssh_start_auth",
+                    data: { hostId: msg.hostId },
+                  }),
+                );
+              }
+            }
+          } else if (msg.type === "opkssh_status") {
+            if (connectionErrorRef.current) return;
+            if (msg.stage === "chooser") {
+              setOpksshDialog({
+                isOpen: true,
+                authUrl: msg.url || "",
+                requestId: msg.requestId || "",
+                stage: "chooser",
+                providers: msg.providers,
+              });
+              if (opksshTimeoutRef.current) {
+                clearTimeout(opksshTimeoutRef.current);
+              }
+              opksshTimeoutRef.current = setTimeout(() => {
+                setOpksshDialog(null);
+                if (webSocketRef.current) {
+                  webSocketRef.current.close();
+                }
+              }, 300000);
+            } else {
+              setOpksshDialog((prev) =>
+                prev ? { ...prev, stage: msg.stage } : null,
+              );
+            }
+          } else if (msg.type === "opkssh_completed") {
+            if (opksshTimeoutRef.current) {
+              clearTimeout(opksshTimeoutRef.current);
+              opksshTimeoutRef.current = null;
+            }
+            setOpksshDialog(null);
+            if (webSocketRef.current && terminal) {
+              webSocketRef.current.send(
+                JSON.stringify({
+                  type: "opkssh_auth_completed",
+                  data: {
+                    hostId: currentHostIdRef.current,
+                    cols: terminal.cols || 80,
+                    rows: terminal.rows || 24,
+                    hostConfig: currentHostConfigRef.current,
+                  },
+                }),
+              );
+            }
+          } else if (msg.type === "opkssh_error") {
+            if (connectionErrorRef.current) return;
+            opksshFailedRef.current = true;
+            if (opksshDialog) {
+              setOpksshDialog((prev) =>
+                prev ? { ...prev, stage: "error", error: msg.error } : null,
+              );
+            } else {
+              setOpksshDialog({
+                isOpen: true,
+                authUrl: "",
+                requestId: msg.requestId || "",
+                stage: "error",
+                error: msg.error,
+              });
+            }
+            setIsConnecting(false);
+          } else if (msg.type === "opkssh_timeout") {
+            if (connectionErrorRef.current) return;
+            opksshFailedRef.current = true;
+            if (opksshDialog) {
+              setOpksshDialog((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      stage: "error",
+                      error: t("terminal.opksshTimeout"),
+                    }
+                  : null,
+              );
+            } else {
+              setOpksshDialog({
+                isOpen: true,
+                authUrl: "",
+                requestId: msg.requestId || "",
+                stage: "error",
+                error: t("terminal.opksshTimeout"),
+              });
+            }
+            setIsConnecting(false);
+          } else if (msg.type === "opkssh_config_error") {
+            setOpksshDialog({
+              isOpen: true,
+              authUrl: "",
+              requestId: msg.requestId || "",
+              stage: "error",
+              error: msg.instructions || msg.error,
+            });
+          } else if (msg.type === "keyboard_interactive_available") {
+            setKeyboardInteractiveDetected(true);
+            setIsConnecting(false);
+            if (connectionTimeoutRef.current) {
+              clearTimeout(connectionTimeoutRef.current);
+              connectionTimeoutRef.current = null;
+            }
+          } else if (msg.type === "auth_method_not_available") {
+            setAuthDialogReason("no_keyboard");
+            setShowAuthDialog(true);
+            setIsConnecting(false);
+            if (connectionTimeoutRef.current) {
+              clearTimeout(connectionTimeoutRef.current);
+              connectionTimeoutRef.current = null;
+            }
+          } else if (msg.type === "cwd") {
+            onOpenFileManager?.(msg.path as string);
+          } else if (msg.type === "passphrase_required") {
+            setShowPassphraseDialog(true);
+            setIsConnecting(false);
+            if (connectionTimeoutRef.current) {
+              clearTimeout(connectionTimeoutRef.current);
+              connectionTimeoutRef.current = null;
+            }
+          } else if (msg.type === "host_key_changed") {
+            setHostKeyVerification({
+              isOpen: true,
+              scenario: "changed",
+              data: msg.data,
+            });
+            if (connectionTimeoutRef.current) {
+              clearTimeout(connectionTimeoutRef.current);
+              connectionTimeoutRef.current = null;
+            }
+          } else if (msg.type === "sessionCreated") {
+            sessionIdRef.current = msg.sessionId;
+            if (hostConfig.instanceId) {
+              import("@/main-axios").then(({ patchOpenTab }) => {
+                patchOpenTab(hostConfig.instanceId!, {
+                  backendSessionId: msg.sessionId,
+                }).catch(() => {});
+              });
+            }
+          } else if (msg.type === "sessionAttached") {
+            if (isAttachingSessionRef.current !== false) { console.info(`[ws] isAttachingSessionRef-transition edge=${isAttachingSessionRef.current}→false trigger=sessionAttached hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`); }
+            isAttachingSessionRef.current = false;
+            opksshFailedRef.current = false;
+            if (wasConnectedRef.current !== true) { console.info(`[ws] wasConnectedRef-transition edge=${wasConnectedRef.current}→true trigger=ws-open hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`); }
+            wasConnectedRef.current = true;
+            setIsConnected(true);
+            setIsConnecting(false);
+            if (isConnectingRef.current !== false) { console.info(`[ws] isConnectingRef-transition edge=${isConnectingRef.current}→false trigger=sessionAttached hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`); }
+            isConnectingRef.current = false;
+            if (shouldNotReconnectRef.current !== false) { console.info(`[ws] shouldNotReconnectRef-transition edge=${shouldNotReconnectRef.current}→false trigger=sessionAttached hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`); }
+            shouldNotReconnectRef.current = false;
+            updateConnectionError(null);
+            if (connectionTimeoutRef.current) {
+              clearTimeout(connectionTimeoutRef.current);
+              connectionTimeoutRef.current = null;
+            }
+            if (reconnectTimeoutRef.current) {
+              clearTimeout(reconnectTimeoutRef.current);
+              reconnectTimeoutRef.current = null;
+            }
+            reconnectAttempts.current = 0;
+            isReconnectingRef.current = false;
+
+            logTerminalActivity();
+
+            addLog({
+              type: "success",
+              stage: "connection",
+              message: t("terminal.reconnected"),
+            });
+          } else if (msg.type === "sessionExpired") {
+            if (isAttachingSessionRef.current !== false) { console.info(`[ws] isAttachingSessionRef-transition edge=${isAttachingSessionRef.current}→false trigger=sessionExpired hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`); }
+            isAttachingSessionRef.current = false;
+            sessionIdRef.current = null;
+            wasSessionExpiredRef.current = true;
+            if (hostConfig.instanceId) {
+              import("@/main-axios").then(({ patchOpenTab }) => {
+                patchOpenTab(hostConfig.instanceId!, {
+                  backendSessionId: null,
+                }).catch(() => {});
+              });
+            }
+            if (webSocketRef.current) {
+              webSocketRef.current.close();
+            }
+          } else if (msg.type === "sessionTakenOver") {
+            sessionIdRef.current = null;
+
+            if (terminal) {
+              terminal.clear();
+            }
+            setIsConnected(false);
+            setIsConnecting(true);
+
+            addLog({
+              type: "warning",
+              stage: "connection",
+              message: t("terminal.sessionTakenOver"),
+            });
+
+            const cols = terminal?.cols || 80;
+            const rows = terminal?.rows || 24;
+            console.info(`[reopen] fired hostId=${hostConfig.id} path=direct-caller callSite="sessionTakenOver"`);
+            connectToHost(cols, rows);
+          } else if (msg.type === "tmux_sessions_available") {
+            setTmuxSessionPicker({
+              sessions: msg.sessions,
+            });
+          } else if (
+            msg.type === "tmux_session_created" ||
+            msg.type === "tmux_session_attached"
+          ) {
+            const sessionName =
+              typeof msg.sessionName === "string" ? msg.sessionName : "";
+            tmuxSessionNameRef.current = sessionName || "(active)";
+            setTmuxSessionName(tmuxSessionNameRef.current);
+            setIsTmuxAttached(true);
+            onTmuxSessionChange?.(tmuxSessionNameRef.current);
+            addLog({
+              type: "info",
+              stage: "connection",
+              message:
+                msg.type === "tmux_session_created"
+                  ? t("terminal.tmuxSessionCreated", {
+                      name: sessionName || "new",
+                    })
+                  : t("terminal.tmuxSessionAttached", {
+                      name: sessionName,
+                    }),
+            });
+          } else if (msg.type === "tmux_unavailable") {
+            setTimeout(() => {
+              toast.warning(t("terminal.tmuxUnavailable"), {
+                duration: 8000,
+              });
+            }, 500);
+            addLog({
+              type: "warning",
+              stage: "connection",
+              message: t("terminal.tmuxUnavailable"),
+            });
+          } else if (msg.type === "tmux_session_missing") {
+            const missingName =
+              typeof msg.sessionName === "string" ? msg.sessionName : "";
+            const message = t("terminal.tmuxSessionMissing", {
+              name: missingName || "?",
+              host: hostName || "?",
+            });
+            addLog({
+              type: "error",
+              stage: "connection",
+              message,
+            });
+            updateConnectionError(message);
+            setIsConnecting(false);
+            shouldNotReconnectRef.current = true;
+            onTmuxSessionMissing?.(missingName);
+            if (webSocketRef.current) {
+              try {
+                webSocketRef.current.close();
+              } catch {}
+            }
+          } else if (msg.type === "tmux_detached") {
+            tmuxSessionNameRef.current = null;
+            setTmuxSessionName(null);
+            setIsTmuxAttached(false);
+            onTmuxSessionChange?.(null);
+            toast.info(t("terminal.tmuxDetached"), { duration: 3000 });
+          } else if (msg.type === "paste_send_failed") {
+            // Quick 260803-1xw / bounty pv-paste-to-terminal-lands-as-
+            // unsent-bracket-paste: the backend PV submit watchdog fires
+            // this event when the initial Enter + 1 retry Enter both
+            // failed to produce any PTY activity within 2 x 2.5s windows.
+            // Tina could not reproduce the underlying stuck-send locally
+            // (tmux+paste-buffer at 22KB/100KB), so this is our
+            // observability + recovery UX rather than a byte-level fix —
+            // surface visibly so user knows the send didn't take effect
+            // and can retry manually or shorten the message.
+            toast.error(t("terminal.pasteSendFailed"), { duration: 8000 });
+            addLog({
+              type: "error",
+              stage: "connection",
+              message: t("terminal.pasteSendFailed"),
+            });
+          } else if (msg.type === "connection_log") {
+            if (msg.data) {
+              addLog({
+                type: msg.data.level || "info",
+                stage: msg.data.stage || "auth",
+                message: msg.data.message,
+                details: msg.data.details,
+              });
+            }
+          }
+        } catch (error) {
+          // Distinguish JSON parse errors (malformed frame) from handler errors
+          if (error instanceof SyntaxError) {
+            console.warn(`[ws-msg] parse-error hostId=${hostConfig.id ?? 'null'} sessionId=${tmuxSessionNameRef.current ?? 'null'} dataPrefix="${typeof event.data === 'string' ? event.data.slice(0, 80) : '<non-string>'}" err="${error instanceof Error ? error.message : String(error)}"`);
+          } else {
+            console.error(`[ws] msg-handler-error hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'} err="${error instanceof Error ? error.message : String(error)}"`);
+          }
+        }
+      });
+
+      const currentAttemptId = connectionAttemptIdRef.current;
+
+      ws.addEventListener("close", (event) => {
+        if (currentAttemptId !== connectionAttemptIdRef.current) {
+          return;
+        }
+
+        // Phase 111 SKEW-09 (D-08): distinguishable close code = version drift.
+        // Structured field extraction — never serialize the raw DOM CloseEvent
+        // (circular refs; role-file directive + Pitfall 5).
+        const isSkew = event.code === 4409;
+        console.info("[skew-lock] ws closed", {
+          operation: "ws_closed",
+          code: event.code,
+          reason: event.reason,
+          wasClean: event.wasClean,
+          isSkew,
+          endpoint: "terminal",
+        });
+        if (isSkew) {
+          lockSkewedSession({
+            reason: "ws_handshake_mismatch",
+            clientBuild: CLIENT_BUILD_ID,
+            serverBuild: event.reason || "unknown",
+          });
+          // Halt: prevent existing reconnect-backoff logic from firing.
+          shouldNotReconnectRef.current = true;
+          setIsConnected(false);
+          setIsConnecting(false);
+          isConnectingRef.current = false;
+          return;
+        }
+
+        // [ws] close — structured line BEFORE branch dispatch (D-05: explicit field extraction per CloseEvent)
+        console.info(`[ws] close hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'} code=${event.code} reason="${event.reason}" wasClean=${event.wasClean} isVisible=${isVisibleRef.current} wasConnected=${wasConnectedRef.current}`);
+
+        setIsConnected(false);
+        if (isConnectingRef.current !== false) { console.info(`[ws] isConnectingRef-transition edge=${isConnectingRef.current}→false trigger=ws-close hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`); }
+        isConnectingRef.current = false;
+
+        if (pingIntervalRef.current) {
+          clearInterval(pingIntervalRef.current);
+          pingIntervalRef.current = null;
+        }
+
+        if (pongTimeoutRef.current) {
+          clearTimeout(pongTimeoutRef.current);
+          pongTimeoutRef.current = null;
+        }
+
+        if (totpTimeoutRef.current) {
+          clearTimeout(totpTimeoutRef.current);
+          totpTimeoutRef.current = null;
+        }
+
+        if (wasSessionExpiredRef.current) {
+          wasSessionExpiredRef.current = false;
+          const cols = terminal?.cols || 80;
+          const rows = terminal?.rows || 24;
+          console.info(`[reopen] fired hostId=${hostConfig.id} path=onclose-retry code=${event.code} wasClean=${event.wasClean}`);
+          connectToHost(cols, rows);
+          return;
+        }
+
+        if (event.code === 1006) {
+          console.warn(`[ws] abnormal-close hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'} code=${event.code} reason="${event.reason}" wasClean=${event.wasClean} wasConnected=${wasConnectedRef.current}`);
+          addLog({
+            type: "warning",
+            stage: "connection",
+            message: t("terminal.websocketAbnormalClose"),
+          });
+
+          if (wasConnectedRef.current) {
+            console.info(`[reopen] fired hostId=${hostConfig.id} path=onclose-retry code=${event.code} wasClean=${event.wasClean}`);
+            attemptReconnection();
+          } else {
+            updateConnectionError(t("terminal.websocketAbnormalClose"));
+            setIsConnecting(false);
+          }
+          return;
+        }
+
+        if (event.code === 1008) {
+          console.error(`[ws] auth-failed hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'} code=${event.code} reason="${event.reason}"`);
+          addLog({
+            type: "error",
+            stage: "auth",
+            message: "Authentication failed - please re-login",
+          });
+          updateConnectionError("Authentication failed - please re-login");
+          setIsConnecting(false);
+          shouldNotReconnectRef.current = true;
+
+          return;
+        }
+
+        if (
+          !wasConnectedRef.current &&
+          !isAttachingSessionRef.current &&
+          event.wasClean &&
+          (event.code === 1005 || event.code === 1000)
+        ) {
+          console.error(`[ws] connection-rejected hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'} code=${event.code} reason="${event.reason}" wasClean=${event.wasClean}`);
+          addLog({
+            type: "error",
+            stage: "connection",
+            message: t("terminal.connectionRejected"),
+          });
+          updateConnectionError(t("terminal.connectionRejected"));
+          setIsConnecting(false);
+          shouldNotReconnectRef.current = true;
+          return;
+        }
+
+        const shouldAttemptReconnection =
+          !wasDisconnectedBySSH.current &&
+          !isUnmountingRef.current &&
+          !shouldNotReconnectRef.current &&
+          !isConnectingRef.current;
+
+        if (shouldAttemptReconnection) {
+          wasDisconnectedBySSH.current = false;
+          console.info(`[reopen] fired hostId=${hostConfig.id} path=onclose-retry code=${event.code} wasClean=${event.wasClean}`);
+          attemptReconnection();
+        } else {
+          setIsConnecting(false);
+        }
+      });
+
+      ws.addEventListener("error", (event) => {
+        if (currentAttemptId !== connectionAttemptIdRef.current) {
+          return;
+        }
+
+        console.error(`[ws] error hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'} type=${event.type} isTrusted=${event.isTrusted} readyState=${ws.readyState}`);
+
+        setIsConnected(false);
+        if (isConnectingRef.current !== false) { console.info(`[ws] isConnectingRef-transition edge=${isConnectingRef.current}→false trigger=ws-error hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'}`); }
+        isConnectingRef.current = false;
+        updateConnectionError(t("terminal.websocketError"));
+        if (terminal) {
+          terminal.clear();
+        }
+        setIsConnecting(false);
+
+        if (pingIntervalRef.current) {
+          clearInterval(pingIntervalRef.current);
+          pingIntervalRef.current = null;
+        }
+
+        if (totpTimeoutRef.current) {
+          clearTimeout(totpTimeoutRef.current);
+          totpTimeoutRef.current = null;
+        }
+      });
+    }
+
+    async function writeTextToClipboard(text: string): Promise<boolean> {
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(text);
+          return true;
+        }
+      } catch {
+        // fall through to legacy method
+      }
+      try {
+        const textarea = document.createElement("textarea");
+        textarea.value = text;
+        textarea.style.position = "fixed";
+        textarea.style.left = "-9999px";
+        document.body.appendChild(textarea);
+        textarea.focus();
+        textarea.select();
+        document.execCommand("copy");
+        document.body.removeChild(textarea);
+        return true;
+      } catch {
+        toast.error(t("terminal.clipboardWriteFailed"));
+        return false;
+      }
+    }
+
+    async function readTextFromClipboard(): Promise<string> {
+      try {
+        if (navigator.clipboard && navigator.clipboard.readText) {
+          return await navigator.clipboard.readText();
+        }
+      } catch {
+        // fall through
+      }
+      if (window.location.protocol !== "https:") {
+        toast.error(t("terminal.clipboardHttpWarning"));
+      }
+      return "";
+    }
+
+    const handleSelectCommand = useCallback(
+      (command: string) => {
+        if (!terminal || !webSocketRef.current) return;
+
+        for (const char of command) {
+          webSocketRef.current.send(
+            JSON.stringify({ type: "input", data: char }),
+          );
+        }
+
+        setTimeout(() => {
+          terminal.focus();
+        }, 100);
+      },
+      [terminal],
+    );
+
+    useEffect(() => {
+      commandHistoryContext.setOnSelectCommand(handleSelectCommand);
+    }, [handleSelectCommand]);
+
+    const handleAutocompleteSelect = useCallback(
+      (selectedCommand: string) => {
+        if (!webSocketRef.current) return;
+
+        const currentCmd = currentAutocompleteCommand.current;
+        const completion = selectedCommand.substring(currentCmd.length);
+
+        for (const char of completion) {
+          webSocketRef.current.send(
+            JSON.stringify({ type: "input", data: char }),
+          );
+        }
+
+        updateCurrentCommand(selectedCommand);
+
+        setShowAutocomplete(false);
+        setAutocompleteSuggestions([]);
+        currentAutocompleteCommand.current = "";
+
+        setTimeout(() => {
+          terminal?.focus();
+        }, 50);
+      },
+      [terminal, updateCurrentCommand],
+    );
+
+    const handleDeleteCommand = useCallback(
+      async (command: string) => {
+        if (!hostConfig.id) return;
+
+        try {
+          await deleteCommandFromHistory(hostConfig.id, command);
+
+          setCommandHistory((prev) => {
+            const newHistory = prev.filter((cmd) => cmd !== command);
+            setCommandHistoryContextRef.current(newHistory);
+            return newHistory;
+          });
+
+          autocompleteHistory.current = autocompleteHistory.current.filter(
+            (cmd) => cmd !== command,
+          );
+        } catch (error) {
+          console.error(`[ws] delete-history-failed hostId=${hostConfig.id} err="${error instanceof Error ? error.message : String(error)}"`);
+        }
+      },
+      [hostConfig.id],
+    );
+
+    useEffect(() => {
+      commandHistoryContext.setOnDeleteCommand(handleDeleteCommand);
+    }, [handleDeleteCommand]);
+
+    // Separate theme and options updates to avoid terminal re-initialization flashes
+    useEffect(() => {
+      if (!terminal) return;
+
+      const config = {
+        ...DEFAULT_TERMINAL_CONFIG,
+        ...hostConfig.terminalConfig,
+      };
+
+      const activeTheme = previewTheme || config.theme;
+      const themeColors = resolveSkynetThemeColors(activeTheme, appTheme);
+
+      const fontConfig = TERMINAL_FONTS.find(
+        (f) => f.value === config.fontFamily,
+      );
+      const fontFamily = fontConfig?.fallback || TERMINAL_FONTS[0].fallback;
+
+      // Update terminal options individually to avoid re-initialization flashes
+      terminal.options.cursorBlink = config.cursorBlink;
+      terminal.options.cursorStyle = config.cursorStyle;
+      terminal.options.scrollback = config.scrollback;
+      terminal.options.fontSize = config.fontSize;
+      terminal.options.fontFamily = fontFamily;
+      terminal.options.rightClickSelectsWord = config.rightClickSelectsWord;
+      terminal.options.fastScrollSensitivity = config.fastScrollSensitivity;
+      terminal.options.minimumContrastRatio = config.minimumContrastRatio;
+      terminal.options.letterSpacing = config.letterSpacing;
+      terminal.options.lineHeight = config.lineHeight;
+      terminal.options.bellStyle = config.bellStyle as
+        | "none"
+        | "sound"
+        | "visual"
+        | "both";
+
+      terminal.options.theme = {
+        background: themeColors.background,
+        foreground: themeColors.foreground,
+        cursor: themeColors.cursor,
+        cursorAccent: themeColors.cursorAccent,
+        selectionBackground: themeColors.selectionBackground,
+        selectionForeground: themeColors.selectionForeground,
+        black: themeColors.black,
+        red: themeColors.red,
+        green: themeColors.green,
+        yellow: themeColors.yellow,
+        blue: themeColors.blue,
+        magenta: themeColors.magenta,
+        cyan: themeColors.cyan,
+        white: themeColors.white,
+        brightBlack: themeColors.brightBlack,
+        brightRed: themeColors.brightRed,
+        brightGreen: themeColors.brightGreen,
+        brightYellow: themeColors.brightYellow,
+        brightBlue: themeColors.brightBlue,
+        brightMagenta: themeColors.brightMagenta,
+        brightCyan: themeColors.brightCyan,
+        brightWhite: themeColors.brightWhite,
+      };
+
+      // Ensure terminal is correctly fitted if font-related options change
+      if (fitAddonRef.current && isFitted) {
+        performFit();
+      }
+
+      // Refresh terminal to apply new theme colors to existing buffer content
+      hardRefresh();
+    }, [terminal, hostConfig.terminalConfig, previewTheme, appTheme, isFitted]);
+
+    useEffect(() => {
+      if (!terminal || !xtermRef.current) return;
+
+      const config = {
+        ...DEFAULT_TERMINAL_CONFIG,
+        ...hostConfig.terminalConfig,
+      };
+
+      const fontConfig = TERMINAL_FONTS.find(
+        (f) => f.value === config.fontFamily,
+      );
+      const fontFamily = fontConfig?.fallback || TERMINAL_FONTS[0].fallback;
+
+      const activeTheme = previewTheme || config.theme;
+      const themeColors = resolveSkynetThemeColors(activeTheme, appTheme);
+
+      // Set initial options before opening the terminal
+      terminal.options = {
+        cursorBlink: config.cursorBlink,
+        cursorStyle: config.cursorStyle,
+        scrollback: config.scrollback,
+        fontSize: config.fontSize,
+        fontFamily,
+        allowTransparency: true, // MUST be set before open()
+        convertEol: false,
+        macOptionIsMeta: false,
+        macOptionClickForcesSelection: false,
+        rightClickSelectsWord: config.rightClickSelectsWord,
+        fastScrollSensitivity: config.fastScrollSensitivity,
+        allowProposedApi: true,
+        minimumContrastRatio: config.minimumContrastRatio,
+        letterSpacing: config.letterSpacing,
+        lineHeight: config.lineHeight,
+        bellStyle: config.bellStyle as "none" | "sound" | "visual" | "both",
+        theme: {
+          background: themeColors.background,
+          foreground: themeColors.foreground,
+          cursor: themeColors.cursor,
+          cursorAccent: themeColors.cursorAccent,
+          selectionBackground: themeColors.selectionBackground,
+          selectionForeground: themeColors.selectionForeground,
+          black: themeColors.black,
+          red: themeColors.red,
+          green: themeColors.green,
+          yellow: themeColors.yellow,
+          blue: themeColors.blue,
+          magenta: themeColors.magenta,
+          cyan: themeColors.cyan,
+          white: themeColors.white,
+          brightBlack: themeColors.brightBlack,
+          brightRed: themeColors.brightRed,
+          brightGreen: themeColors.brightGreen,
+          brightYellow: themeColors.brightYellow,
+          brightBlue: themeColors.brightBlue,
+          brightMagenta: themeColors.brightMagenta,
+          brightCyan: themeColors.brightCyan,
+          brightWhite: themeColors.brightWhite,
+        },
+      };
+
+      const fitAddon = new FitAddon();
+      const clipboardProvider = new RobustClipboardProvider();
+      const clipboardAddon = new ClipboardAddon(undefined, clipboardProvider);
+      const unicode11Addon = new Unicode11Addon();
+      const webLinksAddon = new WebLinksAddon((_event, uri) => {
+        const url =
+          uri.startsWith("http://") || uri.startsWith("https://")
+            ? uri
+            : `https://${uri}`;
+        window.open(url, "_blank");
+      });
+
+      fitAddonRef.current = fitAddon;
+      terminal.loadAddon(fitAddon);
+      terminal.loadAddon(clipboardAddon);
+      terminal.loadAddon(unicode11Addon);
+      terminal.loadAddon(webLinksAddon);
+
+      terminal.unicode.activeVersion = "11";
+
+      terminal.open(xtermRef.current);
+      document.fonts.ready.then(() => {
+        terminal.refresh(0, terminal.rows - 1);
+        fitAddon.fit();
+      });
+
+      terminal.attachCustomWheelEventHandler((ev) => {
+        const cfg = {
+          ...DEFAULT_TERMINAL_CONFIG,
+          ...hostConfig.terminalConfig,
+        };
+        const mod = cfg.fastScrollModifier;
+        const modHeld =
+          (mod === "alt" && ev.altKey) ||
+          (mod === "ctrl" && ev.ctrlKey) ||
+          (mod === "shift" && ev.shiftKey);
+        if (modHeld) {
+          const lines = Math.round(
+            (Math.abs(ev.deltaY) / 100) * (cfg.fastScrollSensitivity ?? 5),
+          );
+          terminal.scrollLines(ev.deltaY > 0 ? lines : -lines);
+          return false;
+        }
+        return true;
+      });
+
+      fitAddonRef.current?.fit();
+      // Double-rAF ensures layout is fully settled (fonts, flexbox, etc.) before
+      // committing the fitted size, preventing the "terminal too short" glitch.
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          fitAddonRef.current?.fit();
+          setIsFitted(true);
+        });
+      });
+
+      const element = xtermRef.current;
+      const handleContextMenu = (e: MouseEvent) => {
+        if (e.ctrlKey && onOpenFileManager) {
+          e.preventDefault();
+          e.stopPropagation();
+          onOpenFileManager();
+          return;
+        }
+
+        if (getUseRightClickCopyPaste()) {
+          e.preventDefault();
+          e.stopPropagation();
+          if (terminal.hasSelection()) {
+            const text = terminal.getSelection();
+            writeTextToClipboard(text).then(() => terminal.clearSelection());
+          } else {
+            readTextFromClipboard().then((text) => {
+              if (text) terminal.paste(text);
+            });
+          }
+          return;
+        }
+      };
+      element?.addEventListener("contextmenu", handleContextMenu);
+
+      const handlePaste = (e: ClipboardEvent) => {
+        const text = e.clipboardData?.getData("text");
+        if (text) {
+          e.preventDefault();
+          e.stopPropagation();
+          terminal.paste(text);
+        }
+      };
+      element?.addEventListener("paste", handlePaste);
+
+      let tmuxDragTracking = false;
+      const handleTmuxDragStart = (e: MouseEvent) => {
+        if (e.button !== 0) return;
+        if (!tmuxSessionNameRef.current) return;
+        tmuxDragTracking = true;
+      };
+      const handleTmuxDragMove = () => {
+        if (!tmuxDragTracking) return;
+        tmuxDragTracking = false;
+        if (tmuxCopyModeHintShownRef.current) return;
+        tmuxCopyModeHintShownRef.current = true;
+        toast.info(t("terminal.tmuxCopyHint"), { duration: 5000 });
+      };
+      const handleTmuxDragEnd = () => {
+        tmuxDragTracking = false;
+      };
+      element?.addEventListener("mousedown", handleTmuxDragStart);
+      element?.addEventListener("mousemove", handleTmuxDragMove);
+      element?.addEventListener("mouseup", handleTmuxDragEnd);
+
+      const handleBackspaceMode = (e: KeyboardEvent) => {
+        if (e.key !== "Backspace") return;
+        if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+        const config = {
+          ...DEFAULT_TERMINAL_CONFIG,
+          ...hostConfig.terminalConfig,
+        };
+        if (config.backspaceMode !== "control-h") return;
+
+        e.preventDefault();
+        e.stopPropagation();
+
+        if (webSocketRef.current?.readyState === 1) {
+          webSocketRef.current.send(
+            JSON.stringify({ type: "input", data: "\x08" }),
+          );
+        }
+        return false;
+      };
+
+      element?.addEventListener("keydown", handleBackspaceMode, true);
+
+      // Mobile: translate one-finger vertical swipes into synthetic wheel
+      // events. xterm.js's wheel handling then routes them — tmux mouse
+      // mode (or alt-scroll for TUIs) interprets them just like a real
+      // scroll wheel. Two-finger / pinch and long-press selection are
+      // left alone.
+      const TOUCH_COMMIT_DISTANCE_PX = 10;
+      const TOUCH_COMMIT_TIMEOUT_MS = 400;
+      const TOUCH_LINE_HEIGHT_PX = 20;
+      let touchActive = false;
+      let touchCommitted = false;
+      let touchStartX = 0;
+      let touchStartY = 0;
+      let touchStartTime = 0;
+      let touchLastY = 0;
+
+      const handleTouchStart = (e: TouchEvent) => {
+        if (e.touches.length !== 1) {
+          touchActive = false;
+          return;
+        }
+        touchActive = true;
+        touchCommitted = false;
+        touchStartX = e.touches[0].clientX;
+        touchStartY = e.touches[0].clientY;
+        touchLastY = touchStartY;
+        touchStartTime = Date.now();
+      };
+
+      const handleTouchMove = (e: TouchEvent) => {
+        if (!touchActive || e.touches.length !== 1) return;
+        const tx = e.touches[0].clientX;
+        const ty = e.touches[0].clientY;
+        if (!touchCommitted) {
+          const dx = tx - touchStartX;
+          const dy = ty - touchStartY;
+          if (Math.hypot(dx, dy) < TOUCH_COMMIT_DISTANCE_PX) return;
+          if (Date.now() - touchStartTime > TOUCH_COMMIT_TIMEOUT_MS) {
+            touchActive = false;
+            return;
+          }
+          if (Math.abs(dy) < Math.abs(dx)) {
+            touchActive = false;
+            return;
+          }
+          touchCommitted = true;
+          touchLastY = ty;
+        }
+        const dy = touchLastY - ty;
+        if (Math.abs(dy) < TOUCH_LINE_HEIGHT_PX) return;
+        e.preventDefault();
+        touchLastY = ty;
+        const wheel = new WheelEvent("wheel", {
+          deltaY: dy > 0 ? 100 : -100,
+          deltaMode: 0,
+          bubbles: true,
+          cancelable: true,
+        });
+        (terminal.element ?? element)?.dispatchEvent(wheel);
+      };
+
+      const handleTouchEnd = () => {
+        touchActive = false;
+        touchCommitted = false;
+      };
+
+      element?.addEventListener("touchstart", handleTouchStart, {
+        passive: true,
+      });
+      element?.addEventListener("touchmove", handleTouchMove, {
+        passive: false,
+      });
+      element?.addEventListener("touchend", handleTouchEnd, { passive: true });
+      element?.addEventListener("touchcancel", handleTouchEnd, {
+        passive: true,
+      });
+
+      // iOS dictation keyboards (Wispr Flow et al.) insert text via
+      // UITextDocumentProxy.insertText which fires a single DOM input
+      // event with multi-character data and no keydown/composition
+      // events. xterm.js's pipeline only emits the first character in
+      // that case. We intercept in the capture phase so we can mutate
+      // the helper textarea before xterm.js's target-phase listener
+      // reads it. See xterm.js issues #2403 and #1101.
+      const handleCompositionStart = () => {
+        compositionInProgressRef.current = true;
+      };
+      const handleCompositionEnd = () => {
+        compositionInProgressRef.current = false;
+      };
+      const handleMultiCharInput = (e: Event) => {
+        const ev = e as InputEvent;
+        if (compositionInProgressRef.current) return;
+        if (ev.inputType !== "insertText") return;
+        const data = ev.data;
+        if (!data || data.length <= 1) return;
+        if (webSocketRef.current?.readyState !== 1) return;
+        // Strip whatever xterm.js just sent in the last ~150ms — iOS
+        // often fires a keydown for the first character before the
+        // multi-char input event, which would otherwise produce
+        // "TTesting" instead of "Testing".
+        let toSend = data;
+        const recent = recentlySentRef.current;
+        if (
+          Date.now() < recent.expiresAt &&
+          recent.chars.length > 0 &&
+          toSend.startsWith(recent.chars)
+        ) {
+          toSend = toSend.slice(recent.chars.length);
+        }
+        if (toSend.length > 0) {
+          webSocketRef.current.send(
+            JSON.stringify({ type: "input", data: toSend }),
+          );
+        }
+        const target = ev.target as HTMLTextAreaElement | null;
+        if (target && "value" in target) target.value = "";
+        ev.stopPropagation();
+        if (typeof console !== "undefined" && console.debug) {
+          console.debug(
+            "[skynet] multi-char input intercepted:",
+            JSON.stringify(data),
+            "sent=",
+            JSON.stringify(toSend),
+            "stripped=",
+            recent.chars,
+          );
+        }
+      };
+      element?.addEventListener("compositionstart", handleCompositionStart);
+      element?.addEventListener("compositionend", handleCompositionEnd);
+      element?.addEventListener("input", handleMultiCharInput, true);
+
+      const resizeObserver = new ResizeObserver(() => {
+        if (resizeTimeout.current) clearTimeout(resizeTimeout.current);
+        resizeTimeout.current = setTimeout(() => {
+          if (isVisible) {
+            performFit();
+          }
+        }, 50);
+      });
+
+      resizeObserver.observe(xtermRef.current);
+
+      return () => {
+        isFittingRef.current = false;
+        resizeObserver.disconnect();
+        clipboardProvider.dispose();
+        element?.removeEventListener("contextmenu", handleContextMenu);
+        element?.removeEventListener("paste", handlePaste);
+        element?.removeEventListener("mousedown", handleTmuxDragStart);
+        element?.removeEventListener("mousemove", handleTmuxDragMove);
+        element?.removeEventListener("mouseup", handleTmuxDragEnd);
+        element?.removeEventListener("keydown", handleBackspaceMode, true);
+        element?.removeEventListener("touchstart", handleTouchStart);
+        element?.removeEventListener("touchmove", handleTouchMove);
+        element?.removeEventListener("touchend", handleTouchEnd);
+        element?.removeEventListener("touchcancel", handleTouchEnd);
+        element?.removeEventListener(
+          "compositionstart",
+          handleCompositionStart,
+        );
+        element?.removeEventListener("compositionend", handleCompositionEnd);
+        element?.removeEventListener("input", handleMultiCharInput, true);
+        if (notifyTimerRef.current) clearTimeout(notifyTimerRef.current);
+        if (resizeTimeout.current) clearTimeout(resizeTimeout.current);
+      };
+    }, [xtermRef, terminal]);
+
+    const isMountedRef = useRef(false);
+
+    useEffect(() => {
+      isMountedRef.current = true;
+
+      return () => {
+        if (!isMountedRef.current) {
+          return;
+        }
+
+        // Was gated on `currentHostIdRef.current !== currentHostId` — that
+        // silently skipped ws.close() on real unmounts where the host didn't
+        // change (the typical case), leaving the WS + onmessage closure alive
+        // with an orphan xterm instance. Symptom: terminal view "visually
+        // frozen but accepts keys" (data written into DOM-detached buffer).
+        // See [term-diag] write-suspicious mountId=… domConnected=null in
+        // /opt/skynet/console-forward-logs/console-forward.log for the trail.
+        isUnmountingRef.current = true;
+        shouldNotReconnectRef.current = true;
+        isReconnectingRef.current = false;
+        setIsConnecting(false);
+        if (reconnectTimeoutRef.current)
+          clearTimeout(reconnectTimeoutRef.current);
+        if (connectionTimeoutRef.current)
+          clearTimeout(connectionTimeoutRef.current);
+        if (totpTimeoutRef.current) clearTimeout(totpTimeoutRef.current);
+        if (pingIntervalRef.current) {
+          clearInterval(pingIntervalRef.current);
+          pingIntervalRef.current = null;
+        }
+        if (pongTimeoutRef.current) {
+          clearTimeout(pongTimeoutRef.current);
+          pongTimeoutRef.current = null;
+        }
+
+        if (webSocketRef.current) {
+          webSocketRef.current.close();
+        }
+
+        isMountedRef.current = false;
+      };
+    }, [hostConfig.id, hostConfig.instanceId]);
+
+    useEffect(() => {
+      if (!terminal) return;
+
+      const handleCustomKey = (e: KeyboardEvent): boolean => {
+        if (e.type !== "keydown") {
+          return true;
+        }
+
+        // Mobile chord interception: when toolbar has a sticky Ctrl/Alt
+        // active and the user types a letter on the iOS soft keyboard,
+        // combine them into the proper byte sequence. Shift-only sticky
+        // is handled by xterm.js naturally so we don't intercept it here.
+        const sticky = stickyModsRef.current;
+        if (
+          (sticky.ctrl || sticky.alt) &&
+          e.key.length === 1 &&
+          /^[a-zA-Z]$/.test(e.key)
+        ) {
+          let ch = e.key;
+          if (sticky.shift && /^[a-z]$/.test(ch)) ch = ch.toUpperCase();
+          if (sticky.ctrl) {
+            ch = String.fromCharCode(ch.toLowerCase().charCodeAt(0) & 0x1f);
+          }
+          if (sticky.alt) ch = "\x1b" + ch;
+          if (webSocketRef.current?.readyState === 1) {
+            webSocketRef.current.send(
+              JSON.stringify({ type: "input", data: ch }),
+            );
+          }
+          clearStickyModsRef.current();
+          e.preventDefault();
+          e.stopPropagation();
+          return false;
+        }
+
+        if (
+          e.ctrlKey &&
+          !e.shiftKey &&
+          !e.altKey &&
+          !e.metaKey &&
+          e.key.toLowerCase() === "c" &&
+          terminal.hasSelection()
+        ) {
+          const selection = terminal.getSelection();
+          if (selection) {
+            e.preventDefault();
+            e.stopPropagation();
+            writeTextToClipboard(selection);
+            terminal.clearSelection();
+            return false;
+          }
+        }
+
+        if (
+          ((e.metaKey && !e.shiftKey && !e.ctrlKey && !e.altKey) ||
+            (e.ctrlKey &&
+              !e.shiftKey &&
+              !e.altKey &&
+              !e.metaKey &&
+              e.key === "Insert")) &&
+          (e.key.toLowerCase() === "c" || e.key === "Insert")
+        ) {
+          const selection = terminal.getSelection();
+          if (selection) {
+            e.preventDefault();
+            e.stopPropagation();
+            writeTextToClipboard(selection);
+            return false;
+          }
+        }
+
+        if (
+          e.ctrlKey &&
+          !e.shiftKey &&
+          !e.altKey &&
+          !e.metaKey &&
+          e.key.toLowerCase() === "v"
+        ) {
+          // Let the browser handle Ctrl+V natively, the paste event
+          // listener will intercept the result without triggering the
+          // clipboard permission popup
+          return false;
+        }
+
+        if (e.ctrlKey && e.altKey && !e.metaKey && !e.shiftKey) {
+          const key = e.key.toLowerCase();
+          const blockedKeys = ["w", "t", "n", "q"];
+          if (blockedKeys.includes(key)) {
+            e.preventDefault();
+            e.stopPropagation();
+            const ctrlCode = key.charCodeAt(0) - 96;
+            if (webSocketRef.current?.readyState === 1) {
+              webSocketRef.current.send(
+                JSON.stringify({
+                  type: "input",
+                  data: String.fromCharCode(ctrlCode),
+                }),
+              );
+            }
+            return false;
+          }
+        }
+
+        if (showAutocompleteRef.current) {
+          if (e.key === "Escape") {
+            e.preventDefault();
+            e.stopPropagation();
+            setShowAutocomplete(false);
+            setAutocompleteSuggestions([]);
+            currentAutocompleteCommand.current = "";
+            return false;
+          }
+
+          if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+            e.preventDefault();
+            e.stopPropagation();
+
+            const currentIndex = autocompleteSelectedIndexRef.current;
+            const suggestionsLength = autocompleteSuggestionsRef.current.length;
+
+            if (e.key === "ArrowDown") {
+              const newIndex =
+                currentIndex < suggestionsLength - 1 ? currentIndex + 1 : 0;
+              setAutocompleteSelectedIndex(newIndex);
+            } else if (e.key === "ArrowUp") {
+              const newIndex =
+                currentIndex > 0 ? currentIndex - 1 : suggestionsLength - 1;
+              setAutocompleteSelectedIndex(newIndex);
+            }
+            return false;
+          }
+
+          if (
+            e.key === "Enter" &&
+            autocompleteSuggestionsRef.current.length > 0
+          ) {
+            e.preventDefault();
+            e.stopPropagation();
+
+            const selectedCommand =
+              autocompleteSuggestionsRef.current[
+                autocompleteSelectedIndexRef.current
+              ];
+            const currentCmd = currentAutocompleteCommand.current;
+            const completion = selectedCommand.substring(currentCmd.length);
+
+            if (webSocketRef.current?.readyState === 1) {
+              for (const char of completion) {
+                webSocketRef.current.send(
+                  JSON.stringify({ type: "input", data: char }),
+                );
+              }
+            }
+
+            updateCurrentCommandRef.current(selectedCommand);
+
+            setShowAutocomplete(false);
+            setAutocompleteSuggestions([]);
+            currentAutocompleteCommand.current = "";
+
+            return false;
+          }
+
+          if (
+            e.key === "Tab" &&
+            !e.ctrlKey &&
+            !e.altKey &&
+            !e.metaKey &&
+            !e.shiftKey
+          ) {
+            e.preventDefault();
+            e.stopPropagation();
+            const currentIndex = autocompleteSelectedIndexRef.current;
+            const suggestionsLength = autocompleteSuggestionsRef.current.length;
+            const newIndex =
+              currentIndex < suggestionsLength - 1 ? currentIndex + 1 : 0;
+            setAutocompleteSelectedIndex(newIndex);
+            return false;
+          }
+
+          setShowAutocomplete(false);
+          setAutocompleteSuggestions([]);
+          currentAutocompleteCommand.current = "";
+          return true;
+        }
+
+        if (
+          e.key === "Tab" &&
+          e.shiftKey &&
+          !e.ctrlKey &&
+          !e.altKey &&
+          !e.metaKey
+        ) {
+          e.preventDefault();
+          e.stopPropagation();
+          if (webSocketRef.current?.readyState === 1) {
+            webSocketRef.current.send(
+              JSON.stringify({ type: "input", data: "\x1b[Z" }),
+            );
+          }
+          return false;
+        }
+
+        if (
+          e.key === "Tab" &&
+          !e.ctrlKey &&
+          !e.altKey &&
+          !e.metaKey &&
+          !e.shiftKey
+        ) {
+          e.preventDefault();
+          e.stopPropagation();
+
+          const sendTabToShell = () => {
+            if (webSocketRef.current?.readyState === 1) {
+              webSocketRef.current.send(
+                JSON.stringify({ type: "input", data: "\t" }),
+              );
+            }
+          };
+
+          const autocompleteEnabled =
+            localStorage.getItem("commandAutocomplete") === "true";
+
+          if (!autocompleteEnabled) {
+            sendTabToShell();
+            return false;
+          }
+
+          const currentCmd = getCurrentCommandRef.current().trim();
+          if (currentCmd.length === 0) {
+            sendTabToShell();
+            return false;
+          }
+
+          if (webSocketRef.current?.readyState === 1) {
+            const matches = autocompleteHistory.current
+              .filter(
+                (cmd) =>
+                  cmd.startsWith(currentCmd) &&
+                  cmd !== currentCmd &&
+                  cmd.length > currentCmd.length,
+              )
+              .slice(0, 5);
+
+            if (matches.length === 1) {
+              const completedCommand = matches[0];
+              const completion = completedCommand.substring(currentCmd.length);
+
+              for (const char of completion) {
+                webSocketRef.current.send(
+                  JSON.stringify({ type: "input", data: char }),
+                );
+              }
+
+              updateCurrentCommandRef.current(completedCommand);
+            } else if (matches.length > 1) {
+              currentAutocompleteCommand.current = currentCmd;
+              setAutocompleteSuggestions(matches);
+              setAutocompleteSelectedIndex(0);
+
+              const cursorY = terminal.buffer.active.cursorY;
+              const cursorX = terminal.buffer.active.cursorX;
+              const rect = xtermRef.current?.getBoundingClientRect();
+
+              if (rect) {
+                const cellHeight =
+                  terminal.rows > 0 ? rect.height / terminal.rows : 20;
+                const cellWidth =
+                  terminal.cols > 0 ? rect.width / terminal.cols : 10;
+
+                const itemHeight = 32;
+                const footerHeight = 32;
+                const maxMenuHeight = 240;
+                const estimatedMenuHeight = Math.min(
+                  matches.length * itemHeight + footerHeight,
+                  maxMenuHeight,
+                );
+                const cursorBottomY = rect.top + (cursorY + 1) * cellHeight;
+                const cursorTopY = rect.top + cursorY * cellHeight;
+                const spaceBelow = window.innerHeight - cursorBottomY;
+                const spaceAbove = cursorTopY;
+
+                const showAbove =
+                  spaceBelow < estimatedMenuHeight && spaceAbove > spaceBelow;
+
+                setAutocompletePosition({
+                  top: showAbove
+                    ? Math.max(0, cursorTopY - estimatedMenuHeight)
+                    : cursorBottomY,
+                  left: Math.max(0, rect.left + cursorX * cellWidth),
+                });
+              }
+
+              setShowAutocomplete(true);
+            } else {
+              sendTabToShell();
+            }
+          }
+          return false;
+        }
+
+        return true;
+      };
+
+      terminal.attachCustomKeyEventHandler(handleCustomKey);
+    }, [terminal]);
+
+    useEffect(() => {
+      // attach gates initial WS lifecycle (URL-restored active-set tabs open their WS on mount even while offscreen; see bounty url-restore-loads-only-selected-session-not-full-active-set). quick-260809-eqk followup (patch #368, 2026-08-09): also gate on isVisibleRef. Without this, iter 2's pause effect (line ~624) closes the WS on hide → onclose flips isConnected/isConnecting → this setup effect's deps re-fire → it immediately reopens the WS behind the pause's back. Empirically confirmed via diag: hidden terminals were still burning 17-61 KB/30s of SSH bytes post-iter-2 ship. Trade: hidden URL-restored panes no longer pre-warm on mount; they open on first visible-tap instead — same ~2s re-warm cost the pause layer already accepts for visibility flips.
+      if (!terminal || !hostConfig || !attach) return;
+      if (!isVisibleRef.current) {
+        console.warn(`[pause-gate] blocked-setup-effect hostId=${hostConfig.id} sessionId=${tmuxSessionNameRef.current ?? 'null'} reason=hidden`);
+        return;
+      }
+      if (isConnected || isConnecting) return;
+
+      if (isReconnectingRef.current || reconnectTimeoutRef.current !== null) {
+        return;
+      }
+
+      if (shouldNotReconnectRef.current) {
+        return;
+      }
+
+      if (
+        webSocketRef.current &&
+        (webSocketRef.current.readyState === WebSocket.OPEN ||
+          webSocketRef.current.readyState === WebSocket.CONNECTING)
+      ) {
+        return;
+      }
+
+      setIsConnecting(true);
+      fitAddonRef.current?.fit();
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          fitAddonRef.current?.fit();
+          if (terminal.cols > 0 && terminal.rows > 0) {
+            scheduleNotify(terminal.cols, terminal.rows);
+            console.info(`[reopen] fired hostId=${hostConfig.id} path=setup-effect wsUrl=${hostConfig.id ? `/ssh/websocket/?hostId=${hostConfig.id}` : 'unknown'}`);
+            connectToHost(terminal.cols, terminal.rows);
+          }
+        });
+      });
+    }, [terminal, hostConfig.id, attach, isConnected, isConnecting]);
+
+    useEffect(() => {
+      if (!terminal || !fitAddonRef.current) return;
+
+      if (!isVisible) {
+        lastFittedSizeRef.current = null;
+        lastSentSizeRef.current = null;
+        return;
+      }
+
+      const fitTimeoutId = setTimeout(() => {
+        if (!isFittingRef.current && terminal.cols > 0 && terminal.rows > 0) {
+          performFit();
+          if (!splitScreen && !isConnecting) {
+            requestAnimationFrame(() => terminal.focus());
+          }
+        }
+      }, 50);
+
+      return () => clearTimeout(fitTimeoutId);
+    }, [terminal, isVisible, splitScreen, isConnecting]);
+
+    const hasConnectionError = !!connectionError;
+
+    const sshAdapter = useMemo(
+      () =>
+        makeSshAdapter(
+          () => terminal,
+          (data: string) => {
+            if (webSocketRef.current?.readyState === 1) {
+              webSocketRef.current.send(
+                JSON.stringify({ type: "input", data }),
+              );
+            }
+          },
+        ),
+      [terminal],
+    );
+
+    // Phase 05 Plan 03 (patch pending): injected-turn send after
+    // upload_ready_to_inject. Fires as a two-event split-send matching the
+    // MessageQueueDrawer pattern at the mount below (line ~2871): body event
+    // first (no mqid), then \r event with messageQueueItemId 60ms later.
+    // Patch #100's split-and-delay Enter and patch #60's atomic delete-on-send
+    // fire automatically inside terminal.ts case "input" for any event
+    // carrying a mqid AND ending in \r.
+    //
+    // The messageQueueItemId is generated client-side by usePrettyViewUploads
+    // (crypto.randomUUID) — no server queue row is created for uploads (the
+    // queue-row lifecycle is patch #60's mechanism for the MessageQueueDrawer;
+    // uploads reuse ONLY the mqid field on the input event to inherit patch
+    // #60's atomic-post-write side effect and patch #100's split-and-delay
+    // path). If user abandons the pane between the body-send and the \r-
+    // send (60ms window), the tmux pane will simply hold the caption+metadata
+    // in its input buffer un-submitted — same failure mode as any other
+    // sub-second WS disconnect. No parallel send path; no new queue row.
+    //
+    // Phase 41 Plan 02: injected-turn callback removed — PrettyView and
+    // the message queue drawer are now owned by IdentitySessionPane. Terminal.tsx
+    // only renders the raw xterm surface for non-identity panes.
+
+    return (
+      <div
+        className="h-full w-full relative flex flex-col"
+        style={{ backgroundColor }}
+      >
+        <div
+          ref={xtermRef}
+          className="flex-1 min-h-0 w-full"
+          style={{
+            pointerEvents: isVisible ? "auto" : "none",
+            visibility:
+              isConnected && isFitted && !connectionError
+                ? "visible"
+                : "hidden",
+          }}
+          onClick={() => {
+            if (terminal && !splitScreen) {
+              terminal.focus();
+            }
+          }}
+        />
+        {/* Phase 41 Plan 02: PrettyView, MessageQueueDrawer, IdentityBadge,
+            and IdentityModal removed from Terminal.tsx. These are now rendered
+            by IdentitySessionPane (src/ui/shell/IdentitySessionPane.tsx) which
+            wraps Terminal for identity panes. Terminal.tsx only renders the raw
+            xterm surface regardless of pretty-mode state. */}
+
+        {isMobile && isConnected && (
+          <Toolbar
+            adapter={sshAdapter}
+            onStickyChange={(mods) => {
+              stickyModsRef.current = mods;
+            }}
+            registerClearSticky={(clear) => {
+              clearStickyModsRef.current = clear;
+            }}
+          />
+        )}
+
+        {/* Phase 41 Plan 02: removed pretty-mode gate — Terminal.tsx only
+            mounts for non-identity (raw terminal) panes, so the loader always
+            applies when connecting. */}
+        <SimpleLoader
+          visible={isConnecting && !isConnectionLogExpanded}
+          message={t("terminal.connecting")}
+          backgroundColor={backgroundColor}
+        />
+
+        {showDisconnectedOverlay && !isConnecting && (
+          <div
+            className="absolute inset-0 flex flex-col items-center justify-center gap-3 z-[120]"
+            style={{ backgroundColor }}
+          >
+            <p className="text-sm text-[color:var(--color-pv-fg-muted)]">
+              {t("terminal.connectionLost")}
+            </p>
+            <div className="flex gap-2">
+              <Button
+                variant="secondary"
+                className="bg-[linear-gradient(160deg,rgba(45,55,80,0.55),rgba(28,35,55,0.6))] text-[#dfe3ee] border-[rgba(120,140,180,0.35)] shadow-[0_4px_12px_rgba(0,0,0,0.35),inset_0_1px_0_rgba(220,230,255,0.14),0_0_16px_rgba(120,140,180,0.18)] hover:brightness-110"
+                onClick={() => {
+                  setShowDisconnectedOverlay(false);
+                  isUnmountingRef.current = false;
+                  shouldNotReconnectRef.current = false;
+                  isReconnectingRef.current = false;
+                  isConnectingRef.current = false;
+                  reconnectAttempts.current = 0;
+                  wasDisconnectedBySSH.current = false;
+                  wasConnectedRef.current = false;
+                  updateConnectionError(null);
+                  if (terminal) {
+                    terminal.clear();
+                    connectToHost(terminal.cols, terminal.rows);
+                  }
+                }}
+              >
+                {t("terminal.reconnect")}
+              </Button>
+              {onClose && (
+                <Button variant="outline" onClick={onClose}>
+                  {t("terminal.closeTab")}
+                </Button>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Phase 41 Plan 02: removed pretty-mode gate — Terminal.tsx only
+            mounts for non-identity (raw terminal) panes. */}
+        <ConnectionLog
+          isConnecting={isConnecting}
+          isConnected={isConnected}
+          hasConnectionError={hasConnectionError && !showDisconnectedOverlay}
+          position={hasConnectionError ? "top" : "bottom"}
+          onClosePane={onClose}
+        />
+
+        <TOTPDialog
+          isOpen={totpRequired}
+          prompt={totpPrompt}
+          onSubmit={handleTotpSubmit}
+          onCancel={handleTotpCancel}
+          backgroundColor={backgroundColor}
+        />
+
+        {showAuthDialog && (
+          <Suspense fallback={null}>
+            <SSHAuthDialog
+              isOpen={showAuthDialog}
+              reason={authDialogReason}
+              onSubmit={handleAuthDialogSubmit}
+              onCancel={handleAuthDialogCancel}
+              hostInfo={{
+                ip: hostConfig.ip,
+                port: hostConfig.port,
+                username: hostConfig.username,
+                name: hostConfig.name,
+              }}
+              backgroundColor={backgroundColor}
+            />
+          </Suspense>
+        )}
+
+        <PassphraseDialog
+          isOpen={showPassphraseDialog}
+          onSubmit={handlePassphraseSubmit}
+          onCancel={handlePassphraseCancel}
+          hostInfo={{
+            ip: hostConfig.ip,
+            port: hostConfig.port,
+            username: hostConfig.username,
+            name: hostConfig.name,
+          }}
+          backgroundColor={backgroundColor}
+        />
+
+        <WarpgateDialog
+          isOpen={warpgateAuthRequired}
+          url={warpgateAuthUrl}
+          securityKey={warpgateSecurityKey}
+          onContinue={handleWarpgateContinue}
+          onCancel={handleWarpgateCancel}
+          onOpenUrl={handleWarpgateOpenUrl}
+          backgroundColor={backgroundColor}
+        />
+
+        {opksshDialog?.isOpen && (
+          <OPKSSHDialog
+            isOpen={opksshDialog.isOpen}
+            authUrl={opksshDialog.authUrl}
+            requestId={opksshDialog.requestId}
+            stage={opksshDialog.stage}
+            error={opksshDialog.error}
+            providers={opksshDialog.providers}
+            onCancel={() => {
+              if (webSocketRef.current) {
+                webSocketRef.current.send(
+                  JSON.stringify({
+                    type: "opkssh_cancel",
+                    data: { requestId: opksshDialog.requestId },
+                  }),
+                );
+              }
+              setOpksshDialog(null);
+              if (opksshTimeoutRef.current) {
+                clearTimeout(opksshTimeoutRef.current);
+                opksshTimeoutRef.current = null;
+              }
+            }}
+            onOpenUrl={() => {
+              window.open(opksshDialog.authUrl, "_blank");
+              if (webSocketRef.current) {
+                webSocketRef.current.send(
+                  JSON.stringify({
+                    type: "opkssh_browser_opened",
+                    data: { requestId: opksshDialog.requestId },
+                  }),
+                );
+              }
+            }}
+            onSelectProvider={(alias) => {
+              if (!opksshDialog.authUrl) return;
+              const selectUrl = `${opksshDialog.authUrl}/select?op=${encodeURIComponent(alias)}`;
+              window.open(selectUrl, "_blank");
+              if (webSocketRef.current) {
+                webSocketRef.current.send(
+                  JSON.stringify({
+                    type: "opkssh_browser_opened",
+                    data: { requestId: opksshDialog.requestId },
+                  }),
+                );
+              }
+              setOpksshDialog((prev) =>
+                prev ? { ...prev, stage: "waiting" } : null,
+              );
+            }}
+            backgroundColor={backgroundColor}
+          />
+        )}
+
+        {hostKeyVerification?.isOpen && (
+          <HostKeyVerificationDialog
+            isOpen={true}
+            scenario={hostKeyVerification.scenario}
+            {...hostKeyVerification.data}
+            onAccept={() => {
+              if (webSocketRef.current) {
+                webSocketRef.current.send(
+                  JSON.stringify({
+                    type: "host_key_verification_response",
+                    data: { action: "accept" },
+                  }),
+                );
+              }
+              setHostKeyVerification(null);
+            }}
+            onReject={() => {
+              if (webSocketRef.current) {
+                webSocketRef.current.send(
+                  JSON.stringify({
+                    type: "host_key_verification_response",
+                    data: { action: "reject" },
+                  }),
+                );
+              }
+              setHostKeyVerification(null);
+              setIsConnecting(false);
+              updateConnectionError(t("terminal.hostKeyRejected"));
+            }}
+            backgroundColor={backgroundColor}
+          />
+        )}
+
+        {tmuxSessionPicker && (
+          <TmuxSessionPicker
+            isOpen={true}
+            sessions={tmuxSessionPicker.sessions}
+            onSelect={(sessionName) => {
+              setTmuxSessionPicker(null);
+              if (webSocketRef.current?.readyState === WebSocket.OPEN) {
+                webSocketRef.current.send(
+                  JSON.stringify({
+                    type: "tmux_attach",
+                    data: { sessionName },
+                  }),
+                );
+              }
+            }}
+            onCreateNew={() => {
+              setTmuxSessionPicker(null);
+              if (webSocketRef.current?.readyState === WebSocket.OPEN) {
+                webSocketRef.current.send(
+                  JSON.stringify({
+                    type: "tmux_attach",
+                    data: { sessionName: "" },
+                  }),
+                );
+              }
+            }}
+            onCancel={() => setTmuxSessionPicker(null)}
+            backgroundColor={backgroundColor}
+          />
+        )}
+
+        <CommandAutocomplete
+          visible={showAutocomplete}
+          suggestions={autocompleteSuggestions}
+          selectedIndex={autocompleteSelectedIndex}
+          position={autocompletePosition}
+          onSelect={handleAutocompleteSelect}
+        />
+      </div>
+    );
+  },
+);
+
+export const Terminal = forwardRef<TerminalHandle, SSHTerminalProps>(
+  function Terminal(props, ref) {
+    return (
+      <ConnectionLogProvider>
+        <TerminalInner {...props} ref={ref} />
+      </ConnectionLogProvider>
+    );
+  },
+);

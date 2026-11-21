@@ -1,0 +1,142 @@
+# Stage 1: Install dependencies
+FROM node:22-slim AS deps
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt/lists/*
+
+COPY package*.json ./
+COPY .npmrc ./
+COPY vendor ./vendor
+
+COPY scripts/patch-guacamole-lite.cjs ./scripts/
+COPY scripts/patch-better-sqlite3.cjs ./scripts/
+COPY scripts/patch-nan.cjs ./scripts/
+COPY scripts/patch-online-3d-viewer.cjs ./scripts/
+
+# sharing=locked: both stages share this cache and each ends with `npm cache
+# clean --force`; run concurrently (cold cache) they delete each other's files.
+RUN --mount=type=cache,target=/root/.npm,sharing=locked npm ci && \
+    node scripts/patch-guacamole-lite.cjs && \
+    npm cache clean --force
+
+# Stage 1.5: Compute git HEAD SHA from the `git-repo` named context that
+# `docker/docker-compose.yml`'s `additional_contexts` maps to the repo's
+# `.git/` dir. This makes VITE_BUILD_ID fully automatic — every
+# `docker compose build` bakes the current HEAD SHA into the image with
+# zero operator ceremony (no shell export, no wrapper script). Emits
+# /sha.txt for downstream stages to COPY. Uses a bind mount so `.git/`
+# never enters any layer.
+FROM alpine:3 AS sha-computer
+RUN apk add --no-cache git
+RUN --mount=type=bind,from=git-repo,target=/git-dir,readonly \
+    git --git-dir=/git-dir rev-parse HEAD > /sha.txt && \
+    test -s /sha.txt
+
+# Stage 2: Build frontend
+FROM deps AS frontend-builder
+WORKDIR /app
+
+# Auto-baked build-id: sha-computer stage produced /sha.txt from the
+# current git HEAD; Vite substitutes `import.meta.env.VITE_BUILD_ID` into
+# every client bundle from the env exported by the `npm run build` RUN
+# below. See `src/backend/config/server-build-id.ts` for the server-side
+# counterpart (runtime env from entrypoint).
+COPY --from=sha-computer /sha.txt /tmp/.build-sha
+
+COPY . .
+
+RUN find public/fonts -name "*.ttf" ! -name "*Regular.ttf" ! -name "*Bold.ttf" ! -name "*Italic.ttf" -delete
+
+RUN npm cache clean --force && \
+    export VITE_BUILD_ID=$(cat /tmp/.build-sha) && \
+    NODE_OPTIONS="--max-old-space-size=3072" npm run build
+
+# Stage 3: Build backend
+FROM deps AS backend-builder
+WORKDIR /app
+
+COPY . .
+
+RUN npm run build:backend
+
+# Stage 4: Production dependencies only
+FROM node:22-slim AS production-deps
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt/lists/*
+
+COPY package*.json ./
+COPY .npmrc ./
+COPY vendor ./vendor
+
+COPY scripts/patch-guacamole-lite.cjs ./scripts/
+COPY scripts/patch-better-sqlite3.cjs ./scripts/
+COPY scripts/patch-nan.cjs ./scripts/
+COPY scripts/patch-online-3d-viewer.cjs ./scripts/
+
+RUN --mount=type=cache,target=/root/.npm,sharing=locked npm ci --omit=dev && \
+    node scripts/patch-guacamole-lite.cjs && \
+    (cd node_modules/better-sqlite3 && npx --yes node-gyp rebuild --release) && \
+    npm cache clean --force
+
+# Stage 5: Final optimized image
+FROM node:22-slim
+WORKDIR /app
+
+ENV DATA_DIR=/app/data \
+    PORT=8080 \
+    NODE_ENV=production \
+    # Phase 117 M-K (2026-09-19): safe container default so every fleet
+    # subpath reader (getLocalIdentitiesRoot / getLocalRolesRoot /
+    # getLocalProjectsRoot) writes into the /host-home bind mount by
+    # default. Prevents the silent-ephemeral bug where projects (or any
+    # future fleet subpath) land in the container's writable layer and
+    # get destroyed on every `docker compose up --force-recreate`.
+    # Operator can still override via docker-compose env_file if they
+    # need a custom host-home path.
+    HOME_HOST_DIR=/host-home
+
+RUN apt-get update && apt-get install -y nginx gettext-base openssl ca-certificates gosu wget ffmpeg systemd jq tmux && \
+    update-ca-certificates && \
+    rm -rf /var/lib/apt/lists/* && \
+    mkdir -p /app/data /app/uploads /app/data/.opk /app/nginx \
+        /tmp/nginx/proxy_temp /tmp/nginx/client_body /tmp/nginx/fastcgi_temp /tmp/nginx/scgi_temp /tmp/nginx/uwsgi_temp \
+        /var/log/skynet/console-forward && \
+    chown -R node:node /app /tmp/nginx /var/log/skynet && \
+    chmod 755 /app/data /app/uploads /app/data/.opk /app/nginx /tmp/nginx /var/log/skynet /var/log/skynet/console-forward
+# `systemd` package provides the `systemctl` client binary — needed for the
+# distributor's local-branch fireRestartHookLocally to talk to the host user's
+# systemd session (via the /run/user/1000 bind-mount + XDG_RUNTIME_DIR from
+# docker/docker-compose.host-systemd.override.yml). We do NOT run systemd
+# itself as PID 1 inside the container — the entrypoint stays the app.
+# systemctl is just a DBus client.
+
+COPY docker/nginx.conf /app/nginx/nginx.conf.template
+COPY docker/nginx-https.conf /app/nginx/nginx-https.conf.template
+
+COPY --chown=node:node --from=frontend-builder /app/dist /app/html
+COPY --chown=node:node docker/branding-defaults /app/branding-defaults
+COPY --chown=node:node docker/pool-defaults /app/pool-defaults
+COPY --chown=node:node substrate /app/fleet-substrate
+
+COPY --chown=node:node --from=production-deps /app/node_modules /app/node_modules
+COPY --chown=node:node --from=backend-builder /app/dist/backend ./dist/backend
+COPY --chown=node:node package.json ./
+
+# Auto-baked build-id: sha-computer stage wrote /sha.txt from git HEAD;
+# entrypoint.sh reads this file and exports VITE_BUILD_ID before Node
+# starts, so `src/backend/config/server-build-id.ts` sees the byte-stable
+# value. See sha-computer stage near the top for the source.
+COPY --chown=node:node --from=sha-computer /sha.txt /app/.build-sha
+
+VOLUME ["/app/data"]
+
+EXPOSE ${PORT} 30001 30002 30003 30004 30005 30006
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD wget -q -O /dev/null http://localhost:30001/health || exit 1
+
+COPY docker/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+CMD ["/entrypoint.sh"]

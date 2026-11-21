@@ -1,0 +1,144 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { describe, expect, it } from "vitest";
+import {
+  isCutOffPermissionPrompt,
+  parsePermissionPromptScreen,
+} from "./permission-prompt-screen";
+
+const fixture = (name: string) =>
+  readFileSync(join(__dirname, "__fixtures__", name), "utf8");
+
+describe("parsePermissionPromptScreen", () => {
+  it("parses a real hook-ask Bash prompt captured from v2.1.302", () => {
+    const p = parsePermissionPromptScreen(
+      fixture("permission-prompt-hook-ask.txt"),
+    );
+    expect(p).not.toBeNull();
+    expect(p!.title).toBe("Bash command");
+    expect(p!.description).toBe("List scratch files");
+    expect(p!.body).toBe("ls -la");
+    expect(p!.reason).toContain("Test reason: possibly risky delete");
+    expect(p!.autoDenySeconds).toBeNull();
+    expect(p!.yesKey).toBe("1");
+    expect(p!.noKey).toBe("2");
+  });
+
+  it("parses the dangerous-rm safety prompt with its auto-deny countdown", () => {
+    const p = parsePermissionPromptScreen(
+      fixture("permission-prompt-dangerous-rm-countdown.txt"),
+    );
+    expect(p).not.toBeNull();
+    expect(p!.description).toBe(
+      "Stop dev server, remove scratch DB, show status",
+    );
+    expect(p!.body.split("\n")).toHaveLength(4);
+    expect(p!.body).toContain('pkill -f "vite --port 5173"');
+    expect(p!.reason).toMatch(/^Dangerous rm operation on possibly-empty variable path/);
+    expect(p!.reason).not.toContain("automatically deny");
+    expect(p!.autoDenySeconds).toBe(20);
+  });
+
+  it("keeps the fingerprint stable while the countdown ticks", () => {
+    const a = fixture("permission-prompt-dangerous-rm-countdown.txt");
+    const b = a.replace("in 0:20,", "in 0:07,");
+    const pa = parsePermissionPromptScreen(a)!;
+    const pb = parsePermissionPromptScreen(b)!;
+    expect(pb.autoDenySeconds).toBe(7);
+    expect(pb.fingerprint).toBe(pa.fingerprint);
+  });
+
+  it("reads minutes in the countdown", () => {
+    const s = fixture("permission-prompt-dangerous-rm-countdown.txt").replace(
+      "in 0:20,",
+      "in 1:05,",
+    );
+    expect(parsePermissionPromptScreen(s)!.autoDenySeconds).toBe(65);
+  });
+
+  it("picks the right digits when there is a 'Yes, and don't ask again' option", () => {
+    const s = fixture("permission-prompt-hook-ask.txt").replace(
+      "   2. No",
+      "   2. Yes, and don't ask again for ls commands\n   3. No",
+    );
+    const p = parsePermissionPromptScreen(s)!;
+    expect(p.yesKey).toBe("1");
+    expect(p.noKey).toBe("3");
+  });
+
+  it("returns null for an idle screen", () => {
+    expect(
+      parsePermissionPromptScreen(fixture("permission-prompt-none-idle.txt")),
+    ).toBeNull();
+  });
+
+  it("returns null for the folder-trust dialog (no Yes/No proceed question)", () => {
+    const trust = [
+      "────────────────────────────────────────",
+      " Accessing workspace:",
+      " Quick safety check: Is this a project you created or one you trust?",
+      " ❯ No, exit",
+      "   Yes, I trust this folder",
+      " Enter to confirm · Esc to cancel",
+    ].join("\n");
+    expect(parsePermissionPromptScreen(trust)).toBeNull();
+  });
+
+  it("returns null when the options lack a No", () => {
+    const s = fixture("permission-prompt-hook-ask.txt").replace("2. No", "2. Maybe");
+    expect(parsePermissionPromptScreen(s)).toBeNull();
+  });
+});
+
+describe("parsePermissionPromptScreen — review hardening", () => {
+  const base = fixture("permission-prompt-dangerous-rm-countdown.txt");
+
+  it("reads a countdown whose sentence wraps mid-phrase on a narrow pane", () => {
+    const s = base.replace(
+      " ⚠ Claude Code will automatically deny this request in 0:20, to\n avoid blocking progress on an unattended session",
+      " ⚠ Claude Code will automatically deny this\n request in 0:20, to avoid blocking progress\n on an unattended session",
+    );
+    const p = parsePermissionPromptScreen(s)!;
+    expect(p.autoDenySeconds).toBe(20);
+    expect(p.reason).not.toContain("automatically");
+    const later = parsePermissionPromptScreen(s.replace("in 0:20,", "in 0:13,"))!;
+    expect(later.fingerprint).toBe(p.fingerprint);
+  });
+
+  it("does not take an indented ─ / ╌ line inside the command for structure", () => {
+    const s = base.replace(
+      " --short | cat\n",
+      " --short | cat\n " + "─".repeat(40) + "\n " + "╌".repeat(40) + "\n",
+    );
+    const p = parsePermissionPromptScreen(s)!;
+    expect(p.title).toBe("Bash command");
+    expect(p.body).toContain("S=/tmp/claude-1000");
+    expect(p.body).toContain("─".repeat(40));
+    expect(p.reason).toMatch(/^Dangerous rm/);
+  });
+});
+
+describe("tall prompts (taller than the pane)", () => {
+  it("a prompt cut off at the top doesn't parse, and is recognized as cut off", () => {
+    const s = fixture("permission-prompt-tall-cutoff.txt");
+    expect(parsePermissionPromptScreen(s)).toBeNull();
+    expect(isCutOffPermissionPrompt(s)).toBe(true);
+  });
+
+  it("the same prompt on a tall pane parses in full, gutter stripped", () => {
+    const s = fixture("permission-prompt-tall-full.txt");
+    const p = parsePermissionPromptScreen(s)!;
+    expect(p.title).toBe("Bash command");
+    expect(p.description).toBe("Print tall heredoc");
+    const body = p.body.split("\n");
+    expect(body[0]).toBe("cat <<'EOF'");
+    expect(body).toContain("row 1 of a tall heredoc");
+    expect(body).toContain("row 45 of a tall heredoc");
+    expect(isCutOffPermissionPrompt(s)).toBe(false);
+  });
+
+  it("an idle screen or a whole prompt is not 'cut off'", () => {
+    expect(isCutOffPermissionPrompt(fixture("permission-prompt-none-idle.txt"))).toBe(false);
+    expect(isCutOffPermissionPrompt(fixture("permission-prompt-hook-ask.txt"))).toBe(false);
+  });
+});

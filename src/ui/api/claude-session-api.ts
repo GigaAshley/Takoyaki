@@ -1,0 +1,1415 @@
+/**
+ * Live Claude-session WebSocket client wrapper.
+ *
+ * Opens a same-origin WebSocket to the backend `claude-session-server`
+ * (Plan 01-02 output, listening on port 30011 behind nginx). The browser
+ * attaches the `jwt` HttpOnly cookie automatically via same-origin, so no
+ * query-string JWT fallback is appended here — that fallback in the
+ * backend exists for wscat-based smoke testing, not for browsers.
+ *
+ * Callers construct payloads directly and `switch (event.type)` on
+ * incoming frames — no runtime discriminator helper is exported.
+ *
+ * Phase 111 SKEW-09 (Plan 06): the WS URL grows a `?build=<CLIENT_BUILD_ID>`
+ * query param at construction time so the backend handshake gate (Plan 05
+ * Task 2) can refuse mismatched clients with a distinguishable 4409 close
+ * code. Shared close/message detection listeners are attached via
+ * `addEventListener` (which coexists with per-caller `.onclose`/`.onmessage`
+ * assignments) so every consumer of this helper benefits from drift
+ * detection without touching each caller site individually.
+ */
+
+import { CLIENT_BUILD_ID } from "@/lib/client-build-id";
+import { lockSkewedSession } from "@/state/skew-lock-store";
+import type { SensorStatus } from "./sensor-status-types";
+
+// 2026-09-30 freeze-diag: registry of live sockets opened via this helper.
+// Increment on construction, decrement on close/error so the count reflects
+// "still alive from the browser's perspective". The freeze-diag heartbeat
+// (src/ui/lib/freeze-diag.ts) reads this count each tick — if it climbs
+// without bound while modals open/close, there's a cleanup leak.
+const OPEN_SOCKETS = new Set<WebSocket>();
+
+/** Live count of Claude-session WebSockets currently held open by the app. */
+export function getOpenClaudeSessionSocketCount(): number {
+  return OPEN_SOCKETS.size;
+}
+
+export function openClaudeSessionSocket(): WebSocket {
+  const scheme =
+    typeof window !== "undefined" && window.location.protocol === "https:"
+      ? "wss:"
+      : "ws:";
+  const host =
+    typeof window !== "undefined" ? window.location.host : "localhost";
+  // Phase 111 SKEW-09: handshake stamp for D-08 refusal on mismatch.
+  const url = `${scheme}//${host}/claude-session/websocket/?build=${encodeURIComponent(CLIENT_BUILD_ID)}`;
+  const ws = new WebSocket(url);
+  attachSkewLockListeners(ws, "claude-session");
+  OPEN_SOCKETS.add(ws);
+  const drop = () => OPEN_SOCKETS.delete(ws);
+  // Test stubs lack the DOM addEventListener API — mirror the guard in
+  // attachSkewLockListeners (L86). Registry semantics degrade in tests
+  // (the stub socket stays in OPEN_SOCKETS) but the freeze-diag heartbeat
+  // only runs at boot in a real browser.
+  if (typeof ws.addEventListener === "function") {
+    ws.addEventListener("close", drop);
+    ws.addEventListener("error", drop);
+  }
+  return ws;
+}
+
+/**
+ * Phase 111 SKEW-09 (D-08 + D-09): attach shared drift-detection listeners.
+ *
+ * Uses `addEventListener` (not `.onclose = ...`) so caller-owned
+ * `.onclose`/`.onmessage` assignments continue to fire per DOM spec —
+ * both handlers are invoked for each event, in registration order.
+ *
+ * D-08 close-code lane: `event.code === 4409` means the backend's handshake
+ * gate refused this connection because our `CLIENT_BUILD_ID` no longer
+ * matches the server's build. Fire `lockSkewedSession` and let the
+ * SkewLockModal take over. `return` in the caller's own onclose handler
+ * would still let its reconnect logic run — but the skew-lock store is
+ * idempotent, so a second call is a no-op, and the modal freezes the app
+ * before a reconnect can complete.
+ *
+ * D-09 per-message lane: the backend piggybacks `build: <SERVER_BUILD_ID>`
+ * on every outbound JSON envelope (Plan 05 Task 3 via `ws.send` monkey-
+ * patch). If `parsed.build` is a string that differs from CLIENT_BUILD_ID,
+ * the running bundle is stale — fire the lock. The typeof check makes
+ * this a no-op for frames without the field (backward compat during
+ * rollout) and for non-JSON binary frames.
+ *
+ * Structured logging: explicit-field extraction on CloseEvent per the
+ * role-file directive (Pitfall 5 — never serialize the raw DOM CloseEvent,
+ * circular refs + non-enumerable properties).
+ */
+function attachSkewLockListeners(ws: WebSocket, endpoint: string): void {
+  // Test-mock compatibility: many pre-existing test files stub WebSocket with
+  // an object exposing only `.onmessage`/`.onclose`/`.onopen` setters, not the
+  // DOM `addEventListener` API. Real browser WebSockets always have it; tests
+  // that don't need drift-detection can skip these listeners safely.
+  if (typeof ws.addEventListener !== "function") return;
+  ws.addEventListener("close", (event) => {
+    const isSkew = event.code === 4409;
+    console.info("[skew-lock] ws closed", {
+      operation: "ws_closed",
+      code: event.code,
+      reason: event.reason,
+      wasClean: event.wasClean,
+      isSkew,
+      endpoint,
+    });
+    if (isSkew) {
+      lockSkewedSession({
+        reason: "ws_handshake_mismatch",
+        clientBuild: CLIENT_BUILD_ID,
+        // Server closes before revealing its build over the wire — store
+        // handles unknown-server-build gracefully.
+        serverBuild: event.reason || "unknown",
+      });
+    }
+  });
+
+  ws.addEventListener("message", (event) => {
+    // Only inspect string frames — binary frames (Blob/ArrayBuffer) cannot
+    // carry a JSON envelope with `build` field.
+    if (typeof event.data !== "string") return;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(event.data);
+    } catch {
+      return; // malformed — caller's handler will deal with it
+    }
+    if (
+      parsed !== null &&
+      typeof parsed === "object" &&
+      "build" in parsed &&
+      typeof (parsed as { build: unknown }).build === "string" &&
+      (parsed as { build: string }).build !== CLIENT_BUILD_ID
+    ) {
+      lockSkewedSession({
+        reason: "ws_message_tag_mismatch",
+        clientBuild: CLIENT_BUILD_ID,
+        serverBuild: (parsed as { build: string }).build,
+      });
+    }
+  });
+}
+
+export type SessionMetaEvent = {
+  type: "session";
+  pid: number;
+  sessionFile: string;
+  /**
+   * Phase 47 (load-more button): total line count of the current JSONL
+   * session file at emit time. The client compares against WORKING_SET_CAP
+   * (PrettyView.tsx:97) to gate the load-more button's initial visibility —
+   * `totalLines > WORKING_SET_CAP` means there is older history behind the
+   * default twenty-newest window, so the button mounts. Emitted always by
+   * Phase 47+ backends (Plan 03 populates it); optional in the type for
+   * backward-compat with any older backend build. See CONTEXT.md § What
+   * this is / § Shape rationale in
+   * .planning/phases/47-.../47-CONTEXT.md.
+   */
+  totalLines?: number;
+};
+
+/**
+ * Dormant-branch analog of `SessionMetaEvent`. Emitted after the dormant
+ * branch discovers the identity's most-recently active JSONL file, so the
+ * load-more button's visibility gate has `sessionTotalLines` populated on
+ * dormant panes too. Distinct frame type (rather than a widened `session`
+ * frame) because the client's `session` handler also flips status to
+ * "streaming" and the auto-dismiss guard at PrettyView.tsx:2607 clears
+ * dormant state on receipt — both wrong for a dormant pane. Carries just
+ * enough for the gate: no pid (dormant panes have no live process); no
+ * status/pane-state semantics.
+ */
+export type DormantSessionMetaEvent = {
+  type: "dormant_session_meta";
+  sessionFile: string;
+  totalLines: number;
+};
+
+export type MessageEvent = {
+  type: "message";
+  role: "user" | "assistant";
+  content: string;
+  eventId: string;
+  ts: number;
+  /**
+   * Phase 47 (load-more button): 1-indexed JSONL line-number this frame was
+   * parsed from. Populated by Phase 47+ backends for both streaming-tail
+   * hydration and range-fetch responses. The client tracks
+   * `oldestLoadedLine` from the smallest `line` value seen and uses it as
+   * the `beforeLine` cursor for the next FetchOlderRangePayload. Optional
+   * in the type for backward-compat; the client MUST tolerate its absence
+   * on frames from older backend builds (null-safe fallback for the
+   * oldestLoadedLine bootstrap).
+   */
+  line?: number;
+  /**
+   * Phase 97 UAT follow-up (2026-09-10): optional pending-state marker
+   * for relay-source optimistic bubbles. Populated ONLY by
+   * useRelayAdapter when a pending send lands in the messages stream
+   * before its send_ack (or when a failed pending stays visible). Absent
+   * on all confirmed messages. Harness path renders pending sends via a
+   * separate PrettyView.pendingSends.map — this field is a relay-source
+   * concern only; ChatMessage already accepts a `pendingState` prop with
+   * the same semantics, so PrettyView threads this field through unchanged.
+   */
+  pendingState?: "sending" | "failed" | null;
+  /**
+   * shape-interrupt-button: the harness's "[Request interrupted by user]"
+   * marker, delivered as an assistant-role "Interrupted" message. When it is
+   * the latest message the work indicator is forced off.
+   */
+  interrupted?: true;
+  /**
+   * The assistant message that ends its turn (the harness's
+   * `stop_reason: "end_turn"`). While it is the latest message the work
+   * indicator is off, without waiting for the working signal to catch up.
+   */
+  turnEnd?: true;
+};
+
+// shape-interrupt-button — server -> client. Prompts the transcript shows were
+// cancelled (the agent never received them): hide their bubbles. Sent live on
+// a cancel verdict (to every view of the pane) and whenever the transcript's
+// sibling shape reveals a cancel (including on replay).
+export type MessagesHiddenEvent = {
+  type: "messages_hidden";
+  eventIds: string[];
+  reason: "cancelled";
+};
+
+// shape-interrupt-button — server -> client. A restart revived a cancelled
+// prompt (the agent now has it): show its bubble again.
+export type MessagesUnhiddenEvent = {
+  type: "messages_unhidden";
+  eventIds: string[];
+  reason: "revived";
+};
+
+// shape-interrupt-button — server -> client, to the pressing view only.
+// cancelled: the latest prompt was rewound; `content` is its text (null when
+// it was not a visible user message) so the words can be given back.
+export type InterruptResultEvent =
+  | { type: "interrupt_result"; verdict: "cancelled"; eventId: string; content: string | null }
+  | { type: "interrupt_result"; verdict: "stopped" }
+  | { type: "interrupt_result"; verdict: "none"; reason: string }
+  | { type: "interrupt_result"; verdict: "failed" };
+
+// Patch #86: WS-inline base64 image payload. `data` is raw base64 — the
+// consumer prepends `data:${mediaType};base64,` when building `<img src>`.
+// `toolUseId` is populated only for images that arrived via the canonical
+// Anthropic tool_result path; absent for bare image content blocks and
+// for the Claude-Code-local `toolUseResult.file.base64` convenience path.
+export type ImageBlock = {
+  data: string;
+  mediaType: string;
+  toolUseId?: string;
+};
+
+export type ImageEvent = {
+  type: "image";
+  role: "user" | "assistant" | "tool_result";
+  images: ImageBlock[];
+  text: string;
+  eventId: string;
+  ts: number;
+  /**
+   * Phase 47 (load-more button): 1-indexed JSONL line-number this frame was
+   * parsed from. Populated by Phase 47+ backends for both streaming-tail
+   * hydration and range-fetch responses. Optional in the type for
+   * backward-compat; the client MUST tolerate its absence on frames from
+   * older backend builds.
+   */
+  line?: number;
+};
+
+export type InactiveEvent = {
+  type: "inactive";
+  reason: string;
+};
+
+export type ContextPctEvent = {
+  type: "context_pct";
+  pct: number; // 0-100 inclusive
+  // Optional flag on frames emitted from the dormant-branch JSONL read
+  // (readContextPctFromJsonl piggybacking on the dormant-poll tick). Absent
+  // (or false) on the normal active-flow contextPctTimer emits. Consumed by
+  // the frontend's live-frame auto-dismiss check so a dormant-branch emit
+  // does not false-flip the dormantRef mirror (Phase 56: the overlay itself
+  // no longer exists, but dormantRef is still updated for internal state
+  // tracking on the frontend — see PrettyView.tsx dormantRef mirror).
+  dormant?: boolean;
+};
+
+export type HarnessTask = {
+  id: string;
+  subject: string;
+  description?: string;
+  activeForm?: string;
+  status: "pending" | "in_progress" | "completed" | string;
+  blocks?: string[];
+  blockedBy?: string[];
+};
+
+export type HarnessTasksEvent = {
+  type: "harness_tasks";
+  tasks: HarnessTask[]; // raw list — client filters completed for display
+};
+
+// WorkNarrationEvent — server -> client. The latest "where the agent is in
+// the job" line for the work indicator, in a short (phone) and long (desktop)
+// version. Both null = clear (a new turn started).
+export type WorkNarrationEvent = {
+  type: "work_narration";
+  short: string | null;
+  long: string | null;
+};
+
+export type BackgroundedAgent = {
+  toolUseId: string;
+  subagentType: string; // input.subagent_type; may be ""
+  description: string; // input.description; may be ""
+  startedAt: number; // ms epoch
+};
+
+export type BackgroundedAgentsEvent = {
+  type: "backgrounded_agents";
+  agents: BackgroundedAgent[]; // currently-running only; empty = none
+};
+
+export interface BackgroundedShell {
+  toolUseId: string;
+  description: string; // input.description; may be ""
+  command: string; // input.command, truncated to ~120 chars
+  ts: number; // ms epoch of the tool_use turn
+}
+
+export interface BackgroundedShellsEvent {
+  type: "backgrounded_shells";
+  shells: BackgroundedShell[]; // currently-running only; empty = none
+}
+
+export type SessionHoldingEvent = {
+  type: "session_holding";
+};
+
+// Fix B (2026-07-30): emitted by the backend when the repoll active-branch
+// sees the SAME sessionFile while changeoverState === "holding" — meaning
+// holding was armed by a transient false alarm, not a real session change.
+// Frontend handler surgically clears isHolding + holdingTimeoutError only;
+// the message stream, contextPct, harnessTasks, backgroundedAgents,
+// and asideText are all preserved verbatim (contrast with
+// session_changed which is a heavy-reset for a real session change).
+export type SessionHoldingClearedEvent = {
+  type: "session_holding_cleared";
+};
+
+export type SessionChangedEvent = {
+  type: "session_changed";
+  newSessionFile: string;
+};
+
+// Phase 17 (RELAYBUB-01, RELAYBUB-02) — relay event wire types.
+//
+// RelayOutboundEvent: emitted when the backend parser detects a Bash tool_use
+// that is a real Matrix relay send (curl + -X PUT + rooms/X/send/m.room.message/Y
+// conjunction). Field notes:
+//   body:       extracted human message body via the 7-strategy shell/heredoc/inline-json
+//               extractor (bounty pretty-view-outgoing-relay-render, 2026-08-18) —
+//               null means the extractor found no known shape, consumer falls back
+//               to rendering rawCommand (~3.6% tail: cross-turn file refs, python heredocs).
+//   rawCommand: the full Bash command — always preserved as a faithful record even
+//               when body is non-null (may contain curl bearer tokens; T-17-01-02).
+//
+// RelayInboundEvent: emitted when a task-notification user turn matches
+// the recv.sh event-line format [room X] [@sender] (event $Y): BODY.
+//   matrixEventId: the $event_id from the recv.sh line (distinct from
+//                  the outer JSONL eventId which is the JSONL uuid).
+export type RelayOutboundEvent = {
+  type: "relay_outbound";
+  room: string | null;
+  rawCommand: string;
+  /** Extracted message body from the outbound curl command via the 7-strategy
+   * shell-var/heredoc/inline-json extractor. null = fallback path (unextractable
+   * shape); consumer should render rawCommand as-is (bounty
+   * pretty-view-outgoing-relay-render, 2026-08-18). */
+  body: string | null;
+  /** relay-mcp sends: who the agent addressed (mxid, identity name or person's
+   * name), verbatim. Null/absent for room sends and curl sends. */
+  to?: string | null;
+  /** relay-mcp sends: the tool call id, matched to its RelaySendResultEvent. */
+  toolUseId?: string | null;
+  eventId: string;
+  ts: number;
+  /**
+   * Phase 47 (load-more button): 1-indexed JSONL line-number this frame was
+   * parsed from. Populated by Phase 47+ backends for both streaming-tail
+   * hydration and range-fetch responses. Optional in the type for
+   * backward-compat; the client MUST tolerate its absence on frames from
+   * older backend builds.
+   */
+  line?: number;
+};
+
+/** Outcome of a relay-mcp send (the tool_result after the call), paired with
+ * its RelayOutboundEvent by toolUseId. Not rendered on its own. */
+export type RelaySendResultEvent = {
+  type: "relay_send_result";
+  toolUseId: string;
+  ok: boolean;
+  roomId: string | null;
+  error: string | null;
+  eventId: string;
+  ts: number;
+  line?: number;
+};
+
+export type RelayInboundEvent = {
+  type: "relay_inbound";
+  room: string;
+  sender: string;
+  matrixEventId: string;
+  body: string;
+  raw: string;
+  eventId: string;
+  ts: number;
+  /**
+   * Phase 47 (load-more button): 1-indexed JSONL line-number this frame was
+   * parsed from. Populated by Phase 47+ backends for both streaming-tail
+   * hydration and range-fetch responses. Optional in the type for
+   * backward-compat; the client MUST tolerate its absence on frames from
+   * older backend builds.
+   */
+  line?: number;
+};
+
+// Phase 14 (plain-language-translation-asides) Wave 2 — new WS wire types.
+//
+// aside_ready — server -> client. Backend has extracted a /btw answer from
+// the tmux BTW overlay (per CONTEXT.md § Extraction: two consecutive stable
+// poll reads containing ASIDE_END_MARKER) and is delivering it to this
+// client for AsideBubble render. Refs: ASIDE-05 (aside surfaces post-turn)
+// + ASIDE-09 (tab-close / re-attach recovery emits this to the mounting
+// client immediately after connect-time pane probe finds an already-open
+// BTW overlay).
+export type AsideReadyEvent = {
+  type: "aside_ready";
+  text: string; // extracted /btw answer text; may span multiple lines
+};
+
+// aside_dismissed — server -> client. Backend observed the BTW overlay
+// disappearing (either from a client-initiated Escape, or from any other
+// cause — user SSH-attaching and pressing Escape herself, tmux death,
+// etc.). Broadcast to ALL clients subscribed to this session's WS stream
+// for cross-tab dismiss coherence. Refs: ASIDE-07 (dismiss via Resume X) +
+// ASIDE-11 (cross-tab dismiss coherence).
+export type AsideDismissedEvent = {
+  type: "aside_dismissed";
+};
+
+export type TailErrorEvent = {
+  type: "tail_error";
+  message: string;
+};
+
+// Emitted by the WS server at the top of every fresh connection (initial
+// attach or any reconnect against a new backend closure). Signals that
+// backend state — including the per-WS `lineNum` counter driving frame
+// `line` values — has restarted from zero. Client MUST reset its
+// insertion-sort-by-line `messages` state on receipt: otherwise messages
+// retained from before this attach (which carry now-higher pre-reconnect
+// `line` values) trap post-attach frames (with fresh low `line` values
+// starting from 1) beneath them, and the 20-item cap silently drops
+// every incoming frame from the front — the user sees a frozen message
+// list even though the WS is healthy and the backend is emitting normally.
+export type WireBootEvent = {
+  type: "wire_boot";
+};
+
+// Emitted once per tail start (after wire_boot, session_changed or a
+// session-file rotation) when the opening batch — the recent window the
+// server replays on open — has been sent in full. The client holds
+// transcript frames from the start of a hydration until this arrives, then
+// shows them at once. `startLine` is the first replayed line; `totalLines`
+// the file's line count at the snapshot (null on the full-read fallback
+// when it couldn't be taken).
+export type HistoryReadyEvent = {
+  type: "history_ready";
+  startLine: number;
+  totalLines: number | null;
+};
+
+// Phase 50 Plan 02 D-15 — signal-driven send-path watchdog escalation.
+// Fired by src/backend/claude-session/pv-send-watchdog.ts at T+20000ms
+// silence after a split-send arm, indicating the harness never accepted
+// the message (no matching kind:"message" role:"user" parser signal
+// arrived from either the direct-user-turn path or the queue-operation-
+// enqueue path). Frontend consumers flip the corresponding optimistic
+// bubble to the red-failure state and re-populate the composebox text so
+// the user can edit and re-send (D-03).
+//
+// Wire shape PRESERVED from the OLD terminal-layer watchdog (removed in
+// Phase 50 Plan 02 Task 3) for frontend backward compatibility — matches
+// what the OLD terminal-layer watchdog used to emit (deleted in Phase 50 Plan 02 Task 3).
+export type PasteSendFailedEvent = {
+  type: "paste_send_failed";
+  mqid: string | null;
+  reason: string;
+};
+
+// Phase 50 Plan 02 D-21 — execCommand throw at the input handler surface.
+// Distinct from paste_send_failed (which fires at T+20000ms after the
+// send tried to complete): this fires the INSTANT the tmux send-keys
+// exec throws — the message failed at ingress and no watchdog was armed.
+// `mqid` is null for non-split (adhoc keystroke) throws where the send
+// is not tied to a compose-send optimistic bubble.
+// A send marked as coming out of the compose box's text area started with a
+// blocked command (src/types/blocked-commands.ts); nothing was typed into the
+// agent. The composer drops the pending bubble and shows the refusal.
+export type CommandRefusedEvent = {
+  type: "command_refused";
+  mqid: string;
+};
+
+export type SendKeysErrorEvent = {
+  type: "send_keys_error";
+  mqid: string | null;
+  reason: string;
+  message: string;
+};
+
+// WaitingBubble Allow / Deny — the on-screen tool-permission prompt, parsed
+// server-side from a tmux capture (permission-prompt-screen.ts). Reply to a
+// {type:"permission_probe"} client frame; prompt is null when no answerable
+// Yes/No prompt is on screen.
+export type PermissionPromptInfo = {
+  title: string;
+  description: string | null;
+  body: string;
+  reason: string | null;
+  autoDenySeconds: number | null;
+  yesKey: string;
+  noKey: string;
+  fingerprint: string;
+};
+
+export type PermissionPromptStateEvent = {
+  type: "permission_prompt_state";
+  prompt: PermissionPromptInfo | null;
+};
+
+// Reply to {type:"permission_answer", choice, fingerprint}. "gone" = the
+// prompt had already closed (or changed) so no key was sent.
+export type PermissionAnswerResultEvent = {
+  type: "permission_answer_result";
+  choice: "allow" | "deny";
+  fingerprint: string;
+  status: "sent" | "gone" | "error";
+};
+
+export type ErrorEvent = {
+  type: "error";
+  message: string;
+  code?: string;
+};
+
+/**
+ * Phase 56 (2026-08-23): invisible-dormancy state signal. Backend emits this
+ * for pane state tracking (WIP-indicator gating, live-frame auto-dismiss,
+ * backend dormancy tracking). No user-facing UI consumes it — the
+ * DormancyOverlay + Wake button were deleted. Frontend still calls
+ * setDormant(parsed.dormant) so dormantRef live-frame auto-dismiss has a
+ * signal to mirror, but nothing renders based on this event any more.
+ * wakingSince field was removed from the emit in Plan 56-01.
+ */
+export type DormantEvent = { type: "dormant"; dormant: boolean };
+
+/**
+ * Phase 30 (PS30-01 + PS30-04): backend-authoritative pane-entry verdict.
+ *
+ * Emitted by the backend on every WS attach (fresh clients get current
+ * truth) and on every state change. Consolidates the five legacy racing
+ * frame types (session_holding / session_holding_cleared / session_changed
+ * / dormant / inactive) into a single authoritative wire surface — see
+ * src/backend/claude-session/pane-state-emitter.ts for the emitter.
+ *
+ * `state` values match the backend emitter's PaneState union exactly:
+ * active | holding | dormant | inactive | error. `reason` is optional
+ * free-form diagnostic text (string | undefined) — the frontend treats
+ * it as opaque and currently does not surface it in the UI (T-30-03-03
+ * information-disclosure mitigation per Plan 30-03 threat model).
+ *
+ * The frontend consumer stores parsed.state into a paneState React state
+ * slot; the trivial usePaneResolvingMachine hook + pure resolveRenderedState
+ * reducer derive the rendered overlay from (wsTransportState, paneState).
+ * Legacy frame types stay on the wire for backward compat (D-migration in
+ * 30-CONTEXT.md); their captureFirstFrame client-inference calls are all
+ * DELETED per Plan 30-03 Task 3.
+ */
+export type PaneStateEvent = {
+  type: "pane_state";
+  state: "active" | "holding" | "dormant" | "inactive" | "error";
+  reason?: string;
+};
+
+/**
+ * pv-malformed-jsonl-placeholder-bubble (2026-08-10) — surfaced when
+ * parseSessionLine returns kind:"malformed" (JSON.parse threw on the raw
+ * line). The truncated turn's content is unrecoverable (Claude Code's
+ * JSONL writer occasionally races an assistant record and a
+ * file-history-snapshot onto the same line and cuts the first mid-string).
+ * `bytes` carries the trimmed byte length of the unparseable line for
+ * diagnostic display; `eventId` is fabricated backend-side (no uuid was
+ * parseable). Rendered as a compact placeholder bubble so user sees
+ * that something was dropped instead of silently losing the turn.
+ */
+export type MalformedLineEvent = {
+  type: "malformed_line";
+  bytes: number;
+  eventId: string;
+  ts: number;
+  /**
+   * Phase 47 (load-more button): 1-indexed JSONL line-number this frame was
+   * parsed from. Populated by Phase 47+ backends for both streaming-tail
+   * hydration and range-fetch responses. Optional in the type for
+   * backward-compat; the client MUST tolerate its absence on frames from
+   * older backend builds.
+   */
+  line?: number;
+};
+
+/**
+ * A condense (compaction): the chat shows one divider where it happened, the
+ * summary inside it (fixed preamble already removed). Never a user message.
+ */
+export type CompactionEvent = {
+  type: "compaction";
+  summary: string;
+  eventId: string;
+  ts: number;
+  line?: number;
+};
+
+/**
+ * The guidance typed with a condense — written a couple of lines after the
+ * summary; the chat folds it into the nearest divider above it.
+ */
+export type CompactionGuidanceEvent = {
+  type: "compaction_guidance";
+  guidance: string;
+  eventId: string;
+  ts: number;
+  line?: number;
+};
+
+export type ClaudeSessionServerEvent =
+  | ArchivedStateEvent
+  | SessionMetaEvent
+  | DormantSessionMetaEvent
+  | MessageEvent
+  | ImageEvent
+  | InactiveEvent
+  | ContextPctEvent
+  | HarnessTasksEvent
+  | WorkNarrationEvent
+  | BackgroundedAgentsEvent
+  | BackgroundedShellsEvent
+  | SessionHoldingEvent
+  | SessionHoldingClearedEvent
+  | SessionChangedEvent
+  | AsideReadyEvent
+  | AsideDismissedEvent
+  | TailErrorEvent
+  | WireBootEvent
+  | HistoryReadyEvent
+  | ErrorEvent
+  // Phase 56 (2026-08-23) — dormancy is invisible; DormantEvent still emitted
+  // for internal state tracking. The former wake-result response arm was
+  // deleted here alongside the backend wake handler + frontend Wake button.
+  | DormantEvent
+  // Phase 30 (PS30-01 + PS30-04) — backend-authoritative pane-entry verdict
+  | PaneStateEvent
+  | IdentityIdentityFileEvent
+  // Phase 22 SRIC-06 / Plan 22-06: role-file read + update events (mirror
+  // shape of IdentityIdentityFileEvent + IdentityIdentityFileUpdatedEvent)
+  | IdentityRoleFileEvent
+  | IdentityRoleFileUpdatedEvent
+  // Phase 89 Plan 05: IdentityHistoryEvent + IdentityHandoffEvent removed per D-12
+  // (frontend consumers deleted; backend WS handlers still handle these types).
+  | IdentityWakeupsEvent
+  | IdentityWakeupUpdatedEvent
+  // Phase 72 Plan 01: identity-scope create/delete parity-gap closure.
+  // Phase 134 Plan 134-02: role-scope wakeup CRUD variants retired
+  // (IdentityRoleWakeupsEvent + IdentityRoleWakeupUpdatedEvent +
+  // IdentityRoleWakeupCreatedEvent + IdentityRoleWakeupDeletedEvent).
+  | IdentityWakeupCreatedEvent
+  | IdentityWakeupDeletedEvent
+  // Phase 17 relay events — handlers added in plan 17-03; PrettyView's
+  // non-exhaustive switch silently ignores these until then.
+  | RelayOutboundEvent
+  | RelaySendResultEvent
+  | RelayInboundEvent
+  // pv-malformed-jsonl-placeholder-bubble (2026-08-10)
+  | MalformedLineEvent
+  | CompactionEvent
+  | CompactionGuidanceEvent
+  // Phase 50 Plan 02 (D-15 + D-21) — signal-driven send-path watchdog frames
+  | PasteSendFailedEvent
+  | SendKeysErrorEvent
+  | CommandRefusedEvent
+  // WaitingBubble Allow / Deny
+  | PermissionPromptStateEvent
+  | PermissionAnswerResultEvent
+  // Phase 47 (load-more button) — response to FetchOlderRangePayload
+  | FetchOlderRangeBatchEvent
+  // shape-interrupt-button
+  | MessagesHiddenEvent
+  | MessagesUnhiddenEvent
+  | InterruptResultEvent;
+
+export type ConnectToPanePayload = {
+  type: "connectToPane";
+  hostId: number;
+  tmuxSession: string;
+  /** Open an archived agent's conversation, view-only (`tmuxSession` = its name). */
+  archived?: boolean;
+};
+
+/** An archived agent's look, read by the server from its archived identity file. */
+export type ArchivedIdentityLook = {
+  identityKey: string;
+  hostId: number;
+  displayName: string;
+  title: string | null;
+  colorHue: number | null;
+  voice: string | null;
+  task: string | null;
+  role: string | null;
+  roles: string[];
+  /** Roles whose own folder is archived — shown as plain text, not links. */
+  archivedRoles: string[];
+  roleDisplayNames: Record<string, string | null>;
+  /** The single live role's picture, or "". */
+  avatarUrl: string;
+};
+
+/**
+ * Where an agent's folder is, as the server sees it: on an archived
+ * conversation (`connectToPane` with `archived: true`) it opens with this
+ * frame; a live conversation gets `state: "archived"` when its agent has been
+ * archived. `noHistory` = archived, but no history was kept.
+ */
+export type ArchivedStateEvent = {
+  type: "archived_state";
+  state: "live" | "archived" | "gone";
+  look?: ArchivedIdentityLook;
+  noHistory?: boolean;
+};
+
+// Phase 14 Wave 2 — client -> server payloads for the aside subsystem.
+//
+// AsideArmPayload — client -> server. Sent by PrettyView on the
+// `isIdle:false -> true` transition when `pvIdentity !== null` (per
+// CONTEXT.md § Trigger — locked 2026-07-26). This is the SOLE trigger
+// source for the backend's /btw injection: the backend does NOT observe
+// the terminal WSS's `type:"idle"` signal (the two WSSes live on separate
+// ports with no shared state). The frontend gates identity BEFORE
+// emitting; the backend accepts any aside_arm for a connected pretty-view
+// WS without checking identity. No payload beyond the type tag — the
+// backend derives hostId + tmuxSession from the connection's own captured
+// state (set during connectToPane). Ref: ASIDE-01.
+export type AsideArmPayload = {
+  type: "aside_arm";
+};
+
+// NarrationWatchPayload — client -> server. Whether this view is showing the
+// work indicator right now; narration calls only run while some view is.
+export type NarrationWatchPayload = {
+  type: "narration_watch";
+  active: boolean;
+};
+
+// AsideDismissedPayload — client -> server. Sent when user clicks the X
+// (Resume) affordance on the ComposeBox. hostId + tmuxSession are
+// informational for cross-tab-broadcast targeting; per T-14-02-01
+// mitigation, the backend does NOT trust these fields for send-keys
+// routing — it uses the connection's own captured currentHostId /
+// currentTmuxSession (set at connectToPane discovery, validated against
+// the pane's actual SSH context). Ref: ASIDE-07.
+export type AsideDismissedPayload = {
+  type: "aside_dismissed";
+  hostId: number;
+  tmuxSession: string;
+};
+
+/**
+ * Phase 47 (load-more button) — client → server request payload.
+ *
+ * Sent by PrettyView when the user clicks the LoadMoreOlderButton. The
+ * client asks the server to read a bounded slice of older JSONL lines
+ * ending just BEFORE `beforeLine` (exclusive) — i.e. the server returns
+ * lines `[max(1, beforeLine - count), beforeLine - 1]` inclusive.
+ *
+ * LINE-CURSOR SHAPE (locked 2026-08-20, revised from eventId-cursor after
+ * checker feedback): the server does NOT search for a cursor eventId in
+ * the JSONL. An eventId-cursor would require scanning up to totalLines
+ * of the file to find the matching line, which contradicts the range
+ * reader's 200-line hard cap and would crash on any session larger than
+ * 200 lines. The line-cursor shape lets the handler do exactly ONE
+ * bounded `readSessionFileRange` call per request.
+ *
+ * See CONTEXT.md § What this is / § Shape rationale in
+ * .planning/phases/47-.../47-CONTEXT.md.
+ */
+export type FetchOlderRangePayload = {
+  // LOCKED: type tag must NOT be "fetch_older" — see
+  // PrettyView.hydration-cap.test.tsx Test H
+  type: "fetch_older_range";
+  /**
+   * Line-number of the client's OLDEST currently-visible message; the
+   * server reads lines `[max(1, beforeLine - count), beforeLine - 1]`
+   * inclusive. 1-indexed to match `sed -n '2,4p'` semantics.
+   */
+  beforeLine: number;
+  /**
+   * Number of older lines to fetch. Caller MUST pass 20 per CONTEXT.md
+   * § Scope edges batch-size lock; server also clamps in [1, 200] with
+   * a hard cap for defense-in-depth (see
+   * session-file-range-reader.readSessionFileRange).
+   */
+  count: number;
+};
+
+// Patch #17g/#92: identity artifact WS wire types.
+// Phase 89 Plan 05: history + handoff frontend wire types removed per D-12 —
+// frontend consumers deleted; backend WS handlers still handle these types for now.
+//
+//   client -> server (post-Phase-89-Plan-05):
+//     { type: "identity:get-identity-file", identityKey: string, hostId: number }
+//     { type: "identity:list-wakeups", identityKey: string, hostId: number }
+//     // Phase 18 / IDMEDIT-06: markdown write surfaces (full-overwrite, tmp+rename atomic):
+//     { type: "identity:update-identity-file", identityKey: string, hostId: number, contents: string }
+//
+//   server -> client (post-Phase-89-Plan-05):
+//     { type: "identity:identity-file", markdown: string, error?: string }
+//     { type: "identity:wakeups", wakeups: Wakeup[], error?: string }
+//     // Phase 18 / IDMEDIT-06: post-write echo:
+//     { type: "identity:identity-file-updated", markdown: string, error?: string }
+//
+// hostId is the pane's SSH host id — backend uses it to route reads to the pane's box
+// (or falls back to the local bind-mount when the hostId is in IDENTITIES_LOCAL_HOST_IDS).
+
+export type IdentityGetIdentityFilePayload = {
+  type: "identity:get-identity-file";
+  identityKey: string;
+  /** patch #92: pane's SSH host id — backend routes reads to the pane's box. */
+  hostId: number;
+  /** Read the archived agent's file (~/fleet/identities-archive/<key>/). */
+  archived?: boolean;
+};
+export type IdentityIdentityFileEvent = { type: "identity:identity-file"; markdown: string; error?: string };
+
+// Phase 22 SRIC-06 / Plan 22-06: role-file WS wire types.
+//
+// Byte-shape mirror of the identity-file pair above. Backend does the two-step
+// (identity file → role: frontmatter → open ~/fleet/roles/<role>/<role>.md);
+// the frontend contract stays (identityKey, hostId) — role name never crosses
+// the wire, per D-CONTEXT § "Backend does the two-step" lock.
+//
+// hostId is required on read and write — the backend rejects a hostless
+// request ("hostId is required"); there is no local bind-mount fallback.
+
+export type IdentityGetRoleFilePayload = {
+  type: "identity:get-role-file";
+  identityKey: string;
+  /** Pane's SSH host id — backend routes reads to the pane's box. Required. */
+  hostId: number;
+};
+export type IdentityRoleFileEvent = { type: "identity:role-file"; markdown: string; error?: string };
+
+// History + Handoff wire types removed 2026-09-08 per Phase 89 Plan 05 D-12 —
+// frontend consumers deleted; backend WS handlers still handle these types for
+// now (deliberate: no backend removal per D-12 scope).
+
+// Patch #154: Wakeup gains `slug` (filename stem — the address the update
+// path uses) and raw `schedule` (unknown — so the modal renders + edits it
+// without a wire-side re-humanization round-trip). Existing consumers get
+// a superset; nothing they read went away.
+export type Wakeup = {
+  slug: string;
+  name: string;
+  enabled: boolean;
+  scheduleHuman: string;
+  schedule: unknown;
+  instruction: string;
+  /** Epoch seconds of the last real fire; null = never fired. Optional on
+   *  the wire so an older backend's rows still type-check. */
+  lastFiredAt?: number | null;
+  /** Sensor-triggered wake-ups only; null/absent for clock schedules. */
+  sensor?: SensorStatus | null;
+  /** Switched on and still able to fire — what archiving the agent ends. */
+  canFireAgain?: boolean;
+};
+export type IdentityListWakeupsPayload = {
+  type: "identity:list-wakeups";
+  identityKey: string;
+  /** patch #92: pane's SSH host id — backend routes reads to the pane's box. */
+  hostId: number;
+  /** Read the archived agent's wake-ups. */
+  archived?: boolean;
+  /** A failed read replies with `error` rather than an empty list (the
+   *  archive check, which must say when it couldn't check). */
+  strict?: boolean;
+};
+
+/** An archived agent's conversation apps (view-only window). */
+export type IdentityListArchivedAppsPayload = {
+  type: "identity:list-archived-apps";
+  identityKey: string;
+  hostId: number;
+};
+
+export type ArchivedConversationApp = {
+  slug: string;
+  title: string;
+  description: string | null;
+  iconDataUrl: string | null;
+};
+
+export type IdentityArchivedAppsEvent = {
+  type: "identity:archived-apps";
+  apps: ArchivedConversationApp[];
+  error?: string;
+};
+export type IdentityWakeupsEvent = { type: "identity:wakeups"; wakeups: Wakeup[]; error?: string };
+
+// Patch #154: identity mutation wire types. Both are one-shot request/response
+// like the read handlers — client opens a WS, sends the update, receives the
+// FRESH list, closes. Fresh-list-in-response saves a follow-up read round-trip
+// and gives the modal an atomic swap.
+//
+// Quick 260731-2pa: `IdentityUpdateWakeupPayload.updates` widened to also
+// carry `name?: string` and `instruction?: string` — the form-based editor
+// in WakeupsTab.tsx writes the full spec on Save (all four fields), so the
+// wire type has to allow all four. Backend server + WakeupUpdate type mirror
+// the widening.
+
+export type IdentityUpdateWakeupPayload = {
+  type: "identity:update-wakeup";
+  identityKey: string;
+  hostId: number;
+  /** folder name of wakeups/<slug>/wakeup.json — regex-validated on the server. */
+  wakeupSlug: string;
+  updates: {
+    enabled?: boolean;
+    schedule?: unknown;
+    // Quick 260731-2pa: `name` (non-empty string) and `instruction` (string)
+    // added — form-based wakeup editor writes the full spec on Save.
+    name?: string;
+    instruction?: string;
+  };
+};
+export type IdentityWakeupUpdatedEvent = {
+  type: "identity:wakeup-updated";
+  wakeups: Wakeup[];
+  error?: string;
+};
+
+// ─── Phase 72 Plan 01: identity-scope wakeup create/delete parity-gap closure ─
+//
+// Two wire type pairs close the identity-scope parity gap (create + delete
+// for identity-scope wakeups, which today only supports list + update):
+//   - identity:create-wakeup / identity:wakeup-created (create)
+//   - identity:delete-wakeup / identity:wakeup-deleted (delete)
+//
+// Both events echo the FRESH {wakeups} list on success so the client can
+// atomically re-render without a follow-up read (same convention as
+// IdentityWakeupUpdatedEvent).
+//
+// Phase 134 Plan 134-02: the four role-scope wire type pairs that once lived
+// alongside these (identity:{list,update,create,delete}-role-wakeup +
+// identity:role-wakeup{s,-updated,-created,-deleted}) have been retired
+// top-to-bottom.
+
+/** Shared wire-side shape for the create-wakeup payloads. Mirror of the
+ *  backend WakeupSpec type. Slug is derived server-side from `name` via
+ *  kebab-case normalization — client does NOT compute it. */
+export type WakeupSpecWire = {
+  name: string;
+  enabled: boolean;
+  schedule: unknown;
+  instruction: string;
+};
+
+// ─── identity-scope wakeup CRUD parity-gap closure ─────────────────────
+
+export type IdentityCreateWakeupPayload = {
+  type: "identity:create-wakeup";
+  identityKey: string;
+  hostId: number;
+  spec: WakeupSpecWire;
+};
+export type IdentityWakeupCreatedEvent = {
+  type: "identity:wakeup-created";
+  wakeups: Wakeup[];
+  error?: string;
+};
+
+export type IdentityDeleteWakeupPayload = {
+  type: "identity:delete-wakeup";
+  identityKey: string;
+  hostId: number;
+  wakeupSlug: string;
+};
+export type IdentityWakeupDeletedEvent = {
+  type: "identity:wakeup-deleted";
+  wakeups: Wakeup[];
+  error?: string;
+};
+
+// Phase 18 / IDMEDIT-06: markdown write wire types.
+//
+// Contents carries the FULL FILE — Save is a full-overwrite on the markdown
+// side, not a diff or patch (D-IDMEDIT-01/02/03 shape lock). The *-updated
+// echo carries the confirmed post-write markdown or entries so the client
+// rehydrates from server-side truth rather than trusting its own draft.
+//
+// The server caps contents at IDMEDIT_MAX_MARKDOWN_BYTES = 2_000_000 UTF-8
+// bytes (2MB). Oversized payloads are rejected before SFTP is opened — the
+// error surfaces via the *-updated event's error field.
+
+export type IdentityUpdateIdentityFilePayload = {
+  type: "identity:update-identity-file";
+  identityKey: string;
+  /** Pane SSH host id — backend uses it to route writes to the pane's box. */
+  hostId: number;
+  /** UTF-8 markdown payload (full-overwrite). Server caps at IDMEDIT_MAX_MARKDOWN_BYTES (2MB). */
+  contents: string;
+};
+export type IdentityIdentityFileUpdatedEvent = {
+  type: "identity:identity-file-updated";
+  /** Server-echoed confirmed markdown post-write; source of truth for client rehydrate. */
+  markdown: string;
+  error?: string;
+};
+
+// Phase 22 SRIC-06 / Plan 22-06: role-file update wire types. Byte-shape mirror
+// of the identity-file update pair above. Backend does the two-step; frontend
+// contract stays (identityKey, hostId, contents). Same byte cap
+// (IDMEDIT_MAX_MARKDOWN_BYTES = 2MB) enforced server-side.
+
+export type IdentityUpdateRoleFilePayload = {
+  type: "identity:update-role-file";
+  identityKey: string;
+  /** Pane SSH host id — backend uses it to route writes to the pane's box. */
+  hostId: number;
+  /** UTF-8 markdown payload (full-overwrite of ~/fleet/roles/<role>/<role>.md). */
+  contents: string;
+};
+export type IdentityRoleFileUpdatedEvent = {
+  type: "identity:role-file-updated";
+  /** Server-echoed confirmed markdown post-write; source of truth for client rehydrate. */
+  markdown: string;
+  error?: string;
+};
+
+// Phase 90 Plan 90-03: role-name-keyed companion of the pair above. Consumed
+// by the RoleModal (Plan 90-04) which has no identity context. D-08.3
+// planner-pick — companion wire type rather than "frontend synthesizes an
+// identityKey" fallback.
+
+export type RoleUpdateFilePayload = {
+  type: "role:update-file";
+  roleName: string;
+  /** Backend SSH host id. Required — the backend rejects a hostless write. */
+  hostId: number;
+  /** UTF-8 markdown payload (full-overwrite of ~/fleet/roles/<roleName>/<roleName>.md). */
+  contents: string;
+};
+export type RoleFileUpdatedEvent = {
+  type: "role:file-updated";
+  /** Server-echoed confirmed markdown post-write (via readRoleFileByName). */
+  markdown: string;
+  error?: string;
+};
+
+/**
+ * Phase 47 (load-more button) — server → client response event.
+ *
+ * Emitted in reply to a FetchOlderRangePayload. Carries a bounded batch
+ * of raw parsed per-turn wire frames drawn from the underlying JSONL
+ * session file. Every element in `messages` carries the widened
+ * `line?: number` field (populated by Plan 03) so the client can advance
+ * its `oldestLoadedLine` cursor to the smallest returned line.
+ *
+ * Success path: `messages` is non-empty (or empty when
+ * `beforeLine <= 1`), `oldestLine = max(1, beforeLine - count)`,
+ * `hasMore = oldestLine > 1`, `error` absent.
+ *
+ * Failure path: `messages: []`, `oldestLine: 0`, `hasMore: false`, and
+ * `error: "..."`. When `error` is set, the client MUST IGNORE
+ * `messages` / `oldestLine` / `hasMore` and drive the button's error
+ * state variant (the client-side gate is the `error` field itself, not
+ * the numeric field values).
+ *
+ * See CONTEXT.md § Shape / § What would make it wrong in
+ * .planning/phases/47-.../47-CONTEXT.md.
+ */
+export type FetchOlderRangeBatchEvent = {
+  // LOCKED: type tag must NOT be "fetch_older_batch" — see
+  // PrettyView.hydration-cap.test.tsx Test H
+  type: "fetch_older_range_batch";
+  /**
+   * The batch of per-turn wire frames the server read from the JSONL
+   * range. Every element carries the widened `line?: number` field
+   * (populated by Plan 03) so the client can advance its
+   * `oldestLoadedLine`. Union mirrors PrettyView.tsx's `StreamEvent`
+   * type (L190-195) — the same set of per-turn frames the streaming
+   * tail emits.
+   */
+  messages: (
+    | MessageEvent
+    | ImageEvent
+    | RelayOutboundEvent
+    | RelaySendResultEvent
+    | RelayInboundEvent
+    | MalformedLineEvent
+    | CompactionEvent
+    | CompactionGuidanceEvent
+  )[];
+  /**
+   * The line-number of the oldest frame in this batch. Plan 04's client
+   * uses this to advance `oldestLoadedLine` for the next click's
+   * `beforeLine`. Equal to `max(1, beforeLine - count)` on the server.
+   */
+  oldestLine: number;
+  /**
+   * Server-reported "there are still older lines behind this batch"
+   * (i.e. `oldestLine > 1`). Drives the button's post-response
+   * visibility — `false` unmounts the button.
+   */
+  hasMore: boolean;
+  /**
+   * Present ONLY on failure; drives the error state variant in Plan
+   * 02's LoadMoreOlderButton. On failure Plan 03 emits
+   * `messages: [], oldestLine: 0, hasMore: false, error: "..."` — the
+   * client's gate is the `error` field itself.
+   */
+  error?: string;
+};
+
+// ─── Phase 104 Plan 02: batched trapped-work probe (D-03 wire mirror) ────────
+//
+// Single one-shot request/response: client opens WS, sends one
+// identity:probe-trapped-work frame carrying every visible identity's
+// (identityKey, hostId), the server replies with one identity:trapped-work
+// frame carrying per-target {hasTrappedWork} booleans (or an error field per
+// target), and the client closes the socket.
+//
+// Wire path per D-03: the response uses Promise.allSettled server-side so one
+// dead SSH host cannot block the batch — dead-host entries carry
+// {hasTrappedWork: false, error: string} while other targets still return
+// their live boolean. The per-target error preserves shape uniformity so the
+// frontend store can preserve the last-known snapshot for a failing target
+// rather than clobber to false.
+//
+// D-06 start-absent semantics on the frontend: the store returns `undefined`
+// pre-fetch; both `undefined` and `{hasTrappedWork: false}` render nothing
+// (the indicator only appears on strict `=== true`).
+//
+//   client -> server:
+//     { type: "identity:probe-trapped-work", targets: [{identityKey, hostId}, ...] }
+//
+//   server -> client:
+//     { type: "identity:trapped-work", results: [{identityKey, hostId, hasTrappedWork, error?}, ...] }
+//
+// hostId must be a positive host id; a null hostId gets a per-target
+// {error:"hostId is required"} (no local bind-mount fallback).
+
+export type TrappedWorkTarget = {
+  identityKey: string;
+  hostId: number | null;
+};
+
+export type IdentityProbeTrappedWorkPayload = {
+  type: "identity:probe-trapped-work";
+  targets: TrappedWorkTarget[];
+};
+
+export type TrappedWorkResult = {
+  identityKey: string;
+  hostId: number | null;
+  hasTrappedWork: boolean;
+  error?: string;
+};
+
+export type IdentityTrappedWorkEvent = {
+  type: "identity:trapped-work";
+  results: TrappedWorkResult[];
+};
+
+/**
+ * Fire a one-shot batched trapped-work probe. Opens its own WS, sends one
+ * identity:probe-trapped-work frame on open, resolves on the first matching
+ * identity:trapped-work response, then closes the socket (Phase 104 D-03).
+ *
+ * Rejects on onerror / onclose-before-response with "Connection failed" so
+ * callers can distinguish transport failures from per-target errors (the
+ * latter surface in individual results[i].error fields).
+ */
+export function probeIdentityTrappedWork(
+  targets: TrappedWorkTarget[],
+): Promise<IdentityTrappedWorkEvent> {
+  return new Promise((resolve, reject) => {
+    let responded = false;
+    const sock = openClaudeSessionSocket();
+    sock.onopen = () => {
+      const payload: IdentityProbeTrappedWorkPayload = {
+        type: "identity:probe-trapped-work",
+        targets,
+      };
+      try {
+        sock.send(JSON.stringify(payload));
+      } catch {
+        /* ws may be mid-close */
+      }
+    };
+    sock.onmessage = (event: MessageEvent<string>) => {
+      if (responded) return;
+      try {
+        const raw = JSON.parse(event.data) as { type?: string };
+        if (raw.type !== "identity:trapped-work") return; // ignore unrelated frames
+        responded = true;
+        resolve(raw as IdentityTrappedWorkEvent);
+        try {
+          sock.close();
+        } catch {
+          /* ignore */
+        }
+      } catch {
+        /* ignore parse errors — wait for a valid frame */
+      }
+    };
+    const handleFail = () => {
+      if (responded) return;
+      responded = true;
+      reject(new Error("Connection failed"));
+    };
+    sock.onerror = handleFail;
+    sock.onclose = () => {
+      if (!responded) handleFail();
+    };
+  });
+}
+
+/**
+ * Phase 90 Plan 90-03 (D-08.3): fire a one-shot role-file update request keyed
+ * on roleName (NOT identityKey). Byte-shape mirror of the identity-keyed
+ * updateRoleFile helper inlined in IdentityModal (L1000+) — same
+ * openClaudeSessionSocket + send-on-open + resolve-on-matching-response +
+ * close-after-response pattern probeIdentityTrappedWork uses above.
+ *
+ * The role modal (Plan 90-04) has no identity context, so this helper is the
+ * clean save path for role-file cosmetic edits. Resolves with `{markdown}` on
+ * success (server-echoed post-write body via readRoleFileByName); throws
+ * `Error(env.error)` if the response envelope carries `error`.
+ */
+export function updateRoleFileByName(
+  roleName: string,
+  hostId: number,
+  contents: string,
+): Promise<{ markdown: string }> {
+  return new Promise((resolve, reject) => {
+    let responded = false;
+    const sock = openClaudeSessionSocket();
+    sock.onopen = () => {
+      const payload: RoleUpdateFilePayload = {
+        type: "role:update-file",
+        roleName,
+        hostId,
+        contents,
+      };
+      try {
+        sock.send(JSON.stringify(payload));
+      } catch {
+        /* ws may be mid-close */
+      }
+    };
+    sock.onmessage = (event: MessageEvent<string>) => {
+      if (responded) return;
+      try {
+        const raw = JSON.parse(event.data) as { type?: string };
+        if (raw.type !== "role:file-updated") return; // ignore unrelated frames
+        responded = true;
+        const env = raw as RoleFileUpdatedEvent;
+        try {
+          sock.close();
+        } catch {
+          /* ignore */
+        }
+        if (env.error) {
+          reject(new Error(env.error));
+        } else {
+          resolve({ markdown: env.markdown });
+        }
+      } catch {
+        /* ignore parse errors — wait for a valid frame */
+      }
+    };
+    const handleFail = () => {
+      if (responded) return;
+      responded = true;
+      reject(new Error("Connection failed"));
+    };
+    sock.onerror = handleFail;
+    sock.onclose = () => {
+      if (!responded) handleFail();
+    };
+  });
+}
+
+// ─── Phase 90 Plan 90-09: role-name-keyed WS one-shots ─────────────────────
+//
+// Byte-shape mirrors of updateRoleFileByName above — one-shot open →
+// send-on-open → resolve on matching response envelope → close socket.
+// Backend handlers for these wire types shipped in Plan 90-07.
+// Consumers (RoleModal + RoleBountiesTab + RoleCosmeticEditBlock) landed in
+// Plan 90-10 and use these instead of the earlier identity-keyed reads.
+//
+// Wire type / response type pairs:
+//   role:get-file        {roleName, hostId}                        -> role:file-loaded     {markdown, error?}
+//   role:list-bounties   {roleName, hostId?, includeArchived?}     -> role:bounties-loaded {bounties, archivedBounties, error?}
+//
+// Phase 134 Plan 134-02: the four role-scope wakeup CRUD wire types
+// (role:{list,create,update,delete}-wakeup + role:wakeup{s-loaded,-created,-updated,-deleted})
+// have been retired top-to-bottom.
+
+export type RoleGetFilePayload = {
+  type: "role:get-file";
+  roleName: string;
+  /** Backend SSH host id. Required — the backend rejects a hostless read. */
+  hostId: number;
+};
+export type RoleFileLoadedEvent = {
+  type: "role:file-loaded";
+  markdown: string;
+  error?: string;
+};
+
+// Phase 134 Plan 134-02 retired role-scope wakeup wire types
+// (RoleListWakeupsPayload / RoleWakeupsLoadedEvent / RoleCreateWakeupPayload /
+// RoleWakeupCreatedEvent / RoleUpdateWakeupPayload / RoleWakeupUpdatedEvent /
+// RoleDeleteWakeupPayload / RoleWakeupDeletedEvent).
+// Phase 136 retired the role-scope bounty wire types
+// (RoleListBountiesPayload / RoleBountiesLoadedEvent).
+
+/**
+ * Read ~/fleet/roles/<roleName>/<roleName>.md. Resolves `{markdown}` on
+ * success; rejects with `Error(env.error)` if the envelope carries `error`
+ * (e.g. invalid roleName, host-not-found).
+ */
+export function getRoleFileByName(args: {
+  roleName: string;
+  hostId: number;
+}): Promise<{ markdown: string }> {
+  return new Promise((resolve, reject) => {
+    let responded = false;
+    const sock = openClaudeSessionSocket();
+    sock.onopen = () => {
+      const payload: RoleGetFilePayload = {
+        type: "role:get-file",
+        roleName: args.roleName,
+        hostId: args.hostId,
+      };
+      try {
+        sock.send(JSON.stringify(payload));
+      } catch {
+        /* ws may be mid-close */
+      }
+    };
+    sock.onmessage = (event: MessageEvent<string>) => {
+      if (responded) return;
+      try {
+        const raw = JSON.parse(event.data) as { type?: string };
+        if (raw.type !== "role:file-loaded") return;
+        responded = true;
+        const env = raw as RoleFileLoadedEvent;
+        try {
+          sock.close();
+        } catch {
+          /* ignore */
+        }
+        if (env.error) {
+          reject(new Error(env.error));
+        } else {
+          resolve({ markdown: env.markdown });
+        }
+      } catch {
+        /* ignore parse errors */
+      }
+    };
+    const handleFail = () => {
+      if (responded) return;
+      responded = true;
+      reject(new Error("Connection failed"));
+    };
+    sock.onerror = handleFail;
+    sock.onclose = () => {
+      if (!responded) handleFail();
+    };
+  });
+}
+
+// Phase 136 retired listBountiesForRoleName.
+// Phase 134 Plan 134-02 retired the four role-scope wakeup helpers
+// (listRoleWakeupsByName, createRoleWakeupByName, updateRoleWakeupByName,
+// deleteRoleWakeupByName) alongside their payload/event type declarations
+// above. The per-identity wakeup helpers + WakeupSpecWire type stay live.
+

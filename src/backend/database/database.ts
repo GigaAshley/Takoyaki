@@ -1,0 +1,2633 @@
+import express from "express";
+import http from "http";
+import bodyParser from "body-parser";
+import multer from "multer";
+import cookieParser from "cookie-parser";
+import { createSubdomainDispatchMiddleware } from "../serve-url/subdomain-dispatch.js";
+import { serveUrlHandler } from "../serve-url/serve-route.js";
+import userRoutes from "./routes/users.js";
+import hostRoutes from "./routes/host.js";
+import alertRoutes from "./routes/alerts.js";
+import credentialsRoutes from "./routes/credentials.js";
+import snippetsRoutes from "./routes/snippets.js";
+import c2sTunnelPresetRoutes from "./routes/c2s-tunnel-presets.js";
+import terminalRoutes from "./routes/terminal.js";
+import guacamoleRoutes from "../guacamole/routes.js";
+import networkTopologyRoutes from "./routes/network-topology.js";
+import rbacRoutes from "./routes/rbac.js";
+import openTabsRoutes from "./routes/open-tabs.js";
+import identitiesRoutes from "./routes/identities.js";
+import appsRoutes from "./routes/apps.js";
+// app-archive shape: POST /apps/:hostId/:slug/archive drops `.archive-requested`
+// on the app folder via the per-app-file primitive. Mirrors identity-archive
+// and role-archive mount discipline (mounted before the generic /apps router).
+import appsArchiveRoutes from "./routes/apps-archive.js";
+// Phase 143 Plan 143-03 (D-05/D-07): GET /apps-archive — fleet-wide list of
+// archived app slugs across the caller's own hosts. Mirrors the fan-out shape
+// of identities-archive-list.ts, substituting listArchivedAppsOnHost (plan 143-02).
+import appsArchiveListRoutes from "./routes/apps-archive-list.js";
+// Phase 143 Plan 143-04 (D-01): POST /apps/:hostId/:slug/unarchive — drops
+// .unarchive-requested sentinel inside the archive folder after two fast-path
+// preconditions (archive-exists, name-collision). Mounted AFTER appsArchiveRoutes
+// under "/apps" — POST sub-paths are distinct so no handler shadowing occurs.
+import appsUnarchiveRoutes from "./routes/apps-unarchive.js";
+// app-rename shape: PATCH /apps/:hostId/:slug — rewrites app.json `title`.
+import appsRenameRoutes from "./routes/apps-rename.js";
+// project-scoped apps: POST /apps/:hostId/:slug/move — "Move to" on any app
+// (sidebar or a project); the agent-supervisor carries it out.
+import appsMoveRoutes from "./routes/apps-move.js";
+// Phase 120 Plan 05 (D-08): the /apps/:hostId/:slug/pane/* reverse-proxy
+// route. Named export (not default) to disambiguate from Phase 119's
+// default-exported apps router at the mount site below.
+import {
+  appPaneRouter,
+  handleAppPaneUpgrade,
+} from "../apps/app-pane-router.js";
+// Phase 137 Plan 03 Task 2: combined upgrade dispatcher — routes
+// /apps/*/pane/* before destroying any non-matching upgrade socket
+// (RESEARCH Pitfall 6).
+import { combinedPaneUpgradeDispatcher } from "./combined-pane-upgrade-dispatcher.js";
+// @types/node types http.Server's `upgrade` callback socket as `Duplex`,
+// but the runtime object is a `net.Socket` and downstream (proxy-middleware,
+// ws) is typed against `Socket`. Import the type here purely to cast at the
+// call site below — mirrors the sibling pattern in
+// src/backend/apps/tests/app-pane-router.integration.test.ts:200.
+import type { Socket as NetSocket } from "node:net";
+import identityAvatarBatchRoutes from "./routes/identity-avatar-batch.js";
+import identityExistsOnHostRoutes from "./routes/identity-exists-on-host.js";
+import identityNoDormancyRoutes from "./routes/identity-no-dormancy.js";
+import identityPinRoutes from "./routes/identity-pin.js";
+// Phase 115 Plan 115-03 (D-17): user-initiated archive — POST
+// /identities/:key/archive drops the `.archive-requested` sentinel on the
+// identity's host. Mounted BEFORE the generic /identities router so the
+// :key/archive sub-route isn't intercepted by the generic /:identityKey handler.
+import identityArchiveRoutes from "./routes/identity-archive.js";
+import identityCondenseRoutes from "./routes/identity-condense.js";
+// Phase 143 Plan 143-04 (D-01/D-02/D-03/D-04): POST /identities/:key/unarchive
+// drops `.unarchive-requested` inside `~/fleet/identities-archive/<key>/` after
+// three fast-path preconditions (archive-exists, name-collision, all-roles-live).
+// Mounted alongside identity-archive; coexists under "/identities" because the
+// POST sub-paths are distinct (:key/archive vs :key/unarchive).
+import identityUnarchiveRoutes from "./routes/identity-unarchive.js";
+// Phase 143 Plan 143-03 (D-05/D-06/D-07): GET /identities-archive — fleet-wide
+// list of archived identity keys across the caller's own hosts. Exposes the
+// existing listArchivedIdentityKeysOnHost primitive as an HTTP surface.
+import identitiesArchiveListRoutes from "./routes/identities-archive-list.js";
+// Phase 122 Plan 122-02: POST /conversation-search — content-grep across the
+// caller's SSH+autoTmux hosts (live + archive identity trees), snippet-windowed
+// results sorted mtime-desc, offset/limit paginated. Backing route file:
+// ./routes/conversation-search.ts. Mount is a standalone base path (no
+// overlap with /identities or /sessions).
+import conversationSearchRoutes from "./routes/conversation-search.js";
+// Phase 117 Plan 117-05 (D-05, D-31, D-36a, D-37): user-initiated project
+// membership write — POST /identities/:key/project writes (or clears)
+// the `project:` frontmatter field on the identity's markdown file via
+// writeSessionProjectField (117-01). Mounted alongside the sibling
+// /:key/archive sub-route BEFORE the generic /identities router.
+import sessionProjectWriteRoutes from "./routes/session-project-write.js";
+import identityBirthRoutes from "./routes/identity-birth.js";
+import matrixAdminRoutes from "../matrix/matrix-admin-routes.js";
+// /push-subscriptions router — Telegram notification setup.
+// Backing route file: ./routes/push-subscriptions.ts.
+import pushSubscriptionsRoutes from "./routes/push-subscriptions.js";
+// Phase 80 Plan 04: pool-name picker router — mounted at /identities/pool
+// alongside the other /identities/xxx sub-routers, BEFORE the generic
+// /identities mount (see mount block comment for landmine detail).
+import identityPoolRoutes from "../pool/pool-routes.js";
+import rolesListForHostRoutes from "./routes/roles-list-for-host.js";
+import rolesCreateRoutes from "./routes/roles-create.js";
+// Phase 90 Plan 90-02 (D-08.2): GET /roles/:name/avatar?hostId=<n> — role
+// avatar serve endpoint. Mounted at the same /roles base as the list +
+// create routers; the depth difference (`/` vs `/:name/avatar`) keeps them
+// from colliding under Express's chained-router mount.
+import rolesRoutes from "./routes/roles.js";
+// Phase 133 Plan 133-01 (D-01, D-05, D-16, D-19): user-initiated role archive
+// endpoint — POST /roles/:name/archive drops `.archive-requested` on the role
+// folder via the per-role-file primitive. Mounted BEFORE the three existing
+// /roles routers so /:name/archive isn't shadowed by any future generic
+// /:roleName handler (mirrors the identity-archive mount discipline).
+import roleArchiveRoutes from "./routes/role-archive.js";
+// Phase 143 Plan 143-04 (D-01/D-02/D-03/D-04): POST /roles/:name/unarchive
+// drops `.unarchive-requested` inside `~/fleet/roles-archive/<name>/` after two
+// fast-path preconditions (archive-exists, name-collision). Coexists with
+// role-archive under "/roles" — POST sub-paths distinct (:name/archive vs
+// :name/unarchive).
+import roleUnarchiveRoutes from "./routes/role-unarchive.js";
+// Phase 143 Plan 143-03 (D-05/D-07): GET /roles-archive?hostId=<n> — host-scoped
+// list of archived role names. Mirrors roles-list-for-host.ts shape, substituting
+// listArchivedRolesOnHost (plan 143-02). Standalone base path /roles-archive.
+import rolesArchiveListRoutes from "./routes/roles-archive-list.js";
+// Phase 134 Plan 134-01 (wake-ups-redesign campaign shape 2 CRUD API): the
+// two /scheduled-agents routers land as a chained pair — the list router
+// handles GET / fleet-wide fan-out, the write router handles
+// POST/PATCH/DELETE per-host. Matching nginx location blocks live in BOTH
+// docker/nginx.conf AND docker/nginx-https.conf (D-17 — CLAUDE.md
+// load-bearing rule).
+import scheduledAgentsListRoutes from "./routes/scheduled-agents-list.js";
+import scheduledAgentsWriteRoutes from "./routes/scheduled-agents-write.js";
+import globalFilesListRoutes from "./routes/global-files.js";
+import globalFilesReadWriteRoutes from "./routes/global-files-read-write.js";
+// Phase 44 SKILLED-01: /skills-editor router — 7 endpoints
+// (list-skills / list-files / read / write / create / delete-file /
+// delete-skill) for editing skill folders on managed hosts. Mount + nginx
+// block sit alongside the /global-files pair; router owns its own
+// path-safety gate (SKILL_NAME_RE + isSafeRelativePath + prefix
+// assertion + shellEscape) — no operator whitelist.
+import skillsEditorRoutes from "./routes/skills-editor.js";
+import instanceWideRoutes from "./routes/instance-wide.js";
+import instanceFileRoutes from "./routes/instance-file.js";
+// /document-convert: LibreOffice converter sidecar front door (file viewers).
+import documentConvertRoutes from "./routes/document-convert.js";
+// /role-skills-editor router (Phase 89) — list / create / rename / delete role skills and read / write / create / delete their files on managed hosts. Mount + nginx block sit alongside the /skills-editor pair.
+import roleSkillsEditorRoutes from "./routes/role-skills-editor.js";
+// Phase 118 Plan 118-01 (D-04, D-16, D-17, D-19, D-20, D-21, D-22): /workspace CRUD router — 9 endpoints (list, read-file, write-file, delete, rename, mkdir, create-file, upload, download) for browsing the identity workspace on any user-accessible host via SFTP. Matching nginx location blocks in BOTH docker/nginx.conf AND docker/nginx-https.conf per CLAUDE.md nginx caveat (missing in HTTPS conf → /workspace returns index.html and crashes the frontend).
+import workspaceRoutes from "./routes/workspace-routes.js";
+// Read-only git view over identity workspaces (repos / repo / diff). Served under /workspace/git, so the existing /workspace nginx location blocks already cover it.
+import workspaceGitRoutes from "./routes/workspace-git-routes.js";
+import workspaceSearchRoutes from "./routes/workspace-search-routes.js";
+import workspaceDesktopRoutes from "./routes/workspace-desktop-routes.js";
+// Phase 117 Plan 04 (D-25, D-30, D-36a, D-37): /projects router — GET list
+// + POST create + POST :slug/archive. JSON body per D-36a. Backend is
+// authoritative for slug derivation per Pitfall 1.
+import projectListRoutes from "./routes/project-list.js";
+import sharingRoutes from "./routes/sharing.js";
+// Phase 117 Plan 117-05 (D-05, D-05a, D-06, D-36a, D-37): /relay-rooms
+// router — POST /:roomId/project performs the read-modify-write on the
+// Matrix room's m.tag account_data via setRoomProjectTag (117-02).
+// Mounted at plural /relay-rooms to avoid collision with existing
+// /relay-room/create + /relay-room/:roomId/participants under the
+// singular /relay-room base.
+import relayRoomProjectTagRoutes from "./routes/relay-room-project-tag.js";
+// Phase 117 Plan 117-07 (Fix 1 gate / D-05 relay-room carrier): GET
+// /relay-rooms/project-tags — boot-time enumerator that walks the acting
+// user's Matrix rooms and returns every room whose account_data has a
+// `u.project.<slug>` tag. Frontend hydrates roomProjectAssignments at
+// AppShell mount from this endpoint (partial hydration on per-room errors).
+// Mounted at plural /relay-rooms alongside 117-05's project-tag write route.
+import relayRoomProjectTagsListRoutes from "./routes/relay-room-project-tags-list.js";
+// Phase 40 (D-01, D-04): SSRF-hardened proxy for agent-served tailnet URLs —
+// POST /pretty-view/fetch-tailnet-url. Frontend eligibility hook (Plan 40-02)
+// and editor open path (Plan 40-03) both consume this. Threat model
+// T-40-01 (SSRF) / T-40-02 (dir-listing spoof) mitigations enforced INSIDE
+// the route via strict CGNAT regex + path guards + content-type sniff.
+import prettyViewFetchTailnetUrlRoutes from "./routes/pretty-view-fetch-tailnet-url.js";
+import {
+  prettyViewFetchHostFileRoutes,
+  fileUrlRoutes,
+} from "./routes/pretty-view-fetch-host-file.js";
+import messageQueueRoutes from "./routes/message-queue.js";
+import composeDraftsRoutes from "./routes/compose-drafts.js";
+// Phase 85 (D-01, D-05, D-10): send-log POST /stamp — auth-gated backend
+// authority for middle-zone recency signal (called by frontend compose-send
+// funnel on every send-attempt, fire-and-forget). Router owns its own
+// AuthManager JWT middleware chain (no additional middleware wired here).
+// Both of user's devices read from the same store on next fleet-status
+// frame → multi-device consistency without client sync.
+import identitySendLogRoutes from "../fleet-status/identity-send-log-routes.js";
+import attentionRoutes from "../attention/attention-routes.js";
+import sessionsRoutes from "./routes/sessions.js";
+// Phase 90 Plan 04 Task 3 — GET /relay-room/:roomId/participants endpoint.
+// Returns the humans + agents partition for a relay room, classified
+// server-side via the shared participants-classifier module (also used
+// by the /relay-room/websocket/ WS server — W#9 consistency invariant).
+// Matching nginx location blocks land in BOTH docker/nginx.conf AND
+// docker/nginx-https.conf for BOTH the WS path AND this REST path per
+// CLAUDE.md nginx caveat (Pitfall 6).
+import relayRoomCreateRoutes from "./routes/relay-room-create.js";
+import { requireRecentAuth } from "../utils/recent-auth.js";
+import relayRoomParticipantsRoutes from "./routes/relay-room-participants.js";
+import userPreferencesRoutes from "./routes/user-preferences.js";
+import whatsNewRoutes from "./routes/whats-new.js";
+import debugRoutes from "./routes/debug.js";
+import voiceRoutes from "./routes/voice.js";
+import relayPointerRoutes from "./routes/relay-pointer.js";
+// Phase 70 (branding-config): unauthenticated pre-login branding surfaces.
+// Mounts /api/branding, /branding/*, and /manifest.webmanifest. Matching
+// nginx location blocks land in plan 70-02 (BOTH docker/nginx.conf AND
+// docker/nginx-https.conf per CLAUDE.md nginx caveat).
+import brandingRoutes from "../branding/branding-routes.js";
+// Phase 121 (feedback-pipeline): auth-gated feedback intake + enabled-check.
+// Mounts /api/feedback/enabled (GET) and /feedback (POST). Matching nginx
+// location blocks land in plan 121-03 Task 6 (BOTH docker/nginx.conf AND
+// docker/nginx-https.conf per CLAUDE.md nginx caveat).
+import feedbackRoutes from "../feedback/feedback-routes.js";
+import { getBrandedIndexHtml } from "../branding/branding-template.js";
+import { createCorsMiddleware } from "../utils/cors-config.js";
+import fs from "fs";
+import path from "path";
+import os from "os";
+import "dotenv/config";
+import { databaseLogger, apiLogger } from "../utils/logger.js";
+// Phase 111 SKEW-02/SKEW-05: server-side build-id capture + drift-refusal
+// middleware. SERVER_BUILD_ID is read-once at process startup (see
+// server-build-id.ts D-16 contract); the middleware factory captures it at
+// construction time so no per-request env re-reads happen. Boot log +
+// middleware install site are wired below.
+import { getServerBuildId, SERVER_BUILD_ID } from "../config/server-build-id.js";
+import { createSkewLockMiddleware } from "./skew-lock-middleware.js";
+import { AuthManager } from "../utils/auth-manager.js";
+import { DataCrypto } from "../utils/data-crypto.js";
+import { DatabaseFileEncryption } from "../utils/database-file-encryption.js";
+import { DatabaseMigration } from "../utils/database-migration.js";
+import { UserDataExport } from "../utils/user-data-export.js";
+import { AutoSSLSetup } from "../utils/auto-ssl-setup.js";
+import { eq, and } from "drizzle-orm";
+import { parseUserAgent } from "../utils/user-agent-parser.js";
+import { getProxyAgent } from "../utils/proxy-agent.js";
+import {
+  users,
+  hosts,
+  sshCredentials,
+  fileManagerRecent,
+  fileManagerPinned,
+  fileManagerShortcuts,
+  dismissedAlerts,
+  sshCredentialUsage,
+  settings,
+} from "./db/schema.js";
+import type {
+  CacheEntry,
+  GitHubRelease,
+  GitHubAPIResponse,
+  AuthenticatedRequest,
+} from "../../types/index.js";
+import { getDb, DatabaseSaveTrigger } from "./db/index.js";
+import Database from "better-sqlite3";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+
+// Phase 111 SKEW-02: single-shot boot log so operators can grep this line in
+// `docker logs skynet` to confirm the deployed container's build-id matches
+// the expected git commit. Load-bearing for Pitfall 4 (stale-env detection —
+// a "dev-unknown" or wrong-SHA value here means the SKYNET_BUILD_SHA build
+// arg didn't propagate correctly and every fresh client will reload-loop).
+// The getServerBuildId() reference below keeps the getter surface live so
+// downstream WS servers and the guacamole-token issuer that consume it via
+// import don't tree-shake the module out — the const export is what actually
+// backs the header stamp, but the getter is the read-once-contract surface.
+apiLogger.info("Server build id at startup", {
+  operation: "server_boot_build_id",
+  buildId: SERVER_BUILD_ID,
+  // Sanity-check that the const export and the getter agree — cheap
+  // one-shot assertion at boot, no per-request cost.
+  buildIdViaGetter: getServerBuildId(),
+});
+
+app.set("trust proxy", true);
+
+const authManager = AuthManager.getInstance();
+const authenticateJWT = authManager.createAuthMiddleware();
+const requireAdmin = authManager.createAdminMiddleware();
+
+// Phase 103 D-24 mount order: cookieParser + subdomain-dispatch + serveUrlHandler
+// MUST run BEFORE express.json/bodyParser/bodyParser.raw. http-proxy-middleware v4
+// streams the raw request body to the upstream target, so any middleware that
+// consumes the request stream (bodyParser.*) upstream of the proxy truncates
+// POST bodies to zero bytes. cookieParser runs first because it reads
+// req.headers.cookie (header-only, no body consumption) and subdomain-dispatch
+// needs req.cookies to run the JWT check for *.serve.<domain> traffic.
+//
+// These ALSO run before createCorsMiddleware: the D-07 deny in cors-config.ts
+// rejects every *.serve.<domain> origin as the primary domain's CSRF
+// defense, which would otherwise judge tunnel-bound traffic that never touches
+// the primary API. Browsers attach Origin to ES-module script fetches even
+// same-origin, so with CORS first every module request from a dev server behind
+// a serve URL 500s while the HTML shell (no Origin on subresources) loads fine.
+// Serve traffic terminates in serveUrlHandler, so it never reaches the deny;
+// primary-domain traffic falls through both and is judged by CORS unchanged.
+app.use(cookieParser());
+app.use(createSubdomainDispatchMiddleware());
+app.use(serveUrlHandler);
+
+// Phase 120 D-08 pane proxy — MUST run BEFORE bodyParser.* for the SAME
+// reason serveUrlHandler above does: http-proxy-middleware v4 streams the
+// raw request body to the upstream target, so any prior middleware that
+// consumes the request stream (bodyParser.urlencoded is the load-bearing
+// one for SvelteKit form actions) truncates POST bodies to zero bytes
+// while leaving the original Content-Length header intact, and the
+// upstream then waits forever for bytes that never arrive → browser
+// hangs until edge timeout. Cookie parser stays above because
+// authenticateJWT inside the router reads req.cookies.jwt (header-only,
+// no body consumption). Non-matching /apps sub-paths fall through via
+// next() to reach the /apps/:hostId/:slug/icon router mounted later.
+// WebSocket upgrades on this same path shape are handled at the
+// http.Server level via httpServer.on("upgrade", ...) below because
+// router.all catches HTTP methods only, not upgrade events (BLOCKER 6
+// fix, T-120-32).
+app.use("/apps", appPaneRouter);
+
+app.use(createCorsMiddleware());
+
+const uploadsDir = path.join(process.env.DATA_DIR || "./db/data", "uploads");
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, uploadsDir);
+  },
+  filename: (req, file, cb) => {
+    const timestamp = Date.now();
+    cb(null, `${timestamp}-${file.originalname}`);
+  },
+});
+
+const upload = multer({
+  storage: storage,
+  limits: {
+    fileSize: 1024 * 1024 * 1024,
+  },
+  fileFilter: (req, file, cb) => {
+    if (
+      file.originalname.endsWith(".skynet-export.sqlite") ||
+      file.originalname.endsWith(".sqlite")
+    ) {
+      cb(null, true);
+    } else {
+      cb(new Error("Only .skynet-export.sqlite files are allowed"));
+    }
+  },
+});
+
+class GitHubCache {
+  private cache: Map<string, CacheEntry> = new Map();
+  private readonly CACHE_DURATION = 30 * 60 * 1000;
+
+  set<T>(key: string, data: T): void {
+    const now = Date.now();
+    this.cache.set(key, {
+      data,
+      timestamp: now,
+      expiresAt: now + this.CACHE_DURATION,
+    });
+  }
+
+  get<T>(key: string): T | null {
+    const entry = this.cache.get(key);
+    if (!entry) {
+      return null;
+    }
+
+    if (Date.now() > entry.expiresAt) {
+      this.cache.delete(key);
+      return null;
+    }
+
+    return entry.data as T;
+  }
+}
+
+const githubCache = new GitHubCache();
+
+function parseSemver(
+  version: string | undefined,
+): [number, number, number] | null {
+  const match = String(version || "").match(/(\d+)\.(\d+)(?:\.(\d+))?/);
+  if (!match) return null;
+
+  return [Number(match[1]), Number(match[2]), Number(match[3] || 0)];
+}
+
+function compareSemver(
+  a: string | undefined,
+  b: string | undefined,
+): number | null {
+  const parsedA = parseSemver(a);
+  const parsedB = parseSemver(b);
+  if (!parsedA || !parsedB) return null;
+
+  for (let i = 0; i < 3; i += 1) {
+    if (parsedA[i] > parsedB[i]) return 1;
+    if (parsedA[i] < parsedB[i]) return -1;
+  }
+
+  return 0;
+}
+
+const GITHUB_API_BASE = "https://api.github.com";
+const REPO_OWNER = "GigaAshley";
+const REPO_NAME = "Takoyaki";
+
+async function fetchGitHubAPI<T>(
+  endpoint: string,
+  cacheKey: string,
+): Promise<GitHubAPIResponse<T>> {
+  const cachedEntry = githubCache.get<CacheEntry<T>>(cacheKey);
+  if (cachedEntry) {
+    return {
+      data: cachedEntry.data,
+      cached: true,
+      cache_age: Date.now() - cachedEntry.timestamp,
+    };
+  }
+
+  try {
+    const url = `${GITHUB_API_BASE}${endpoint}`;
+    const response = await fetch(url, {
+      headers: {
+        Accept: "application/vnd.github+json",
+        "User-Agent": "TakoyakiUpdateChecker/1.0",
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+      dispatcher: getProxyAgent(url),
+    });
+
+    if (!response.ok) {
+      throw new Error(
+        `GitHub API error: ${response.status} ${response.statusText}`,
+      );
+    }
+
+    const data = (await response.json()) as T;
+    const cacheData: CacheEntry<T> = {
+      data,
+      timestamp: Date.now(),
+      expiresAt: Date.now() + 30 * 60 * 1000,
+    };
+    githubCache.set(cacheKey, cacheData);
+
+    return {
+      data: data,
+      cached: false,
+    };
+  } catch (error) {
+    databaseLogger.error(`Failed to fetch from GitHub API`, error, {
+      operation: "github_api",
+      endpoint,
+    });
+    throw error;
+  }
+}
+
+// Phase 132 SKEW-05: server-side skew-lock middleware — stamps every response
+// with X-Skynet-Server-Build and refuses mismatched-tag requests with 409
+// stale_client. Placed AFTER serveUrlHandler (installed above at line 250 —
+// Phase 103 *.serve.<domain> traffic must bypass; that traffic proxies to
+// arbitrary backend targets that don't know about Skynet's build tag) and
+// BEFORE bodyParser.* (header-only check runs cheap — no body parse needed).
+// D-06 mismatch-only: requests WITHOUT the client-build header pass through
+// unchanged (preserves substrate distributor, curl testing, agent scripting).
+app.use(createSkewLockMiddleware());
+app.use(bodyParser.json({ limit: "1gb" }));
+app.use(bodyParser.urlencoded({ limit: "1gb", extended: true }));
+app.use(bodyParser.raw({ limit: "5gb", type: "application/octet-stream" }));
+app.use((_req, res, next) => {
+  res.setHeader("Cache-Control", "no-store");
+  next();
+});
+
+/**
+ * @openapi
+ * /health:
+ *   get:
+ *     summary: Health check
+ *     description: Returns the health status of the server.
+ *     tags:
+ *       - General
+ *     responses:
+ *       200:
+ *         description: Server is healthy.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 status:
+ *                   type: string
+ *                   example: ok
+ */
+app.get("/health", (req, res) => {
+  res.json({ status: "ok" });
+});
+
+/**
+ * @openapi
+ * /version:
+ *   get:
+ *     summary: Get version information
+ *     description: Returns the local and remote version of the application.
+ *     tags:
+ *       - General
+ *     responses:
+ *       200:
+ *         description: Version information.
+ *       404:
+ *         description: Local version not set.
+ *       500:
+ *         description: Fetch error.
+ */
+/**
+ * Where this instance's source code is published (Preferences → About).
+ * Builds include AGPL-3.0 code (SuperDoc), so an instance running modified
+ * code must point its users at that modified source: deployers with local
+ * patches set TAKOYAKI_SOURCE_URL to their public fork or branch
+ * (SKYNET_SOURCE_URL is still read for older deployments).
+ */
+const SOURCE_URL = process.env.TAKOYAKI_SOURCE_URL ||
+  process.env.SKYNET_SOURCE_URL ||
+  "https://github.com/GigaAshley/Takoyaki";
+
+app.get("/version", authenticateJWT, async (req, res) => {
+  let localVersion = process.env.VERSION;
+
+  if (!localVersion) {
+    const versionSources = [
+      () => {
+        try {
+          const packagePath = path.resolve(process.cwd(), "package.json");
+          const packageJson = JSON.parse(fs.readFileSync(packagePath, "utf8"));
+          return packageJson.version;
+        } catch {
+          return null;
+        }
+      },
+      () => {
+        try {
+          const packagePath = path.resolve("/app", "package.json");
+          const packageJson = JSON.parse(fs.readFileSync(packagePath, "utf8"));
+          return packageJson.version;
+        } catch {
+          return null;
+        }
+      },
+      () => {
+        try {
+          const packagePath = path.resolve(__dirname, "../../../package.json");
+          const packageJson = JSON.parse(fs.readFileSync(packagePath, "utf8"));
+          return packageJson.version;
+        } catch {
+          return null;
+        }
+      },
+    ];
+
+    for (const getVersion of versionSources) {
+      try {
+        const foundVersion = getVersion();
+        if (foundVersion && foundVersion !== "unknown") {
+          localVersion = foundVersion;
+          break;
+        }
+      } catch {
+        continue;
+      }
+    }
+  }
+
+  if (!localVersion) {
+    databaseLogger.error("No version information available", undefined, {
+      operation: "version_check",
+    });
+    return res.status(404).send("Local Version Not Set");
+  }
+
+  if (req.query.checkRemote === "false") {
+    return res.json({ localVersion, status: "update_check_disabled", sourceUrl: SOURCE_URL });
+  }
+
+  try {
+    const cacheKey = "latest_release";
+    const releaseData = await fetchGitHubAPI<GitHubRelease>(
+      `/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest`,
+      cacheKey,
+    );
+
+    const rawTag = releaseData.data.tag_name || releaseData.data.name || "";
+    const remoteVersionMatch = rawTag.match(/(\d+\.\d+(\.\d+)?)/);
+    const remoteVersion = remoteVersionMatch ? remoteVersionMatch[1] : null;
+
+    if (!remoteVersion) {
+      databaseLogger.warn("Remote version not found in GitHub response", {
+        operation: "version_check",
+        rawTag,
+      });
+      return res.status(401).send("Remote Version Not Found");
+    }
+
+    const versionComparison = compareSemver(localVersion, remoteVersion);
+    const status =
+      versionComparison === null || versionComparison === 0
+        ? "up_to_date"
+        : versionComparison > 0
+          ? "beta"
+          : "requires_update";
+
+    const response = {
+      status,
+      localVersion: localVersion,
+      version: remoteVersion,
+      remoteVersion: remoteVersion,
+      latest_release: {
+        tag_name: releaseData.data.tag_name,
+        name: releaseData.data.name,
+        published_at: releaseData.data.published_at,
+        html_url: releaseData.data.html_url,
+      },
+      cached: releaseData.cached,
+      cache_age: releaseData.cache_age,
+      sourceUrl: SOURCE_URL,
+    };
+
+    res.json(response);
+  } catch (err) {
+    databaseLogger.error("Version check failed", err, {
+      operation: "version_check",
+    });
+    res.status(500).send("Fetch Error");
+  }
+});
+
+/**
+ * @openapi
+ * /releases/rss:
+ *   get:
+ *     summary: Get releases in RSS format
+ *     description: Returns the latest releases from the GitHub repository in an RSS-like JSON format.
+ *     tags:
+ *       - General
+ *     parameters:
+ *       - in: query
+ *         name: page
+ *         schema:
+ *           type: integer
+ *         description: The page number of the releases to fetch.
+ *       - in: query
+ *         name: per_page
+ *         schema:
+ *           type: integer
+ *         description: The number of releases to fetch per page.
+ *     responses:
+ *       200:
+ *         description: Releases in RSS format.
+ *       500:
+ *         description: Failed to generate RSS format.
+ */
+app.get("/releases/rss", authenticateJWT, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page as string) || 1;
+    const per_page = Math.min(
+      parseInt(req.query.per_page as string) || 20,
+      100,
+    );
+    const cacheKey = `releases_rss_${page}_${per_page}`;
+
+    const releasesData = await fetchGitHubAPI<GitHubRelease[]>(
+      `/repos/${REPO_OWNER}/${REPO_NAME}/releases?page=${page}&per_page=${per_page}`,
+      cacheKey,
+    );
+
+    const rssItems = releasesData.data.map((release) => ({
+      id: release.id,
+      title: release.name || release.tag_name,
+      description: release.body,
+      link: release.html_url,
+      pubDate: release.published_at,
+      version: release.tag_name,
+      isPrerelease: release.prerelease,
+      isDraft: release.draft,
+      assets: release.assets.map((asset) => ({
+        name: asset.name,
+        size: asset.size,
+        download_count: asset.download_count,
+        download_url: asset.browser_download_url,
+      })),
+    }));
+
+    const response = {
+      feed: {
+        title: `${REPO_NAME} Releases`,
+        description: `Latest releases from ${REPO_NAME} repository`,
+        link: `https://github.com/${REPO_OWNER}/${REPO_NAME}/releases`,
+        updated: new Date().toISOString(),
+      },
+      items: rssItems,
+      total_count: rssItems.length,
+      cached: releasesData.cached,
+      cache_age: releasesData.cache_age,
+    };
+
+    res.json(response);
+  } catch (error) {
+    databaseLogger.error("Failed to generate RSS format", error, {
+      operation: "rss_releases",
+    });
+    res.status(500).json({
+      error: "Failed to generate RSS format",
+      details: error instanceof Error ? error.message : "Unknown error",
+    });
+  }
+});
+
+/**
+ * @openapi
+ * /encryption/status:
+ *   get:
+ *     summary: Get encryption status
+ *     description: Returns the security status of the application.
+ *     tags:
+ *       - Encryption
+ *     responses:
+ *       200:
+ *         description: Security status.
+ *       500:
+ *         description: Failed to get security status.
+ */
+app.get("/encryption/status", requireAdmin, async (req, res) => {
+  try {
+    const securityStatus = {
+      initialized: true,
+      system: { hasSecret: true, isValid: true },
+      activeSessions: {},
+      activeSessionCount: 0,
+    };
+
+    res.json({
+      security: securityStatus,
+      version: "v2-kek-dek",
+    });
+  } catch (error) {
+    apiLogger.error("Failed to get security status", error, {
+      operation: "security_status",
+    });
+    res.status(500).json({ error: "Failed to get security status" });
+  }
+});
+
+/**
+ * @openapi
+ * /encryption/initialize:
+ *   post:
+ *     summary: Initialize security system
+ *     description: Initializes the security system for the application.
+ *     tags:
+ *       - Encryption
+ *     responses:
+ *       200:
+ *         description: Security system initialized successfully.
+ *       500:
+ *         description: Failed to initialize security system.
+ */
+app.post("/encryption/initialize", requireAdmin, async (req, res) => {
+  try {
+    const authManager = AuthManager.getInstance();
+
+    const isValid = true;
+    if (!isValid) {
+      await authManager.initialize();
+    }
+
+    res.json({
+      success: true,
+      message: "Security system initialized successfully",
+      version: "v2-kek-dek",
+      note: "User data encryption will be set up when users log in",
+    });
+  } catch (error) {
+    apiLogger.error("Failed to initialize security system", error, {
+      operation: "security_init_api_failed",
+    });
+    res.status(500).json({ error: "Failed to initialize security system" });
+  }
+});
+
+/**
+ * @openapi
+ * /encryption/regenerate:
+ *   post:
+ *     summary: Regenerate JWT secret
+ *     description: Regenerates the system JWT secret. This will invalidate all existing JWT tokens.
+ *     tags:
+ *       - Encryption
+ *     responses:
+ *       200:
+ *         description: System JWT secret regenerated.
+ *       500:
+ *         description: Failed to regenerate JWT secret.
+ */
+app.post("/encryption/regenerate", requireAdmin, async (req, res) => {
+  try {
+    apiLogger.warn("System JWT secret regenerated via API", {
+      operation: "jwt_regenerate_api",
+    });
+
+    res.json({
+      success: true,
+      message: "System JWT secret regenerated",
+      warning:
+        "All existing JWT tokens are now invalid - users must re-authenticate",
+      note: "User data encryption keys are protected by passwords and cannot be regenerated",
+    });
+  } catch (error) {
+    apiLogger.error("Failed to regenerate JWT secret", error, {
+      operation: "jwt_regenerate_failed",
+    });
+    res.status(500).json({ error: "Failed to regenerate JWT secret" });
+  }
+});
+
+/**
+ * @openapi
+ * /encryption/regenerate-jwt:
+ *   post:
+ *     summary: Regenerate JWT secret
+ *     description: Regenerates the JWT secret. This will invalidate all existing JWT tokens.
+ *     tags:
+ *       - Encryption
+ *     responses:
+ *       200:
+ *         description: New JWT secret generated.
+ *       500:
+ *         description: Failed to regenerate JWT secret.
+ */
+app.post("/encryption/regenerate-jwt", requireAdmin, async (req, res) => {
+  try {
+    apiLogger.warn("JWT secret regenerated via API", {
+      operation: "jwt_secret_regenerate_api",
+    });
+
+    res.json({
+      success: true,
+      message: "New JWT secret generated",
+      warning:
+        "All existing JWT tokens are now invalid - users must re-authenticate",
+    });
+  } catch (error) {
+    apiLogger.error("Failed to regenerate JWT secret", error, {
+      operation: "jwt_secret_regenerate_failed",
+    });
+    res.status(500).json({ error: "Failed to regenerate JWT secret" });
+  }
+});
+
+/**
+ * @openapi
+ * /database/export:
+ *   post:
+ *     summary: Export user data
+ *     description: Exports the user's data as a SQLite database file.
+ *     tags:
+ *       - Database
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               password:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: User data exported successfully.
+ *       400:
+ *         description: Password required for export.
+ *       401:
+ *         description: Invalid password.
+ *       500:
+ *         description: Failed to export user data.
+ */
+app.post("/database/export", authenticateJWT, requireRecentAuth, async (req, res) => {
+  try {
+    const userId = (req as AuthenticatedRequest).userId;
+    const deviceInfo = parseUserAgent(req);
+
+    const user = await getDb().select().from(users).where(eq(users.id, userId));
+    if (!user || user.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const isOidcUser = !!user[0].isOidc;
+
+    if (!DataCrypto.getUserDataKey(userId)) {
+      if (isOidcUser) {
+        const oidcUnlocked = await authManager.authenticateOIDCUser(userId);
+        if (!oidcUnlocked) {
+          return res.status(403).json({
+            error: "Failed to unlock user data with SSO credentials",
+          });
+        }
+      } else {
+        return res.status(403).json({
+          error: "User data is locked. Please log in again.",
+        });
+      }
+    }
+
+    apiLogger.info("Exporting user data as SQLite", {
+      operation: "user_data_sqlite_export_api",
+      userId,
+    });
+
+    const userDataKey = DataCrypto.getUserDataKey(userId);
+    if (!userDataKey) {
+      throw new Error("User data not unlocked");
+    }
+
+    const tempDir = path.join(os.tmpdir(), "skynet-exports");
+
+    try {
+      if (!fs.existsSync(tempDir)) {
+        fs.mkdirSync(tempDir, { recursive: true });
+      }
+    } catch (dirError) {
+      apiLogger.error("Failed to create temp directory", dirError, {
+        operation: "export_temp_dir_error",
+        tempDir,
+      });
+      throw new Error(`Failed to create temp directory: ${dirError.message}`, {
+        cause: dirError,
+      });
+    }
+
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const filename = `skynet-export-${user[0].username}-${timestamp}.sqlite`;
+    const tempPath = path.join(tempDir, filename);
+
+    apiLogger.info("Creating export database", {
+      operation: "export_db_creation",
+      userId,
+      tempPath,
+    });
+
+    const exportDb = new Database(tempPath);
+
+    try {
+      exportDb.exec(`
+        CREATE TABLE users (
+          id TEXT PRIMARY KEY,
+          username TEXT NOT NULL,
+          password_hash TEXT NOT NULL,
+          is_admin INTEGER NOT NULL DEFAULT 0,
+          is_oidc INTEGER NOT NULL DEFAULT 0,
+          oidc_identifier TEXT,
+          client_id TEXT,
+          client_secret TEXT,
+          issuer_url TEXT,
+          authorization_url TEXT,
+          token_url TEXT,
+          identifier_path TEXT,
+          name_path TEXT,
+          scopes TEXT DEFAULT 'openid email profile',
+          totp_secret TEXT,
+          totp_enabled INTEGER NOT NULL DEFAULT 0,
+          totp_backup_codes TEXT
+        );
+
+        CREATE TABLE settings (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        );
+
+        CREATE TABLE ssh_data (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL,
+          connection_type TEXT NOT NULL DEFAULT 'ssh',
+          name TEXT,
+          ip TEXT NOT NULL,
+          port INTEGER NOT NULL,
+          username TEXT NOT NULL,
+          folder TEXT,
+          tags TEXT,
+          pin INTEGER NOT NULL DEFAULT 0,
+          auth_type TEXT NOT NULL,
+          force_keyboard_interactive TEXT,
+          password TEXT,
+          key TEXT,
+          key_password TEXT,
+          key_type TEXT,
+          sudo_password TEXT,
+          autostart_password TEXT,
+          autostart_key TEXT,
+          autostart_key_password TEXT,
+          credential_id INTEGER,
+          override_credential_username INTEGER,
+          enable_terminal INTEGER NOT NULL DEFAULT 1,
+          enable_tunnel INTEGER NOT NULL DEFAULT 1,
+          tunnel_connections TEXT,
+          jump_hosts TEXT,
+          enable_file_manager INTEGER NOT NULL DEFAULT 1,
+          enable_docker INTEGER NOT NULL DEFAULT 0,
+          show_terminal_in_sidebar INTEGER NOT NULL DEFAULT 1,
+          show_file_manager_in_sidebar INTEGER NOT NULL DEFAULT 0,
+          show_tunnel_in_sidebar INTEGER NOT NULL DEFAULT 0,
+          show_docker_in_sidebar INTEGER NOT NULL DEFAULT 0,
+          show_server_stats_in_sidebar INTEGER NOT NULL DEFAULT 0,
+          default_path TEXT,
+          stats_config TEXT,
+          docker_config TEXT,
+          terminal_config TEXT,
+          quick_actions TEXT,
+          notes TEXT,
+          use_socks5 INTEGER,
+          socks5_host TEXT,
+          socks5_port INTEGER,
+          socks5_username TEXT,
+          socks5_password TEXT,
+          socks5_proxy_chain TEXT,
+          domain TEXT,
+          security TEXT,
+          ignore_cert INTEGER NOT NULL DEFAULT 0,
+          guacamole_config TEXT,
+          mac_address TEXT,
+          port_knock_sequence TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE ssh_credentials (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL,
+          name TEXT NOT NULL,
+          description TEXT,
+          folder TEXT,
+          tags TEXT,
+          auth_type TEXT NOT NULL,
+          username TEXT,
+          password TEXT,
+          key TEXT,
+          private_key TEXT,
+          public_key TEXT,
+          key_password TEXT,
+          key_type TEXT,
+          detected_key_type TEXT,
+          usage_count INTEGER NOT NULL DEFAULT 0,
+          last_used TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE file_manager_recent (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL,
+          host_id INTEGER NOT NULL,
+          name TEXT NOT NULL,
+          path TEXT NOT NULL,
+          last_opened TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE file_manager_pinned (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL,
+          host_id INTEGER NOT NULL,
+          name TEXT NOT NULL,
+          path TEXT NOT NULL,
+          pinned_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE file_manager_shortcuts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL,
+          host_id INTEGER NOT NULL,
+          name TEXT NOT NULL,
+          path TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE transfer_recent (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL,
+          source_host_id INTEGER NOT NULL,
+          dest_host_id INTEGER NOT NULL,
+          dest_path TEXT NOT NULL,
+          dest_path_label TEXT NOT NULL,
+          last_used TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE dismissed_alerts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL,
+          alert_id TEXT NOT NULL,
+          dismissed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE ssh_credential_usage (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          credential_id INTEGER NOT NULL,
+          host_id INTEGER NOT NULL,
+          user_id TEXT NOT NULL,
+          used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+
+      const userRecord = user[0];
+      const insertUser = exportDb.prepare(`
+        INSERT INTO users (id, username, password_hash, is_admin, is_oidc, oidc_identifier, client_id, client_secret, issuer_url, authorization_url, token_url, identifier_path, name_path, scopes, totp_secret, totp_enabled, totp_backup_codes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      insertUser.run(
+        userRecord.id,
+        userRecord.username,
+        "[EXPORTED_USER_NO_PASSWORD]",
+        userRecord.isAdmin ? 1 : 0,
+        userRecord.isOidc ? 1 : 0,
+        userRecord.oidcIdentifier || null,
+        userRecord.clientId || null,
+        userRecord.clientSecret || null,
+        userRecord.issuerUrl || null,
+        userRecord.authorizationUrl || null,
+        userRecord.tokenUrl || null,
+        userRecord.identifierPath || null,
+        userRecord.namePath || null,
+        userRecord.scopes || null,
+        userRecord.totpSecret || null,
+        userRecord.totpEnabled ? 1 : 0,
+        userRecord.totpBackupCodes || null,
+      );
+
+      const sshHosts = await getDb()
+        .select()
+        .from(hosts)
+        .where(eq(hosts.userId, userId));
+      const insertHost = exportDb.prepare(`
+        INSERT INTO ssh_data (id, user_id, connection_type, name, ip, port, username, folder, tags, pin, auth_type, force_keyboard_interactive, password, key, key_password, key_type, sudo_password, autostart_password, autostart_key, autostart_key_password, credential_id, override_credential_username, enable_terminal, enable_tunnel, tunnel_connections, jump_hosts, enable_file_manager, enable_docker, show_terminal_in_sidebar, show_file_manager_in_sidebar, show_tunnel_in_sidebar, show_docker_in_sidebar, show_server_stats_in_sidebar, default_path, stats_config, docker_config, terminal_config, quick_actions, notes, use_socks5, socks5_host, socks5_port, socks5_username, socks5_password, socks5_proxy_chain, domain, security, ignore_cert, guacamole_config, mac_address, port_knock_sequence, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+
+      for (const host of sshHosts) {
+        const decrypted = DataCrypto.decryptRecord(
+          "ssh_data",
+          host,
+          userId,
+          userDataKey,
+        );
+        insertHost.run(
+          decrypted.id,
+          decrypted.userId,
+          decrypted.connectionType || "ssh",
+          decrypted.name || null,
+          decrypted.ip,
+          decrypted.port,
+          decrypted.username,
+          decrypted.folder || null,
+          decrypted.tags || null,
+          decrypted.pin ? 1 : 0,
+          decrypted.authType,
+          decrypted.forceKeyboardInteractive || null,
+          decrypted.password || null,
+          decrypted.key || null,
+          decrypted.keyPassword || null,
+          decrypted.keyType || null,
+          decrypted.sudoPassword || null,
+          decrypted.autostartPassword || null,
+          decrypted.autostartKey || null,
+          decrypted.autostartKeyPassword || null,
+          decrypted.credentialId || null,
+          decrypted.overrideCredentialUsername ? 1 : 0,
+          decrypted.enableTerminal ? 1 : 0,
+          decrypted.enableTunnel ? 1 : 0,
+          decrypted.tunnelConnections || null,
+          decrypted.jumpHosts || null,
+          decrypted.enableFileManager ? 1 : 0,
+          decrypted.enableDocker ? 1 : 0,
+          decrypted.showTerminalInSidebar ? 1 : 0,
+          decrypted.showFileManagerInSidebar ? 1 : 0,
+          decrypted.showTunnelInSidebar ? 1 : 0,
+          decrypted.showDockerInSidebar ? 1 : 0,
+          decrypted.showServerStatsInSidebar ? 1 : 0,
+          decrypted.defaultPath || null,
+          decrypted.statsConfig || null,
+          decrypted.dockerConfig || null,
+          decrypted.terminalConfig || null,
+          decrypted.quickActions || null,
+          decrypted.notes || null,
+          decrypted.useSocks5 ? 1 : 0,
+          decrypted.socks5Host || null,
+          decrypted.socks5Port || null,
+          decrypted.socks5Username || null,
+          decrypted.socks5Password || null,
+          decrypted.socks5ProxyChain || null,
+          decrypted.domain || null,
+          decrypted.security || null,
+          decrypted.ignoreCert ? 1 : 0,
+          decrypted.guacamoleConfig || null,
+          decrypted.macAddress || null,
+          decrypted.portKnockSequence || null,
+          decrypted.createdAt,
+          decrypted.updatedAt,
+        );
+      }
+
+      const credentials = await getDb()
+        .select()
+        .from(sshCredentials)
+        .where(eq(sshCredentials.userId, userId));
+      const insertCred = exportDb.prepare(`
+        INSERT INTO ssh_credentials (id, user_id, name, description, folder, tags, auth_type, username, password, key, private_key, public_key, key_password, key_type, detected_key_type, usage_count, last_used, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+
+      for (const cred of credentials) {
+        const decrypted = DataCrypto.decryptRecord(
+          "ssh_credentials",
+          cred,
+          userId,
+          userDataKey,
+        );
+        insertCred.run(
+          decrypted.id,
+          decrypted.userId,
+          decrypted.name,
+          decrypted.description || null,
+          decrypted.folder || null,
+          decrypted.tags || null,
+          decrypted.authType,
+          decrypted.username,
+          decrypted.password || null,
+          decrypted.key || null,
+          decrypted.privateKey || null,
+          decrypted.publicKey || null,
+          decrypted.keyPassword || null,
+          decrypted.keyType || null,
+          decrypted.detectedKeyType || null,
+          decrypted.usageCount || 0,
+          decrypted.lastUsed || null,
+          decrypted.createdAt,
+          decrypted.updatedAt,
+        );
+      }
+
+      const [recentFiles, pinnedFiles, shortcuts] = await Promise.all([
+        getDb()
+          .select()
+          .from(fileManagerRecent)
+          .where(eq(fileManagerRecent.userId, userId)),
+        getDb()
+          .select()
+          .from(fileManagerPinned)
+          .where(eq(fileManagerPinned.userId, userId)),
+        getDb()
+          .select()
+          .from(fileManagerShortcuts)
+          .where(eq(fileManagerShortcuts.userId, userId)),
+      ]);
+
+      const insertRecent = exportDb.prepare(`
+        INSERT INTO file_manager_recent (id, user_id, host_id, name, path, last_opened)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `);
+      for (const item of recentFiles) {
+        insertRecent.run(
+          item.id,
+          item.userId,
+          item.hostId,
+          item.name,
+          item.path,
+          item.lastOpened,
+        );
+      }
+
+      const insertPinned = exportDb.prepare(`
+        INSERT INTO file_manager_pinned (id, user_id, host_id, name, path, pinned_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `);
+      for (const item of pinnedFiles) {
+        insertPinned.run(
+          item.id,
+          item.userId,
+          item.hostId,
+          item.name,
+          item.path,
+          item.pinnedAt,
+        );
+      }
+
+      const insertShortcut = exportDb.prepare(`
+        INSERT INTO file_manager_shortcuts (id, user_id, host_id, name, path, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `);
+      for (const item of shortcuts) {
+        insertShortcut.run(
+          item.id,
+          item.userId,
+          item.hostId,
+          item.name,
+          item.path,
+          item.createdAt,
+        );
+      }
+
+      const alerts = await getDb()
+        .select()
+        .from(dismissedAlerts)
+        .where(eq(dismissedAlerts.userId, userId));
+      const insertAlert = exportDb.prepare(`
+        INSERT INTO dismissed_alerts (id, user_id, alert_id, dismissed_at)
+        VALUES (?, ?, ?, ?)
+      `);
+      for (const alert of alerts) {
+        insertAlert.run(
+          alert.id,
+          alert.userId,
+          alert.alertId,
+          alert.dismissedAt,
+        );
+      }
+
+      const usage = await getDb()
+        .select()
+        .from(sshCredentialUsage)
+        .where(eq(sshCredentialUsage.userId, userId));
+      const insertUsage = exportDb.prepare(`
+        INSERT INTO ssh_credential_usage (id, credential_id, host_id, user_id, used_at)
+        VALUES (?, ?, ?, ?, ?)
+      `);
+      for (const item of usage) {
+        insertUsage.run(
+          item.id,
+          item.credentialId,
+          item.hostId,
+          item.userId,
+          item.usedAt,
+        );
+      }
+
+      const settingsData = await getDb().select().from(settings);
+      const insertSetting = exportDb.prepare(`
+        INSERT INTO settings (key, value)
+        VALUES (?, ?)
+      `);
+      for (const setting of settingsData) {
+        insertSetting.run(setting.key, setting.value);
+      }
+    } finally {
+      exportDb.close();
+    }
+
+    res.setHeader("Content-Type", "application/x-sqlite3");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+
+    const fileStream = fs.createReadStream(tempPath);
+
+    fileStream.on("error", (streamError) => {
+      apiLogger.error("File stream error during export", streamError, {
+        operation: "export_file_stream_error",
+        userId,
+        tempPath,
+      });
+      if (!res.headersSent) {
+        res.status(500).json({
+          error: "Failed to stream export file",
+          details: streamError.message,
+        });
+      }
+    });
+
+    fileStream.on("end", () => {
+      apiLogger.success("User data exported as SQLite successfully", {
+        operation: "user_data_sqlite_export_success",
+        userId,
+        filename,
+      });
+
+      fs.unlink(tempPath, (err) => {
+        if (err) {
+          apiLogger.warn("Failed to clean up export file", {
+            operation: "export_cleanup_failed",
+            path: tempPath,
+            error: err.message,
+          });
+        }
+      });
+    });
+
+    fileStream.pipe(res);
+  } catch (error) {
+    apiLogger.error("User data SQLite export failed", error, {
+      operation: "user_data_sqlite_export_failed",
+    });
+    res.status(500).json({
+      error: "Failed to export user data",
+      details: error instanceof Error ? error.message : "Unknown error",
+    });
+  }
+});
+
+/**
+ * @openapi
+ * /database/import:
+ *   post:
+ *     summary: Import user data
+ *     description: Imports user data from a SQLite database file.
+ *     tags:
+ *       - Database
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               file:
+ *                 type: string
+ *                 format: binary
+ *               password:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Incremental import completed successfully.
+ *       400:
+ *         description: No file uploaded or password required for import.
+ *       401:
+ *         description: Invalid password.
+ *       500:
+ *         description: Failed to import SQLite data.
+ */
+app.post(
+  "/database/import",
+  authenticateJWT,
+  upload.single("file"),
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: "No file uploaded" });
+      }
+
+      const userId = (req as AuthenticatedRequest).userId;
+      const mainDb = getDb();
+      const deviceInfo = parseUserAgent(req);
+
+      const userRecords = await mainDb
+        .select()
+        .from(users)
+        .where(eq(users.id, userId));
+
+      if (!userRecords || userRecords.length === 0) {
+        return res.status(404).json({ error: "User not found" });
+      }
+
+      const isOidcUser = !!userRecords[0].isOidc;
+
+      if (!DataCrypto.getUserDataKey(userId)) {
+        if (isOidcUser) {
+          const oidcUnlocked = await authManager.authenticateOIDCUser(userId);
+          if (!oidcUnlocked) {
+            return res.status(403).json({
+              error: "Failed to unlock user data with SSO credentials",
+            });
+          }
+        } else {
+          return res.status(403).json({
+            error: "User data is locked. Please log in again.",
+          });
+        }
+      }
+
+      apiLogger.info("Importing SQLite data", {
+        operation: "sqlite_import_api",
+        userId,
+        filename: req.file.originalname,
+        fileSize: req.file.size,
+        mimetype: req.file.mimetype,
+      });
+
+      const userDataKey = DataCrypto.getUserDataKey(userId);
+      if (!userDataKey) {
+        throw new Error("User data not unlocked");
+      }
+
+      if (!fs.existsSync(req.file.path)) {
+        return res.status(400).json({
+          error: "Uploaded file not found",
+          details: "File was not properly uploaded",
+        });
+      }
+
+      const fileHeader = Buffer.alloc(16);
+      const fd = fs.openSync(req.file.path, "r");
+      fs.readSync(fd, fileHeader, 0, 16, 0);
+      fs.closeSync(fd);
+
+      const sqliteHeader = "SQLite format 3";
+      if (fileHeader.toString("utf8", 0, 15) !== sqliteHeader) {
+        return res.status(400).json({
+          error: "Invalid file format - not a SQLite database",
+          details: `Expected SQLite file, got file starting with: ${fileHeader.toString("utf8", 0, 15)}`,
+        });
+      }
+
+      let importDb;
+      try {
+        importDb = new Database(req.file.path, { readonly: true });
+
+        importDb
+          .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+          .all();
+      } catch (sqliteError) {
+        return res.status(400).json({
+          error: "Failed to open SQLite database",
+          details: sqliteError.message,
+        });
+      }
+
+      const result = {
+        success: false,
+        summary: {
+          sshHostsImported: 0,
+          sshCredentialsImported: 0,
+          fileManagerItemsImported: 0,
+          dismissedAlertsImported: 0,
+          credentialUsageImported: 0,
+          settingsImported: 0,
+          skippedItems: 0,
+          errors: [],
+        },
+      };
+
+      try {
+        mainDb.$client.exec("PRAGMA foreign_keys = OFF");
+        try {
+          const importedHosts = importDb
+            .prepare("SELECT * FROM ssh_data")
+            .all();
+          for (const host of importedHosts) {
+            try {
+              const existing = await mainDb
+                .select()
+                .from(hosts)
+                .where(
+                  and(
+                    eq(hosts.userId, userId),
+                    eq(hosts.ip, host.ip),
+                    eq(hosts.port, host.port),
+                    eq(hosts.username, host.username),
+                  ),
+                );
+
+              if (existing.length > 0) {
+                result.summary.skippedItems++;
+                continue;
+              }
+
+              const hostData = {
+                userId: userId,
+                name: host.name,
+                ip: host.ip,
+                port: host.port,
+                username: host.username,
+                folder: host.folder,
+                tags: host.tags,
+                pin: Boolean(host.pin),
+                authType: host.auth_type,
+                forceKeyboardInteractive: host.force_keyboard_interactive,
+                password: host.password,
+                key: host.key,
+                keyPassword: host.key_password,
+                keyType: host.key_type,
+                sudoPassword: host.sudo_password,
+                autostartPassword: host.autostart_password,
+                autostartKey: host.autostart_key,
+                autostartKeyPassword: host.autostart_key_password,
+                credentialId: host.credential_id || null,
+                overrideCredentialUsername: Boolean(
+                  host.override_credential_username,
+                ),
+                enableTerminal: Boolean(host.enable_terminal),
+                enableTunnel: Boolean(host.enable_tunnel),
+                tunnelConnections: host.tunnel_connections,
+                jumpHosts: host.jump_hosts,
+                enableFileManager: Boolean(host.enable_file_manager),
+                enableDocker: Boolean(host.enable_docker),
+                showTerminalInSidebar: Boolean(host.show_terminal_in_sidebar),
+                showFileManagerInSidebar: Boolean(
+                  host.show_file_manager_in_sidebar,
+                ),
+                showTunnelInSidebar: Boolean(host.show_tunnel_in_sidebar),
+                showDockerInSidebar: Boolean(host.show_docker_in_sidebar),
+                showServerStatsInSidebar: Boolean(
+                  host.show_server_stats_in_sidebar,
+                ),
+                defaultPath: host.default_path,
+                statsConfig: host.stats_config,
+                terminalConfig: host.terminal_config,
+                quickActions: host.quick_actions,
+                notes: host.notes,
+                useSocks5: Boolean(host.use_socks5),
+                socks5Host: host.socks5_host,
+                socks5Port: host.socks5_port,
+                socks5Username: host.socks5_username,
+                socks5Password: host.socks5_password,
+                socks5ProxyChain: host.socks5_proxy_chain,
+                createdAt: host.created_at || new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+              };
+
+              const encrypted = DataCrypto.encryptRecord(
+                "ssh_data",
+                hostData,
+                userId,
+                userDataKey,
+              );
+              await mainDb.insert(hosts).values(encrypted);
+              result.summary.sshHostsImported++;
+            } catch (hostError) {
+              result.summary.errors.push(
+                `SSH host import error: ${hostError.message}`,
+              );
+            }
+          }
+        } catch {
+          apiLogger.info("ssh_data table not found in import file, skipping");
+        }
+
+        try {
+          const importedCreds = importDb
+            .prepare("SELECT * FROM ssh_credentials")
+            .all();
+          for (const cred of importedCreds) {
+            try {
+              const existing = await mainDb
+                .select()
+                .from(sshCredentials)
+                .where(
+                  and(
+                    eq(sshCredentials.userId, userId),
+                    eq(sshCredentials.name, cred.name),
+                    eq(sshCredentials.username, cred.username),
+                  ),
+                );
+
+              if (existing.length > 0) {
+                result.summary.skippedItems++;
+                continue;
+              }
+
+              const credData = {
+                userId: userId,
+                name: cred.name,
+                description: cred.description,
+                folder: cred.folder,
+                tags: cred.tags,
+                authType: cred.auth_type,
+                username: cred.username,
+                password: cred.password,
+                key: cred.key,
+                privateKey: cred.private_key,
+                publicKey: cred.public_key,
+                keyPassword: cred.key_password,
+                keyType: cred.key_type,
+                detectedKeyType: cred.detected_key_type,
+                usageCount: cred.usage_count || 0,
+                lastUsed: cred.last_used,
+                createdAt: cred.created_at || new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+              };
+
+              const encrypted = DataCrypto.encryptRecord(
+                "ssh_credentials",
+                credData,
+                userId,
+                userDataKey,
+              );
+              await mainDb.insert(sshCredentials).values(encrypted);
+              result.summary.sshCredentialsImported++;
+            } catch (credError) {
+              result.summary.errors.push(
+                `SSH credential import error: ${credError.message}`,
+              );
+            }
+          }
+        } catch {
+          apiLogger.info(
+            "ssh_credentials table not found in import file, skipping",
+          );
+        }
+
+        const fileManagerTables = [
+          {
+            table: "file_manager_recent",
+            schema: fileManagerRecent,
+            key: "fileManagerItemsImported",
+          },
+          {
+            table: "file_manager_pinned",
+            schema: fileManagerPinned,
+            key: "fileManagerItemsImported",
+          },
+          {
+            table: "file_manager_shortcuts",
+            schema: fileManagerShortcuts,
+            key: "fileManagerItemsImported",
+          },
+        ];
+
+        for (const { table, schema, key } of fileManagerTables) {
+          try {
+            const importedItems = importDb
+              .prepare(`SELECT * FROM ${table}`)
+              .all();
+            for (const item of importedItems) {
+              try {
+                const existing = await mainDb
+                  .select()
+                  .from(schema)
+                  .where(
+                    and(
+                      eq(schema.userId, userId),
+                      eq(schema.path, item.path),
+                      eq(schema.name, item.name),
+                    ),
+                  );
+
+                if (existing.length > 0) {
+                  result.summary.skippedItems++;
+                  continue;
+                }
+
+                const itemData = {
+                  userId: userId,
+                  hostId: item.host_id,
+                  name: item.name,
+                  path: item.path,
+                  ...(table === "file_manager_recent" && {
+                    lastOpened: item.last_opened,
+                  }),
+                  ...(table === "file_manager_pinned" && {
+                    pinnedAt: item.pinned_at,
+                  }),
+                  ...(table === "file_manager_shortcuts" && {
+                    createdAt: item.created_at,
+                  }),
+                };
+
+                await mainDb.insert(schema).values(itemData);
+                result.summary[key]++;
+              } catch (itemError) {
+                result.summary.errors.push(
+                  `${table} import error: ${itemError.message}`,
+                );
+              }
+            }
+          } catch {
+            apiLogger.info(`${table} table not found in import file, skipping`);
+          }
+        }
+
+        try {
+          const importedAlerts = importDb
+            .prepare("SELECT * FROM dismissed_alerts")
+            .all();
+          for (const alert of importedAlerts) {
+            try {
+              const existing = await mainDb
+                .select()
+                .from(dismissedAlerts)
+                .where(
+                  and(
+                    eq(dismissedAlerts.userId, userId),
+                    eq(dismissedAlerts.alertId, alert.alert_id),
+                  ),
+                );
+
+              if (existing.length > 0) {
+                result.summary.skippedItems++;
+                continue;
+              }
+
+              await mainDb.insert(dismissedAlerts).values({
+                userId: userId,
+                alertId: alert.alert_id,
+                dismissedAt: alert.dismissed_at || new Date().toISOString(),
+              });
+              result.summary.dismissedAlertsImported++;
+            } catch (alertError) {
+              result.summary.errors.push(
+                `Dismissed alert import error: ${alertError.message}`,
+              );
+            }
+          }
+        } catch {
+          apiLogger.info(
+            "dismissed_alerts table not found in import file, skipping",
+          );
+        }
+
+        const targetUser = await mainDb
+          .select()
+          .from(users)
+          .where(eq(users.id, userId));
+        if (targetUser.length > 0 && targetUser[0].isAdmin) {
+          try {
+            const importedSettings = importDb
+              .prepare("SELECT * FROM settings")
+              .all();
+            for (const setting of importedSettings) {
+              try {
+                const existing = await mainDb
+                  .select()
+                  .from(settings)
+                  .where(eq(settings.key, setting.key));
+
+                if (existing.length > 0) {
+                  await mainDb
+                    .update(settings)
+                    .set({ value: setting.value })
+                    .where(eq(settings.key, setting.key));
+                  result.summary.settingsImported++;
+                } else {
+                  await mainDb.insert(settings).values({
+                    key: setting.key,
+                    value: setting.value,
+                  });
+                  result.summary.settingsImported++;
+                }
+              } catch (settingError) {
+                result.summary.errors.push(
+                  `Setting import error (${setting.key}): ${settingError.message}`,
+                );
+              }
+            }
+          } catch {
+            apiLogger.info("settings table not found in import file, skipping");
+          }
+        } else {
+          apiLogger.info(
+            "Settings import skipped - only admin users can import settings",
+          );
+        }
+
+        mainDb.$client.exec("PRAGMA foreign_keys = ON");
+        result.success = true;
+
+        try {
+          await DatabaseSaveTrigger.forceSave("database_import");
+        } catch (saveError) {
+          apiLogger.error(
+            "Failed to persist imported data to disk",
+            saveError,
+            {
+              operation: "import_force_save_failed",
+              userId,
+            },
+          );
+        }
+      } finally {
+        if (importDb) {
+          importDb.close();
+        }
+      }
+
+      try {
+        fs.unlinkSync(req.file.path);
+      } catch {
+        apiLogger.warn("Failed to clean up uploaded file", {
+          operation: "file_cleanup_warning",
+          filePath: req.file.path,
+        });
+      }
+
+      res.json({
+        success: result.success,
+        message: result.success
+          ? "Incremental import completed successfully"
+          : "Import failed",
+        summary: result.summary,
+      });
+
+      if (result.success) {
+        apiLogger.success("SQLite data imported successfully", {
+          operation: "sqlite_import_api_success",
+          userId,
+          summary: result.summary,
+        });
+      }
+    } catch (error) {
+      if (req.file?.path && fs.existsSync(req.file.path)) {
+        try {
+          fs.unlinkSync(req.file.path);
+        } catch {
+          apiLogger.warn("Failed to clean up uploaded file after error", {
+            operation: "file_cleanup_error",
+            filePath: req.file.path,
+          });
+        }
+      }
+
+      apiLogger.error("SQLite import failed", error, {
+        operation: "sqlite_import_api_failed",
+        userId: (req as AuthenticatedRequest).userId,
+      });
+      res.status(500).json({
+        error: "Failed to import SQLite data",
+        details: error instanceof Error ? error.message : "Unknown error",
+      });
+    }
+  },
+);
+
+/**
+ * @openapi
+ * /database/export/preview:
+ *   post:
+ *     summary: Preview user data export
+ *     description: Generates a preview of the user data export, including statistics about the data.
+ *     tags:
+ *       - Database
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               scope:
+ *                 type: string
+ *               includeCredentials:
+ *                 type: boolean
+ *     responses:
+ *       200:
+ *         description: Export preview generated successfully.
+ *       500:
+ *         description: Failed to generate export preview.
+ */
+app.post("/database/export/preview", authenticateJWT, async (req, res) => {
+  try {
+    const userId = (req as AuthenticatedRequest).userId;
+    const { scope = "user_data", includeCredentials = true } = req.body;
+
+    const exportData = await UserDataExport.exportUserData(userId, {
+      format: "encrypted",
+      scope,
+      includeCredentials,
+    });
+
+    const stats = UserDataExport.getExportStats(exportData);
+
+    res.json({
+      preview: true,
+      stats,
+      estimatedSize: JSON.stringify(exportData).length,
+    });
+
+    apiLogger.success("Export preview generated", {
+      operation: "export_preview_api_success",
+      userId,
+      totalRecords: stats.totalRecords,
+    });
+  } catch (error) {
+    apiLogger.error("Export preview failed", error, {
+      operation: "export_preview_api_failed",
+    });
+    res.status(500).json({
+      error: "Failed to generate export preview",
+      details: error instanceof Error ? error.message : "Unknown error",
+    });
+  }
+});
+
+/**
+ * @openapi
+ * /database/restore:
+ *   post:
+ *     summary: Restore database from backup
+ *     description: Restores the database from an encrypted backup file.
+ *     tags:
+ *       - Database
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               backupPath:
+ *                 type: string
+ *               targetPath:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Database restored successfully.
+ *       400:
+ *         description: Backup path is required or invalid encrypted backup file.
+ *       500:
+ *         description: Database restore failed.
+ */
+app.post("/database/restore", requireAdmin, async (req, res) => {
+  try {
+    const { backupPath, targetPath } = req.body;
+
+    if (!backupPath) {
+      return res.status(400).json({ error: "Backup path is required" });
+    }
+
+    if (!DatabaseFileEncryption.isEncryptedDatabaseFile(backupPath)) {
+      return res.status(400).json({ error: "Invalid encrypted backup file" });
+    }
+
+    const restoredPath =
+      await DatabaseFileEncryption.restoreFromEncryptedBackup(
+        backupPath,
+        targetPath,
+      );
+
+    res.json({
+      success: true,
+      message: "Database restored successfully",
+      restoredPath,
+    });
+  } catch (error) {
+    apiLogger.error("Database restore failed", error, {
+      operation: "database_restore_api_failed",
+    });
+    res.status(500).json({
+      error: "Database restore failed",
+      details: error instanceof Error ? error.message : "Unknown error",
+    });
+  }
+});
+
+app.use("/users", userRoutes);
+// Phase 75 amendment: matrix-admin creds ingestion + rotation surface. Admin-gated
+// (authenticateJWT + requireAdmin middleware). Same endpoint serves the one-shot
+// bootstrap AND future rotation calls (returns rotation:true when overwriting).
+app.use("/matrix-admin", matrixAdminRoutes);
+// /push-subscriptions — Telegram notification setup.
+app.use("/push-subscriptions", pushSubscriptionsRoutes);
+app.use("/host", hostRoutes);
+app.use("/alerts", alertRoutes);
+app.use("/credentials", credentialsRoutes);
+app.use("/snippets", snippetsRoutes);
+app.use("/c2s-tunnel-presets", c2sTunnelPresetRoutes);
+app.use("/terminal", terminalRoutes);
+app.use("/guacamole", guacamoleRoutes);
+app.use("/network-topology", networkTopologyRoutes);
+app.use("/rbac", rbacRoutes);
+app.use("/open-tabs", openTabsRoutes);
+// Phase 20 (IDUI-04): identity avatar batch — mount BEFORE /identities so
+// /identities/avatar/batch and /identities/avatar/candidate/:id don't collide
+// with the generic /identities/:id/* routes in identitiesRoutes.
+app.use("/identities/avatar", identityAvatarBatchRoutes);
+// Phase 20 (IDUI-06): compound birth endpoint with SSE progress stream — mount
+// at /identities/birth BEFORE the general /identities mount so Express routes
+// the exact path here without falling through to the generic identities handler.
+app.use("/identities/birth", identityBirthRoutes);
+// Phase 80 Plan 04: pool-name picker — mount BEFORE /identities so
+// /identities/pool/pick resolves here and does not fall through to the
+// generic identitiesRoutes /:identityKey handler (which would 400
+// "identityKey must match [a-z0-9_-]{1,64}" because "pool" fails the
+// pattern). RESEARCH §Landmine 4 — same discipline as avatar/birth.
+app.use("/identities/pool", identityPoolRoutes);
+// Phase 20 (IDUI-05): target-host-side identity name collision probe — mount
+// BEFORE /identities so /identities/exists-on-host resolves here first.
+app.use("/identities", identityExistsOnHostRoutes);
+// Quick 260811-ax1: per-identity .no-dormancy sentinel toggle — mount BEFORE
+// the generic /identities router so /:key/no-dormancy resolves here and does
+// not fall through to identitiesRoutes's /:id routes.
+app.use("/identities", identityNoDormancyRoutes);
+// Single-identity .pinned toggle (PUT /identities/:key/pinned) — same
+// mount-before-generic discipline as no-dormancy.
+app.use("/identities", identityPinRoutes);
+// Phase 115 Plan 115-03 (D-17): user-initiated archive endpoint — POST
+// /identities/:key/archive drops `.archive-requested` on the identity's host
+// via the per-identity-file primitive. Mounted alongside the sibling
+// no-dormancy sub-route BEFORE the generic /identities router so the
+// :key/archive sub-route isn't intercepted by identitiesRoutes's /:identityKey
+// handlers. Same discipline as the exists-on-host + no-dormancy mounts above.
+app.use("/identities", identityArchiveRoutes);
+// POST /identities/:key/condense drops `.compact-requested` (Condense
+// conversation); the agent-supervisor carries it out. Same mount discipline
+// as identity-archive — before the generic /identities router.
+app.use("/identities", identityCondenseRoutes);
+// Phase 143 Plan 143-04 (D-01): POST /identities/:key/unarchive drops
+// `.unarchive-requested` sentinel in the archive folder with three preconditions
+// (D-02: archive-exists, name-collision, all-roles-live). Coexists with
+// identity-archive under "/identities" — distinct sub-paths (:key/archive vs
+// :key/unarchive) prevent any handler shadowing.
+app.use("/identities", identityUnarchiveRoutes);
+// Phase 143 Plan 143-03 (D-05/D-06/D-07): GET /identities-archive — fleet-wide
+// list of archived identity keys. Standalone base path (no overlap with
+// /identities/:key sub-routes). Must mount BEFORE any generic catch-all.
+app.use("/identities-archive", identitiesArchiveListRoutes);
+// Phase 122 Plan 122-02: POST /conversation-search — cross-host content-grep
+// endpoint. Mounted as a standalone base path so it does not overlap with
+// /identities/* or /sessions/*. Frontend (Wave 2) calls
+// authApi.post("/conversation-search", { query, offset, limit }).
+app.use("/conversation-search", conversationSearchRoutes);
+// Phase 117 Plan 117-05 (D-05, D-31, D-36a, D-37): POST /identities/:key/project —
+// writes the `project:` frontmatter field on the identity file via the 117-01
+// writer. Mounted alongside identity-archive; the two /:key/<action> sub-routes
+// are non-overlapping (:key/archive vs :key/project) and BOTH mount BEFORE
+// the generic /identities router so /:key/project isn't shadowed by
+// identitiesRoutes's /:identityKey handlers. Every successful write triggers
+// subscription-registry.publishProjectListChanged so connected WS clients
+// re-hydrate the sidebar's projects zone.
+app.use("/identities", sessionProjectWriteRoutes);
+// Phase 133 Plan 133-01 (D-01, D-05): role archive route — POST
+// /roles/:name/archive drops the `.archive-requested` sentinel on the role
+// folder. Mounted BEFORE the three existing /roles routers below so
+// /:name/archive is not shadowed by any future generic /:roleName handler
+// in rolesRoutes (mirrors the identity-archive mount discipline at
+// database.ts:2033). Same match-precedence pattern: specific /:name/action
+// sub-routes MUST mount ahead of generic /:name handlers.
+app.use("/roles", roleArchiveRoutes);
+// Phase 143 Plan 143-04 (D-01): POST /roles/:name/unarchive drops
+// `.unarchive-requested` sentinel in the role archive folder with two
+// preconditions (D-02: archive-exists, name-collision). Coexists with
+// roleArchiveRoutes under "/roles" — sub-paths are distinct.
+app.use("/roles", roleUnarchiveRoutes);
+// Phase 143 Plan 143-03 (D-05/D-07): GET /roles-archive?hostId=<n> — host-scoped
+// archived-role list. Standalone base path; must mount BEFORE any generic
+// catch-all (mirrors archive-route mount discipline at database.ts:2067).
+app.use("/roles-archive", rolesArchiveListRoutes);
+// Phase 22 (SRIC-02): /roles?hostId=<n> — target-host-side role directory
+// enumeration. Standalone mount; kept ABOVE /identities to preserve match
+// precedence should a future /roles subpath ever collide.
+app.use("/roles", rolesListForHostRoutes);
+// Phase 22 (SRIC-04): POST /roles — target-host-side role folder creation.
+// Same base path as the list router; Express supports multiple routers at the
+// same mount by chaining app.use. The list router only handles GET so POST
+// falls through to this router. Both /roles mounts appear BEFORE /identities.
+app.use("/roles", rolesCreateRoutes);
+// Phase 90 Plan 90-02 (D-08.2): GET /roles/:name/avatar?hostId=<n>. Same
+// /roles base again — chains cleanly because this router only defines
+// `router.get("/:name/avatar")`, which is depth-2 and cannot shadow the
+// list router's depth-0 `router.get("/")` enumeration route.
+app.use("/roles", rolesRoutes);
+// Phase 134 Plan 134-01 (wake-ups-redesign shape 2 CRUD API — D-01/D-02/D-17):
+// /scheduled-agents chained mounts. The list router only handles GET /; the
+// write router handles POST /, PATCH /:slug, PATCH /:slug/toggle-enabled,
+// and DELETE /:slug — Express falls through so both routers share the same
+// base path (same pattern as the /roles chain above). Matching nginx
+// location blocks in BOTH docker/nginx.conf AND docker/nginx-https.conf are
+// load-bearing per CLAUDE.md — missing the HTTPS conf means
+// /scheduled-agents 200-returns index.html and crashes the SPA on `.map`
+// in production.
+app.use("/scheduled-agents", scheduledAgentsListRoutes);
+app.use("/scheduled-agents", scheduledAgentsWriteRoutes);
+// Phase 23 GEFM-03: GET /global-files?hostId=<n> — reads the per-host
+// configured file list from /app/data/global-files.json. Wave-2 plan
+// adds a second router on the same base path for POST /read + PUT /write.
+app.use("/global-files", globalFilesListRoutes);
+// Phase 23 GEFM-04: POST /global-files/read + PUT /global-files/write —
+// SSH read/write of whitelisted files. Same base path as the wave-1 list
+// router; Express chains routers so GET falls through to the list router
+// and POST/PUT fall through to this read/write router.
+app.use("/global-files", globalFilesReadWriteRoutes);
+// Phase 44 SKILLED-01: /skills-editor router — 7 endpoints
+// (list-skills / list-files / read / write / create / delete-file /
+// delete-skill) mounted alongside /global-files. Matching nginx
+// `location ~ ^/skills-editor(/.*)?$` blocks in BOTH docker/nginx.conf
+// AND docker/nginx-https.conf (parity load-bearing per patch #446 arc).
+app.use("/skills-editor", skillsEditorRoutes);
+// Instance-wide skills & roles (list / promote / remove / sync). Matching nginx
+// location blocks in BOTH docker/nginx.conf AND docker/nginx-https.conf.
+app.use("/instance-wide", express.json({ limit: "64kb" }), instanceWideRoutes);
+// Instance file (/etc/claude-code/CLAUDE.md on every host). Matching nginx
+// location blocks in BOTH docker/nginx.conf AND docker/nginx-https.conf.
+app.use("/instance-file", instanceFileRoutes);
+// /role-skills-editor router — mounted alongside /skills-editor. Matching nginx location blocks in BOTH docker/nginx.conf AND docker/nginx-https.conf (parity load-bearing per patch #446 arc).
+app.use("/role-skills-editor", roleSkillsEditorRoutes);
+// File viewers: legacy Office / OpenDocument conversion via the converter sidecar (SKYNET_CONVERTER_URL). Matching nginx location blocks in BOTH docker/nginx.conf AND docker/nginx-https.conf.
+app.use("/document-convert", documentConvertRoutes);
+// Phase 118 Plan 118-01 (D-04, D-16, D-17, D-19, D-20, D-21, D-22): /workspace CRUD router — 9 endpoints (list, read-file, write-file, delete, rename, mkdir, create-file, upload, download). Matching nginx location blocks land in BOTH docker/nginx.conf AND docker/nginx-https.conf per CLAUDE.md nginx caveat (missing in HTTPS conf → /workspace returns index.html and crashes the frontend).
+app.use("/workspace/git", workspaceGitRoutes);
+// Files-tab name search across the folder tree — under /workspace so the existing nginx location covers it.
+app.use("/workspace/search", workspaceSearchRoutes);
+// Identity desktop (status / start / view-only Guacamole connect) — under /workspace so the existing nginx location covers it.
+app.use("/workspace/desktop", workspaceDesktopRoutes);
+app.use("/workspace", workspaceRoutes);
+// Phase 117 Plan 04 (D-25, D-30, D-36a, D-37): /projects router — GET list
+// + POST create + POST :slug/archive. JSON body per D-36a. Mounted alongside
+// /role-skills-editor BEFORE any late catch-alls. Every successful write path
+// triggers subscription-registry.publishProjectListChanged so connected WS
+// clients re-hydrate the sidebar's projects zone.
+app.use("/projects", projectListRoutes);
+// "Shared with" control for agents, roles and projects on multi-user machines.
+app.use("/sharing", sharingRoutes);
+// Phase 40 (D-01, D-04): SSRF-hardened proxy for agent-served tailnet URLs —
+// POST /pretty-view/fetch-tailnet-url. Frontend eligibility hook + editor
+// open path both consume this. Threat model T-40-01/T-40-02 mitigations
+// enforced inside the route.
+app.use("/pretty-view", prettyViewFetchTailnetUrlRoutes);
+// Phase 75 (D-01, D-04): SFTP-backed file fetch. Split-router pattern per
+// checker W-3 — each router mounted at exactly one prefix, no ghost URL
+// aliases. POST /pretty-view/fetch-host-file serves the modal JSON path;
+// GET /file/:host/* serves the verbatim URL agents write. Both routers
+// call the same shared fetch helper. Ghost aliases (POST /fetch-host-file
+// at root, GET /pretty-view/file/:host/*) return 404 by construction
+// because the wrong-prefix router has no matching handler.
+app.use("/pretty-view", prettyViewFetchHostFileRoutes);
+app.use("/", fileUrlRoutes);
+app.use("/identities", identitiesRoutes);
+// app-archive shape: POST /apps/:hostId/:slug/archive — drops
+// `.archive-requested` on the target host's ~/fleet/apps/<slug>/ folder via
+// the per-app-file primitive. Mounted BEFORE the generic /apps router so the
+// POST sub-route is not shadowed by any future generic /:hostId/:slug POST
+// handler (mirrors identity-archive + role-archive mount discipline).
+app.use("/apps", appsArchiveRoutes);
+app.use("/apps", appsUnarchiveRoutes); // Phase 143 D-01
+app.use("/apps", appsRenameRoutes); // app-rename shape
+app.use("/apps", appsMoveRoutes); // project-scoped apps: Move to (sidebar / project)
+// Phase 143 Plan 143-03 (D-05/D-07): GET /apps-archive — fleet-wide archived-app
+// list. Standalone base path; must mount BEFORE any generic catch-all (mirrors
+// archive-route mount discipline at database.ts:2067).
+app.use("/apps-archive", appsArchiveListRoutes);
+// Phase 119 Plan 05 (D-06): GET /apps/:hostId/:slug/icon — serves
+// ~/fleet/apps/<slug>/icon.webp from the target host via SSH. Mirrors
+// /identities/:identityKey/avatar (identities.ts:849). See
+// src/backend/database/routes/apps.ts for the route body.
+app.use("/apps", appsRoutes);
+app.use("/message-queue", messageQueueRoutes);
+app.use("/compose-drafts", composeDraftsRoutes);
+app.use("/identity-send-log", identitySendLogRoutes);
+app.use("/attention", attentionRoutes);
+app.use("/sessions", sessionsRoutes);
+// Phase 91 Plan 03 — POST /relay-room/create (sub-slice C: new-conversation
+// modal backend endpoint). Mounts BEFORE the participants route so Express
+// finds /relay-room/create before the /:roomId/participants wildcard. The two
+// routes have non-overlapping paths so ordering is functionally irrelevant,
+// but placing create first improves readability. No additional nginx location
+// block needed — the existing /relay-room prefix block covers this path.
+app.use("/relay-room", relayRoomCreateRoutes);
+// Phase 90 Plan 04 Task 3 — GET /relay-room/:roomId/participants (BLOCKER
+// #4 fix per plan). Nginx dual-update required for BOTH /relay-room/websocket/
+// (WS route bound by relay-room-stream-server on port 30015) AND this REST
+// prefix — both blocks land in BOTH docker/nginx.conf AND docker/nginx-https.conf.
+app.use("/relay-room", relayRoomParticipantsRoutes);
+// Phase 117 Plan 117-05 (D-05, D-05a, D-36a): POST /relay-rooms/:roomId/project —
+// read-modify-write on the Matrix room's m.tag account_data via
+// setRoomProjectTag (117-02). Preserves non-project tags, strips any
+// existing u.project.*, adds the new u.project.<slug> (or clears when
+// project=null). Mounted at plural /relay-rooms to avoid collision with
+// the /relay-room mounts above; nginx location block already covers
+// the prefix by inclusion.
+app.use("/relay-rooms", relayRoomProjectTagRoutes);
+// Phase 117 Plan 117-07 (Fix 1 / D-05 relay-room carrier): GET
+// /relay-rooms/project-tags?hostId=<n> — enumerator that returns rooms
+// with u.project.<slug> account_data tags. Chains cleanly with the
+// /:roomId/project write route above (non-overlapping sub-paths).
+app.use("/relay-rooms", relayRoomProjectTagsListRoutes);
+app.use("/user-preferences", userPreferencesRoutes);
+app.use("/whats-new", whatsNewRoutes);
+// RELAYBUB-04 (Phase 17): /relay-pointer needs matching location blocks in BOTH docker/nginx.conf
+// AND docker/nginx-https.conf — see CLAUDE.md nginx caveat. Handler uses head -c bounded remote
+// read for CLAUDE.md fleet-availability protection ("user never loses access to her fleet").
+app.use("/relay-pointer", relayPointerRoutes);
+app.use("/debug", debugRoutes);
+app.use("/voice", voiceRoutes);
+// Phase 70 (branding-config): unauthenticated pre-login surface. Mounted
+// BEFORE the frontend express.static block so /manifest.webmanifest is
+// intercepted here rather than served from public/. Per CLAUDE.md nginx
+// caveat, matching location blocks for /api/branding, /branding/*, and
+// /manifest.webmanifest MUST exist in BOTH docker/nginx.conf AND
+// docker/nginx-https.conf — the /manifest.webmanifest block REPLACES the
+// prior static-serve block. Nginx plumbing lands in plan 70-02.
+app.use(brandingRoutes);
+// Phase 121 (feedback-pipeline): auth-gated feedback intake + enabled-check.
+// Unprefixed mount because the router registers TWO distinct path prefixes
+// (/api/feedback/enabled AND /feedback) — `app.use("/feedback", ...)` would
+// clobber the /api/feedback/enabled route. Mounted AFTER bodyParser.json
+// (L350) so req.body is populated (Pitfall 5), plus the POST handler
+// applies its own inline express.json({limit:"512kb"}) for the T-121-11
+// size cap. Per CLAUDE.md nginx caveat, matching location blocks for
+// /api/feedback/enabled AND /feedback MUST exist in BOTH docker/nginx.conf
+// AND docker/nginx-https.conf. Nginx plumbing lands in plan 121-03 Task 6.
+app.use(feedbackRoutes);
+
+const frontendDistPaths = [
+  // Phase 73 branding-nginx fix: the docker image copies the frontend build
+  // output from `/app/dist` (in the frontend-builder stage) to `/app/html`
+  // in the runtime image (see docker/Dockerfile L77 `COPY --from=frontend-
+  // builder /app/dist /app/html`). Without this entry the SPA fallback +
+  // getBrandedIndexHtml template middleware is dead code in production —
+  // Express never finds `frontendDist`, the whole `if (frontendDist) {...}`
+  // block is skipped, and any request that routes here (post-nginx-fix)
+  // gets Express's default 404 "Cannot GET /".
+  path.join(process.cwd(), "html"),
+  path.join(__dirname, "../../../dist"),
+  path.join(__dirname, "../../dist"),
+  path.join(process.cwd(), "dist"),
+];
+
+const frontendDist = frontendDistPaths.find((p) =>
+  fs.existsSync(path.join(p, "index.html")),
+);
+
+if (frontendDist) {
+  databaseLogger.info(`Serving frontend from: ${frontendDist}`, {
+    operation: "static_files",
+  });
+  app.use(
+    express.static(frontendDist, {
+      // Phase 70 fix — disable automatic index.html serving on `/`. The SPA
+      // fallback below intercepts every HTML-accepting GET and templates
+      // the response from the branding config (getBrandedIndexHtml), so a
+      // rebranded deployment has no user-visible "SKYNET" strings on first
+      // paint or in the iOS home-screen install label.
+      index: false,
+      setHeaders: (res, filePath) => {
+        const relativePath = path
+          .relative(frontendDist, filePath)
+          .replaceAll(path.sep, "/");
+
+        if (relativePath.startsWith("assets/")) {
+          res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+          return;
+        }
+
+        if (
+          relativePath === "index.html" ||
+          relativePath === "sw.js" ||
+          relativePath === "manifest.json"
+        ) {
+          // Phase 111 SKEW-14: no-store on index.html is load-bearing for the
+          // version-drift hard-lock reload-recovery gesture (D-13). Also
+          // enforced at both nginx configs (docker/nginx.conf +
+          // docker/nginx-https.conf). Do NOT relax.
+          res.setHeader(
+            "Cache-Control",
+            "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0",
+          );
+        }
+      },
+    }),
+  );
+
+  // Phase 70 fix — SPA fallback templates index.html from the branding config
+  // so a rebranded deployment has no user-visible "SKYNET" strings on first
+  // paint (the <title>) or in the iOS legacy home-screen install label (the
+  // apple-mobile-web-app-title meta). getBrandedIndexHtml never throws — on
+  // read failure it returns the raw bytes, and if raw is empty it returns "".
+  app.use((req, res, next) => {
+    if (req.method === "GET" && req.accepts("html")) {
+      // Phase 111 SKEW-14: no-store on index.html is load-bearing for the
+      // version-drift hard-lock reload-recovery gesture (D-13). Also enforced
+      // at both nginx configs (docker/nginx.conf + docker/nginx-https.conf).
+      // Do NOT relax.
+      res.setHeader(
+        "Cache-Control",
+        "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0",
+      );
+      void getBrandedIndexHtml(frontendDist)
+        .then((html) => {
+          if (html) {
+            res.type("html").send(html);
+          } else {
+            res.sendFile(path.join(frontendDist, "index.html"));
+          }
+        })
+        .catch((err) => {
+          databaseLogger.error("SPA fallback: branded index render failed", {
+            operation: "spa_fallback_branded_render_failed",
+            error: err instanceof Error ? err.message : String(err),
+          });
+          if (!res.headersSent) {
+            res.sendFile(path.join(frontendDist, "index.html"));
+          }
+        });
+    } else {
+      next();
+    }
+  });
+}
+
+app.use(
+  (
+    err: unknown,
+    req: express.Request,
+    res: express.Response,
+    _next: express.NextFunction,
+  ) => {
+    void _next;
+    apiLogger.error("Unhandled error in request", err, {
+      operation: "error_handler",
+      method: req.method,
+      url: req.url,
+      userAgent: req.get("User-Agent"),
+    });
+    res.status(500).json({ error: "Internal Server Error" });
+  },
+);
+
+const HTTP_PORT = 30001;
+
+async function initializeSecurity() {
+  try {
+    const authManager = AuthManager.getInstance();
+    await authManager.initialize();
+
+    DataCrypto.initialize();
+
+    const isValid = true;
+    if (!isValid) {
+      throw new Error("Security system validation failed");
+    }
+  } catch (error) {
+    databaseLogger.error("Failed to initialize security system", error, {
+      operation: "security_init_error",
+    });
+    throw error;
+  }
+}
+
+/**
+ * @openapi
+ * /database/migration/status:
+ *   get:
+ *     summary: Get database migration status
+ *     description: Returns the status of the database migration.
+ *     tags:
+ *       - Database
+ *     responses:
+ *       200:
+ *         description: Migration status.
+ *       500:
+ *         description: Failed to get migration status.
+ */
+app.get(
+  "/database/migration/status",
+  authenticateJWT,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const dataDir = process.env.DATA_DIR || "./db/data";
+      const migration = new DatabaseMigration(dataDir);
+      const status = migration.checkMigrationStatus();
+
+      const dbPath = path.join(dataDir, "db.sqlite");
+      const encryptedDbPath = `${dbPath}.encrypted`;
+
+      const files = fs.readdirSync(dataDir);
+      const backupFiles = files.filter((f) => f.includes(".migration-backup-"));
+      const migratedFiles = files.filter((f) => f.includes(".migrated-"));
+
+      let unencryptedSize = 0;
+      let encryptedSize = 0;
+
+      if (status.hasUnencryptedDb) {
+        try {
+          unencryptedSize = fs.statSync(dbPath).size;
+        } catch {
+          // expected - file may not exist
+        }
+      }
+
+      if (status.hasEncryptedDb) {
+        try {
+          encryptedSize = fs.statSync(encryptedDbPath).size;
+        } catch {
+          // expected - file may not exist
+        }
+      }
+
+      res.json({
+        migrationStatus: status,
+        files: {
+          unencryptedDbSize: unencryptedSize,
+          encryptedDbSize: encryptedSize,
+          backupFiles: backupFiles.length,
+          migratedFiles: migratedFiles.length,
+        },
+      });
+    } catch (error) {
+      apiLogger.error("Failed to get migration status", error, {
+        operation: "migration_status_api_failed",
+      });
+      res.status(500).json({
+        error: "Failed to get migration status",
+        details: error instanceof Error ? error.message : "Unknown error",
+      });
+    }
+  },
+);
+
+/**
+ * @openapi
+ * /database/migration/history:
+ *   get:
+ *     summary: Get database migration history
+ *     description: Returns the history of database migrations.
+ *     tags:
+ *       - Database
+ *     responses:
+ *       200:
+ *         description: Migration history.
+ *       500:
+ *         description: Failed to get migration history.
+ */
+app.get(
+  "/database/migration/history",
+  authenticateJWT,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const dataDir = process.env.DATA_DIR || "./db/data";
+
+      const files = fs.readdirSync(dataDir);
+
+      const backupFiles = files
+        .filter((f) => f.includes(".migration-backup-"))
+        .map((f) => {
+          const filePath = path.join(dataDir, f);
+          const stats = fs.statSync(filePath);
+          return {
+            name: f,
+            size: stats.size,
+            created: stats.birthtime,
+            modified: stats.mtime,
+            type: "backup",
+          };
+        })
+        .sort((a, b) => b.modified.getTime() - a.modified.getTime());
+
+      const migratedFiles = files
+        .filter((f) => f.includes(".migrated-"))
+        .map((f) => {
+          const filePath = path.join(dataDir, f);
+          const stats = fs.statSync(filePath);
+          return {
+            name: f,
+            size: stats.size,
+            created: stats.birthtime,
+            modified: stats.mtime,
+            type: "migrated",
+          };
+        })
+        .sort((a, b) => b.modified.getTime() - a.modified.getTime());
+
+      res.json({
+        files: [...backupFiles, ...migratedFiles],
+        summary: {
+          totalBackups: backupFiles.length,
+          totalMigrated: migratedFiles.length,
+          oldestBackup:
+            backupFiles.length > 0
+              ? backupFiles[backupFiles.length - 1].created
+              : null,
+          newestBackup: backupFiles.length > 0 ? backupFiles[0].created : null,
+        },
+      });
+    } catch (error) {
+      apiLogger.error("Failed to get migration history", error, {
+        operation: "migration_history_api_failed",
+      });
+      res.status(500).json({
+        error: "Failed to get migration history",
+        details: error instanceof Error ? error.message : "Unknown error",
+      });
+    }
+  },
+);
+
+const httpServer = http.createServer(app);
+
+// Phase 137 Plan 03 (RESEARCH Pitfall 6): combined upgrade dispatcher.
+// The dispatcher path-tests /apps/*/pane/* BEFORE routing so a
+// non-matching upgrade is destroyed by this outer handler, NOT by the
+// inner handler. `handleAppPaneUpgrade`'s legacy internal
+// destroy-on-non-match branch (HIGH-3 fix, 2026-09-19) becomes dead code
+// once this dispatcher is in place — the outer path-test guarantees the
+// internal regex will always match.
+// See src/backend/database/combined-pane-upgrade-dispatcher.ts for the
+// extracted + unit-tested implementation.
+// Phase 120 D-08 (T-120-32, BLOCKER 6) origin preserved: upgrade events
+// fire on the http.Server BEFORE any Express dispatch; router.all catches
+// HTTP methods only.
+// handleAppPaneUpgrade is invoked via the combined dispatcher (extracted
+// to combined-pane-upgrade-dispatcher.ts for unit testability — see that
+// module for the routing logic). It is imported above to make the
+// dependency explicit here.
+void handleAppPaneUpgrade; // referenced via combinedPaneUpgradeDispatcher;
+                           // its internal non-match branch is now dead code
+                           // because the combined dispatcher guarantees a
+                           // path match before calling it. Retained for
+                           // defense-in-depth.
+httpServer.on("upgrade", (req, socket, head) => {
+  void combinedPaneUpgradeDispatcher(req, socket as NetSocket, head);
+});
+
+httpServer.on("error", (err: NodeJS.ErrnoException) => {
+  if (err.code === "EADDRINUSE") {
+    databaseLogger.error(
+      `Port ${HTTP_PORT} is already in use. Kill the existing process and retry.`,
+      err,
+      {
+        operation: "http_server_port_conflict",
+        port: HTTP_PORT,
+      },
+    );
+    process.exit(1);
+  }
+  throw err;
+});
+
+export const serverReady = new Promise<void>((resolve) => {
+  httpServer.listen(HTTP_PORT, async () => {
+    if (!fs.existsSync(uploadsDir)) {
+      fs.mkdirSync(uploadsDir, { recursive: true });
+    }
+
+    await initializeSecurity();
+    resolve();
+  });
+});
+
+const sslConfig = AutoSSLSetup.getSSLConfig();
+if (sslConfig.enabled) {
+  databaseLogger.info(`SSL is enabled`, {
+    operation: "ssl_info",
+    nginx_https_port: sslConfig.port,
+    backend_http_port: HTTP_PORT,
+  });
+}

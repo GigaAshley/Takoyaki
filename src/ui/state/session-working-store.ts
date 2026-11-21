@@ -1,0 +1,1169 @@
+// ─── Session working-state store (Phase 34 Plan 06 — fleet-status cutover) ───
+// Module-scoped in-memory store for per-(host, tmuxSession) "is the session
+// working?" composite state. Sourced exclusively from the fleet-status
+// WebSocket channel (the backend-authoritative signal). Two old feeders
+// (PTY-idle from Terminal.tsx + backgrounded-work from PrettyView.tsx)
+// were REMOVED in Plan 06 — see 34-06-SUMMARY.md for the retired symbols.
+//
+// Composite formula (Phase 62 Plan 04 — two-branch structure; see the
+// leading block comment above publishFleetStatusSessionState for the full
+// specification and rollout rationale):
+//   DIRECT-SIGNAL BRANCH  (upgraded box: activityMtime and/or stoppedMtime
+//                          present) — grounded on marker mtimes alone; `bg`
+//                          is DROPPED from composition here per §Philosophy.
+//   FALLBACK BRANCH       (unupgraded box: both mtimes null) — executes the
+//                          existing Phase 59 shell-idle-gate predicate
+//                          byte-for-byte INCLUDING the `bg` term per
+//                          §Rollout Option 1's zero-behavior-change promise.
+//   waiting   = status === "waiting"   // separate axis — NOT working, bubble-only
+//
+// The ambient filter runs at the WATCHER (Plan 04), not here. By the time
+// SessionState arrives at the browser, backgroundTasks[] is already
+// ambient-filtered — every entry is non-ambient work.
+//
+// History note on `shell`:
+//   Patch #442 (2026-08-14, bounty phase-39-uat-regression-wip-always-on-
+//   idle-dot-missing) EXCLUDED `shell` from `main` after diagnosing that
+//   ambient Monitors were pinning status=shell → WIP-always-on. Fleet-
+//   status watcher-side ambient filtering had already stripped the same
+//   Monitors from `background_tasks[]`, so the fix targeted the foreground
+//   `status` axis in the store.
+//
+// inline-260823-wip-shell-is-work (user 2026-08-23): RESTORED to include
+//   `shell` in `main`. Empirical: three idle sessions on tina's box (all
+//   with 4 ambient Monitors each) are `status: idle`, not `shell` — the
+//   original "shell always" symptom is no longer reproducible on the same
+//   harness version. Meanwhile every real work turn oscillates busy →
+//   shell → busy → shell (assistant tokens + tool executions), and the
+//   post-#442 predicate flipped isWorking=false for the entire duration
+//   of every tool execution — producing the "flickers on and off" +
+//   "many sessions working but no indicator" symptoms user reported
+//   2026-08-23. Evidence: patricia + molly + wendy + carly + stephanie
+//   + vicky logs 10:03-10:06Z all showed busy↔shell oscillation flipping
+//   isWorking every 10-30s during continuous work.
+//
+// Ambient Monitors remain filtered on the bg axis via the watcher-side
+// [ambient]- prefix strip, so they still cannot flip isWorking. `idle`
+// and `waiting` remain excluded from main — idle correctly means
+// "waiting for the user"; waiting drives WaitingBubble on its own axis.
+//
+// Internal state shape: Map<string, { isWorking: boolean }>
+// Key format: `${hostId}:${tmuxSession ?? ""}` — unchanged convention.
+//
+// Per-key no-op notify guard: if the new isWorking === existing isWorking AND
+// the key already exists, skip notify. First-time publish always notifies.
+//
+// publishFleetStatusSessionGone: deletes the key from the map and notifies.
+// Unlike publishFleetStatusSessionState, gone always notifies (deletion is
+// always a change).
+//
+// Storage layer: NONE. In-memory Map only. A page refresh resets the store;
+// the fleet-status WS snapshot on re-connect repopulates all keys.
+//
+// Phase 44 (Plan 03): the store now consolidates lastMessageAt writes from
+// both feeds (fleet-status WS + /sessions/list seed) through a single
+// max-wins chokepoint (advanceSessionLastMessageAt). The WS publish path
+// calls the chokepoint after the isWorking swap; the seed path calls it
+// directly. See 43-CONTEXT.md § Reconciliation helper.
+//
+// Phase 47 (Plan 03): the store now carries a THIRD axis, aiTitle, with
+// LAST-WINS semantics (not max-wins). Publish path grows an Axis C block
+// that routes through advanceSessionAiTitle (unconditional call after
+// Axis B; the helper's own predicate handles null/no-op/write). Seed path
+// via seedSessionAiTitle mirrors the seedSessionLastMessageAt API. On
+// frames that co-change all three axes, publishFleetStatusSessionState
+// fires exactly 3 notifies (one per axis) — the correct observable
+// contract of the three-axis single-chokepoint architecture. See
+// 47-CONTEXT.md § Working-store third axis.
+//
+// Phase 53 (Plan 02): the store carries a FIFTH axis, condensing (then
+// `recycling`, for the retired agent reset), with direct swap-and-notify
+// semantics (like dormant Axis D). Publish path has an Axis E block below
+// Axis D; sourced from the backend-authoritative condense sentinels
+// (`.compact-requested` / `.compacting`, folded into one wire boolean by
+// source B); consumed via useSessionIsCondensing by every surface that shows
+// the agent is condensing, mounted pane or not (one source for all surfaces).
+//
+// Store pattern mirrors src/ui/state/conversation-store.ts: module-scoped
+// `state` object + Map + Set<() => void> listener registry + snapshotVersion
+// counter; notify() bumps + iterates; subscribe() returns disposer.
+
+import { useSyncExternalStore } from "react";
+import type { SessionState } from "../api/fleet-status-types.js";
+
+// ─── Module-scoped state ─────────────────────────────────────────────────────
+
+type WorkingRecord = {
+  isWorking: boolean;
+  // Phase 41 Plan 03 — the "message either direction" recency signal mirrored
+  // from the fleet-status wire frame (SessionState.lastMessageAt). `null` when
+  // the wire frame carried `null` (session with no message-bearing history) OR
+  // when the wire frame omitted the field entirely (pre-Phase-41-03 watcher).
+  // The conversation-store row-derivation reads this via getSessionLastMessageAt
+  // and stamps row.lastMessageAt so compareByRecencyDesc can drive the flat
+  // middle-zone sort. See §Sort model — middle section in 41-CONTEXT.md.
+  lastMessageAt: number | null;
+  // Phase 47 — the current-work hint sourced from the harness-emitted
+  // ai-title JSONL line. `null` when the wire frame carried `null` (no
+  // ai-title yet) OR when the wire frame omitted the field entirely
+  // (pre-Phase-47 backend). Reconciliation is LAST-WINS (not max-wins like
+  // lastMessageAt) because ai-title EVOLVES: as the session's topic drifts
+  // across turns, the freshest value from either source (WS or
+  // /sessions/list seed) is the correct one. See 47-CONTEXT.md § Working-
+  // store third axis.
+  aiTitle: string | null;
+  // Phase 52 Plan 01 — the inline supervisor-dormancy signal. Source: the
+  // ~/fleet/identities/<tmuxSession>/.dormant sentinel file on the target
+  // host. `true` when the sentinel is present (identity parked by supervisor),
+  // `false` otherwise. Default `false` on cold-start and on frames from
+  // pre-Phase-52 backends that omit the field entirely. Strict boolean at
+  // the store boundary — three-valued wire input (true/false/null/undefined)
+  // collapses to boolean here so the Ready predicate (!isWorking && !dormant)
+  // in Plan 03 reads a simple boolean. Reconciliation: direct swap-and-notify
+  // (no max-wins, no last-wins — just a boolean gate on the sentinel).
+  dormant: boolean;
+  // The backend-authoritative condensing signal mirrored from the
+  // fleet-status wire frame (SessionState.condensing). `true` when the wire
+  // frame carried `condensing: true` (`.compact-requested` or `.compacting`
+  // present — the agent's context is being condensed in place, queued or in
+  // flight). `false` when the wire frame carried `false`, `null`, or omitted
+  // the field entirely (safe default — no false positives). Wire's
+  // three-valued input collapses to strict boolean at the store boundary in
+  // the Axis E block below via `state_arg.condensing === true`. Hook
+  // consumers read a simple boolean. Reconciliation is direct swap-and-notify
+  // (no max-wins, no last-wins). Preserved across Axis A (isWorking)
+  // republishes via `condensing: existing?.condensing ?? false` in the Axis A
+  // nextMap write (defensive against the Pitfall-3 pattern documented in
+  // Phase 53 RESEARCH.md). Consumed by useSessionIsCondensing(key).
+  condensing: boolean;
+  // Phase 59 Plan 03 (WIP shell-idle gate — 2026-08-29): stop-gate axes.
+  // Mirrors wire `lastStopAt`; `null` when the wire carried null OR omitted
+  // the field. Cache-preserved across every Axis (A/B/C/D/E) republish per
+  // the Pitfall-3 invariant — an Axis-A-only isWorking flip that carries no
+  // lastStopAt signal MUST NOT wipe the cached value. Read by the `main`
+  // predicate below (Axis F block writes it on wire delta).
+  //
+  // Phase 62 Plan 04 (WIP hook-based rewrite 2026-08-30): retained — not
+  // retired — for the entire Phase 62 rollout window per CONTEXT.md §Rollout
+  // Option 1 (LOCKED for this phase). The new direct-signal predicate branch
+  // (activityMtime > stoppedMtime, see below) supersedes this axis on
+  // upgraded boxes, but sessions on unupgraded boxes continue to drive
+  // isWorking via the Phase 59 shell-idle-gate predicate that reads this
+  // axis. A follow-up phase (post-full-rollout, orchestrator-tracked) retires
+  // both this axis and its lastStatusChangeAt sibling below.
+  lastStopAt: number | null;
+  // Phase 59 Plan 03 — mirrors wire `lastStatusChangeAt`; `null` when the
+  // wire carried null OR omitted the field. Cache-preserved across every
+  // Axis republish per Pitfall-3 (same invariant as lastStopAt above). Read
+  // by the `main` predicate below (Axis G block writes it on wire delta).
+  //
+  // Phase 62 Plan 04 — see the lastStopAt block comment above for the
+  // Option-1 rollout retention rationale — this axis is also retained for
+  // the rollout window and is retired together with lastStopAt in the same
+  // follow-up phase once every managed box has been upgraded.
+  lastStatusChangeAt: number | null;
+  // Phase 62 Plan 04 (WIP hook-based rewrite 2026-08-30) — the two per-session
+  // marker mtimes that back the new direct-signal WIP predicate. Mirrored
+  // from wire `SessionState.activityMtime` (touched by activity-hook.sh on
+  // UserPromptSubmit + PreToolUse per Plan 62-01/02). `null` when the wire
+  // carried null OR omitted the field (marker file absent, SSH hiccup, or
+  // emitting backend pre-dates Phase 62 — all three collapse to null at the
+  // store boundary and all three trigger the Option-1 rollout fallback to
+  // the Phase 59 shell-idle-gate predicate).
+  //
+  // Cache-preserved across every Axis (A/B/C/D/E/F/G) republish per the
+  // Pitfall-3 invariant established for all prior axes — an Axis-A-only
+  // isWorking flip that carries no activityMtime signal MUST NOT wipe the
+  // cached value. Axis H below is the ONLY writer on wire delta.
+  //
+  // Read by the direct-signal branch of the isWorking predicate below (when
+  // `activityMtime !== null || stoppedMtime !== null`). Per CONTEXT.md
+  // §Philosophy the direct-signal branch is grounded on marker mtimes ALONE
+  // — the `bg = backgroundTasks.length > 0` axis does NOT contribute in the
+  // direct-signal branch (bg is retained only in the retained Phase 59
+  // fallback branch, byte-for-byte, per §Rollout Option 1).
+  activityMtime: number | null;
+  // Phase 62 Plan 04 — mirrors wire `SessionState.stoppedMtime` (touched by
+  // stopped-hook.sh on Stop / StopFailure / PermissionRequest per Plan
+  // 62-01/02 — PermissionRequest is deliberately treated as "stopped" per
+  // CONTEXT.md §Philosophy: "agent is waiting on you" is the same as "agent
+  // is done" from the affordance's perspective — both mean the row deserves
+  // user's attention right now).
+  //
+  // Same three-valued semantics + Pitfall-3 preservation invariant as
+  // activityMtime above. Axis I below is the ONLY writer on wire delta.
+  // Read by the direct-signal branch of isWorking below.
+  stoppedMtime: number | null;
+};
+
+type State = {
+  map: Map<string, WorkingRecord>;
+};
+
+let state: State = {
+  map: new Map<string, WorkingRecord>(),
+};
+
+// How long after a Stop an activity touch on an idle session is treated as
+// harness background noise rather than work (see the direct-signal branch).
+const STRAY_ACTIVITY_WINDOW_MS = 15_000;
+
+let snapshotVersion = 0;
+
+const listeners = new Set<() => void>();
+
+function notify(): void {
+  snapshotVersion += 1;
+  for (const l of listeners) l();
+}
+
+function subscribe(cb: () => void): () => void {
+  listeners.add(cb);
+  return () => {
+    listeners.delete(cb);
+  };
+}
+
+/**
+ * Phase 41 Plan 03 — public subscribe API for cross-store bridges.
+ *
+ * Exposes the internal listener registry so other stores (specifically
+ * conversation-store, whose middle-zone snapshot must re-derive when a
+ * session's cached lastMessageAt advances) can register a callback that
+ * fires on ANY working-store mutation. Returns a disposer.
+ *
+ * The alternative — having conversation-store poll working-store on every
+ * getSnapshot() — would still work because the snapshot's row derivation
+ * reads getSessionLastMessageAt() at derivation time, but the snapshot
+ * memoization would then hold a stale snapshot until some other event
+ * bumped conversation-store's own version counter. The subscribe bridge
+ * closes that gap: a working-store publish triggers a conversation-store
+ * notify(), invalidates its cached snapshot, and the next getSnapshot()
+ * picks up fresh lastMessageAt values.
+ */
+export function subscribeSessionWorkingStore(cb: () => void): () => void {
+  return subscribe(cb);
+}
+
+// ─── Public API ──────────────────────────────────────────────────────────────
+
+/**
+ * Publish a new or updated SessionState from the fleet-status channel.
+ * Computes isWorking from the D-CTX composite formula and updates the map.
+ *
+ * Per-key no-op notify guard: if isWorking is unchanged AND the key already
+ * exists in the map, skip notify. This prevents spurious re-renders when the
+ * backend sends repeated frames with identical effective states.
+ *
+ * Structured logging: logs every state transition at the hostId + tmuxSession
+ * level so dot regressions can be traced through the browser console.
+ * Per T-34-20 (Repudiation mitigation).
+ */
+export function publishFleetStatusSessionState(
+  hostId: string,
+  state_arg: SessionState,
+): void {
+  const key = `${hostId}:${state_arg.tmuxSession ?? ""}`;
+
+  // Phase 62 Plan 04 (WIP hook-based rewrite 2026-08-30) — the affordance
+  // stops lying. Two-branch predicate structure:
+  //
+  //   1. DIRECT-SIGNAL BRANCH (upgraded box — Plan 62-02 hooks installed):
+  //      Fires when at least one of activityMtime or stoppedMtime is a
+  //      number (i.e. at least one marker file has been touched by a
+  //      Plan 62-01 hook script on the managed box). Composition:
+  //        - activityMtime === null && stoppedMtime !== null → false
+  //          (only stop observed — row does NOT deserve attention).
+  //        - activityMtime !== null && stoppedMtime === null → true
+  //          (activity observed, no stop yet — row deserves attention).
+  //        - both !== null → `activityMtime > stoppedMtime` (strict >,
+  //          equal collapses to false — activity must beat the latest stop).
+  //      The `bg = backgroundTasks.length > 0` axis is DROPPED from
+  //      composition in this branch. Per CONTEXT.md §Philosophy the
+  //      direct-signal predicate is grounded on marker mtimes alone — no
+  //      state machine, no smoothing, no oscillation to fight, no second
+  //      guessing layer alongside the direct signal. If a case is missed,
+  //      the fix is to change which hooks we subscribe to (Plan 62-02),
+  //      NOT to layer inference back in. `backgroundTasks[]` stays on the
+  //      wire per CONTEXT.md §Out of scope for orthogonal consumers.
+  //
+  //   2. FALLBACK BRANCH (unupgraded box — no hooks yet installed):
+  //      Fires when both activityMtime === null AND stoppedMtime === null
+  //      (no direct signal available). Executes the EXISTING Phase 59
+  //      shell-idle-gate predicate BYTE-FOR-BYTE, INCLUDING the `bg` term.
+  //      See the actual composition line in the else-branch below for the
+  //      literal source-of-truth (main + bg with the disjunction operator).
+  //      Zero behavior change on unupgraded boxes is Option-1 rollout's
+  //      core promise per CONTEXT.md §Rollout (LOCKED for this phase). A
+  //      session currently driven by long-running background tasks
+  //      (status=idle, bg=true) MUST continue to show isWorking=true until
+  //      its box is upgraded — dropping `bg` here would silently flip
+  //      such sessions to idle on every unupgraded box, which IS the
+  //      behavior change Option-1 explicitly promised not to make. `bg`
+  //      retirement happens ONLY on upgraded boxes (branch 1 above) where
+  //      the direct signal supersedes it, and fleet-wide once the follow-
+  //      up phase retires the fallback branch entirely.
+  //
+  // The `waiting` status axis is preserved on both branches (feeds
+  // session-waiting-store separately, not part of isWorking here) —
+  // unchanged from prior behavior.
+  //
+  // Historical context on the fallback branch (retained verbatim from
+  // Phase 59 Plan 03 for the reader tracing why the fallback looks the
+  // way it does):
+  //
+  // Phase 59 Plan 03 (WIP-shell-idle-gate 2026-08-29) — supersedes the
+  // inline-260823-wip-shell-is-work rule at the predicate boundary but
+  // preserves it as the mid-turn-shell case. New shape: `shell` counts as
+  // work ONLY when the session's status has transitioned since its own last
+  // Stop-hook fire (`lastStatusChangeAt > lastStopAt`). Rollout safety: when
+  // `lastStopAt === null` (fresh session, or a lazy-rollout session that
+  // pre-dates the Phase 59 backend / hook upgrade) shell defaults to on —
+  // no evidence of a stop is treated as "still working" per CONTEXT.md D-05.
+  //
+  // The inline-260823-wip-shell-is-work truth still holds for real mid-turn
+  // shell: while a turn runs, the backend bumps `lastStatusChangeAt` on
+  // every status transition (busy ↔ shell oscillation), keeping
+  // `lastStatusChangeAt > lastStopAt` and the indicator lit. The predicate
+  // only trips FALSE for stale-shell (the Poppy/aqua/wilma pattern) where
+  // status settled on shell BEFORE the last Stop-hook fire and has not moved
+  // since — the very false-positive that motivated Phase 62 (see the
+  // §Shape / §Philosophy blocks in 62-CONTEXT.md for how the direct-signal
+  // branch closes this while the fallback branch preserves the existing
+  // gate byte-for-byte for the rollout window).
+  // Fall back to cached values when the incoming frame's stop-gate axes are
+  // undefined (e.g. any source-B-style frame that omits these fields). Using
+  // wire-only values would let a source-B frame reset the gating basis for
+  // this key, silently breaking the shell-gate on the next source-A shell
+  // frame — same Pitfall-3 class the Axis writes below guard against.
+  // Consult cache first, wire second, null last. The same fall-back
+  // discipline applies to the new Phase 62 axes activityMtime + stoppedMtime
+  // so the direct-signal branch reads a source-B-safe view of both axes.
+  const existing = state.map.get(key);
+  const lastStopAt =
+    state_arg.lastStopAt ?? existing?.lastStopAt ?? null;
+  const lastStatusChangeAt =
+    state_arg.lastStatusChangeAt ?? existing?.lastStatusChangeAt ?? null;
+  const activityMtime =
+    state_arg.activityMtime ?? existing?.activityMtime ?? null;
+  const stoppedMtime =
+    state_arg.stoppedMtime ?? existing?.stoppedMtime ?? null;
+
+  let isWorking: boolean;
+  if (activityMtime !== null || stoppedMtime !== null) {
+    // Direct-signal branch (upgraded box): activity vs stopped mtime alone.
+    // `bg` is intentionally NOT referenced here per CONTEXT.md §Philosophy.
+    if (activityMtime !== null && stoppedMtime === null) {
+      isWorking = true;
+    } else if (activityMtime === null && stoppedMtime !== null) {
+      isWorking = false;
+    } else {
+      // Both are numbers (TypeScript can't narrow across the || above but
+      // the else-branch of the outer disjunction reaches here only when
+      // both were non-null, so the ! assertions are safe).
+      isWorking = (activityMtime as number) > (stoppedMtime as number);
+    }
+    // The harness's own "idle" (waiting for the user) beats a stray activity
+    // touch just after the Stop hook: harness background work fires an
+    // activity hook a few seconds after Stop (seen at +2s and +4s), which
+    // would otherwise light the indicator until the next turn. Only within
+    // STRAY_ACTIVITY_WINDOW_MS of the stop, so a background sub-agent whose
+    // tool calls keep touching the marker after Stop still counts as work.
+    // Live frames only — source-B frames (sessionId "__dormant__") always say
+    // idle and carry no live status.
+    if (
+      isWorking &&
+      state_arg.status === "idle" &&
+      state_arg.sessionId !== "__dormant__" &&
+      stoppedMtime !== null &&
+      (activityMtime as number) - stoppedMtime <= STRAY_ACTIVITY_WINDOW_MS
+    ) {
+      isWorking = false;
+    }
+  } else {
+    // Fallback branch (unupgraded box): byte-for-byte the Phase 59 predicate,
+    // INCLUDING the `bg` term — Option-1 rollout requires zero behavior
+    // change on unupgraded boxes. See CONTEXT.md §Rollout Option 1.
+    const shellCountsAsWork =
+      state_arg.status === "shell" &&
+      (lastStopAt === null ||
+        (lastStatusChangeAt !== null && lastStatusChangeAt > lastStopAt));
+    const main =
+      state_arg.status === "busy" || shellCountsAsWork;
+    const bg = state_arg.backgroundTasks.length > 0;
+    isWorking = main || bg;
+  }
+
+  // Phase 44 (Plan 03) — single-chokepoint architecture per 43-CONTEXT.md §
+  // Reconciliation helper. isWorking axis handled inline; lastMessageAt axis
+  // routes through advanceSessionLastMessageAt so BOTH the WS-publish path
+  // and the /sessions/list-seed path funnel through the same reconciliation
+  // predicate. Two notify events on frames that co-change both axes is the
+  // correct observable contract.
+  //
+  // Phase 47 (Plan 03) — extended to a THIRD axis (aiTitle) via
+  // advanceSessionAiTitle (Axis C below). Distinct LAST-WINS semantics
+  // (freshest positive string wins; null does NOT overwrite). Co-change
+  // frames now emit 3 notifies (one per axis) — extends Phase 44's
+  // two-axes-two-notifies contract to three. See 47-CONTEXT.md § Working-
+  // store third axis.
+
+  // ── Axis A — isWorking swap-and-notify block ──
+  // Fire only when isWorking actually changed OR the key is brand-new.
+  // The lastMessageAt value written into the record here is the
+  // CURRENTLY-CACHED value (preserved unchanged); Axis B below handles
+  // any lastMessageAt update via advanceSessionLastMessageAt. Similarly
+  // the aiTitle value is preserved as the currently-cached string;
+  // Axis C below handles any aiTitle update via advanceSessionAiTitle.
+  // The dormant value is ALSO preserved from cache here (Axis D below
+  // handles the dormant update independently). This ensures Axis A
+  // republishes do not wipe a dormant:true set by a prior frame.
+  if (existing === undefined || existing.isWorking !== isWorking) {
+    console.info({
+      operation: "fleet_status_working_state_change",
+      hostId,
+      tmuxSession: state_arg.tmuxSession,
+      sessionId: state_arg.sessionId,
+      status: state_arg.status,
+      backgroundTaskCount: state_arg.backgroundTasks.length,
+      isWorking,
+      lastMessageAt: existing?.lastMessageAt ?? null,
+      aiTitle: existing?.aiTitle ?? null,
+      dormant: existing?.dormant ?? false,
+      condensing: existing?.condensing ?? false,
+      previous: existing?.isWorking ?? null,
+      previousLastMessageAt: existing?.lastMessageAt ?? null,
+      previousAiTitle: existing?.aiTitle ?? null,
+      previousDormant: existing?.dormant ?? false,
+      previousCondensing: existing?.condensing ?? false,
+      lastStopAt: existing?.lastStopAt ?? null,
+      lastStatusChangeAt: existing?.lastStatusChangeAt ?? null,
+      previousLastStopAt: existing?.lastStopAt ?? null,
+      previousLastStatusChangeAt: existing?.lastStatusChangeAt ?? null,
+      // Phase 62 Plan 04 — new direct-signal axes on the forensic log so a
+      // future debug session can trace which branch of the predicate
+      // (direct-signal vs. Phase 59 fallback) drove any given transition.
+      activityMtime: existing?.activityMtime ?? null,
+      stoppedMtime: existing?.stoppedMtime ?? null,
+      previousActivityMtime: existing?.activityMtime ?? null,
+      previousStoppedMtime: existing?.stoppedMtime ?? null,
+    });
+
+    const nextMap = new Map(state.map);
+    nextMap.set(key, {
+      isWorking,
+      lastMessageAt: existing?.lastMessageAt ?? null,
+      aiTitle: existing?.aiTitle ?? null,
+      dormant: existing?.dormant ?? false,
+      condensing: existing?.condensing ?? false,
+      // Phase 59 Plan 03 — Pitfall-3 preservation: an Axis-A-only isWorking
+      // flip that carries no lastStopAt / lastStatusChangeAt signal MUST NOT
+      // wipe the cached values. Axes F/G below handle wire-driven updates.
+      lastStopAt: existing?.lastStopAt ?? null,
+      lastStatusChangeAt: existing?.lastStatusChangeAt ?? null,
+      // Phase 62 Plan 04 — Pitfall-3 preservation for the two new axes.
+      // Axes H/I below handle wire-driven updates. Brand-new-key default null.
+      activityMtime: existing?.activityMtime ?? null,
+      stoppedMtime: existing?.stoppedMtime ?? null,
+    });
+    state = { map: nextMap };
+    notify();
+  }
+
+  // ── Axis B — lastMessageAt reconciliation via the chokepoint ──
+  // Unconditional call; the helper's own predicate handles null/stale/fresher.
+  // If Axis A just wrote, this sees the fresh isWorking with the OLD
+  // lastMessageAt so the max-wins compare works correctly.
+  advanceSessionLastMessageAt(key, state_arg.lastMessageAt ?? null);
+
+  // ── Axis C — aiTitle reconciliation via the chokepoint ──
+  // Unconditional call after Axis B; the helper's own predicate handles
+  // null/no-op/write (LAST-WINS: null does NOT overwrite an existing
+  // string; a fresh non-null string overwrites any previous value;
+  // identical strings are a no-op-no-notify via Object.is guard).
+  // Distinct from Axis B's max-wins because ai-title has no numeric
+  // ordering — the freshest ARRIVAL is the correct value. Frames that
+  // co-change all three axes emit 3 notifies (one per axis), the correct
+  // observable contract of the three-axis single-chokepoint architecture
+  // per 47-CONTEXT.md § Working-store third axis.
+  advanceSessionAiTitle(key, state_arg.aiTitle ?? null);
+
+  // ── Axis D — dormant swap-and-notify block (Phase 52 Plan 01) ──
+  // Wire semantic (optional field): `dormant: true` sets true, `dormant: false`
+  // sets false (explicit reset), `dormant` absent (undefined) preserves the
+  // cached value — an Axis-A-only republish that carries no dormant signal
+  // must NOT wipe a dormant:true set by a prior frame. This matches the
+  // optional-field convention on the wire (dormant?: boolean).
+  //
+  // Direct swap-and-notify: no max-wins, no last-wins — when we DO have a
+  // signal, dormant is a strict boolean gate on the sentinel file's presence.
+  // Fire only when we have an explicit signal AND it differs from cache.
+  // Brand-new-key case is handled above in Axis A; here we only fire on change.
+  if (state_arg.dormant !== undefined) {
+    const dormant = state_arg.dormant === true;
+    const existingAfterAxes = state.map.get(key);
+    if (
+      existingAfterAxes !== undefined &&
+      existingAfterAxes.dormant !== dormant
+    ) {
+      const nextMap = new Map(state.map);
+      nextMap.set(key, {
+        isWorking: existingAfterAxes.isWorking,
+        lastMessageAt: existingAfterAxes.lastMessageAt,
+        aiTitle: existingAfterAxes.aiTitle,
+        dormant,
+        condensing: existingAfterAxes.condensing,
+        // Phase 59 Plan 03 — preserve stop-gate axes on dormant flip.
+        lastStopAt: existingAfterAxes.lastStopAt,
+        lastStatusChangeAt: existingAfterAxes.lastStatusChangeAt,
+        // Phase 62 Plan 04 — preserve direct-signal axes on dormant flip.
+        activityMtime: existingAfterAxes.activityMtime,
+        stoppedMtime: existingAfterAxes.stoppedMtime,
+      });
+      state = { map: nextMap };
+      notify();
+    }
+  }
+
+  // ── Axis E — condensing swap-and-notify block (Phase 53 Plan 02) ──
+  // Wire semantic (optional field): `condensing: true` sets true; `condensing:
+  // false` sets false (explicit reset); `condensing` absent (undefined)
+  // preserves the cached value — source A frames never carry the field, so an
+  // Axis-A-only republish must NOT wipe a condensing:true set by a prior
+  // source-B frame; matches the optional-field convention on the wire
+  // (condensing?: boolean | null).
+  //
+  // Direct swap-and-notify: no max-wins, no last-wins — condensing is a
+  // strict boolean gate on the condense sentinels' presence. Fire only when
+  // we have an explicit signal AND it differs from cache. Brand-new-key case
+  // is handled above in Axis A which also preserves condensing in its nextMap
+  // write; here we only fire on change.
+  if (state_arg.condensing !== undefined) {
+    const condensing = state_arg.condensing === true;
+    const existingAfterAxes = state.map.get(key);
+    if (
+      existingAfterAxes !== undefined &&
+      existingAfterAxes.condensing !== condensing
+    ) {
+      const nextMap = new Map(state.map);
+      nextMap.set(key, {
+        isWorking: existingAfterAxes.isWorking,
+        lastMessageAt: existingAfterAxes.lastMessageAt,
+        aiTitle: existingAfterAxes.aiTitle,
+        dormant: existingAfterAxes.dormant,
+        condensing,
+        // Phase 59 Plan 03 — preserve stop-gate axes on condensing flip.
+        lastStopAt: existingAfterAxes.lastStopAt,
+        lastStatusChangeAt: existingAfterAxes.lastStatusChangeAt,
+        // Phase 62 Plan 04 — preserve direct-signal axes on condensing flip.
+        activityMtime: existingAfterAxes.activityMtime,
+        stoppedMtime: existingAfterAxes.stoppedMtime,
+      });
+      state = { map: nextMap };
+      notify();
+    }
+  }
+
+  // ── Axis F — lastStopAt swap-and-notify block (Phase 59 Plan 03) ──
+  // Wire semantic (optional field): `lastStopAt: <number>` sets value;
+  // `lastStopAt: null` explicitly resets cache to null; `lastStopAt` absent
+  // (undefined) preserves the cached value — an Axis-A-only republish that
+  // carries no stop-gate signal MUST NOT wipe a `lastStopAt` set by a prior
+  // frame. Matches the optional-nullable convention on the wire
+  // (lastStopAt?: number | null) mirrored by fleet-status-types.ts and by
+  // the backend zod schema (Plan 59-01).
+  //
+  // Direct swap-and-notify (no max-wins, no last-wins) — the backend derives
+  // this axis from the mtime of the per-session Stop-hook file, so the
+  // freshest server-side reading is authoritative. Fire only when we have
+  // an explicit signal AND it differs from cache. Brand-new-key case is
+  // handled above in Axis A which preserves lastStopAt in its nextMap
+  // write; here we only fire on change. See 59-CONTEXT.md § Shape and
+  // 59-RESEARCH.md § Frontend predicate.
+  if (state_arg.lastStopAt !== undefined) {
+    const lastStopAt = state_arg.lastStopAt;
+    const existingAfterAxes = state.map.get(key);
+    if (
+      existingAfterAxes !== undefined &&
+      existingAfterAxes.lastStopAt !== lastStopAt
+    ) {
+      const nextMap = new Map(state.map);
+      nextMap.set(key, {
+        isWorking: existingAfterAxes.isWorking,
+        lastMessageAt: existingAfterAxes.lastMessageAt,
+        aiTitle: existingAfterAxes.aiTitle,
+        dormant: existingAfterAxes.dormant,
+        condensing: existingAfterAxes.condensing,
+        lastStopAt,
+        lastStatusChangeAt: existingAfterAxes.lastStatusChangeAt,
+        // Phase 62 Plan 04 — preserve direct-signal axes on lastStopAt flip.
+        activityMtime: existingAfterAxes.activityMtime,
+        stoppedMtime: existingAfterAxes.stoppedMtime,
+      });
+      state = { map: nextMap };
+      notify();
+    }
+  }
+
+  // ── Axis G — lastStatusChangeAt swap-and-notify block (Phase 59 Plan 03) ──
+  // Wire semantic (optional field): `lastStatusChangeAt: <number>` sets
+  // value; `lastStatusChangeAt: null` explicitly resets cache to null;
+  // `lastStatusChangeAt` absent (undefined) preserves the cached value —
+  // same optional-nullable convention as Axis F above.
+  //
+  // Direct swap-and-notify — the backend derives this axis SERVER-SIDE
+  // from a poll-to-poll status-value delta (NOT from sessionJson.updatedAt,
+  // which the harness bumps on compose-box typing without a real state
+  // transition — Pitfall 4 in 59-RESEARCH.md). The freshest server-side
+  // reading is authoritative. Brand-new-key case is handled above in Axis
+  // A which preserves lastStatusChangeAt in its nextMap write; here we
+  // only fire on change.
+  if (state_arg.lastStatusChangeAt !== undefined) {
+    const lastStatusChangeAt = state_arg.lastStatusChangeAt;
+    const existingAfterAxes = state.map.get(key);
+    if (
+      existingAfterAxes !== undefined &&
+      existingAfterAxes.lastStatusChangeAt !== lastStatusChangeAt
+    ) {
+      const nextMap = new Map(state.map);
+      nextMap.set(key, {
+        isWorking: existingAfterAxes.isWorking,
+        lastMessageAt: existingAfterAxes.lastMessageAt,
+        aiTitle: existingAfterAxes.aiTitle,
+        dormant: existingAfterAxes.dormant,
+        condensing: existingAfterAxes.condensing,
+        lastStopAt: existingAfterAxes.lastStopAt,
+        lastStatusChangeAt,
+        // Phase 62 Plan 04 — preserve direct-signal axes on
+        // lastStatusChangeAt flip.
+        activityMtime: existingAfterAxes.activityMtime,
+        stoppedMtime: existingAfterAxes.stoppedMtime,
+      });
+      state = { map: nextMap };
+      notify();
+    }
+  }
+
+  // ── Axis H — activityMtime swap-and-notify block (Phase 62 Plan 04) ──
+  // Wire semantic (optional field): `activityMtime: <number>` sets value;
+  // `activityMtime: null` explicitly resets cache to null; `activityMtime`
+  // absent (undefined) preserves the cached value — an Axis-A-only republish
+  // that carries no direct-signal MUST NOT wipe an `activityMtime` set by a
+  // prior frame. Matches the optional-nullable convention on the wire
+  // (activityMtime?: number | null) mirrored by fleet-status-types.ts and by
+  // the backend zod schema (Plan 62-03).
+  //
+  // Direct swap-and-notify (no max-wins, no last-wins) — the backend derives
+  // this axis from the mtime of the per-session activity marker touched by
+  // the Plan 62-01 activity-hook.sh on UserPromptSubmit + PreToolUse events,
+  // so the freshest server-side reading is authoritative. Fire only when we
+  // have an explicit signal AND it differs from cache. Brand-new-key case is
+  // handled above in Axis A which preserves activityMtime in its nextMap
+  // write; here we only fire on change. Mirrors the Axis F pattern above.
+  if (state_arg.activityMtime !== undefined) {
+    const activityMtime = state_arg.activityMtime;
+    const existingAfterAxes = state.map.get(key);
+    if (
+      existingAfterAxes !== undefined &&
+      existingAfterAxes.activityMtime !== activityMtime
+    ) {
+      const nextMap = new Map(state.map);
+      nextMap.set(key, {
+        isWorking: existingAfterAxes.isWorking,
+        lastMessageAt: existingAfterAxes.lastMessageAt,
+        aiTitle: existingAfterAxes.aiTitle,
+        dormant: existingAfterAxes.dormant,
+        condensing: existingAfterAxes.condensing,
+        lastStopAt: existingAfterAxes.lastStopAt,
+        lastStatusChangeAt: existingAfterAxes.lastStatusChangeAt,
+        activityMtime,
+        stoppedMtime: existingAfterAxes.stoppedMtime,
+      });
+      state = { map: nextMap };
+      notify();
+    }
+  }
+
+  // ── Axis I — stoppedMtime swap-and-notify block (Phase 62 Plan 04) ──
+  // Wire semantic (optional field): `stoppedMtime: <number>` sets value;
+  // `stoppedMtime: null` explicitly resets cache to null; `stoppedMtime`
+  // absent (undefined) preserves the cached value — same optional-nullable
+  // convention as Axis H above.
+  //
+  // Direct swap-and-notify — the backend derives this axis from the mtime of
+  // the per-session stopped marker touched by the Plan 62-01 stopped-hook.sh
+  // on Stop / StopFailure / PermissionRequest events (PermissionRequest
+  // deliberately treated as "stopped" per CONTEXT.md §Philosophy — from the
+  // affordance's perspective "agent is waiting on you" is the same as "agent
+  // is done": both mean the row deserves user's attention right now).
+  // Fire only when we have an explicit signal AND it differs from cache.
+  // Brand-new-key case is handled above in Axis A which preserves
+  // stoppedMtime in its nextMap write. Mirrors the Axis G pattern above.
+  if (state_arg.stoppedMtime !== undefined) {
+    const stoppedMtime = state_arg.stoppedMtime;
+    const existingAfterAxes = state.map.get(key);
+    if (
+      existingAfterAxes !== undefined &&
+      existingAfterAxes.stoppedMtime !== stoppedMtime
+    ) {
+      const nextMap = new Map(state.map);
+      nextMap.set(key, {
+        isWorking: existingAfterAxes.isWorking,
+        lastMessageAt: existingAfterAxes.lastMessageAt,
+        aiTitle: existingAfterAxes.aiTitle,
+        dormant: existingAfterAxes.dormant,
+        condensing: existingAfterAxes.condensing,
+        lastStopAt: existingAfterAxes.lastStopAt,
+        lastStatusChangeAt: existingAfterAxes.lastStatusChangeAt,
+        activityMtime: existingAfterAxes.activityMtime,
+        stoppedMtime,
+      });
+      state = { map: nextMap };
+      notify();
+    }
+  }
+}
+
+/**
+ * Mark a session as gone (session ended or watcher lost track of it).
+ * Deletes the key from the map and notifies subscribers so the dot
+ * clears immediately. If the key does not exist, this is a no-op
+ * (prevents double-delete churn from watcher restart cycles — mirrors
+ * the server-side SubscriptionRegistry.publishSessionGone behavior).
+ */
+export function publishFleetStatusSessionGone(
+  hostId: string,
+  tmuxSession: string | null,
+  sessionId: string,
+): void {
+  const key = `${hostId}:${tmuxSession ?? ""}`;
+  if (!state.map.has(key)) return; // no-op
+
+  console.info({
+    operation: "fleet_status_session_gone",
+    hostId,
+    tmuxSession,
+    sessionId,
+    key,
+  });
+
+  const nextMap = new Map(state.map);
+  nextMap.delete(key);
+  state = { map: nextMap };
+  notify();
+}
+
+/**
+ * Phase 44 (Plan 03) — the ONLY writer of WorkingRecord.lastMessageAt.
+ *
+ * Max-wins contract (per 43-CONTEXT.md § Reconciliation helper):
+ *   - If `ts === null`: no-op + no-notify (never regresses cache to null).
+ *   - If no record exists for `key`: create `{ isWorking: false, lastMessageAt: ts }`, notify.
+ *   - If record exists AND record.lastMessageAt is null: write ts, notify.
+ *   - If record exists AND ts > record.lastMessageAt: write ts, notify.
+ *   - If record exists AND ts <= record.lastMessageAt: no-op + no-notify.
+ *
+ * The `isWorking` axis is preserved verbatim on existing records — never
+ * mutated by this helper. New-record writes default `isWorking: false`
+ * (dormant sessions never touch the isWorking axis).
+ *
+ * Called from BOTH the WS publish path (via publishFleetStatusSessionState's
+ * Axis B block) AND the /sessions/list seed path (via
+ * seedSessionLastMessageAt). Single reconciliation chokepoint — any future
+ * contract tweak (e.g., accepting `null` as "clear the value") is a
+ * one-place change.
+ */
+function advanceSessionLastMessageAt(key: string, ts: number | null): void {
+  if (ts === null) return;
+
+  const existing = state.map.get(key);
+  if (
+    existing !== undefined &&
+    existing.lastMessageAt !== null &&
+    ts <= existing.lastMessageAt
+  ) {
+    // Cache already at or beyond ts — max-wins no-op + no-notify.
+    return;
+  }
+
+  const nextRecord: WorkingRecord = {
+    isWorking: existing?.isWorking ?? false,
+    lastMessageAt: ts,
+    aiTitle: existing?.aiTitle ?? null,
+    dormant: existing?.dormant ?? false,
+    condensing: existing?.condensing ?? false,
+    // Phase 59 Plan 03 — preserve cached stop-gate axes across the Axis B
+    // chokepoint write. Seed-created records default both to null.
+    lastStopAt: existing?.lastStopAt ?? null,
+    lastStatusChangeAt: existing?.lastStatusChangeAt ?? null,
+    // Phase 62 Plan 04 — preserve cached direct-signal axes across the
+    // Axis B chokepoint write. Seed-created records default both to null.
+    activityMtime: existing?.activityMtime ?? null,
+    stoppedMtime: existing?.stoppedMtime ?? null,
+  };
+
+  console.info({
+    operation: "session_last_message_at_advance",
+    key,
+    ts,
+    previous: existing?.lastMessageAt ?? null,
+  });
+
+  const nextMap = new Map(state.map);
+  nextMap.set(key, nextRecord);
+  state = { map: nextMap };
+  notify();
+}
+
+/**
+ * Phase 44 (Plan 03) — public seed API for the /sessions/list payload.
+ *
+ * Wrapper around advanceSessionLastMessageAt that computes the working-store
+ * key format `${String(hostId)}:${tmuxSession}` (matching the existing
+ * convention documented at the store header — hostId numeric here per the
+ * fleet-session type, so stringified explicitly).
+ *
+ * `tmuxSession` is a required string (not nullable): Plan 44-01's route
+ * always emits a non-null sessionName; the CONTEXT.md decision explicitly
+ * locks "identity name === tmux session name === /id target" so this seed
+ * path never fires for null tmuxSession. If no WorkingRecord exists yet for
+ * the key, advanceSessionLastMessageAt creates one with `isWorking: false`
+ * (dormant sessions have no isWorking signal). See 43-CONTEXT.md §
+ * Reconciliation helper.
+ */
+export function seedSessionLastMessageAt(
+  hostId: number,
+  tmuxSession: string,
+  ts: number | null,
+): void {
+  const key = `${String(hostId)}:${tmuxSession}`;
+  advanceSessionLastMessageAt(key, ts);
+}
+
+/**
+ * Phase 47 (Plan 03) — the ONLY writer of WorkingRecord.aiTitle.
+ *
+ * LAST-WINS contract (per 47-CONTEXT.md § Working-store third axis):
+ *   - If `title === null`: no-op + no-notify (null NEVER overwrites; the
+ *     ai-title axis only advances on positive signal — fail-open so a
+ *     transient WS frame lacking aiTitle cannot blank the cached string).
+ *   - If no record exists for `key`: create
+ *     `{ isWorking: false, lastMessageAt: null, aiTitle: title }`, notify.
+ *   - If record exists AND `record.aiTitle === title` (Object.is via `===`
+ *     for string primitives): no-op + no-notify (prevents needless
+ *     re-renders when a WS frame carries the same title as the cached one).
+ *   - Otherwise: write `title` (overwriting any prior string OR any prior
+ *     null-with-record case), notify.
+ *
+ * The `isWorking` + `lastMessageAt` axes are preserved verbatim on
+ * existing records — never mutated by this helper. New-record writes
+ * default `isWorking: false` + `lastMessageAt: null` (dormant seed case).
+ *
+ * Distinct from advanceSessionLastMessageAt's max-wins because ai-title
+ * EVOLVES: as the session's topic drifts across turns, the freshest
+ * ARRIVAL is the correct value — strings have no numeric ordering, only
+ * recency of arrival. user 2026-08-19: "If WS says Debug X and later
+ * WS says Fix Y, we want Fix Y."
+ *
+ * Called from BOTH the WS publish path (via publishFleetStatusSessionState's
+ * Axis C block) AND the /sessions/list seed path (via seedSessionAiTitle).
+ * Single reconciliation chokepoint — any future contract tweak is a
+ * one-place change.
+ */
+function advanceSessionAiTitle(key: string, title: string | null): void {
+  if (title === null) return;
+
+  const existing = state.map.get(key);
+  if (existing !== undefined && existing.aiTitle === title) {
+    // Cache already holds this exact string — last-wins no-op + no-notify.
+    return;
+  }
+
+  const nextRecord: WorkingRecord = {
+    isWorking: existing?.isWorking ?? false,
+    lastMessageAt: existing?.lastMessageAt ?? null,
+    aiTitle: title,
+    dormant: existing?.dormant ?? false,
+    condensing: existing?.condensing ?? false,
+    // Phase 59 Plan 03 — preserve cached stop-gate axes across the Axis C
+    // chokepoint write. Seed-created records default both to null.
+    lastStopAt: existing?.lastStopAt ?? null,
+    lastStatusChangeAt: existing?.lastStatusChangeAt ?? null,
+    // Phase 62 Plan 04 — preserve cached direct-signal axes across the
+    // Axis C chokepoint write. Seed-created records default both to null.
+    activityMtime: existing?.activityMtime ?? null,
+    stoppedMtime: existing?.stoppedMtime ?? null,
+  };
+
+  console.info({
+    operation: "session_ai_title_advance",
+    key,
+    title,
+    previous: existing?.aiTitle ?? null,
+  });
+
+  const nextMap = new Map(state.map);
+  nextMap.set(key, nextRecord);
+  state = { map: nextMap };
+  notify();
+}
+
+/**
+ * Phase 47 (Plan 03) — public seed API for the /sessions/list payload.
+ *
+ * Wrapper around advanceSessionAiTitle that computes the working-store
+ * key format `${String(hostId)}:${tmuxSession}` (matching the existing
+ * convention documented at the store header — hostId numeric here per
+ * the fleet-session type, so stringified explicitly).
+ *
+ * `tmuxSession` is a required string (not nullable): the Phase 47
+ * /sessions/list route always emits a non-null sessionName; CONTEXT.md
+ * locks "identity name === tmux session name === /id target" so this
+ * seed path never fires for null tmuxSession. If no WorkingRecord exists
+ * yet for the key, advanceSessionAiTitle creates one with
+ * `isWorking: false` + `lastMessageAt: null` (dormant seed default).
+ * See 47-CONTEXT.md § Working-store third axis.
+ */
+export function seedSessionAiTitle(
+  hostId: number,
+  tmuxSession: string,
+  title: string | null,
+): void {
+  const key = `${String(hostId)}:${tmuxSession}`;
+  advanceSessionAiTitle(key, title);
+}
+
+/**
+ * Hook: derive "is this session working?" for a single key.
+ * Returns a plain boolean.
+ *
+ *   - Null key → false (short-circuit; no useSyncExternalStore work).
+ *   - Unknown key → false (key never published — suppress dot until first frame).
+ *   - isWorking === false (idle, no bg work, or waiting) → false.
+ *   - isWorking === true (busy, shell, or bg work present) → true.
+ *
+ * NOTE: waiting status returns FALSE — waiting is a SEPARATE axis from
+ * working. The WaitingBubble (session-waiting-store) handles the waiting
+ * axis. Per D-CTX § Composite state (LOCKED).
+ */
+export function useSessionIsWorking(key: string | null): boolean {
+  const getSnapshot = (): boolean => {
+    if (key === null) return false;
+    const record = state.map.get(key);
+    if (record === undefined) return false;
+    return record.isWorking;
+  };
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+}
+
+/**
+ * Hook: three-state variant of useSessionIsWorking.
+ * Preserves the "never heard from this session" null signal needed for
+ * aside-arm and ComposeBox idle-gate correctness:
+ *
+ *   - Null key         → null  (no key, no data)
+ *   - Unknown key      → null  (key never published — "never heard"; NOT false)
+ *   - isWorking true   → true  (session actively working)
+ *   - isWorking false  → false (session published + idle)
+ *
+ * DISTINCTION from useSessionIsWorking: the non-raw variant collapses
+ * "unknown key" and "idle" both to false (legacy WipBubble semantics).
+ * This raw variant preserves the third state so PrettyView can distinguish
+ * "first broadcast not yet landed" (null → don't fire aside-arm) from
+ * "broadcast says idle" (false → isIdleDerived true → aside-arm may fire).
+ *
+ * Both hooks read from the SAME internal Map — no additional state.
+ */
+export function useSessionIsWorkingRaw(key: string | null): boolean | null {
+  const getSnapshot = (): boolean | null => {
+    if (key === null) return null;
+    const record = state.map.get(key);
+    if (record === undefined) return null;
+    return record.isWorking;
+  };
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+}
+
+/**
+ * Phase 52 Plan 01 — Hook: derive "is this session dormant?" for a single key.
+ * Returns a strict boolean (never null/undefined).
+ *
+ *   - Null key          → false (short-circuit; no useSyncExternalStore work).
+ *   - Unknown key       → false (key never published — default-open state).
+ *   - dormant === false → false (sentinel absent; identity in normal operation).
+ *   - dormant === true  → true  (sentinel present; identity parked by supervisor).
+ *
+ * Source: ~/fleet/identities/<tmuxSession>/.dormant sentinel file on the
+ * target host, plumbed via ssh-poll-orchestrator source A (live-PID tick) and
+ * source B (dormant-only enumeration). See Phase 52 Plan 01 for both sources.
+ *
+ * Consumed by Plan 03's Ready predicate: rows are "ready" when
+ * !isWorking && !isDormant — both hooks read from the same WorkingRecord.
+ */
+export function useSessionIsDormant(key: string | null): boolean {
+  const getSnapshot = (): boolean => {
+    if (key === null) return false;
+    const record = state.map.get(key);
+    if (record === undefined) return false;
+    return record.dormant;
+  };
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+}
+
+/**
+ * Hook: derive 'is this session condensing?' for a single key. Returns a
+ * strict boolean (never null/undefined).
+ *
+ *   - Null key              → false (short-circuit; no useSyncExternalStore work).
+ *   - Unknown key           → false (key never published — default-safe).
+ *   - condensing === false  → false (no compaction queued or in flight).
+ *   - condensing === true   → true  (`.compact-requested` or `.compacting`
+ *                                    present — the supervisor is condensing
+ *                                    the agent's context in place).
+ *
+ * Source: ~/fleet/identities/<tmuxSession>/.compact-requested + .compacting,
+ * folded into SessionState.condensing by ssh-poll-orchestrator source B.
+ * Works for unmounted rows too — no pane needs to be open to publish it.
+ */
+/** Non-hook read of the condensing axis (false for an unknown key). */
+export function getSessionIsCondensing(key: string): boolean {
+  return state.map.get(key)?.condensing === true;
+}
+
+export function useSessionIsCondensing(key: string | null): boolean {
+  const getSnapshot = (): boolean => {
+    if (key === null) return false;
+    const record = state.map.get(key);
+    if (record === undefined) return false;
+    return record.condensing;
+  };
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+}
+
+/**
+ * Return the raw internal Map as a ReadonlyMap view.
+ * NOT for production callers. Kept exported (rather than gated on
+ * import.meta.env.MODE === "test") because Vite's tree-shaker drops it from
+ * the production bundle if no production code imports it.
+ */
+export function getSessionWorkingSnapshot(): ReadonlyMap<
+  string,
+  {
+    isWorking: boolean;
+    lastMessageAt: number | null;
+    aiTitle: string | null;
+    dormant: boolean;
+    condensing: boolean;
+    // Phase 59 Plan 03 — stop-gate axes exposed on the test-only snapshot
+    // so Test P can assert Axis-A cache preservation of lastStopAt.
+    lastStopAt: number | null;
+    lastStatusChangeAt: number | null;
+    // Phase 62 Plan 04 — direct-signal axes exposed on the test-only
+    // snapshot so Tests K/L/M/N can assert Axis-H/I preservation +
+    // explicit-null reset.
+    activityMtime: number | null;
+    stoppedMtime: number | null;
+  }
+> {
+  return state.map;
+}
+
+// ─── Phase 41 Plan 03 — lastMessageAt cache read paths ───────────────────────
+
+/**
+ * Plain getter — return the cached `lastMessageAt` unix millis for the given
+ * session-working-key, or `null` when the key is not in the cache OR when the
+ * cache holds an explicit null (session with no message-bearing history).
+ *
+ * PRIMARY caller: conversation-store's row-derivation site — every middle-
+ * zone / pinned / RDP row's construction stamps `row.lastMessageAt` by
+ * calling this function with the row's derived sessionKey. compareByRecencyDesc
+ * then reads row.lastMessageAt directly.
+ *
+ * Non-React entry point: does NOT subscribe. The conversation-store's snapshot
+ * memoization is bumped by subscribeSessionWorkingStore's bridge — see
+ * conversation-store.ts's module-init bridge registration.
+ */
+export function getSessionLastMessageAt(sessionKey: string | null): number | null {
+  if (sessionKey === null) return null;
+  const record = state.map.get(sessionKey);
+  if (record === undefined) return null;
+  return record.lastMessageAt;
+}
+
+/**
+ * React hook — subscribe to a single session's cached `lastMessageAt` and
+ * re-render on change. Returns null when the key is absent OR when the
+ * cache holds an explicit null.
+ *
+ * Not currently consumed by production code (conversation-store reads via
+ * the plain getter above at snapshot-derivation time), but exported so any
+ * future per-row surface that wants to observe the raw recency signal
+ * (e.g. a hypothetical "last activity: 3m ago" label) can subscribe
+ * cheaply. Signature parallels useSessionIsWorking.
+ */
+export function useSessionLastMessageAt(sessionKey: string | null): number | null {
+  const getSnapshot = (): number | null => getSessionLastMessageAt(sessionKey);
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+}
+
+/**
+ * React hook — the session's cached activity-marker mtime (ms, the agent
+ * box's clock), or null when unknown. Lets a view tell whether new activity
+ * started after a given transcript timestamp from the same box.
+ */
+export function useSessionActivityMtime(sessionKey: string | null): number | null {
+  const getSnapshot = (): number | null =>
+    sessionKey === null ? null : (state.map.get(sessionKey)?.activityMtime ?? null);
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+}
+
+// ─── Phase 47 Plan 03 — aiTitle cache read paths ─────────────────────────────
+
+/**
+ * Plain getter — return the cached `aiTitle` string for the given session-
+ * working-key, or `null` when the key is not in the cache OR when the cache
+ * holds an explicit null (session with no ai-title yet).
+ *
+ * PRIMARY caller: Plan 47-04's PrettyConversationRow subtitle consumer —
+ * every middle-zone row's subtitle is derived from this cache entry via
+ * the useSessionAiTitle hook below. Non-React entry point: does NOT
+ * subscribe. Mirrors getSessionLastMessageAt's shape (Phase 41 Plan 03).
+ */
+export function getSessionAiTitle(sessionKey: string | null): string | null {
+  if (sessionKey === null) return null;
+  const record = state.map.get(sessionKey);
+  if (record === undefined) return null;
+  return record.aiTitle;
+}
+
+/**
+ * React hook — subscribe to a single session's cached `aiTitle` and
+ * re-render on change. Returns null when the key is absent OR when the
+ * cache holds an explicit null (session with no ai-title yet).
+ *
+ * Consumed by Plan 47-04's PrettyConversationRow (per-row subtitle).
+ * Signature parallels useSessionLastMessageAt. Notify cadence is
+ * controlled by advanceSessionAiTitle's LAST-WINS + Object.is guard so
+ * successive frames carrying the same title do NOT re-render this hook.
+ */
+export function useSessionAiTitle(sessionKey: string | null): string | null {
+  const getSnapshot = (): string | null => getSessionAiTitle(sessionKey);
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+}
+
+// Unused variable reference to suppress TypeScript "declared but never read"
+// for snapshotVersion if nothing else uses it. The notify() caller bumps it.
+void snapshotVersion;
+
+// ─── Test-only helpers ───────────────────────────────────────────────────────
+
+/**
+ * Reset the store to an empty Map + bump version + notify. Used by
+ * session-working-store.test.ts's `beforeEach` so each test starts from a
+ * known-empty state. NOT a public API.
+ */
+export function __resetForTest(): void {
+  state = { map: new Map<string, WorkingRecord>() };
+  notify();
+}

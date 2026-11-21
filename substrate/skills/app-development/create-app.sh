@@ -1,0 +1,431 @@
+#!/usr/bin/env bash
+# create-app.sh [--conversation|--project] <slug> [title] — scaffold a new app.
+#
+#   create-app.sh <slug> [title]                  sidebar app, ~/fleet/apps/<slug>/
+#   create-app.sh --conversation <slug> [title]   conversation app, owned by the
+#                                                 calling agent ($FLEET_IDENTITY):
+#                                                 ~/fleet/identities/<name>/apps/<slug>/
+#   create-app.sh --project <slug> [title]        project app, in the calling agent's
+#                                                 project (its `project:` line):
+#                                                 ~/fleet/projects/<project>/apps/<slug>/
+#
+# Steps:
+#   1. Validate the slug (unique across the whole box — sidebar, conversation
+#      and archived apps all share one namespace) and pre-flight the paths.
+#   2. Under an exclusive flock, pick the next free public port in 9501-9599
+#      and atomically claim it by writing the app's systemd units
+#      (app-units.sh write). Future scans see the units, so writing them under
+#      the lock closes the "two agents pick the same port" race.
+#   3. Copy the starter template into the app folder and substitute slug +
+#      title in app.json + package.json.
+#   4. bun install → bun run build.
+#   5. Enable + start the units (app-units.sh install); verify it answers.
+#
+# Sidebar and project apps get app.json.pending (hidden until published).
+# Conversation apps get app.json straight away (they never appear in the
+# sidebar). Conversation and project apps get the .may-sleep marker (they
+# sleep when idle); sidebar apps are always-on.
+#
+# On any failure after the port claim, a trap removes the partial units and
+# app folder so the port is released.
+
+set -euo pipefail
+
+# systemctl --user needs the user bus; agent shells don't always export it.
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+
+log()  { printf '[create-app] %s\n' "$*"; }
+die()  { printf '[create-app] ERROR: %s\n' "$*" >&2; exit 1; }
+
+# --- Args -------------------------------------------------------------------
+
+KIND=sidebar
+if [ "${1:-}" = "--conversation" ]; then
+    KIND=conversation
+    shift
+elif [ "${1:-}" = "--project" ]; then
+    KIND=project
+    shift
+fi
+if [ $# -lt 1 ] || [ $# -gt 2 ]; then
+    die "usage: create-app.sh [--conversation|--project] <slug> [title]"
+fi
+SLUG="$1"
+TITLE="${2:-}"
+
+if ! [[ "$SLUG" =~ ^[a-z][a-z0-9-]*$ ]]; then
+    die "slug must be kebab-case (lowercase letter start, then letters/digits/hyphens): got '$SLUG'"
+fi
+if [ "${#SLUG}" -gt 40 ]; then
+    die "slug too long (max 40 chars): '$SLUG'"
+fi
+
+# Derive a default title from the slug when none was given.
+# "grocery-list" -> "Grocery List"
+if [ -z "$TITLE" ]; then
+    TITLE=$(printf '%s' "$SLUG" | awk -F- 'BEGIN{OFS=" "} {for(i=1;i<=NF;i++)$i=toupper(substr($i,1,1)) substr($i,2)} 1')
+fi
+
+# --- Paths ------------------------------------------------------------------
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+TEMPLATE_DIR="$SCRIPT_DIR/templates/app-starter"
+UNITS="$SCRIPT_DIR/app-units.sh"
+LOCK_FILE="$HOME/fleet/.create-lock"
+
+if [ "$KIND" = conversation ]; then
+    OWNER="${FLEET_IDENTITY:-}"
+    [ -n "$OWNER" ] || die "--conversation needs FLEET_IDENTITY (your identity name) in the environment"
+    [[ "$OWNER" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "FLEET_IDENTITY is not a valid identity name: '$OWNER'"
+    [ -d "$HOME/fleet/identities/$OWNER" ] || die "identity folder not found: ~/fleet/identities/$OWNER"
+    mkdir -p "$HOME/fleet/identities/$OWNER/apps"
+    APP_DIR="$HOME/fleet/identities/$OWNER/apps/$SLUG"
+elif [ "$KIND" = project ]; then
+    OWNER="${FLEET_IDENTITY:-}"
+    [ -n "$OWNER" ] || die "--project needs FLEET_IDENTITY (your identity name) in the environment"
+    [[ "$OWNER" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "FLEET_IDENTITY is not a valid identity name: '$OWNER'"
+    ID_FILE="$HOME/fleet/identities/$OWNER/$OWNER.md"
+    [ -f "$ID_FILE" ] || die "identity file not found: $ID_FILE"
+    # The `project:` line of the identity file's frontmatter.
+    PROJECT=$(awk 'NR==1 && $0!="---"{exit} NR>1 && $0=="---"{exit} NR>1 && /^project:/{sub(/^project:[ \t]*/,""); gsub(/["\047 \t\r]/,""); print; exit}' "$ID_FILE")
+    [ -n "$PROJECT" ] || die "you're not in a project (no project: line in $ID_FILE) — build a conversation or sidebar app instead"
+    [[ "$PROJECT" =~ ^[a-z0-9-]{1,64}$ ]] && [ "$PROJECT" != archive ] || die "invalid project in $ID_FILE: '$PROJECT'"
+    [ -f "$HOME/fleet/projects/$PROJECT/project.md" ] || die "your project '$PROJECT' doesn't exist on this box"
+    mkdir -p "$HOME/fleet/projects/$PROJECT/apps"
+    APP_DIR="$HOME/fleet/projects/$PROJECT/apps/$SLUG"
+else
+    APP_DIR="$HOME/fleet/apps/$SLUG"
+fi
+
+# --- Pre-flight -------------------------------------------------------------
+
+[ -d "$HOME/fleet/apps" ]         || die "~/fleet/apps does not exist — run bootstrap.sh first"
+[ -d "$HOME/fleet/apps-archive" ] || die "~/fleet/apps-archive does not exist — run bootstrap.sh first"
+[ -d "$HOME/fleet/apps-backups" ] || die "~/fleet/apps-backups does not exist — run bootstrap.sh first"
+[ -d "$TEMPLATE_DIR" ]            || die "starter template not found at $TEMPLATE_DIR"
+[ ! -e "$APP_DIR" ]               || die "app already exists at $APP_DIR"
+if bash "$UNITS" slug-taken "$SLUG"; then
+    die "the name '$SLUG' is already used by another app on this box (live, archived, in a conversation or a project) — pick another slug"
+fi
+
+# Read the numeric fleet-DB hostId from the distributor-written file so we
+# can bake PANE_BASE = '/apps/<HOSTID>/<SLUG>/pane' into scaffolded pane.ts
+# + server.js. The distributor writes this on every fleet-substrate sweep
+# (see run-bootstrap.ts Step 5b / local-fleet-install.ts Step 5b). If the
+# file is missing, this box hasn't been swept yet — surface the failure
+# rather than scaffolding an app with a bogus prefix.
+HOSTID_FILE="$HOME/fleet/host/id"
+if [ ! -f "$HOSTID_FILE" ]; then
+    die "$HOSTID_FILE missing — the fleet-substrate distributor hasn't swept this box yet. Wait a minute and retry, or ask the box-maintainer role to check the distributor. Do NOT scaffold without a real hostId; PANE_BASE would be wrong and the app would 404 in the pane iframe."
+fi
+HOSTID=$(cat "$HOSTID_FILE" | tr -d '[:space:]')
+if ! [[ "$HOSTID" =~ ^[1-9][0-9]{0,9}$ ]]; then
+    die "$HOSTID_FILE contains an invalid hostId ('$HOSTID') — expected a positive integer. Ask the box-maintainer role to check the distributor sweep."
+fi
+
+# Make bun discoverable even if this script runs from a shell that hasn't
+# sourced rc files (e.g. an SSH exec).
+export PATH="$HOME/.bun/bin:$PATH"
+command -v bun >/dev/null 2>&1 || die "bun not on PATH — run bootstrap.sh first"
+
+# --- Port claim (under exclusive lock) --------------------------------------
+
+log "kind:  $KIND"
+log "slug:  $SLUG"
+log "title: $TITLE"
+log "dir:   $APP_DIR"
+
+# --- Cleanup trap (armed BEFORE any state mutation) -------------------------
+# The trap fires on EXIT (success or failure). CLEANUP_ON_FAIL controls whether
+# it actually rolls back — it stays 0 until we've committed enough state to
+# need cleanup, then flips to 1. Armed early so a failure inside the port-claim
+# subshell doesn't leave an orphan unit file.
+
+CLEANUP_ON_FAIL=0
+cleanup() {
+    if [ "$CLEANUP_ON_FAIL" = "1" ]; then
+        log "cleaning up partial create (rolling back port claim)..."
+        bash "$UNITS" uninstall "$SLUG" 2>/dev/null || true
+        rm -rf "$APP_DIR"
+    fi
+}
+trap cleanup EXIT
+
+# --- Port claim (real subshell — fd 200 + lock scoped to this block only) ---
+# Command substitution runs in a subshell; fd 200 opens there, flock holds the
+# exclusive lock, port is picked, unit file is written, subshell exits (closing
+# fd, releasing lock), and the picked port is captured via stdout.
+
+PORT=$(
+    exec 200>"$LOCK_FILE"
+    flock -x 200
+
+    # Every public port already claimed: live units (both styles) plus the
+    # stashes of archived apps and archived conversations, so their units
+    # can be restored to the same slot later.
+    # Re-check the name under the lock — a create of the same slug that
+    # started at the same moment would otherwise overwrite these units.
+    if bash "$UNITS" slug-taken "$SLUG"; then
+        echo "the name '$SLUG' was just taken by another app on this box — pick another slug" >&2
+        exit 1
+    fi
+
+    USED_PORTS=$(bash "$UNITS" used-ports)
+
+    picked=""
+    for candidate in $(seq 9501 9599); do
+        if ! printf '%s\n' "$USED_PORTS" | grep -qx "$candidate"; then
+            picked=$candidate
+            break
+        fi
+    done
+
+    if [ -z "$picked" ]; then
+        echo "no free port in 9501-9599 — archive some apps first (or hard-delete some archived ones)" >&2
+        exit 1
+    fi
+
+    bash "$UNITS" write "$SLUG" "$APP_DIR" "$picked"
+    printf '%s' "$picked"
+)
+[ -n "$PORT" ] || die "port claim failed"
+
+log "port:  $PORT (claimed atomically; app listens privately on $((PORT + 10000)))"
+log "wrote systemd units: app-$SLUG.{socket,service} app-$SLUG-{relay.service,marker.path,boot.service}"
+
+# Port is now claimed on disk — any failure past this point needs rollback.
+CLEANUP_ON_FAIL=1
+
+# --- Scaffold the app folder -----------------------------------------------
+
+cp -r "$TEMPLATE_DIR" "$APP_DIR"
+log "scaffolded starter into $APP_DIR"
+# A box not yet swept by the distributor can still carry the retired
+# single-unit template inside the starter; it doesn't belong in the app.
+rm -f "$APP_DIR/app-SLUG.service.template"
+
+# Delete the starter's shipped app.json — the sidebar sweep gates on this file
+# existing, so leaving it in place would flash a half-built app onto the
+# user's sidebar the moment the systemd unit comes up. Instead we write
+# app.json.pending (see below); the agent renames it to app.json as the
+# explicit publish step once the app is actually complete + verified.
+rm -f "$APP_DIR/app.json"
+
+# Rename the starter README to README.md.pending — same shape as
+# app.json.pending. The template README is a placeholder meant to be
+# customized (top description replaced) not shipped as-is; the .pending
+# suffix signals "scaffold placeholder, rename to publish" and removes
+# the Read-before-Write friction agents hit when overwriting a file that
+# already exists on disk.
+mv "$APP_DIR/README.md" "$APP_DIR/README.md.pending"
+
+# Ensure static/ exists so SKILL.md step 8 can drop the icon.webp symlink
+# into it after image-gen. We do NOT create the symlink here at scaffold —
+# SvelteKit's build walker calls statSync (not lstatSync) on entries under
+# static/, and a dangling symlink (target = icon.webp, which doesn't exist
+# until step 8) crashes the build with ENOENT. The symlink is created in
+# step 8 alongside a rebuild + restart, once icon.webp is real.
+mkdir -p "$APP_DIR/static"
+
+# --- Substitutions ---------------------------------------------------------
+
+# app.json.pending — same shape as the final app.json (two fields: title,
+# description). Title pre-filled; description blank for the agent to fill.
+# The `.pending` suffix keeps the app INVISIBLE to the sidebar sweep until
+# the agent renames it to app.json as the publish step.
+#
+# Conversation apps never appear in the sidebar, so they get app.json right
+# away (its title + description show on the app's chip and in the
+# conversation's Apps tab) and the .may-sleep marker.
+if [ "$KIND" = conversation ]; then
+    META="$APP_DIR/app.json"
+else
+    META="$APP_DIR/app.json.pending"
+fi
+python3 - "$META" "$TITLE" <<'PYEOF'
+import json, sys, pathlib
+p = pathlib.Path(sys.argv[1])
+p.write_text(json.dumps({"title": sys.argv[2], "description": ""}, indent=2) + "\n")
+PYEOF
+if [ "$KIND" = conversation ]; then
+    : > "$APP_DIR/.may-sleep"
+    log "wrote app.json (title=\"$TITLE\", description empty) and .may-sleep (sleeps when idle)"
+elif [ "$KIND" = project ]; then
+    : > "$APP_DIR/.may-sleep"
+    log "wrote app.json.pending (title=\"$TITLE\", description empty) and .may-sleep (sleeps when idle)"
+    log "  → the project's sidebar section will NOT show this app until you publish: mv app.json.pending app.json"
+else
+    log "wrote app.json.pending (title=\"$TITLE\", description empty)"
+    log "  → sidebar will NOT show this app until you publish: mv app.json.pending app.json"
+fi
+
+# PANE_BASE substitution — src/lib/pane.ts + server.js carry literal
+# `/apps/__HOSTID__/__SLUG__/pane` strings that need to be rewritten to
+# `/apps/<hostid>/<slug>/pane` at scaffold time. The pane iframe route,
+# the .serve. tab route, the transformPageChunk rewrite, and the
+# server.js path-strip all rely on this being correct — a bogus prefix
+# 404s the whole app in-pane. Idempotent per-file sed with temp file +
+# atomic rename so a mid-write failure can't leave a partial file.
+for f in "$APP_DIR/src/lib/pane.ts" "$APP_DIR/server.js"; do
+    if [ ! -f "$f" ]; then
+        die "expected template file missing after copy: $f"
+    fi
+    tmp=$(mktemp "${f}.XXXXXX")
+    sed -e "s|__HOSTID__|$HOSTID|g" -e "s|__SLUG__|$SLUG|g" "$f" > "$tmp"
+    mv "$tmp" "$f"
+done
+log "substituted PANE_BASE = /apps/$HOSTID/$SLUG/pane in pane.ts + server.js"
+
+# package.json — set the "name" field to the slug so it doesn't collide
+# with the template's default name if bun install caches by name.
+if [ -f "$APP_DIR/package.json" ]; then
+    python3 - "$APP_DIR/package.json" "$SLUG" <<'PYEOF'
+import json, sys, pathlib
+p = pathlib.Path(sys.argv[1])
+data = json.loads(p.read_text())
+data["name"] = sys.argv[2]
+p.write_text(json.dumps(data, indent=2) + "\n")
+PYEOF
+    log "updated package.json (name=$SLUG)"
+fi
+
+# --- Install deps ----------------------------------------------------------
+
+log "installing dependencies (bun install)..."
+(cd "$APP_DIR" && bun install 2>&1) | tail -3
+
+# The starter template ships with its initial migration pre-generated under
+# drizzle/ — no generate step needed here. If the agent later edits the
+# schema, they'll run `bun run db:generate` themselves per the skill body.
+
+# --- Build production output ----------------------------------------------
+
+log "building production output (bun run build)..."
+(cd "$APP_DIR" && bun run build 2>&1) | tail -5
+
+if [ ! -f "$APP_DIR/build/index.js" ]; then
+    die "build did not produce build/index.js — check the tail above"
+fi
+
+# --- Enable + start --------------------------------------------------------
+
+bash "$UNITS" install "$SLUG" "$APP_DIR" "$PORT"
+log "systemd units enabled and started"
+
+# Knock on the public address — this also wakes a sleeping app, so it checks
+# the whole path (socket → relay → app) the user's requests will take.
+CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "http://127.0.0.1:$PORT/" || true)
+if [ -n "$CODE" ] && [ "$CODE" != "000" ]; then
+    log "app-$SLUG answers on 127.0.0.1:$PORT"
+else
+    log "WARNING: app-$SLUG did not answer on 127.0.0.1:$PORT"
+    log "  check: journalctl --user -u app-$SLUG -n 50 --no-pager"
+    # Don't die here — leave the app in place so the agent can debug it.
+    # The port claim stays valid; user can archive-app or delete manually.
+fi
+
+# --- Success ---------------------------------------------------------------
+
+CLEANUP_ON_FAIL=0
+
+APP_LINK="$(tr -d '[:space:]' < "$HOME/fleet/host/parent" 2>/dev/null)/apps/$HOSTID/$SLUG/pane/"
+
+cat <<EOF
+
+[create-app] done
+  kind:    $KIND
+  slug:    $SLUG
+  title:   $TITLE
+  port:    $PORT (public, 127.0.0.1) → $((PORT + 10000)) (the app itself)
+  folder:  $APP_DIR
+  logs:    journalctl --user -u app-$SLUG -f
+  status:  systemctl --user status app-$SLUG
+EOF
+
+if [ "$KIND" = conversation ]; then
+cat <<EOF
+
+  This is a conversation app: it never appears in the sidebar, and it is
+  archived along with your conversation. It may sleep when idle (.may-sleep
+  is present) — delete that marker if the app does anything on its own clock.
+
+Next: edit the starter down to your app's actual shape.
+  - src/lib/server/db/schema.ts  — the Drizzle schema (replace the starter table)
+  - src/lib/server/todos.ts       — the app's logic + zod shapes (rename to your domain)
+  - src/routes/api/               — the JSON API, one endpoint() per route
+  - src/routes/+page.svelte       — the UI (changes go through \$lib/api)
+  - src/routes/+page.server.ts    — page load (reads only)
+  - README.md.pending             — describe the app; rename to README.md when done
+  - app.json                      — fill in the "description" field
+
+Iterate in dev mode:
+    systemctl --user stop app-$SLUG
+    cd $APP_DIR
+    bun run dev
+
+Then build + restart:
+    bun run build && systemctl --user restart app-$SLUG
+
+Finally, once it works end to end and has its icon, hand it to the user by
+linking it in your message (it renders as an app chip):
+    [$TITLE]($APP_LINK)
+EOF
+elif [ "$KIND" = project ]; then
+cat <<EOF
+
+  This is a project app in project '$PROJECT': once published it shows under
+  that project in the sidebar and in the project window's Apps tab, and it is
+  archived along with the project. It may sleep when idle (.may-sleep is
+  present) — delete that marker if the app does anything on its own clock.
+
+  ⚠️ It is NOT visible yet. Publish (final step) once the app is complete +
+     verified: mv app.json.pending app.json
+
+Next: edit the starter down to your app's actual shape.
+  - src/lib/server/db/schema.ts  — the Drizzle schema (replace the starter table)
+  - src/routes/+page.svelte       — the UI
+  - src/routes/+page.server.ts    — server logic (load + form actions)
+  - README.md.pending             — describe the app; rename to README.md when done
+  - app.json.pending              — fill in the "description" field
+
+Iterate in dev mode:
+    systemctl --user stop app-$SLUG
+    cd $APP_DIR
+    bun run dev
+
+Then build + restart:
+    bun run build && systemctl --user restart app-$SLUG
+
+Finally, publish (this puts the row under the project), then link it:
+    mv $APP_DIR/app.json.pending $APP_DIR/app.json
+    [$TITLE]($APP_LINK)
+EOF
+else
+cat <<EOF
+
+  ⚠️ The app is NOT on the user's sidebar yet. The sweep gates on app.json
+     existing; you have app.json.pending. Publish (final step) once the app
+     is actually complete + verified: mv app.json.pending app.json
+
+Next: edit the starter down to your app's actual shape.
+  - src/lib/server/db/schema.ts  — the Drizzle schema (replace the starter table)
+  - src/lib/server/todos.ts       — the app's logic + zod shapes (rename to your domain)
+  - src/routes/api/               — the JSON API, one endpoint() per route
+  - src/routes/+page.svelte       — the UI (changes go through \$lib/api)
+  - src/routes/+page.server.ts    — page load (reads only)
+  - README.md.pending             — describe the app; rename to README.md when done
+  - app.json.pending              — fill in the "description" field
+
+Iterate in dev mode:
+    systemctl --user stop app-$SLUG
+    cd $APP_DIR
+    bun run dev
+
+Then build + restart:
+    bun run build && systemctl --user restart app-$SLUG
+
+Finally, publish (this puts the tile on the user's sidebar):
+    mv $APP_DIR/app.json.pending $APP_DIR/app.json
+EOF
+fi

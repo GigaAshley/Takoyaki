@@ -1,0 +1,188 @@
+/* Skynet-native theming for MDXEditor (phase 111, plan 01, D-11/D-12/D-13).
+ *
+ * Layered on top of MDXEditor's built-in `.dark-theme` class:
+ *   1. `.dark-theme` (from @mdxeditor/editor/style.css) sets Radix-dark base
+ *      tokens.
+ *   2. `.skynet-mdxeditor` (our companion class on the same root) remaps a
+ *      subset of MDXEditor's CSS variables to Skynet's `--color-pv-*` palette
+ *      so the toolbar / panel chrome matches the app.
+ *
+ * Palette authority: every colour reference in pretty-view derives from
+ * `--color-pv-*` tokens (defined at src/ui/index.css §143-159) or the per-
+ * pane `--pv-id-hue` var. Cross-surface colour must NEVER touch Skynet's
+ * global `--background` / `--foreground` (project directive; CLAUDE.md §
+ * Palette authority).
+ */
+
+.mdxeditor.skynet-mdxeditor {
+  /* Panel + base surfaces — pull from Skynet pretty-view tokens.
+   * MDXEditor's `--baseBg` family drives toolbar background, panel
+   * background, hover states, and the frontmatter dialog surface. */
+  --baseBg: rgba(255, 255, 255, 0.06);
+  --baseBgSubtle: rgba(255, 255, 255, 0.04);
+  --baseBgHover: rgba(255, 255, 255, 0.09);
+  --baseBgActive: rgba(255, 255, 255, 0.12);
+  --baseBorder: rgba(220, 225, 245, 0.10);
+  --baseBorderHover: rgba(220, 225, 245, 0.18);
+  --baseText: #e8e4d8;              /* mirrors --color-pv-fg */
+  --baseTextContrast: #f0ebe0;
+  --baseSolid: rgba(255, 255, 255, 0.12);
+  --baseSolidHover: rgba(255, 255, 255, 0.18);
+  --basePageBg: transparent;
+
+  /* Accent — Skynet identity hue (blue default; per-identity via
+   * --pv-id-hue set on the pretty-view root). Toolbar active-button chrome
+   * and link colour drive off these. */
+  --accentText: hsla(var(--pv-id-hue, 220), 80%, 68%, 1);
+  --accentBg: hsla(var(--pv-id-hue, 220), 80%, 60%, 0.20);
+  --accentBgHover: hsla(var(--pv-id-hue, 220), 80%, 60%, 0.30);
+  --accentBorder: hsla(var(--pv-id-hue, 220), 80%, 60%, 0.40);
+  --accentSolid: hsla(var(--pv-id-hue, 220), 80%, 60%, 0.35);
+
+  /* Typography — follow Skynet's theme fonts (index.css @theme). */
+  font-family: var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  --font-mono: JetBrains Mono Variable, ui-monospace, monospace;
+  background: transparent;
+}
+
+/* Inline code (single backticks). We target the LEXICAL DOM: `code`
+ * outside a `pre` is inline; `code` inside `pre` (or the .cm-editor pane)
+ * is fenced. Skynet's --color-pv-code-fg (#ffb896) is the single source of
+ * truth (D-12). */
+.mdxeditor.skynet-mdxeditor .mdx-prose code:not(pre code) {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  color: var(--color-pv-code-fg);
+  padding: 1px 4px;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 0.94em;
+}
+
+/* Fenced code (CodeMirror). Match ChatMessage / IdentityFileTab read-mode
+ * code-block treatment: dark navy panel with inset shadow.
+ * --color-pv-code-fg still drives the text colour so switching between
+ * read-mode markdown preview and edit-mode WYSIWYG shows no visual jump. */
+.mdxeditor.skynet-mdxeditor .cm-editor {
+  background: rgba(10, 12, 20, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  box-shadow: inset 0 2px 8px rgba(0, 0, 0, 0.4);
+  border-radius: 6px;
+  padding: 8px 12px;
+}
+.mdxeditor.skynet-mdxeditor .cm-content,
+.mdxeditor.skynet-mdxeditor .cm-line {
+  color: var(--color-pv-code-fg);
+  font-family: var(--font-mono);
+}
+.mdxeditor.skynet-mdxeditor .cm-gutters {
+  background: transparent;
+  border-right: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+/* Frontmatter dialog + tooltips — scoped to `.skynet-mdxeditor` (NOT
+ * `.mdxeditor.skynet-mdxeditor`) because MDXEditor's `EditorRootElement`
+ * creates a SEPARATE popup container (`<div class="mdxeditor-popup-container
+ * ... skynet-mdxeditor">`) appended to `document.body` — that's the portal
+ * target for every Radix Tooltip/Dialog/Popover. It has our `.skynet-mdxeditor`
+ * className (MDXEditor copies the wrapper's className onto it) but NOT the
+ * plain `.mdxeditor` class (that lives only on the in-editor wrapper). See
+ * node_modules/@mdxeditor/editor/dist/MDXEditor.js#EditorRootElement. */
+
+/* Elevate the whole popup container above Skynet's modal chrome. MDXEditor
+ * ships `._popupContainer_er3ed_1239 { position: relative; z-index: 2 }` on
+ * this element, which creates a stacking context at z=2. Skynet's Identity
+ * and Role modals render at z-[110] (overlay) and z-[120] (content), so
+ * every tooltip/dialog inside the popup container gets occluded regardless
+ * of its own inner z-index. z=130 clears the outer modal without going
+ * higher than needed — future-proof headroom without disrupting anything
+ * that legitimately needs to sit above us. */
+.skynet-mdxeditor.mdxeditor-popup-container {
+  z-index: 130;
+}
+
+/* Frontmatter dialog form fields (inputs + textareas). */
+.skynet-mdxeditor [role="dialog"] input,
+.skynet-mdxeditor [role="dialog"] textarea {
+  background: rgba(0, 0, 0, 0.3);
+  color: #e8e4d8;
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: 4px;
+  padding: 4px 8px;
+}
+
+/* Dialog panel opacity + z-index (defect fix): my --baseBgSubtle remapping
+ * above lands MDXEditor's default _largeDialogContent background at ~4%
+ * white, so the dialog reads as invisible on top of its own darkening
+ * overlay. Opaque panel + defensive z-index (70/69) so it clears Skynet's
+ * outer modal stack. Overlay is matched by the CSS-module class
+ * `_dialogOverlay_` rather than a fragile structural selector. */
+.skynet-mdxeditor [role="dialog"] {
+  background: #1a1d26;
+  border: 1px solid rgba(220, 225, 245, 0.18);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+  z-index: 70;
+  padding: 20px;
+}
+.skynet-mdxeditor [class*="_dialogOverlay_"] {
+  background: rgba(0, 0, 0, 0.55);
+  z-index: 69;
+}
+
+/* Toolbar tooltips: MDXEditor's ._tooltipContent defaults to a
+ * `background: var(--baseText); color: var(--baseBase)` pair that lands
+ * invisible under our remapped dark palette; explicit opaque dark panel +
+ * light text + high z-index. */
+.skynet-mdxeditor [class*="_tooltipContent_"] {
+  background-color: #1a1d26 !important;
+  color: #e8e4d8 !important;
+  border: 1px solid rgba(220, 225, 245, 0.18);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  z-index: 80 !important;
+}
+
+/* Prose typography (defect fix — was defect #4): MDXEditor ships no
+ * heading/list styles, and Tailwind's preflight resets browser UA defaults.
+ * We add "prose prose-sm prose-invert max-w-none" to the contentEditable
+ * className (see MdxEditorImpl.tsx), which pulls in @tailwindcss/typography's
+ * heading/list/blockquote sizing — same engine as ChatMessage read view.
+ * A few targeted overrides tune the result for the editor context:
+ *  - `prose-invert` is unconditional here because pretty-view is always
+ *    dark; matches ChatMessage's `dark:prose-invert` behavior on that view.
+ *  - `max-w-none` because prose defaults to ~65ch which would visually
+ *    truncate the writable area inside the file tab panel.
+ *  - prose's inline `code` adds `::before`/`::after` backticks that look
+ *    wrong in a WYSIWYG surface; stripped via prose-code:before/after in
+ *    the className, mirroring the ChatMessage override.
+ *  - prose sets bold headings; MDXEditor's Lexical DOM renders headings
+ *    inside .mdx-prose so those rules apply naturally.
+ *  - The MDXEditor CodeMirror styling above (.cm-editor) sits inside prose
+ *    but its container is not a `<pre>`, so prose's pre rules don't fight
+ *    it. */
+.mdxeditor.skynet-mdxeditor .mdx-prose h1,
+.mdxeditor.skynet-mdxeditor .mdx-prose h2,
+.mdxeditor.skynet-mdxeditor .mdx-prose h3,
+.mdxeditor.skynet-mdxeditor .mdx-prose h4,
+.mdxeditor.skynet-mdxeditor .mdx-prose h5,
+.mdxeditor.skynet-mdxeditor .mdx-prose h6 {
+  color: #f0ebe0;
+}
+.mdxeditor.skynet-mdxeditor .mdx-prose ul {
+  list-style-type: disc;
+}
+.mdxeditor.skynet-mdxeditor .mdx-prose ol {
+  list-style-type: decimal;
+}
+.mdxeditor.skynet-mdxeditor .mdx-prose ul,
+.mdxeditor.skynet-mdxeditor .mdx-prose ol {
+  padding-left: 1.5rem;
+}
+.mdxeditor.skynet-mdxeditor .mdx-prose blockquote {
+  border-inline-start: 3px solid rgba(220, 225, 245, 0.25);
+  padding-inline-start: 1rem;
+  color: #b8b4a8;
+  font-style: italic;
+}

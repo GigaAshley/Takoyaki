@@ -1,0 +1,131 @@
+import { describe, it, expect } from "vitest";
+import { displayPath, parseChatDiff, parsePatch, toSplitRows } from "./parse-diff";
+import { GIT_PATCH, PLAIN_UNIFIED } from "./fixtures";
+
+describe("parsePatch — git format-patch", () => {
+  const patch = parsePatch(GIT_PATCH);
+
+  it("finds every file section and ignores mail headers + diffstat", () => {
+    expect(patch.files.map(displayPath)).toEqual([
+      "src/auth.ts",
+      "docs/new.md",
+      "old.txt → renamed.txt",
+      "logo.png",
+    ]);
+    expect(patch.files.map((f) => f.status)).toEqual([
+      "modified",
+      "added",
+      "renamed",
+      "binary",
+    ]);
+  });
+
+  it("counts additions and deletions per file and in total", () => {
+    expect(patch.files[0].additions).toBe(2);
+    expect(patch.files[0].deletions).toBe(1);
+    expect(patch.files[1].additions).toBe(2);
+    expect(patch.additions).toBe(4);
+    expect(patch.deletions).toBe(1);
+  });
+
+  it("keeps a removed line that starts with '-- ' inside its hunk", () => {
+    const del = patch.files[0].hunks[0].lines.find((l) => l.kind === "del");
+    expect(del?.text).toBe("-- a leading-dashes line that was removed");
+  });
+
+  it("numbers lines from the hunk header and treats a stripped blank line as context", () => {
+    const lines = patch.files[0].hunks[0].lines;
+    expect(lines[0]).toMatchObject({ kind: "ctx", oldNo: 1, newNo: 1 });
+    expect(lines[2]).toMatchObject({ kind: "add", oldNo: null, newNo: 2 });
+    expect(lines.at(-1)).toMatchObject({ kind: "ctx", text: "", oldNo: 4, newNo: 5 });
+  });
+
+  it("records '\\ No newline at end of file' as a note", () => {
+    const last = patch.files[1].hunks[0].lines.at(-1);
+    expect(last).toMatchObject({ kind: "note", text: "No newline at end of file" });
+  });
+});
+
+describe("parsePatch — plain diff -u", () => {
+  it("splits files on ---/+++ pairs and strips timestamps", () => {
+    const patch = parsePatch(PLAIN_UNIFIED);
+    expect(patch.files.map(displayPath)).toEqual(["b.txt", "c.txt"]);
+    expect(patch.files[1].hunks[0].lines).toEqual([
+      { kind: "del", text: "x", oldNo: 3, newNo: null },
+      { kind: "add", text: "y", oldNo: null, newNo: 3 },
+    ]);
+  });
+
+  it("returns no files for text that isn't a diff", () => {
+    expect(parsePatch("just some notes\n").files).toEqual([]);
+  });
+});
+
+describe("toSplitRows", () => {
+  it("pairs a removal run with the following addition run", () => {
+    const hunk = parsePatch(GIT_PATCH).files[0].hunks[0];
+    const rows = toSplitRows(hunk);
+    expect(rows[0].left?.kind).toBe("ctx");
+    expect(rows[0].right?.kind).toBe("ctx");
+    expect(rows[1].left?.kind).toBe("del");
+    expect(rows[1].right?.text).toBe("const b = 2;");
+    expect(rows[2].left).toBeNull();
+    expect(rows[2].right?.text).toBe("const c = 3;");
+  });
+});
+
+describe("parseChatDiff — ```diff blocks in chat", () => {
+  it("reads a bare +/-/space block as one unnamed, unnumbered hunk", () => {
+    const patch = parseChatDiff(" keep\n-old line\n+new line\n+another\n");
+    expect(patch).not.toBeNull();
+    expect(patch!.files).toHaveLength(1);
+    expect(patch!.files[0].newPath).toBeNull();
+    expect(patch!.additions).toBe(2);
+    expect(patch!.deletions).toBe(1);
+    const lines = patch!.files[0].hunks[0].lines;
+    expect(lines.map((l) => l.kind)).toEqual(["ctx", "del", "add", "add"]);
+    expect(lines.map((l) => l.text)).toEqual(["keep", "old line", "new line", "another"]);
+    expect(lines.every((l) => l.oldNo === null && l.newNo === null)).toBe(true);
+  });
+
+  it("keeps a real patch's file paths and line numbers", () => {
+    const patch = parseChatDiff(PLAIN_UNIFIED);
+    expect(patch).not.toBeNull();
+    expect(patch!.files.map(displayPath)).toEqual(parsePatch(PLAIN_UNIFIED).files.map(displayPath));
+    expect(patch!.files[0].hunks[0].lines.some((l) => l.newNo !== null)).toBe(true);
+  });
+
+  it("reads ---/+++ headers without an @@ line as the file, not as rows", () => {
+    const patch = parseChatDiff("--- a/foo.ts\n+++ b/foo.ts\n-old\n+new");
+    expect(patch!.files.map(displayPath)).toEqual(["foo.ts"]);
+    expect(patch!.additions).toBe(1);
+    expect(patch!.deletions).toBe(1);
+  });
+
+  it("keeps lines past an understated @@ count", () => {
+    const patch = parseChatDiff("@@ -1 +1 @@\n-a\n+b\n-c\n+d");
+    expect(patch!.additions).toBe(2);
+    expect(patch!.deletions).toBe(2);
+    const lines = patch!.files[0].hunks[0].lines;
+    expect(lines.map((l) => l.text)).toEqual(["a", "b", "c", "d"]);
+    expect(lines.map((l) => l.oldNo ?? l.newNo)).toEqual([1, 1, 2, 2]);
+  });
+
+  it("treats an @@ line without numbers as a hunk separator", () => {
+    const patch = parseChatDiff("@@ foo @@\n-a\n+b\n@@ bar @@\n+c");
+    expect(patch!.files[0].hunks.map((h) => h.header)).toEqual(["@@ foo @@", "@@ bar @@"]);
+    expect(patch!.additions).toBe(2);
+    expect(patch!.files[0].hunks[0].lines[0].oldNo).toBeNull();
+  });
+
+  it("parses a full git format-patch via the strict path", () => {
+    const patch = parseChatDiff(GIT_PATCH);
+    expect(patch!.files.map(displayPath)).toEqual(parsePatch(GIT_PATCH).files.map(displayPath));
+  });
+
+  it("returns null for text that isn't a diff", () => {
+    expect(parseChatDiff("const x = 1;\n+y")).toBeNull();
+    expect(parseChatDiff(" only context\n same")).toBeNull();
+    expect(parseChatDiff("")).toBeNull();
+  });
+});

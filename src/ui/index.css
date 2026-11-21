@@ -1,0 +1,664 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "@fontsource-variable/jetbrains-mono";
+@import "@fontsource-variable/inter";
+@plugin "@tailwindcss/typography";
+
+@font-face {
+  font-family: "Caskaydia Cove Nerd Font Mono";
+  src: url("/fonts/CaskaydiaCoveNerdFontMono-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Caskaydia Cove Nerd Font Mono";
+  src: url("/fonts/CaskaydiaCoveNerdFontMono-Bold.ttf") format("truetype");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Caskaydia Cove Nerd Font Mono";
+  src: url("/fonts/CaskaydiaCoveNerdFontMono-Italic.ttf") format("truetype");
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Caskaydia Cove Nerd Font Mono";
+  src: url("/fonts/CaskaydiaCoveNerdFontMono-BoldItalic.ttf") format("truetype");
+  font-weight: 700;
+  font-style: italic;
+  font-display: swap;
+}
+
+body {
+  overscroll-behavior: none;
+  background-color: var(--background);
+}
+
+/* Fleet-wide mobile tap responsiveness (2026-08-07, user: "sometimes I
+   press things on mobile ... and they don't press so I have to touch
+   them again"). iOS Safari's default `touch-action: auto` keeps a ~300ms
+   double-tap-zoom arbitration window even on `user-scalable=no` pages;
+   during it, a small finger movement can flip the browser's tap → scroll
+   classification and silently suppress the click. `manipulation` opts
+   the element out of double-tap-zoom so the browser commits to a click
+   at touchend without waiting. Applied by SEMANTIC ROLE so every button
+   / menu item / tab / option is covered without enumerating class names,
+   plus <a role="button"> and form controls. Deliberately NOT applied to
+   scroll containers or the app root — vertical scroll still bubbles from
+   a `manipulation` child up to the parent scroller. Long-press behaviors
+   (identity badge + conversation row → context menu) are JS timers on
+   touchstart and are unaffected by touch-action. */
+button,
+[role="button"],
+[role="menuitem"],
+[role="tab"],
+[role="option"],
+[role="switch"],
+[role="checkbox"],
+[role="radio"],
+input[type="button"],
+input[type="submit"],
+input[type="reset"],
+input[type="checkbox"],
+input[type="radio"] {
+  touch-action: manipulation;
+}
+
+@custom-variant dark (&:is(.dark *));
+@custom-variant dracula (&:is(.dracula *));
+
+@theme inline {
+  /* App default is Inter (sans). Mono is opt-in only (`font-mono`) — for
+     code, diffs, keys, fingerprints, IDs. Anything that doesn't pick a
+     font (incl. portaled menus/popovers, which escape every wrapper)
+     inherits the sans default from html/body below. */
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-heading: var(--font-sans);
+  --font-mono: "JetBrains Mono Variable", monospace;
+  --color-accent-brand: var(--accent-brand);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+
+  /* ── LEGACY: the pre-redesign "glass" palette (--color-pv-*, --radius-pv-*,
+     --shadow-pv-*). Still read by surfaces not yet restyled (login, SSH
+     dialogs, terminal chrome, a few viewers). Do NOT use in new UI — the
+     palette is the kit's --k-* (components/kit/kit.css :root); the
+     conversation view's own parts are in features/pretty-view/conversation.css.
+     Dynamic identity hue is the per-pane --pv-id-hue set on PrettyView's root. */
+  --color-pv-base: #141520;               /* cool off-black top of gradient */
+  --color-pv-base-mid: #101118;
+  --color-pv-base-end: #0a0b12;
+  /* Panel-shelf surface + rim (patch #82 shelf treatment). Panels used
+     to be floating cards with warm-cream 2.5% overlay; they're now
+     wall-to-wall shelves with cool-black-glass gradient stacked above
+     the compose surround. Values repurpose the surface-quiet/border-
+     quiet names because the semantic (quiet panel surface) still
+     applies. */
+  --color-pv-surface-quiet: rgba(25, 26, 34, 0.5);
+  --color-pv-surface-quiet-alt: rgba(15, 16, 22, 0.55);
+  --color-pv-border-quiet: rgba(220, 225, 245, 0.06);
+  --color-pv-border-quiet-strong: rgba(220, 225, 245, 0.1);
+  --color-pv-fg: #e8e4d8;                 /* warm off-white primary text */
+  --color-pv-fg-muted: #a89a80;
+  --color-pv-fg-dim: #7a6f60;
+  --color-pv-code-fg: #ffb896;
+  --radius-pv-bubble: 14px;
+  --radius-pv-card: 10px;
+  /* Patch #82: repurposed from "quiet floating card" (drop shadow +
+     inset rim) to "quiet shelf" (inset rim only). The drop-shadow was
+     the "slightly-bigger black rectangle" user called out; a wall-
+     to-wall shelf has nothing to float over so no drop shadow. Just
+     the cool-cream 1px top rim for glass definition. */
+  --shadow-pv-quiet-card: inset 0 1px 0 rgba(220, 225, 245, 0.04);
+}
+
+/* Phase 14B Slice 8: `:root { light-mode }` block retired. Skynet never
+ * activates the prior fork's light theme — the app boots into the `.dark` class
+ * by default via ThemeProvider, and every user-visible surface is a
+ * dark-mode surface. Keeping the light-mode variables around was pure
+ * dead weight (35 lines, ~100 tokens). The pv aesthetic drives every
+ * pretty surface directly; the `.dark` block below survives only to
+ * keep IdentityBadge md (terminal-pane badge, size='md' default at
+ * IdentityBadge.tsx:133-161 — a protected reference surface per the
+ * Phase 14B plan) rendering correctly, plus a handful of tiny legacy
+ * theme-class references elsewhere the plan's "best effort" scope
+ * didn't catch. Future phases can retire `.dark` after IdentityBadge md
+ * is migrated to inline styles or its own CSS. */
+
+.dark {
+  /* App-wide accent hue. Every hsla(var(--pv-hue, 35), ...) expression
+     across the codebase inherits this value unless an ancestor sets its
+     own --pv-hue (per-identity rows use the identity's colorHue). Value
+     190 matches the login page + create-role/new-session dialogs. */
+  --pv-hue: 190;
+  /* Tailwind's rounded-* scale (rounded-sm/md/lg/xl/2xl/etc) derives from
+     var(--radius) — see @theme block above. Without a definition on .dark
+     the calc() chain resolves to invalid → 0px, and every rounded-* class
+     silently paints square corners. Value matches .dracula. */
+  --radius: 0.625rem;
+  --background: #0a0b12;
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.21 0.004 128.68);
+  --popover: oklch(0.21 0.004 128.68);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.922 0 0);
+  --primary-foreground: oklch(0.2115 0.0042 128.68);
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.255 0 0);
+  --muted-foreground: oklch(0.72 0 0);
+  --accent: oklch(0.255 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: oklch(1 0 0 / 12%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.556 0 0);
+}
+
+/* ── Dracula ────────────────────────────────────────────────── */
+.dracula {
+  --background: #282a36;
+  --foreground: #f8f8f2;
+  --card: #21222c;
+  --popover: #21222c;
+  --popover-foreground: #f8f8f2;
+  --primary: #f8f8f2;
+  --primary-foreground: #282a36;
+  --secondary: #44475a;
+  --secondary-foreground: #f8f8f2;
+  --muted: #44475a;
+  --muted-foreground: #6272a4;
+  --accent: #44475a;
+  --accent-foreground: #f8f8f2;
+  --destructive: #ff5555;
+  --border: rgba(98, 114, 164, 0.25);
+  --input: rgba(98, 114, 164, 0.2);
+  --ring: #6272a4;
+  --radius: 0.625rem;
+}
+
+/* Phase 14B Slice 8: 6 non-Dracula xterm color themes retired
+ * (Catppuccin Mocha, Nord, Solarized Dark, Tokyo Night, One Dark,
+ * Gruvbox Dark — upstream fork carry-overs). Dracula stays because
+ * it's the theme user locked in for her fleet. See
+ * .planning/phases/14A-css-purge-wave-a-deletions/14A-SUMMARY.md for
+ * the CSS purge wave methodology. */
+
+@layer base {
+  * {
+    @apply outline-none;
+    scrollbar-width: thin;
+    /* Hidden when idle; shown while its area is hovered or being scrolled
+       (lib/scrollbar-reveal.ts sets data-scrollbar-reveal). The gutter keeps
+       its width either way, so nothing shifts when it appears. */
+    scrollbar-color: transparent transparent;
+  }
+  *:hover,
+  [data-scrollbar-reveal] {
+    scrollbar-color: oklch(1 0 0 / 20%) transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  *::-webkit-scrollbar-thumb {
+    background: transparent;
+    border-radius: 3px;
+  }
+  *:hover::-webkit-scrollbar-thumb,
+  [data-scrollbar-reveal]::-webkit-scrollbar-thumb {
+    background: oklch(1 0 0 / 20%);
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background: oklch(1 0 0 / 35%);
+  }
+  *::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+  html,
+  body,
+  #root {
+    height: var(--app-height, 100dvh);
+    @apply overflow-hidden;
+  }
+  body {
+    @apply bg-background text-foreground font-sans;
+  }
+  html {
+    @apply font-sans;
+  }
+  /* Tailwind v4's preflight drops the UA `cursor: pointer` on <button>, so
+   * every clickable in the app rendered an arrow. Lives in @layer base rather
+   * than the Button component's class list: base loses to every utility, so
+   * per-call cursor-default / cursor-not-allowed / cursor-grab still win
+   * without tailwind-merge conflicts. `:not(:disabled)` keeps disabled
+   * controls on the arrow. The :has() rule catches the sr-only-file-input
+   * pattern where the label is the clickable, not a button. */
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  label:has(> input[type="file"]),
+  summary {
+    cursor: pointer;
+  }
+}
+
+/* Patch #144 Fix (c): iOS PWA safe-area-inset-bottom is painted with the
+ * <html> background, not <body>. Setting html to pv-base-end makes the
+ * ~1cm bottom safe area match the pv-gradient's bottom stop instead of
+ * showing transparent-black bleed through. Cascade: `.dark { --background:
+ * #0a0b12 }` sets --color-pv-base-end via @theme inline mapping; we
+ * reference the token directly rather than --background so this rule holds
+ * even if a future theme rebase moves --background away from #0a0b12. */
+html {
+  background-color: var(--color-pv-base-end);
+}
+
+/* iOS PWA standalone-mode viewport fix: without this, body sizes to fit
+ * AppShell (100dvh) which iOS reports as physical-viewport MINUS both safe
+ * areas (~82 CSS px short on iPhone 16 Pro Max). That leaves body ending ~34
+ * CSS px above physical bottom, and body's `bg-background` painting stops
+ * there — producing a visible "black bar" strip below the app. Forcing body
+ * to 100vh (which iOS DOES resolve to full physical viewport in PWA
+ * standalone) makes body cover the whole display, which in turn causes iOS
+ * to re-measure the viewport such that innerHeight, visualViewport.height,
+ * and 100dvh all grow to the full physical value. AppShell's 100dvh then
+ * naturally reaches the physical bottom without needing its own edit.
+ * Verified live 2026-08-01 on user's iPhone 16 Pro Max PWA via the
+ * bottompad diagnostic tuner (see bounty pwa-bottom-safe-area-reclaim). */
+body {
+  min-height: 100vh;
+}
+
+/* iOS keyboard-viewport lock (see src/ui/hooks/use-keyboard-viewport-lock.ts):
+ * while the keyboard is up the app is sized to the visual viewport and the
+ * document must not be scrollable, or iOS scrolls it and the tap-to-caret /
+ * space-bar trackpad math goes off by the scroll offset. Drop the 100vh floor
+ * above, and the bottom safe-area pad (the home indicator is behind the
+ * keyboard). */
+html.kb-open body {
+  min-height: 0;
+}
+html.kb-open {
+  --kb-safe-bottom: 0px;
+}
+/* A phone sheet is pinned to the screen's bottom edge, which the keyboard
+ * covers (the layout viewport doesn't shrink for it) — sit it on top of the
+ * keyboard instead, no taller than what's left. --kb-inset is the keyboard's
+ * height, set by the same hook. */
+@media (max-width: 639.98px) {
+  html.kb-open [data-slot="modal-content"][data-sheet] {
+    bottom: var(--kb-inset, 0px) !important;
+    max-height: calc(var(--app-height, 100dvh) - 12px) !important;
+  }
+}
+
+/* Font size scale applied to html element */
+html.fs-xs {
+  font-size: 11px;
+}
+html.fs-sm {
+  font-size: 12px;
+}
+html.fs-md {
+  font-size: 14px;
+}
+html.fs-lg {
+  font-size: 16px;
+}
+html.fs-xl {
+  font-size: 18px;
+}
+
+/* Patch #163 supersedes #162 — no-patchwork mobile font strategy.
+ * Instead of per-surface .prose-sm overrides, a single html font-size bump
+ * on mobile does the work uniformly via the rem cascade.
+ *
+ * Patch #164 fix: `!important` is LOAD-BEARING. Skynet's font-size scale
+ * system (see src/ui/lib/theme.ts `applyFontSize` — adds one of `.fs-xs`
+ * `.fs-sm` `.fs-md` `.fs-lg` `.fs-xl` to `<html>`, persisted in localStorage)
+ * emits base rules like `html.fs-lg{font-size:16px}` at specificity 0-1-1
+ * that BEAT plain `html{}` at 0-0-1 regardless of source order — the media
+ * query rule silently loses the cascade and mobile never scales. Same lesson
+ * as patch #81 (shadcn dark: variant). Mobile intent is unconditional
+ * scale-uniform, so overriding the user's fs-* desktop preference on
+ * mobile is correct here — mobile is a separate context, not a proportional
+ * scale of desktop.
+ *
+ * Patch #309 (user 2026-08-04): drops mobile html base 24px → 18px. The
+ * 24px shipped in #163 turned out to be too big — user had been counter-
+ * scaling with a Safari per-domain zoom preference set 2 steps below default
+ * and hadn't realized we'd been iterating design against that zoomed-out
+ * view. A fresh browser on a second instance surfaced the gap. 18px
+ * matches fs-xl and approximates Safari-2-steps-down of 24px, aligning the
+ * default with what user has actually been designing at. Some previously-
+ * shipped mobile px chrome overrides (patch #165 composebox buttons, .pv-
+ * speak-btn 52px, other px tap targets) may look proportionally too large
+ * against the new smaller rem base and need individual trimming — parked as
+ * `mobile-scale-18px-outlier-tweaks` bounty. */
+@media (max-width: 768px) {
+  html {
+    font-size: 18px !important;
+  }
+}
+
+/* Feedback-strip buttons under an agent bubble (speak / 👍 / 👎, only when
+   feedback is enabled). Base 28x28; on mobile the tap target roughly doubles.
+   The in-bubble speak button is conversation.css's .pv-speak-btn. */
+.pv-strip-btn {
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+}
+.pv-strip-btn svg {
+  width: 16px;
+  height: 16px;
+}
+@media (max-width: 767.98px) {
+  .pv-strip-btn {
+    width: 39px;
+    height: 39px;
+    border-radius: 8px;
+  }
+  .pv-strip-btn svg {
+    width: 20px;
+    height: 20px;
+  }
+}
+
+@utility scrollbar-none {
+  scrollbar-width: none;
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+@utility thin-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+  &:hover,
+  &[data-scrollbar-reveal] {
+    scrollbar-color: oklch(1 0 0 / 15%) transparent;
+  }
+  &::-webkit-scrollbar {
+    width: 4px;
+  }
+  &::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  &::-webkit-scrollbar-thumb {
+    background: transparent;
+    border-radius: 2px;
+  }
+  &:hover::-webkit-scrollbar-thumb,
+  &[data-scrollbar-reveal]::-webkit-scrollbar-thumb {
+    background: oklch(1 0 0 / 15%);
+  }
+}
+
+@keyframes blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
+}
+
+/* Pretty-view identity badge + task pill breathing cycle (~5s, subtle
+ * ~8% brighten at the peak). Animates the OPACITY of a light overlay rather
+ * than `filter: brightness()` on the pill itself: a filter animation repaints
+ * the pill every frame forever (visible jank on iPhone), an opacity animation
+ * runs on the compositor with no repaint. The host element must be a
+ * containing block (absolute / relative) — no position rule here: unlayered CSS
+ * would beat Tailwind's layered `absolute` utility. Reduced-motion disables. */
+.pv-identity-breathe::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  /* Plain alpha blend (no mix-blend-mode, which can force an offscreen
+     group). A ~4% warm-white wash ≈ the old brightness(1.08) on these
+     dark fills. */
+  background: rgba(255, 245, 225, 0.04);
+  opacity: 0;
+  will-change: opacity;
+  animation: pv-identity-breathe 5s ease-in-out infinite;
+}
+@keyframes pv-identity-breathe {
+  0%,
+  100% {
+    opacity: 0;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+/* Task-pill side buttons (desktop running / unpushed work): a short glow
+ * pulse when the button appears, then a steady color — never a continuous
+ * animation, since a desktop can stay running for hours. */
+@keyframes pv-side-button-arrive {
+  0%,
+  100% {
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 6px 18px rgba(0, 0, 0, 0.45);
+  }
+  50% {
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 6px 18px rgba(0, 0, 0, 0.45), 0 0 22px 5px hsla(var(--pv-side-hue), 75%, 55%, 0.75);
+  }
+}
+
+.pv-side-button {
+  animation: pv-side-button-arrive 1.2s ease-in-out 3;
+}
+
+/* Sidebar hover-peek (use-sidebar-peek.ts): the collapsed sidebar slides in
+ * over the panes from the left edge, and back out. */
+@keyframes pv-sidebar-peek-in {
+  from {
+    transform: translateX(-102%);
+  }
+  to {
+    transform: none;
+  }
+}
+
+@keyframes pv-sidebar-peek-out {
+  from {
+    transform: none;
+  }
+  to {
+    transform: translateX(-102%);
+  }
+}
+
+/* Swipe-to-list (use-swipe-to-list.ts): on a touchscreen's conversation
+ * screen the list stays mounted here, off-screen and unrendered, in the same
+ * box it fills as the list screen. A swipe drives its transform inline. */
+[data-swipe-layer="parked"] {
+  position: fixed;
+  top: max(env(safe-area-inset-top), 0px);
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 40;
+  transform: translateX(-102%);
+  visibility: hidden;
+  content-visibility: hidden;
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-sidebar-peek] {
+    animation-duration: 1ms !important;
+  }
+  .pv-identity-breathe::after,
+  .pv-side-button {
+    animation: none !important;
+  }
+}
+
+/* Patch #181 — composebox button press feedback (A-variant, ?btnfx=1 tuner
+ * pick). Every <button> inside .pv-composebox transitions its scale +
+ * background + box-shadow on the `.pv-btn-pressed` class, which is added
+ * by a delegated pointerdown listener in ComposeBox.tsx for a fixed 250ms
+ * window regardless of tap length. Motivation: pretty-view buttons like
+ * ThumbsUp ("thumbs up") produce message bubbles asynchronously — the
+ * session-side accept latency is out of our control, so user needs an
+ * immediate local ack that her tap registered. Uses the standalone
+ * `scale:` property (not `transform: scale()`) so it composes
+ * independently of shadcn Button's baseline `active:translate-y-px` and
+ * doesn't override any existing `transform` on the button. */
+.pv-composebox button {
+  transition:
+    scale 90ms ease,
+    background-color 200ms ease,
+    box-shadow 200ms ease;
+  transform-origin: center center;
+}
+
+.pv-composebox button.pv-btn-pressed {
+  scale: 0.92;
+  background: var(--k-s3);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pv-composebox button {
+    transition: background-color 200ms ease, box-shadow 200ms ease;
+  }
+  .pv-composebox button.pv-btn-pressed {
+    scale: 1;
+  }
+}
+
+/* ── Multi-role gold sheen ───────────────────────────────────
+   MTG-style "multicolor = gold". A multi-role identity with no colorHue of
+   its own resolves to hue 44 (backend identity-appearance.ts); the
+   `pv-multi-role` class (on the PrettyView root and the search row) adds a metallic band so it reads as gold rather than yellow.
+   The sheen is built off the element's own hue, so an explicit colorHue on a
+   multi-role identity still gets the metallic finish in its own color. */
+.pv-multi-role {
+  --pv-mr-h: var(--pv-id-hue);
+  --pv-mr-sheen: linear-gradient(160deg,
+    hsla(calc(var(--pv-mr-h) + 2), 70%, 64%, 0.62) 0%,
+    hsla(var(--pv-mr-h), 55%, 42%, 0.58) 20%,
+    hsla(calc(var(--pv-mr-h) - 4), 50%, 26%, 0.64) 52%,
+    hsla(var(--pv-mr-h), 58%, 38%, 0.6) 78%,
+    hsla(calc(var(--pv-mr-h) - 6), 45%, 18%, 0.7) 100%);
+  --pv-mr-rim: hsla(calc(var(--pv-mr-h) + 2), 75%, 68%, 0.55);
+}
+.pv-multi-role .pv-hue-surface {
+  background-image: var(--pv-mr-sheen) !important;
+  border-color: var(--pv-mr-rim) !important;
+}
+/* Roleless look. An identity with no roles and no colorHue of its own has no
+   role to borrow a look from, so it paints in one neutral grey everywhere
+   rather than each surface's own default hue. `pv-neutral` sits where
+   `pv-multi-role` does (PrettyView root) and on the search
+   row (the sidebar row's own neutral rules live in pretty-conversations.css); surfaces that build their colors in JS (badge, task pill,
+   modal header) use identityTint() for the same greys. The hue these
+   elements still carry (NEUTRAL_HUE) only reaches small accents. */
+.pv-neutral {
+  --pv-neutral-fill: linear-gradient(160deg, hsla(0, 0%, 38%, 0.55), hsla(0, 0%, 24%, 0.60));
+  --pv-neutral-disc: linear-gradient(160deg, hsla(0, 0%, 25%, 0.72), hsla(0, 0%, 15%, 0.82));
+  --pv-neutral-rim: hsla(0, 0%, 60%, 0.36);
+  --pv-neutral-glow: hsla(0, 0%, 60%, 0.18);
+}
+.pv-neutral .pv-hue-surface {
+  background-image: var(--pv-neutral-fill) !important;
+  border-color: var(--pv-neutral-rim) !important;
+}
+
+/* Split-view divider drag: embedded frames ignore the pointer while a resize
+   is live, so a frame can never swallow the drag (backstop to pointer
+   capture). */
+body[data-split-resizing] iframe {
+  pointer-events: none;
+}
+
+/* Divider grab strips step aside during a pane / row / app-tile drag so a
+   drop near the line lands on the pane underneath (SplitView). */
+body[data-split-dnd] [data-split-divider-handle] {
+  pointer-events: none;
+}
+
+/* A meeting point of split-view dividers under the pointer: every line that
+   a press there would drag lights up, and the strips show a move cursor. */
+[data-split-divider][data-split-meet] > [data-split-divider-line] {
+  background-color: hsla(var(--pv-hue, 35), 55%, 50%, 0.6);
+}
+[data-split-divider-handle][data-split-meet] {
+  cursor: move;
+}
+
+/* Surfaces whose menu opens on press-and-hold (useRowKebabContextMenu): no
+   text selection or iOS callout under the finger on touch screens. */
+@media (pointer: coarse) {
+  [data-hold-menu] {
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  /* A rename box in such a row still edits and selects normally. */
+  [data-hold-menu] :is(input, textarea, [contenteditable=""], [contenteditable="true"]) {
+    -webkit-touch-callout: default;
+    -webkit-user-select: text;
+    user-select: text;
+  }
+}
+
+/* Swipe-left-to-remove on list rows (useRowKebabContextMenu's `swipe`). The
+   strip hangs off the row's right edge and fills the space the row uncovers. */
+@media (pointer: coarse) {
+  [data-swipe-row] {
+    touch-action: pan-y;
+  }
+}
+.row-swipe-action {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 100%;
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  padding-left: 18px;
+  background: var(--k-danger);
+  color: #fff;
+  font: 600 0.82rem/1 var(--font-sans);
+  white-space: nowrap;
+  pointer-events: none;
+}

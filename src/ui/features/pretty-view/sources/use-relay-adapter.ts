@@ -1,0 +1,798 @@
+/**
+ * Phase 93 Slice 3 — useRelayAdapter.
+ *
+ * Ported byte-for-behavior from Slice D's standalone relay-source stream
+ * hook per D-10 (retirement moved this out of the standalone relay-source
+ * tree; Phase 93 Slice 4 retired the source). This hook now owns the WS
+ * lifecycle for the relay case of the shared chat surface — PrettyView with
+ * source.kind === "relay" reads adapter.messages via useChatSurfaceAdapter.
+ *
+ * Key differences vs. the source hook:
+ *   1. Export renamed `useRelayRoomStream` → `useRelayAdapter`.
+ *   2. Two-arg signature (Warning 4): `(source, isVisible)`. `source` is
+ *      nullable — when null, the hook is a no-op (no WS opened, empty return,
+ *      no timers). This satisfies Slice 1's stubbed-peer contract, which
+ *      `useChatSurfaceAdapter` uses to keep hook-call order stable across
+ *      kind-flips (Pitfall 2 resolution). `isVisible` threads verbatim from
+ *      `useChatSurfaceAdapter`'s Slice 1 signature.
+ *   3. Return shape matches Slice 1's `ChatSurfaceAdapterState`:
+ *        - `messages: ChatSurfaceMessage[]` — internal state stays named
+ *          `history` for minimal diff; returned key is `messages` for D-09
+ *          consistency. Values are `MatrixEvent`s mapped to `RelayInboundEvent`
+ *          / `RelayOutboundEvent` shapes via `matrixEventToStreamEvent` below
+ *          (Assumption A2).
+ *        - `participants: { humans, agents }` — initial state
+ *          `{ humans: [], agents: [] }` (NEVER null when the hook is active;
+ *          Warning 2). Updated on `participants` frames.
+ *        - `sendMessage: (body, mqid) => Promise<boolean>` — Promise-returning
+ *          wrapper (harness/relay unified adapter contract) around the source
+ *          hook's void-returning sendMessage.
+ *        - `error: string | null` — null initially; populated on
+ *          inactive/error frames.
+ *        - `isReady: boolean` — false initially; flips true on the FIRST
+ *          `session` frame (chosen because `session` fires immediately on WS
+ *          connect after auth/access gate pass — it's the earliest reliable
+ *          "backend is authoritative" signal; `history_batch` follows shortly
+ *          after but may be absent if the room has zero history).
+ *        - Optional pagination fields (`hasOlder`, `loadOlderStatus`,
+ *          `loadOlderError`, `fetchOlder`) populated per source-hook behavior.
+ *   4. `viewingUserMxid` resolved internally via `useViewingUserMxid()` from
+ *      `@/state/viewing-user-store` (Slice D W#8 pattern).
+ *   5. Preserved byte-for-behavior: constants
+ *      (PENDING_SEND_TIMEOUT_MS_NORMAL = 20_000, MAX_RECONNECT_ATTEMPTS = 5,
+ *      LOAD_OLDER_COUNT = 20), backoff (linear-with-cap 2s/4s/6s/8s/8s with
+ *      full-jitter per R-54-07), isVisible gate, all 8 frame handlers, all
+ *      pending-send lifecycle (insert with timer, remove on live_event echo,
+ *      flip to failed on timeout/error, cancel timer on unmount), all
+ *      `console.info({ operation: "relay_room_..." })` structured logs.
+ *   6. Preserved: Assumption A4 (Matrix `unsigned.transaction_id` echo-back).
+ *      mqid → WS payload.txnId → backend matrix-message-send.ts (untouched)
+ *      → Matrix txnId → live_event.unsigned.transaction_id → correlation
+ *      lookup removes pending + appends real event. Any change to this chain
+ *      breaks Pitfall 4.
+ *
+ * ## Frame dispatch (identical to source)
+ *   - session:        flips isReady=true; no other side effect (roomTitle is
+ *                     already carried on `source.roomTitle`).
+ *   - history_batch:  replace history; set hasOlder from hasMore.
+ *   - live_event:     append (with pending-correlation via Pitfall 4).
+ *   - send_ack:       remove pending.
+ *   - send_error:     flipToFailed.
+ *   - participants:   updates participants state.
+ *   - inactive:       error → 'room-not-found'.
+ *   - error:          error → 'protocol'; connection stays open.
+ *
+ * ## Structured logging (PATTERNS.md § 2 discipline)
+ *   All boundary events log via console.info with explicit fields; NEVER raw
+ *   JSON.stringify of a WS frame. Log operations preserved verbatim:
+ *     relay_room_ws_open, relay_room_ws_close, relay_room_ws_reconnect,
+ *     relay_room_send_message, relay_room_send_ack, relay_room_send_error,
+ *     relay_room_fetch_older, relay_room_participants_update.
+ */
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+import {
+  openRelayRoomSocket,
+  type MatrixEvent,
+  type RelayRoomServerEvent,
+  type ConnectToRoomPayload,
+  type SendMessagePayload,
+  type FetchOlderRangePayload,
+} from "./relay-room-api";
+import type {
+  ChatSurfaceSource,
+  ChatSurfaceAdapterState,
+  ChatSurfaceMessage,
+  ChatSurfaceParticipants,
+} from "./chat-surface-source";
+import { useViewingUserMxid, useViewingUserId } from "@/state/viewing-user-store";
+import { getSkewLockedSnapshot } from "@/state/skew-lock-store";
+
+// ─── Constants (mirror source hook + PrettyView pending-send + reconnect) ────
+
+/** PrettyView L145: matches D-16 timeout. */
+const PENDING_SEND_TIMEOUT_MS_NORMAL = 20_000;
+
+/** PrettyView L90: matches patch #148 reconnect cap. */
+const MAX_RECONNECT_ATTEMPTS = 5;
+
+/** D-14 match-pretty-view page size. */
+const LOAD_OLDER_COUNT = 20;
+
+// ─── Types ───────────────────────────────────────────────────────────────────
+
+export type RelayRoomError =
+  | "room-not-found"
+  | "auth-expired"
+  | "protocol"
+  | null;
+
+interface PendingSend {
+  mqid: string;
+  content: string;
+  sentAt: number;
+  state: "sending" | "failed";
+  timer: ReturnType<typeof setTimeout> | null;
+}
+
+// ─── Empty-state singleton (Warning 2: participants never null when active) ──
+
+const EMPTY_PARTICIPANTS: ChatSurfaceParticipants = { humans: [], agents: [] };
+
+const IDLE_STATE: ChatSurfaceAdapterState = {
+  messages: [],
+  participants: EMPTY_PARTICIPANTS,
+  sendMessage: async () => false,
+  error: null,
+  isReady: false,
+  // Phase 97 Finding 1: "no source connected yet" state — false is the
+  // correct default (the veil consumer sees this as "not yet loaded" and
+  // shows the scrim). In practice `source.kind === "relay"` gates the
+  // peer veil-arm effect in PrettyView, so this idle-state field is
+  // defensive.
+  isMessagesLoaded: false,
+  hasOlder: false,
+  loadOlderStatus: "idle",
+  loadOlderError: null,
+  fetchOlder: async () => {},
+};
+
+// ─── MatrixEvent → ChatSurfaceMessage mapper (Assumption A2) ─────────────────
+
+/**
+ * Map a MatrixEvent into the union `ChatSurfaceMessage`. Non-self messages
+ * become `RelayInboundEvent` shape (rendered via RelayInboundBubble D-16);
+ * self messages become `RelayOutboundEvent` shape (rendered via
+ * OutboundBubble / RelayOutboundBubble — case-agnostic per D-15).
+ *
+ * Non-text events (state changes, redactions, etc.) return null and are
+ * filtered from the returned `messages` array.
+ */
+function matrixEventToStreamEvent(
+  event: MatrixEvent,
+  viewingUserMxid: string,
+  roomId: string,
+): ChatSurfaceMessage | null {
+  // Only render text-body events. Other Matrix types (m.room.member,
+  // m.room.redaction, etc.) are silently skipped from the message list —
+  // participants frames + inactive frames carry the semantics we care about.
+  const msgtype = event.content["msgtype"];
+  const body = event.content["body"];
+  if (typeof body !== "string") return null;
+  if (msgtype !== "m.text" && msgtype !== undefined) return null;
+
+  const isSelf = event.sender === viewingUserMxid;
+  if (isSelf) {
+    // Phase 97 UAT follow-up 4 (2026-09-10): render the sender's own
+    // messages as normal user ChatMessage bubbles (blue, right-aligned)
+    // instead of RelayOutboundBubble (hue-tinted, left-aligned, with a
+    // ▸ "relay send" header + expandable raw-command area). RelayOutbound
+    // Bubble is HARNESS-only — it's what the backend surfaces when it
+    // detects a Bash tool-use turn that curls a matrix send (Phase 17
+    // Plan 03). In relay-source view, the sender's own text messages
+    // deserve the normal chat treatment.
+    return {
+      type: "message",
+      role: "user",
+      content: body,
+      eventId: event.event_id,
+      ts: event.origin_server_ts,
+    };
+  }
+  return {
+    type: "relay_inbound",
+    room: roomId,
+    sender: event.sender,
+    matrixEventId: event.event_id,
+    body,
+    raw: body,
+    eventId: event.event_id,
+    ts: event.origin_server_ts,
+  };
+}
+
+// ─── Hook ────────────────────────────────────────────────────────────────────
+
+export function useRelayAdapter(
+  source: Extract<ChatSurfaceSource, { kind: "relay" }> | null,
+  isVisible: boolean,
+): ChatSurfaceAdapterState {
+  // Hooks that MUST be called unconditionally regardless of `source` (Pitfall
+  // 2). Passing null source keeps the hook alive but inert; every hook still
+  // runs in stable order.
+  const viewingUserMxid = useViewingUserMxid();
+  const viewingUserId = useViewingUserId();
+
+  const roomId = source?.roomId ?? "";
+
+  const [history, setHistory] = useState<MatrixEvent[]>([]);
+  const [participants, setParticipants] =
+    useState<ChatSurfaceParticipants>(EMPTY_PARTICIPANTS);
+  const [error, setError] = useState<RelayRoomError>(null);
+  const [pendingSends, setPendingSends] = useState<PendingSend[]>([]);
+  const [hasOlder, setHasOlder] = useState<boolean>(false);
+  const [loadOlderStatus, setLoadOlderStatus] = useState<
+    "idle" | "loading" | "error"
+  >("idle");
+  const [loadOlderError, setLoadOlderError] = useState<string | null>(null);
+  // Warning 2 — isReady flips true on the FIRST `session` frame (earliest
+  // reliable "backend is authoritative" signal; see header JSDoc).
+  const [isReady, setIsReady] = useState<boolean>(false);
+  // Phase 97 Finding 1 — isMessagesLoaded flips true on the FIRST
+  // `history_batch` frame (the "backend has read the room's history"
+  // signal). Distinct from isReady: `session` (isReady=true) fires on
+  // WS-auth pass, before any actual message-loading work. The veil
+  // dismiss signal must be history_batch, not session, so an empty
+  // room's veil dismisses on frame arrival regardless of events.length.
+  //
+  // Rules-of-hooks discipline (Phase 93 Landmine 5): this useState MUST
+  // live ABOVE the `if (source === null) return IDLE_STATE;` early-return
+  // below. It also has no matching reset site — `setIsReady(false)` is
+  // never called elsewhere in this hook (state persists across the
+  // reconnect-ladder retryKey re-run; the closing frame comes via the
+  // next `history_batch` on the fresh WS). Mirror that discipline —
+  // do NOT add a defensive reset that would flash the veil on reconnect.
+  const [isMessagesLoaded, setIsMessagesLoaded] = useState<boolean>(false);
+
+  const wsRef = useRef<WebSocket | null>(null);
+  const pendingSendsRef = useRef<PendingSend[]>([]);
+  const reconnectAttemptsRef = useRef<number>(0);
+  const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+  const viewingUserMxidRef = useRef<string>(viewingUserMxid ?? "");
+  const roomIdRef = useRef<string>(roomId);
+  // history ref-mirror so fetchOlder (useCallback with [] deps) can read the
+  // latest history without re-creating on every history change.
+  const historyRef = useRef<MatrixEvent[]>([]);
+  // Retry key that triggers the WS-setup effect to re-run on reconnect.
+  const [retryKey, setRetryKey] = useState<number>(0);
+
+  useEffect(() => {
+    pendingSendsRef.current = pendingSends;
+  }, [pendingSends]);
+
+  useEffect(() => {
+    viewingUserMxidRef.current = viewingUserMxid ?? "";
+  }, [viewingUserMxid]);
+
+  useEffect(() => {
+    roomIdRef.current = roomId;
+  }, [roomId]);
+
+  // ── flipToFailed helper (mirrors source hook + PrettyView L1179-1197) ────
+  const flipToFailed = useCallback((mqid: string, reason: string) => {
+    setPendingSends((prev) => {
+      const found = prev.find((p) => p.mqid === mqid && p.state === "sending");
+      if (!found) return prev;
+      if (found.timer !== null) clearTimeout(found.timer);
+      // Structured warn — reason + mqid only, never body.
+      // eslint-disable-next-line no-console
+      console.info({
+        operation: "relay_room_send_error",
+        mqid,
+        reason,
+      });
+      return prev.map((p) =>
+        p.mqid === mqid ? { ...p, state: "failed", timer: null } : p,
+      );
+    });
+  }, []);
+
+  // ── clearAllPendingSends (mirrors PrettyView L1331-1340) ─────────────────
+  const clearAllPendingSends = useCallback(() => {
+    for (const p of pendingSendsRef.current) {
+      if (p.timer !== null) clearTimeout(p.timer);
+    }
+    setPendingSends([]);
+  }, []);
+
+  // ── sendMessage — Promise-returning wrapper (adapter contract) ───────────
+  // Wraps the source hook's void-returning sendMessage so the return shape
+  // matches ChatSurfaceAdapterState. Resolves `true` when the WS is open and
+  // the payload was sent; `false` when the WS was not open (seeded as failed).
+  const sendMessage = useCallback(
+    async (body: string, mqid: string): Promise<boolean> => {
+      const ws = wsRef.current;
+      if (ws === null || ws.readyState !== WebSocket.OPEN) {
+        // Fail-immediately per D-14: seed the pending as failed so the UI
+        // shows a red bubble. Simpler than pretty view's queued-send path.
+        setPendingSends((prev) => [
+          ...prev,
+          {
+            mqid,
+            content: body,
+            sentAt: Date.now(),
+            state: "failed",
+            timer: null,
+          },
+        ]);
+        // eslint-disable-next-line no-console
+        console.info({
+          operation: "relay_room_send_message",
+          mqid,
+          roomId: roomIdRef.current,
+          userId: viewingUserId,
+          ok: false,
+          reason: "ws_not_open",
+        });
+        return false;
+      }
+      const payload: SendMessagePayload = {
+        type: "send_message",
+        body,
+        txnId: mqid,
+      };
+      try {
+        ws.send(JSON.stringify(payload));
+      } catch {
+        // ws.send may throw if ws is mid-close between the readyState check
+        // and the send call. Seed as failed to match the fail-immediately
+        // branch above.
+        setPendingSends((prev) => [
+          ...prev,
+          {
+            mqid,
+            content: body,
+            sentAt: Date.now(),
+            state: "failed",
+            timer: null,
+          },
+        ]);
+        return false;
+      }
+      const timerHandle = setTimeout(
+        () => flipToFailed(mqid, "timeout"),
+        PENDING_SEND_TIMEOUT_MS_NORMAL,
+      );
+      setPendingSends((prev) => [
+        ...prev,
+        {
+          mqid,
+          content: body,
+          sentAt: Date.now(),
+          state: "sending",
+          timer: timerHandle,
+        },
+      ]);
+      // eslint-disable-next-line no-console
+      console.info({
+        operation: "relay_room_send_message",
+        mqid,
+        roomId: roomIdRef.current,
+        userId: viewingUserId,
+        ok: true,
+      });
+      return true;
+    },
+    [flipToFailed, viewingUserId],
+  );
+
+  // ── fetchOlder — Promise-returning wrapper (adapter contract) ────────────
+  // The adapter contract signature is `() => Promise<void>` (no argument).
+  // The source hook took a beforeEventId argument; we compute it internally
+  // from the oldest event in history (via historyRef) so callers don't need
+  // to thread it.
+  const fetchOlder = useCallback(async (): Promise<void> => {
+    const ws = wsRef.current;
+    if (ws === null || ws.readyState !== WebSocket.OPEN) return;
+    const hist = historyRef.current;
+    if (hist.length === 0) return;
+    const beforeEventId = hist[0].event_id;
+    const payload: FetchOlderRangePayload = {
+      type: "fetch_older_range",
+      beforeEventId,
+      count: LOAD_OLDER_COUNT,
+    };
+    try {
+      ws.send(JSON.stringify(payload));
+      setLoadOlderStatus("loading");
+      setLoadOlderError(null);
+    } catch {
+      setLoadOlderStatus("error");
+      setLoadOlderError("send_failed");
+      return;
+    }
+    // eslint-disable-next-line no-console
+    console.info({
+      operation: "relay_room_fetch_older",
+      beforeEventId,
+      count: LOAD_OLDER_COUNT,
+      roomId: roomIdRef.current,
+    });
+  }, []);
+
+  // Keep historyRef in sync with the history state (used by fetchOlder above).
+  useEffect(() => {
+    historyRef.current = history;
+  }, [history]);
+
+  // ── WS setup effect ──────────────────────────────────────────────────────
+  useEffect(() => {
+    // No-op branch: hook inert when source is null OR isVisible is false.
+    // Passing null source is how `useChatSurfaceAdapter` calls this hook when
+    // the active source is harness — hook still runs (Pitfall 2 stability)
+    // but doesn't open a WS.
+    if (source === null) return;
+    if (!isVisible) return;
+
+    let cancelled = false;
+    const ws = openRelayRoomSocket();
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      if (cancelled) return;
+      // Reset error on successful open (patch #148 discipline — clear stale
+      // banner from a prior attempt).
+      setError(null);
+      // Reset the reconnect-attempt counter on a successful open — without this,
+      // once the 5-attempt cap fires the ladder is permanently exhausted and a
+      // healthy WS that later drops hours in never reconnects. Bug was inherited
+      // byte-for-behavior from the retired standalone hook via Slice 3 D-10 port.
+      reconnectAttemptsRef.current = 0;
+      const payload: ConnectToRoomPayload = {
+        type: "connectToRoom",
+        roomId: roomIdRef.current,
+      };
+      try {
+        ws.send(JSON.stringify(payload));
+      } catch {
+        // ws may be mid-close
+      }
+      // Phase 97 code-review Fix 3: read the viewing user id from
+      // viewingUserMxidRef.current at emit time (not from the closure-captured
+      // `viewingUserId` above). This effect's deps are
+      // `[source?.roomId ?? null, isVisible, retryKey]` — viewingUserMxid is
+      // NOT in that list, so a mid-session viewing-user change would leave
+      // the WS-open log carrying a stale id. The actual WS behavior already
+      // reads viewingUserMxidRef correctly (see L476); this fix is log-quality
+      // only, keeping the forensic tape honest.
+      // eslint-disable-next-line no-console
+      console.info({
+        operation: "relay_room_ws_open",
+        roomId: roomIdRef.current,
+        userId: viewingUserMxidRef.current,
+      });
+    };
+
+    ws.onmessage = (event: MessageEvent<string>) => {
+      if (cancelled) return;
+      let parsed: RelayRoomServerEvent;
+      try {
+        parsed = JSON.parse(event.data) as RelayRoomServerEvent;
+      } catch {
+        return;
+      }
+      switch (parsed.type) {
+        case "session":
+          // Warning 2: session is the earliest reliable "backend is
+          // authoritative" signal. isReady flips true here so MultiBadgeAnchor
+          // (Slice 2) can discriminate loading (isReady=false) from empty
+          // (isReady=true, zero participants).
+          setIsReady(true);
+          break;
+        case "history_batch":
+          setHistory(parsed.events);
+          setHasOlder(parsed.hasMore);
+          setLoadOlderStatus("idle");
+          setLoadOlderError(null);
+          // Belt-and-suspenders: history_batch also flips isReady=true (in
+          // case a session frame is somehow missed — defensive).
+          setIsReady(true);
+          // Phase 97 Finding 1: flip isMessagesLoaded=true on the FRAME
+          // arrival — unconditional on `parsed.events.length`. Empty
+          // rooms MUST dismiss the veil (a room with zero messages
+          // still fires history_batch with events:[]), so the signal
+          // is the frame itself, not events.length > 0.
+          setIsMessagesLoaded(true);
+          break;
+        case "live_event": {
+          const evt = parsed.event;
+          const isSelfSender = evt.sender === viewingUserMxidRef.current;
+          const echoedTxnId =
+            evt.unsigned !== undefined
+              ? evt.unsigned.transaction_id
+              : undefined;
+          if (isSelfSender && typeof echoedTxnId === "string") {
+            // Pitfall 4 correlation — try to match a pending entry by mqid.
+            const pending = pendingSendsRef.current.find(
+              (p) => p.mqid === echoedTxnId,
+            );
+            if (pending) {
+              // Cancel the timer + remove the pending.
+              if (pending.timer !== null) clearTimeout(pending.timer);
+              setPendingSends((prev) =>
+                prev.filter((p) => p.mqid !== echoedTxnId),
+              );
+              // Phase 97 UAT follow-up 2 (2026-09-10): the correlation
+              // branch appends UNCONDITIONALLY. The earlier UAT batch #4
+              // added a dedup guard here too, but that caused the sender's
+              // own echo to disappear — if the send's real event_id
+              // somehow matched anything in history (or a duplicate
+              // live_event delivery fired), the optimistic pending got
+              // removed but the real event was skipped too, leaving no
+              // visible bubble. The non-correlated branch below still
+              // dedups (defense against history_batch overlap).
+              setHistory((prev) => [...prev, evt]);
+              break;
+            }
+          }
+          // Non-correlated live event — append IF NOT ALREADY in history.
+          // Phase 97 UAT follow-up (2026-09-10): fix "4 bubbles for 2
+          // messages" hydration bug. On a fresh WS subscribe, the server
+          // emits `history_batch` with recent events, then may also emit
+          // those same events as `live_event` (buffered-from-before-connect
+          // pattern). Without this de-dup, both feeders write to `history`
+          // and every message renders twice. Client-side de-dup is
+          // defensive even if the server closes the overlap — WS reconnect
+          // + StrictMode double-mount can create the same overlap in
+          // production.
+          setHistory((prev) =>
+            prev.some((h) => h.event_id === evt.event_id)
+              ? prev
+              : [...prev, evt],
+          );
+          break;
+        }
+        case "send_ack": {
+          const { txnId, eventId } = parsed;
+          const pending = pendingSendsRef.current.find(
+            (p) => p.mqid === txnId,
+          );
+          if (pending) {
+            if (pending.timer !== null) clearTimeout(pending.timer);
+            setPendingSends((prev) => prev.filter((p) => p.mqid !== txnId));
+            // Phase 97 UAT follow-up 3 (2026-09-10): promote the pending
+            // into a real history entry using the eventId the server
+            // returned. Without this the sender's own message vanishes
+            // when the pending is cleared (send_ack fires but a
+            // corresponding live_event may never be delivered to the
+            // sender's own WS — some Matrix homeserver configs echo only
+            // to OTHER participants). The synthesized event carries the
+            // sender's mxid + the pending's body content so it renders
+            // identically to how the recipient sees it. If a live_event
+            // for this event_id later arrives, the non-correlated branch's
+            // dedup guard prevents a second copy from being appended.
+            const viewingMxid = viewingUserMxidRef.current;
+            if (viewingMxid !== null) {
+              const synth: MatrixEvent = {
+                event_id: eventId,
+                type: "m.room.message",
+                sender: viewingMxid,
+                origin_server_ts: pending.sentAt,
+                content: {
+                  msgtype: "m.text",
+                  body: pending.content,
+                },
+                unsigned: { transaction_id: txnId },
+              };
+              setHistory((prev) =>
+                prev.some((h) => h.event_id === eventId)
+                  ? prev
+                  : [...prev, synth],
+              );
+            }
+          }
+          // eslint-disable-next-line no-console
+          console.info({
+            operation: "relay_room_send_ack",
+            mqid: txnId,
+            eventId: parsed.eventId,
+          });
+          break;
+        }
+        case "send_error":
+          flipToFailed(parsed.txnId, parsed.reason);
+          break;
+        case "participants":
+          setParticipants({
+            humans: parsed.humans,
+            agents: parsed.agents,
+          });
+          // eslint-disable-next-line no-console
+          console.info({
+            operation: "relay_room_participants_update",
+            // Counts exclude the viewing user — backend applies D-07 self-exclusion in /participants response.
+            humansExclViewer: parsed.humans.length,
+            agentsExclViewer: parsed.agents.length,
+            roomId: roomIdRef.current,
+          });
+          break;
+        case "inactive":
+          setError("room-not-found");
+          break;
+        case "error":
+          setError("protocol");
+          break;
+      }
+    };
+
+    ws.onerror = () => {
+      if (cancelled) return;
+      // Error details are unreliable cross-browser; the subsequent close
+      // event carries the authoritative status.
+    };
+
+    ws.onclose = () => {
+      if (cancelled) return;
+      // eslint-disable-next-line no-console
+      console.info({
+        operation: "relay_room_ws_close",
+        roomId: roomIdRef.current,
+      });
+      // Clear pending timers on close.
+      clearAllPendingSends();
+      // Phase 111 SKEW-09: if the skew-lock has been tripped (either by
+      // this WS's own 4409 close code detected in relay-room-api.ts, or by
+      // another lane), don't reconnect — the shell is about to reload and
+      // a reconnect would just get 4409-closed again.
+      if (getSkewLockedSnapshot().locked) return;
+      // Reconnect with linear-with-cap backoff (patch #148: 2s/4s/6s/8s/8s).
+      if (reconnectAttemptsRef.current < MAX_RECONNECT_ATTEMPTS) {
+        const capMs = Math.min(
+          2000 * (reconnectAttemptsRef.current + 1),
+          8000,
+        );
+        // Full-jitter (R-54-07) — random draw in [0, capMs) to prevent tab-
+        // restore herds from re-clumping on the reconnect ladder.
+        const delay = Math.floor(Math.random() * capMs);
+        reconnectAttemptsRef.current += 1;
+        // eslint-disable-next-line no-console
+        console.info({
+          operation: "relay_room_ws_reconnect",
+          attempt: reconnectAttemptsRef.current,
+          delayMs: delay,
+          roomId: roomIdRef.current,
+        });
+        reconnectTimeoutRef.current = setTimeout(() => {
+          reconnectTimeoutRef.current = null;
+          if (cancelled) return;
+          setRetryKey((k) => k + 1);
+        }, delay);
+      }
+    };
+
+    return () => {
+      cancelled = true;
+      if (reconnectTimeoutRef.current !== null) {
+        clearTimeout(reconnectTimeoutRef.current);
+        reconnectTimeoutRef.current = null;
+      }
+      // Bounty frontend-websocket-leak-on-container-recreate: detach
+      // handler property refs BEFORE close() so the retention cycle
+      // (ws → ws.onopen closure → ws via ws.send at L438) is broken. Without
+      // this, each cleanup (retryKey bump or unmount) leaves a dead WS pinned
+      // by its own handlers and container-recreate storms compound the count
+      // against nginx worker_connections.
+      ws.onopen = null;
+      ws.onmessage = null;
+      ws.onerror = null;
+      ws.onclose = null;
+      try {
+        ws.close();
+      } catch {
+        // ignore
+      }
+      wsRef.current = null;
+      clearAllPendingSends();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [source?.roomId ?? null, isVisible, retryKey]);
+
+  // ── Return the ChatSurfaceAdapterState-compatible shape ──────────────────
+
+  // Map MatrixEvent[] → ChatSurfaceMessage[] (D-16 render compatibility). The
+  // mapper filters out non-text events (state changes, redactions, etc.).
+  // Memoized on `history` so downstream consumers (PrettyView `effectiveMessages`,
+  // ComposeBox subtree via `handleComposeSend` useCallback deps) see a stable
+  // reference when the underlying history has not changed. Without this, the
+  // hook returned a fresh array + fresh object every render, defeating memoization
+  // across the compose subtree and re-firing every downstream effect.
+  //
+  // Pitfall 2 discipline: this useMemo is called UNCONDITIONALLY (before the
+  // source === null early-return below). Placing it after the early-return
+  // would violate rules-of-hooks on kind-flip — first render with source=null
+  // returns before the hook, next render with source=non-null calls it,
+  // React throws "Rendered more hooks than during previous render."
+  const messages = useMemo<ChatSurfaceMessage[]>(() => {
+    const out: ChatSurfaceMessage[] = [];
+    for (const evt of history) {
+      const mapped = matrixEventToStreamEvent(
+        evt,
+        viewingUserMxidRef.current,
+        roomIdRef.current,
+      );
+      if (mapped !== null) out.push(mapped);
+    }
+    // Phase 97 UAT follow-up (2026-09-10): append optimistic bubbles for
+    // pending sends that haven't been echoed back yet. Slice 5 left this
+    // deferred (comment at the bottom of the file said "Optimistic-bubble
+    // rendering could be added in a later slice if needed"); UAT surfaced
+    // that without this, the sender sees no bubble at all until the
+    // server echoes their own send back over the WS — a several-second
+    // gap where the compose box empties but the pane stays visually
+    // unchanged. Pending entries are inserted in the send-time order they
+    // arrived (pendingSends is append-only until echo/failure).
+    //
+    // Correlation semantics: when a live_event with matching mqid lands,
+    // the switch case atomically removes the pending AND appends the real
+    // event — no double-render window because both setState calls batch.
+    // If the pending times out or fails, its `state` flips to "failed"
+    // but it stays in pendingSends so the failure bubble persists (D-14).
+    for (const p of pendingSends) {
+      out.push({
+        type: "message",
+        role: "user",
+        content: p.content,
+        // Use mqid as the eventId — stable React key, and doesn't collide
+        // with the real event's eventId once it arrives (echo path removes
+        // this pending BEFORE the real event enters history).
+        eventId: p.mqid,
+        ts: p.sentAt,
+        // Phase 97 UAT follow-up 4 (2026-09-10): mark the optimistic
+        // bubble as pending so ChatMessage renders failed styling
+        // (state === "failed"); "sending" renders as a plain bubble.
+        // The threaded prop is consumed at PrettyView's ChatMessage
+        // render site.
+        pendingState: p.state === "failed" ? "failed" : "sending",
+      });
+    }
+    // Phase 97 UAT follow-up 2 (2026-09-10): sort chronologically by ts
+    // (ascending — oldest first, newest last, standard chat convention).
+    // history_batch may deliver events newest-first depending on the
+    // Matrix server's pagination direction; without this sort the pane
+    // renders reversed. Defensive against server order regardless of
+    // which direction the server used. Pending sends carry client
+    // sentAt (Date.now) as ts so they naturally land at the newest end.
+    out.sort((a, b) => (a.ts ?? 0) - (b.ts ?? 0));
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [history, pendingSends]);
+
+  // Memoize the returned object so consumers checking reference equality
+  // (React.memo, useCallback deps that include the adapter object) don't see
+  // a fresh reference every render. Same Pitfall 2 discipline as `messages`
+  // above: called unconditionally before the source === null early-return.
+  const memoizedActiveState = useMemo(() => ({
+    messages,
+    participants,
+    sendMessage,
+    error,
+    isReady,
+    // Phase 97 Finding 1: added to BOTH the returned object AND the deps
+    // array below (Phase 93 Landmine 4 — every returned field must be in
+    // deps). Consumed by PrettyView's relay-case veil-arm effect.
+    isMessagesLoaded,
+    hasOlder,
+    loadOlderStatus,
+    loadOlderError,
+    fetchOlder,
+  }), [
+    messages,
+    participants,
+    sendMessage,
+    error,
+    isReady,
+    isMessagesLoaded,
+    hasOlder,
+    loadOlderStatus,
+    loadOlderError,
+    fetchOlder,
+  ]);
+
+  // No-op return when source is null (harness case caller via
+  // useChatSurfaceAdapter): return the idle singleton so the harness case sees
+  // participants={humans:[],agents:[]}, isReady=false, empty messages. This
+  // early-return sits BELOW the two useMemos above (Pitfall 2 discipline).
+  if (source === null) {
+    return IDLE_STATE;
+  }
+
+  // Phase 97 UAT follow-up (2026-09-10): pendingSends now feeds the
+  // `messages` useMemo above as optimistic bubbles, so it's a real
+  // observed dependency of the returned shape — no more `void`
+  // suppression needed.
+
+  return memoizedActiveState;
+}

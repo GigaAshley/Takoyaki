@@ -1,0 +1,690 @@
+/**
+ * WebAudioStreamPlayer — factory for progressive streaming WAV playback via Web Audio API.
+ *
+ * Takes a Response (from postSpeakStream) with an unread streaming body, reads
+ * it chunk-by-chunk, decodes each PCM chunk into an AudioBuffer, and schedules
+ * playback via AudioBufferSourceNodes so audio starts playing before synthesis
+ * finishes (~30ms TTFB per Chatterbox streaming endpoint).
+ *
+ * Scheduling recipe: "nextStartTime running clock" pattern lifted from Nelly's
+ * streaming Chatterbox demo (https://example.com/tts-demo/ view-source,
+ * Nelly's permission to lift wholesale). Each source is scheduled at
+ * nextStartTime; nextStartTime advances by buffer.duration after each schedule.
+ *
+ * A fresh AudioContext is created per play() invocation — locked by
+ * 19-CONTEXT.md § Frontend player to avoid sample-rate-mismatch bugs across
+ * calls (Chatterbox voices may have different sample rates).
+ *
+ * If the audio never starts (context stuck suspended, nobody paused it),
+ * onError fires after NEVER_STARTED_MS rather than waiting forever.
+ *
+ * Patch #237 (Phase 19 Plan 04).
+ */
+
+import { parseRiffHeader, decodePcmChunk, type RiffHeader } from "./riffPcmDecode";
+import { createTimeStretcher, type TimeStretcher } from "./timeStretch";
+
+// Client-side playback speed. Applied by time-stretching the decoded PCM
+// (timeStretch.ts) before scheduling, so the pitch stays put; sources then
+// play at their native rate.
+// Per-user preference (user_preferences.tts_playback_rate), pushed in by
+// AppShell via setTtsPlaybackRate whenever the user's preferences load or
+// change. Each player snapshots the rate at creation, so a change applies
+// from the next message spoken. null / out-of-range → 1.0 (native rate).
+// Bounds mirror TTS_PLAYBACK_RATE_MIN/MAX in
+// src/backend/database/routes/user-preferences.ts — keep the two in step.
+export const TTS_PLAYBACK_RATE_DEFAULT = 1.0;
+export const TTS_PLAYBACK_RATE_MIN = 0.25;
+export const TTS_PLAYBACK_RATE_MAX = 4;
+
+let currentTtsPlaybackRate = TTS_PLAYBACK_RATE_DEFAULT;
+
+export function setTtsPlaybackRate(rate: number | null | undefined): void {
+  currentTtsPlaybackRate =
+    typeof rate === "number" &&
+    Number.isFinite(rate) &&
+    rate >= TTS_PLAYBACK_RATE_MIN &&
+    rate <= TTS_PLAYBACK_RATE_MAX
+      ? rate
+      : TTS_PLAYBACK_RATE_DEFAULT;
+}
+
+export function getTtsPlaybackRate(): number {
+  return currentTtsPlaybackRate;
+}
+
+// the operator 2026-09-20 — Chrome silently drops audio output for
+// AudioBufferSourceNodes scheduled too far ahead of the playhead
+// (empirically ~30-60s), while still firing their onended callbacks on
+// schedule. The 2026-09-17 first pass capped by COUNT (8 pending
+// sources ≈ 13s at ~2s per buffer). That reasoning collapses when
+// individual buffers are large: the operator reproduced after a pause/resume
+// let Chrome's fetch queue accumulate, and subsequent reader.read()
+// calls returned ~1MB chunks that decoded to 32-65s AudioBuffers. 8
+// such sources = 100+ seconds queued ahead — right back in the drop
+// zone. Symptom: message plays correctly through the first N seconds,
+// then a chunk drops silently while onended still fires on schedule.
+//
+// Fix: cap by TIME instead of COUNT. Block scheduling when the next
+// source would start more than SCHEDULE_HORIZON_SECONDS ahead of the
+// playhead. Bounds the schedule-ahead invariant regardless of
+// individual buffer size — one 60s buffer just delays the loop 60s;
+// no more scheduled sources pile up behind it. Backpressure still
+// propagates the same way (reader parks → fetch stops draining → TCP
+// window shrinks → Polly slows down).
+const SCHEDULE_HORIZON_SECONDS = 15;
+
+// the operator 2026-09-23 — the horizon fix above bounds schedule-ahead
+// across sources, but a SINGLE source whose audible playback extends
+// far past the playhead still hits Chrome's silent-drop zone: log from
+// the incident showed one 65.5s AudioBuffer scheduled with a safe 5s
+// lead but a 52s tail, and its middle went silent while onended fired
+// on schedule at expectedEnd. Reader saw a clean stream; user heard
+// audio cut mid-message then resume near the end (perceived as
+// "jumped to the last paragraph"). Cap the per-source AUDIBLE duration
+// so worst-case source-end-ahead-of-playhead = horizon(15) + cap(10)
+// = 25s, comfortably under the ~30s low edge of the drop zone. Applied
+// by sub-splitting oversized reader.read() PCM chunks in the play()
+// loop before scheduling; each sub-chunk goes through the same
+// backpressure gate so ahead-of-playhead stays bounded across the
+// sub-source sequence too.
+const MAX_BUFFER_AUDIBLE_SECONDS = 10;
+
+/** Input audio time-stretched per main-thread slice (see the read loop). */
+const STRETCH_SLICE_SECONDS = 1;
+
+/** Audio scheduled but the clock never moved for this long (and no pause) → give up. */
+export const NEVER_STARTED_MS = 8000;
+
+// ─── Public API ───────────────────────────────────────────────────────────────
+
+export interface WebAudioStreamPlayerOptions {
+  onEnded?: () => void;
+  onError?: (err: Error) => void;
+  // Phase 31 instrumentation hooks — fired at observable Web Audio lifecycle
+  // transitions (analogous to HTMLAudioElement media events per D-02).
+  onCanPlay?: () => void;   // first audio chunk decoded and scheduled
+  onPlaying?: () => void;  // AudioContext resumed from suspended (resume path)
+  onPause?: () => void;    // AudioContext suspended (pause path)
+  onStalled?: () => void;  // reader stall detected (done=false, value=undefined)
+  onSuspend?: () => void;  // AudioContext moved to suspended state unexpectedly
+}
+
+export interface WebAudioStreamPlayer {
+  play(response: Response): Promise<void>;
+  stop(): void;
+  // Pause/resume suspend and resume the underlying AudioContext. Already-
+  // scheduled AudioBufferSourceNodes hold their start times against the
+  // context clock, which freezes while suspended — so on resume, everything
+  // continues from where it left off, and any chunks the reader loop schedules
+  // during the pause naturally queue up for post-resume playback. A pause is
+  // an intent that holds whatever state the context is in: paused before
+  // play() or before a suspended context was woken, the audio never starts
+  // until resume(); a resume() right after a pause waits for the suspend to
+  // land rather than being undone by it. Both are best-effort: if the browser has already killed the AudioContext (long tab
+  // background, memory pressure), resume() fires onError with the underlying
+  // failure so the caller can flip back to idle.
+  pause(): Promise<void>;
+  resume(): Promise<void>;
+  /**
+   * Current output level (windowed RMS, 0–1) of what is playing, or null when
+   * it can't be read (nothing playing yet, context not running, stopped).
+   * Drives voice mode's trace while a reply is read aloud.
+   */
+  readLevel?(): number | null;
+}
+
+/**
+ * Create a WebAudioStreamPlayer that drives progressive WAV playback.
+ *
+ * Returns an object with:
+ * - play(response): starts the read loop; resolves when the reader signals done
+ *   (NOT when all audio has played — onEnded fires later after sources complete)
+ * - stop(): tears down all scheduled sources + AudioContext; idempotent
+ *
+ * Callbacks:
+ * - onEnded: fires when reader is done AND all scheduled sources have ended
+ * - onError: fires on non-ok response or mid-stream reader error; NOT fired by
+ *   an external stop() call
+ *
+ * onEnded and onError are mutually exclusive for a single play session.
+ */
+export function createWebAudioStreamPlayer(
+  opts: WebAudioStreamPlayerOptions = {},
+): WebAudioStreamPlayer {
+  // ─── Internal state ─────────────────────────────────────────────────────────
+  const playbackRate = currentTtsPlaybackRate;
+  let audioContext: AudioContext | null = null;
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  const sources: AudioBufferSourceNode[] = [];
+  // Parallel to `sources` — one entry per scheduled source with the timing
+  // metadata needed to diagnose "audio hard-cut before it should" reports
+  // (the operator 2026-09-17 — media-ended fired legitimately but tail audio was
+  // silent; instrumentation exists to pin the source-ended fire pattern next
+  // occurrence). idx counts from 0, matches sources[] index.
+  const scheduledMeta: Array<{
+    idx: number;
+    startTime: number;
+    bufferDuration: number;
+    audibleDuration: number;
+    expectedEnd: number;
+  }> = [];
+  let endedSources = 0;
+  let readerDone = false;
+  let stopped = false;
+  let onEndedFired = false;
+  let onErrorFired = false;
+  // Backpressure state — see SCHEDULE_HORIZON_SECONDS rationale at top of file.
+  // scheduleWakeup is set by the reader loop when it's waiting for horizon
+  // room, cleared+invoked by onSourceEnded when a source finishes.
+  let scheduleWakeup: (() => void) | null = null;
+  /**
+   * The caller wants playback held: set by pause() at once (whatever the
+   * context's state, even before play() made one) and cleared by resume().
+   * While set, nothing nudges the context awake and a frozen clock is
+   * expected.
+   */
+  let userPaused = false;
+  /** A suspend() pause() started and hasn't finished — resume() waits for it. */
+  let pendingSuspend: Promise<void> | null = null;
+  let neverStartedTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Sits between the sources and the speakers so the level can be read. */
+  let analyser: AnalyserNode | null = null;
+  let levelBuf: Float32Array<ArrayBuffer> | null = null;
+
+  // ─── Private helpers ─────────────────────────────────────────────────────────
+
+  /** Concatenate two Uint8Arrays into a new one. */
+  function concat(a: Uint8Array, b: Uint8Array): Uint8Array {
+    const out = new Uint8Array(a.byteLength + b.byteLength);
+    out.set(a, 0);
+    out.set(b, a.byteLength);
+    return out;
+  }
+
+  /** Tear down the reader, all scheduled sources, and the AudioContext. */
+  function teardown(): void {
+    // Wake the reader loop if it's parked at the backpressure gate. Any
+    // teardown path (natural end, external stop, resume-closed error) needs
+    // to release the wait so the loop can observe the new state and exit
+    // instead of hanging on a wake signal that will never come once
+    // audioContext is set to null below.
+    if (scheduleWakeup) {
+      const wake = scheduleWakeup;
+      scheduleWakeup = null;
+      wake();
+    }
+    if (reader) {
+      try {
+        reader.cancel();
+      } catch {
+        /* ignore — reader may already be closed */
+      }
+      reader = null;
+    }
+    for (const s of sources) {
+      try {
+        s.stop();
+      } catch {
+        /* already ended — stop() on an ended source throws InvalidStateError */
+      }
+    }
+    sources.length = 0;
+    if (neverStartedTimer !== null) clearTimeout(neverStartedTimer);
+    neverStartedTimer = null;
+    if (audioContext && audioContext.state !== "closed") {
+      audioContext.close().catch(() => {});
+    }
+    audioContext = null;
+  }
+
+  /** First chunk scheduled: nudge a suspended context, and watch that the clock starts. */
+  function watchStart(ctx: AudioContext): void {
+    if (ctx.state === "suspended" && !userPaused) void ctx.resume().catch(() => {});
+    neverStartedTimer = setTimeout(() => {
+      neverStartedTimer = null;
+      if (stopped || onEndedFired || onErrorFired || userPaused || audioContext !== ctx) return;
+      if (endedSources > 0 || (ctx.state === "running" && ctx.currentTime > 0.05)) return;
+      console.error(
+        `[tts-player] never-started afterMs=${NEVER_STARTED_MS} ctxState=${ctx.state} ctxTime=${ctx.currentTime.toFixed(3)} sources=${sources.length}`,
+      );
+      onErrorFired = true;
+      teardown();
+      opts.onError?.(new Error("Audio never started (AudioContext stayed suspended)"));
+    }, NEVER_STARTED_MS);
+  }
+
+  /**
+   * Fire opts.onEnded if and only if:
+   * - reader has signalled done (last chunk processed)
+   * - all scheduled sources have fired their onended callbacks
+   * - it hasn't fired before (one-shot)
+   * - stop() was not called externally (external stop is not a natural end)
+   */
+  function maybeFireEnded(): void {
+    if (readerDone && endedSources >= sources.length && !onEndedFired && !stopped) {
+      onEndedFired = true;
+      const ctxTime = audioContext?.currentTime ?? -1;
+      const lastMeta = scheduledMeta[scheduledMeta.length - 1];
+      console.info(
+        `[tts-player] fire-ended ctxTime=${ctxTime.toFixed(3)} endedSources=${endedSources} sources=${sources.length} lastScheduledEnd=${lastMeta?.expectedEnd.toFixed(3) ?? "n/a"} ctxState=${audioContext?.state ?? "null"}`,
+      );
+      teardown();
+      opts.onEnded?.();
+    }
+  }
+
+  /** Called by each source's onended. `idx` matches sources[] index. */
+  function onSourceEnded(idx: number): void {
+    endedSources += 1;
+    const meta = scheduledMeta[idx];
+    const ctxTime = audioContext?.currentTime ?? -1;
+    const drift = meta ? ctxTime - meta.expectedEnd : 0;
+    console.info(
+      `[tts-player] source-ended idx=${idx} expectedEnd=${meta?.expectedEnd.toFixed(3) ?? "n/a"} ctxTime=${ctxTime.toFixed(3)} drift=${drift.toFixed(3)} endedCount=${endedSources} totalCount=${sources.length} ctxState=${audioContext?.state ?? "null"}`,
+    );
+    // Wake the reader loop if it's parked waiting for horizon room.
+    if (scheduleWakeup) {
+      const wake = scheduleWakeup;
+      scheduleWakeup = null;
+      wake();
+    }
+    maybeFireEnded();
+  }
+
+  /**
+   * Schedule decoded (already time-stretched) samples as an
+   * AudioBufferSourceNode on the given context.
+   *
+   * Uses the nextStartTime running clock pattern from Nelly's demo:
+   * schedule at nextStartTime, then advance nextStartTime by buffer.duration
+   * so consecutive buffers play gaplessly.
+   */
+  function scheduleChunk(
+    channelData: Float32Array[],
+    hdr: RiffHeader,
+    ctx: AudioContext,
+    nextStartTimeRef: { value: number },
+  ): void {
+    if (channelData[0].length === 0) return;
+
+    const buffer = ctx.createBuffer(hdr.channels, channelData[0].length, hdr.sampleRate);
+    for (let ch = 0; ch < hdr.channels; ch++) {
+      buffer.getChannelData(ch).set(channelData[ch]);
+    }
+
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(analyser ?? ctx.destination);
+    const idx = sources.length;
+    source.onended = () => onSourceEnded(idx);
+
+    // If we've fallen behind the playhead (e.g. a slow decode stall), reset
+    // nextStartTime to now + epsilon to avoid queuing a backlog of silent gaps.
+    const preClampNextStart = nextStartTimeRef.value;
+    if (nextStartTimeRef.value < ctx.currentTime) {
+      nextStartTimeRef.value = ctx.currentTime + 0.02;
+    }
+
+    source.start(nextStartTimeRef.value);
+    // The speed change is already in the samples, so audible = buffer duration.
+    const audibleDuration = buffer.duration;
+    const startTime = nextStartTimeRef.value;
+    const expectedEnd = startTime + audibleDuration;
+    nextStartTimeRef.value = expectedEnd;
+    sources.push(source);
+    scheduledMeta.push({ idx, startTime, bufferDuration: buffer.duration, audibleDuration, expectedEnd });
+    const clamped = preClampNextStart !== startTime;
+    console.info(
+      `[tts-player] schedule idx=${idx} start=${startTime.toFixed(3)} bufDur=${buffer.duration.toFixed(3)} audible=${audibleDuration.toFixed(3)} expectedEnd=${expectedEnd.toFixed(3)} ctxTime=${ctx.currentTime.toFixed(3)} clamped=${clamped} ctxState=${ctx.state} rate=${playbackRate}`,
+    );
+  }
+
+  // ─── Public API ─────────────────────────────────────────────────────────────
+
+  async function play(response: Response): Promise<void> {
+    // Guard: non-ok response → error immediately, no AudioContext created.
+    if (!response.ok) {
+      onErrorFired = true;
+      opts.onError?.(
+        new Error(`postSpeakStream returned ${response.status}`),
+      );
+      return;
+    }
+
+    // Guard: response with no body (shouldn't happen in practice but defensive).
+    if (!response.body) {
+      onErrorFired = true;
+      opts.onError?.(new Error("Response has no body"));
+      return;
+    }
+
+    // Fresh AudioContext per invocation — avoids sample-rate mismatch across calls
+    // (19-CONTEXT.md § Frontend player, locked decision).
+    audioContext = new AudioContext();
+    const ctx = audioContext;
+    // Best-effort level tap; without it playback goes straight to the speakers.
+    try {
+      if (typeof ctx.createAnalyser === "function") {
+        analyser = ctx.createAnalyser();
+        analyser.fftSize = 1024;
+        analyser.connect(ctx.destination);
+        levelBuf = new Float32Array(analyser.fftSize);
+      }
+    } catch {
+      analyser = null;
+      levelBuf = null;
+    }
+    // iOS can bring an interrupted context straight back to running when a
+    // call ends — while held, put it back on hold.
+    ctx.onstatechange = () => {
+      if (userPaused && !stopped && ctx.state === "running" && audioContext === ctx && !pendingSuspend) {
+        console.info(`[tts-player] re-held after state change to running`);
+        void suspendForPause(ctx);
+      }
+    };
+    reader = response.body.getReader();
+    // Paused before playback began: hold the new context from the start.
+    if (userPaused) void suspendForPause(audioContext);
+
+    let headerBytes: Uint8Array | null = null;
+    let header: RiffHeader | null = null;
+    // Trailing bytes from the previous chunk that didn't complete a full PCM
+    // frame — prepended to the next chunk before decoding. Without this,
+    // chunks arriving at odd byte boundaries silently drop 1-3 bytes per
+    // occurrence in decodePcmChunk's frame truncation, and every subsequent
+    // Int16 sample is misaligned by that offset. Symptom: audio starts clean,
+    // drifts to gibberish, then to static as more misaligned chunks accumulate.
+    let pcmRemainder = new Uint8Array(0);
+    // 20ms epsilon — small enough to be imperceptible, large enough to prevent
+    // underrun on the very first scheduled source.
+    const nextStartTimeRef = { value: audioContext.currentTime + 0.02 };
+    let firstChunkScheduled = false;
+    let stretcher: TimeStretcher | null = null;
+
+    /**
+     * Schedule decoded samples, sub-split so no single AudioBuffer's audible
+     * playback extends far enough past the playhead to hit Chrome's
+     * silent-drop zone (see MAX_BUFFER_AUDIBLE_SECONDS at top of file), each
+     * piece behind the backpressure gate. Resolves false when the player was
+     * torn down while waiting.
+     */
+    async function scheduleSamples(channelData: Float32Array[], hdr: RiffHeader): Promise<boolean> {
+      const total = channelData[0]?.length ?? 0;
+      const maxPerSubChunk = Math.max(1, Math.floor(MAX_BUFFER_AUDIBLE_SECONDS * hdr.sampleRate));
+      let subOffset = 0;
+      while (subOffset < total) {
+        // Backpressure: hold off scheduling if the next source would start
+        // more than SCHEDULE_HORIZON_SECONDS ahead of the playhead. Wake
+        // when a source ends (playhead advances) or teardown fires. See
+        // SCHEDULE_HORIZON_SECONDS rationale at top of file for why this
+        // exists (Chrome silently drops far-future scheduled buffer output).
+        while (
+          !stopped &&
+          audioContext !== null &&
+          nextStartTimeRef.value - audioContext.currentTime >= SCHEDULE_HORIZON_SECONDS
+        ) {
+          console.info(
+            `[tts-player] backpressure-wait aheadSec=${(nextStartTimeRef.value - audioContext.currentTime).toFixed(3)} horizon=${SCHEDULE_HORIZON_SECONDS} pending=${sources.length - endedSources} ctxTime=${audioContext.currentTime.toFixed(3)} ctxState=${audioContext.state}`,
+          );
+          await new Promise<void>((resolve) => {
+            scheduleWakeup = resolve;
+          });
+        }
+        // audioContext may have been nulled by teardown() while we were parked
+        // (external stop, resume-closed error). Bail cleanly rather than
+        // dereferencing null below.
+        if (stopped || audioContext === null) return false;
+
+        const subEnd = Math.min(subOffset + maxPerSubChunk, total);
+        scheduleChunk(
+          channelData.map((c) => c.subarray(subOffset, subEnd)),
+          hdr,
+          audioContext,
+          nextStartTimeRef,
+        );
+        subOffset = subEnd;
+        // Fire onCanPlay on the first successfully scheduled chunk — analogous
+        // to HTMLAudioElement's canplay event (enough data to start playback).
+        if (!firstChunkScheduled) {
+          firstChunkScheduled = true;
+          watchStart(audioContext);
+          opts.onCanPlay?.();
+        }
+      }
+      return true;
+    }
+
+    // Total bytes read off the response body — surfaced in reader-done so we
+    // can compare client-received bytes against the backend's per-request
+    // totalPcmBytes accounting (2026-09-28 cutoff investigation). A gap
+    // between backend-emitted and client-received pins the loss to network
+    // / HTTP transport rather than Polly or the app.
+    let totalBytesRead = 0;
+
+    try {
+      while (true) {
+        if (stopped) return;
+
+        const { done, value } = await reader.read();
+        // stop() cancels the reader, which resolves a pending read as done —
+        // that is the caller's own action, never an end or an error.
+        if (stopped) return;
+        if (done) {
+          // The stretcher holds back about a frame of audio; play it out.
+          if (stretcher && header && !(await scheduleSamples(stretcher.flush(), header))) return;
+          readerDone = true;
+          const ctxTime = audioContext?.currentTime ?? -1;
+          const lastMeta = scheduledMeta[scheduledMeta.length - 1];
+          console.info(
+            `[tts-player] reader-done sources=${sources.length} endedSoFar=${endedSources} ctxTime=${ctxTime.toFixed(3)} lastScheduledEnd=${lastMeta?.expectedEnd.toFixed(3) ?? "n/a"} totalBytesRead=${totalBytesRead} ctxState=${audioContext?.state ?? "null"}`,
+          );
+          // A stream that ends without any audio (provider stalled before
+          // speaking) is a failure, not a natural end — the caller must say
+          // so rather than go quietly idle.
+          if (sources.length === 0 && !onErrorFired) {
+            onErrorFired = true;
+            teardown();
+            opts.onError?.(new Error(`speak stream ended with no audio (totalBytesRead=${totalBytesRead})`));
+            return;
+          }
+          maybeFireEnded();
+          return;
+        }
+        // value=undefined mid-stream → stall condition (reader returned without
+        // data and without signalling done).
+        if (!value) {
+          opts.onStalled?.();
+          continue;
+        }
+        totalBytesRead += value.byteLength;
+
+        // Accumulate bytes until we have the full 44-byte RIFF header.
+        let pcmChunk: Uint8Array;
+        if (header === null) {
+          headerBytes = headerBytes ? concat(headerBytes, value) : value;
+          if (headerBytes.byteLength < 44) continue;
+          header = parseRiffHeader(headerBytes);
+          pcmChunk = headerBytes.subarray(header.pcmDataOffset);
+          headerBytes = null;
+        } else {
+          pcmChunk = value;
+        }
+
+        // Prepend any trailing partial-frame bytes from the previous chunk,
+        // then split off any new trailing partial-frame bytes to carry over.
+        // This keeps every scheduleChunk call frame-aligned, regardless of
+        // where the HTTP chunked-transfer boundaries fall in the byte stream.
+        if (pcmRemainder.byteLength > 0) {
+          pcmChunk = concat(pcmRemainder, pcmChunk);
+          pcmRemainder = new Uint8Array(0);
+        }
+        const frameBytes = header.channels * (header.bitDepth / 8);
+        const alignedLen = Math.floor(pcmChunk.byteLength / frameBytes) * frameBytes;
+        if (alignedLen < pcmChunk.byteLength) {
+          pcmRemainder = pcmChunk.subarray(alignedLen);
+          pcmChunk = pcmChunk.subarray(0, alignedLen);
+        }
+
+        if (pcmChunk.byteLength === 0) continue;
+
+        const decoded = decodePcmChunk(pcmChunk, header);
+        stretcher ??= createTimeStretcher(header.sampleRate, header.channels, playbackRate);
+        // Stretch in slices, yielding between them: after a pause a single
+        // read can hold 20s+ of audio, and stretching it in one go would
+        // freeze the page. At 1× nothing is stretched, so one slice.
+        const total = decoded[0]?.length ?? 0;
+        const sliceLen =
+          playbackRate === 1 ? Math.max(1, total) : Math.max(1, Math.round(STRETCH_SLICE_SECONDS * header.sampleRate));
+        for (let off = 0; off < total; off += sliceLen) {
+          if (off > 0) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+          if (stopped || audioContext === null) return;
+          const slice = decoded.map((c) => c.subarray(off, off + sliceLen));
+          if (!(await scheduleSamples(stretcher.process(slice), header))) return;
+        }
+      }
+    } catch (err) {
+      if (!stopped && !onErrorFired) {
+        onErrorFired = true;
+        teardown();
+        opts.onError?.(err instanceof Error ? err : new Error(String(err)));
+      }
+    }
+  }
+
+  function stop(): void {
+    if (stopped) return; // idempotent
+    stopped = true;
+    const pending = sources.length - endedSources;
+    console.info(
+      `[tts-player] stop pending=${pending} sources=${sources.length} ctxTime=${(audioContext?.currentTime ?? -1).toFixed(3)} ctxState=${audioContext?.state ?? "null"}`,
+    );
+    // Release the reader loop if it's parked at the backpressure gate so it
+    // can observe stopped=true and exit its while(true).
+    if (scheduleWakeup) {
+      const wake = scheduleWakeup;
+      scheduleWakeup = null;
+      wake();
+    }
+    teardown();
+    // Do NOT fire onEnded or onError — external stop is the caller's own action.
+  }
+
+  /** Suspend `ctx` for a pause; resume() waits on the promise. */
+  function suspendForPause(ctx: AudioContext): Promise<void> {
+    const stateBefore = ctx.state;
+    const ctxTimeBefore = ctx.currentTime;
+    const pending = sources.length - endedSources;
+    const p = ctx
+      .suspend()
+      .then(() => {
+        console.info(
+          `[tts-player] pause stateBefore=${stateBefore} stateAfter=${ctx.state} ctxTime=${ctxTimeBefore.toFixed(3)} pending=${pending}`,
+        );
+        // Fire onPause after successful suspend — analogous to HTMLAudioElement
+        // pause event (audio stream paused at user/system request).
+        opts.onPause?.();
+      })
+      .catch((err: unknown) => {
+        // Rare — browser may reject if the context was killed under us.
+        // Treat as a no-op; the next resume attempt will surface it via onError.
+        // Fire onSuspend to signal unexpected context state change.
+        const errMessage = err instanceof Error ? err.message : String(err);
+        console.warn(`[tts-player] pause-error errMessage="${errMessage}" ctxState=${ctx.state}`);
+        opts.onSuspend?.();
+      })
+      .finally(() => {
+        if (pendingSuspend === p) pendingSuspend = null;
+      });
+    pendingSuspend = p;
+    return p;
+  }
+
+  async function pause(): Promise<void> {
+    if (stopped) {
+      console.info(`[tts-player] pause-noop reason=stopped`);
+      return;
+    }
+    // The intent holds even when there's nothing to suspend yet: play() and
+    // the start watch honour it.
+    const already = userPaused;
+    userPaused = true;
+    if (!audioContext) {
+      console.info(`[tts-player] pause-held reason=no-context`);
+      return;
+    }
+    if (audioContext.state !== "running") {
+      // Suspended (e.g. made outside a tap and not yet nudged) or closed: the
+      // intent alone keeps it from being woken.
+      console.info(`[tts-player] pause-held reason=state-${audioContext.state} already=${already} ctxTime=${audioContext.currentTime.toFixed(3)}`);
+      return;
+    }
+    await suspendForPause(audioContext);
+  }
+
+  async function resume(): Promise<void> {
+    // No-op if stopped. Before play() there is no context: clearing the
+    // intent is all it takes. If the context isn't actually suspended
+    // (already running / closed / gone), a resume() call would either be
+    // pointless or fail — surface a killed context to the caller via onError
+    // so the UI can flip back to idle.
+    if (stopped) {
+      console.info(`[tts-player] resume-noop reason=stopped`);
+      return;
+    }
+    userPaused = false;
+    // A pause whose suspend is still in flight lands first, so this resume
+    // isn't undone by it (a quick pause → resume).
+    if (pendingSuspend) await pendingSuspend;
+    if (userPaused || stopped) return; // paused again, or stopped, meanwhile
+    if (!audioContext) {
+      console.info(`[tts-player] resume-noop reason=no-context`);
+      return;
+    }
+    if (audioContext.state === "running") {
+      console.info(`[tts-player] resume-noop reason=already-running ctxTime=${audioContext.currentTime.toFixed(3)}`);
+      return;
+    }
+    if (audioContext.state === "closed") {
+      const pending = sources.length - endedSources;
+      console.error(`[tts-player] resume-closed pending=${pending} sources=${sources.length}`);
+      if (!onErrorFired) {
+        onErrorFired = true;
+        teardown();
+        opts.onError?.(new Error("AudioContext closed — cannot resume"));
+      }
+      return;
+    }
+    const stateBefore = audioContext.state;
+    const ctxTimeBefore = audioContext.currentTime;
+    const pending = sources.length - endedSources;
+    try {
+      await audioContext.resume();
+      console.info(
+        `[tts-player] resume stateBefore=${stateBefore} stateAfter=${audioContext?.state ?? "null"} ctxTime=${ctxTimeBefore.toFixed(3)} pending=${pending}`,
+      );
+      // Fire onPlaying after successful resume — analogous to HTMLAudioElement
+      // playing event (playback restarted after being paused/suspended).
+      opts.onPlaying?.();
+    } catch (err) {
+      const errMessage = err instanceof Error ? err.message : String(err);
+      console.error(`[tts-player] resume-error errMessage="${errMessage}" stateBefore=${stateBefore} ctxState=${audioContext?.state ?? "null"} pending=${pending}`);
+      if (!onErrorFired) {
+        onErrorFired = true;
+        teardown();
+        opts.onError?.(err instanceof Error ? err : new Error(String(err)));
+      }
+    }
+  }
+
+  function readLevel(): number | null {
+    const ctx = audioContext;
+    if (stopped || !ctx || !analyser || !levelBuf || ctx.state !== "running") return null;
+    analyser.getFloatTimeDomainData(levelBuf);
+    let sum = 0;
+    for (let i = 0; i < levelBuf.length; i++) sum += levelBuf[i] * levelBuf[i];
+    return Math.sqrt(sum / levelBuf.length);
+  }
+
+  return { play, stop, pause, resume, readLevel };
+}

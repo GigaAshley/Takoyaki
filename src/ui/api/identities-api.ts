@@ -1,0 +1,690 @@
+import { authApi, handleApiError } from "@/main-axios";
+import { stampedFetch } from "@/lib/stamped-fetch";
+
+export interface Identity {
+  identityKey: string;
+  /** quick-260912-0t4: hostId surfaced as a top-level wire field so the
+   *  frontend can key its byHostKey composite map (`${hostId}::${identityKey}`)
+   *  without reverse-parsing avatarUrl. Populated by publicIdentity() at
+   *  request time from the per-host fanout. Optional in the type only so
+   *  pre-quick-260912-0t4 test fixtures keep compiling; production responses
+   *  always include it. */
+  hostId?: number;
+  displayName: string;
+  title: string | null;
+  colorHue: number | null;
+  voice: string | null;
+  /** The single role whose look this identity inherits — null for a
+   *  multi-role identity (it inherits no one role's look). For WHICH roles
+   *  the identity holds, read `roles` via `identityRoles()`. */
+  role: string | null;
+  /** Every role the identity holds, in frontmatter order. Optional so older
+   *  payloads/fixtures still type-check; `identityRoles()` falls back to
+   *  `[role]` when absent. */
+  roles?: string[];
+  avatarMime: string;
+  /** Phase 68 Plan 04: hostId is now baked into avatarUrl by the backend
+   *  (publicIdentity emits avatarUrl as `/identities/:key/avatar?hostId=N`).
+   *  Frontend consumers render identity.avatarUrl directly — no avatarUrlWithHost
+   *  helper needed. id/createdAt/updatedAt removed (disk-authoritative; no DB row). */
+  avatarUrl: string;
+  avatarEtag: string;
+  /** Phase 67 Plan 67-01: coordinator flag derived from the identity's
+   *  on-disk YAML frontmatter (`coordinator: true|false`). Non-nullable —
+   *  absent-from-disk normalizes to `false` (actor) per the backend
+   *  publicIdentity safe-default contract, so Wave 2's surface components
+   *  can branch on it without null-safety plumbing. */
+  coordinator: boolean;
+  /** Phase 80: task string from identity file frontmatter. Null when absent
+   *  (existing pre-Phase-80 identities and coord-spawned identities without
+   *  task). Present-and-truthy gates the task-primary UI treatment on chat +
+   *  list surfaces (D-06 fallback semantics). */
+  task: string | null;
+  /** Phase 117 Plan 117-07 (D-05 identity carrier): project slug from
+   *  identity file frontmatter. Null when absent. Non-optional to match the
+   *  backend emitter's always-emit posture (publicIdentity emits `null` when
+   *  the field is missing on disk, per identity-appearance's fallback).
+   *  Consumed by the frontend's conversation-store projects-derived selector
+   *  to bucket the identity's conversation into a project section. */
+  project: string | null;
+  /** Phase 92 Plan 02 (D-03/D-04): presence of `~/fleet/identities/<key>/.pinned`
+   *  sentinel on the identity's home host, populated by the backend
+   *  publicIdentity fanout via identityFileExists in the same Promise.all wave
+   *  as readIdentityFile. Optional so pre-Phase-92 test fixtures and consumers
+   *  that don't care about pin state stay compiling; absent-from-response
+   *  normalizes to false (fail-closed per D-01 "presence is meaning"). The
+   *  panel's hydrate effect projects this field into state.pinnedIds via
+   *  deriveDiskPinnedIds (identities-store.ts) — Plan 92-04's replacement for
+   *  the retired getPinnedIds() /user-preferences fetch. */
+  pinned?: boolean;
+  /** (Phase 115 Plan 115-02: the Phase 107 sibling `hidden?: boolean` field
+   *  was retired per D-21 alongside the backend publicIdentity() 7th-arg
+   *  removal + the `.hidden` disk-fanout probe removal.) */
+  /** Phase 85 Plan 85-01 Task 2: role-cosmetic defaults surfaced separately
+   *  from the resolved values. Populated per D-CTX-85-inherit merge on the
+   *  backend so IdentityModal (Plan 85-05) can render inherit-vs-override
+   *  affordances without a second RPC.
+   *
+   *  Shape:
+   *    - null → no role resolvable (identity file lacks `role:` frontmatter)
+   *    - {} → role exists but carries no cosmetic frontmatter fields
+   *    - {title/colorHue/voice/avatar: ...} → role's raw values verbatim;
+   *      each field is optional and appears only when present on the role
+   *
+   *  The resolved values live on the top-level `title/colorHue/voice` fields
+   *  already (per `identity ?? role ?? null`). This field's sole purpose is
+   *  to let the edit surface show which values came from the role vs the
+   *  identity's own frontmatter. */
+  roleDefaults?: {
+    title?: string;
+    displayName?: string;
+    colorHue?: number;
+    voice?: string;
+    avatar?: string;
+  } | null;
+}
+
+export interface IdentityInput {
+  identityKey?: string;
+  displayName?: string;
+  title?: string | null;
+  colorHue?: number | null;
+  voice?: string | null;
+  /** Modal-unification 2026-09-29: task is editable via the IdentityModal
+   *  head inline-pencil. absent → leave alone; null → REMOVE the task key;
+   *  present → set. Backend PUT /identities/:key overlays task through the
+   *  same shape as title. */
+  task?: string | null;
+}
+
+function buildFormData(meta: IdentityInput, avatar: File | null): FormData {
+  const fd = new FormData();
+  fd.append("data", JSON.stringify(meta));
+  if (avatar) fd.append("avatar", avatar);
+  return fd;
+}
+
+/**
+ * Phase 66 Plan 66-02: updateIdentity's data payload now carries `hostId`
+ * so the backend can route the disk-write to the identity's home box via
+ * the artifact-reader (LOCAL bind-mount vs REMOTE connectOneShot). createIdentity
+ * intentionally does NOT take hostId here — POST /identities does not hit
+ * disk in this phase (Plan 66-04 scope).
+ *
+ * Phase 68 Plan 04: no longer includes hostId in the URL path — hostId is a
+ * body field per Phase 66 Plan 02 (still needed to route the backend disk-write).
+ */
+function buildUpdateFormData(
+  meta: IdentityInput,
+  avatar: File | null,
+  hostId: number,
+): FormData {
+  const fd = new FormData();
+  fd.append("data", JSON.stringify({ ...meta, hostId }));
+  if (avatar) fd.append("avatar", avatar);
+  return fd;
+}
+
+/**
+ * Phase 66 Plan 03: listIdentities widened to accept an optional
+ * `identityHosts` map (identityKey → hostId). The backend per-request
+ * fetches on-disk cosmetics per identity using this caller-scoped map;
+ * rows whose key is NOT in the map come back with safe-default cosmetics
+ * (displayName = capitalizeFirst(identityKey); title/colorHue/voice = null;
+ * avatarMime/avatarEtag = "").
+ *
+ * identityHosts is caller-scoped. Empty map (default) = all cosmetics as
+ * safe-defaults (matches Phase 66 transition-window semantics — Plan 05
+ * wires the populated call site from conversation-store fleetSessions).
+ */
+export async function listIdentities(
+  identityHosts: Record<string, number> = {},
+  opts: { onlyNamed?: boolean } = {},
+): Promise<Identity[]> {
+  try {
+    const params: Record<string, string> = {};
+    if (Object.keys(identityHosts).length > 0) {
+      params.identityHosts = JSON.stringify(identityHosts);
+    }
+    // onlyNamed: return just the identities the map names (per host) instead
+    // of every identity on every host the map mentions.
+    if (opts.onlyNamed) params.only = "1";
+    const response = await authApi.get("/identities", { params });
+    return response.data as Identity[];
+  } catch (error) {
+    handleApiError(error, "list identities");
+  }
+}
+
+
+export async function createIdentity(
+  meta: Required<Pick<IdentityInput, "identityKey" | "displayName">> &
+    Pick<IdentityInput, "title" | "colorHue">,
+  avatar: File,
+): Promise<Identity> {
+  try {
+    const response = await authApi.post(
+      "/identities",
+      buildFormData(meta, avatar),
+      { headers: { "Content-Type": "multipart/form-data" } },
+    );
+    return response.data as Identity;
+  } catch (error) {
+    handleApiError(error, "create identity");
+  }
+}
+
+export async function updateIdentity(
+  identityKey: string,
+  meta: IdentityInput,
+  avatar: File | null,
+  /** Phase 66 Plan 66-02: REQUIRED — routes the backend disk-write to the
+   *  identity's home box (isLocalHostId LOCAL branch vs connectOneShot
+   *  REMOTE branch). IdentityModal already receives hostId as a prop
+   *  (Phase 22 SRIC, L170); the modal's onSave threads it through.
+   *  Phase 68 Plan 04: JSDoc updated — first arg is now identityKey (lowercase
+   *  identity name, e.g. "tina"), not a nanoid PK id. URL uses
+   *  encodeURIComponent(identityKey) per the no-dormancy route discipline
+   *  (IDENTITY_KEY_RE allows '/', '+' which are URL-special; encodeURIComponent
+   *  handles them). hostId is still a body field in the multipart payload. */
+  hostId: number,
+): Promise<Identity> {
+  try {
+    const response = await authApi.put(
+      `/identities/${encodeURIComponent(identityKey)}`,
+      buildUpdateFormData(meta, avatar, hostId),
+      { headers: { "Content-Type": "multipart/form-data" } },
+    );
+    // The PUT echo always reports `pinned: false` (it never reads the
+    // `.pinned` sentinel), so drop it — applyIdentityChange then keeps the
+    // store's real pin state instead of unpinning the row.
+    const { pinned: _echoPinned, ...updated } = response.data as Identity;
+    return updated;
+  } catch (error) {
+    handleApiError(error, "update identity");
+  }
+}
+
+
+export interface AvatarCandidate {
+  id: string;
+  url: string;
+}
+
+export async function postGenerateAvatarBatch(input: {
+  name: string;
+  title: string;
+  brief: string;
+  // Identity's chosen hue on the standard HSL color wheel (0-359). Backend
+  // instructs the LLM to center the drafted palette on this hue so the
+  // generated avatar matches the identity's badge/bubble tint. Null =
+  // no constraint (LLM picks freely). Fixes the "picked pink, got all blue"
+  // bug where colorHue was stored on the identity but never plumbed into
+  // avatar generation.
+  colorHue?: number | null;
+}): Promise<AvatarCandidate[]> {
+  try {
+    // Patch #314: per-call timeout override. Default authApi timeout is
+    // 30s but this endpoint runs an LLM archetype draft (up to 30s) THEN
+    // 3 parallel gpt-image-1.5 renders (up to 60s each). Wall time can
+    // legitimately reach ~90s; matching the nginx location's
+    // proxy_read_timeout 120s gives headroom without changing the
+    // global default. Do NOT bump the global timeout — every other
+    // route benefits from failing fast on a network hiccup.
+    const response = await authApi.post("/identities/avatar/batch", input, {
+      timeout: 120_000,
+    });
+    return (response.data as { candidates: AvatarCandidate[] }).candidates;
+  } catch (error) {
+    handleApiError(error, "generate avatars");
+  }
+}
+
+export async function postManualAvatarCandidate({
+  file,
+}: {
+  file: File;
+}): Promise<{ id: string }> {
+  try {
+    const fd = new FormData();
+    fd.append("avatar", file);
+    // Explicit Content-Type override matches createIdentity/updateIdentity
+    // above. The authApi instance defaults to application/json; without this
+    // override axios v1's formDataToJSON transform fires, serializes the
+    // FormData to a JSON body that drops the File field, and multer returns
+    // 400 "missing avatar field". Passing "multipart/form-data" (no boundary
+    // — axios adds it) suppresses the JSON transform and lets multer parse.
+    const response = await authApi.post(
+      "/identities/avatar/candidate/manual",
+      fd,
+      { headers: { "Content-Type": "multipart/form-data" } },
+    );
+    return response.data as { id: string };
+  } catch (error) {
+    handleApiError(error, "upload manual avatar");
+  }
+}
+
+export async function getIdentityExistsOnHost(
+  hostId: number,
+  name: string,
+): Promise<boolean> {
+  try {
+    const response = await authApi.get("/identities/exists-on-host", {
+      params: { hostId, name },
+    });
+    return (response.data as { exists: boolean }).exists;
+  } catch (error) {
+    handleApiError(error, "check identity on host");
+  }
+}
+
+// getIdentityNoDormancy / setIdentityNoDormancy retired 2026-09-29 alongside
+// the IdentityModal Boost-response switch. The .no-dormancy sentinel is now
+// agent-touched-only per user request; the backend route at
+// src/backend/database/routes/identity-no-dormancy.ts stays intact for
+// out-of-band use, but no frontend surface calls it.
+
+// ─── Phase 22 (SRIC-02): roles list per host ─────────────────────────────────
+// Backing route: src/backend/database/routes/roles-list-for-host.ts
+// GET /roles?hostId=<n> → [{name, description, ...cosmetics}]
+// Consumed by NewSessionDialog's Role dropdown (see plan 22-02 Task 4).
+//
+// Phase 90 Plan 90-01 (D-08.1 — planner-pick: extend existing endpoint, no
+// companion): backend includes optional cosmetic frontmatter fields on
+// each entry (displayName, colorHue, voice, avatar). Missing/malformed
+// fields are OMITTED from the response — the widened type keeps every
+// field optional so two-field callers keep compiling untouched. Phase 90-05
+// uses these fields to render `.pv-row` conversation-row-treatment rows in
+// the role's own hue with the role's own avatar (no follow-up round-trip).
+//
+// Pretty-names shape (2026-09-30): the legacy `title?` field is gone —
+// roles now carry `displayName:` in their frontmatter (hard cutover, no
+// back-compat read path). displayName stays optional on the type for the
+// edge case of a role file with no frontmatter at all; roleDisplayName()
+// falls back to a title-cased slug in that case.
+export type RoleSummary = {
+  name: string;
+  /** One-line `description:` from the role file's frontmatter; "" when unset. */
+  description: string;
+  displayName?: string;
+  colorHue?: number;
+  voice?: string;
+  avatar?: string;
+  /** Managed instance-wide (master copy in the app, synced to every host). */
+  instanceWide?: boolean;
+  /** `borrowable: true` in the role file: any agent on the host may borrow
+   *  it for a task without taking it on. Absent when not borrowable. */
+  borrowable?: boolean;
+};
+
+export async function listRolesForHost(hostId: number): Promise<RoleSummary[]> {
+  try {
+    const response = await authApi.get("/roles", { params: { hostId } });
+    return response.data as RoleSummary[];
+  } catch (error) {
+    handleApiError(error, "list roles for host");
+  }
+}
+
+// ─── Phase 90 Plan 90-02 (D-08.2): role avatar URL builder ───────────────────
+// Backing route: src/backend/database/routes/roles.ts
+// GET /roles/:name/avatar?hostId=<n> → image bytes with correct Content-Type
+// (404 if the role has no `avatar:` frontmatter or the sibling file is missing).
+//
+// Consumers: the Plan 90-05 roles-list modal (`.pv-row` rows carry a 40px
+// round `.pv-avatar` with `<img src={roleAvatarUrl(...)}>`) and the Plan
+// 90-04 role modal header. Returns a URL string for `<img src>` consumption —
+// no fetching function needed; matches the identity-avatar pattern where the
+// URL is baked into `identity.avatarUrl` and rendered directly.
+export function roleAvatarUrl(hostId: number, roleName: string): string {
+  return `/roles/${encodeURIComponent(roleName)}/avatar?hostId=${hostId}`;
+}
+
+// ─── Phase 90 Plan 90-09: role avatar upload helper (Plan 90-08 companion) ──
+// Backing route: src/backend/database/routes/roles.ts
+// POST /roles/:name/avatar?hostId=<n> body: multipart/form-data { avatar: File }
+//   → 201 { filename, avatarUrl }
+//
+// Mirrors the identity avatar-upload multipart pattern (see updateIdentity /
+// postManualAvatarCandidate above). The Content-Type override is REQUIRED —
+// axios v1's default JSON transform would drop the File field otherwise
+// (see postManualAvatarCandidate L200-207 for the historical write-up).
+//
+// Consumer (Plan 90-10): RoleCosmeticEditBlock avatar-swap save path.
+// Errors propagate via handleApiError as thrown Error — caller catches to
+// render the UI failure state.
+export async function updateRoleAvatarByName(
+  hostId: number,
+  roleName: string,
+  file: File,
+): Promise<{ filename: string; avatarUrl: string }> {
+  try {
+    const formData = new FormData();
+    formData.append("avatar", file);
+    const response = await authApi.post(
+      `/roles/${encodeURIComponent(roleName)}/avatar`,
+      formData,
+      {
+        params: { hostId },
+        headers: { "Content-Type": "multipart/form-data" },
+      },
+    );
+    return response.data as { filename: string; avatarUrl: string };
+  } catch (error) {
+    handleApiError(error, "upload role avatar");
+  }
+}
+
+// ─── Phase 80 Plan 80-05: pool name picker ───────────────────────────────────
+// Backing route: src/backend/pool/pool-routes.ts (plan 80-04)
+// POST /identities/pool/pick with JSON body {role, hostId} → { name: string }
+// Consumed by NewSessionDialog's name-field prefill (plan 80-06).
+
+/**
+ * Phase 80: fetch an unused pool name for the given host.
+ *
+ * Backend picks a bare pool name (lowercase) that has no identity folder on the
+ * target host. User can edit thereafter (pool is a suggestion source, not a
+ * restriction). Errors surface via handleApiError.
+ *
+ * 2026-09-14: `role` is OPTIONAL. Availability is answered by the host's
+ * identity directories, which are role-independent, so a name can be suggested
+ * before the user has picked a role. Pass it when known — the backend still
+ * validates the shape and it keeps the request self-describing in logs.
+ */
+export async function pickPoolName(
+  hostId: number,
+  role?: string,
+): Promise<{ name: string }> {
+  try {
+    const response = await authApi.post("/identities/pool/pick", {
+      hostId,
+      ...(role ? { role } : {}),
+    });
+    return response.data as { name: string };
+  } catch (error) {
+    handleApiError(error, "pick pool name");
+  }
+}
+
+// ─── Phase 22 (SRIC-04): create role on target host ──────────────────────────
+// Backing route: src/backend/database/routes/roles-create.ts
+// POST /roles with body {name, description, hostId} → 201 {name, description}
+// Consumed by CreateRoleDialog's submit handler (see plan 22-04 Task 2).
+//
+// Error handling: 409 collisions surface as a typed error the dialog can
+// render inline ("A role named `<name>` already exists on <host>"). All
+// other non-2xx responses surface via handleApiError.
+
+export class RoleAlreadyExistsError extends Error {
+  constructor(public readonly roleName: string) {
+    super(`role exists on host: ${roleName}`);
+    this.name = "RoleAlreadyExistsError";
+  }
+}
+
+/**
+ * Phase 85 Plan 85-01 Task 3: role-cosmetic input surfaced separately from
+ * `avatar` (which is a File uploaded via multipart, not a JSON field). The
+ * backend derives the on-disk avatar filename from the uploaded File's
+ * mimetype per Plan 85-02 (`<role>.<mimeext>`), so the client never sends
+ * an `avatar` string in the JSON — only the File itself.
+ */
+// Pretty-names shape (2026-09-30): `title?` is retired. The pretty name is
+// a first-class top-level `displayName` field on the role create input; this
+// cosmetics-input type only carries the per-field visual cosmetics now.
+export type RoleCosmeticInput = {
+  colorHue?: number;
+  voice?: string;
+  /** Written as `borrowable: true`; leave out for a role that isn't. */
+  borrowable?: boolean;
+};
+
+/**
+ * Phase 85 Plan 85-01 Task 3 (pulled forward from Plan 85-02's client task):
+ * widened createRole client sends multipart/form-data mirroring
+ * updateIdentity's shape (see buildUpdateFormData L55-64). The `data` field
+ * carries `{name, description, hostId, cosmetics?}` JSON; the optional
+ * `avatar` File part carries the role's shared avatar image.
+ *
+ * Backward compatibility: `cosmetics` and `avatar` are both optional so
+ * pre-Phase-85 call sites like CreateRoleDialog.tsx L178-182 that pass a
+ * single 3-key input keep typechecking + keep working (multipart body with
+ * no cosmetics + no avatar file).
+ *
+ * Content-Type override: authApi defaults to application/json; without the
+ * explicit "multipart/form-data" header axios v1's formDataToJSON transform
+ * fires and drops the File field entirely, and multer returns 400 "missing
+ * avatar field" (regression pattern documented at postManualAvatarCandidate
+ * L173-196).
+ *
+ * 409 branch preserved — RoleAlreadyExistsError is thrown so the dialog can
+ * render an inline "role already exists" message.
+ *
+ * Note on cross-plan sequencing: Plan 85-02 owns the backend endpoint this
+ * client speaks to (POST /roles widened to multipart). Both plans land in
+ * Wave 1 in parallel; this client's colocated tests mock authApi so they do
+ * NOT require the real backend endpoint to run. End-to-end integration
+ * happens in Wave 2 (Plan 85-03) when CreateRoleDialog actually calls this
+ * widened client against the widened backend endpoint.
+ */
+export async function createRole(
+  input: {
+    // Pretty-names shape (2026-09-30): client sends the free-form typed
+    // pretty name as `displayName`; backend derives the slug and echoes
+    // the derived slug back in `response.data.name`.
+    displayName: string;
+    description: string;
+    hostId: number;
+    cosmetics?: RoleCosmeticInput;
+  },
+  avatar?: File | null,
+): Promise<{
+  name: string;
+  description: string;
+  cosmetics: RoleCosmeticInput & { displayName?: string; avatar?: string };
+}> {
+  try {
+    const fd = new FormData();
+    fd.append(
+      "data",
+      JSON.stringify({
+        displayName: input.displayName,
+        description: input.description,
+        hostId: input.hostId,
+        cosmetics: input.cosmetics ?? {},
+      }),
+    );
+    if (avatar) {
+      fd.append("avatar", avatar);
+    }
+    const response = await authApi.post("/roles", fd, {
+      headers: { "Content-Type": "multipart/form-data" },
+    });
+    return response.data as {
+      name: string;
+      description: string;
+      cosmetics: RoleCosmeticInput & { displayName?: string; avatar?: string };
+    };
+  } catch (error) {
+    // Pretty-names shape (2026-09-30): backend auto-suffixes slug
+    // collisions, so 409 "already exists" no longer fires on duplicate
+    // typed names. Keep the typed error for defense-in-depth / older
+    // peer backends, but the dialog's inline-409 branch is retired.
+    const err = error as { response?: { status?: number } };
+    if (err?.response?.status === 409) {
+      throw new RoleAlreadyExistsError(input.displayName);
+    }
+    handleApiError(error, "create role");
+  }
+}
+
+
+// ─── openBirthStream ─────────────────────────────────────────────────────────
+// SSE consumer for POST /identities/birth. EventSource does NOT support POST;
+// we use fetch + ReadableStream instead. Auth is cookie-based (withCredentials
+// equivalent: credentials:"include") — the JWT cookie is sent automatically by
+// the browser, matching the authApi axios instance's `withCredentials: true`.
+//
+// Wire format (per plan 04 SSE route):
+//   event: birth
+//   data: {"type":"step","n":1,"phase":"started"}
+//
+//   event: birth
+//   data: {"type":"ended","ok":true,"identityId":"...","sessionName":"..."}
+//
+// The generator yields each parsed BirthEvent in order. On non-200 response,
+// it reads the JSON error body and throws. On stream end, it exits cleanly.
+
+export interface BirthRequest {
+  hostId: number;
+  /** Pre-slugged identity key — pool-picked path sends this directly. */
+  name?: string;
+  /** Pretty-names shape (2026-09-30): name-it-myself path sends the free-form
+   *  typed pretty name here; backend derives the slug via the shared helper.
+   *  Exactly one of `name` or `displayName` must be present. */
+  displayName?: string;
+  /** Phase 86 Plan 86-04: cosmetics moved to role level per D-CTX-86-inherit.
+   *  Identity-born requests OMIT title so the identity inherits its role's
+   *  title on landing; per-identity override is later possible via
+   *  IdentityModal (Plan 86-05). Backend accepts absence — see
+   *  identity-birth.ts (title-required gate deleted). */
+  title?: string;
+  path: string;
+  colorHue: number | null;
+  voice: string | null;
+  /** Phase 86 Plan 86-04: cosmetics moved to role level per D-CTX-86-inherit.
+   *  Identity-born requests OMIT avatarCandidateId so the identity inherits
+   *  the role's avatar (served via /identities/:key/avatar role-folder
+   *  fallback landed in Plan 86-01). Backend accepts absence — see
+   *  identity-birth.ts (avatarCandidateId-required gate deleted, Step 2.5
+   *  avatar-sibling write skipped when candidate is absent). */
+  avatarCandidateId?: string;
+  /** Phase 22 SRIC-02: kebab-case-lowercase role name from the target host.
+   *  The first of the agent's roles when `roles` is also sent. Omit (with
+   *  `roles`) for an agent with no roles. */
+  role?: string;
+  /** Multi-role: additional roles beyond `role`, in pick order. Omit for a
+   *  single-role agent. The identity file records `roles: [role, ...roles]`. */
+  roles?: string[];
+  /** Phase 80: optional task string ("what will this agent work on?").
+   *  Frontend soft-caps ~200 chars; backend hard-caps 500 chars. */
+  task?: string;
+  /** Phase 80 A1 lock: when true, backend composes MXID as
+   *  `@<PoolName>-<Role>[-N]:<server>` PascalCase-hyphenated (plan 80-03b
+   *  DIVERGE). When false/absent, backend uses legacy `@<name>:<server>`
+   *  shape (backward compat for manually-typed names and pre-Phase-80
+   *  identities). NewSessionDialog (plan 80-06) sets true when the name
+   *  field value came from `pickPoolName` prefill AND the user did not edit
+   *  it further. */
+  poolPicked?: boolean;
+  /** Project slug → the identity is born with `project: <slug>` frontmatter. */
+  project?: string;
+}
+
+export type BirthEvent =
+  | {
+      type: "step";
+      n: 1 | 2 | 3 | 4 | 5;
+      phase: "started" | "completed" | "failed";
+      reason?: string;
+    }
+  | {
+      type: "ended";
+      ok: boolean;
+      failedStep?: number;
+      identityId?: string;
+      sessionName?: string;
+    };
+
+export async function* openBirthStream(
+  opts: BirthRequest,
+  signal?: AbortSignal,
+): AsyncGenerator<BirthEvent> {
+  // Phase 111 SKEW-04: stamped-fetch lane (SSE stream stays untouched
+  // downstream — stampedFetch returns the raw Response so getReader() works).
+  const response = await stampedFetch("/identities/birth", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "text/event-stream",
+    },
+    body: JSON.stringify(opts),
+    credentials: "include",
+    signal,
+  });
+
+  if (response.status !== 200) {
+    let errorMsg = `birth failed: HTTP ${response.status}`;
+    try {
+      const json = (await response.json()) as { error?: string };
+      if (json.error) errorMsg = json.error;
+    } catch {
+      // ignore JSON parse errors; use the default message
+    }
+    // Belt-and-braces: cancel the body to release the TCP/HTTP2 connection
+    // slot even if response.json() already consumed it (cancel is a no-op on
+    // a consumed body). Placed after JSON extraction so error message is preserved.
+    await response.body?.cancel().catch(() => { /* swallow — best-effort release */ });
+    throw new Error(errorMsg);
+  }
+
+  if (!response.body) {
+    throw new Error("birth failed: server returned empty SSE stream");
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    // SSE frames are separated by double newlines
+    const frames = buffer.split("\n\n");
+    // Keep the last (potentially incomplete) chunk in the buffer
+    buffer = frames.pop() ?? "";
+
+    for (const frame of frames) {
+      if (!frame.trim()) continue;
+      // Find the data: line in the frame
+      const lines = frame.split("\n");
+      let dataLine: string | undefined;
+      for (const line of lines) {
+        if (line.startsWith("data:")) {
+          dataLine = line.slice("data:".length).trim();
+          break;
+        }
+      }
+      if (!dataLine) continue;
+      try {
+        const evt = JSON.parse(dataLine) as BirthEvent;
+        yield evt;
+      } catch {
+        // Malformed JSON — skip frame
+      }
+    }
+  }
+
+  // Flush any remaining complete frame from the buffer
+  if (buffer.trim()) {
+    const lines = buffer.split("\n");
+    let dataLine: string | undefined;
+    for (const line of lines) {
+      if (line.startsWith("data:")) {
+        dataLine = line.slice("data:".length).trim();
+        break;
+      }
+    }
+    if (dataLine) {
+      try {
+        const evt = JSON.parse(dataLine) as BirthEvent;
+        yield evt;
+      } catch {
+        // Malformed JSON — skip
+      }
+    }
+  }
+}

@@ -1,0 +1,394 @@
+export type Host = {
+  id: string;
+  name: string;
+  username: string;
+  ip: string;
+  port: number;
+  folder: string;
+  online: boolean;
+  cpu: number | null;
+  ram: number | null;
+  lastAccess: string;
+  tags?: string[];
+  authType: "password" | "key" | "credential" | "none" | "opkssh";
+  credentialId?: string;
+  overrideCredentialUsername?: boolean;
+  password?: string;
+  hasPassword?: boolean;
+  sudoPassword?: string;
+  hasSudoPassword?: boolean;
+  hasKey?: boolean;
+  hasKeyPassword?: boolean;
+  key?: string;
+  keyPassword?: string;
+  keyType?: string;
+  notes?: string;
+  macAddress?: string;
+  pin?: boolean;
+
+  enableTerminal: boolean;
+  terminalConfig?: {
+    cursorBlink: boolean;
+    cursorStyle: "block" | "underline" | "bar";
+    fontSize: number;
+    fontFamily: string;
+    letterSpacing: number;
+    lineHeight: number;
+    theme: string;
+    scrollback: number;
+    bellStyle: "none" | "sound" | "visual" | "both";
+    rightClickSelectsWord: boolean;
+    fastScrollModifier: "alt" | "ctrl" | "shift";
+    fastScrollSensitivity: number;
+    minimumContrastRatio: number;
+    backspaceMode: "normal" | "control-h";
+    agentForwarding: boolean;
+    autoMosh: boolean;
+    moshCommand: string;
+    autoTmux: boolean;
+    sudoPasswordAutoFill: boolean;
+    sudoPassword?: string;
+    keepaliveInterval?: number;
+    keepaliveCountMax?: number;
+    environmentVariables: { key: string; value: string }[];
+    startupSnippetId?: number | null;
+  };
+
+  useSocks5?: boolean;
+  socks5Host?: string;
+  socks5Port?: number;
+  socks5Username?: string;
+  socks5Password?: string;
+  socks5ProxyChain?: {
+    host: string;
+    port: number;
+    type: 4 | 5 | "http" | string;
+    username?: string;
+    password?: string;
+  }[];
+  jumpHosts?: { hostId: string }[];
+  portKnockSequence?: {
+    port: number;
+    protocol: "tcp" | "udp";
+    delay: number;
+  }[];
+
+  enableTunnel: boolean;
+  serverTunnels: {
+    mode: "local" | "remote" | "dynamic";
+    bindHost?: string;
+    targetHost?: string;
+    sourcePort: number;
+    endpointHost: string;
+    endpointPort: number;
+    maxRetries: number;
+    retryInterval: number;
+    autoStart: boolean;
+  }[];
+
+  enableFileManager: boolean;
+  defaultPath?: string;
+
+  enableDocker: boolean;
+
+  statsConfig?: {
+    statusCheckEnabled: boolean;
+    statusCheckInterval: number;
+    useGlobalStatusInterval: boolean;
+    metricsEnabled: boolean;
+    metricsInterval: number;
+    useGlobalMetricsInterval: boolean;
+    enabledWidgets: string[];
+  };
+  quickActions: { name: string; snippetId: string }[];
+
+  enableSsh: boolean;
+  enableRdp: boolean;
+  enableVnc: boolean;
+  enableTelnet: boolean;
+
+  sshPort: number;
+  rdpPort: number;
+  vncPort: number;
+  telnetPort: number;
+
+  rdpUser?: string;
+  rdpPassword?: string;
+  domain?: string;
+  security?: string;
+  ignoreCert?: boolean;
+
+  vncPassword?: string;
+  vncUser?: string;
+
+  telnetUser?: string;
+  telnetPassword?: string;
+
+  guacamoleConfig?: Record<string, unknown>;
+  forceKeyboardInteractive?: boolean;
+
+  // Phase 73 (feature 02 slice 2): opt-in flag for the Skynet-side fleet-
+  // substrate reconcile sweep. Only meaningful for SSH-like identity-hosting
+  // hosts. Absent = false (default at the DB layer, migration adds the column
+  // with DEFAULT 0). Exposed on GET /db/host/:id/export and accepted on
+  // POST /db/host + PUT /db/host/:id — no UI toggle yet (operator flips via
+  // curl or admin console for now).
+  runsFleetSubstrate?: boolean;
+  // The machine runs the fleet substrate (through this row or another user's
+  // copy of it). Gates the new-conversation and scheduled-task pickers.
+  canHostAgents?: boolean;
+};
+
+export type Credential = {
+  id: string;
+  name: string;
+  username: string;
+  type: "password" | "key";
+  value?: string;
+  publicKey?: string;
+  passphrase?: string;
+  description?: string;
+  folder?: string;
+  tags?: string[];
+};
+
+export type HostFolder = {
+  name: string;
+  children: (Host | HostFolder)[];
+};
+
+export type TabType =
+  | "dashboard"
+  | "terminal"
+  | "rdp"
+  | "vnc"
+  | "telnet"
+  | "app" // Phase 120 D-01 — app content type
+  | "file" // a file shown read-only in its own pane
+  | "desktop"; // an agent's virtual desktop in its own pane
+
+export type TunnelStatusValue =
+  | "CONNECTED"
+  | "CONNECTING"
+  | "DISCONNECTING"
+  | "DISCONNECTED"
+  | "ERROR"
+  | "WAITING";
+export type TunnelMode = "local" | "remote" | "dynamic";
+
+export type Tunnel = {
+  id: string;
+  hostId: string;
+  sourcePort: number;
+  endpointHost: string;
+  endpointPort: number;
+  status: TunnelStatusValue;
+  mode: TunnelMode;
+  reason?: string;
+  retryCount?: number;
+  maxRetries?: number;
+};
+
+export type Tab = {
+  id: string;
+  instanceId: string;
+  type: TabType;
+  label: string;
+  host?: Host;
+  openedAt: number;
+  restoredSessionId?: string | null;
+  // Named tmux session to attach to on connect.
+  targetTmuxSession?: string | null;
+  // Ephemeral: when true (only set by the New Session dialog paths), the
+  // backend may create the target session if it doesn't exist. Restored
+  // tabs (URL fragment / server-persisted open_tabs) leave this false so
+  // a killed session doesn't silently resurrect as an empty pane. Not
+  // persisted server-side; not encoded in #tab=.
+  allowCreateTmux?: boolean;
+  terminalRef?: import("react").RefObject<{
+    sendInput?: (data: string) => void;
+    reconnect?: () => void;
+    fit?: () => void;
+    notifyResize?: () => void;
+  } | null>;
+
+  // ─── Phase 90 Plan 01 — Phase-89 kind discriminator on the Tab model ───────
+  //
+  // Carries the Phase-89 `kind` marker from the sidebar row (see
+  // `FleetSession` in @/state/conversation-store) down to the pane-mount
+  // dispatcher (Plan 07's tabUtils.tsx widening) so the dispatcher can
+  // branch to the shared chat surface (PrettyView with source.kind === "relay" per Phase 93 Slice 4) for `sessionKind === "relay-room"`
+  // without re-reading the sidebar store at mount time.
+  //
+  // Field name is `sessionKind` (NOT `kind`) intentionally: `Tab` already
+  // uses `type` for its own dispatch axis ("dashboard" | "terminal" | "rdp"
+  // | "vnc" | "telnet"), and a bare `kind` on this shape would read
+  // ambiguously alongside `type`. `sessionKind` names the axis clearly
+  // (which SESSION kind is this tab hosting?) and leaves room for future
+  // per-tab discriminators without collision.
+  //
+  // All three fields are optional — pre-Phase-90 persisted tabs and every
+  // non-relay tab (terminal / rdp / vnc / telnet / dashboard) simply omit
+  // them. Backward-compat rule: dispatcher treats `sessionKind === undefined`
+  // as harness/legacy (existing pane path).
+  // "archived": an archived agent's conversation, opened from search —
+  // view-only, needs no terminal session; `targetTmuxSession` is the
+  // agent's name.
+  sessionKind?: "harness" | "relay-room" | "archived";
+  relayRoomId?: string;
+  relayRoomTitle?: string | null;
+
+  // ─── Phase 120 D-02 — app-leaf tuple ─────────────────────────────────────
+  //
+  // The (hostId, slug) tuple identifying WHICH app the leaf holds. Two-part
+  // because the same short slug can name different apps on different boxes.
+  //
+  // REQUIRED whenever `type === "app"`; MUST be absent otherwise. The field
+  // is declared OPTIONAL at the type level (mirroring the Phase-90
+  // `sessionKind` discipline above) so that pre-Phase-120 persisted tab
+  // records — which have no `app` key at all — continue to parse and
+  // rehydrate without a schema-migration pass. Consumers narrow via the
+  // `isAppTab` predicate (exported below) which surfaces the required-when-
+  // app-type invariant at the type level so downstream code can access
+  // `tab.app.hostId` and `tab.app.slug` without further optional-chaining.
+  app?: { hostId: number; slug: string };
+
+  // File leaf: the (host, path) pair of the Skynet file URL the pane shows
+  // (`/file/<host>/<path>`; host is the URL's host segment, path absolute).
+  // REQUIRED whenever `type === "file"`; absent otherwise — same optional-
+  // at-the-type-level discipline as `app`. `origin` is the encoded tab spec
+  // of the conversation the file was dragged out of, when known.
+  file?: { host: string; path: string; origin?: string | null };
+
+  // Desktop leaf: whose virtual desktop the pane shows — the identity and
+  // the host it lives on. REQUIRED whenever `type === "desktop"`; absent
+  // otherwise — same discipline as `app` / `file`.
+  desktop?: { hostId: number; identityKey: string };
+};
+
+// Phase 120 D-02 — narrowing predicate. Returns true when the tab is an app
+// leaf AND carries the required (hostId, slug) tuple; lets downstream
+// consumers (Plan 06's renderAppTab, Plan 07's openTab / AppShell handlers)
+// access `tab.app.hostId` and `tab.app.slug` without further optional
+// checks. Pure boolean — no I/O, no throw, no side effects.
+export function isAppTab(
+  tab: Tab,
+): tab is Tab & { app: { hostId: number; slug: string } } {
+  return tab.type === "app" && tab.app !== undefined;
+}
+
+// Narrowing predicate for file leaves (see `Tab.file`).
+export function isFileTab(
+  tab: Tab,
+): tab is Tab & { file: { host: string; path: string; origin?: string | null } } {
+  return tab.type === "file" && tab.file !== undefined;
+}
+
+// Narrowing predicate for desktop leaves (see `Tab.desktop`).
+export function isDesktopTab(
+  tab: Tab,
+): tab is Tab & { desktop: { hostId: number; identityKey: string } } {
+  return tab.type === "desktop" && tab.desktop !== undefined;
+}
+
+export type DashboardCardId =
+  | "stats_bar"
+  | "counters_bar"
+  | "quick_actions"
+  | "host_status"
+  | "recent_activity"
+  | "network_graph";
+
+export type DashboardCardConfig = {
+  id: DashboardCardId;
+  label: string;
+  description: string;
+  defaultEnabled: boolean;
+};
+
+export type CardColSpan = "full" | "wide" | "half" | "narrow";
+export type CardRowSize = "short" | "medium" | "tall" | "flex";
+
+export type CardLayoutConfig = {
+  id: DashboardCardId;
+  colSpan: CardColSpan;
+  rowSize: CardRowSize;
+  order: number;
+};
+
+export type LayoutPresetId = "default" | "compact" | "focus" | "wide";
+
+export type LayoutPreset = {
+  id: LayoutPresetId;
+  label: string;
+  description: string;
+  cards: CardLayoutConfig[];
+};
+
+export type UserProfileSection =
+  | "account"
+  | "appearance"
+  | "security"
+  | "api-keys";
+export type AdminSection =
+  | "general"
+  | "oidc"
+  | "users"
+  | "sessions"
+  | "roles"
+  | "database"
+  | "api-keys"
+  | "identities";
+export type AccentColorId = string;
+export type ThemeId =
+  | "dark"
+  | "light"
+  | "system"
+  | "dracula"
+  | "catppuccin"
+  | "nord"
+  | "solarized"
+  | "tokyo-night"
+  | "one-dark"
+  | "gruvbox";
+export type FontSizeId = "xs" | "sm" | "md" | "lg" | "xl";
+
+export type ToolsTab = "ssh-tools" | "snippets" | "history" | "split-screen";
+
+export type Snippet = {
+  id: number;
+  name: string;
+  description?: string;
+  content: string;
+  folder: string | null;
+  order: number;
+};
+
+export const FOLDER_ICONS = [
+  "folder",
+  "server",
+  "cloud",
+  "database",
+  "box",
+  "network",
+  "copy",
+  "settings",
+  "cpu",
+  "globe",
+] as const;
+export type FolderIconId = (typeof FOLDER_ICONS)[number];
+
+export type SnippetFolder = {
+  id: number;
+  name: string;
+  color: string;
+  icon: FolderIconId;
+  open: boolean;
+};
+
+export type HistoryEntry = {
+  id: number;
+  command: string;
+  host: string;
+  time: string;
+};

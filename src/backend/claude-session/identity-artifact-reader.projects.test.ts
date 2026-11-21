@@ -1,0 +1,1406 @@
+/**
+ * identity-artifact-reader.projects.test.ts — Phase 117 Plan 117-01
+ *
+ * Unit tests for the project primitives added to identity-artifact-reader.ts
+ * per CONTEXT.md D-01..D-05, D-25, D-30, D-32, D-36:
+ *
+ *   Task 1 exports:
+ *     - PROJECT_SLUG_RE = /^[a-z0-9-]{1,64}$/ constant
+ *     - getLocalProjectsRoot(): string
+ *     - readSessionProjectField(conn, identityKey): Promise<string | null>
+ *     - writeSessionProjectField(conn, identityKey, projectSlug | null): Promise<void>
+ *
+ *   Task 2 exports (appended below):
+ *     - listProjects(conn): Promise<Array<{slug, displayName}>>
+ *     - readProjectFile(conn, slug): Promise<{markdown: string}>
+ *     - createProject(conn, slug, displayName): Promise<void>
+ *     - archiveProject(conn, slug): Promise<void>
+ *
+ * The load-bearing constraint (RESEARCH § Common Pitfalls #5): the frontmatter
+ * writer must go through a FULL yaml.load round-trip, NOT
+ * extractCosmeticsFromFrontmatter (which is field-narrowing and drops unknown
+ * keys). Test 12 (writeSessionProjectField unknown-key preservation) is the
+ * regression guard.
+ *
+ * Mocking strategy follows identity-artifact-reader.avatar-read.test.ts:
+ *   - vi.mock("fs/promises") — LOCAL branch reads/writes
+ *   - vi.mock("../ssh/tmux-helper.js") — REMOTE-branch execCommand
+ *   - mock ssh2 Client's .sftp() for writeMarkdownFileAtomic's REMOTE branch
+ */
+
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { execFile } from "child_process";
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "fs";
+import type { Client as SSHClientType } from "ssh2";
+type SFTPWrapper = import("ssh2").SFTPWrapper;
+import path from "path";
+import os from "os";
+
+// ---------------------------------------------------------------------------
+// Mocks — declared BEFORE the dynamic import of identity-artifact-reader
+// ---------------------------------------------------------------------------
+
+const execCommandMock = vi.fn();
+vi.mock("../ssh/tmux-helper.js", () => ({
+  execCommand: (conn: unknown, cmd: string) => execCommandMock(conn, cmd),
+}));
+
+const fsReadFileMock = vi.fn();
+const fsWriteFileMock = vi.fn();
+const fsRenameMock = vi.fn();
+const fsMkdirMock = vi.fn();
+const fsReaddirMock = vi.fn();
+const fsStatMock = vi.fn();
+const fsUnlinkMock = vi.fn();
+
+vi.mock("fs/promises", () => ({
+  default: {
+    readFile: (p: string, opts?: unknown) => fsReadFileMock(p, opts),
+    writeFile: (p: string, data: unknown, opts?: unknown) =>
+      fsWriteFileMock(p, data, opts),
+    rename: (from: string, to: string) => fsRenameMock(from, to),
+    mkdir: (p: string, opts?: unknown) => fsMkdirMock(p, opts),
+    readdir: (p: string, opts?: unknown) => fsReaddirMock(p, opts),
+    stat: (p: string) => fsStatMock(p),
+    unlink: (p: string) => fsUnlinkMock(p),
+  },
+  readFile: (p: string, opts?: unknown) => fsReadFileMock(p, opts),
+  writeFile: (p: string, data: unknown, opts?: unknown) =>
+    fsWriteFileMock(p, data, opts),
+  rename: (from: string, to: string) => fsRenameMock(from, to),
+  mkdir: (p: string, opts?: unknown) => fsMkdirMock(p, opts),
+  readdir: (p: string, opts?: unknown) => fsReaddirMock(p, opts),
+  stat: (p: string) => fsStatMock(p),
+  unlink: (p: string) => fsUnlinkMock(p),
+}));
+
+// Import AFTER the vi.mock so the mocks bind to the module graph.
+import {
+  PROJECT_SLUG_RE,
+  getLocalProjectsRoot,
+  readSessionProjectField,
+  writeSessionProjectField,
+  listProjects,
+  LIST_PROJECTS_REMOTE_CMD,
+  parseListProjectsBatchOutput,
+  readProjectFile,
+  writeProjectFile,
+  createProject,
+  archiveProject,
+  applyProjectParentLine,
+  applyProjectUsersBlock,
+  projectMetaFromMarkdown,
+  setProjectParentField,
+} from "./identity-artifact-reader.js";
+
+// ---------------------------------------------------------------------------
+// Mock SSH client builder — records SFTP + exec activity for assertions
+// ---------------------------------------------------------------------------
+
+interface SftpCall {
+  op: "writeFile" | "ext_openssh_rename" | "realpath";
+  args: unknown[];
+}
+
+function buildMockConn(): {
+  conn: SSHClientType;
+  sftp: {
+    writeFile: ReturnType<typeof vi.fn>;
+    ext_openssh_rename: ReturnType<typeof vi.fn>;
+    rename: ReturnType<typeof vi.fn>;
+    unlink: ReturnType<typeof vi.fn>;
+    realpath: ReturnType<typeof vi.fn>;
+    end: ReturnType<typeof vi.fn>;
+  };
+  sftpCalls: SftpCall[];
+} {
+  const sftpCalls: SftpCall[] = [];
+
+  const sftp = {
+    writeFile: vi.fn(
+      (
+        p: string,
+        buf: Buffer,
+        opts: unknown,
+        cb: (err: Error | undefined) => void,
+      ) => {
+        sftpCalls.push({ op: "writeFile", args: [p, buf, opts] });
+        cb(undefined);
+      },
+    ),
+    ext_openssh_rename: vi.fn(
+      (from: string, to: string, cb: (err: Error | undefined) => void) => {
+        sftpCalls.push({ op: "ext_openssh_rename", args: [from, to] });
+        cb(undefined);
+      },
+    ),
+    rename: vi.fn(() => {
+      throw new Error("must not call sftp.rename — use ext_openssh_rename");
+    }),
+    unlink: vi.fn((_p: string, cb: (err: Error | undefined) => void) => {
+      cb(undefined);
+    }),
+    realpath: vi.fn(
+      (
+        p: string,
+        cb: (err: Error | undefined, absPath?: string) => void,
+      ) => {
+        sftpCalls.push({ op: "realpath", args: [p] });
+        cb(undefined, "/home/tester");
+      },
+    ),
+    end: vi.fn(),
+  };
+
+  const conn = {
+    sftp: (cb: (err: Error | undefined, s: SFTPWrapper) => void) => {
+      cb(undefined, sftp as unknown as SFTPWrapper);
+    },
+  } as unknown as SSHClientType;
+
+  return { conn, sftp, sftpCalls };
+}
+
+// ---------------------------------------------------------------------------
+// Setup
+// ---------------------------------------------------------------------------
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  // Default: fs ops reject with ENOENT — every test overrides as needed.
+  fsReadFileMock.mockImplementation(() => {
+    const err = new Error("ENOENT") as NodeJS.ErrnoException;
+    err.code = "ENOENT";
+    return Promise.reject(err);
+  });
+  fsWriteFileMock.mockImplementation(() => Promise.resolve());
+  fsRenameMock.mockImplementation(() => Promise.resolve());
+  fsMkdirMock.mockImplementation(() => Promise.resolve());
+  fsReaddirMock.mockImplementation(() => Promise.resolve([]));
+  fsStatMock.mockImplementation(() => {
+    const err = new Error("ENOENT") as NodeJS.ErrnoException;
+    err.code = "ENOENT";
+    return Promise.reject(err);
+  });
+  fsUnlinkMock.mockImplementation(() => Promise.resolve());
+  execCommandMock.mockResolvedValue("");
+  // Ensure PROJECTS_HOST_DIR is unset by default.
+  delete process.env.PROJECTS_HOST_DIR;
+});
+
+afterEach(() => {
+  vi.clearAllMocks();
+  delete process.env.PROJECTS_HOST_DIR;
+});
+
+// ===========================================================================
+// Task 1: PROJECT_SLUG_RE + getLocalProjectsRoot + read/writeSessionProjectField
+// ===========================================================================
+
+describe("PROJECT_SLUG_RE (D-04 kebab-case-lowercased)", () => {
+  it("Test 1: accepts abc, a-b-c, proj-1, 0-9, 64-char string; rejects 65-char, uppercase, underscore, slash, empty", () => {
+    // Positive cases
+    expect(PROJECT_SLUG_RE.test("abc")).toBe(true);
+    expect(PROJECT_SLUG_RE.test("a-b-c")).toBe(true);
+    expect(PROJECT_SLUG_RE.test("proj-1")).toBe(true);
+    expect(PROJECT_SLUG_RE.test("0-9")).toBe(true);
+    expect(PROJECT_SLUG_RE.test("a".repeat(64))).toBe(true);
+
+    // Negative cases
+    expect(PROJECT_SLUG_RE.test("a".repeat(65))).toBe(false);
+    expect(PROJECT_SLUG_RE.test("A")).toBe(false); // uppercase rejected
+    expect(PROJECT_SLUG_RE.test("abc_def")).toBe(false); // underscore rejected per D-04
+    expect(PROJECT_SLUG_RE.test("abc/def")).toBe(false);
+    expect(PROJECT_SLUG_RE.test("")).toBe(false);
+
+    // Byte-shape gate on the regex literal itself: no `i` flag, no `_` in charset.
+    expect(PROJECT_SLUG_RE.flags).toBe("");
+    expect(PROJECT_SLUG_RE.source).toBe("^[a-z0-9-]{1,64}$");
+  });
+});
+
+describe("getLocalProjectsRoot", () => {
+  it("Test 2a: returns process.env.PROJECTS_HOST_DIR when set", () => {
+    process.env.PROJECTS_HOST_DIR = "/tmp/x";
+    expect(getLocalProjectsRoot()).toBe("/tmp/x");
+  });
+
+  it("Test 2b: falls back to os.homedir()/fleet/projects when env var unset", () => {
+    delete process.env.PROJECTS_HOST_DIR;
+    expect(getLocalProjectsRoot()).toBe(
+      path.join(os.homedir(), "fleet", "projects"),
+    );
+  });
+});
+
+describe("readSessionProjectField", () => {
+  it("Test 3: LOCAL happy — returns 'alpha' when frontmatter has project: alpha", async () => {
+    fsReadFileMock.mockResolvedValueOnce(
+      `---\nroles: worker\nproject: alpha\ndisplayName: 'W'\n---\nbody`,
+    );
+    const result = await readSessionProjectField(null, "moxie");
+    expect(result).toBe("alpha");
+  });
+
+  it("Test 4: LOCAL missing key — returns null when frontmatter has no project key", async () => {
+    fsReadFileMock.mockResolvedValueOnce(
+      `---\nroles: worker\ndisplayName: 'W'\n---\nbody`,
+    );
+    const result = await readSessionProjectField(null, "moxie");
+    expect(result).toBeNull();
+  });
+
+  it("Test 5: LOCAL no frontmatter — returns null when body has no --- fence", async () => {
+    fsReadFileMock.mockResolvedValueOnce("just a body, no frontmatter at all");
+    const result = await readSessionProjectField(null, "moxie");
+    expect(result).toBeNull();
+  });
+
+  it("Test 6: LOCAL empty file (ENOENT) — returns null without throwing", async () => {
+    // fsReadFileMock default is ENOENT-reject → readIdentityFile catches and
+    // returns {markdown: ""} → readSessionProjectField sees empty markdown.
+    const result = await readSessionProjectField(null, "moxie");
+    expect(result).toBeNull();
+  });
+
+  it("Test 6b: LOCAL bogus YAML — returns null (graceful, does not throw)", async () => {
+    fsReadFileMock.mockResolvedValueOnce(
+      `---\nroles: worker\ntask: value with: unquoted-colon\n---\nbody`,
+    );
+    const result = await readSessionProjectField(null, "moxie");
+    // js-yaml may or may not accept this shape — either way, project is absent.
+    expect(result).toBeNull();
+  });
+});
+
+describe("writeSessionProjectField — LOCAL branch", () => {
+  it("Test 7: set — inserts project: alpha; role/displayName/task preserved in order; body byte-identical", async () => {
+    const original =
+      "---\nroles: worker\ndisplayName: 'W'\ntask: 'foo'\n---\nsome body text\n";
+    fsReadFileMock.mockResolvedValueOnce(original);
+
+    await writeSessionProjectField(null, "moxie", "alpha");
+
+    // writeMarkdownFileAtomic went through writeFile+rename. Grab the written contents.
+    expect(fsWriteFileMock).toHaveBeenCalledTimes(1);
+    const written = fsWriteFileMock.mock.calls[0][1] as Buffer;
+    const writtenStr = written.toString("utf-8");
+
+    // Round-trip preserves role / displayName / task AND adds project.
+    // yaml.dump default emits scalars unquoted when safe (forceQuotes:false):
+    // 'W' loads as string W and re-emits as bare W. Assert on the KEY: VALUE
+    // shape, not the quote style.
+    expect(writtenStr).toContain("roles: worker");
+    expect(writtenStr).toMatch(/displayName: '?W'?/);
+    expect(writtenStr).toMatch(/task: '?foo'?/);
+    expect(writtenStr).toContain("project: alpha");
+    // Body preserved byte-for-byte after the frontmatter block.
+    expect(writtenStr).toMatch(/---\nsome body text\n$/);
+  });
+
+  it("Test 8: update — existing project: alpha becomes project: beta; alpha string gone from frontmatter", async () => {
+    const original =
+      "---\nroles: worker\nproject: alpha\ndisplayName: 'W'\n---\nbody\n";
+    fsReadFileMock.mockResolvedValueOnce(original);
+
+    await writeSessionProjectField(null, "moxie", "beta");
+
+    expect(fsWriteFileMock).toHaveBeenCalledTimes(1);
+    const written = fsWriteFileMock.mock.calls[0][1] as Buffer;
+    const writtenStr = written.toString("utf-8");
+
+    // Isolate the frontmatter block and assert alpha does not appear inside it.
+    const fmMatch = writtenStr.match(/^---\n([\s\S]*?)\n---/);
+    expect(fmMatch).not.toBeNull();
+    const frontmatter = fmMatch![1];
+    expect(frontmatter).toContain("project: beta");
+    expect(frontmatter).not.toContain("alpha");
+  });
+
+  it("Test 9: clear — slug=null DELETES the project key entirely; other fields preserved", async () => {
+    const original =
+      "---\nroles: worker\nproject: alpha\ndisplayName: 'W'\ntask: 'foo'\n---\nbody\n";
+    fsReadFileMock.mockResolvedValueOnce(original);
+
+    await writeSessionProjectField(null, "moxie", null);
+
+    expect(fsWriteFileMock).toHaveBeenCalledTimes(1);
+    const written = fsWriteFileMock.mock.calls[0][1] as Buffer;
+    const writtenStr = written.toString("utf-8");
+    const fmMatch = writtenStr.match(/^---\n([\s\S]*?)\n---/);
+    expect(fmMatch).not.toBeNull();
+    const frontmatter = fmMatch![1];
+
+    // Absent-⇒-omit invariant: NO project key at all.
+    expect(frontmatter).not.toMatch(/^project:/m);
+    // Must not emit `project: null` or `project: ''`.
+    expect(frontmatter).not.toContain("project: null");
+    expect(frontmatter).not.toContain("project: ''");
+    // Other fields preserved.
+    expect(frontmatter).toContain("roles: worker");
+    expect(frontmatter).toMatch(/displayName: '?W'?/);
+    expect(frontmatter).toContain("task: foo");
+  });
+
+  it("Test 10: reject bad slug — 'Alpha' (uppercase) throws 'invalid project slug'", async () => {
+    await expect(
+      writeSessionProjectField(null, "moxie", "Alpha"),
+    ).rejects.toThrow(/invalid project slug/);
+    // No read attempted after the slug gate fails.
+    expect(fsReadFileMock).not.toHaveBeenCalled();
+    expect(fsWriteFileMock).not.toHaveBeenCalled();
+  });
+
+  it("Test 11: reject bad identityKey — 'BADKEY!' throws 'invalid identityKey'", async () => {
+    await expect(
+      writeSessionProjectField(null, "BADKEY!", "alpha"),
+    ).rejects.toThrow(/invalid identityKey/);
+    expect(fsReadFileMock).not.toHaveBeenCalled();
+    expect(fsWriteFileMock).not.toHaveBeenCalled();
+  });
+
+  it("Test 12: unknown-key preservation — custom: foo survives round-trip (Pitfall 5 regression guard)", async () => {
+    // The frontmatter carries a `custom: foo` field NOT in the
+    // extractCosmeticsFromFrontmatter allowlist. If writeSessionProjectField
+    // is (mis)implemented via the narrowing extractor, this key disappears
+    // on round-trip. The full yaml.load path preserves it.
+    const original =
+      "---\nroles: worker\ndisplayName: 'W'\ncustom: foo\n---\nbody\n";
+    fsReadFileMock.mockResolvedValueOnce(original);
+
+    await writeSessionProjectField(null, "moxie", "alpha");
+
+    expect(fsWriteFileMock).toHaveBeenCalledTimes(1);
+    const written = fsWriteFileMock.mock.calls[0][1] as Buffer;
+    const writtenStr = written.toString("utf-8");
+    const fmMatch = writtenStr.match(/^---\n([\s\S]*?)\n---/);
+    expect(fmMatch).not.toBeNull();
+    const frontmatter = fmMatch![1];
+
+    // The custom key must survive.
+    expect(frontmatter).toContain("custom: foo");
+    // Plus the new project key.
+    expect(frontmatter).toContain("project: alpha");
+    // And the existing keys.
+    expect(frontmatter).toContain("roles: worker");
+    expect(frontmatter).toMatch(/displayName: '?W'?/);
+  });
+
+  it("Test 12a: roles: flow list survives the round-trip in flow form", async () => {
+    fsReadFileMock.mockResolvedValueOnce(
+      "---\nroles: [worker, sky-uat]\ndisplayName: 'W'\n---\nbody\n",
+    );
+
+    await writeSessionProjectField(null, "moxie", "alpha");
+
+    const writtenStr = (fsWriteFileMock.mock.calls[0][1] as Buffer).toString("utf-8");
+    expect(writtenStr).toMatch(/^---\nroles: \[worker, sky-uat\]\n/);
+    expect(writtenStr).toContain("project: alpha");
+  });
+
+  it("Test 12b: writes atomically via writeMarkdownFileAtomic — tmp file then rename to target", async () => {
+    const original = "---\nroles: worker\n---\nbody\n";
+    fsReadFileMock.mockResolvedValueOnce(original);
+
+    await writeSessionProjectField(null, "moxie", "alpha");
+
+    // atomic write: writeFile to .tmp then rename to target
+    expect(fsWriteFileMock).toHaveBeenCalledTimes(1);
+    expect(fsRenameMock).toHaveBeenCalledTimes(1);
+    const writePath = fsWriteFileMock.mock.calls[0][0] as string;
+    const renameFrom = fsRenameMock.mock.calls[0][0] as string;
+    const renameTo = fsRenameMock.mock.calls[0][1] as string;
+    expect(writePath.endsWith(".tmp")).toBe(true);
+    expect(renameFrom).toBe(writePath);
+    expect(renameTo.endsWith("/moxie.md")).toBe(true);
+    expect(renameTo).not.toContain(".tmp");
+  });
+});
+
+describe("writeSessionProjectField — REMOTE branch", () => {
+  it("Test 13: REMOTE — readIdentityFile's cat command is invoked and writeMarkdownFileAtomic REMOTE fires with $HOME-relative target", async () => {
+    const { conn, sftp, sftpCalls } = buildMockConn();
+    // First execCommand call: readIdentityFile's `cat` command.
+    // Second execCommand call: writeMarkdownFileAtomic's SFTP realpath (bypassed
+    // — realpath is on sftp, not exec). No further exec calls needed.
+    execCommandMock.mockImplementation((_conn: unknown, cmd: string) => {
+      if (cmd.startsWith("cat ")) {
+        return Promise.resolve("---\nroles: worker\n---\nbody\n");
+      }
+      return Promise.resolve("");
+    });
+
+    await writeSessionProjectField(conn, "moxie", "alpha");
+
+    // The cat command was executed with the expected $HOME-relative path.
+    const catCalls = execCommandMock.mock.calls.filter(
+      (c) => typeof c[1] === "string" && c[1].startsWith("cat "),
+    );
+    expect(catCalls.length).toBeGreaterThanOrEqual(1);
+    expect(catCalls[0][1]).toContain(
+      `"$HOME/fleet/identities/moxie/moxie.md"`,
+    );
+
+    // writeMarkdownFileAtomic REMOTE branch fired: SFTP realpath resolved
+    // $HOME, then writeFile+ext_openssh_rename produced the expected path.
+    expect(sftp.ext_openssh_rename).toHaveBeenCalledTimes(1);
+    expect(sftp.rename).not.toHaveBeenCalled();
+    const renameArgs = sftp.ext_openssh_rename.mock.calls[0];
+    const finalPath = renameArgs[1] as string;
+    expect(finalPath).toBe("/home/tester/fleet/identities/moxie/moxie.md");
+
+    // Verify writeFile received a Buffer whose contents include the new
+    // project: alpha frontmatter key.
+    const writeCall = sftpCalls.find((c) => c.op === "writeFile");
+    expect(writeCall).toBeDefined();
+    const writeBuf = writeCall!.args[1] as Buffer;
+    const writeStr = writeBuf.toString("utf-8");
+    expect(writeStr).toContain("project: alpha");
+    expect(writeStr).toContain("roles: worker");
+  });
+});
+
+// ===========================================================================
+// Task 2: listProjects + readProjectFile + createProject + archiveProject
+// ===========================================================================
+
+/**
+ * Helper: build a Dirent-shaped object for fs.readdir({withFileTypes:true})
+ * mocks. Vitest doesn't include fs.Dirent so we duck-type it.
+ */
+function makeDirent(name: string, isDir: boolean): {
+  name: string;
+  isDirectory: () => boolean;
+  isFile: () => boolean;
+} {
+  return {
+    name,
+    isDirectory: () => isDir,
+    isFile: () => !isDir,
+  };
+}
+
+describe("listProjects — LOCAL branch", () => {
+  it("Test L1: happy — three dirs (alpha, beta, archive); archive EXCLUDED; sorted by slug; displayName pulled from each project.md", async () => {
+    // fs.readdir on the root returns 3 dirents.
+    fsReaddirMock.mockImplementation((p: string, opts?: unknown) => {
+      const _ = opts;
+      if (typeof p === "string" && p.endsWith("projects")) {
+        return Promise.resolve([
+          makeDirent("beta", true),
+          makeDirent("alpha", true),
+          makeDirent("archive", true),
+        ]);
+      }
+      return Promise.resolve([]);
+    });
+    // Each project.md read returns the frontmatter shape.
+    fsReadFileMock.mockImplementation((p: string) => {
+      if (typeof p === "string" && p.includes("/alpha/project.md")) {
+        return Promise.resolve("---\ndisplayName: 'Alpha One'\n---\n");
+      }
+      if (typeof p === "string" && p.includes("/beta/project.md")) {
+        return Promise.resolve("---\ndisplayName: 'Beta'\n---\n");
+      }
+      const err = new Error("ENOENT") as NodeJS.ErrnoException;
+      err.code = "ENOENT";
+      return Promise.reject(err);
+    });
+
+    const result = await listProjects(null);
+    expect(result).toEqual([
+      { slug: "alpha", displayName: "Alpha One", users: null, parent: null },
+      { slug: "beta", displayName: "Beta", users: null, parent: null },
+    ]);
+    // archive MUST NOT appear anywhere.
+    expect(result.some((p) => p.slug === "archive")).toBe(false);
+  });
+
+  it("Test L2: displayName fallback — falls back to slug when project.md missing or has no displayName", async () => {
+    fsReaddirMock.mockImplementation((p: string) => {
+      if (typeof p === "string" && p.endsWith("projects")) {
+        return Promise.resolve([
+          makeDirent("alpha", true), // no project.md at all
+          makeDirent("beta", true), // project.md exists but no displayName in frontmatter
+        ]);
+      }
+      return Promise.resolve([]);
+    });
+    fsReadFileMock.mockImplementation((p: string) => {
+      if (typeof p === "string" && p.includes("/alpha/project.md")) {
+        const err = new Error("ENOENT") as NodeJS.ErrnoException;
+        err.code = "ENOENT";
+        return Promise.reject(err);
+      }
+      if (typeof p === "string" && p.includes("/beta/project.md")) {
+        return Promise.resolve("---\nroles: something-else\n---\n");
+      }
+      return Promise.reject(new Error("unexpected path: " + p));
+    });
+
+    const result = await listProjects(null);
+    expect(result).toEqual([
+      { slug: "alpha", displayName: "alpha", users: null, parent: null },
+      { slug: "beta", displayName: "beta", users: null, parent: null },
+    ]);
+  });
+
+  it("Test L3: missing root — fs.readdir ENOENT → returns []", async () => {
+    fsReaddirMock.mockImplementation(() => {
+      const err = new Error("ENOENT") as NodeJS.ErrnoException;
+      err.code = "ENOENT";
+      return Promise.reject(err);
+    });
+
+    const result = await listProjects(null);
+    expect(result).toEqual([]);
+  });
+});
+
+const b64 = (t: string) => Buffer.from(t, "utf-8").toString("base64");
+const rec = (slug: string, md: string | null) => `===PROJECT:${slug}===\n${md === null ? "" : b64(md)}\n`;
+
+describe("listProjects — REMOTE branch (one batched exec)", () => {
+  it("Test L4: happy — ONE exec (find ! -name archive + inline project.md); entries sorted; displayName parsed", async () => {
+    const { conn } = buildMockConn();
+    execCommandMock.mockResolvedValue(
+      // NON-sorted order to prove sort happens client-side.
+      rec("beta", "---\ndisplayName: 'Beta'\n---\n") +
+        rec("alpha", "---\ndisplayName: 'Alpha One'\nusers: [alice]\n---\nbody\n"),
+    );
+
+    const result = await listProjects(conn);
+
+    expect(execCommandMock).toHaveBeenCalledTimes(1);
+    const cmd = execCommandMock.mock.calls[0][1] as string;
+    expect(cmd).toBe(LIST_PROJECTS_REMOTE_CMD);
+    expect(cmd).toContain("! -name archive");
+    expect(cmd).toContain("$HOME/fleet/projects");
+    expect(result).toEqual([
+      { slug: "alpha", displayName: "Alpha One", users: ["alice"], parent: null },
+      { slug: "beta", displayName: "Beta", users: null, parent: null },
+    ]);
+  });
+
+  it("Test L5: only-slug-valid entries — BADENTRY! filtered out via PROJECT_SLUG_RE gate; missing project.md → slug fallback", async () => {
+    const { conn } = buildMockConn();
+    execCommandMock.mockResolvedValue(rec("alpha", null) + rec("BADENTRY!", "---\ndisplayName: X\n---\n") + rec("beta", null));
+
+    const result = await listProjects(conn);
+    expect(execCommandMock).toHaveBeenCalledTimes(1);
+    expect(result).toEqual([
+      { slug: "alpha", displayName: "alpha", users: null, parent: null },
+      { slug: "beta", displayName: "beta", users: null, parent: null },
+    ]);
+  });
+
+  it("Test L5b: empty output (no projects dir) → []", async () => {
+    const { conn } = buildMockConn();
+    execCommandMock.mockResolvedValue("");
+    expect(await listProjects(conn)).toEqual([]);
+  });
+
+  it("Test L5c: exec failure propagates (same as the old find failure)", async () => {
+    const { conn } = buildMockConn();
+    execCommandMock.mockRejectedValue(new Error("boom"));
+    await expect(listProjects(conn)).rejects.toThrow("boom");
+  });
+});
+
+describe("parseListProjectsBatchOutput — edge cases", () => {
+  it("content that looks like a header can't break framing (it's base64'd)", () => {
+    const tricky = "---\ndisplayName: Tricky\n---\n===PROJECT:evil===\nnot a header\n";
+    const m = parseListProjectsBatchOutput(rec("alpha", tricky) + rec("beta", "b"));
+    expect([...m.keys()]).toEqual(["alpha", "beta"]);
+    expect(m.get("alpha")).toBe(tricky);
+    expect(m.get("beta")).toBe("b");
+  });
+
+  it("header with no payload line (truncated output) and header-followed-by-header → empty contents", () => {
+    const m = parseListProjectsBatchOutput("===PROJECT:alpha===\n===PROJECT:beta===\n" + b64("x") + "\n===PROJECT:gamma===");
+    expect(m.get("alpha")).toBe("");
+    expect(m.get("beta")).toBe("x");
+    expect(m.get("gamma")).toBe("");
+  });
+
+  it("CRLF line endings, UTF-8 content, duplicate slug (first wins), junk lines ignored", () => {
+    const out =
+      "junk before\r\n" +
+      `===PROJECT:alpha===\r\n${b64("café ☕")}\r\n` +
+      `===PROJECT:alpha===\n${b64("second")}\n` +
+      "stray line\n";
+    const m = parseListProjectsBatchOutput(out);
+    expect([...m.entries()]).toEqual([["alpha", "café ☕"]]);
+  });
+
+  it("invalid slugs (uppercase, newline-split fragments, '===' inside) are dropped and don't steal the next payload", () => {
+    const out =
+      `===PROJECT:Bad===\n${b64("bad")}\n` +
+      `===PROJECT:foo======\n${b64("forged")}\n` +
+      rec("ok", "good");
+    const m = parseListProjectsBatchOutput(out);
+    expect([...m.entries()]).toEqual([["ok", "good"]]);
+  });
+});
+
+describe("LIST_PROJECTS_REMOTE_CMD — real shell", () => {
+  it("emits one record per non-archive, non-symlink project dir with base64'd project.md", async () => {
+    const home = mkdtempSync(path.join(os.tmpdir(), "list-projects-sh-"));
+    try {
+      const root = path.join(home, "fleet", "projects");
+      for (const d of ["alpha", "beta", "archive", "no-md"]) mkdirSync(path.join(root, d), { recursive: true });
+      writeFileSync(path.join(root, "alpha", "project.md"), "---\ndisplayName: Alpha ☕\n---\n===PROJECT:beta===\n");
+      writeFileSync(path.join(root, "beta", "project.md"), "");
+      writeFileSync(path.join(root, "archive", "project.md"), "---\ndisplayName: Archived\n---\n");
+      writeFileSync(path.join(root, "stray-file"), "x");
+      symlinkSync(path.join(root, "alpha"), path.join(root, "linked"));
+      const stdout = await new Promise<string>((resolve, reject) =>
+        execFile("bash", ["-c", LIST_PROJECTS_REMOTE_CMD], { env: { ...process.env, HOME: home } }, (err, out) =>
+          err ? reject(err) : resolve(out),
+        ),
+      );
+      const m = parseListProjectsBatchOutput(stdout);
+      expect([...m.keys()].sort()).toEqual(["alpha", "beta", "no-md"]);
+      expect(m.get("alpha")).toBe("---\ndisplayName: Alpha ☕\n---\n===PROJECT:beta===\n");
+      expect(m.get("beta")).toBe("");
+      expect(m.get("no-md")).toBe("");
+
+      // Missing projects dir → empty output, exit 0.
+      const empty = await new Promise<string>((resolve, reject) =>
+        execFile("bash", ["-c", LIST_PROJECTS_REMOTE_CMD], { env: { ...process.env, HOME: path.join(home, "nope") } }, (err, out) =>
+          err ? reject(err) : resolve(out),
+        ),
+      );
+      expect(empty).toBe("");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 130: users-frontmatter parsing behavior in listProjects
+//
+// Mirrors the Phase 129 D-3 fallback discipline from identity-appearance.ts —
+// an absent or malformed `users:` field surfaces as `users: null` on the
+// listProjects row (falls open at the gate seam). A well-formed array of
+// strings surfaces verbatim (case-preserved).
+// ---------------------------------------------------------------------------
+describe("listProjects — users frontmatter parsing (Phase 130 D-3)", () => {
+  it("Test L6: users present as list of strings — surfaces verbatim (case preserved)", async () => {
+    fsReaddirMock.mockImplementation((p: string) => {
+      if (typeof p === "string" && p.endsWith("projects")) {
+        return Promise.resolve([makeDirent("alpha", true)]);
+      }
+      return Promise.resolve([]);
+    });
+    fsReadFileMock.mockImplementation((p: string) => {
+      if (typeof p === "string" && p.includes("/alpha/project.md")) {
+        // js-yaml renders inline flow-style arrays; assert case preservation
+        // by writing mixed-case usernames.
+        return Promise.resolve(
+          "---\ndisplayName: 'Alpha'\nusers:\n  - Alice\n  - riley\n---\n",
+        );
+      }
+      const err = new Error("ENOENT") as NodeJS.ErrnoException;
+      err.code = "ENOENT";
+      return Promise.reject(err);
+    });
+
+    const result = await listProjects(null);
+    expect(result).toEqual([
+      { slug: "alpha", displayName: "Alpha", users: ["Alice", "riley"], parent: null },
+    ]);
+  });
+
+  it("Test L7: users empty list — surfaces as null (falls open per D-3)", async () => {
+    fsReaddirMock.mockImplementation((p: string) => {
+      if (typeof p === "string" && p.endsWith("projects")) {
+        return Promise.resolve([makeDirent("alpha", true)]);
+      }
+      return Promise.resolve([]);
+    });
+    fsReadFileMock.mockImplementation((p: string) => {
+      if (typeof p === "string" && p.includes("/alpha/project.md")) {
+        return Promise.resolve(
+          "---\ndisplayName: 'Alpha'\nusers: []\n---\n",
+        );
+      }
+      const err = new Error("ENOENT") as NodeJS.ErrnoException;
+      err.code = "ENOENT";
+      return Promise.reject(err);
+    });
+
+    // Empty list is structurally an array-of-strings that .every()-passes
+    // trivially, so it DOES surface as []. The visibility gate itself is the
+    // place that interprets empty-list-as-falls-open (matches
+    // isIdentityVisibleToUser at identity-visibility-gate.ts:65-72). The
+    // parser is intentionally faithful — round-tripping the file's bytes.
+    const result = await listProjects(null);
+    expect(result).toEqual([
+      { slug: "alpha", displayName: "Alpha", users: [], parent: null },
+    ]);
+  });
+
+  it("Test L8: users not an array — falls back to null (malformed value)", async () => {
+    fsReaddirMock.mockImplementation((p: string) => {
+      if (typeof p === "string" && p.endsWith("projects")) {
+        return Promise.resolve([makeDirent("alpha", true)]);
+      }
+      return Promise.resolve([]);
+    });
+    fsReadFileMock.mockImplementation((p: string) => {
+      if (typeof p === "string" && p.includes("/alpha/project.md")) {
+        // users: as a scalar (bad shape) — must NOT accidentally surface.
+        return Promise.resolve(
+          "---\ndisplayName: 'Alpha'\nusers: alice\n---\n",
+        );
+      }
+      const err = new Error("ENOENT") as NodeJS.ErrnoException;
+      err.code = "ENOENT";
+      return Promise.reject(err);
+    });
+
+    const result = await listProjects(null);
+    expect(result).toEqual([
+      { slug: "alpha", displayName: "Alpha", users: null, parent: null },
+    ]);
+  });
+
+  it("Test L9: users array with non-string entries — falls back to null (mixed-type array)", async () => {
+    fsReaddirMock.mockImplementation((p: string) => {
+      if (typeof p === "string" && p.endsWith("projects")) {
+        return Promise.resolve([makeDirent("alpha", true)]);
+      }
+      return Promise.resolve([]);
+    });
+    fsReadFileMock.mockImplementation((p: string) => {
+      if (typeof p === "string" && p.includes("/alpha/project.md")) {
+        return Promise.resolve(
+          "---\ndisplayName: 'Alpha'\nusers:\n  - alice\n  - 42\n---\n",
+        );
+      }
+      const err = new Error("ENOENT") as NodeJS.ErrnoException;
+      err.code = "ENOENT";
+      return Promise.reject(err);
+    });
+
+    const result = await listProjects(null);
+    expect(result).toEqual([
+      { slug: "alpha", displayName: "Alpha", users: null, parent: null },
+    ]);
+  });
+});
+
+describe("readProjectFile", () => {
+  it("Test R1: LOCAL happy — returns {markdown: '...body'} from $HOME/fleet/projects/alpha/project.md", async () => {
+    fsReadFileMock.mockImplementation((p: string) => {
+      if (typeof p === "string" && p.includes("/alpha/project.md")) {
+        return Promise.resolve("---\ndisplayName: 'Alpha'\n---\nbody");
+      }
+      return Promise.reject(new Error("unexpected: " + p));
+    });
+
+    const result = await readProjectFile(null, "alpha");
+    expect(result).toEqual({ markdown: "---\ndisplayName: 'Alpha'\n---\nbody" });
+  });
+
+  it("Test R2: LOCAL missing — fs.readFile ENOENT → returns {markdown: ''}", async () => {
+    // fsReadFileMock default is ENOENT-reject.
+    const result = await readProjectFile(null, "alpha");
+    expect(result).toEqual({ markdown: "" });
+  });
+
+  it("Test R3: invalid slug — 'Alpha' (uppercase) throws before any I/O", async () => {
+    await expect(readProjectFile(null, "Alpha")).rejects.toThrow(
+      /invalid project slug/,
+    );
+    expect(fsReadFileMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("writeProjectFile", () => {
+  it("Test W1: LOCAL happy — writeMarkdownFileAtomic (writeFile+rename) hits $HOME/fleet/projects/alpha/project.md; server-echoes markdown", async () => {
+    fsWriteFileMock.mockImplementation(() => Promise.resolve());
+    fsRenameMock.mockImplementation(() => Promise.resolve());
+
+    const contents = "---\ndisplayName: 'Alpha'\n---\nedited body";
+    const result = await writeProjectFile(null, "alpha", contents);
+
+    // Server-echo shape.
+    expect(result).toEqual({ markdown: contents });
+
+    // .tmp write then rename (writeMarkdownFileAtomic's atomic-write pattern).
+    expect(fsWriteFileMock).toHaveBeenCalledTimes(1);
+    const tmpPath = fsWriteFileMock.mock.calls[0][0] as string;
+    expect(tmpPath.endsWith("/alpha/project.md.tmp")).toBe(true);
+    const writtenBuf = fsWriteFileMock.mock.calls[0][1] as Buffer;
+    expect(writtenBuf.toString("utf-8")).toBe(contents);
+
+    expect(fsRenameMock).toHaveBeenCalledTimes(1);
+    const renameFrom = fsRenameMock.mock.calls[0][0] as string;
+    const renameTo = fsRenameMock.mock.calls[0][1] as string;
+    expect(renameFrom.endsWith("/alpha/project.md.tmp")).toBe(true);
+    expect(renameTo.endsWith("/alpha/project.md")).toBe(true);
+    expect(renameTo).not.toContain(".tmp");
+  });
+
+  it("Test W2: LOCAL ENOENT on missing project dir — writeFile rejects, writeProjectFile propagates the error (no silent recovery)", async () => {
+    const enoent = new Error("ENOENT: no such file or directory") as NodeJS.ErrnoException;
+    enoent.code = "ENOENT";
+    fsWriteFileMock.mockImplementation(() => Promise.reject(enoent));
+
+    await expect(
+      writeProjectFile(null, "alpha", "body"),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+
+    // Rename should NOT fire when the .tmp write itself failed.
+    expect(fsRenameMock).not.toHaveBeenCalled();
+  });
+
+  it("Test W3: invalid slug — 'Alpha' (uppercase) throws before any I/O", async () => {
+    await expect(writeProjectFile(null, "Alpha", "body")).rejects.toThrow(
+      /invalid project slug/,
+    );
+    expect(fsWriteFileMock).not.toHaveBeenCalled();
+    expect(fsRenameMock).not.toHaveBeenCalled();
+  });
+
+  it("Test W4: REMOTE happy — SFTP writeFile + ext_openssh_rename hit $HOME/fleet/projects/alpha/project.md; server-echoes markdown", async () => {
+    const { conn, sftp } = buildMockConn();
+    const contents = "---\ndisplayName: 'Alpha'\n---\nedited body";
+
+    const result = await writeProjectFile(conn, "alpha", contents);
+    expect(result).toEqual({ markdown: contents });
+
+    // SFTP tmp+rename fired against the resolved $HOME/fleet/projects/... path.
+    expect(sftp.writeFile).toHaveBeenCalledTimes(1);
+    const writeTarget = sftp.writeFile.mock.calls[0][0] as string;
+    expect(writeTarget.endsWith("/fleet/projects/alpha/project.md.tmp")).toBe(true);
+
+    expect(sftp.ext_openssh_rename).toHaveBeenCalledTimes(1);
+    const renameArgs = sftp.ext_openssh_rename.mock.calls[0];
+    expect(renameArgs[0]).toBe("/home/tester/fleet/projects/alpha/project.md.tmp");
+    expect(renameArgs[1]).toBe("/home/tester/fleet/projects/alpha/project.md");
+  });
+});
+
+describe("createProject — LOCAL branch", () => {
+  it("reserved slug 'archive' → EEXIST before any I/O (route auto-suffixes to archive-2)", async () => {
+    await expect(createProject(null, "archive", "Archive")).rejects.toMatchObject({ code: "EEXIST" });
+    expect(fsMkdirMock).not.toHaveBeenCalled();
+  });
+
+  it("Test C1 (M2 fix): happy — parent recursive-mkdir, then atomic non-recursive mkdir(projectDir), then writeMarkdownFileAtomic with frontmatter displayName + empty body", async () => {
+    // Both mkdirs succeed.
+    fsMkdirMock.mockImplementation(() => Promise.resolve());
+
+    await createProject(null, "alpha", "Alpha One");
+
+    // Phase 117 M2 fix (2026-09-18): parent projects/ dir gets a
+    // recursive mkdir, then projectDir gets a non-recursive mkdir
+    // (atomic dupe-detection at the syscall level).
+    expect(fsMkdirMock).toHaveBeenCalledTimes(2);
+
+    // First call: recursive mkdir on parent projects root.
+    const parentCall = fsMkdirMock.mock.calls[0];
+    expect(typeof parentCall[0]).toBe("string");
+    expect((parentCall[0] as string).endsWith("/projects")).toBe(true);
+    expect(parentCall[1]).toMatchObject({ recursive: true });
+
+    // Second call: NON-recursive mkdir on projectDir (atomic race guard).
+    const childCall = fsMkdirMock.mock.calls[1];
+    expect((childCall[0] as string).endsWith("/alpha")).toBe(true);
+    // options either absent or explicitly not recursive:true — the M2
+    // fix passes no options at all, so childCall[1] is undefined.
+    expect(
+      childCall[1] === undefined ||
+        (childCall[1] as { recursive?: boolean }).recursive !== true,
+    ).toBe(true);
+
+    // Atomic write went through writeFile+rename.
+    expect(fsWriteFileMock).toHaveBeenCalledTimes(1);
+    const written = fsWriteFileMock.mock.calls[0][1] as Buffer;
+    const writtenStr = written.toString("utf-8");
+
+    // Frontmatter carries the displayName; body is empty per D-25.
+    expect(writtenStr).toMatch(/^---\ndisplayName: '?Alpha One'?\n---\n/);
+    // Body after frontmatter is empty (no # heading, no seed content).
+    const bodyMatch = writtenStr.match(/^---\n[\s\S]*?\n---\n([\s\S]*)$/);
+    expect(bodyMatch).not.toBeNull();
+    expect(bodyMatch![1]).toBe("");
+
+    // Rename target is $HOME/fleet/projects/alpha/project.md.
+    const renameTo = fsRenameMock.mock.calls[0][1] as string;
+    expect(renameTo.endsWith("/projects/alpha/project.md")).toBe(true);
+  });
+
+  it("Test C2 (M2 fix): rejects dupe slug — non-recursive mkdir throws EEXIST → re-thrown as EEXIST-shaped error; no write fires", async () => {
+    // Simulate: parent mkdir succeeds; child mkdir throws EEXIST
+    // (race with a concurrent create, or plain-old dupe).
+    let mkdirCall = 0;
+    fsMkdirMock.mockImplementation(() => {
+      mkdirCall += 1;
+      if (mkdirCall === 1) {
+        return Promise.resolve(); // parent -p succeeds
+      }
+      const err = new Error("EEXIST: file already exists") as NodeJS.ErrnoException;
+      err.code = "EEXIST";
+      return Promise.reject(err);
+    });
+
+    await expect(
+      createProject(null, "alpha", "Alpha One"),
+    ).rejects.toMatchObject({
+      code: "EEXIST",
+    });
+
+    // No write past the failed mkdir.
+    expect(fsWriteFileMock).not.toHaveBeenCalled();
+  });
+
+  it("Test C3: rejects invalid slug — 'Alpha' throws before any I/O", async () => {
+    await expect(createProject(null, "Alpha", "Alpha One")).rejects.toThrow(
+      /invalid project slug/,
+    );
+    // Post-M2 fix: fsStatMock is no longer consulted by createProject
+    // (only archiveProject uses it now). fsMkdirMock and fsWriteFileMock
+    // must NOT fire because slug validation happens before any I/O.
+    expect(fsMkdirMock).not.toHaveBeenCalled();
+    expect(fsWriteFileMock).not.toHaveBeenCalled();
+  });
+
+  it("Test C3b: rejects empty/oversize displayName — no I/O", async () => {
+    await expect(createProject(null, "alpha", "")).rejects.toThrow(
+      /displayName/,
+    );
+    await expect(
+      createProject(null, "alpha", "x".repeat(81)),
+    ).rejects.toThrow(/displayName/);
+    expect(fsMkdirMock).not.toHaveBeenCalled();
+    expect(fsWriteFileMock).not.toHaveBeenCalled();
+  });
+
+  // -------------------------------------------------------------------------
+  // Phase 130: users param on createProject
+  //
+  // The optional `users` parameter is populated by the auto-tag path in
+  // project-list.ts POST /projects on multi-user hosts. Verify the write
+  // path preserves it in the emitted frontmatter (non-empty array → written;
+  // empty/absent → omitted, matching Phase 129 discipline for zero-migration
+  // on single-user hosts).
+  // -------------------------------------------------------------------------
+  it("Test C3c: users non-empty — written into frontmatter alongside displayName", async () => {
+    fsMkdirMock.mockImplementation(() => Promise.resolve());
+    await createProject(null, "alpha", "Alpha One", ["alice"]);
+
+    const written = fsWriteFileMock.mock.calls[0][1] as Buffer;
+    const writtenStr = written.toString("utf-8");
+    // Frontmatter should include both displayName and users.
+    expect(writtenStr).toMatch(/displayName: '?Alpha One'?/);
+    expect(writtenStr).toMatch(/users:/);
+    expect(writtenStr).toMatch(/- alice/);
+  });
+
+  it("Test C3d: users empty array — OMITTED from frontmatter (byte-identical to no-users case)", async () => {
+    fsMkdirMock.mockImplementation(() => Promise.resolve());
+    await createProject(null, "alpha", "Alpha One", []);
+
+    const written = fsWriteFileMock.mock.calls[0][1] as Buffer;
+    const writtenStr = written.toString("utf-8");
+    // No users key at all — matches Phase 129 "single-user hosts stay silent".
+    expect(writtenStr).not.toMatch(/users:/);
+  });
+
+  it("Test C3e: users null — OMITTED from frontmatter", async () => {
+    fsMkdirMock.mockImplementation(() => Promise.resolve());
+    await createProject(null, "alpha", "Alpha One", null);
+
+    const written = fsWriteFileMock.mock.calls[0][1] as Buffer;
+    const writtenStr = written.toString("utf-8");
+    expect(writtenStr).not.toMatch(/users:/);
+  });
+
+  it("Test C3f: users omitted param — byte-identical to explicit-null case (backward-compat)", async () => {
+    fsMkdirMock.mockImplementation(() => Promise.resolve());
+    await createProject(null, "alpha", "Alpha One");
+
+    const written = fsWriteFileMock.mock.calls[0][1] as Buffer;
+    const writtenStr = written.toString("utf-8");
+    expect(writtenStr).not.toMatch(/users:/);
+    // Pre-130 shape preserved: just displayName in frontmatter.
+    expect(writtenStr).toMatch(/^---\ndisplayName: '?Alpha One'?\n---\n/);
+  });
+});
+
+describe("createProject — REMOTE branch", () => {
+  it("Test C4 (M2 fix + H3 fix): happy — single-shot `mkdir -p PARENT && mkdir CHILD` combo (atomic race guard) with double-quoted $HOME, then writeMarkdownFileAtomic REMOTE", async () => {
+    const { conn, sftp, sftpCalls } = buildMockConn();
+    const execedCmds: string[] = [];
+    execCommandMock.mockImplementation((_conn: unknown, cmd: string) => {
+      execedCmds.push(cmd);
+      return Promise.resolve("");
+    });
+
+    await createProject(conn, "alpha", "Alpha One");
+
+    // Phase 117 M2 fix (2026-09-18): pre-fix, there were TWO execs —
+    // probe (test -d) then mkdir -p. Post-fix, there is ONE combined
+    // exec that ensures the parent dir exists (recursive -p) and then
+    // creates the child atomically (non-recursive mkdir). If the child
+    // already exists, mkdir fails with a non-zero exit that
+    // execWithTimeout turns into a throw — we re-map to EEXIST.
+    expect(execCommandMock).toHaveBeenCalledTimes(1);
+    const cmd = execedCmds[0];
+
+    // Phase 117 H3 fix (2026-09-18): double-quoted $HOME, no single-
+    // quote wrapping.
+    expect(cmd).toContain('mkdir -p "$HOME/fleet/projects"');
+    expect(cmd).toContain('mkdir "$HOME/fleet/projects/alpha"');
+    // Regression: MUST NOT single-quote-wrap $HOME.
+    expect(cmd).not.toContain("'$HOME");
+    // Regression (M2): the child mkdir MUST be non-recursive — the
+    // whole point of the atomic dupe-detection.
+    expect(cmd).not.toMatch(/mkdir -p "\$HOME\/fleet\/projects\/alpha"/);
+
+    // Atomic write REMOTE branch fired.
+    expect(sftp.ext_openssh_rename).toHaveBeenCalledTimes(1);
+    const renameArgs = sftp.ext_openssh_rename.mock.calls[0];
+    expect(renameArgs[1]).toBe("/home/tester/fleet/projects/alpha/project.md");
+
+    // Written contents carry displayName frontmatter.
+    const writeCall = sftpCalls.find((c) => c.op === "writeFile");
+    expect(writeCall).toBeDefined();
+    const writeStr = (writeCall!.args[1] as Buffer).toString("utf-8");
+    expect(writeStr).toMatch(/displayName: '?Alpha One'?/);
+  });
+
+  it("Test C5 (M2 fix): REMOTE rejects dupe — mkdir throws 'File exists' → re-mapped to EEXIST-shaped throw; no write fires", async () => {
+    const { conn, sftp } = buildMockConn();
+    execCommandMock.mockImplementation((_conn: unknown, cmd: string) => {
+      if (cmd.includes("mkdir")) {
+        return Promise.reject(
+          new Error(
+            `mkdir: cannot create directory '/home/tester/fleet/projects/alpha': File exists`,
+          ),
+        );
+      }
+      return Promise.resolve("");
+    });
+
+    await expect(createProject(conn, "alpha", "Alpha One")).rejects.toMatchObject({
+      code: "EEXIST",
+    });
+
+    // SFTP writeFile MUST NOT have fired.
+    expect(sftp.writeFile).not.toHaveBeenCalled();
+  });
+});
+
+describe("archiveProject — LOCAL branch", () => {
+  it("Test A1: happy — mkdir archive/ recursive, then rename projects/<slug> → projects/archive/<slug>", async () => {
+    await archiveProject(null, "alpha");
+
+    // archive/ dir created with recursive:true.
+    expect(fsMkdirMock).toHaveBeenCalled();
+    const mkdirCall = fsMkdirMock.mock.calls.find(
+      (c) => typeof c[0] === "string" && (c[0] as string).endsWith("/archive"),
+    );
+    expect(mkdirCall).toBeDefined();
+    expect(mkdirCall![1]).toMatchObject({ recursive: true });
+
+    // rename from projects/alpha → projects/archive/alpha.
+    expect(fsRenameMock).toHaveBeenCalledTimes(1);
+    const [renameFrom, renameTo] = fsRenameMock.mock.calls[0];
+    expect((renameFrom as string).endsWith("/projects/alpha")).toBe(true);
+    expect((renameTo as string).endsWith("/projects/archive/alpha")).toBe(true);
+  });
+
+  it("Test A2: invalid slug — '../etc' throws before any I/O (path-traversal defense)", async () => {
+    await expect(archiveProject(null, "../etc")).rejects.toThrow(
+      /invalid project slug/,
+    );
+    expect(fsMkdirMock).not.toHaveBeenCalled();
+    expect(fsRenameMock).not.toHaveBeenCalled();
+  });
+
+  it("Test A2b (M1 fix): archive-twice → renames to a SUFFIXED archive dest, never onto the existing one", async () => {
+    // archive/alpha exists (earlier archive of this slug); the suffixed
+    // dest does not.
+    fsStatMock.mockImplementationOnce(() => Promise.resolve({ isDirectory: () => true }));
+    await archiveProject(null, "alpha");
+    expect(fsRenameMock).toHaveBeenCalledTimes(1);
+    const renameTo = fsRenameMock.mock.calls[0][1] as string;
+    expect(renameTo).toMatch(/\/projects\/archive\/alpha-\d{8}T\d{6}Z$/);
+  });
+
+  it("Test A2c: suffixed dest ALSO exists → EEXIST and no rename (nested-corruption defense)", async () => {
+    fsStatMock.mockImplementation(() => Promise.resolve({ isDirectory: () => true }));
+    await expect(archiveProject(null, "alpha")).rejects.toMatchObject({ code: "EEXIST" });
+    expect(fsRenameMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("archiveProject — REMOTE branch", () => {
+  it("Test A3 (H3 fix): single exec — mkdir -p archive, collision-suffix guard, mv, all with double-quoted $HOME", async () => {
+    const { conn } = buildMockConn();
+    const execedCmds: string[] = [];
+    execCommandMock.mockImplementation((_conn: unknown, cmd: string) => {
+      execedCmds.push(cmd);
+      return Promise.resolve("ok\n");
+    });
+
+    await archiveProject(conn, "alpha");
+
+    expect(execedCmds).toHaveLength(1);
+    const cmd = execedCmds[0];
+    expect(cmd).toContain('mkdir -p "$HOME/fleet/projects/archive"');
+    expect(cmd).toContain('d="$HOME/fleet/projects/archive/alpha"');
+    // Collision → suffix; still-colliding → refuse rather than nest.
+    expect(cmd).toMatch(/if \[ -e "\$d" \]; then d="\$d-\d{8}T\d{6}Z"; fi/);
+    expect(cmd).toContain('if [ -e "$d" ]; then echo EEXIST; exit 17; fi');
+    expect(cmd).toContain('mv "$HOME/fleet/projects/alpha" "$d"');
+    // Regression: MUST NOT single-quote-wrap $HOME.
+    expect(cmd).not.toContain("'$HOME");
+  });
+
+  it("Test A3b (M1 fix): REMOTE shell reports EEXIST → throws EEXIST-coded error", async () => {
+    const { conn } = buildMockConn();
+    execCommandMock.mockImplementation(() => Promise.resolve("EEXIST\n"));
+    await expect(archiveProject(conn, "alpha")).rejects.toMatchObject({ code: "EEXIST" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Nested projects — `parent:` read, create, and line-based set/clear
+// ---------------------------------------------------------------------------
+
+describe("listProjects — parent frontmatter (nested projects)", () => {
+  function stubFiles(files: Record<string, string>) {
+    fsReaddirMock.mockImplementation((p: string) => {
+      if (typeof p === "string" && p.endsWith("projects")) {
+        return Promise.resolve(Object.keys(files).map((n) => makeDirent(n, true)));
+      }
+      return Promise.resolve([]);
+    });
+    fsReadFileMock.mockImplementation((p: string) => {
+      for (const [slug, body] of Object.entries(files)) {
+        if (typeof p === "string" && p.includes(`/${slug}/project.md`)) {
+          return Promise.resolve(body);
+        }
+      }
+      const err = new Error("ENOENT") as NodeJS.ErrnoException;
+      err.code = "ENOENT";
+      return Promise.reject(err);
+    });
+  }
+
+  it("valid slug surfaces; self, malformed, non-string, absent → null", async () => {
+    stubFiles({
+      kid: "---\ndisplayName: Kid\nparent: top\n---\n",
+      quoted: "---\ndisplayName: Q\nparent: 'top'\n---\n",
+      selfie: "---\nparent: selfie\n---\n",
+      bad: "---\nparent: Not_A_Slug\n---\n",
+      num: "---\nparent: 42\n---\n",
+      top: "---\ndisplayName: Top\n---\n",
+    });
+    const result = await listProjects(null);
+    expect(Object.fromEntries(result.map((r) => [r.slug, r.parent]))).toEqual({
+      bad: null,
+      kid: "top",
+      num: null,
+      quoted: "top",
+      selfie: null,
+      top: null,
+    });
+  });
+});
+
+describe("createProject — parent (nested projects)", () => {
+  it("writes parent right after displayName", async () => {
+    fsMkdirMock.mockImplementation(() => Promise.resolve());
+    await createProject(null, "kid", "Kid", ["alice"], "top");
+    const written = (fsWriteFileMock.mock.calls[0][1] as Buffer).toString("utf-8");
+    expect(written).toMatch(/^---\ndisplayName: '?Kid'?\nparent: top\nusers:\n {2}- alice\n---\n$/);
+  });
+
+  it("null / omitted parent → no parent line", async () => {
+    fsMkdirMock.mockImplementation(() => Promise.resolve());
+    await createProject(null, "kid", "Kid", null, null);
+    const written = (fsWriteFileMock.mock.calls[0][1] as Buffer).toString("utf-8");
+    expect(written).not.toMatch(/parent:/);
+  });
+
+  it("invalid or self parent → throws before any I/O", async () => {
+    await expect(createProject(null, "kid", "Kid", null, "../x")).rejects.toThrow(
+      /invalid parent/,
+    );
+    await expect(createProject(null, "kid", "Kid", null, "kid")).rejects.toThrow(
+      /invalid parent/,
+    );
+    expect(fsMkdirMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("applyProjectParentLine — line-based, byte-preserving", () => {
+  const supervised =
+    "---\n" +
+    "displayName: 'Trip Planning'\n" +
+    "users: [alice]\n" +
+    "members:  # auto-maintained by agent-supervisor from identities' project: — edits are overwritten\n" +
+    "  - ada\n" +
+    "  - bob\n" +
+    "---\n" +
+    "\n# Body\n\nparent: this line is body prose, not frontmatter\n";
+
+  it("set: inserts after displayName; every other byte preserved", () => {
+    const out = applyProjectParentLine(supervised, "travel");
+    expect(out).toBe(
+      supervised.replace(
+        "displayName: 'Trip Planning'\n",
+        "displayName: 'Trip Planning'\nparent: travel\n",
+      ),
+    );
+  });
+
+  it("clear after set round-trips to the original bytes exactly", () => {
+    const set = applyProjectParentLine(supervised, "travel");
+    expect(applyProjectParentLine(set, null)).toBe(supervised);
+  });
+
+  it("replace: removes every existing top-level parent line, writes one", () => {
+    const md =
+      "---\nparent: old\ndisplayName: X\nnote: keep\nparent: older # dup\n---\nbody\n";
+    expect(applyProjectParentLine(md, "new")).toBe(
+      "---\ndisplayName: X\nparent: new\nnote: keep\n---\nbody\n",
+    );
+  });
+
+  it("no displayName → inserted right after the opening fence", () => {
+    expect(applyProjectParentLine("---\nusers: [a]\n---\nb", "p")).toBe(
+      "---\nparent: p\nusers: [a]\n---\nb",
+    );
+  });
+
+  it("empty frontmatter block", () => {
+    expect(applyProjectParentLine("---\n---\nbody", "p")).toBe(
+      "---\nparent: p\n---\nbody",
+    );
+    expect(applyProjectParentLine("---\nparent: p\n---\nbody", null)).toBe(
+      "---\n---\nbody",
+    );
+  });
+
+  it("no frontmatter: set creates one; clear is a no-op", () => {
+    expect(applyProjectParentLine("just prose\n", "p")).toBe(
+      "---\nparent: p\n---\njust prose\n",
+    );
+    expect(applyProjectParentLine("", "p")).toBe("---\nparent: p\n---\n");
+    expect(applyProjectParentLine("just prose\n", null)).toBe("just prose\n");
+  });
+
+  it("CRLF file: inserted line uses CRLF, other lines untouched", () => {
+    const md = "---\r\ndisplayName: X\r\nmembers: []  # auto\r\n---\r\nbody\r\n";
+    const out = applyProjectParentLine(md, "p");
+    expect(out).toBe(
+      "---\r\ndisplayName: X\r\nparent: p\r\nmembers: []  # auto\r\n---\r\nbody\r\n",
+    );
+    expect(applyProjectParentLine(out, null)).toBe(md);
+  });
+
+  it("indented parent: keys (nested YAML) are not touched", () => {
+    const md = "---\ndisplayName: X\nmeta:\n  parent: deep\n---\n";
+    expect(applyProjectParentLine(md, null)).toBe(md);
+  });
+
+  it("UTF-8 BOM before the fence is kept and the fence still recognized", () => {
+    const md = "\uFEFF---\ndisplayName: X\n---\n";
+    expect(applyProjectParentLine(md, "p")).toBe(
+      "\uFEFF---\ndisplayName: X\nparent: p\n---\n",
+    );
+  });
+  it("multi-line displayName block value: inserted after the whole value", () => {
+    const md = "---\ndisplayName: >-\n  Long\n  Name\nusers: [a]\n---\n";
+    expect(applyProjectParentLine(md, "p")).toBe(
+      "---\ndisplayName: >-\n  Long\n  Name\nparent: p\nusers: [a]\n---\n",
+    );
+  });
+
+  it("opening fence with no closing fence: refuses instead of mangling", () => {
+    expect(() => applyProjectParentLine("---\ndisplayName: X\nbody\n", "p")).toThrow(
+      /not closed/,
+    );
+  });
+});
+
+describe("setProjectParentField", () => {
+  it("LOCAL: read → line edit → atomic write of project.md", async () => {
+    fsReadFileMock.mockResolvedValue("---\ndisplayName: Kid\n---\nbody");
+    fsWriteFileMock.mockImplementation(() => Promise.resolve());
+    fsRenameMock.mockImplementation(() => Promise.resolve());
+    const result = await setProjectParentField(null, "kid", "top");
+    expect(result.markdown).toBe("---\ndisplayName: Kid\nparent: top\n---\nbody");
+    const tmpPath = fsWriteFileMock.mock.calls[0][0] as string;
+    expect(tmpPath.endsWith("/kid/project.md.tmp")).toBe(true);
+  });
+
+  it("no-op when the file already says the same thing (no write)", async () => {
+    fsReadFileMock.mockResolvedValue("---\ndisplayName: Kid\n---\n");
+    await setProjectParentField(null, "kid", null);
+    expect(fsWriteFileMock).not.toHaveBeenCalled();
+  });
+
+  it("invalid slug / parent / self → throws before any I/O", async () => {
+    await expect(setProjectParentField(null, "Kid", "top")).rejects.toThrow();
+    await expect(setProjectParentField(null, "kid", "../x")).rejects.toThrow();
+    await expect(setProjectParentField(null, "kid", "kid")).rejects.toThrow();
+    expect(fsReadFileMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("nested projects — review fixes (reader)", () => {
+  it("a leading BOM doesn't hide the frontmatter", () => {
+    const meta = projectMetaFromMarkdown(
+      "kid",
+      "\uFEFF---\ndisplayName: Kid\nusers: [alice]\nparent: top\n---\n",
+    );
+    expect(meta).toEqual({ slug: "kid", displayName: "Kid", users: ["alice"], parent: "top" });
+  });
+
+  it("parent lands after a folded displayName even across a blank line in it", () => {
+    const md = "---\ndisplayName: >-\n  line one\n\n  line two\nmembers: []\n---\n";
+    const out = applyProjectParentLine(md, "top");
+    expect(out).toBe(
+      "---\ndisplayName: >-\n  line one\n\n  line two\nparent: top\nmembers: []\n---\n",
+    );
+    expect(projectMetaFromMarkdown("kid", out).parent).toBe("top");
+  });
+
+  it("a blank line after displayName that isn't followed by indentation ends it", () => {
+    const md = "---\ndisplayName: Kid\n\nmembers: []\n---\n";
+    expect(applyProjectParentLine(md, "top")).toBe(
+      "---\ndisplayName: Kid\nparent: top\n\nmembers: []\n---\n",
+    );
+  });
+
+  it("applyProjectUsersBlock replaces flow or block users, keeping every other byte", () => {
+    const flow = "---\ndisplayName: C\nparent: p\nusers: [x]\nmembers: []\n---\nbody\n";
+    expect(applyProjectUsersBlock(flow, ["alice", "bob"])).toBe(
+      "---\ndisplayName: C\nparent: p\nusers:\n  - alice\n  - bob\nmembers: []\n---\nbody\n",
+    );
+    const block = "---\ndisplayName: C\nusers:\n  - x\n\n  # c\n  - y\nmembers: []\n---\n";
+    expect(applyProjectUsersBlock(block, ["alice"])).toBe(
+      "---\ndisplayName: C\nusers:\n  - alice\nmembers: []\n---\n",
+    );
+  });
+
+  it("applyProjectUsersBlock inserts after displayName/parent when absent; quotes odd names", () => {
+    const md = "---\ndisplayName: C\nparent: p\nmembers:\n  - a1\n---\n";
+    const out = applyProjectUsersBlock(md, ["ali ce"]);
+    expect(out).toBe(
+      '---\ndisplayName: C\nparent: p\nusers:\n  - "ali ce"\nmembers:\n  - a1\n---\n',
+    );
+    expect(projectMetaFromMarkdown("c", out).users).toEqual(["ali ce"]);
+    expect(applyProjectUsersBlock("no frontmatter", ["a"])).toBe("no frontmatter");
+  });
+});

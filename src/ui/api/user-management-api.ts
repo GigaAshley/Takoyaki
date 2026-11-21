@@ -1,0 +1,327 @@
+import { authApi, handleApiError } from "@/main-axios";
+
+// USER MANAGEMENT
+// ============================================================================
+
+// Backing route: GET /users/list (admin only) — every user with the fields
+// the admin panel shows.
+export interface AdminUser {
+  id: string;
+  username: string;
+  isAdmin: boolean;
+  isOidc: boolean;
+  totpEnabled: boolean;
+  mxid: string | null;
+  phoneE164: string | null;
+  avatarPath: string | null;
+  /** Push-notification grant. Admins always have notifications regardless. */
+  notificationsEnabled: boolean;
+}
+
+export async function getUserList(): Promise<{ users: AdminUser[] }> {
+  try {
+    const response = await authApi.get("/users/list");
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "fetch user list");
+  }
+}
+
+// ─── Phase 38: identity sharing — picker-facing users list ──────────────────
+// Backing route: src/backend/database/routes/user-admin-routes.ts (/users/list-basic)
+// GET /users/list-basic → { users: [{id, username, mxid}, ...] }
+// Every user OTHER than the requester (server-side ne(users.id, requester)).
+// Empty array on single-user deployments — picker hides itself in that case.
+//
+// Distinct from /users/list (admin-gated, exposes isAdmin/isOidc/etc.); this
+// route is reachable by any authenticated user and is scoped to id+username+mxid
+// only, enforced by an explicit-columns drizzle select on the backend.
+//
+// Phase 91-00 widening: mxid added as string | null. Phase 88 slice A mints
+// mxids at POST /users/create; pre-Phase-88 users may have mxid=null. Slice
+// C's new-conversation modal (Phase 91) filters mxid-less users out of the
+// Humans picker — they cannot participate in a relay-mediated room by
+// construction.
+//
+
+export interface BasicUser {
+  id: string;
+  username: string;
+  /** Phase 88 slice A relay identity (`@localpart_human:server`).
+   *  Null for pre-Phase-88 users who were never minted a relay
+   *  identity. Slice C's new-conversation modal (Phase 91) filters
+   *  mxid-less users out of the Humans picker — they cannot
+   *  participate in a relay-mediated room by construction. */
+  mxid: string | null;
+}
+
+/**
+ * Fetch the picker-facing user list (every user except the requester).
+ *
+ * Returns `BasicUser[]` where each entry carries `{id, username, mxid}`.
+ * `mxid` is the Phase 88 relay identity string for Phase 88+ users, or
+ * null for pre-Phase-88 users who were never minted a relay identity.
+ * Phase 91 slice C's new-conversation modal filters mxid-less users out of
+ * the Humans picker — they cannot participate in relay-mediated rooms by
+ * construction (Phase 88 didn't mint a Matrix identity for them).
+ */
+export async function getUsersListBasic(): Promise<BasicUser[]> {
+  try {
+    const response = await authApi.get("/users/list-basic");
+    return (response.data as { users: BasicUser[] }).users;
+  } catch (error) {
+    handleApiError(error, "list basic users");
+  }
+}
+
+export async function getSessions(): Promise<{
+  sessions: {
+    id: string;
+    userId: string;
+    username?: string;
+    deviceType: string;
+    deviceInfo: string;
+    createdAt: string;
+    expiresAt: string;
+    lastActiveAt: string;
+    isRevoked?: boolean;
+    isCurrentSession?: boolean;
+  }[];
+}> {
+  try {
+    const response = await authApi.get("/users/sessions");
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "fetch sessions");
+  }
+}
+
+export async function revokeSession(
+  sessionId: string,
+): Promise<{ success: boolean; message: string }> {
+  try {
+    const response = await authApi.delete(`/users/sessions/${sessionId}`);
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "revoke session");
+  }
+}
+
+export async function revokeAllUserSessions(
+  userId: string,
+  exceptCurrent = false,
+): Promise<{ success: boolean; message: string }> {
+  try {
+    const response = await authApi.post("/users/sessions/revoke-all", {
+      targetUserId: userId,
+      exceptCurrent,
+    });
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "revoke all user sessions");
+  }
+}
+
+export interface ApiKey {
+  id: string;
+  name: string;
+  userId: string;
+  username: string | null;
+  tokenPrefix: string;
+  createdAt: string;
+  expiresAt: string | null;
+  lastUsedAt: string | null;
+  isActive: boolean;
+}
+
+export interface CreatedApiKey extends ApiKey {
+  token: string;
+}
+
+export async function createApiKey(
+  name: string,
+  userId: string,
+  expiresAt?: string,
+): Promise<CreatedApiKey> {
+  try {
+    // No end date means "never expires", chosen on purpose by the caller.
+    const response = await authApi.post("/users/api-keys", {
+      name,
+      userId,
+      ...(expiresAt ? { expiresAt } : { neverExpires: true }),
+    });
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "create API key");
+  }
+}
+
+export async function getApiKeys(): Promise<{ apiKeys: ApiKey[] }> {
+  try {
+    const response = await authApi.get("/users/api-keys");
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "fetch API keys");
+  }
+}
+
+export async function deleteApiKey(
+  keyId: string,
+): Promise<{ success: boolean }> {
+  try {
+    const response = await authApi.delete(`/users/api-keys/${keyId}`);
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "delete API key");
+  }
+}
+
+export async function makeUserAdmin(
+  userId: string,
+): Promise<Record<string, unknown>> {
+  try {
+    const response = await authApi.post("/users/make-admin", { userId });
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "make user admin");
+  }
+}
+
+export async function removeAdminStatus(
+  userId: string,
+): Promise<Record<string, unknown>> {
+  try {
+    const response = await authApi.post("/users/remove-admin", { userId });
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "remove admin status");
+  }
+}
+
+export async function setUserMxid(
+  userId: string,
+  mxid: string,
+): Promise<Record<string, unknown>> {
+  try {
+    const response = await authApi.post(
+      `/users/${encodeURIComponent(userId)}/mxid`,
+      { mxid },
+    );
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "set user mxid");
+  }
+}
+
+export async function setUserPhone(
+  userId: string,
+  phoneE164: string,
+): Promise<Record<string, unknown>> {
+  try {
+    const response = await authApi.post(
+      `/users/${encodeURIComponent(userId)}/phone`,
+      { phoneE164 },
+    );
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "set user phone");
+  }
+}
+
+export async function setUserNotificationsEnabled(
+  userId: string,
+  enabled: boolean,
+): Promise<Record<string, unknown>> {
+  try {
+    const response = await authApi.post(
+      `/users/${encodeURIComponent(userId)}/notifications-enabled`,
+      { enabled },
+    );
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "set user notifications access");
+  }
+}
+
+export async function deleteUser(
+  username: string,
+): Promise<Record<string, unknown>> {
+  try {
+    const response = await authApi.delete("/users/delete-user", {
+      data: { username },
+    });
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "delete user");
+  }
+}
+
+export async function deleteAccount(
+  password: string,
+): Promise<Record<string, unknown>> {
+  try {
+    const response = await authApi.delete("/users/delete-account", {
+      data: { password },
+    });
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "delete account");
+  }
+}
+
+export async function getOidcAutoProvision(): Promise<{ enabled: boolean }> {
+  try {
+    const response = await authApi.get("/users/oidc-auto-provision");
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "check OIDC auto-provision status");
+  }
+}
+
+export async function updateOidcAutoProvision(
+  enabled: boolean,
+): Promise<Record<string, unknown>> {
+  try {
+    const response = await authApi.patch("/users/oidc-auto-provision", {
+      enabled,
+    });
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "update OIDC auto-provision");
+  }
+}
+
+export async function updatePasswordLoginAllowed(
+  allowed: boolean,
+): Promise<{ allowed: boolean }> {
+  try {
+    const response = await authApi.patch("/users/password-login-allowed", {
+      allowed,
+    });
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "update password login allowed");
+  }
+}
+
+export async function updateOIDCConfig(
+  config: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  try {
+    const response = await authApi.post("/users/oidc-config", config);
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "update OIDC config");
+  }
+}
+
+export async function disableOIDCConfig(): Promise<Record<string, unknown>> {
+  try {
+    const response = await authApi.delete("/users/oidc-config");
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "disable OIDC config");
+  }
+}
+
+// ============================================================================

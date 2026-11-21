@@ -1,0 +1,965 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+# Test driver for Phase 111-01 appearance additions to fleet-status-sweep.py.
+#
+# Covers the new _read_frontmatter_cosmetics / _read_role_cosmetics /
+# _build_identity_line appearance paths with a HOME-scoped scratch fixture.
+# Every case is unreachable from the TypeScript fixture tests — the TS side
+# tests the sweep-schema parser; this tests the Python emitter and its
+# hand-rolled frontmatter parser.
+#
+# Exits 0 on all-pass; exits 1 on any failure with a diagnostic naming the
+# failing test.
+#
+# Usage: bash substrate/scripts/tests/fleet-status-sweep-appearance.sh
+#   Run from the repo root.
+#
+# Hermetic environment contract:
+#   The sweep reads $HOME for its identity and role paths. This driver builds a
+#   scratch tree at $FIXTURE and runs each test with HOME="$FIXTURE" so the real
+#   ~/fleet/identities is never touched. Because $FIXTURE/.claude/sessions/
+#   does not exist, the sweep emits only identity lines (no pid lines). The
+#   scratch tree is removed on EXIT by a trap.
+#
+# Requirements: bash, python3 (same python3 used for the sweep script itself).
+
+set -u  # -e is NOT set — the script uses explicit assert helpers so a failing
+        # assert does not silently skip subsequent tests.
+
+# ---- path resolution ----
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+SWEEP="$REPO_ROOT/substrate/scripts/fleet-status-sweep.py"
+
+if [ ! -f "$SWEEP" ]; then
+  printf 'FATAL: sweep script not found at %s\n' "$SWEEP" >&2
+  exit 1
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+  printf 'FATAL: python3 not found — required for this test driver\n' >&2
+  exit 1
+fi
+
+# ---- scratch fixture ----
+FIXTURE=""
+FIXTURE=$(mktemp -d)
+
+cleanup() {
+  [ -n "$FIXTURE" ] && [ -d "$FIXTURE" ] && rm -rf "$FIXTURE"
+}
+trap cleanup EXIT
+
+# ---- test state ----
+PASS=0
+FAIL=0
+FAILURES=()
+
+# ---- helpers ----
+
+fail() {
+  local msg="${1:-unknown failure}"
+  FAILURES+=("${CURRENT_TEST:-unknown}: $msg")
+  FAIL=$((FAIL + 1))
+}
+
+assert_eq() {
+  local expected="$1" actual="$2" msg="${3:-assert_eq}"
+  if [ "$expected" != "$actual" ]; then
+    fail "$msg: expected='$expected' got='$actual'"
+  fi
+}
+
+# Run a test function, record pass/fail.
+run_test() {
+  local test_fn="$1"
+  local before_fail=$FAIL
+  CURRENT_TEST="$test_fn"
+
+  # Reset the fixture for every test so tests are independent.
+  rm -rf "${FIXTURE:?}"/*
+
+  "$test_fn"
+
+  if [ "$FAIL" -eq "$before_fail" ]; then
+    PASS=$((PASS + 1))
+    printf 'PASS  %s\n' "$test_fn"
+  else
+    printf 'FAIL  %s\n' "$test_fn"
+  fi
+}
+
+# run_sweep: run the sweep with HOME=$FIXTURE; capture stdout.
+# Stderr goes to a temp file so we can check it separately from stdout.
+LAST_STDERR=""
+run_sweep() {
+  local stderr_file
+  stderr_file=$(mktemp)
+  LAST_STDERR=$stderr_file
+  HOME="$FIXTURE" python3 "$SWEEP" 2>"$stderr_file"
+}
+
+# make_identity: create a fixture identity folder.
+# Usage: make_identity <name> [md_content]
+#   If md_content is omitted, no .md file is created.
+make_identity() {
+  local name="$1"
+  local md="${2:-}"
+  mkdir -p "$FIXTURE/fleet/identities/$name"
+  if [ -n "$md" ]; then
+    printf '%s' "$md" > "$FIXTURE/fleet/identities/$name/$name.md"
+  fi
+}
+
+# make_role: create a fixture role folder.
+# Usage: make_role <name> [md_content]
+make_role() {
+  local name="$1"
+  local md="${2:-}"
+  mkdir -p "$FIXTURE/fleet/roles/$name"
+  if [ -n "$md" ]; then
+    printf '%s' "$md" > "$FIXTURE/fleet/roles/$name/$name.md"
+  fi
+}
+
+# assert_identity_field: assert that a field on a named identity's JSONL line has a given value.
+# Uses python3 for structural assertion rather than fragile string greps.
+# Usage: assert_identity_field <stdout_var> <identity> <field_path> <expected_json>
+#   field_path: dot-separated key path e.g. "role" or "identity_cosmetics.displayName"
+assert_identity_field() {
+  local stdout_var="$1" identity="$2" field_path="$3" expected_json="$4"
+  local result
+  result=$(printf '%s' "$stdout_var" | python3 -c "
+import sys, json
+lines = [l for l in sys.stdin.read().splitlines() if l.strip()]
+target = None
+for l in lines:
+    obj = json.loads(l)
+    if obj.get('line_kind') == 'identity' and obj.get('identity') == '$identity':
+        target = obj
+        break
+if target is None:
+    print('MISSING_LINE')
+    sys.exit(0)
+path = '$field_path'.split('.')
+node = target
+for k in path:
+    if node is None or not isinstance(node, dict):
+        node = None
+        break
+    node = node.get(k)
+print(json.dumps(node))
+" 2>/dev/null)
+  if [ "$result" = "MISSING_LINE" ]; then
+    fail "assert_identity_field($identity.$field_path): identity line missing from output"
+  elif [ "$result" != "$expected_json" ]; then
+    fail "assert_identity_field($identity.$field_path): expected=$expected_json got=$result"
+  fi
+}
+
+# assert_identity_has_field: assert that a field EXISTS on the identity line (not null/absent).
+assert_identity_has_field() {
+  local stdout_var="$1" identity="$2" field_path="$3"
+  local result
+  result=$(printf '%s' "$stdout_var" | python3 -c "
+import sys, json
+lines = [l for l in sys.stdin.read().splitlines() if l.strip()]
+for l in lines:
+    obj = json.loads(l)
+    if obj.get('line_kind') == 'identity' and obj.get('identity') == '$identity':
+        path = '$field_path'.split('.')
+        node = obj
+        for k in path:
+            if node is None or not isinstance(node, dict):
+                node = None
+                break
+            node = node.get(k)
+        print('present' if node is not None else 'absent')
+        sys.exit(0)
+print('MISSING_LINE')
+" 2>/dev/null)
+  if [ "$result" = "MISSING_LINE" ]; then
+    fail "assert_identity_has_field($identity.$field_path): identity line missing"
+  elif [ "$result" != "present" ]; then
+    fail "assert_identity_has_field($identity.$field_path): field is absent or null"
+  fi
+}
+
+# assert_identity_no_field: assert that a field is ABSENT (null/missing) on the identity line.
+assert_identity_no_field() {
+  local stdout_var="$1" identity="$2" field_path="$3"
+  local result
+  result=$(printf '%s' "$stdout_var" | python3 -c "
+import sys, json
+lines = [l for l in sys.stdin.read().splitlines() if l.strip()]
+for l in lines:
+    obj = json.loads(l)
+    if obj.get('line_kind') == 'identity' and obj.get('identity') == '$identity':
+        path = '$field_path'.split('.')
+        node = obj
+        for k in path:
+            if node is None or not isinstance(node, dict):
+                node = None
+                break
+            node = node.get(k)
+        print('absent' if node is None else 'present')
+        sys.exit(0)
+print('MISSING_LINE')
+" 2>/dev/null)
+  if [ "$result" = "MISSING_LINE" ]; then
+    fail "assert_identity_no_field($identity.$field_path): identity line missing"
+  elif [ "$result" != "absent" ]; then
+    fail "assert_identity_no_field($identity.$field_path): field was present but expected absent"
+  fi
+}
+
+# assert_line_count: assert that the number of identity lines equals expected.
+assert_identity_line_count() {
+  local stdout_var="$1" expected="$2"
+  local count
+  count=$(printf '%s' "$stdout_var" | python3 -c "
+import sys, json
+lines = [l for l in sys.stdin.read().splitlines() if l.strip()]
+print(sum(1 for l in lines if json.loads(l).get('line_kind') == 'identity'))
+" 2>/dev/null)
+  if [ "$count" != "$expected" ]; then
+    fail "assert_identity_line_count: expected=$expected got=$count"
+  fi
+}
+
+# ============================================================
+# TEST CASES
+# ============================================================
+
+# Case 1: Full inheritance case.
+# Identity with roles: + displayName: + task: and NO title/colorHue;
+# role with title: + colorHue:. Assert identity_cosmetics has displayName and
+# task but NOT title/colorHue; role_cosmetics has title and colorHue.
+# Mirrors a live shape (pixel inherits from box-maintainer).
+test_case_01_full_inheritance() {
+  make_identity "archie" "---
+roles: archivist
+displayName: Archie
+task: catalog things: every day
+---
+body text here
+"
+  make_role "archivist" "---
+title: Archivist
+colorHue: 240
+---
+role body
+"
+  local out
+  out=$(run_sweep)
+  assert_identity_field "$out" "archie" "role" '"archivist"'
+  assert_identity_has_field "$out" "archie" "identity_cosmetics.displayName"
+  assert_identity_field "$out" "archie" "identity_cosmetics.displayName" '"Archie"'
+  assert_identity_has_field "$out" "archie" "identity_cosmetics.task"
+  assert_identity_field "$out" "archie" "identity_cosmetics.task" '"catalog things: every day"'
+  assert_identity_no_field "$out" "archie" "identity_cosmetics.title"
+  assert_identity_no_field "$out" "archie" "identity_cosmetics.colorHue"
+  assert_identity_has_field "$out" "archie" "role_cosmetics.title"
+  assert_identity_field "$out" "archie" "role_cosmetics.title" '"Archivist"'
+  assert_identity_field "$out" "archie" "role_cosmetics.colorHue" '240'
+}
+
+# Case 2: Read-once-per-role.
+# Three identities sharing one role. Assert all three lines carry an identical
+# role_cosmetics object. Also assert the emitted line count is exactly 3.
+test_case_02_read_once_per_role() {
+  local role_md="---
+title: Shared Role
+colorHue: 120
+---
+"
+  make_role "sharedrole" "$role_md"
+  for name in alpha beta gamma; do
+    make_identity "$name" "---
+roles: sharedrole
+---
+body
+"
+  done
+  local out
+  out=$(run_sweep)
+  assert_identity_line_count "$out" "3"
+  # All three must have identical role_cosmetics
+  local rc_alpha rc_beta rc_gamma
+  rc_alpha=$(printf '%s' "$out" | python3 -c "
+import sys,json
+for l in sys.stdin.read().splitlines():
+    o=json.loads(l)
+    if o.get('identity')=='alpha': print(json.dumps(o.get('role_cosmetics'),sort_keys=True))
+" 2>/dev/null)
+  rc_beta=$(printf '%s' "$out" | python3 -c "
+import sys,json
+for l in sys.stdin.read().splitlines():
+    o=json.loads(l)
+    if o.get('identity')=='beta': print(json.dumps(o.get('role_cosmetics'),sort_keys=True))
+" 2>/dev/null)
+  rc_gamma=$(printf '%s' "$out" | python3 -c "
+import sys,json
+for l in sys.stdin.read().splitlines():
+    o=json.loads(l)
+    if o.get('identity')=='gamma': print(json.dumps(o.get('role_cosmetics'),sort_keys=True))
+" 2>/dev/null)
+  assert_eq "$rc_alpha" "$rc_beta" "case 02: alpha and beta role_cosmetics must be identical"
+  assert_eq "$rc_beta" "$rc_gamma" "case 02: beta and gamma role_cosmetics must be identical"
+}
+
+# Case 3: No frontmatter at all.
+# Identity file with body text but no --- fences. Assert identity_cosmetics is
+# null, role is null, role_cosmetics is null, and the line IS still present.
+test_case_03_no_frontmatter() {
+  make_identity "nofm" "this is just plain text with no YAML fences at all
+second line
+"
+  local out
+  out=$(run_sweep)
+  assert_identity_line_count "$out" "1"
+  assert_identity_field "$out" "nofm" "identity_cosmetics" 'null'
+  assert_identity_field "$out" "nofm" "role" 'null'
+  assert_identity_field "$out" "nofm" "role_cosmetics" 'null'
+}
+
+# Case 4: Missing identity file.
+# Identity folder exists with no <key>.md. Assert the line is present with null cosmetics.
+test_case_04_missing_identity_file() {
+  # make_identity with no md content creates the folder but not the .md
+  make_identity "nomdfolder"
+  local out
+  out=$(run_sweep)
+  assert_identity_line_count "$out" "1"
+  assert_identity_field "$out" "nomdfolder" "identity_cosmetics" 'null'
+  assert_identity_field "$out" "nomdfolder" "role" 'null'
+  assert_identity_field "$out" "nomdfolder" "role_cosmetics" 'null'
+}
+
+# Case 5: Path-traversal role.
+# Identity with roles: ../../tmp. Assert role is null and role_cosmetics is null.
+test_case_05_path_traversal_role() {
+  make_identity "traversal" "---
+roles: ../../tmp
+displayName: Traversal
+---
+body
+"
+  local out
+  out=$(run_sweep)
+  assert_identity_field "$out" "traversal" "role" 'null'
+  assert_identity_field "$out" "traversal" "role_cosmetics" 'null'
+  # identity_cosmetics should still have displayName (appearance is independent of role)
+  assert_identity_field "$out" "traversal" "identity_cosmetics.displayName" '"Traversal"'
+}
+
+# Case 6: Sentinels.
+# Two identities: one with .pinned present, one with .pinned absent.
+# (Phase 115 Plan 115-02 retired the `.hidden` sentinel entirely per D-21;
+#  the previous version of this test checked pinned + hidden together.
+#  Phase 115 Plan 115-05 narrows it to the surviving .pinned axis.)
+test_case_06_sentinels() {
+  make_identity "pinnedonly" "---\n---\n"
+  touch "$FIXTURE/fleet/identities/pinnedonly/.pinned"
+
+  make_identity "noflags" "---\n---\n"
+
+  local out
+  out=$(run_sweep)
+  assert_identity_field "$out" "pinnedonly" "pinned" 'true'
+  assert_identity_field "$out" "noflags" "pinned" 'false'
+}
+
+# Case 6b: desktop_running — true only while the display recorded in the
+# identity's desktop/display names an X lock file whose pid is a live X
+# server (a live process named X*). A dead pid, or a live pid that isn't an X
+# server (pid reuse after a hard kill), reads as not running. Uses display
+# numbers far above any real one and always removes its lock files.
+test_case_06b_desktop_running() {
+  local base=$(( 60000 + RANDOM % 1000 ))
+  local live_n=$base dead_n=$(( base + 1000 )) reused_n=$(( base + 2000 ))
+  # A stand-in X server: a process that renames itself to X… (Linux
+  # PR_SET_NAME), so its process name starts with X.
+  python3 -c "import ctypes,time; ctypes.CDLL(None).prctl(15, b'Xfakeserver', 0, 0, 0); time.sleep(60)" &
+  local xpid=$!
+  local nosock_n=$(( base + 3000 ))
+  trap 'kill "$xpid" 2>/dev/null; rm -f "/tmp/.X${live_n}-lock" "/tmp/.X${dead_n}-lock" "/tmp/.X${reused_n}-lock" "/tmp/.X${nosock_n}-lock" "/tmp/.X11-unix/X${live_n}" "/tmp/.X11-unix/X${dead_n}" "/tmp/.X11-unix/X${reused_n}"; trap - RETURN' RETURN
+  sleep 0.3  # let it rename itself
+  mkdir -p /tmp/.X11-unix
+  touch "/tmp/.X11-unix/X${live_n}" "/tmp/.X11-unix/X${dead_n}" "/tmp/.X11-unix/X${reused_n}"
+
+  make_identity "deskon" "---\n---\n"
+  mkdir -p "$FIXTURE/fleet/identities/deskon/desktop"
+  printf '%s\n' "$live_n" > "$FIXTURE/fleet/identities/deskon/desktop/display"
+  printf '%10d\n' "$xpid" > "/tmp/.X${live_n}-lock"
+
+  make_identity "deskdead" "---\n---\n"
+  mkdir -p "$FIXTURE/fleet/identities/deskdead/desktop"
+  printf '%s\n' "$dead_n" > "$FIXTURE/fleet/identities/deskdead/desktop/display"
+  printf '%10d\n' 999999999 > "/tmp/.X${dead_n}-lock"
+
+  make_identity "deskreused" "---\n---\n"
+  mkdir -p "$FIXTURE/fleet/identities/deskreused/desktop"
+  printf '%s\n' "$reused_n" > "$FIXTURE/fleet/identities/deskreused/desktop/display"
+  printf '%10d\n' "$$" > "/tmp/.X${reused_n}-lock"
+
+  # Live X server and lock, but its socket isn't up yet (still starting).
+  make_identity "desknosock" "---\n---\n"
+  mkdir -p "$FIXTURE/fleet/identities/desknosock/desktop"
+  printf '%s\n' "$nosock_n" > "$FIXTURE/fleet/identities/desknosock/desktop/display"
+  printf '%10d\n' "$xpid" > "/tmp/.X${nosock_n}-lock"
+
+  make_identity "desknone" "---\n---\n"
+
+  local out
+  out=$(run_sweep)
+  assert_identity_field "$out" "deskon" "desktop_running" 'true'
+  assert_identity_field "$out" "deskdead" "desktop_running" 'false'
+  assert_identity_field "$out" "deskreused" "desktop_running" 'false'
+  assert_identity_field "$out" "desknosock" "desktop_running" 'false'
+  assert_identity_field "$out" "desknone" "desktop_running" 'false'
+}
+
+# Case 7: colorHue out of range.
+# Role with colorHue: 400. Assert colorHue is absent from role_cosmetics.
+test_case_07_colorhue_out_of_range() {
+  make_identity "badhue" "---
+roles: badrole
+---
+body
+"
+  make_role "badrole" "---
+title: Bad Hue Role
+colorHue: 400
+---
+body
+"
+  local out
+  out=$(run_sweep)
+  assert_identity_no_field "$out" "badhue" "role_cosmetics.colorHue"
+  # title should still be present (only colorHue was invalid)
+  assert_identity_field "$out" "badhue" "role_cosmetics.title" '"Bad Hue Role"'
+}
+
+# Case 7b: colorHue in quoted form (MDXEditor + Skynet writers standardize on
+# single-quoted numeric strings per the frontmatter-shape audit). The Python
+# parser must strip surrounding matching quotes before int() so quoted values
+# survive the sweep. Also covers double-quoted for defense-in-depth.
+test_case_07b_colorhue_quoted() {
+  make_identity "quotehue" "---
+roles: quoterole
+---
+body
+"
+  make_role "quoterole" "---
+title: Quote Hue Role
+colorHue: '240'
+---
+body
+"
+  local out
+  out=$(run_sweep)
+  assert_identity_field "$out" "quotehue" "role_cosmetics.colorHue" '240'
+
+  make_identity "dquotehue" "---
+roles: dquoterole
+---
+body
+"
+  make_role "dquoterole" '---
+title: DQuote Hue Role
+colorHue: "180"
+---
+body
+'
+  out=$(run_sweep)
+  assert_identity_field "$out" "dquotehue" "role_cosmetics.colorHue" '180'
+}
+
+# Case 8: Quoted and commented values.
+# Identity with title: "Quoted Title"   # trailing comment and a # full-line
+# comment inside the fence. Assert title is exactly Quoted Title.
+test_case_08_quoted_and_commented() {
+  make_identity "quotey" '---
+# This is a full-line comment inside the fence
+title: "Quoted Title"   # trailing comment
+displayName: Quotey
+---
+body
+'
+  local out
+  out=$(run_sweep)
+  assert_identity_field "$out" "quotey" "identity_cosmetics.title" '"Quoted Title"'
+  assert_identity_field "$out" "quotey" "identity_cosmetics.displayName" '"Quotey"'
+}
+
+# Case 9: Bounded read.
+# Identity file whose opening --- fence is followed by 6000 characters of body
+# before the closing fence. Assert identity_cosmetics is null (cap reached ->
+# treated as no frontmatter -> plain row) and the line is still emitted.
+test_case_09_bounded_read() {
+  # Build a file: "---\n" + 6000 chars of 'x' + "\n---\n"
+  # The closing fence is beyond FRONTMATTER_HEAD_BYTES (4096 chars), so the
+  # capped read finds only one fence -> returns (None, None).
+  mkdir -p "$FIXTURE/fleet/identities/bigfm"
+  python3 -c "
+content = '---\n' + 'x' * 6000 + '\n---\ntitle: ShouldNotAppear\n'
+open('$FIXTURE/fleet/identities/bigfm/bigfm.md', 'w').write(content)
+"
+
+  local out
+  out=$(run_sweep)
+  assert_identity_line_count "$out" "1"
+  assert_identity_field "$out" "bigfm" "identity_cosmetics" 'null'
+}
+
+# Case 10: stdout purity.
+# Assert every non-empty stdout line parses as JSON and carries schema_version == 1.
+test_case_10_stdout_purity() {
+  make_identity "purity" "---
+roles: purerole
+displayName: Purity
+---
+body
+"
+  make_role "purerole" "---
+title: Pure Role
+---
+body
+"
+  local out
+  out=$(run_sweep)
+  local result
+  result=$(printf '%s' "$out" | python3 -c "
+import sys, json
+lines = [l for l in sys.stdin.read().splitlines() if l.strip()]
+bad_json = []
+bad_version = []
+for l in lines:
+    try:
+        obj = json.loads(l)
+    except json.JSONDecodeError as e:
+        bad_json.append(l[:80])
+        continue
+    if obj.get('schema_version') != 1:
+        bad_version.append(l[:80])
+if bad_json:
+    print('BAD_JSON:' + str(bad_json))
+elif bad_version:
+    print('BAD_VERSION:' + str(bad_version))
+else:
+    print('ok')
+" 2>/dev/null)
+  assert_eq "ok" "$result" "case 10: stdout must contain only valid JSON with schema_version==1"
+}
+
+# Case 11: project happy path.
+# Identity with `project: trip-planning` → identity_cosmetics.project ==
+# "trip-planning". Phase 117 M6 follow-up.
+test_case_11_project_happy_path() {
+  make_identity "wanderer" "---
+roles: traveler
+project: trip-planning
+---
+body
+"
+  make_role "traveler" "---
+title: Traveler
+---
+"
+  local out
+  out=$(run_sweep)
+  assert_identity_has_field "$out" "wanderer" "identity_cosmetics.project"
+  assert_identity_field "$out" "wanderer" "identity_cosmetics.project" '"trip-planning"'
+}
+
+# Case 12: project absent.
+# Identity with no project frontmatter → identity_cosmetics has no project
+# key (absent, not null). Guards the "no publisher no field" contract.
+test_case_12_project_absent() {
+  make_identity "homebody" "---
+roles: traveler
+---
+body
+"
+  make_role "traveler" "---
+title: Traveler
+---
+"
+  local out
+  out=$(run_sweep)
+  assert_identity_no_field "$out" "homebody" "identity_cosmetics.project"
+}
+
+# Case 13: malformed project slug — silent-drop.
+# PROJECT_SLUG_RE requires [a-z0-9-]{1,64}. Uppercase, spaces, underscores,
+# or overlength must NOT emit the field (bogus values must not paint an
+# identity into a nonexistent section).
+test_case_13_project_malformed_slug_dropped() {
+  make_identity "bad1" "---
+roles: traveler
+project: Trip Planning
+---
+body
+"
+  make_identity "bad2" "---
+roles: traveler
+project: trip_planning
+---
+body
+"
+  make_identity "bad3" "---
+roles: traveler
+project: ../etc/passwd
+---
+body
+"
+  make_role "traveler" "---
+title: Traveler
+---
+"
+  local out
+  out=$(run_sweep)
+  assert_identity_no_field "$out" "bad1" "identity_cosmetics.project"
+  assert_identity_no_field "$out" "bad2" "identity_cosmetics.project"
+  assert_identity_no_field "$out" "bad3" "identity_cosmetics.project"
+}
+
+# Case 14: project on the ROLE file must NOT be extracted.
+# Same discipline as task — project is per-identity, allowed_keys gate on
+# role reads excludes it. Even if a role.md carries `project: something`,
+# it must never surface in role_cosmetics.
+test_case_14_project_not_inherited_from_role() {
+  make_identity "riderr" "---
+roles: rolewithproject
+---
+body
+"
+  make_role "rolewithproject" "---
+title: Role With Project
+project: shouldnotappear
+---
+"
+  local out
+  out=$(run_sweep)
+  # role_cosmetics has the title but NOT project.
+  assert_identity_has_field "$out" "riderr" "role_cosmetics.title"
+  assert_identity_no_field "$out" "riderr" "role_cosmetics.project"
+  # And the identity file has no project field either, so identity_cosmetics
+  # must also be project-less (no accidental inheritance path).
+  assert_identity_no_field "$out" "riderr" "identity_cosmetics.project"
+}
+
+# Case 15: quoted project slug survives.
+# Writers may emit `project: "trip-planning"` (matching the colorHue-quoted
+# tolerance). Strip surrounding matched quotes before PROJECT_SLUG_RE.
+test_case_15_project_quoted() {
+  make_identity "quoted" "---
+roles: traveler
+project: \"trip-planning\"
+---
+body
+"
+  make_identity "squoted" "---
+roles: traveler
+project: 'trip-planning'
+---
+body
+"
+  make_role "traveler" "---
+title: Traveler
+---
+"
+  local out
+  out=$(run_sweep)
+  assert_identity_field "$out" "quoted" "identity_cosmetics.project" '"trip-planning"'
+  assert_identity_field "$out" "squoted" "identity_cosmetics.project" '"trip-planning"'
+}
+
+# Case 16: users list — flow style survives on identity + role sides.
+# Flow style `users: [alice, bob]` is the on-disk convention and what
+# MDXEditor's string-only frontmatterPlugin ends up round-tripping to.
+test_case_16_users_flow_style() {
+  make_identity "flowid" "---
+roles: flowrole
+users: [alice, bob]
+---
+body
+"
+  make_role "flowrole" "---
+title: Flow Role
+users: [charlie]
+---
+"
+  local out
+  out=$(run_sweep)
+  assert_identity_field "$out" "flowid" "identity_cosmetics.users" '["alice", "bob"]'
+  assert_identity_field "$out" "flowid" "role_cosmetics.users" '["charlie"]'
+}
+
+# Case 17: users list — block style survives, AND subsequent frontmatter
+# keys after the block are still parsed (skip cursor stops at the last
+# dash-item, never overshoots into a following key line).
+test_case_17_users_block_style() {
+  make_identity "blockid" "---
+roles: blockrole
+users:
+  - carol
+  - \"dave\"
+  - eve
+title: After Block
+---
+body
+"
+  make_role "blockrole" "---
+title: Block Role
+users:
+  - admin
+---
+"
+  local out
+  out=$(run_sweep)
+  assert_identity_field "$out" "blockid" "identity_cosmetics.users" '["carol", "dave", "eve"]'
+  # Load-bearing: the title line AFTER the block must still be picked up.
+  assert_identity_field "$out" "blockid" "identity_cosmetics.title" '"After Block"'
+  assert_identity_field "$out" "blockid" "role_cosmetics.users" '["admin"]'
+}
+
+# Case 18: absent users → key omitted from cosmetics (absent-⇒-omit D-3
+# fallback). Distinguishes "missing" from "present but empty".
+test_case_18_users_absent() {
+  make_identity "nousers" "---
+roles: norole
+title: No Users Here
+---
+body
+"
+  make_role "norole" "---
+title: No Users Role
+---
+"
+  local out
+  out=$(run_sweep)
+  assert_identity_no_field "$out" "nousers" "identity_cosmetics.users"
+  assert_identity_no_field "$out" "nousers" "role_cosmetics.users"
+}
+
+# Case 19a: block-style users list with an inline comment between items.
+# Load-bearing regression for the gate-side security concern — an internal
+# comment must NOT prematurely end the block and silently drop subsequent
+# dash-items (falls open would leak the identity to every user).
+test_case_19a_users_block_with_inline_comment() {
+  make_identity "commentid" "---
+roles: commentrole
+users:
+  # operator team
+  - alice
+  - bob
+title: After Block With Comment
+---
+body
+"
+  make_role "commentrole" "---
+title: Comment Role
+users:
+  - admin
+  # trailing note
+  - other-admin
+---
+"
+  local out
+  out=$(run_sweep)
+  assert_identity_field "$out" "commentid" "identity_cosmetics.users" '["alice", "bob"]'
+  # Following-key parity — the block's skip cursor must NOT overshoot.
+  assert_identity_field "$out" "commentid" "identity_cosmetics.title" '"After Block With Comment"'
+  assert_identity_field "$out" "commentid" "role_cosmetics.users" '["admin", "other-admin"]'
+}
+
+# Case 19: empty flow list → key omitted (empty falls open per D-3).
+test_case_19_users_empty_flow() {
+  make_identity "emptyusers" "---
+roles: emptyrole
+users: []
+---
+body
+"
+  make_role "emptyrole" "---
+title: Empty Role
+---
+"
+  local out
+  out=$(run_sweep)
+  assert_identity_no_field "$out" "emptyusers" "identity_cosmetics.users"
+}
+
+# Global stderr/stdout purity check:
+# Run the sweep with stderr redirected to a file; assert the file is allowed
+# to be non-empty while every stdout line still parses as JSON.
+test_global_stderr_stdout_separation() {
+  make_identity "sep" "---
+title: Sep
+---
+body
+"
+  local stderr_file
+  stderr_file=$(mktemp)
+  local out
+  out=$(HOME="$FIXTURE" python3 "$SWEEP" 2>"$stderr_file")
+  local result
+  result=$(printf '%s' "$out" | python3 -c "
+import sys, json
+lines = [l for l in sys.stdin.read().splitlines() if l.strip()]
+for l in lines:
+    try:
+        json.loads(l)
+    except:
+        print('INVALID_JSON')
+        sys.exit(0)
+print('ok')
+" 2>/dev/null)
+  assert_eq "ok" "$result" "global: every stdout line must parse as JSON even when stderr has content"
+  rm -f "$stderr_file"
+}
+
+# ============================================================
+# MAIN
+# ============================================================
+printf '=== fleet-status-sweep-appearance test driver ===\n'
+printf 'sweep: %s\n' "$SWEEP"
+printf 'fixture: %s\n' "$FIXTURE"
+printf '\n'
+
+# Case 20: avatar_version — 16-hex digest, stable across sweeps, and changes
+# when the role's avatar file, or the identity's own sibling avatar, changes.
+avatar_version_of() {
+  printf '%s' "$1" | python3 -c "
+import sys, json
+for l in sys.stdin.read().splitlines():
+    if not l.strip(): continue
+    o = json.loads(l)
+    if o.get('line_kind') == 'identity' and o.get('identity') == '$2':
+        print(o.get('avatar_version')); break
+"
+}
+
+test_case_20_avatar_version() {
+  make_identity "vera" "---
+roles: painter
+---
+"
+  make_role "painter" "---
+title: Painter
+avatar: painter.webp
+---
+"
+  printf 'v1' > "$FIXTURE/fleet/roles/painter/painter.webp"
+  local v1 v2 v3 v4
+  v1=$(avatar_version_of "$(run_sweep)" vera)
+  case "$v1" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+    *) fail "avatar_version not 16 hex: '$v1'" ;;
+  esac
+  v2=$(avatar_version_of "$(run_sweep)" vera)
+  assert_eq "$v1" "$v2" "avatar_version stable across sweeps"
+  printf 'v2-longer' > "$FIXTURE/fleet/roles/painter/painter.webp"
+  v3=$(avatar_version_of "$(run_sweep)" vera)
+  [ "$v3" != "$v2" ] || fail "avatar_version unchanged after role avatar rewrite"
+  printf 'own' > "$FIXTURE/fleet/identities/vera/vera.png"
+  v4=$(avatar_version_of "$(run_sweep)" vera)
+  [ "$v4" != "$v3" ] || fail "avatar_version unchanged after identity sibling avatar added"
+  # Repointing the identity's own avatar: frontmatter (no file change) must
+  # change the version too — the route picks the sibling by that value.
+  make_identity "vera" "---
+roles: painter
+avatar: vera.png
+---
+"
+  local v5
+  v5=$(avatar_version_of "$(run_sweep)" vera)
+  [ "$v5" != "$v4" ] || fail "avatar_version unchanged after identity avatar: frontmatter change"
+}
+
+# Case 21: `roles:` drives the single `role` field. Singular `role:` is no
+# longer read; one listed role → role set; several → role null, roles listed.
+test_case_21_roles_key_drives_role() {
+  make_identity "legacyrole" "---
+role: archivist
+---
+"
+  make_identity "multirole" "---
+roles: [archivist, painter]
+---
+"
+  make_role "archivist" "---
+title: Archivist
+---
+"
+  local out
+  out=$(run_sweep)
+  assert_identity_field "$out" "legacyrole" "role" 'null'
+  assert_identity_field "$out" "legacyrole" "roles" '[]'
+  assert_identity_field "$out" "multirole" "role" 'null'
+  assert_identity_field "$out" "multirole" "role_cosmetics" 'null'
+  assert_identity_field "$out" "multirole" "roles" '["archivist", "painter"]'
+}
+
+# Case 21b: quoted task values render without their quotes (agents quote
+# `task:` so `: ` doesn't break YAML for the app's own parser).
+test_case_21b_task_quoted() {
+  make_identity "quinn" "---
+roles: archivist
+task: \"Pantheon: setup plan\"
+---
+"
+  make_identity "sid" "---
+roles: archivist
+task: 'it''s: fine'
+---
+"
+  make_role "archivist" "---
+title: Archivist
+---
+"
+  local out
+  out=$(run_sweep)
+  assert_identity_field "$out" "quinn" "identity_cosmetics.task" '"Pantheon: setup plan"'
+  assert_identity_field "$out" "sid" "identity_cosmetics.task" '"it'"'"'s: fine"'
+}
+
+run_test test_case_01_full_inheritance
+run_test test_case_02_read_once_per_role
+run_test test_case_03_no_frontmatter
+run_test test_case_04_missing_identity_file
+run_test test_case_05_path_traversal_role
+run_test test_case_06_sentinels
+run_test test_case_06b_desktop_running
+run_test test_case_07_colorhue_out_of_range
+run_test test_case_07b_colorhue_quoted
+run_test test_case_08_quoted_and_commented
+run_test test_case_09_bounded_read
+run_test test_case_10_stdout_purity
+run_test test_case_11_project_happy_path
+run_test test_case_12_project_absent
+run_test test_case_13_project_malformed_slug_dropped
+run_test test_case_14_project_not_inherited_from_role
+run_test test_case_15_project_quoted
+run_test test_case_16_users_flow_style
+run_test test_case_17_users_block_style
+run_test test_case_18_users_absent
+run_test test_case_19_users_empty_flow
+run_test test_case_19a_users_block_with_inline_comment
+run_test test_case_20_avatar_version
+run_test test_case_21_roles_key_drives_role
+run_test test_case_21b_task_quoted
+run_test test_global_stderr_stdout_separation
+
+printf '\n===============================\n'
+printf 'PASS: %s  FAIL: %s\n' "$PASS" "$FAIL"
+if [ "$FAIL" -gt 0 ]; then
+  printf 'Failures:\n'
+  for _f in "${FAILURES[@]}"; do
+    printf '  - %s\n' "$_f"
+  done
+  exit 1
+fi
+exit 0

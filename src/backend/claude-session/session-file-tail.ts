@@ -1,0 +1,214 @@
+import type { Client } from "ssh2";
+import { sshLogger } from "../utils/logger.js";
+import { hangUpChannel, type HangUpChannel } from "../ssh/channel-hangup.js";
+
+/**
+ * Follow a remote JSONL session file forward over an SSH exec channel, invoking
+ * `onLine` for every complete newline-terminated line as it lands.
+ *
+ * Three design choices worth naming:
+ *
+ * 1. `tail -F` from line 1 over polling. Claude Code writes lines incrementally to
+ *    the JSONL as the conversation progresses, and rotates the file on
+ *    session boundaries. Polling the whole file wastes bandwidth on backfill
+ *    and racy against rotation. `tail -F` (capital) follows across
+ *    truncation/renaming; `-n +<fromLine>` (default 1) picks where the
+ *    read starts. Conversation opens go through session-file-window.ts,
+ *    which replays the recent window itself and follows from just past its
+ *    snapshot; `fromLine` 1 is its full-read fallback.
+ *
+ * 2. Newline-buffered. JSONL frames can span multiple TCP data chunks; we
+ *    accumulate the partial tail in a closure buffer and only surface a line
+ *    once its trailing `\n` arrives. Downstream parsing (parseSessionLine)
+ *    trims whitespace, so we deliberately do NOT strip `\r` here — that's
+ *    parse-layer responsibility.
+ *
+ * 3. POSIX `sh -c` trap wrapper + signal-then-close teardown + stdin-blocker.
+ *    OpenSSH does NOT propagate `SSH_MSG_CHANNEL_CLOSE` as SIGHUP to the
+ *    remote child (see mindrot #1424); `tail -F`'s stdout writes silently
+ *    `EPIPE` and it keeps running as a PPID=1 orphan across every WS
+ *    reconnect. Three-prong fix, all three carrying weight:
+ *      - Prong A: stop() hangs the channel up through hangUpChannel
+ *        (channel-hangup.ts): it ends stdin — which Prong C turns into
+ *        an immediate kill of the tail — and sends TERM, then closes
+ *        from our side only if the server hasn't closed the channel
+ *        after a grace period. A plain close while tail is writing
+ *        drops the whole connection on Tailscale SSH. A synchronous
+ *        throw from signal() is caught and logged; close() still runs.
+ *      - Prong B: the remote command wraps `tail -F` in a `sh -c 'trap
+ *        "kill $t 2>/dev/null" EXIT INT HUP TERM; ... & t=$!; ...'` so a
+ *        SIGHUP or SIGTERM to the wrapper shell fires the trap and kills
+ *        the backgrounded tail. Effective when the server DOES propagate
+ *        the signal (some sshds do; OpenSSH doesn't).
+ *      - Prong C (2026-09-28): after backgrounding tail, the wrapper
+ *        blocks on `read -r _`. The exec channel's stdin is inherited
+ *        from ssh2's stream and stays open until Skynet closes it
+ *        (session-file-tail.ts never calls stream.end() itself). When
+ *        the SSH channel is torn down (WS reconnect, tab close, stop()
+ *        calling close(), network drop), the remote sshd closes its
+ *        write-end of the stdin pipe, `read` sees EOF and returns
+ *        non-zero, and we fall through to `kill $t; wait $t`. This
+ *        closes the orphan-leak hole that Prongs A and B could not:
+ *        Prong A is a no-op on OpenSSH, Prong B only fires when the
+ *        child tail dies first, and tail only dies on EPIPE, which
+ *        requires it to actually WRITE to stdout — which only happens
+ *        when the tailed JSONL is being appended to. Paused sessions
+ *        (JSONL idle) leaked one tail per WS reconnect. Prong C fires
+ *        regardless of tail's activity because we're blocking on
+ *        stdin, not on the child's I/O behavior. Root-cause writeup:
+ *        260823-9tw-ssh-tail-watcher-orphan-on-close-fix-tra plan and
+ *        the 2026-09-28 workstation forensics (347 orphans killed at
+ *        load 21).
+ */
+
+// Copied locally rather than exporting from tmux-helper.ts to keep tmux-helper's
+// public surface minimal. Same 3-line implementation.
+function shellEscape(s: string): string {
+  return "'" + s.replace(/'/g, "'\\''") + "'";
+}
+
+export type TailHandle = { stop: () => void };
+
+const STDERR_ACCUMULATION_LIMIT_BYTES = 4096;
+
+export function tailSessionFile(
+  conn: Client,
+  absolutePath: string,
+  onLine: (line: string) => void,
+  onError: (err: Error) => void,
+  opts: { fromLine?: number } = {},
+): TailHandle {
+  // 1-indexed line to start from. The windowed open (session-file-window.ts)
+  // replays the recent lines itself and follows from just past its snapshot.
+  const fromLine =
+    Number.isInteger(opts.fromLine) && (opts.fromLine as number) >= 1 ? (opts.fromLine as number) : 1;
+  let stopped = false;
+  // Bubble-load diagnostic (2026-09-25): track TTFB + streaming progress so
+  // slow bubble-loads are attributable to SSH-side transport vs downstream
+  // Skynet-side parse/emit. Zero cost when the tail runs healthy.
+  const tailOpenAtMs = performance.now();
+  let firstLineAtMs: number | null = null;
+  let lineCount = 0;
+  let nextProgressCheckpointAt = 500;
+  // The ssh2 ClientChannel type is not re-exported at this level; we retain
+  // the loose reference so the stop() helper can call close/signal
+  // without pulling ClientChannel into this file's public surface.
+  let stream: HangUpChannel | null = null;
+  let buffer = "";
+  let stderrBuf = "";
+  let anyStdout = false;
+
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    // Bubble-load diagnostic (2026-09-25): stop-time summary with total lines
+    // + total open duration + TTFB. Complements the [tail-ttfb] + [tail-progress]
+    // pair so a full grep-lifecycle of one tail shows start, first-data, N
+    // progress checkpoints, and this stop.
+    const totalMs = Math.round(performance.now() - tailOpenAtMs);
+    const ttfbMs = firstLineAtMs === null ? null : Math.round(firstLineAtMs - tailOpenAtMs);
+    sshLogger.info(
+      `[session-file-tail] stop: closing channel + signaling remote path=${absolutePath} anyStdout=${anyStdout} lines=${lineCount} total_ms=${totalMs} ttfb_ms=${ttfbMs}`,
+      { operation: "session_file_tail_stop", lineCount, totalMs, ttfbMs },
+    );
+    if (!stream) return;
+    // Prong A: end stdin (Prong C kills the tail on EOF) and send TERM, and
+    // close only if the server hasn't ended the channel after a grace
+    // period — a plain close while tail is still writing drops the whole
+    // connection on Tailscale SSH (channel-hangup.ts).
+    hangUpChannel(stream);
+  };
+
+  // Prong B (trap wrapper) + Prong C (stdin blocker). Outer arg is single-
+  // quoted so `$t` and `$!` expand in the REMOTE shell, not in Node's
+  // template string. The escaped path is itself already single-quoted by
+  // shellEscape, so the outer single-quoted argument naturally closes/reopens
+  // around it — the POSIX `'foo'\''bar'` splicing pattern extends cleanly
+  // to already-quoted tokens embedded in an enclosing single-quoted string.
+  //
+  // Command shape:
+  //   sh -c 'trap "kill $t 2>/dev/null" EXIT INT HUP TERM;
+  //          tail -F -n +<fromLine> <escaped-path> & t=$!;
+  //          read -r _;                    <-- Prong C: block on stdin
+  //          kill $t 2>/dev/null;          <-- explicit teardown on EOF
+  //          wait $t 2>/dev/null'          <-- reap the killed tail
+  const command =
+    "sh -c 'trap \"kill $t 2>/dev/null\" EXIT INT HUP TERM; tail -F -n +" + fromLine + " " +
+    shellEscape(absolutePath) +
+    " & t=$!; read -r _; kill $t 2>/dev/null; wait $t 2>/dev/null'";
+
+  conn.exec(command, (err, s) => {
+    if (err) {
+      onError(err);
+      return;
+    }
+    if (stopped) {
+      // Caller stopped before the exec channel opened. Tear down immediately.
+      hangUpChannel(s);
+      return;
+    }
+    stream = s;
+
+    s.on("data", (buf: Buffer) => {
+      if (stopped) return;
+      // Bubble-load diagnostic (2026-09-25): first-data timestamp.
+      if (!anyStdout) {
+        firstLineAtMs = performance.now();
+        sshLogger.info(
+          `[tail-ttfb] path=${absolutePath} first_data_ms=${Math.round(firstLineAtMs - tailOpenAtMs)} chunk_bytes=${buf.length}`,
+          { operation: "session_file_tail_first_data", firstDataMs: Math.round(firstLineAtMs - tailOpenAtMs) },
+        );
+      }
+      anyStdout = true;
+      buffer += buf.toString("utf-8");
+      // Extract every complete line; leave any partial trailing chunk in
+      // `buffer` for the next data event.
+      while (true) {
+        const nl = buffer.indexOf("\n");
+        if (nl === -1) break;
+        const line = buffer.slice(0, nl);
+        buffer = buffer.slice(nl + 1);
+        lineCount++;
+        // Bubble-load diagnostic: log progress checkpoints at 500/1000/2000/...
+        // lines so we can see the streaming curve on slow tails.
+        if (lineCount === nextProgressCheckpointAt) {
+          sshLogger.info(
+            `[tail-progress] path=${absolutePath} lines=${lineCount} elapsed_ms=${Math.round(performance.now() - tailOpenAtMs)}`,
+            { operation: "session_file_tail_progress", lineCount, elapsedMs: Math.round(performance.now() - tailOpenAtMs) },
+          );
+          nextProgressCheckpointAt = lineCount < 2000 ? lineCount + 500 : lineCount * 2;
+        }
+        try {
+          onLine(line);
+        } catch (cbErr) {
+          onError(
+            cbErr instanceof Error ? cbErr : new Error(String(cbErr)),
+          );
+        }
+      }
+    });
+
+    s.stderr.on("data", (buf: Buffer) => {
+      if (stopped) return;
+      stderrBuf += buf.toString("utf-8");
+      // If stderr grows past the threshold WITHOUT any stdout progress, treat
+      // as fatal — usually means the path doesn't exist or permission denied.
+      // Once we've seen any stdout the tail is healthy; stderr noise from
+      // rotation warnings is expected and harmless.
+      if (
+        !anyStdout &&
+        stderrBuf.length > STDERR_ACCUMULATION_LIMIT_BYTES
+      ) {
+        onError(new Error("tail stderr: " + stderrBuf.slice(0, 500)));
+        stop();
+      }
+    });
+
+    s.on("error", (streamErr: Error) => {
+      if (stopped) return;
+      onError(streamErr);
+    });
+  });
+
+  return { stop };
+}

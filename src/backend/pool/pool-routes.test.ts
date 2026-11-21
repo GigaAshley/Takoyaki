@@ -1,0 +1,773 @@
+/**
+ * Phase 80 Plan 04 — Tests for the pool-routes router (POST /pick).
+ *
+ * Tests exercise POST /identities/pool/pick via a bare Express app using
+ * Node's built-in http module (project convention: no supertest — mirror
+ * roles-list-for-host.test.ts pattern).
+ *
+ * Auth middleware is mocked. All backend collaborators (resolveHostById,
+ * getVettedPool, listIdentityKeysOnHost, isLocalHostId, connectOneShot) are
+ * mocked so tests exercise only the router logic.
+ *
+ * ─── 2026-09-14 rewrite ────────────────────────────────────────────────────
+ * The availability authority moved from Synapse (per-candidate MXID probe) to
+ * the target host's identity directories (single enumeration + set difference).
+ * Consequences reflected in these tests:
+ *   - `role` is OPTIONAL — it only ever existed here to compose the probe MXID.
+ *     A malformed role is still a 400; an ABSENT role is now a 200.
+ *   - The Matrix admin-creds fail-early gate is gone (no Matrix dependency).
+ *   - Enumeration failure degrades to an unverified suggestion, never a 5xx.
+ *
+ * Test coverage:
+ *   1:   missing JWT → 401
+ *   2:   missing hostId → 400
+ *   3:   non-integer hostId → 400
+ *   4:   ABSENT role → 200 (inverted from the old "missing role → 400")
+ *   4b:  empty-string role → 200 (treated as absent)
+ *   5:   role uppercase → 400 (malformed role still rejected)
+ *   6:   role leading digit → 200 (inverted — canonical pattern allows it)
+ *   6b:  genuinely malformed role → 400
+ *   7:   cross-user hostId → 404
+ *   8:   empty pool → 503 "pool is empty"
+ *   9:   HAPPY PATH — a name already on the host is skipped
+ *   10:  host enumerated EXACTLY ONCE regardless of pool size (cost guard)
+ *   11:  all names taken → falls back to a taken candidate, never fails
+ *   12:  unreachable host still returns a name (degradation contract)
+ *   12b: enumeration failure mid-flight still returns a name
+ *   12c: a hanging host does not hang the request (total budget)
+ *   13:  LOCAL host skips SSH entirely (conn === null)
+ *   13b: REMOTE host closes its SSH connection
+ *   14:  pool casing drift — PascalCase entry matches lowercase folder
+ */
+
+import {
+  describe,
+  it,
+  expect,
+  beforeEach,
+  afterEach,
+  vi,
+  type Mock,
+} from "vitest";
+import express from "express";
+import http from "node:http";
+import type { AddressInfo } from "node:net";
+
+// ---------------------------------------------------------------------------
+// Auth manager mock — controls whether a request is authenticated
+// ---------------------------------------------------------------------------
+
+let mockUserId: string | null = "1";
+
+vi.mock("../utils/auth-manager.js", () => {
+  const AuthManager = {
+    getInstance: () => ({
+      createAuthMiddleware: () =>
+        (
+          req: express.Request,
+          res: express.Response,
+          next: express.NextFunction,
+        ) => {
+          if (mockUserId === null) {
+            return res.status(401).json({ error: "Unauthorized" });
+          }
+          (req as express.Request & { userId: string }).userId = mockUserId;
+          next();
+        },
+    }),
+  };
+  return { AuthManager };
+});
+
+// ---------------------------------------------------------------------------
+// Mock backend collaborators BEFORE importing the module under test
+// ---------------------------------------------------------------------------
+
+vi.mock("../ssh/host-resolver.js", () => ({
+  resolveHostById: vi.fn(),
+}));
+
+vi.mock("./pool-loader.js", () => ({
+  getVettedPool: vi.fn(),
+}));
+
+// 2026-09-14: the availability authority moved from Synapse to the target
+// host's identity directories, so this router no longer imports
+// matrix-admin-client / matrix-admin-creds-store at all. What it DOES import is
+// the identity enumerator + the local-host discriminator, plus a one-shot SSH
+// connection for the REMOTE branch.
+vi.mock("../claude-session/identity-artifact-reader.js", () => ({
+  isLocalHostId: vi.fn(),
+  listIdentityKeysOnHost: vi.fn(),
+}));
+
+// Phase 128: the router now also enumerates the target host's archive
+// directory for LRU-oldest-first tier-2 ranking.
+vi.mock("../claude-session/list-archived-identity-keys.js", () => ({
+  listArchivedIdentityEntriesOnHost: vi.fn(),
+}));
+
+vi.mock("../ssh/ssh-one-shot.js", () => ({
+  connectOneShot: vi.fn(),
+}));
+
+// Silence logger noise in test output
+vi.mock("../utils/logger.js", () => ({
+  sshLogger: {
+    error: vi.fn(),
+    warn: vi.fn(),
+    info: vi.fn(),
+  },
+}));
+
+// ---------------------------------------------------------------------------
+// Import mocked modules AFTER vi.mock() declarations
+// ---------------------------------------------------------------------------
+
+import { resolveHostById } from "../ssh/host-resolver.js";
+import { getVettedPool } from "./pool-loader.js";
+import {
+  isLocalHostId,
+  listIdentityKeysOnHost,
+} from "../claude-session/identity-artifact-reader.js";
+import { listArchivedIdentityEntriesOnHost } from "../claude-session/list-archived-identity-keys.js";
+import { connectOneShot } from "../ssh/ssh-one-shot.js";
+
+// ---------------------------------------------------------------------------
+// HTTP request helper (mirrors roles-list-for-host.test.ts)
+// ---------------------------------------------------------------------------
+
+function httpRequest(
+  server: http.Server,
+  opts: {
+    method: string;
+    path: string;
+    body?: unknown;
+    headers?: Record<string, string>;
+  },
+): Promise<{ status: number; body: unknown }> {
+  return new Promise((resolve, reject) => {
+    const { port } = server.address() as AddressInfo;
+    const bodyStr = opts.body === undefined ? "" : JSON.stringify(opts.body);
+    const headers: Record<string, string> = {
+      ...(opts.headers ?? {}),
+    };
+    if (bodyStr) {
+      headers["Content-Type"] = "application/json";
+      headers["Content-Length"] = String(Buffer.byteLength(bodyStr));
+    }
+
+    const req = http.request(
+      {
+        hostname: "127.0.0.1",
+        port,
+        method: opts.method,
+        path: opts.path,
+        headers,
+      },
+      (res) => {
+        let data = "";
+        res.on("data", (chunk: Buffer) => {
+          data += chunk.toString();
+        });
+        res.on("end", () => {
+          let body: unknown;
+          try {
+            body = JSON.parse(data);
+          } catch {
+            body = data;
+          }
+          resolve({ status: res.statusCode ?? 0, body });
+        });
+      },
+    );
+    req.on("error", reject);
+    if (bodyStr) req.write(bodyStr);
+    req.end();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Stub host + creds records
+// ---------------------------------------------------------------------------
+
+const stubHost = {
+  id: 7,
+  ip: "10.0.0.7",
+  port: 22,
+  username: "ubuntu",
+  authType: "password" as const,
+  password: "secret",
+};
+
+/** Stub SSH connection handle — only `end()` is exercised by the router. */
+const stubConn = { end: vi.fn() };
+
+// ---------------------------------------------------------------------------
+// Import the router under test (module does not exist yet → RED)
+// ---------------------------------------------------------------------------
+
+import router from "./pool-routes.js";
+import {
+  FleetNameCensus,
+  __resetFleetNameCensusForTests,
+} from "./fleet-name-census.js";
+
+let server: http.Server;
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  mockUserId = "1";
+
+  // Default: user owns host 7, unknown otherwise.
+  (resolveHostById as Mock).mockImplementation((hostId: number) => {
+    if (hostId === 7) return Promise.resolve(stubHost);
+    return Promise.resolve(null);
+  });
+
+  (getVettedPool as Mock).mockReturnValue(["Willow", "Aster"]);
+  // Default: host 7 is REMOTE, reachable, and has no identities yet.
+  (isLocalHostId as Mock).mockReturnValue(false);
+  (connectOneShot as Mock).mockResolvedValue(stubConn);
+  (listIdentityKeysOnHost as Mock).mockResolvedValue([]);
+  (listArchivedIdentityEntriesOnHost as Mock).mockResolvedValue([]);
+  __resetFleetNameCensusForTests();
+
+  const app = express();
+  // Mount router at /identities/pool (mirrors database.ts mount).
+  app.use("/identities/pool", router);
+
+  server = http.createServer(app);
+  server.listen(0);
+});
+
+afterEach(() => {
+  return new Promise<void>((resolve) => server.close(() => resolve()));
+});
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+describe("POST /identities/pool/pick", () => {
+  it("Test 1: missing JWT → 401", async () => {
+    mockUserId = null;
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/identities/pool/pick",
+      body: { role: "skynet-maintainer", hostId: 7 },
+    });
+    expect(res.status).toBe(401);
+    expect(listIdentityKeysOnHost).not.toHaveBeenCalled();
+    expect(getVettedPool).not.toHaveBeenCalled();
+  });
+
+  it("Test 2: missing hostId → 400", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/identities/pool/pick",
+      body: { role: "skynet-maintainer" },
+    });
+    expect(res.status).toBe(400);
+    expect((res.body as { error: string }).error).toMatch(/hostId/);
+    expect(getVettedPool).not.toHaveBeenCalled();
+  });
+
+  it("Test 3: non-integer hostId → 400", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/identities/pool/pick",
+      body: { role: "skynet-maintainer", hostId: "abc" },
+    });
+    expect(res.status).toBe(400);
+    expect((res.body as { error: string }).error).toMatch(/hostId/);
+    expect(getVettedPool).not.toHaveBeenCalled();
+  });
+
+  it("Test 4: ABSENT role → 200 (role is optional as of 2026-09-14)", async () => {
+    // Inverted from the original "missing role → 400". Role only ever existed
+    // on this route to compose an MXID for the Synapse availability probe;
+    // with availability now answered by the host's identity folders, role is
+    // irrelevant here. The frontend needs a name suggestion BEFORE a role has
+    // been picked, so absence must be legal rather than a 400.
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/identities/pool/pick",
+      body: { hostId: 7 },
+    });
+    expect(res.status).toBe(200);
+    // Pool is shuffled, so assert membership rather than a specific name.
+    expect(["willow", "aster"]).toContain((res.body as { name: string }).name);
+    expect(listIdentityKeysOnHost).toHaveBeenCalled();
+  });
+
+  it("Test 4b: empty-string role → 200 (treated as absent, not malformed)", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/identities/pool/pick",
+      body: { role: "", hostId: 7 },
+    });
+    expect(res.status).toBe(200);
+    expect(["willow", "aster"]).toContain((res.body as { name: string }).name);
+  });
+
+  it("Test 5: role uppercase → 400", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/identities/pool/pick",
+      body: { role: "Skynet-Maintainer", hostId: 7 },
+    });
+    expect(res.status).toBe(400);
+    expect((res.body as { error: string }).error).toMatch(/role/);
+    expect(getVettedPool).not.toHaveBeenCalled();
+  });
+
+  it("Test 6: role with leading digit → 200 (canonical pattern allows it)", async () => {
+    // Inverted 2026-09-14. This route used to enforce a STRICTER leading-alpha
+    // rule than the rest of the system, inherited from the MXID-shape gate it
+    // needed while it composed handles to probe. It no longer composes anything,
+    // and the strict rule was actively harmful: role creation and the role-list
+    // endpoint both use the canonical `/^[a-z0-9-]+$/`, so `2foo` is a legal role
+    // that would appear in the dropdown and then 400 here — killing name
+    // suggestions for a role the system itself accepted.
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/identities/pool/pick",
+      body: { role: "2foo", hostId: 7 },
+    });
+    expect(res.status).toBe(200);
+    expect(["willow", "aster"]).toContain((res.body as { name: string }).name);
+  });
+
+  it("Test 6b: genuinely malformed role → 400 (uppercase / illegal chars)", async () => {
+    // Validation is still real, just aligned with the canonical pattern. Role is
+    // advisory on this route now, so the point of the gate is to fail loudly here
+    // rather than let a malformed value travel silently.
+    for (const role of ["Skynet-Maintainer", "has space", "has_underscore"]) {
+      const res = await httpRequest(server, {
+        method: "POST",
+        path: "/identities/pool/pick",
+        body: { role, hostId: 7 },
+      });
+      expect(res.status).toBe(400);
+      expect((res.body as { error: string }).error).toMatch(/role/);
+    }
+  });
+
+  it("Test 7: cross-user hostId → 404 (resolveHostById returns null)", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/identities/pool/pick",
+      body: { role: "skynet-maintainer", hostId: 99999 },
+    });
+    expect(res.status).toBe(404);
+    expect((res.body as { error: string }).error).toMatch(/Host/i);
+    // Pool + host enumeration MUST NOT be touched on cross-user 404
+    expect(getVettedPool).not.toHaveBeenCalled();
+    expect(listIdentityKeysOnHost).not.toHaveBeenCalled();
+  });
+
+  it("Test 8: empty pool → 503 'pool is empty'", async () => {
+    // (Was Test 9. The old Test 8 asserted a 503 when Matrix admin creds were
+    // missing; this route no longer consults Matrix at all, so that gate — and
+    // the fail-early creds dependency behind it — is gone.)
+    (getVettedPool as Mock).mockReturnValueOnce([]);
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/identities/pool/pick",
+      body: { role: "skynet-maintainer", hostId: 7 },
+    });
+    expect(res.status).toBe(503);
+    expect((res.body as { error: string }).error).toMatch(/pool is empty/);
+    // Host enumeration MUST NOT be touched on empty pool
+    expect(listIdentityKeysOnHost).not.toHaveBeenCalled();
+  });
+
+  it("Test 9: HAPPY PATH — skips names already present on the host", async () => {
+    // Availability authority is the target host's identity folders. `willow`
+    // already has a home there, so the pick MUST fall through to `aster`
+    // regardless of shuffle order.
+    (getVettedPool as Mock).mockReturnValueOnce(["Willow", "Aster"]);
+    (listIdentityKeysOnHost as Mock).mockResolvedValueOnce(["willow"]);
+
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/identities/pool/pick",
+      body: { role: "skynet-maintainer", hostId: 7 },
+    });
+
+    expect(res.status).toBe(200);
+    // Response is the bare lowercase pool name (matches IDENTITY_KEY_RE).
+    expect((res.body as { name: string }).name).toBe("aster");
+  });
+
+  it("Test 10: enumerates the host EXACTLY ONCE regardless of pool size", async () => {
+    // Cost regression guard. The prior implementation issued one Synapse admin
+    // call PER CANDIDATE (up to pool-length sequential round-trips). The host
+    // authority answers the whole question in a single enumeration; keep it
+    // that way.
+    (getVettedPool as Mock).mockReturnValueOnce([
+      "Willow",
+      "Aster",
+      "Moxie",
+      "Fern",
+      "Rune",
+    ]);
+    (listIdentityKeysOnHost as Mock).mockResolvedValueOnce([]);
+
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/identities/pool/pick",
+      body: { role: "skynet-maintainer", hostId: 7 },
+    });
+
+    expect(res.status).toBe(200);
+    expect((listIdentityKeysOnHost as Mock).mock.calls.length).toBe(1);
+  });
+
+  it("Test 11: all names taken → falls back to a taken candidate (never fails)", async () => {
+    // SINGLE-name pool so the assertion actually distinguishes "fell back" from
+    // "found a free name". With a two-name pool, `toContain` over both names is
+    // satisfied by any return value — including the happy path — so the test
+    // would still pass with the fallback deleted.
+    (getVettedPool as Mock).mockReturnValueOnce(["Willow"]);
+    // The only pool name is occupied → no free candidate. Returning it anyway is
+    // correct: never 5xx a suggestion endpoint over pool exhaustion (RESEARCH
+    // §Landmine 8). Birth will reject it downstream, which is the intended
+    // outcome at genuine exhaustion.
+    (listIdentityKeysOnHost as Mock).mockResolvedValueOnce(["willow"]);
+
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/identities/pool/pick",
+      body: { role: "skynet-maintainer", hostId: 7 },
+    });
+    expect(res.status).toBe(200);
+    expect((res.body as { name: string }).name).toBe("willow");
+  });
+
+  it("Test 12: unreachable host still returns a name (degradation contract)", async () => {
+    // A suggestion box that stalls or 5xx-es is worse UX than an unverified
+    // suggestion, and birth-time checks remain the real correctness gate. So an
+    // SSH failure must be swallowed, NOT surfaced.
+    (getVettedPool as Mock).mockReturnValueOnce(["Willow"]);
+    (connectOneShot as Mock).mockRejectedValueOnce(
+      new Error("connect ETIMEDOUT 10.0.0.7:22"),
+    );
+
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/identities/pool/pick",
+      body: { role: "skynet-maintainer", hostId: 7 },
+    });
+    expect(res.status).toBe(200);
+    expect((res.body as { name: string }).name).toBe("willow");
+    // MUST NOT leak host/pool internals in the (successful) response.
+    expect(JSON.stringify(res.body)).not.toContain("ETIMEDOUT");
+  });
+
+  it("Test 12b: enumeration failure mid-flight still returns a name", async () => {
+    // Same contract as Test 12 but the failure lands on the enumeration rather
+    // than the connection — covers the SSH-exec-timeout shape too.
+    (getVettedPool as Mock).mockReturnValueOnce(["Willow"]);
+    (listIdentityKeysOnHost as Mock).mockRejectedValueOnce(
+      new Error("SSH exec timeout after 3000ms"),
+    );
+
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/identities/pool/pick",
+      body: { role: "skynet-maintainer", hostId: 7 },
+    });
+    expect(res.status).toBe(200);
+    expect((res.body as { name: string }).name).toBe("willow");
+  });
+
+  it("Test 12c: a hanging host does not hang the request (total budget)", async () => {
+    // connectOneShot's timeout covers only the handshake, and the enumerator
+    // carries its own 15s exec timer — so a box that accepts TCP but never
+    // answers could stall this endpoint ~18s without an outer budget. Assert the
+    // request still resolves with a name well before that.
+    (getVettedPool as Mock).mockReturnValueOnce(["Willow"]);
+    (listIdentityKeysOnHost as Mock).mockImplementation(
+      () => new Promise(() => { /* never settles */ }),
+    );
+
+    const started = Date.now();
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/identities/pool/pick",
+      body: { role: "skynet-maintainer", hostId: 7 },
+    });
+    const elapsed = Date.now() - started;
+
+    expect(res.status).toBe(200);
+    expect((res.body as { name: string }).name).toBe("willow");
+    expect(elapsed).toBeLessThan(10000);
+  }, 20000);
+
+  it("Test 13: LOCAL host skips SSH entirely", async () => {
+    // When the target is the box Skynet runs on, enumeration reads the
+    // identities root directly — opening an SSH connection to ourselves would
+    // be wasteful and can fail on boxes with no inbound SSH (harbor is
+    // SSM-only).
+    (isLocalHostId as Mock).mockReturnValue(true);
+    (getVettedPool as Mock).mockReturnValueOnce(["Willow"]);
+    (listIdentityKeysOnHost as Mock).mockResolvedValueOnce([]);
+
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/identities/pool/pick",
+      body: { role: "skynet-maintainer", hostId: 7 },
+    });
+    expect(res.status).toBe(200);
+    expect((res.body as { name: string }).name).toBe("willow");
+    expect(connectOneShot).not.toHaveBeenCalled();
+    // conn === null signals the LOCAL branch to the enumerator.
+    expect(listIdentityKeysOnHost).toHaveBeenCalledWith(null);
+  });
+
+  it("Test 13b: REMOTE host closes its SSH connection", async () => {
+    // Leaked one-shot connections accumulate per name suggestion, and the modal
+    // re-suggests on every host/role change.
+    (getVettedPool as Mock).mockReturnValueOnce(["Willow"]);
+
+    await httpRequest(server, {
+      method: "POST",
+      path: "/identities/pool/pick",
+      body: { role: "skynet-maintainer", hostId: 7 },
+    });
+
+    expect(connectOneShot).toHaveBeenCalled();
+    expect(stubConn.end).toHaveBeenCalled();
+  });
+
+  it("Test 14: pool.json casing drift — PascalCase entry compares + returns lowercase", async () => {
+    // Pool entries are PascalCase by convention (Plan 80-01 seed shape) while
+    // identity folders on disk are lowercase (H3 invariant). The comparison
+    // must normalize, or a PascalCase pool entry would never match its own
+    // lowercase folder and every taken name would read as free.
+    (getVettedPool as Mock).mockReturnValueOnce(["Willow", "Aster"]);
+    (listIdentityKeysOnHost as Mock).mockResolvedValueOnce(["willow"]);
+
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/identities/pool/pick",
+      body: { role: "skynet-maintainer", hostId: 7 },
+    });
+    expect(res.status).toBe(200);
+    // "Willow" (pool) matched "willow" (disk) → skipped, despite the casing gap.
+    expect((res.body as { name: string }).name).toBe("aster");
+  });
+
+  // --------------------------------------------------------------------------
+  // Phase 128 — tiered pool selection tests
+  // --------------------------------------------------------------------------
+
+  it("Test 15: tier-1 fresh name preferred over tier-2 archived name", async () => {
+    // Cedar has been archived (was in circulation, retired 30 days ago); Willow
+    // has never been used on this host. Even though Cedar is a valid candidate,
+    // Willow (fresh) must come first — the whole point of the tiered ranker.
+    (getVettedPool as Mock).mockReturnValueOnce(["Willow", "Cedar"]);
+    (listIdentityKeysOnHost as Mock).mockResolvedValueOnce([]);
+    (listArchivedIdentityEntriesOnHost as Mock).mockResolvedValueOnce([
+      { name: "cedar", mtimeMs: Date.now() - 30 * 86_400_000 },
+    ]);
+
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/identities/pool/pick",
+      body: { hostId: 7 },
+    });
+    expect(res.status).toBe(200);
+    expect((res.body as { name: string }).name).toBe("willow");
+  });
+
+  it("Test 16: no fresh names — tier-2 returns the oldest-archived name first", async () => {
+    // Every pool name has been archived. Ranker must pick the one archived
+    // longest ago (Pine at t=1000ms epoch, older than Cedar at t=5000ms).
+    (getVettedPool as Mock).mockReturnValueOnce(["Cedar", "Pine"]);
+    (listIdentityKeysOnHost as Mock).mockResolvedValueOnce([]);
+    (listArchivedIdentityEntriesOnHost as Mock).mockResolvedValueOnce([
+      { name: "cedar", mtimeMs: 5000 }, // newer
+      { name: "pine", mtimeMs: 1000 }, // older → wins
+    ]);
+
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/identities/pool/pick",
+      body: { hostId: 7 },
+    });
+    expect(res.status).toBe(200);
+    expect((res.body as { name: string }).name).toBe("pine");
+  });
+
+  it("Test 17: partial degradation — archive enumeration fails, active succeeds → still tier-1 pick", async () => {
+    // The whole point of the parallel/independent soft-degrade: an archive
+    // read failure MUST NOT cause active-set info to be discarded. The name
+    // returned should still avoid actively-held names.
+    (getVettedPool as Mock).mockReturnValueOnce(["Willow", "Aster"]);
+    (listIdentityKeysOnHost as Mock).mockResolvedValueOnce(["willow"]);
+    (listArchivedIdentityEntriesOnHost as Mock).mockRejectedValueOnce(
+      new Error("archive enumeration timed out"),
+    );
+
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/identities/pool/pick",
+      body: { hostId: 7 },
+    });
+    expect(res.status).toBe(200);
+    // Willow is active → skipped; Aster is the only non-active option.
+    expect((res.body as { name: string }).name).toBe("aster");
+  });
+
+  it("Test 18: archive dir missing (fresh host) — enumerator returns [] → every name is tier-1 fresh", async () => {
+    // A brand-new host that has never archived anyone returns [] from the
+    // archive enumerator (ENOENT swallowed). All pool names are tier-1
+    // candidates; result is one of them, verified via set membership.
+    (getVettedPool as Mock).mockReturnValueOnce(["Willow", "Aster", "Cedar"]);
+    (listIdentityKeysOnHost as Mock).mockResolvedValueOnce([]);
+    (listArchivedIdentityEntriesOnHost as Mock).mockResolvedValueOnce([]);
+
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/identities/pool/pick",
+      body: { hostId: 7 },
+    });
+    expect(res.status).toBe(200);
+    expect(["willow", "aster", "cedar"]).toContain(
+      (res.body as { name: string }).name,
+    );
+  });
+
+  it("Test 19: archive contains a name no longer in the pool — silently ignored", async () => {
+    // Simulates the Dagda-was-dropped case: a name that once was in the pool
+    // has since been removed, but the host's archive still contains the
+    // folder. Ranker must intersect archive with the CURRENT pool.
+    (getVettedPool as Mock).mockReturnValueOnce(["Willow"]);
+    (listIdentityKeysOnHost as Mock).mockResolvedValueOnce([]);
+    (listArchivedIdentityEntriesOnHost as Mock).mockResolvedValueOnce([
+      { name: "dagda", mtimeMs: 100 }, // NOT in pool
+    ]);
+
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/identities/pool/pick",
+      body: { hostId: 7 },
+    });
+    expect(res.status).toBe(200);
+    // Willow is fresh → tier 1; Dagda never surfaces.
+    expect((res.body as { name: string }).name).toBe("willow");
+  });
+
+  it("Test 20: enumerator returns role-suffixed folder names — derived to pool bases before ranking (2026-09-27 regression)", async () => {
+    // The enumerators emit FULL folder names (`clipper-box-maintainer-3`), not
+    // the pool bases (`clipper`) the ranker's filter compares against. Before
+    // the fix, the route fed raw folder names straight to the ranker, so a
+    // currently-held `clipper-box-maintainer-3` did not exclude `clipper` from
+    // tier 1 — the name got recycled while ~120 truly-fresh names sat unused.
+    // This test drives folder-shaped mock output through the route and asserts
+    // the ranker sees derived base names.
+    (getVettedPool as Mock).mockReturnValueOnce(["Clipper", "Toucan", "Willow"]);
+    (listIdentityKeysOnHost as Mock).mockResolvedValueOnce([
+      "clipper-box-maintainer-3", // real enumerator shape
+      "toucan-box-maintainer-2",
+    ]);
+    (listArchivedIdentityEntriesOnHost as Mock).mockResolvedValueOnce([]);
+
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/identities/pool/pick",
+      body: { hostId: 7 },
+    });
+    expect(res.status).toBe(200);
+    // Clipper + Toucan are both currently held → must NOT be picked.
+    // Willow is genuinely fresh → the only correct answer.
+    expect((res.body as { name: string }).name).toBe("willow");
+  });
+
+  it("Test 21: enumerator archive returns role-suffixed folder names — derived to pool bases for tier-2 LRU (2026-09-27 regression)", async () => {
+    // Same shape mismatch on the archive side. Archived `clipper-box-maintainer-3`
+    // must reduce to pool base `clipper` so it lands in tier 2 (recycled), not
+    // in tier 1 (fresh) alongside genuinely-untouched names.
+    (getVettedPool as Mock).mockReturnValueOnce(["Clipper", "Willow"]);
+    (listIdentityKeysOnHost as Mock).mockResolvedValueOnce([]);
+    (listArchivedIdentityEntriesOnHost as Mock).mockResolvedValueOnce([
+      { name: "clipper-box-maintainer-3", mtimeMs: Date.now() - 3600_000 },
+    ]);
+
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/identities/pool/pick",
+      body: { hostId: 7 },
+    });
+    expect(res.status).toBe(200);
+    // Willow is tier-1 fresh, Clipper is tier-2 recycled → Willow wins.
+    expect((res.body as { name: string }).name).toBe("willow");
+  });
+});
+
+describe("POST /identities/pool/pick — fleet name census", () => {
+  it("Census 1: a name live on another machine is not suggested while a fresh one remains", async () => {
+    const census = new FleetNameCensus();
+    census.noteHost("7", "m-target");
+    census.noteHost("9", "m-other");
+    census.recordMachine("m-other", ["willow-box-maintainer"], []);
+    __resetFleetNameCensusForTests(census);
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/identities/pool/pick",
+      body: { hostId: 7 },
+    });
+    expect(res.status).toBe(200);
+    expect((res.body as { name: string }).name).toBe("aster");
+  });
+
+  it("Census 2: a name archived elsewhere more recently loses to one archived longer ago", async () => {
+    const census = new FleetNameCensus();
+    census.recordMachine("m-other", [], [
+      { name: "willow-x", mtimeMs: 100 },
+      { name: "aster-x", mtimeMs: 900 },
+    ]);
+    __resetFleetNameCensusForTests(census);
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/identities/pool/pick",
+      body: { hostId: 7 },
+    });
+    expect((res.body as { name: string }).name).toBe("willow");
+  });
+
+  it("Census 3: suggestion makes no contact with hosts other than the target", async () => {
+    const census = new FleetNameCensus();
+    census.recordMachine("m-other", ["willow-x"], []);
+    __resetFleetNameCensusForTests(census);
+    await httpRequest(server, {
+      method: "POST",
+      path: "/identities/pool/pick",
+      body: { hostId: 7 },
+    });
+    expect(resolveHostById).toHaveBeenCalledTimes(1);
+    expect(connectOneShot).toHaveBeenCalledTimes(1);
+  });
+
+  it("Census 4: a suggestion is held, so a concurrent pick for another host gets a different name", async () => {
+    (resolveHostById as Mock).mockImplementation((hostId: number) =>
+      Promise.resolve(hostId === 7 || hostId === 8 ? stubHost : null),
+    );
+    const first = await httpRequest(server, {
+      method: "POST",
+      path: "/identities/pool/pick",
+      body: { hostId: 7 },
+    });
+    const second = await httpRequest(server, {
+      method: "POST",
+      path: "/identities/pool/pick",
+      body: { hostId: 8 },
+    });
+    expect((second.body as { name: string }).name).not.toBe(
+      (first.body as { name: string }).name,
+    );
+  });
+});

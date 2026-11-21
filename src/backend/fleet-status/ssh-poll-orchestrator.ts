@@ -1,0 +1,4152 @@
+/**
+ * ssh-poll-orchestrator.ts — 2s SSH-poll coordinator for the Skynet backend.
+ *
+ * ## D-CTX § PIVOT 2026-08-13 (LOCKED)
+ * No per-box daemon. No systemd user unit. No standalone subpackage.
+ * This module IS the fleet-status watcher — it runs inside the Skynet backend
+ * process and uses the existing Skynet SSH primitives to poll identity-hosting
+ * boxes every 2 seconds.
+ *
+ * ## Architecture
+ * - Opens ONE long-lived SSH channel per identity-hosting host (via the
+ *   `acquireSshChannel` injected dep — bound to `connectOneShot` in starter.ts).
+ *   Using a dedicated per-host long-lived Client rather than the per-request
+ *   `withConnection` pool: the 2s cadence would fight the pool's max-per-host
+ *   limit (3) if we leased + released a connection every 2 seconds across N hosts.
+ *   A long-lived Client keeps exactly one SSH control channel per host open
+ *   for the life of the orchestrator, satisfying T-34-18 (pool exhaustion).
+ * - On each 2s tick: lists `~/.claude/sessions/*.json`, reads session-JSON +
+ *   /proc/<pid>/stat + hook payload for each PID (batched Promise.all), parses
+ *   via Plan 01 pure-library helpers, computes SessionState, publishes state
+ *   deltas to the Plan 02 SubscriptionRegistry.
+ * - 30s stale sweep: re-probes each tracked PID's /proc/stat to catch PIDs that
+ *   vanished between poll ticks (e.g. session-JSON deleted mid-tick).
+ *
+ * ## Fail-open on missing hook payload file (user 2026-08-13 LOCKED)
+ * When the Stop-hook payload file is absent / empty / malformed / SSH-read-error:
+ *   - Treat background_tasks[] as [] for that poll cycle.
+ *   - Continue publishing SessionState (session-JSON status is authoritative).
+ *   - Log ONE rate-limited WARN per host per hookPayloadWarnCooldownMs (default 60s).
+ *   - Do NOT crash, do NOT stop polling, do NOT publish session_gone.
+ *
+ * ## Dependency injection
+ * All SSH, all DB, all timers are injected. The module is unit-testable with
+ * vi.useFakeTimers() + vi.fn() without any real SSH or database.
+ */
+import { recordAvatarVersion, recordAppIconVersion } from "./avatar-version-registry.js";
+import { systemLogger } from "../utils/logger.js";
+import {
+  parseSessionJson,
+  parseStopHookPayload,
+} from "./types.js";
+import { isStaleFromStat } from "./liveness-check.js";
+import { resolvePidToTmuxSession } from "./pid-to-tmux.js";
+import { filterAmbientTasks } from "./ambient-filter.js";
+import { isTeammateMessage } from "../claude-session/session-file-parser.js";
+import {
+  shellSingleQuote,
+  DISCOVERY_EXEC_TIMEOUT_MS,
+  toHostPerspectivePath,
+} from "../claude-session/discover-identity-session-file.js";
+import { findAgentHistoryFilesVia } from "../claude-session/agent-history-file.js";
+import type { SubscriptionRegistry } from "./subscription-registry.js";
+import {
+  FRAME_SCHEMA_VERSION,
+  makeAppGoneFrame,
+  makeGoneFrame,
+  makeUpdateFrame,
+  type AppState,
+  type SessionState,
+} from "./wire-protocol.js";
+import { isIdentityVisibleToUser } from "./identity-visibility-gate.js";
+import { isAppVisibleToUser } from "./app-visibility-gate.js";
+import type { HostRecord } from "./host-id-resolver.js";
+import { writeSessionFileCache } from "./session-file-cache.js";
+// Phase 92 — v1 JSONL sweep wire contract (Plan 01). parseSweepJsonl is the
+// lenient parser that never throws; SWEEP_SCHEMA_VERSION is compared per-line
+// server-side, and any mismatch surfaces via parseSweepJsonl's schemaMismatch
+// flag which drives the caller-side fallback branch in pollOneHostBatch below.
+import {
+  parseSweepJsonl,
+  SWEEP_SCHEMA_VERSION,
+  type SweepAppLine,
+  type SweepPidLine,
+  type SweepIdentityLine,
+} from "./sweep-schema.js";
+// Phase 85 (D-07): per-tick `lastMessageAt` derivation reads user's newest
+// send-time timestamp from the identity-name-keyed send-log store instead of
+// scanning the JSONL tail. `scanTailForNewestMessageAt` stays defined + exported
+// for byte-parallel consumers in `src/backend/database/routes/sessions.ts`
+// (D-08); only the in-file `derivedLastMessageAt` derivation retires from it.
+import { getIdentityLastSend } from "./identity-send-log-store.js";
+import { getTurnFinishStore, type TurnFinishStore } from "../attention/turn-finish-store.js";
+import { getReadStateStore, type ReadStateStore } from "../attention/read-state-store.js";
+import { scanTailForLatestUserReply } from "../attention/user-reply-scan.js";
+import {
+  checkExecBreaker,
+  recordExecFailure,
+  recordExecSuccess,
+} from "../ssh/host-circuit-breaker.js";
+// Phase 111 Plan 03 — single appearance merge authority. `appearanceFromIdentityLine`
+// (module-scope helper below) calls `resolveIdentityAppearance` exactly ONCE per
+// identity per tick; both source-A and source-B adapters share that one call site.
+import {
+  resolveIdentityAppearance,
+  type RawCosmetics,
+} from "./identity-appearance.js";
+import type { IdentityAppearance } from "./wire-protocol.js";
+import type { PendingBirth } from "../spawn-requests/types.js";
+// Slim import — parse-request-body.ts is a dependency-free extraction that
+// avoids pulling worker.ts's heavy transitive graph (birthIdentity, matrix
+// admin, Skynet DB init, pool-loader) into the fleet-status test module
+// surface. See parse-request-body.ts header for the full rationale.
+import {
+  parseRequestBody,
+  isRoleRequestBody,
+  parseRoleRequestBody,
+} from "../spawn-requests/parse-request-body.js";
+
+// ---------------------------------------------------------------------------
+// Peer-keyed sweep-result cache
+//
+// Two orchestrators on the same Skynet process (one per subscribed user) that
+// both hold host rows pointing at the same physical box (same ip:port) would
+// otherwise each fire their own `fleet-status-sweep` exec independently every
+// poll tick. The sweep script is identity-and-user-agnostic — it reads the
+// box's on-disk state and emits JSONL that any orchestrator can consume; the
+// user-gating happens later in the pipeline (identity-visibility, host-access).
+// So sharing the raw sweep bytes across orchestrators is safe.
+//
+// This cache is a module-scope Map, so every orchestrator in the same Node
+// process sees the same entries. Keyed by peer (`ip:port`) which the sweep
+// call site already computes for the exec breaker; TTL is set below the
+// pollIntervalMs default so a caller polling on its own natural cadence
+// always finds a stale-enough entry to refetch on its own schedule, while a
+// second caller polling within the TTL of the first gets the cached bytes.
+//
+// Fallback shape: cache miss (empty, or expired) is INDISTINGUISHABLE from
+// the pre-existing behavior — a fresh channel.exec fires exactly as before.
+// If the cache breaks, worst-case is every orchestrator does its own exec
+// (i.e. today's behavior). Rollback is a single revert.
+//
+// Not cached: failure paths. Only successful sweeps get an entry so callers
+// don't inherit a peer's degraded state via cache retention. Timeouts, null
+// stdout, schema-mismatch, and empty-on-nonempty-box all skip caching so the
+// next tick's caller sees the real underlying signal.
+// ---------------------------------------------------------------------------
+
+interface SweepCacheEntry {
+  readonly result: string;
+  readonly expiresAt: number;
+}
+
+const sweepResultCache = new Map<string, SweepCacheEntry>();
+
+/**
+ * TTL for the peer-keyed sweep-result cache. Sized just under the default
+ * `pollIntervalMs` (2000ms) so a single orchestrator polling on its own
+ * cadence effectively always misses the cache and fires its own exec, while
+ * a second orchestrator polling the same peer inside the window gets the
+ * cached bytes.
+ */
+export const SWEEP_RESULT_CACHE_TTL_MS = 1500;
+
+/**
+ * Read a cached sweep result for `peer` — null if empty or expired. Exported
+ * for unit tests; production callers go through the pollOneHostBatch path.
+ */
+export function getCachedSweepResult(peer: string): string | null {
+  const entry = sweepResultCache.get(peer);
+  if (!entry) return null;
+  if (Date.now() >= entry.expiresAt) {
+    sweepResultCache.delete(peer);
+    return null;
+  }
+  return entry.result;
+}
+
+/**
+ * Store a successful sweep result in the cache. Exported for unit tests;
+ * production callers go through the pollOneHostBatch path.
+ */
+export function cacheSweepResult(peer: string, result: string): void {
+  sweepResultCache.set(peer, {
+    result,
+    expiresAt: Date.now() + SWEEP_RESULT_CACHE_TTL_MS,
+  });
+}
+
+/**
+ * __resetSweepResultCacheForTests — clears the module-scope cache Map.
+ *
+ * TEST-ONLY. Call in beforeEach to prevent state leak between test cases.
+ * The __ prefix signals internal-only; do not call from production code.
+ */
+export function __resetSweepResultCacheForTests(): void {
+  sweepResultCache.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Public interfaces
+// ---------------------------------------------------------------------------
+
+/**
+ * Thin SSH exec wrapper — one per identity-hosting host for the life of
+ * the orchestrator. Returns null on any SSH-side error (never throws).
+ *
+ * The optional `stdinBody` param routes to a stdin-writing variant so
+ * callers pushing payloads larger than Linux's MAX_ARG_STRLEN (128 KB
+ * per argv element on x86_64) can stream the body via CHANNEL_DATA
+ * rather than embedding it in the exec command string. See
+ * writeInstalledBytesWithMode in ../distributor/ssh-push.ts for the
+ * load-bearing consumer.
+ */
+/**
+ * Per-call exec options. `timeoutMs` is passed INTO the underlying
+ * execCommand so the SSH channel is closed (and its per-host semaphore slot
+ * freed) when it expires — a caller's own Promise.race only abandons the
+ * promise. Adapters fall back to a per-subsystem ceiling when omitted
+ * (FLEET_STATUS_EXEC_TIMEOUT_MS here). Local (child_process) channels may
+ * ignore it.
+ */
+export interface SshChannelExecOptions {
+  timeoutMs?: number;
+}
+
+/**
+ * Default per-exec ceiling for the fleet-status channel adapter. Equal to the
+ * legacy-poll wall-time cap (LEGACY_POLL_TIMEOUT_MS) — the largest budget any
+ * fleet-status caller races an exec against, so no exec can outlive the poll
+ * that issued it. Tighter race sites (probe 5s, sweep 8s, discovery 5s) pass
+ * their own budget through opts.
+ */
+export const FLEET_STATUS_EXEC_TIMEOUT_MS = 30_000;
+
+export interface SshChannel {
+  exec(
+    command: string,
+    stdinBody?: Buffer,
+    opts?: SshChannelExecOptions,
+  ): Promise<string | null>;
+  /**
+   * `ip:port` of the underlying SSH peer. Used as the exec-breaker key by
+   * fleet-status probe + batch paths — same peer-key format connectOneShot
+   * feeds the connect breaker (see host-circuit-breaker.ts).
+   *
+   * Optional so local-host channels (child_process-backed) and test mocks
+   * can omit it; consumers must handle undefined by skipping breaker
+   * consultation (graceful degradation).
+   */
+  peer?: string;
+  /**
+   * True once the connection this channel execs on is gone for good (the
+   * peer rebooted, the socket closed, the client was released). The poller
+   * caches one channel per host, so without this a host whose connection
+   * died would keep timing out on the dead one until Skynet restarts.
+   * Optional: channels that can't die (local-host, test mocks) omit it.
+   */
+  isClosed?(): boolean;
+}
+
+export interface OrchestratorDeps {
+  /** Async DB query — returns the list of identity-hosting host records */
+  listIdentityHostingHosts(): Promise<HostRecord[]>;
+
+  /** Open a dedicated SSH channel for a host; returns null on failure */
+  acquireSshChannel(host: HostRecord): Promise<SshChannel | null>;
+
+  /** Release a previously-acquired SSH channel */
+  releaseSshChannel(host: HostRecord, channel: SshChannel): void;
+
+  /** The subscription registry (Plan 02) — receives state deltas */
+  registry: SubscriptionRegistry;
+
+  /**
+   * Timer factory (injectable for tests).
+   * The fn may return a Promise — tests can capture fn from the mock and
+   * await it directly to drive poll/sweep cycles synchronously.
+   */
+  setInterval(fn: () => Promise<void> | void, ms: number): ReturnType<typeof setInterval>;
+  clearInterval(h: ReturnType<typeof setInterval>): void;
+
+  /** Clock (injectable for tests) */
+  now(): number;
+
+  /** Defaults below */
+  pollIntervalMs?: number;
+  staleSweepIntervalMs?: number;
+  hookPayloadPath?: string;
+  hookPayloadWarnCooldownMs?: number;
+  /**
+   * Durable per-(host, identity) last-finished-turn log (sidebar unread
+   * marks). Defaults to the process-wide store; tests inject their own.
+   */
+  turnFinishStore?: TurnFinishStore;
+  /**
+   * Per-user read state — a user reply newer than the last finished turn
+   * marks that turn seen. Defaults to the process-wide store.
+   */
+  readStateStore?: ReadStateStore;
+  /**
+   * The person this orchestrator polls for (one orchestrator per Skynet
+   * user). When set, every sweep works out which agents and apps that person
+   * can see, and when a `users:` change (sharing) flips one, sends them the
+   * row or a gone straight away — the fingerprinted publishes never notice a
+   * sharing-only change, so without this the sidebar waits for a refresh.
+   * Absent (tests, internal callers) = no tracking.
+   */
+  viewer?: { userId: string; username(): Promise<string | null> };
+}
+
+export interface SshPollOrchestrator {
+  start(): Promise<void>;
+  stop(): void;
+  getPollTickCount(): number;
+  /**
+   * Look up the sweep-populated raw cosmetics for an identity on a host.
+   *
+   * Returns `null` when there is no live entry — either the host has no
+   * orchestrator state yet (SSH channel not up, first tick hasn't run), or
+   * the identity was not present in the last successful sweep's identity
+   * lines (folder missing, archived, reconciled away). Callers treat null as
+   * "cache miss" and fall through to their own SSH read.
+   *
+   * The `identityCosmetics` and `roleCosmetics` inside a returned object may
+   * each independently be null when the sweep saw no frontmatter on that
+   * side — passed unchanged to `isIdentityVisibleToUser` where absent = falls
+   * open per D-3.
+   *
+   * `hostIdStr` is the string host id used on the wire (matches the shape
+   * WS-frame filter callers already have). Non-numeric strings return null.
+   */
+  getCachedIdentityCosmetics(
+    hostIdStr: string,
+    identityName: string,
+  ): {
+    identityCosmetics: RawCosmetics | null;
+    roleCosmetics: RawCosmetics | null;
+    role: string | null;
+    /** Multi-role only: each listed role's cosmetics, for the gate. */
+    rolesCosmetics?: Array<RawCosmetics | null>;
+    /** Every listed role, index-aligned with rolesCosmetics. */
+    roles?: string[];
+  } | null;
+}
+
+// ---------------------------------------------------------------------------
+// readStatWithSentinel — transport-vs-dead distinguishing stat reader
+// ---------------------------------------------------------------------------
+
+/**
+ * Tagged discriminated union returned by `readStatWithSentinel`. Distinguishes
+ * three outcomes of a `/proc/<pid>/stat` read over the SSH channel:
+ *
+ *   - `{ok: true, content}`     — stat read succeeded, content is /proc/<pid>/stat.
+ *   - `{ok: false, reason: 'enoent'}`    — real absence (PID dead).
+ *   - `{ok: false, reason: 'transport'}` — SSH channel error / unknown shape.
+ *
+ * The whole point of this helper is bounty 9c8d4a72-1e5f-4b8a-9d3c-6f2b8e4a7c19:
+ * SSH `Channel open failure` on the raw `cat /proc/<pid>/stat` exec was returning
+ * `null` from the channel adapter, which `isStaleFromStat(_, null)` treats as
+ * PID-dead. The reaper then published `session_gone` for actively-working sessions
+ * whenever sshd MaxSessions saturated. See fix-wip-indicator-transport-vs-dead.md.
+ */
+export type StatReadResult =
+  | { ok: true; content: string }
+  | { ok: false; reason: 'enoent' | 'transport' };
+
+/**
+ * Read `/proc/<pid>/stat` via the SSH channel, distinguishing transport error
+ * from real PID-dead ENOENT via an exit-code sentinel.
+ *
+ * Command shape: `cat /proc/${pid}/stat 2>&1 && echo __STAT_OK__ || echo __STAT_ENOENT__`
+ *
+ * The sentinel is what makes the null-return from the adapter unambiguous —
+ * a genuine PID-dead read returns `<empty stdout>__STAT_ENOENT__` (adapter
+ * captures string), whereas a transport failure returns `null` (adapter swallows
+ * the SSH channel-open-failure).
+ *
+ * Dispatch rules (applied in order):
+ *   1. `raw === null`                  → transport failure (adapter caught throw).
+ *   2. Trimmed raw ends with `__STAT_OK__`     → strip sentinel + trailing whitespace → ok.
+ *   3. Trimmed raw ends with `__STAT_ENOENT__` → real ENOENT (PID dead) → reap.
+ *   4. Any other shape (empty, unknown sentinel, malformed) → transport (fail-OPEN).
+ *
+ * Fail-OPEN on unknown is deliberate per the fix agreement: an unrecognised shape
+ * is more likely a truncated / mangled channel response than a real PID-dead
+ * signal, so it must NOT cause a reap. The next tick will retry.
+ *
+ * Bounty: 9c8d4a72-1e5f-4b8a-9d3c-6f2b8e4a7c19
+ */
+export async function readStatWithSentinel(
+  channel: SshChannel,
+  pid: number,
+): Promise<StatReadResult> {
+  const cmd = `cat /proc/${pid}/stat 2>&1 && echo __STAT_OK__ || echo __STAT_ENOENT__`;
+  const raw = await channel.exec(cmd);
+
+  // Rule 1: adapter swallowed a throw (SSH channel-open-failure etc.)
+  if (raw === null) {
+    return { ok: false, reason: 'transport' };
+  }
+
+  const trimmed = raw.trimEnd();
+
+  // Rule 2: OK sentinel present — strip it + any trailing whitespace, return content.
+  if (trimmed.endsWith('__STAT_OK__')) {
+    const content = trimmed.slice(0, -'__STAT_OK__'.length).trimEnd();
+    return { ok: true, content };
+  }
+
+  // Rule 3: ENOENT sentinel present — real absence, PID dead.
+  if (trimmed.endsWith('__STAT_ENOENT__')) {
+    return { ok: false, reason: 'enoent' };
+  }
+
+  // Rule 4: unknown shape (empty, malformed, unrecognised sentinel) → fail-OPEN.
+  return { ok: false, reason: 'transport' };
+}
+
+// ---------------------------------------------------------------------------
+// Internal types
+// ---------------------------------------------------------------------------
+
+/**
+ * Narrow extension of HostRecord that adds the runs_fleet_substrate opt-in
+ * flag (Phase 72 Plan 02's Drizzle column). Exported so starter.ts's
+ * listIdentityHostingHosts + starter.test.ts's compile-time shape check can
+ * reference it directly. The projection helper `projectRunsFleetSubstrate`
+ * (starter.ts) normalizes the Drizzle column value into the strict boolean
+ * field this type declares, so consumers see fail-closed behavior on any
+ * legacy NULL / undefined / non-1 row.
+ *
+ * `_connDetails` is the decrypted SSH host record packaged by
+ * listIdentityHostingHosts for the acquireSshChannel path; it is opaque
+ * to ssh-poll-orchestrator itself but part of the wire-through shape
+ * between starter.ts and the OrchestratorDeps consumer.
+ */
+export interface IdentityHostingHostRecord extends HostRecord {
+  runsFleetSubstrate: boolean;
+  _connDetails: Record<string, unknown>;
+}
+
+interface PidCacheEntry {
+  sessionId: string;
+  tmuxSession: string | null;
+  procStart: string;
+  lastPublishedFingerprint: string;
+  // Phase 41 Plan 03 — cached derived value of the "newest message-bearing
+  // JSONL frame ts, either direction" recency signal. `null` when the JSONL
+  // has zero message-bearing frames (session with no history). Sticky across
+  // poll ticks: a poll that reads a tail that does NOT include a newer
+  // message-bearing frame leaves the prior cached value alone; only a NEWER
+  // frame overwrites it. This is what makes the signal edge-triggered on
+  // messages (not on lifecycle events / tool_use / thinking blocks).
+  lastMessageAt: number | null;
+  // Phase 47 — cached derived latest ai-title from the same JSONL tail-read
+  // that feeds lastMessageAt. Passenger on the same jsonlPath — no
+  // independent stale-tick counter (aiTitle inherits invalidation via the
+  // shared cached jsonlPath). Last-wins semantics: a fresher tail-scan
+  // whose scanTailForLatestAiTitle returns a non-null string overwrites the
+  // cached value; a scan returning null preserves the cache (fail-open on
+  // transient SSH hiccups matches lastMessageAt's behavior). Publishes iff
+  // computeFingerprint sees a change (aiTitle is a distinct fingerprint
+  // axis so an ai-title-only drift still fires publishSessionState).
+  aiTitle: string | null;
+  // Phase 44 Plan 02 — cached JSONL path resolved via
+  // discoverIdentityJsonlPathViaChannel (identity /id-first-turn discovery).
+  // Populated on the first tick where tmuxSession resolves; reused across
+  // every subsequent tick so discovery only fires ONCE per PID lifetime in
+  // the happy path. Set back to null to trigger re-discovery on the next
+  // tick (see staleTailTickCount below — the only path that invalidates
+  // the cached path defensively). See 44-CONTEXT.md § ssh-poll-orchestrator.ts
+  // swap for the timing + rationale.
+  jsonlPath: string | null;
+  // Phase 44 Plan 02 — count of consecutive ticks where the cached
+  // `jsonlPath`'s tail-scan (Phase 47 Plan 02: `tail -c 262144`) failed to
+  // advance a NON-NULL cached `lastMessageAt`. Reset to 0 on any tick that
+  // advances lastMessageAt.
+  // (The STALE_TAIL_REDISCOVERY_THRESHOLD trip that invalidated `jsonlPath`
+  // is retired — the counter is carried but no longer advanced.) Original
+  // intent: on reaching the threshold, invalidate `jsonlPath`
+  // so the next tick re-fires discovery — defense against Claude Code
+  // JSONL rotation mid-session (a resume can rotate the active file,
+  // leaving the cached path pointing at a stale JSONL; compaction stays in
+  // the same file and sessionId).
+  //
+  // IMPORTANT (tightened condition, revised from a prior draft):
+  // sessions with a NULL cached `lastMessageAt` (genuinely no message-
+  // bearing history yet) do NOT tick this counter — it stays at 0. The
+  // threshold is a ROTATION-DEFENSE for sessions that once had a signal
+  // and lost it, NOT a "kick discovery when we haven't seen a message
+  // yet" mechanism. Incrementing here would create permanent-cycle
+  // re-discovery churn for identities that legitimately have no message
+  // history (fresh session pre-first-turn; identity that never invokes
+  // /id; identity whose entire history is tool_use / thinking / lifecycle
+  // events). See 44-CONTEXT.md § ssh-poll-orchestrator.ts swap.
+  staleTailTickCount: number;
+  // Phase 52 Plan 01 Task 2 — cached derived boolean result of the source A
+  // dormant sentinel stat (`stat ~/fleet/identities/'<tmuxSession>'/.dormant
+  // 2>/dev/null >/dev/null && echo yes || echo no`). Trimmed stdout "yes" →
+  // true; "no" → false; anything else (null, throw, unexpected output) →
+  // fail-open using this cached value (defaults to `false` on cold-start).
+  // The dormant axis participates in computeFingerprint so a dormant-only
+  // flip publishes a new frame (delta detection is per-axis). Fail-open
+  // preservation matches lastMessageAt / aiTitle patterns — transient SSH
+  // hiccups do NOT flip a valid dormant reading.
+  dormant: boolean;
+  // Source A carries NO condensing cache: the condensing axis lives solely in
+  // source B's `sourceBIdentityState` per-identity cache (see PerHostState
+  // below + composeAndPublishPerIdentity). Source A omits the field.
+  // -------------------------------------------------------------------------
+  // Phase 59 Plan 02 (WIP shell-idle gate — 2026-08-26): three new cache axes
+  // for the WIP indicator's stop-gate derivation. Both new axes participate
+  // in computeFingerprint so a value change on either publishes a new frame
+  // even when status + backgroundTasks + lastMessageAt + aiTitle + dormant +
+  // condensing are all unchanged.
+  // -------------------------------------------------------------------------
+  // Cached previous-tick `sessionJson.status` value, used exclusively to
+  // derive `lastStatusChangeAt` via poll-to-poll status-value delta
+  // comparison. `null` on cold-start (first tick sees a PID with no prior
+  // comparison basis → seed lastStatusChangeAt to deps.now()). This is the
+  // ONLY source-of-truth for the delta comparison; sessionJson.updatedAt is
+  // NEVER read as the source (Pitfall 4: the harness bumps updatedAt on
+  // compose-box typing without a real state transition).
+  lastStatus: "busy" | "shell" | "idle" | "waiting" | null;
+  // Unix millis of the poll tick where sessionJson.status most recently
+  // transitioned to a different value. Seeded to `deps.now()` on first
+  // appearance (isNew); updated to `deps.now()` when this-tick status
+  // differs from cached lastStatus; preserved otherwise (same-status tick
+  // does NOT bump). Frontend consumes together with lastStopAt in the
+  // `main = busy || (shell && stopIsFresh)` predicate on session-working-store.
+  lastStatusChangeAt: number;
+  // Unix millis derived from `stat -c %Y ~/.claude/fleet-status/stop-<sessionId>.json * 1000`
+  // (GNU stat seconds since epoch, converted to millis for wire consistency
+  // with every other timestamp axis). `null` when the file does not exist
+  // (session has never had a turn end since the Phase 59 Plan 01 stop hook
+  // was installed). Cache-preserved on SSH hiccup (transient null returns
+  // preserve prior value — fail-open matching lastMessageAt / aiTitle /
+  // dormant patterns).
+  lastStopAt: number | null;
+  // -------------------------------------------------------------------------
+  // Phase 62 Plan 03 (WIP hook-based rewrite — 2026-08-30): two new cache axes
+  // for the direct-signal WIP predicate. Both participate in computeFingerprint
+  // so a mtime-only change on either publishes a new frame even when every
+  // other axis is unchanged.
+  //
+  // Sources: the two per-session marker files touched by the Plan 62-01 hook
+  // scripts, installed onto managed boxes by Plan 62-02:
+  //   - activityMtime: mtime × 1000 of
+  //     `~/.claude/fleet-status/hooks/<sessionId>/activity` (touched on
+  //     UserPromptSubmit + PreToolUse).
+  //   - stoppedMtime:  mtime × 1000 of
+  //     `~/.claude/fleet-status/hooks/<sessionId>/stopped`  (touched on
+  //     Stop + StopFailure + PermissionRequest).
+  //
+  // Semantics (both fields): `null` on cold-start, missing file (empty
+  // stdout), or SSH hiccup (null exec return). Cache-preserved on all three
+  // — fail-open in the safe direction matches lastMessageAt / aiTitle /
+  // dormant / lastStopAt patterns. Numeric value (unix millis) only when
+  // the stat returned a non-null non-empty numeric-parseable stdout.
+  //
+  // Rollout note (CONTEXT.md § Rollout Option 1 — LOCKED for Phase 62):
+  // These two axes ride alongside — NOT instead of — the Phase 59 lastStopAt
+  // + lastStatusChangeAt axes for the duration of the rollout window. The
+  // frontend (Plan 62-04) chooses which predicate applies per-session based
+  // on marker presence:
+  //   - activityMtime !== null || stoppedMtime !== null → new predicate
+  //     (`activityMtime > stoppedMtime` → working).
+  //   - both null → fall through to the retained Phase 59 shell-idle-gate
+  //     predicate (box not yet upgraded to Plan 62-02 installer).
+  // A follow-up phase retires the Phase 59 axes cleanly post-full-rollout.
+  //
+  // SessionId-rotation reset: on rotation (isNew-equivalent), both new axes
+  // reset to null (the new sessionId's marker files may not exist yet).
+  // Matches the Phase 59 lastStopAt rotation-reset at line ~1193 in processPid.
+  // -------------------------------------------------------------------------
+  activityMtime: number | null;
+  stoppedMtime: number | null;
+  // Phase 111 Plan 03 — resolved identity appearance, joined from the identity
+  // line the sweep emits on the SAME exec that delivers PID state (D-01: zero
+  // additional SSH channels). Stamped on BOTH the publish branch AND the
+  // suppress branch so the cache stays lockstep with derivation (Research
+  // § Pitfall 3 — missing either branch would silently re-compare against a
+  // stale appearance value on the next tick).
+  //
+  // Semantics: object → resolved this tick; null → the emitting host sent no
+  // appearance keys (pre-Plan-111-01) or this is the legacy path.
+  identityAppearance: IdentityAppearance | null;
+}
+
+// Source B per-identity cache entry (identity-folder-keyed, PID-independent).
+//
+// Field semantics:
+//   dormant                   — `.dormant` sentinel stat; participates in fingerprint.
+//   condensing                — `.compact-requested` || `.compacting`: the
+//                                agent's context is being condensed in place
+//                                (queued or in flight); participates in fingerprint.
+//   lastPublishedFingerprint  — the (dormant|condensing|appearance|lastFinish)
+//                                tuple last published for this identity;
+//                                fingerprint-suppression compares against this
+//                                on every tick.
+//   identityAppearance        — Phase 111 Plan 03: resolved appearance from the
+//                                sweep line's appearance keys. Stamped on BOTH
+//                                the publish branch AND the suppress branch so the
+//                                cache stays lockstep with derivation (Pitfall 3).
+//                                Semantics: object → resolved this tick; null →
+//                                the emitting host sent no appearance keys
+//                                (pre-Plan-111-01) or this is the legacy path.
+interface SourceBIdentityCacheEntry {
+  dormant: boolean;
+  condensing: boolean;
+  lastPublishedFingerprint: string;
+  identityAppearance: IdentityAppearance | null;
+}
+
+interface PerHostState {
+  host: HostRecord;
+  channel: SshChannel;
+  livenessMap: Map<number, PidCacheEntry>;
+  lastHookWarnAt: number;
+  // Source B per-identity cache (dormant + condensing axes). Entries exist
+  // for identities source B currently publishes for — identities with no
+  // live PID, or live identities that are condensing; a live identity that
+  // is not condensing is evicted (source A owns its frames). See
+  // SourceBIdentityCacheEntry above for field-level semantics and
+  // composeAndPublishPerIdentity for the per-tick update contract.
+  sourceBIdentityState: Map<string, SourceBIdentityCacheEntry>;
+  // Live identities already checked against the registry for a condensing
+  // value left by an earlier watcher (composeAndPublishPerIdentity). Once per
+  // identity per host state: any later condensing is in sourceBIdentityState.
+  registryCondensingChecked: Set<string>;
+  // -------------------------------------------------------------------------
+  // Phase 92: sweep-first / legacy-fallback dispatch state.
+  //
+  // The fleet-status poller dispatches one of two pipelines per tick per host:
+  //   (batch)  — one `~/.local/bin/fleet-status-sweep` exec per host, parse
+  //              JSONL, drive the same compose+publish machinery as legacy.
+  //   (legacy) — the original ~9-11 exec/PID + ~5 exec/identity fan-out.
+  //
+  // Dispatch decision uses the `sweepScriptPresent` cache below. The probe
+  // (`test -x ~/.local/bin/fleet-status-sweep`) fires ONCE per host per
+  // SSH-channel lifetime — not per tick — so a slow-flip on the managed box
+  // (distributor installs the script, or human deletes it) is detected on
+  // the next SSH reconnect, not every 2s.
+  //
+  // Cache invalidation is signaled by `lastProbeChannelRef !== channel`
+  // (object-identity check against the current SshChannel). On acquireSsh-
+  // Channel reconnect, starter.ts hands us a fresh SshChannel wrapper, so
+  // the object identity differs and the probe re-fires. Cheaper than
+  // plumbing a callback through starter.ts's channel-teardown handlers.
+  //
+  // Transient recovery: on `sweep-exec null` in the batch path (SSH hiccup
+  // that swallowed the script's stdout), pollOneHost sets sweepScriptPresent
+  // back to null so the next tick re-probes. Permanent absence sets it to
+  // `false` (probe returned "no" or null), which blocks the batch path
+  // until the next channel reconnect.
+  //
+  // Schema drift: `sweepSchemaMismatchThisConnection` latches true on the
+  // first parse whose `schema_version !== SWEEP_SCHEMA_VERSION` and stays
+  // true for the rest of this SSH-channel lifetime. Blocks the batch path
+  // (falls straight to legacy) without re-invoking the sweep-exec every
+  // tick — a schema-version bump is a container-restart-scope event.
+  // -------------------------------------------------------------------------
+  sweepScriptPresent: boolean | null;
+  sweepSchemaMismatchThisConnection: boolean;
+  lastProbeChannelRef: SshChannel | null;
+
+  // Phase 115 hotfix (2026-09-18): per-host reconciliation set of live-tree
+  // identity names seen in the last successful sweep tick. Used at the end of
+  // each successful sweep to diff against the current tick's live-tree set
+  // and emit publishSessionGone for any identity that was cached but is no
+  // longer emitted (e.g. archived, folder deleted, folder renamed). Closes
+  // the "cache diverges from sweep" gap surfaced by sky's archive UAT
+  // 2026-09-17. Reconciliation ONLY runs on sweep success (parsed.identityLines
+  // is a full answer) — never on {ok:false} sweep failures, so transient SSH
+  // hiccups don't flap the sidebar.
+  lastTickLiveTreeIdentities: Set<string>;
+
+  // Phase 118 Plan 118-04 (D-11, D-12, D-13, D-02): per-host reconciliation
+  // set of source-C app slugs seen in the last successful sweep tick. Mirrors
+  // `lastTickLiveTreeIdentities` above verbatim (adopting Phase 115's
+  // `67b4a7ef` pattern for apps, per D-11). Populated at the end of each
+  // successful sweep with EVERY slug that entered the picture — healthy OR
+  // unhealthy (D-02 carve-out). Do NOT filter to healthy-only: an unhealthy
+  // app that persists across ticks would gone-and-re-add every tick,
+  // defeating D-13 (health-flip must be a single publishAppUpdate, never
+  // publishAppGoneByHostSlug + publishAppUpdate).
+  //
+  // Diff'd against previous tick on next success to fire
+  // publishAppGoneByHostSlug for silent removals (folder deleted, unit
+  // removed by archive-app.sh, D-01/D-02 dropped for any reason).
+  //
+  // Reconciliation ONLY runs on sweep success per D-12 (the {ok:false} early
+  // returns above in pollOneHostBatch never reach the reconciliation block,
+  // so transient SSH failures don't flap the sidebar). Matches the identity
+  // reconciliation guard.
+  lastTickLiveApps: Set<string>;
+
+  // Which agents (by identity name) and apps (by slug) the viewer
+  // (`deps.viewer`) could see at the last successful sweep. A flip between
+  // sweeps sends the viewer the row or a gone — see reconcileViewerVisibility.
+  viewerVisibleIdentities: Map<string, boolean>;
+  viewerVisibleApps: Map<string, boolean>;
+
+  // False until this host state's first successful batch sweep has been
+  // reconciled against the process-wide registry (see
+  // reconcileRegistryWithFirstSweep). The lastTick* sets start empty, so
+  // without that one-shot pass anything that vanished while no poller was
+  // running (identity archived overnight, app archived with every tab
+  // closed) was never marked gone and got replayed in every connect snapshot.
+  registryReconciled: boolean;
+  // Consecutive successful-but-empty batch sweeps (reset by any non-empty
+  // one). Gates the registry reconcile on the empty-box path.
+  emptySweepStreak: number;
+
+  // Per-identity raw cosmetics cache — populated by the source-B loop on every
+  // successful sweep tick for EVERY live-tree identity (before the skip-and-
+  // evict branch that trims `sourceBIdentityState`). Consumers query it via
+  // `getCachedIdentityCosmetics` on the orchestrator's public surface to gate
+  // WS frames without doing their own SSH read per frame.
+  //
+  // Distinct from `sourceBIdentityState` because that map's lifetime is tied
+  // to source B's publish set (live-and-not-condensing identities get evicted).
+  // This map's lifetime is tied to the live tree: an identity present in the
+  // last sweep's identity lines has an entry; an identity that dropped off
+  // the live tree has its entry removed alongside the `lastTickLiveTreeIdentities`
+  // reconciliation. That way the WS gate closure sees "sweep-fresh cosmetics
+  // for every present identity" without accidentally reading stale data for
+  // an identity that no longer exists.
+  //
+  // A `null` on either side means "sweep saw no frontmatter cosmetics on that
+  // side" — passed unchanged to `isIdentityVisibleToUser`, which treats it as
+  // an absent gate list (falls open per D-3).
+  identityCosmeticsCache: Map<
+    string,
+    {
+      identityCosmetics: RawCosmetics | null;
+      roleCosmetics: RawCosmetics | null;
+      /**
+       * The identity's single role as emitted by the sweep (its `roles:`
+       * frontmatter when that lists exactly one role), carried alongside
+       * cosmetics so consumers can look up role without a second SSH read.
+       * `null` when the identity holds zero or several roles.
+       */
+      role: string | null;
+      /** Multi-role only: each listed role's cosmetics (index-aligned with
+       *  the sweep's `roles`), so the gate can check every role's `users:`. */
+      rolesCosmetics?: Array<RawCosmetics | null>;
+      /** Every role the sweep listed for the identity. */
+      roles?: string[];
+    }
+  >;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 92 — fetch/compose seam types
+//
+// processPid and the per-identity iteration of pollDormantOnlyIdentities are
+// split into two coordinated pieces: (a) a FETCH step that runs the exec fan-
+// out (legacy path) OR reads pre-fetched values from a SweepPidLine /
+// SweepIdentityLine (batch path), and (b) a COMPOSE + PUBLISH step that runs
+// the fingerprint, publish contract, cache write, and writeSessionFileCache
+// (RESEARCH G8) — SHARED by both paths so parity is guaranteed by construction.
+//
+// The two fetched-state structs mirror the intermediate values today's
+// processPid + pollDormantOnlyIdentities produce from their exec results. In
+// the legacy path fetchPerPidState / fetchPerIdentityState issue the same
+// per-PID / per-identity exec fan-out and populate these structs. In the batch
+// path the SweepPidLine / SweepIdentityLine fields map DIRECTLY onto these
+// struct fields (schema decision documented in sweep-schema.ts's
+// SWEEP_FIELD_PARITY table).
+//
+// PARITY NON-NEGOTIABLE: the compose helpers accept only these struct shapes,
+// so a SessionState frame published from the batch path is byte-identical to
+// one published from the legacy path for every field the sweep emits. The one
+// documented divergence — SWEEP_FIELD_PARITY.A3 (box-wide last-stop-payload
+// fallback) is NOT emitted by the sweep, so the batch path passes
+// hookPayloadRaw=null and background_tasks falls back to [] when
+// per_session_stop_payload is also null. Legacy path preserves the A3
+// fallback. This is a deliberate scope decision made in Plan 01.
+// ---------------------------------------------------------------------------
+
+/**
+ * Snapshot of every value processPid fetches over SSH before entering the
+ * compose+publish phase. Fields carry the RESEARCH.md exec-site letter (A1..
+ * A12) they parity with — batch-path callers fill these directly from a
+ * SweepPidLine; legacy-path fetchPerPidState fills them by running the
+ * existing exec fan-out.
+ *
+ * The mtime fields (A6/A7/A8) carry the RAW server-side reading — either a
+ * number × 1000 for a valid stat, or null for absent/SSH-hiccup/non-numeric.
+ * The COMPOSE step applies the "fail-open preserve cached value" reconciliation
+ * against PidCacheEntry (that logic depends on cache reads which are compose-
+ * side responsibility — mirrors L1482-1503, L1388-1403, L1408-1423 of the
+ * pre-refactor processPid).
+ */
+interface PerPidFetchedState {
+  /** A1 — `cat ~/.claude/sessions/<pid>.json` raw contents; null = mid-write */
+  sessionJsonRaw: string | null;
+  /** A2 — `/proc/<pid>/stat` read with sentinel (bounty 9c8d4a72) */
+  statResult: StatReadResult;
+  /**
+   * A3 — box-wide `~/.claude/fleet-status/last-stop-payload.json`. Legacy path
+   * always fetches; BATCH PATH PASSES `null` (SWEEP_FIELD_PARITY.A3 skip:
+   * sweep does NOT emit A3, per-session A9 supersedes; on both-null the
+   * caller falls back to emitHookPayloadWarn + background_tasks=[]).
+   */
+  hookPayloadRaw: string | null;
+  /** A4+A5 resolved — PID → tmux pane → tmux session name (identity name) */
+  tmuxSession: string | null;
+  /**
+   * A6 — RAW per-session stop-<sid>.json mtime × 1000 for this tick's read.
+   * null = SSH hiccup / file absent / non-numeric / sessionId failed the
+   * safe-char regex guard. Compose applies fail-open cache preservation.
+   */
+  freshLastStopAt: number | null;
+  /** A7 — RAW Phase 62 activity marker mtime × 1000 for this tick's read */
+  freshActivityMtime: number | null;
+  /** A8 — RAW Phase 62 stopped marker mtime × 1000 for this tick's read */
+  freshStoppedMtime: number | null;
+  /** A9 — per-session `stop-<sid>.json` payload; null when absent/SSH-hiccup */
+  perSessionHookPayloadRaw: string | null;
+  /**
+   * A10 — RAW `.dormant` sentinel read via source-A path.
+   * Discriminates on the stdout: "yes" → true, "no" → false, anything else
+   * (including null from SSH hiccup) → null (compose falls back to cache).
+   */
+  freshDormant: boolean | null;
+  /**
+   * A11 — Phase 32 discovery result. Legacy path caches per PID lifetime;
+   * batch path takes the SweepIdentityLine.jsonl_path for the joined
+   * identity (schema fold — no separate per-PID discovery on the wire).
+   */
+  jsonlPath: string | null;
+  /**
+   * A12 — up to 256KB tail of the identity's active JSONL for the ai-title
+   * scan. Null when jsonlPath is unknown/unreadable; caller runs
+   * scanTailForLatestAiTitle unchanged.
+   */
+  jsonlTail: string | null;
+  /**
+   * Phase 111 Plan 03 — resolved identity appearance, joined from the identity
+   * line the sweep emits. The shared `appearanceFromIdentityLine` helper calls
+   * `resolveIdentityAppearance` exactly once per identity per tick; the result
+   * rides here so composeAndPublishPerPid can stamp it on the frame and cache.
+   *
+   * Semantics: object → resolved this tick; null → the emitting host sent no
+   * appearance keys (pre-Plan-111-01) or this is the legacy path.
+   */
+  identityAppearance: IdentityAppearance | null;
+}
+
+/**
+ * Snapshot of every value the per-identity iteration of
+ * pollDormantOnlyIdentities fetches over SSH (legacy path) or reads off a
+ * SweepIdentityLine (batch path) before the compose+publish phase. Fields
+ * carry RESEARCH.md exec-site letters.
+ */
+interface PerIdentityFetchedState {
+  name: string;
+  /** B1 — `.dormant` sentinel */
+  isDormant: boolean;
+  /** B2 — `.compact-requested` sentinel (agent or app asked to condense) */
+  isCompactRequested: boolean;
+  /** B3 — `.compacting` sentinel (supervisor is compacting right now) */
+  isCompacting: boolean;
+  /**
+   * B6..B9 — Phase 111 Plan 03: resolved appearance from the sweep line's
+   * appearance keys. The shared `appearanceFromIdentityLine` helper calls
+   * `resolveIdentityAppearance` exactly once per identity per tick.
+   *
+   * Semantics: object → resolved this tick; null → the emitting host sent no
+   * appearance keys (pre-Plan-111-01) or this is the legacy path.
+   */
+  identityAppearance: IdentityAppearance | null;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 41 Plan 03 — JSONL path + message-bearing predicate
+// ---------------------------------------------------------------------------
+
+/**
+ * user 2026-08-23 lock: "only my real messages going to them" —
+ * INVERTS the 2026-08-14 lock. Assistant activity, incoming/outgoing
+ * DMs, scheduled wakes, task notifications, skill-body injections all
+ * excluded. See quick-260823-bap plan for the full predicate matrix.
+ *
+ * Predicate: a JSONL line counts iff top-level type==="user" AND
+ * message.content is a plain string AND (starts with "<command-" OR
+ * NOT (starts with "<" AND ends with ">") on trimmed content) AND
+ * NOT a Ctrl-C kill signal (control-chars-only content) AND
+ * NOT an agent-supervisor /exit slash-command AND
+ * NOT an agent-supervisor resumed-injection sentinel.
+ *
+ * Independent JSON.parse (mirrors scanTailForLatestAiTitle pattern) —
+ * do NOT extend parseSessionLine to expose raw content. Parallel-copy
+ * discipline preserved per 43-CONTEXT.md scope decision (canonical
+ * copy in sessions.ts must stay byte-parallel).
+ *
+ * user 2026-08-29 refinement: three additional harness-injected shapes
+ * confirmed on Tabitha's session file now explicitly rejected:
+ * - Ctrl-C kill signal: supervisor delivers "\x03\x03" as plain-string
+ *   content; after trimming, stripping all ASCII control chars yields "".
+ * - /exit slash-command: agent-supervisor fires `/exit` before a restart;
+ *   content contains "<command-name>/exit</command-name>".
+ * - Resumed-injection sentinel: supervisor injects "Your session was just
+ *   resumed by the agent-supervisor…" as a type:"user" turn in some paths.
+ * - Teammate message: agent-team peer sends ("Another Claude session sent a
+ *   message:\n<teammate-message …") land as plain type:"user" string turns.
+ *
+ * Phase 85 (D-08): stays alive as a shared helper. Not called from this
+ * file's own lastMessageAt path anymore (retired — the derivation now reads
+ * from the identity-name-keyed send-log store via getIdentityLastSend), but
+ * the src/backend/database/routes/sessions.ts byte-parallel copy of
+ * scanTailForNewestMessageAt still depends on this predicate's contract.
+ */
+function isRealUserTurn(rawLine: string): { ok: true; ts: number } | { ok: false } {
+  const trimmed = rawLine.trim();
+  if (trimmed === "") return { ok: false };
+  let obj: unknown;
+  try {
+    obj = JSON.parse(trimmed);
+  } catch {
+    return { ok: false };
+  }
+  if (obj === null || typeof obj !== "object") return { ok: false };
+  const top = obj as Record<string, unknown>;
+  // Step 2: top-level type must be "user" (excludes assistant, relay_outbound, etc.)
+  if (top.type !== "user") return { ok: false };
+  // Step 3: message.content must be a plain string (excludes list-content user turns:
+  // tool_result arrays, skill-body [{type:"text",text:…}] injections, etc.)
+  const msg = top.message;
+  if (msg === null || typeof msg !== "object") return { ok: false };
+  const content = (msg as Record<string, unknown>).content;
+  if (typeof content !== "string") return { ok: false };
+  // Step 4: apply the XML-wrapper exclusion.
+  const t = content.trim();
+  const isXmlWrapper = t.startsWith("<") && t.endsWith(">");
+  const isCommand = t.startsWith("<command-");
+  if (!isCommand && isXmlWrapper) return { ok: false };
+  // Step 5 (2026-08-29 refinement): drop /exit slash-command injected by agent-supervisor
+  // before a restart. user's own slash-commands (/id, /build, /gsd:*) are unaffected.
+  if (content.includes("<command-name>/exit</command-name>")) return { ok: false };
+  // Step 6 (2026-08-29 refinement): drop control-chars-only content (e.g. Ctrl-C kill
+  // signal "\x03\x03"). t is already trimmed of regular whitespace; stripping ASCII
+  // control chars from t and getting "" means the payload was pure control-char noise.
+  if (t.replace(/[\x00-\x1F]/g, "") === "") return { ok: false };
+  // Step 7 (2026-08-29 refinement): drop agent-supervisor resumed-injection sentinel.
+  // Prefix-anchored to avoid matching quoted mentions in real user prose.
+  if (content.startsWith("Your session was just resumed by the agent-supervisor")) return { ok: false };
+  // Step 8: drop agent-team teammate messages (harness-delivered peer sends, not user speech).
+  if (isTeammateMessage(content)) return { ok: false };
+  // Passed all gates — extract ts from the timestamp field.
+  const rawTs = top.timestamp;
+  if (typeof rawTs !== "string") return { ok: false };
+  const ts = Date.parse(rawTs);
+  if (!Number.isFinite(ts)) return { ok: false };
+  return { ok: true, ts };
+}
+
+// Phase 44 Plan 02's STALE_TAIL_REDISCOVERY_THRESHOLD (N stale-tail ticks →
+// re-run discovery, a defense against JSONL rotation on resume) is retired:
+// source A stopped advancing the counter with the Phase 85 lastMessageAt swap,
+// and its last consumer — source B's `/id reset` tail-scan — went away with
+// agent reset. Compaction stays in the same JSONL file and sessionId, so
+// Condense needs no rediscovery.
+
+// Phase 44 Plan 02 — the former jsonlPathForSession helper (cwd + sessionId
+// → constructed path) has been removed. It built the JSONL path via
+// `~/.claude/projects/<slug>/<sessionId>.jsonl` from sessionJson fields;
+// that derivation was fragile against cwd drift and
+// Claude Code sessionId rotation on resume (a live session
+// could silently point at a stale JSONL that had stopped growing). The
+// orchestrator now derives the JSONL path via
+// `discoverIdentityJsonlPathViaChannel` — the agent-history lookup
+// (agent-history-file.ts): newest JSONL in the agent's OWN history folder
+// whose first user-role line matches `/id <identityName>`. Stable across
+// resume.
+
+/**
+ * Parse a JSONL blob (the raw stdout of a `tail -c 262144 <jsonl-path>` exec)
+ * and return the newest user-real-user-turn `ts` (unix millis) found across
+ * all lines, or null if no line qualified. Empty lines and malformed lines are
+ * skipped silently — this is a best-effort sample, not a validation pass.
+ *
+ * This runs on EVERY poll tick per PID; the cost is bounded by the tail
+ * width (Phase 47 Plan 02: `tail -c 262144` — 256KB; per Phase 47 CONTEXT.md
+ * § Backend scraper mechanics — bounded parse well under 5ms on typical
+ * hardware).
+ *
+ * Predicate: isRealUserTurn (user 2026-08-23 lock). Each line is
+ * independently JSON.parsed by the predicate helper — parseSessionLine is
+ * NOT used for the recency filter (it is no longer the gating function;
+ * it is still called for other purposes elsewhere if needed). The predicate
+ * returns {ok, ts} so a single JSON.parse feeds both the gate and the ts
+ * extraction, avoiding a second parse on the keep path.
+ *
+ * Phase 85 (D-08): retired from the in-file lastMessageAt derivation but
+ * STAYS DEFINED — src/backend/database/routes/sessions.ts maintains a
+ * byte-parallel copy and hand-mirrors this scanner for the /sessions/list
+ * dormant-side derivation. If either copy changes, update BOTH. The
+ * in-orchestrator lastMessageAt axis now reads from the identity-name-keyed
+ * send-log store (Phase 85-02 identity-send-log-store) via
+ * getIdentityLastSend, so the function is no longer called from
+ * processPid's per-tick per-session block.
+ */
+// Phase 85 (D-08 export): test-only export of the retired scanner so the
+// predicate-matrix suite in ssh-poll-orchestrator.test.ts can continue to
+// probe isRealUserTurn's contract at the byte level. The function is
+// no longer called from processPid but is still THE canonical predicate
+// implementation that sessions.ts byte-parallel-copies; keeping tests on
+// this observable preserves regression coverage of the predicate.
+export function __scanTailForNewestMessageAtForTests(
+  tailContents: string,
+): number | null {
+  return scanTailForNewestMessageAt(tailContents);
+}
+
+function scanTailForNewestMessageAt(tailContents: string): number | null {
+  let newest: number | null = null;
+  const lines = tailContents.split("\n");
+  for (const line of lines) {
+    if (line.trim() === "") continue;
+    const result = isRealUserTurn(line);
+    if (!result.ok) continue;
+    const { ts } = result;
+    if (newest === null || ts > newest) {
+      newest = ts;
+    }
+  }
+  return newest;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 47 Plan 02 — ai-title scanner
+// ---------------------------------------------------------------------------
+
+/**
+ * Substring pre-filter for the harness-emitted `{"type":"ai-title","aiTitle":
+ * "…","sessionId":"…"}` line (see Phase 47 CONTEXT.md § Backend scraper
+ * mechanics + § Harness ai-title source). Used to avoid JSON.parse-ing every
+ * message-bearing line just to check for ai-title lines.
+ */
+const AI_TITLE_LINE_PREFIX = '"type":"ai-title"';
+
+/**
+ * Scan the raw stdout of a `tail -c N <jsonl-path>` for the LAST ai-title
+ * line's aiTitle string (last-wins per CONTEXT.md § working-store third axis
+ * — topic drifts across a session, so the freshest line reflects the current
+ * topic). Returns null if zero valid ai-title lines are found (empty tail,
+ * missing field, malformed JSON, wrong-type value).
+ *
+ * Hand-mirrored from `sessions.ts scanTailForLatestAiTitle` per Phase 44
+ * Plan 01 precedent — the two backend read paths keep local copies rather
+ * than share a module (44-CONTEXT.md § "no new shared module" scope decision
+ * inherited from Phase 43; 47-CONTEXT.md § domain inherits from Phase 43
+ * scope decision). If either copy ever needs to change, update BOTH sites.
+ *
+ * In-process JSON.parse (not `jq` shell subprocess) matches the existing
+ * `parseSessionLine` pattern the Phase 44 Plan 01 scanner uses — cheaper
+ * (no exec) and consistent with the surrounding scanTailForNewestMessageAt.
+ */
+function scanTailForLatestAiTitle(tailContents: string): string | null {
+  let latest: string | null = null;
+  const lines = tailContents.split("\n");
+  for (const line of lines) {
+    // Cheap substring pre-filter — avoid JSON.parse on non-ai-title lines.
+    if (!line.includes(AI_TITLE_LINE_PREFIX)) continue;
+    try {
+      const parsed: unknown = JSON.parse(line);
+      if (
+        parsed !== null &&
+        typeof parsed === "object" &&
+        typeof (parsed as { aiTitle?: unknown }).aiTitle === "string"
+      ) {
+        latest = (parsed as { aiTitle: string }).aiTitle;
+      }
+    } catch {
+      // Malformed line — skip silently (best-effort sampling).
+      continue;
+    }
+  }
+  return latest;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 44 Plan 02 — SshChannel-adapter for discoverIdentitySessionFile
+// ---------------------------------------------------------------------------
+
+/**
+ * Adapter that runs the agent-history lookup (agent-history-file.ts — the
+ * agent's own history folder, newest `/id <name>` file) over the
+ * orchestrator's `SshChannel.exec` abstraction, which returns null on SSH
+ * error rather than throwing.
+ *
+ * Fail-safe: SSH error, timeout or no matching file → null. Zero log lines
+ * here; the caller (processPid) owns logging on the null path.
+ */
+async function discoverIdentityJsonlPathViaChannel(
+  channel: SshChannel,
+  identityName: string,
+): Promise<string | null> {
+  try {
+    const byName = await findAgentHistoryFilesVia(
+      (script) => channel.exec(script, undefined, { timeoutMs: DISCOVERY_EXEC_TIMEOUT_MS }),
+      [identityName],
+    );
+    return byName.get(identityName) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fingerprint helper
+// ---------------------------------------------------------------------------
+
+function computeFingerprint(state: SessionState): string {
+  const bgKey = state.backgroundTasks
+    .map((t) => `${t.id}:${t.status}`)
+    .join(",");
+  // Phase 41 Plan 03: lastMessageAt is a distinct axis of the fingerprint —
+  // a new message either direction (JSONL ts advances) is a state-change
+  // publish trigger even when status + backgroundTasks are unchanged.
+  // Null is normalized to "" so a first-time null publish still emits a
+  // distinct fingerprint distinct from an unpopulated cache entry.
+  // Phase 47 Plan 02: aiTitle is a distinct axis of the fingerprint — an
+  // ai-title change (topic drift) is a state-change publish trigger even
+  // when status + backgroundTasks + lastMessageAt are unchanged. Same
+  // null-normalization pattern as lastMessageAt so a first-time null
+  // publish is distinguishable from an unpopulated cache entry.
+  // Phase 52 Plan 01: dormant is a distinct axis of the fingerprint — a
+  // dormant-only flip publishes a new frame even when status +
+  // backgroundTasks + lastMessageAt + aiTitle are unchanged. Boolean-with-
+  // undefined collapses to "1"/"0"/"" so a first-time undefined publish is
+  // distinguishable from cold cache. In practice source A always stamps a
+  // strict boolean; the ?? branch handles the "field omitted" path from
+  // source B's future explicit-null frames.
+  // Phase 53 Plan 01: condensing is a distinct axis of the fingerprint — a
+  // condensing-only flip publishes a new frame even when status +
+  // backgroundTasks + lastMessageAt + aiTitle + dormant are all unchanged.
+  // Same tri-valued pattern as dormant: "1"/"0"/"" so a condensing-only flip
+  // is detectable vs cold cache. Only source B stamps it (source A omits).
+  // Phase 59 Plan 02: lastStopAt + lastStatusChangeAt are two additional
+  // distinct axes — a change to either (per-session Stop-hook file rewrote,
+  // or server-derived status-value transitioned) publishes a new frame even
+  // when every other axis is unchanged. Null-normalized to "" so a
+  // first-time-null publish is distinguishable from cold cache (matches
+  // lastMessageAt / aiTitle numeric-axis handling). Fingerprint segments
+  // MUST live at the END of the template literal so any future axis is
+  // appended after these two without disturbing the delta contract.
+  // Phase 62 Plan 03: activityMtime + stoppedMtime are two additional
+  // distinct axes — a per-session marker file touch (activity-hook.sh fired
+  // on UserPromptSubmit / PreToolUse, or stopped-hook.sh fired on Stop /
+  // StopFailure / PermissionRequest) bumps the mtime, which is the ONLY
+  // way to observe the direct-signal WIP predicate. Same null-normalized
+  // "" convention as the Phase 59 numeric axes — a marker-mtime-only change
+  // publishes a new frame even when status + backgroundTasks + lastStopAt +
+  // lastStatusChangeAt + every other axis is unchanged. Segments appended
+  // at the END so any future axis is added after these without disturbing
+  // the existing delta contract.
+  // Phase 111 Plan 03: identityAppearance is a distinct axis of the fingerprint
+  // — a change in any visible appearance field (displayName, title, colorHue,
+  // voice, task, coordinator, role, pinned, roleDefaults) publishes a
+  // new frame even when every other axis is unchanged. The segment is appended
+  // at the END per the append-at-END rule stated twice above. avatarUrl is
+  // included: it carries the sweep's avatar version (`&v=`), so an avatar
+  // change must publish a frame.
+  // (Phase 115 Plan 115-02: `hidden` retired from the fingerprint axis list per D-21.)
+  return `${state.status}|${state.waitingFor ?? ""}|${bgKey}|${state.updatedAt}|${state.lastMessageAt ?? ""}|${state.aiTitle ?? ""}|${state.dormant === true ? "1" : state.dormant === false ? "0" : ""}|${state.condensing === true ? "1" : state.condensing === false ? "0" : ""}|${state.lastStopAt ?? ""}|${state.lastStatusChangeAt ?? ""}|${state.activityMtime ?? ""}|${state.stoppedMtime ?? ""}|${appearanceFingerprintSegment(state.identityAppearance ?? null)}|${state.lastFinishAt ?? ""}`;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 111 Plan 03 — appearance fingerprint segment helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Produce the fingerprint contribution for an `IdentityAppearance` value.
+ *
+ * Returns "" when `a === null` so the cold / no-appearance case is
+ * distinguishable from a resolved-but-default appearance.
+ *
+ * Otherwise returns a "|"-joined string covering EVERY field that can change
+ * what a conversation-list row looks like. A field omitted here is a change
+ * that gets read from disk, carried on the wire, and then silently suppressed —
+ * this segment is exactly what makes appearance-only changes publish.
+ *
+ * Normalization conventions (matching computeFingerprint verbatim):
+ *   - strings / numbers → `?? ""`
+ *   - booleans → tri-valued `x === true ? "1" : x === false ? "0" : ""`
+ *     so a first-time-undefined publish is distinguishable from cold cache.
+ *
+ * `roleDefaults` is serialized with SORTED KEYS so two structurally-equal
+ * objects always produce the same segment. `JSON.stringify` is NOT used
+ * directly because key order is not guaranteed identical across two separate
+ * Object.assign / spread operations — non-deterministic key order would
+ * produce a spurious publish every tick (T-111-17 mitigation).
+ *
+ * `avatarUrl` is included: it carries the sweep's avatar version (`&v=`),
+ * which changes when the avatar file does.
+ */
+function appearanceFingerprintSegment(a: IdentityAppearance | null): string {
+  if (a === null) return "";
+  // Serialize roleDefaults with sorted keys for deterministic output.
+  // null → ""; object → sorted key=value pairs.
+  let roleDefaultsSeg = "";
+  if (a.roleDefaults !== null && a.roleDefaults !== undefined) {
+    const sorted = Object.keys(a.roleDefaults).sort();
+    roleDefaultsSeg = sorted.map((k) => `${k}=${String((a.roleDefaults as Record<string, unknown>)[k] ?? "")}`).join(",");
+  }
+  return [
+    a.displayName ?? "",
+    a.title ?? "",
+    a.colorHue ?? "",
+    a.voice ?? "",
+    a.task ?? "",
+    a.coordinator === true ? "1" : a.coordinator === false ? "0" : "",
+    a.role ?? "",
+    a.pinned === true ? "1" : a.pinned === false ? "0" : "",
+    roleDefaultsSeg,
+    a.avatarUrl ?? "",
+    // `project:` frontmatter — without it an on-disk project change alone
+    // (agent edit / Identity-file tab save) never published, so the row
+    // stayed in its old section until some other field changed.
+    a.project ?? "",
+    // Desktop starting/stopping must publish a frame on its own.
+    a.desktopRunning === true ? "1" : a.desktopRunning === false ? "0" : "",
+  ].join("|");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 111 Plan 03 — shared appearance resolver helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve appearance from a `SweepIdentityLine`'s raw cosmetics.
+ *
+ * This is the ONLY place a `SweepIdentityLine`'s raw cosmetics become a
+ * resolved `IdentityAppearance`. The cascade itself (`identity ?? role ?? null`)
+ * lives in `identity-appearance.ts` via `resolveIdentityAppearance` and is
+ * NOT duplicated here.
+ *
+ * Both the source-A adapter (`pidLineToPerPidFetched`) and the source-B adapter
+ * (`identityLineToPerIdentityFetched`) call this helper so appearance is resolved
+ * at exactly one call site even though there are two consumers.
+ *
+ * Design:
+ *   - `identityLine === undefined` → return null (a pid line whose identity has
+ *     no matching identity line; the sweep guarantees one exists, so this is a
+ *     defensive branch for future invariant violations — plain row, no drop).
+ *   - "Host sent no appearance keys at all" is distinguished from "keys present,
+ *     read failed". If all three of `identity_cosmetics`, `role_cosmetics`,
+ *     `pinned` are `undefined`, the emitting host predates Plan 111-01
+ *     → return null WITHOUT calling the resolver. Collapsing "no keys" and
+ *     "resolved from nothing" would let a mid-distribution host blank appearance
+ *     a previous tick had carried.
+ *   - Pinned uses `=== true` (fail-closed): a stat error or missing key
+ *     must NEVER paint an identity as pinned by mistake. This mirrors
+ *     Phase 107's `.catch(() => false)` discipline on the `.pinned` sentinel.
+ *     (Phase 115 Plan 115-02 retired the sibling `.hidden` sentinel per D-21.)
+ */
+function appearanceFromIdentityLine(
+  identityLine: SweepIdentityLine | undefined,
+  hostIdRaw: string,
+  identityName: string,
+): IdentityAppearance | null {
+  if (identityLine === undefined) return null;
+
+  // Distinguish "host predates Plan 111-01 (no appearance keys)" from
+  // "keys present but empty". All three undefined → pre-111-01 host → null.
+  // (Phase 115 Plan 115-02: the fourth key `hidden` was retired per D-21.)
+  const hasAnyAppearanceKey =
+    identityLine.identity_cosmetics !== undefined ||
+    identityLine.role_cosmetics !== undefined ||
+    identityLine.pinned !== undefined;
+  if (!hasAnyAppearanceKey) return null;
+
+  // Coerce the host id ONCE here. On unparseable hostId, resolve with 0 and
+  // emit one warn — avatarUrl will be wrong but every other field is right
+  // (a plain-but-present appearance beats a dropped one; D-01 + T-111-16).
+  const parsedHostId = parseInt(hostIdRaw, 10);
+  let hostId: number;
+  if (!Number.isFinite(parsedHostId)) {
+    hostId = 0;
+    systemLogger.warn("Fleet-status: appearance hostId unparseable — resolving with 0", {
+      operation: "fleet_status_appearance_hostid_unparseable",
+      rawHostId: hostIdRaw,
+      identityName,
+    });
+  } else {
+    hostId = parsedHostId;
+  }
+
+  const resolved = resolveIdentityAppearance({
+    identityKey: identityName,
+    hostId,
+    cosmetics: (identityLine.identity_cosmetics as RawCosmetics | null | undefined) ?? null,
+    roleCosmetics: (identityLine.role_cosmetics as RawCosmetics | null | undefined) ?? null,
+    role: identityLine.role ?? null,
+    ...(Array.isArray(identityLine.roles) ? { roles: identityLine.roles } : {}),
+    // Fail-closed on pinned: === true means a missing/undefined key defaults
+    // to false. This is Phase 107's .catch(() => false) discipline carried
+    // onto this path — a stat error must NEVER paint an identity as pinned
+    // by mistake.
+    pinned: identityLine.pinned === true,
+    avatarVersion: identityLine.avatar_version ?? null,
+    // Fail-closed like pinned: only a literal true shows the desktop button.
+    desktopRunning: identityLine.desktop_running === true,
+  });
+  recordAvatarVersion(hostId, identityName, identityLine.avatar_version);
+
+  return resolved;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 118 Plan 118-04 — source-C app adapter (snake_case wire → camelCase
+// AppState).
+//
+// Pure field copy — no runtime validation, no defensive undefined checks.
+// The runtime validation gate is the AppStateSchema Zod at the wire boundary
+// (wire-protocol.ts, added by Plan 118-03). If the sweep script emits a
+// malformed app line, the parser in sweep-schema.ts has already cast it
+// leniently into SweepAppLine; downstream Zod validation on the client
+// rejects any drift without corrupting the server-side registry.
+//
+// Adapter drops NO fields, adds NO fields, invents NO defaults. Every one of
+// the seven D-05 fields plus the D-03 healthMessage carve-out is mirrored
+// 1:1 from the wire schema (snake_case) onto AppState (camelCase).
+// ---------------------------------------------------------------------------
+function adaptAppLineToState(
+  hostId: string,
+  line: SweepAppLine,
+  machineId?: string,
+): AppState {
+  return {
+    hostId,
+    machineId: machineId ?? hostId,
+    slug: line.slug,
+    title: line.title,
+    description: line.description,
+    port: line.port,
+    hasIcon: line.has_icon,
+    // Older emitters don't send icon_version; normalize to null.
+    iconVersion: line.icon_version ?? null,
+    createdAtMs: line.created_at_ms,
+    isHealthy: line.is_healthy,
+    healthMessage: line.health_message,
+    // Phase 130: pass through the per-user visibility gate list. Rolling-
+    // deploy coercion (undefined → null) handles the window where a NEW
+    // container reads an OLD peer sweep (pre-130 Python emitters don't send
+    // the `users` field; parser is lenient and lands undefined; adapter
+    // normalizes to the AppState D-3 contract of `string[] | null`).
+    users: line.users ?? null,
+    // convo-scoped apps: additive fields; older emitters omit them.
+    owner:
+      typeof line.owner === "string" && /^[a-zA-Z0-9_-]{1,64}$/.test(line.owner)
+        ? line.owner
+        : null,
+    asleep: typeof line.asleep === "boolean" ? line.asleep : null,
+    // project-scoped apps: additive; older emitters omit it.
+    project:
+      typeof line.project === "string" && /^[a-z0-9-]{1,64}$/.test(line.project) && line.project !== "archive"
+        ? line.project
+        : null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 99 — spawn-request scan helpers (D-01, D-02, D-03, D-17)
+//
+// One atomic read-and-delete exec per tick per host: lists
+// ~/fleet/spawn-requests/, reads + claims each *.json request file via `mv`
+// (atomic claim — Pitfall 7, RESEARCH Security Note), filters to UUID-shaped
+// basenames (36-char length guard prevents *.success.json / *.failure.json
+// from being claimed), and returns the parsed batch to pollOneHost.
+//
+// Missing folder → empty batch (D-03, not an error).
+// Null SSH return → empty batch, warn logged (fail-open, same as ls path).
+// ---------------------------------------------------------------------------
+
+/**
+ * Atomic shell one-liner for the spawn-request scan (RESEARCH Pattern 2).
+ *
+ * - `cd ... || exit 0` — missing folder short-circuits cleanly (D-03).
+ * - `[ -f "$f" ] || continue` — skip glob no-match (*.json expands to literal
+ *   when folder is empty, which is guarded by the `[ -f ]` test).
+ * - `base="${f%.json}"` then `[ ${#base} -eq 36 ] || continue` — UUID length
+ *   guard: request filenames are <uuid>.json (36-char hex-and-dash). Response
+ *   files (.success.json, .failure.json) AND in-flight markers (.claimed.json)
+ *   have stripped bases of 44+ chars, all rejected here — so the scan never
+ *   double-claims a request already in-flight or already resolved (Pitfall 7).
+ * - `mv "$f" "$base.claimed.json" 2>/dev/null || continue` — atomic claim.
+ *   Only one concurrent tick can win the mv; the loser skips. The renamed
+ *   `.claimed.json` marker STAYS on disk as durable in-flight state:
+ *     - Operators can `ls` the folder and see queue state at a glance
+ *       (raw .json = awaiting scan; .claimed.json = birth in progress;
+ *       .success.json / .failure.json = done).
+ *     - If Skynet's in-memory queue is wiped by a container restart mid-drain,
+ *       the .claimed.json file survives. Operator can manually rename it
+ *       back to .json to re-drop rather than silently losing the request.
+ *       (Pre-fix: `mv $f $tmp; cat $tmp; rm -f $tmp` deleted the file at
+ *       claim time — request evaporated with the queue on restart.)
+ * - `printf '%s\t' "$f"; cat "$base.claimed.json"; printf '\n'` — emit
+ *   tab-separated `<filename><TAB><body><NEWLINE>`. `$f` is the ORIGINAL
+ *   filename (`<uuid>.json`) because bash doesn't retroactively update it
+ *   after the mv — parseSpawnRequestBatch's UUID_RE match still works.
+ *   No shell quoting of the JSON body — raw bytes to stdout.
+ */
+const SPAWN_REQUESTS_SCAN_CMD = [
+  "cd ~/fleet/spawn-requests 2>/dev/null || exit 0;",
+  "for f in *.json; do",
+  "[ -f \"$f\" ] || continue;",
+  "base=\"${f%.json}\";",
+  "[ ${#base} -eq 36 ] || continue;",
+  "mv \"$f\" \"$base.claimed.json\" 2>/dev/null || continue;",
+  "printf '%s\\t' \"$f\"; cat \"$base.claimed.json\"; printf '\\n';",
+  "done",
+].join(" ");
+
+/** UUID shape regex for defense-in-depth in the TS parser (RESEARCH Security Note). */
+const UUID_RE = /^[0-9a-f-]{36}$/i;
+
+/**
+ * Parse the batched stdout from the atomic spawn-request scan exec into an
+ * array of PendingBirth items.
+ *
+ * stdout format: one line per claimed file, tab-separated:
+ *   <uuid>.json<TAB><json-body><NEWLINE>
+ *
+ * Skips:
+ * - Lines without a TAB separator.
+ * - Filenames whose UUID portion fails UUID_RE (e.g. response files).
+ * - Lines with malformed JSON (warns + continues).
+ *
+ * `hostConnDetails` is the sweep-decrypted `_connDetails` bag threaded down
+ * from `scanSpawnRequests` (which reads it off the substrate-host record
+ * emitted by `list-substrate-hosts.ts`). Used by the worker's response-file
+ * writer to SFTP responses back without a per-user resolver call (quick-
+ * 260923-9x1 — closes the silent-response-file-failure regression where
+ * `resolveHostById(hostId, "")` returned null and the worker gave up).
+ * Optional at this seam because the LOCAL scan branch in
+ * `scan-orchestrator.ts` legitimately has no SSH bag to pass (LOCAL response
+ * writes go straight to the container bind-mount via `writeMarkdownFileAtomic`).
+ */
+export function parseSpawnRequestBatch(
+  stdout: string,
+  hostId: string,
+  hostConnDetails?: Record<string, unknown>,
+): PendingBirth[] {
+  if (!stdout.trim()) return [];
+  const results: PendingBirth[] = [];
+  const hostIdNum = parseInt(hostId, 10);
+  for (const line of stdout.split("\n")) {
+    const tab = line.indexOf("\t");
+    if (tab === -1) continue;
+    const filename = line.slice(0, tab).trim();
+    const body = line.slice(tab + 1).trim();
+    const uuid = filename.replace(/\.json$/, "");
+    if (!UUID_RE.test(uuid)) continue;
+
+    // Role requests share the drop folder; `kind: "role"` routes them to the
+    // role worker (processRoleRequest) instead of an identity birth.
+    if (isRoleRequestBody(body)) {
+      const roleParsed = parseRoleRequestBody(body);
+      if (roleParsed.ok === false) {
+        systemLogger.warn("spawn-request-scan: role request malformed — enqueueing malformed failure", {
+          operation: "spawn_request_scan_malformed",
+          fleetHostId: hostId,
+          uuid,
+          kind: "role",
+          reason: roleParsed.message,
+        });
+        results.push({
+          hostId,
+          hostIdNum,
+          uuid,
+          roles: [], prompt: "",
+          task: null,
+          requested_at: "",
+          hostConnDetails,
+          malformedReason: roleParsed.message,
+        });
+        continue;
+      }
+      results.push({
+        hostId,
+        hostIdNum,
+        uuid,
+        roles: [], prompt: "",  // identity fields unused — roleRequest drives behavior
+        task: null,
+        requested_at: roleParsed.body.requested_at,
+        requested_by: roleParsed.body.requested_by,
+        hostConnDetails,
+        roleRequest: roleParsed.body,
+      });
+      continue;
+    }
+
+    // Full request-body validation via the worker's parseRequestBody helper.
+    // On failure, enqueue a PendingBirth with malformedReason so the worker
+    // drops a proper {reason:"malformed", message} failure file back to coord.
+    // (Post-code-review M2/M3: prior version silently dropped malformed
+    // requests via `continue`, leaving coord to time out.)
+    const parsed = parseRequestBody(uuid, body);
+    // Explicit `=== false` narrowing: `!parsed.ok` fails to narrow the
+    // discriminated union under tsconfig.node.json's strict setup (build tsc
+    // sees the full union inside the guard instead of just the ok:false
+    // variant). Same TS 6.0.3 workaround pattern used in identity-birth-
+    // orchestrator.ts mintResult/loginResult call sites.
+    if (parsed.ok === false) {
+      systemLogger.warn("spawn-request-scan: request body malformed — enqueueing malformed failure", {
+        operation: "spawn_request_scan_malformed",
+        fleetHostId: hostId,
+        uuid,
+        reason: parsed.message,
+      });
+      results.push({
+        hostId,
+        hostIdNum,
+        uuid,
+        roles: [], prompt: "",  // malformed-branch defaults (D-13 bridge — malformedReason drives behavior)
+        task: null,
+        requested_at: "",
+        hostConnDetails,
+        malformedReason: parsed.message,
+      });
+      continue;
+    }
+
+    results.push({
+      hostId,
+      hostIdNum,
+      uuid,
+      roles: parsed.body.roles,
+      prompt: parsed.body.prompt,
+      task: parsed.body.task,
+      requested_at: parsed.body.requested_at,
+      users: parsed.body.users,
+      name: parsed.body.name,
+      project: parsed.body.project,
+      requested_by: parsed.body.requested_by,
+      hostConnDetails,
+    });
+  }
+  return results;
+}
+
+/**
+ * Issue the atomic scan exec on the per-host SSH channel and return parsed
+ * PendingBirth items.
+ *
+ * Fails open on SSH error (null channel.exec return) — same pattern as the
+ * ls listing inside pollOneHost. Missing folder returns empty batch (D-03).
+ */
+export async function scanSpawnRequests(host: HostRecord, channel: SshChannel): Promise<PendingBirth[]> {
+  const stdout = await channel.exec(SPAWN_REQUESTS_SCAN_CMD);
+  if (stdout === null) {
+    systemLogger.warn("Spawn-scan: exec returned null (SSH error)", {
+      operation: "spawn_scan_exec_ssh_error",
+      fleetHostId: host.id,
+    });
+    return [];
+  }
+  if (!stdout.trim()) {
+    // Missing folder (cd ... || exit 0) OR empty folder — both non-errors per D-03.
+    return [];
+  }
+  // quick-260923-9x1: pull the sweep-decrypted _connDetails bag off the host
+  // record (populated by list-substrate-hosts.ts via the CSKEK path) so it
+  // rides onto every emitted PendingBirth as hostConnDetails. HostRecord's
+  // declared shape (host-id-resolver.ts:14) is {id, name}, but every call site
+  // in scan-orchestrator.ts and the fleet-status poll loop passes richer
+  // records that carry _connDetails — read it defensively here.
+  const hostConnDetails = (host as unknown as { _connDetails?: Record<string, unknown> })._connDetails;
+  const results = parseSpawnRequestBatch(stdout, host.id, hostConnDetails);
+  systemLogger.info("Spawn-scan: exec complete", {
+    operation: "spawn_scan_exec_complete",
+    fleetHostId: host.id,
+    claimed: results.length,
+  });
+  return results;
+}
+
+// ---------------------------------------------------------------------------
+// Factory
+// ---------------------------------------------------------------------------
+
+export function createSshPollOrchestrator(
+  deps: OrchestratorDeps,
+): SshPollOrchestrator {
+  const pollIntervalMs = deps.pollIntervalMs ?? 2000;
+  const staleSweepIntervalMs = deps.staleSweepIntervalMs ?? 30000;
+  const hookPayloadPath =
+    deps.hookPayloadPath ?? "~/.claude/fleet-status/last-stop-payload.json";
+  const hookPayloadWarnCooldownMs = deps.hookPayloadWarnCooldownMs ?? 60000;
+  const turnFinishStore = deps.turnFinishStore ?? getTurnFinishStore();
+  const readStateStore = (): ReadStateStore => deps.readStateStore ?? getReadStateStore();
+  // `${hostId}::${identity}` → the finished turn a reply already marked seen,
+  // so a reply sitting in the tail costs one store write, not one per tick.
+  const replyMarkedFinish = new Map<string, number>();
+  // `${hostId}::${identity}` → when marking failed, so a broken store is
+  // retried (and logged) every 30s rather than every tick.
+  const replyMarkFailedAt = new Map<string, number>();
+  const REPLY_MARK_RETRY_MS = 30_000;
+  // `${hostId}::${identity}` → the last tail scanned and what it held. The
+  // scan reads the whole tail through the conversation's own parser (a few
+  // ms), and most ticks see the same tail again; transcripts only grow at
+  // the end, so its length and last bytes tell whether anything changed.
+  const replyScanMemo = new Map<string, { sig: string; replyAt: number | null }>();
+
+  // A user reply (typed in Skynet or relayed by an orchestrator) newer than
+  // the agent's last finished turn means the user has answered it: mark that
+  // turn seen for every user and tell their open tabs. The agent's next
+  // finished turn is newer than the reply, so it lights up again as usual.
+  const markSeenOnUserReply = (
+    hostId: string,
+    identityName: string,
+    lastFinishAt: number,
+    jsonlTail: string,
+  ): void => {
+    const key = `${hostId}::${identityName}`;
+    if (replyMarkedFinish.get(key) === lastFinishAt) return;
+    const failedAt = replyMarkFailedAt.get(key);
+    if (failedAt !== undefined && deps.now() - failedAt < REPLY_MARK_RETRY_MS) return;
+    const sig = `${jsonlTail.length}:${jsonlTail.slice(-256)}`;
+    let replyAt: number | null;
+    const memo = replyScanMemo.get(key);
+    if (memo !== undefined && memo.sig === sig) {
+      replyAt = memo.replyAt;
+    } else {
+      replyAt = scanTailForLatestUserReply(jsonlTail);
+      replyScanMemo.set(key, { sig, replyAt });
+    }
+    if (replyAt === null || replyAt <= lastFinishAt) return;
+    let users: string[];
+    try {
+      users = readStateStore().markSeenForAllUsers(hostId, identityName, lastFinishAt);
+    } catch (err) {
+      replyMarkFailedAt.set(key, deps.now());
+      systemLogger.warn("attention mark-seen-on-reply failed", {
+        operation: "attention_mark_seen_on_reply_failed",
+        fleetHostId: hostId,
+        identityName,
+        lastFinishAt,
+        replyAt,
+        error: err instanceof Error ? err.message : "unknown",
+      });
+      return;
+    }
+    replyMarkedFinish.set(key, lastFinishAt);
+    replyMarkFailedAt.delete(key);
+    systemLogger.info("attention mark-seen-on-reply", {
+      operation: "attention_mark_seen_on_reply",
+      fleetHostId: hostId,
+      identityName,
+      lastFinishAt,
+      replyAt,
+      advancedUsers: users.length,
+    });
+    for (const userId of users) {
+      deps.registry.publishToUser(userId, {
+        schemaVersion: FRAME_SCHEMA_VERSION,
+        type: "read-state-changed",
+        hostId,
+        identityName,
+        seenFinishAt: lastFinishAt,
+      });
+    }
+  };
+
+  // Source-B (dormant / condensing) frames carry the stored finished-turn time
+  // too, so a dormant agent's unread mark survives a page reload.
+  const lastFinishField = (hostId: string, identityName: string): { lastFinishAt?: number } => {
+    const v = turnFinishStore.get(hostId, identityName);
+    return v !== null ? { lastFinishAt: v } : {};
+  };
+
+  // Internal state
+  const perHostState = new Map<string, PerHostState>();
+  // -----------------------------------------------------------------------
+  // quick-260820-tm0 — per-host in-flight guard (2026-08-20 wilma incident)
+  //
+  // The wilma incident (2026-08-20) accumulated 392 concurrent tailscale-ssh
+  // be-child sessions on a single remote target because pollAllHosts kept
+  // stacking new pollOneHost invocations on the same hostId while the prior
+  // one was still awaiting a slow `ls -1`. Node's setInterval fires every
+  // pollIntervalMs regardless of whether the previous async fn resolved, so
+  // a target whose `ls -1` takes 30s under load can accumulate ~15
+  // concurrent pollOneHost iterations before a single one completes.
+  //
+  // The guard is PER-HOST, NOT GLOBAL — a slow host must NOT block polls
+  // for other hosts on the same tick. Membership check runs immediately
+  // before the pollOneHost call inside the pollAllHosts loop; a match
+  // increments skipCount, logs at INFO, and continues to the next host.
+  // On successful schedule the flag is set, skipCount is reset to 0, and
+  // pollOneHost is invoked inside try/catch/finally so `inFlight.delete`
+  // runs on both happy-path return AND thrown errors (never leaks a
+  // stuck flag). See Task 2 (quick-260820-tm0) for the paired eviction
+  // cleanup that removes entries here when a host is pruned from the
+  // identity-host list.
+  // -----------------------------------------------------------------------
+  const inFlight = new Set<string>();
+  const skipCount = new Map<string, number>();
+  // Hosts whose dead channel is being replaced. Ticks can overlap (a slow
+  // reconnect outlasts the 2s interval), so a second tick must neither
+  // re-collect these as dead nor acquire them via the add-branch — two
+  // concurrent acquires would open two connections and leak one.
+  const reconnecting = new Set<string>();
+  let pollTimer: ReturnType<typeof setInterval> | null = null;
+  let sweepTimer: ReturnType<typeof setInterval> | null = null;
+  let pollTickCount = 0;
+  let stopped = false;
+
+  // How often to re-query the DB for identity hosts (every ~30s worth of polls)
+  const hostRefreshEveryNTicks = Math.max(
+    1,
+    Math.floor(staleSweepIntervalMs / pollIntervalMs),
+  );
+
+  // SSH backoff per host — prevents a persistently-broken host from hammering
+  // the pool every pollIntervalMs. Increment on any SSH-level failure
+  // (channel.exec returning null in the legacy path, acquire returning
+  // null / throwing). Reset on any successful poll (batch ok OR legacy ls
+  // returning non-null). At >= THRESHOLD consecutive failures, skip poll ticks
+  // for an exponentially-growing window capped at MAX_MS. The cap stays at
+  // 30s: while the connect breaker is OPEN every refused acquire lands here
+  // too, so this window stacks on top of the breaker's — together they bound
+  // how long a host that came back stays bare in sidebars. Triggered by the
+  // 2026-09-23 fleet_status_host_ssh_unreachable log flood on RDP-only hosts
+  // that had enableSsh=true misconfigured (fixed at the DB layer separately).
+  const SSH_BACKOFF_FAILURE_THRESHOLD = 3;
+  const SSH_BACKOFF_INITIAL_MS = 30_000;
+  const SSH_BACKOFF_MAX_MS = 30_000;
+  type HostSshBackoffState = {
+    consecutiveFailures: number;
+    skipUntilMs: number;
+  };
+  const sshBackoffByHost = new Map<string, HostSshBackoffState>();
+
+  function noteSshFailure(hostId: string): void {
+    const prev = sshBackoffByHost.get(hostId) ?? {
+      consecutiveFailures: 0,
+      skipUntilMs: 0,
+    };
+    const nextFailures = prev.consecutiveFailures + 1;
+    let skipUntilMs = prev.skipUntilMs;
+    if (nextFailures >= SSH_BACKOFF_FAILURE_THRESHOLD) {
+      const overThreshold = nextFailures - SSH_BACKOFF_FAILURE_THRESHOLD;
+      const delayMs = Math.min(
+        SSH_BACKOFF_INITIAL_MS * Math.pow(2, overThreshold),
+        SSH_BACKOFF_MAX_MS,
+      );
+      skipUntilMs = deps.now() + delayMs;
+    }
+    sshBackoffByHost.set(hostId, {
+      consecutiveFailures: nextFailures,
+      skipUntilMs,
+    });
+  }
+
+  function noteSshSuccess(hostId: string): void {
+    sshBackoffByHost.delete(hostId);
+  }
+
+  function isHostInSshBackoff(hostId: string): boolean {
+    const entry = sshBackoffByHost.get(hostId);
+    if (!entry) return false;
+    return deps.now() < entry.skipUntilMs;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Phase 92 — sweep-first / legacy-fallback dispatch
+  //
+  // pollOneHost is now a THIN DISPATCHER. It:
+  //   (1) Detects per-SSH-channel-lifetime cache invalidation (new channel
+  //       object → reset the probe cache).
+  //   (2) Probes for ~/.local/bin/fleet-status-sweep on first-tick-per-channel.
+  //   (3) On sweep-present + no schema-drift-latch: try pollOneHostBatch.
+  //       - On success: return.
+  //       - On failure (null exec / schema mismatch / empty-on-nonempty-box):
+  //         log the reason, force re-probe next tick if transient, fall
+  //         through to legacy.
+  //   (4) Otherwise: run pollOneHostLegacy (the pre-Phase-92 body verbatim).
+  //
+  // The `inFlight` guard at pollAllHosts wraps this whole function unchanged.
+  // A slow sweep-exec does NOT stack ticks (RESEARCH.md G5 preserved).
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Phase 92 — sweep-exec timeout. Larger than DISCOVERY_EXEC_TIMEOUT_MS (5s)
+   * because the sweep does per-identity fs walks that may hit cold disk cache
+   * on managed boxes with many identities. Still safely under the 2s poll
+   * interval's `inFlight` skip semantics on most boxes — a sweep that regularly
+   * exceeds this bound is a symptom of managed-box overload and should surface
+   * via `inFlight` skip logs (quick-260820-tm0), not a silent hang.
+   */
+  const SWEEP_EXEC_TIMEOUT_MS = 8000;
+
+  /**
+   * Legacy-path poll wall-time cap. The legacy branch (pollOneHostLegacy +
+   * scanSpawnRequests) runs ~9-11 execs per PID plus fan-out; on a healthy
+   * host it lands in <5s, but any un-timed `channel.exec` inside it can wedge
+   * indefinitely (execCommand awaits `stream.on("close")` forever if the SSH
+   * stream never emits close — e.g. a container-to-self loopback whose
+   * underlying TCP is half-broken but the OS hasn't detected it). Without a
+   * bound, `pollOneHost`'s `inFlight` guard skips every subsequent tick
+   * forever. 30s is well above normal legacy runtime and far below the
+   * "stuck forever" threshold operators observe (~130s+).
+   */
+  const LEGACY_POLL_TIMEOUT_MS = FLEET_STATUS_EXEC_TIMEOUT_MS;
+
+  /**
+   * Presence-probe wall-time cap. The `test -x ~/.local/bin/fleet-status-sweep`
+   * probe at the top of pollOneHost is a single trivial exec — normally sub-100ms
+   * — but like every other un-timed `channel.exec` it will wedge forever if the
+   * SSH stream never emits `close` (same half-broken-loopback failure mode the
+   * LEGACY_POLL_TIMEOUT_MS docblock names). If it wedges, `pollOneHost` never
+   * returns and the outer `inFlight` guard at pollAllHosts stays raised for that
+   * host forever — every subsequent tick logs `poll_skipped_inflight`. Observed
+   * in the wild on hostId 6 (Skynet self-poll over loopback SSH), 2026-09-19:
+   * container startup → batch 8s timeout → forces sweepScriptPresent=null →
+   * next tick's re-probe wedged → 900+ skips over ~30min until manual restart.
+   * On timeout we treat as `sweepScriptPresent=false` and fall through to legacy
+   * (which has its own 30s bound).
+   */
+  const PROBE_TIMEOUT_MS = 5000;
+
+// ---------------------------------------------------------------------------
+// Phase 99 — spawn-request scan helpers (D-01, D-02, D-03, D-17)
+//
+// One atomic read-and-delete exec per tick per host: lists
+// ~/fleet/spawn-requests/, reads + claims each *.json request file via `mv`
+// (atomic claim — Pitfall 7, RESEARCH Security Note), filters to UUID-shaped
+// basenames (36-char length guard prevents *.success.json / *.failure.json
+// from being claimed), and returns the parsed batch to pollOneHost.
+//
+// Missing folder → empty batch (D-03, not an error).
+// Null SSH return → empty batch, warn logged (fail-open, same as ls path).
+
+  /**
+   * pollOneHost — dispatcher. See docblock above.
+   */
+  async function pollOneHost(hostState: PerHostState): Promise<void> {
+    const { host, channel } = hostState;
+
+    systemLogger.info("Fleet-status poll start", {
+      operation: "fleet_status_poll_start",
+      fleetHostId: host.id,
+      tick: pollTickCount,
+    });
+
+    // Reset per-connection presence cache if the SSH channel object changed.
+    // The starter.ts channel-teardown handlers (`client.on("end"/"close"/
+    // "error")`) drop the hostClients entry; the next acquireSshChannel
+    // returns a fresh SshChannel wrapper. Comparing object identity here is
+    // cheaper than plumbing a callback through starter.ts (open-question #4
+    // resolution: per-host-per-connection-lifetime probe cache).
+    if (hostState.channel !== hostState.lastProbeChannelRef) {
+      hostState.sweepScriptPresent = null;
+      hostState.sweepSchemaMismatchThisConnection = false;
+      hostState.lastProbeChannelRef = hostState.channel;
+    }
+
+    // Presence probe on first tick per SSH-channel lifetime OR after a
+    // sweep-exec null return (transient recovery — see below). Wall-time
+    // bounded — see PROBE_TIMEOUT_MS docblock for the wedge failure mode.
+    // On timeout: leave `sweepScriptPresent` as null so the next tick re-probes
+    // (the wedge may be transient), and this tick falls through to legacy
+    // because the batch dispatch guard requires `sweepScriptPresent` to be
+    // truthy. Legacy has its own 30s bound.
+    if (hostState.sweepScriptPresent === null) {
+      // Exec-breaker gate — if the peer has been failing execs consecutively,
+      // skip the probe entirely rather than burning another PROBE_TIMEOUT_MS
+      // budget on a peer we already know is stressed. `sweepScriptPresent`
+      // stays null so the next tick will re-consult the breaker; when the
+      // backoff window elapses the breaker allows a single probe through
+      // (PROBING state), which resolves the state machine.
+      //
+      // If channel.peer is undefined (local host, test mock), the breaker
+      // gate is skipped — graceful degradation, no behavior change.
+      const peer = channel.peer;
+      const execGate = peer ? checkExecBreaker(peer) : { allowed: true as const };
+      if (!execGate.allowed) {
+        // tsconfig.node.json has strict:false — TS can't narrow the
+        // discriminated union to the {allowed:false} branch. Cast to
+        // access reason / nextAttemptAt without an any-cast.
+        const gate = execGate as {
+          allowed: false;
+          reason: string;
+          nextAttemptAt: number;
+        };
+        systemLogger.warn(
+          "Fleet-status: sweep-script presence probe skipped (exec breaker OPEN)",
+          {
+            operation: "fleet_status_sweep_probe_breaker_open",
+            fleetHostId: host.id,
+            peer,
+            reason: gate.reason,
+            nextAttemptAt: gate.nextAttemptAt,
+          },
+        );
+      } else {
+        let probeRaw: string | null = null;
+        let probeTimedOut = false;
+        try {
+          probeRaw = await Promise.race([
+            channel.exec(
+              "test -x ~/.local/bin/fleet-status-sweep 2>/dev/null && echo yes || echo no",
+              undefined,
+              { timeoutMs: PROBE_TIMEOUT_MS },
+            ),
+            new Promise<string | null>((_, reject) =>
+              setTimeout(
+                () =>
+                  reject(
+                    new Error(
+                      `sweep-script presence probe timeout after ${PROBE_TIMEOUT_MS}ms`,
+                    ),
+                  ),
+                PROBE_TIMEOUT_MS,
+              ),
+            ),
+          ]);
+        } catch (err) {
+          probeTimedOut = true;
+          if (peer) recordExecFailure(peer);
+          systemLogger.warn("Fleet-status: sweep-script presence probe timeout", {
+            operation: "fleet_status_sweep_probe_timeout",
+            fleetHostId: host.id,
+            peer,
+            error: err instanceof Error ? err.message : "unknown",
+          });
+        }
+        if (!probeTimedOut) {
+          // The exec itself returned in time. A null result is still a signal
+          // the channel misbehaved (SSH hiccup swallowed stdout) — treat as
+          // exec failure. Any other return value = healthy exec.
+          if (peer) {
+            if (probeRaw === null) {
+              recordExecFailure(peer);
+            } else {
+              recordExecSuccess(peer);
+            }
+          }
+          hostState.sweepScriptPresent =
+            probeRaw !== null && probeRaw.trim() === "yes";
+          systemLogger.info("Fleet-status: sweep-script presence probed", {
+            operation: "fleet_status_sweep_probe",
+            fleetHostId: host.id,
+            present: hostState.sweepScriptPresent,
+          });
+        }
+      }
+    }
+
+    // Legacy per-identity fan-out is DISABLED in production (2026-09-25).
+    //
+    // Rationale: a one-off sweep-script presence probe failure at boot was
+    // pinning workstation (host 7) on the legacy path, and legacy's ~200
+    // concurrent SSH exec channels per tick (one per identity on a 150-
+    // identity box) saturated the SSH connection pool. Every pane subscribe's
+    // discovery exec then queued behind that saturation and hit the 15s
+    // ssh2 timeout, so message-bubble loads on workstation-hosted panes
+    // broke uniformly.
+    //
+    // The env var `SKYNET_FLEET_STATUS_LEGACY_ENABLED === "true"` re-enables
+    // the fallthrough — set by vitest.setup.ts so the existing 100+ tests
+    // that exercise the legacy path keep passing. Production docker-compose
+    // does NOT set it, so production skips the tick and forces re-probe.
+    // Full legacy removal (function + tests migration) tracked separately.
+    const legacyEnabled = process.env.SKYNET_FLEET_STATUS_LEGACY_ENABLED === "true";
+
+    // Dispatch: batch first; on unavailability/failure, either fall through
+    // to legacy (tests) or skip-and-reprobe (production).
+    if (
+      hostState.sweepScriptPresent &&
+      !hostState.sweepSchemaMismatchThisConnection
+    ) {
+      const result = await pollOneHostBatch(hostState);
+      if (result.ok) {
+        noteSshSuccess(host.id);
+        // Spawn-request scan is NO LONGER piggybacked here — a dedicated
+        // always-on `createSpawnScanOrchestrator` in `../spawn-requests/
+        // scan-orchestrator.ts` runs at container boot and owns scanning
+        // independently of WS-subscriber lifecycle. See bounty
+        // fleet-status-orchestrator-coupling-with-spawn-request-scanning.
+        systemLogger.info("Fleet-status poll end (batch)", {
+          operation: "fleet_status_poll_end",
+          fleetHostId: host.id,
+          tick: pollTickCount,
+          path: "batch",
+          identityCount: result.identityCount,
+          pidCount: result.pidCount,
+        });
+        return;
+      }
+      // Failure — log why. Fallthrough (tests) or skip (production).
+      // tsconfig.node.json has strict:false, so TS can't narrow the discriminated
+      // union via `if (result.ok) return`; access .reason via a typed cast.
+      const failed = result as {
+        ok: false;
+        reason: "null-exec" | "schema-mismatch" | "empty-output-on-nonempty-box";
+      };
+      systemLogger.warn(
+        legacyEnabled
+          ? "Fleet-status: batch path failed, falling back to legacy this tick"
+          : "Fleet-status: batch path failed, skipping tick (legacy disabled)",
+        {
+          operation: legacyEnabled ? "fleet_status_batch_fallback" : "fleet_status_batch_skip",
+          fleetHostId: host.id,
+          reason: failed.reason,
+        },
+      );
+      // On null-exec, force re-probe next tick (may be transient — SSH hiccup
+      // that swallowed stdout, or script really disappeared between probe
+      // and exec). Schema-mismatch and empty-on-nonempty are architectural
+      // drift symptoms — leave the cache and force fallback until reconnect.
+      if (failed.reason === "null-exec") {
+        hostState.sweepScriptPresent = null;
+      }
+      if (failed.reason === "schema-mismatch") {
+        hostState.sweepSchemaMismatchThisConnection = true;
+      }
+      if (!legacyEnabled) {
+        return;
+      }
+    } else if (!legacyEnabled) {
+      // Batch dispatch was skipped (sweep script absent OR schema mismatch
+      // this connection). In production (legacy disabled), skip the tick
+      // and force re-probe next tick so a stale `sweepScriptPresent === false`
+      // from a boot-time probe race doesn't pin the host on skip-forever.
+      systemLogger.warn("Fleet-status: batch unavailable, skipping tick (legacy disabled)", {
+        operation: "fleet_status_batch_unavailable_skip",
+        fleetHostId: host.id,
+        tick: pollTickCount,
+        sweepScriptPresent: hostState.sweepScriptPresent,
+        sweepSchemaMismatchThisConnection: hostState.sweepSchemaMismatchThisConnection,
+      });
+      // Reset ONLY sweepScriptPresent (not schema-mismatch — that's genuine
+      // drift signal, resets only on channel reconnect).
+      if (hostState.sweepScriptPresent === false) {
+        hostState.sweepScriptPresent = null;
+      }
+      return;
+    }
+
+    // Wrap the legacy branch in a wall-time bound so a wedged `channel.exec`
+    // (execCommand is unbounded — see LEGACY_POLL_TIMEOUT_MS comment) doesn't
+    // freeze the inFlight guard for host permanently. On timeout we tear down
+    // the SSH client via releaseSshChannel so the next tick reconnects fresh,
+    // which is the only way to reclaim any semaphore slots the stuck execs are
+    // still holding.
+    //
+    // Spawn-request scan is NO LONGER piggybacked inside this bound — see
+    // bounty fleet-status-orchestrator-coupling-with-spawn-request-scanning.
+    // A dedicated always-on scanner lives in `../spawn-requests/scan-
+    // orchestrator.ts`, wired at container boot.
+    try {
+      await Promise.race([
+        pollOneHostLegacy(hostState),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () =>
+              reject(
+                new Error(
+                  `pollOneHostLegacy timeout after ${LEGACY_POLL_TIMEOUT_MS}ms`,
+                ),
+              ),
+            LEGACY_POLL_TIMEOUT_MS,
+          ),
+        ),
+      ]);
+    } catch (err) {
+      systemLogger.warn("Fleet-status: legacy-path wall-time exceeded", {
+        operation: "fleet_status_legacy_poll_timeout",
+        fleetHostId: host.id,
+        error: err instanceof Error ? err.message : "unknown",
+      });
+      try {
+        deps.releaseSshChannel(host, hostState.channel);
+      } catch {
+        // best-effort teardown — mirrors the eviction path
+      }
+    }
+
+    systemLogger.info("Fleet-status poll end (legacy)", {
+      operation: "fleet_status_poll_end",
+      fleetHostId: host.id,
+      tick: pollTickCount,
+      path: "legacy",
+    });
+  }
+
+  /**
+   * pollOneHostLegacy — the pre-Phase-92 pollOneHost body extracted verbatim
+   * (rename + move, no behavior change). Used as the fallback branch of the
+   * new dispatcher when the sweep script is absent, returns null, or emits
+   * a schema-mismatched payload.
+   *
+   * Preserved as the mandatory backward-compat path per CONTEXT.md § Backward
+   * compat during rollout: "Do NOT hard-fail if the sweep script is absent."
+   */
+  async function pollOneHostLegacy(hostState: PerHostState): Promise<void> {
+    const { host, channel } = hostState;
+
+    // (a) Enumerate session-JSON files
+    const listing = await channel.exec(
+      "ls -1 ~/.claude/sessions/*.json 2>/dev/null || true",
+    );
+
+    if (listing === null) {
+      noteSshFailure(host.id);
+      systemLogger.warn(
+        "Fleet-status: ls of sessions dir returned null (SSH error)",
+        {
+          operation: "fleet_status_host_ssh_unreachable",
+          fleetHostId: host.id,
+        },
+      );
+      return;
+    }
+    noteSshSuccess(host.id);
+
+    // Parse PID numbers from filenames like /home/user/.claude/sessions/12345.json
+    const pidLines = listing
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean);
+    const pidNumbers: number[] = [];
+    for (const line of pidLines) {
+      const match = /(\d+)\.json$/.exec(line);
+      if (match) {
+        pidNumbers.push(parseInt(match[1], 10));
+      }
+    }
+
+    // (b) For each PID: parallel-fetch session-JSON + stat + hook payload
+    await Promise.all(
+      pidNumbers.map((pid) => processPid(hostState, pid)),
+    );
+
+    // (c) Phase 52 Plan 01 Task 3 — source B: enumerate ~/fleet/identities/
+    //     for dormant-only identities that have NO live claude PID this tick
+    //     and publish SessionState frames for them.
+    const liveTmuxSet = new Set<string>();
+    for (const entry of hostState.livenessMap.values()) {
+      if (entry.tmuxSession !== null) {
+        liveTmuxSet.add(entry.tmuxSession);
+      }
+    }
+    await pollDormantOnlyIdentities(hostState, liveTmuxSet);
+  }
+
+  /**
+   * pollOneHostBatch — Phase 92 batch path. Fires ONE `channel.exec` per host
+   * per poll cycle for the sweep script. Parses the JSONL emission and drives
+   * the SAME compose+publish machinery as the legacy path via the fetch/
+   * compose helpers.
+   *
+   * Failure modes:
+   *   - `null-exec`: sweep exec returned null (SSH transport hiccup, script
+   *     vanished, timeout). Caller falls through to legacy and re-probes.
+   *   - `schema-mismatch`: at least one parseable line carried a schema_version
+   *     other than SWEEP_SCHEMA_VERSION. Caller latches the mismatch flag,
+   *     blocking the batch path until channel reconnect.
+   *   - `empty-output-on-nonempty-box`: sweep returned zero identity + zero
+   *     pid lines, but we have prior-tick evidence the box has content
+   *     (livenessMap or sourceBIdentityState non-empty). Caller falls through
+   *     to legacy for this tick but does NOT latch — the next tick re-tries
+   *     the batch (script might be back after a transient failure).
+   *
+   * Success return carries observability counts for the poll-end log.
+   */
+  async function pollOneHostBatch(
+    hostState: PerHostState,
+  ): Promise<
+    | { ok: true; identityCount: number; pidCount: number }
+    | { ok: false; reason: "null-exec" | "schema-mismatch" | "empty-output-on-nonempty-box" }
+  > {
+    const { host, channel } = hostState;
+    const peer = channel.peer;
+
+    // Exec-breaker gate — if the peer has been failing execs consecutively,
+    // skip the sweep exec entirely rather than burning SWEEP_EXEC_TIMEOUT_MS.
+    // Returns the same null-exec shape a natural timeout would, so the
+    // outer caller's fallback / re-probe logic is unchanged.
+    //
+    // If channel.peer is undefined (local host, test mock), gate is skipped.
+    if (peer) {
+      const execGate = checkExecBreaker(peer);
+      if (!execGate.allowed) {
+        // tsconfig.node.json strict:false — cast to access closed-shape fields.
+        const gate = execGate as {
+          allowed: false;
+          reason: string;
+          nextAttemptAt: number;
+        };
+        systemLogger.warn(
+          "Fleet-status: sweep-exec skipped (exec breaker OPEN)",
+          {
+            operation: "fleet_status_sweep_exec_breaker_open",
+            fleetHostId: host.id,
+            peer,
+            reason: gate.reason,
+            nextAttemptAt: gate.nextAttemptAt,
+          },
+        );
+        return { ok: false, reason: "null-exec" };
+      }
+    }
+
+    // Peer-keyed sweep-result cache — short-circuit the SSH exec if another
+    // orchestrator in this Node process already polled the same peer within
+    // the TTL window. Safe because the sweep script is user-agnostic (reads
+    // box-local state); user-gating happens downstream. See the cache module
+    // block above for the full rationale.
+    //
+    // Cache-hit path skips the exec breaker's success/failure record entirely
+    // — no SSH activity happened, so there's nothing to report about this
+    // peer's exec health.
+    let sweepRaw: string | null;
+    const cached = peer ? getCachedSweepResult(peer) : null;
+    if (cached !== null) {
+      systemLogger.info(
+        "Fleet-status: sweep-exec cache hit (peer shared)",
+        {
+          operation: "fleet_status_sweep_exec_cache_hit",
+          fleetHostId: host.id,
+          peer,
+          bytes: cached.length,
+        },
+      );
+      sweepRaw = cached;
+    } else {
+      // Sweep exec — ONE call per host per poll (the whole point of Phase 92).
+      // Wrapped in Promise.race to bound wall time and prevent inFlight stacking
+      // on a stalled managed box.
+      try {
+        sweepRaw = await Promise.race([
+          channel.exec("~/.local/bin/fleet-status-sweep 2>/dev/null", undefined, {
+            timeoutMs: SWEEP_EXEC_TIMEOUT_MS,
+          }),
+          new Promise<string | null>((_, reject) =>
+            setTimeout(
+              () =>
+                reject(
+                  new Error(
+                    `pollOneHostBatch sweep-exec timeout after ${SWEEP_EXEC_TIMEOUT_MS}ms`,
+                  ),
+                ),
+              SWEEP_EXEC_TIMEOUT_MS,
+            ),
+          ),
+        ]);
+      } catch (err) {
+        if (peer) recordExecFailure(peer);
+        systemLogger.warn("Fleet-status: sweep-exec timeout or throw", {
+          operation: "fleet_status_sweep_exec_null",
+          fleetHostId: host.id,
+          peer,
+          error: err instanceof Error ? err.message : "unknown",
+        });
+        return { ok: false, reason: "null-exec" };
+      }
+
+      if (sweepRaw === null) {
+        // Null stdout from channel.exec means the SSH stream misbehaved (hiccup
+        // that swallowed stdout without a promise rejection). Same failure
+        // signal from the breaker's perspective as a timeout — the peer's
+        // exec channel is not delivering.
+        if (peer) recordExecFailure(peer);
+        systemLogger.warn("Fleet-status: sweep-exec returned null (SSH hiccup)", {
+          operation: "fleet_status_sweep_exec_null",
+          fleetHostId: host.id,
+          peer,
+        });
+        return { ok: false, reason: "null-exec" };
+      }
+
+      // Sweep exec returned real bytes → record success at the breaker layer.
+      // Downstream parse/schema checks may still fail (returning ok:false with
+      // schema-mismatch etc.), but those are content-correctness failures, not
+      // exec-channel-health failures — the breaker doesn't care about them.
+      if (peer) recordExecSuccess(peer);
+
+      // Populate the peer cache so any orchestrator polling this peer within
+      // SWEEP_RESULT_CACHE_TTL_MS reads bytes instead of firing another exec.
+      // Only cache on the fresh-exec success path; if a downstream parse
+      // failure surfaces below (schema-mismatch, empty-on-nonempty-box) we
+      // don't invalidate — the cache holds the SAME raw bytes and downstream
+      // will draw the same conclusion, which is correct (the peer really did
+      // emit that content this tick).
+      if (peer) cacheSweepResult(peer, sweepRaw);
+    }
+
+    const parsed = parseSweepJsonl(sweepRaw);
+    if (parsed.schemaMismatch) {
+      systemLogger.warn(
+        "Fleet-status: sweep-emit schema_version mismatch — latching fallback",
+        {
+          operation: "fleet_status_sweep_schema_mismatch",
+          fleetHostId: host.id,
+          expectedSchemaVersion: SWEEP_SCHEMA_VERSION,
+          identityLineCount: parsed.identityLines.length,
+          pidLineCount: parsed.pidLines.length,
+          unknownLineCount: parsed.unknownLines,
+        },
+      );
+      return { ok: false, reason: "schema-mismatch" };
+    }
+
+    // Source E — publish this host's project list every successful tick. The
+    // /projects HTTP routes publish on their own writes, but a project created
+    // straight on disk (agent mkdir + project.md) has no other path to open
+    // clients. The registry's per-host deep-equal skip makes steady-state
+    // ticks a no-op. null = older sweep / enumeration failed → publish
+    // nothing (never read as "zero projects"). Sits BEFORE the empty-output
+    // check so a host with projects but no identities still publishes, and
+    // does not participate in that check (the heuristic stays as it was).
+    if (parsed.projectList !== null) {
+      deps.registry.publishProjectListChanged(
+        host.id,
+        parsed.projectList.projects.map((p) => ({
+          slug: p.slug,
+          displayName: p.display_name,
+          hostId: host.id,
+          hostname: host.name,
+          archived: false,
+          users: p.users,
+          parent: p.parent ?? null,
+        })),
+      );
+    }
+
+    // Empty output disambiguation: freshly-provisioned or empty box vs
+    // broken script. Prior-tick evidence of content (livenessMap or
+    // sourceBIdentityState non-empty) → treat empty as suspicious and fall
+    // back to legacy for this tick. Otherwise accept as a genuine
+    // empty-box emission.
+    //
+    // Phase 118 Plan 118-04: `appLines` participates in this "did the sweep
+    // emit ANYTHING" check — a box with zero identities + zero PIDs but N
+    // apps is a legitimate emission, not an empty one. Without this
+    // widening, an apps-only sweep would prematurely return here and
+    // bypass the compose+publish + reconciliation blocks below.
+    if (
+      parsed.identityLines.length === 0 &&
+      parsed.pidLines.length === 0 &&
+      parsed.appLines.length === 0
+    ) {
+      const hasPriorContent =
+        hostState.livenessMap.size > 0 ||
+        hostState.sourceBIdentityState.size > 0 ||
+        hostState.lastTickLiveApps.size > 0;
+      if (hasPriorContent) {
+        return { ok: false, reason: "empty-output-on-nonempty-box" };
+      }
+      // Genuinely-empty box — success with zero counts.
+      //
+      // The first-sweep registry reconcile must not trust a lone empty sweep:
+      // hasPriorContent is always false on a fresh host state, so a glitchy
+      // empty emission would otherwise "gone" every cached row for the host
+      // (identity_gone closes open tabs). Require a second consecutive empty
+      // sweep before reconciling an empty picture.
+      hostState.emptySweepStreak += 1;
+      if (hostState.emptySweepStreak >= 2) {
+        reconcileRegistryWithFirstSweep(hostState, new Set(), new Set());
+      }
+      return { ok: true, identityCount: 0, pidCount: 0 };
+    }
+
+    // Build a quick identity→SweepIdentityLine index for source-A PID lines
+    // that need to reuse the identity's jsonl_path (SWEEP_FIELD_PARITY A11
+    // fold — no separate per-PID discovery on the wire).
+    const identityLineByName = new Map<string, SweepIdentityLine>();
+    for (const line of parsed.identityLines) {
+      identityLineByName.set(line.identity, line);
+    }
+
+    // Source A — dispatch each SweepPidLine into the SAME compose helper the
+    // legacy path uses. writeSessionFileCache fires here (compose G8).
+    for (const pidLine of parsed.pidLines) {
+      const fetched = pidLineToPerPidFetched(pidLine, identityLineByName, host.id);
+      await composeAndPublishPerPid(hostState, pidLine.pid, fetched);
+    }
+
+    // Source B — build liveTmuxSet AFTER source A completes (source A's
+    // stale-reap may have deleted PIDs from livenessMap).
+    const liveTmuxSet = new Set<string>();
+    for (const entry of hostState.livenessMap.values()) {
+      if (entry.tmuxSession !== null) {
+        liveTmuxSet.add(entry.tmuxSession);
+      }
+    }
+
+    // Source B — dispatch each SweepIdentityLine into the compose helper.
+    // (Phase 115 Plan 115-06 archived-tree branch retired in the Phase 122
+    //  shape follow-up; the Python sweep no longer walks identities-archive/,
+    //  so `parsed.identityLines` only contains live-tree rows. The strict
+    //  `identityLine.archived === true` skip is kept as a belt-and-braces
+    //  no-op guard in case an older sweep version emits archived rows during
+    //  a rolling deploy window.)
+    for (const identityLine of parsed.identityLines) {
+      if (identityLine.archived === true) continue;
+      // Populate the per-host cosmetics cache BEFORE compose+publish. Must
+      // happen unconditionally — the compose branch below evicts
+      // `sourceBIdentityState` for live-and-not-condensing identities (the
+      // common case), so we cannot piggyback on that map's lifetime for the
+      // WS gate lookup. This map's lifetime is tied to the live tree, not
+      // source B's publish set.
+      hostState.identityCosmeticsCache.set(identityLine.identity, {
+        identityCosmetics:
+          (identityLine.identity_cosmetics as RawCosmetics | null | undefined) ??
+          null,
+        roleCosmetics:
+          (identityLine.role_cosmetics as RawCosmetics | null | undefined) ??
+          null,
+        role: identityLine.role ?? null,
+        ...(Array.isArray(identityLine.roles_cosmetics)
+          ? {
+              rolesCosmetics: identityLine.roles_cosmetics as Array<RawCosmetics | null>,
+            }
+          : {}),
+        ...(Array.isArray(identityLine.roles) ? { roles: identityLine.roles } : {}),
+      });
+      const fetched = identityLineToPerIdentityFetched(identityLine, hostState);
+      const cached = hostState.sourceBIdentityState.get(identityLine.identity);
+      composeAndPublishPerIdentity(hostState, liveTmuxSet, fetched, cached);
+    }
+
+    // Phase 115 hotfix (2026-09-18): reconcile cache with sweep.
+    // Any identity that was in the previous tick's live-tree set but is NOT
+    // in this tick's live-tree set (because she archived, or her folder was
+    // deleted/renamed, or she stopped existing for any other silent reason)
+    // gets a publishSessionGone so the registry drops her from the cached
+    // state map. Without this, the cache holds stale identities forever
+    // whenever they transition off the live tree via a path that doesn't
+    // emit an explicit lifecycle event (archive is one such path — sky UAT
+    // 2026-09-17 root cause). This runs ONLY on sweep-success — the {ok:false}
+    // early returns above never reach here, so transient SSH failures don't
+    // flap the sidebar.
+    const thisTickLiveTreeIdentities = new Set<string>();
+    for (const line of parsed.identityLines) {
+      // Same belt-and-braces guard as the compose loop above — a rolling-deploy
+      // sweep version may still emit archived: true; treat those as absent.
+      if (line.archived === true) continue;
+      thisTickLiveTreeIdentities.add(line.identity);
+    }
+    const departedThisTick = new Set<string>();
+    for (const previousName of hostState.lastTickLiveTreeIdentities) {
+      if (!thisTickLiveTreeIdentities.has(previousName)) {
+        departedThisTick.add(previousName);
+        deps.registry.publishIdentityGoneByName(host.id, previousName);
+      }
+    }
+    hostState.lastTickLiveTreeIdentities = thisTickLiveTreeIdentities;
+
+    // Drop cosmetics-cache entries for identities no longer on the live tree,
+    // so the WS gate closure never reads back stale cosmetics for an identity
+    // whose files are gone. Identities that departed THIS tick keep their
+    // entry until the next tick: the identity_gone fan-out above runs the WS
+    // identity gate asynchronously, and on a cache miss the gate falls back to
+    // reading the identity file — which an archive has already moved — and
+    // denies, silently dropping the gone frame for every other open tab.
+    for (const cachedName of hostState.identityCosmeticsCache.keys()) {
+      if (
+        !thisTickLiveTreeIdentities.has(cachedName) &&
+        !departedThisTick.has(cachedName)
+      ) {
+        hostState.identityCosmeticsCache.delete(cachedName);
+        systemLogger.debug("Fleet-status: evicted departed identity cosmetics", {
+          operation: "fleet_status_identity_cosmetics_evicted",
+          fleetHostId: host.id,
+          identityName: cachedName,
+        });
+      }
+    }
+
+    // Phase 118 Plan 118-04 (D-01, D-02, D-11) — source-C compose+publish for
+    // apps. Each SweepAppLine that reached this scope has already passed the
+    // Python sweep script's D-01/D-02 filters (folder + card + unit checks,
+    // with the "unit exists but stopped" carve-out emitted as unhealthy).
+    // The orchestrator does NOT re-check inclusion here — the Python is the
+    // authority for what's in the picture. adaptAppLineToState is a pure
+    // snake_case → camelCase field copy; publishAppUpdate fans the resulting
+    // AppState frame out to all subscribers via the wire-protocol layer.
+    //
+    // This loop sits inside the sweep-SUCCESS scope: every {ok:false}
+    // early-return above in pollOneHostBatch (sweep null / schema mismatch
+    // / empty-output-on-nonempty-box) bypasses it — same discipline the
+    // identity + pid compose loops above already benefit from.
+    for (const appLine of parsed.appLines) {
+      recordAppIconVersion(Number(host.id), appLine.slug, appLine.icon_version);
+      deps.registry.publishAppUpdate(
+        host.id,
+        adaptAppLineToState(host.id, appLine, host.machineId),
+      );
+    }
+
+    // Phase 118 Plan 118-04 (D-11, D-12, D-13) — reconcile app cache with
+    // sweep. Mirrors the identity reconciliation block immediately above
+    // (adopts Phase 115's `67b4a7ef` pattern verbatim, per D-11).
+    //
+    // Any app slug that was in the previous tick's picture but is NOT in
+    // this tick's picture (folder deleted, unit removed by archive-app.sh,
+    // ceased passing D-01 or D-02 for any other silent reason) gets a
+    // publishAppGoneByHostSlug so the registry drops it from the cached
+    // apps map. Without this, the cache holds stale apps forever whenever
+    // one transitions out of the picture via a path that doesn't emit an
+    // explicit lifecycle event.
+    //
+    // LOAD-BEARING (RESEARCH § Pitfall 3 / D-02 + D-13): the tracking set
+    // holds ALL slugs in the picture — healthy AND unhealthy — NOT just
+    // healthy. Filtering to healthy-only would flap an unhealthy app off
+    // the sidebar every tick and defeat D-13's health-flip-is-update
+    // discipline. Every line in parsed.appLines contributes to the set
+    // regardless of is_healthy.
+    //
+    // Runs ONLY on sweep success — the {ok:false} early returns above in
+    // pollOneHostBatch never reach here, so transient SSH failures don't
+    // flap the sidebar (same D-12 guard the identity reconciliation gets by
+    // virtue of position in the sweep-success scope).
+    const thisTickLiveApps = new Set<string>();
+    for (const line of parsed.appLines) {
+      thisTickLiveApps.add(line.slug);
+    }
+    for (const previousSlug of hostState.lastTickLiveApps) {
+      if (!thisTickLiveApps.has(previousSlug)) {
+        deps.registry.publishAppGoneByHostSlug(host.id, previousSlug);
+      }
+    }
+    hostState.lastTickLiveApps = thisTickLiveApps;
+
+    await reconcileViewerVisibility(hostState, parsed.appLines);
+
+    hostState.emptySweepStreak = 0;
+    const thisTickLiveNames = new Set(thisTickLiveTreeIdentities);
+    for (const pidLine of parsed.pidLines) thisTickLiveNames.add(pidLine.identity);
+    reconcileRegistryWithFirstSweep(
+      hostState,
+      thisTickLiveNames,
+      thisTickLiveApps,
+    );
+
+    return {
+      ok: true,
+      identityCount: parsed.identityLines.length,
+      pidCount: parsed.pidLines.length,
+    };
+  }
+
+  /**
+   * Sharing changes reach the viewer's open sidebar. Visibility comes from
+   * `users:` lists (the agent's, its roles', an app's), which are not part of
+   * any publish fingerprint, so a sharing-only change publishes nothing and
+   * the frame filter would keep dropping (or never start passing) the row.
+   * Compare the viewer's visibility with the last sweep's, using the same
+   * gates the frame filter uses:
+   *   - agent now visible → send its current row (an `update` upserts it);
+   *   - agent now hidden → send a `gone` (no reason: the row leaves the
+   *     sidebar, open tabs stay — same as pid_stale);
+   *   - app now hidden (its own list, or a conversation app whose agent was
+   *     hidden) → send an `app-gone`. A newly visible app needs nothing: apps
+   *     re-publish every sweep and the filter now lets them through.
+   * First sight of a thing records it without sending anything.
+   */
+  // The viewer's username, looked up once a minute rather than per host per
+  // tick (it only changes on a rename).
+  let viewerUsername: { name: string; at: number } | null = null;
+  const VIEWER_USERNAME_TTL_MS = 60_000;
+  async function resolveViewerUsername(
+    viewer: NonNullable<OrchestratorDeps["viewer"]>,
+  ): Promise<string | null> {
+    const now = deps.now();
+    if (viewerUsername && now - viewerUsername.at < VIEWER_USERNAME_TTL_MS) {
+      return viewerUsername.name;
+    }
+    let name: string | null = null;
+    try {
+      name = await viewer.username();
+    } catch {
+      name = null;
+    }
+    viewerUsername = name === null ? null : { name, at: now };
+    return name;
+  }
+
+  async function reconcileViewerVisibility(
+    hostState: PerHostState,
+    appLines: readonly SweepAppLine[],
+  ): Promise<void> {
+    const viewer = deps.viewer;
+    if (!viewer) return;
+    const username = await resolveViewerUsername(viewer);
+    if (username === null) {
+      // A null caller disables the frame gate too, so frames flow regardless
+      // of visibility meanwhile — forget the baseline and start fresh once the
+      // name resolves, rather than diffing against a picture that went stale.
+      hostState.viewerVisibleIdentities = new Map();
+      hostState.viewerVisibleApps = new Map();
+      return;
+    }
+    const hostId = hostState.host.id;
+
+    const prevIdentities = hostState.viewerVisibleIdentities;
+    const nextIdentities = new Map<string, boolean>();
+    let registryRows: SessionState[] | null = null;
+    for (const [name, c] of hostState.identityCosmeticsCache) {
+      const visible = isIdentityVisibleToUser(
+        c.identityCosmetics,
+        c.rolesCosmetics ?? c.roleCosmetics,
+        username,
+      );
+      nextIdentities.set(name, visible);
+      const before = prevIdentities.get(name);
+      if (before === undefined || before === visible) continue;
+      registryRows ??= deps.registry.getSnapshot();
+      const row = registryRows.find((s) => s.hostId === hostId && s.tmuxSession === name);
+      if (visible) {
+        // Sent straight to the viewer, past the frame filter: this poller only
+        // sweeps hosts the viewer has access to, and `visible` is the filter's
+        // own identity gate on the same cosmetics. A new gate added to the
+        // filter's `update` branch must be mirrored here.
+        if (row) deps.registry.publishToUser(viewer.userId, makeUpdateFrame(row));
+        // No row to send yet — keep it unseen so the next sweep tries again.
+        else nextIdentities.set(name, false);
+      } else {
+        deps.registry.publishToUser(
+          viewer.userId,
+          makeGoneFrame(hostId, name, row?.sessionId ?? ""),
+        );
+      }
+      systemLogger.info("Fleet-status: agent visibility changed for viewer", {
+        operation: "fleet_status_viewer_identity_visibility_changed",
+        userId: viewer.userId,
+        fleetHostId: hostId,
+        identityName: name,
+        visible,
+        rowSent: visible ? row !== undefined : true,
+      });
+    }
+    hostState.viewerVisibleIdentities = nextIdentities;
+
+    const prevApps = hostState.viewerVisibleApps;
+    const nextApps = new Map<string, boolean>();
+    for (const line of appLines) {
+      const app = adaptAppLineToState(hostId, line);
+      const visible =
+        isAppVisibleToUser(app.users ?? null, username) &&
+        (!app.owner || nextIdentities.get(app.owner) !== false);
+      nextApps.set(app.slug, visible);
+      if (prevApps.get(app.slug) === true && !visible) {
+        deps.registry.publishToUser(viewer.userId, makeAppGoneFrame(hostId, app.slug));
+        systemLogger.info("Fleet-status: app hidden from viewer", {
+          operation: "fleet_status_viewer_app_hidden",
+          userId: viewer.userId,
+          fleetHostId: hostId,
+          slug: app.slug,
+          owner: app.owner ?? null,
+        });
+      }
+    }
+    hostState.viewerVisibleApps = nextApps;
+  }
+
+  /**
+   * Adapter: SweepPidLine → PerPidFetchedState. Direct field-copy of the
+   * schema fields onto the fetched struct.
+   *
+   * Two SWEEP_FIELD_PARITY-documented divergences from the legacy fetch:
+   *   - `hookPayloadRaw = null` (A3 skip): sweep does NOT emit box-wide
+   *     last-stop-payload.json. Compose handles the null → falls back to
+   *     emitHookPayloadWarn + backgroundTasks=[] when per_session is also
+   *     null. Documented in sweep-schema.ts SWEEP_FIELD_PARITY.A3.
+   *   - `jsonlPath` sourced from the joined SweepIdentityLine (A11 fold):
+   *     per-PID discovery folded into the per-identity discovery on the
+   *     wire; PIDs on identities that have a SweepIdentityLine reuse that
+   *     identity's jsonl_path.
+   */
+  function pidLineToPerPidFetched(
+    pidLine: SweepPidLine,
+    identityLineByName: Map<string, SweepIdentityLine>,
+    // Phase 111 Plan 03: hostIdRaw is the string host.id from hostState.host.id.
+    // Passed here so appearanceFromIdentityLine can coerce it once, consistently.
+    // Note: `identityLine` here is the SAME joined line the A11 `jsonl_path`
+    // fold already uses — no new lookup, no new SSH read.
+    hostIdRaw: string,
+  ): PerPidFetchedState {
+    const identityLine = identityLineByName.get(pidLine.identity);
+    return {
+      sessionJsonRaw: pidLine.session_json,
+      statResult: pidLine.stat_result,
+      hookPayloadRaw: null, // SWEEP_FIELD_PARITY.A3 skip
+      tmuxSession: pidLine.identity,
+      freshLastStopAt: pidLine.per_session_stop_mtime_ms,
+      freshActivityMtime: pidLine.activity_mtime_ms,
+      freshStoppedMtime: pidLine.stopped_mtime_ms,
+      perSessionHookPayloadRaw: pidLine.per_session_stop_payload,
+      freshDormant: pidLine.dormant_a,
+      jsonlPath: pidLine.jsonl_tail !== null
+        // If sweep emitted a tail, the identity is real; get the path from
+        // the joined identity line. Sweep script guarantees a SweepIdentity-
+        // Line for every SweepPidLine.identity (per Plan 02 contract).
+        ? (identityLine?.jsonl_path ?? null)
+        : (identityLine?.jsonl_path ?? null),
+      jsonlTail: pidLine.jsonl_tail,
+      // Phase 111 Plan 03: appearance resolved via the shared helper once per
+      // identity per tick. The joined identityLine is the same line A11 uses.
+      identityAppearance: appearanceFromIdentityLine(identityLine, hostIdRaw, pidLine.identity),
+    };
+  }
+
+  /**
+   * Adapter: SweepIdentityLine → PerIdentityFetchedState. Direct field-copy.
+   *
+   * The condense sentinels are read with `=== true` so a peer host still
+   * running an older sweep script (which omits `compact_requested` /
+   * `compacting`) reads as not condensing.
+   */
+  function identityLineToPerIdentityFetched(
+    identityLine: SweepIdentityLine,
+    hostState: PerHostState,
+  ): PerIdentityFetchedState {
+    return {
+      name: identityLine.identity,
+      isDormant: identityLine.dormant,
+      isCompactRequested: identityLine.compact_requested === true,
+      isCompacting: identityLine.compacting === true,
+      // Phase 111 Plan 03: appearance resolved via the shared helper once per
+      // identity per tick. hostState.host.id carries the string host id.
+      identityAppearance: appearanceFromIdentityLine(identityLine, hostState.host.id, identityLine.identity),
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Source B — per-identity enumeration: dormant + condensing axes
+  //
+  // History:
+  //   - Phase 52 Plan 01 Task 3: introduced source B for the dormant axis only
+  //     (identity-folder-keyed enumeration, PID-independent).
+  //   - Phase 53 / quick-260823-73o: source B became the SOLE publisher of a
+  //     second per-identity axis (then "recycling", for the retired agent
+  //     reset). Source A omits the field.
+  //   - Condense: that axis is now `condensing` = `.compact-requested` ||
+  //     `.compacting`. The supervisor compacts the agent's context in place
+  //     (agent-supervisor.sh handle_compaction); the agent may keep its live
+  //     PID throughout, so the `liveTmuxSet.has(name)` skip is CONDITIONAL:
+  //     skip only when `!isCondensing`. While condensing, source B publishes
+  //     regardless of whether source A also published for the same identity
+  //     this tick (no conflict — source A never stamps the axis).
+  //
+  // Per-tick pipeline (per identity):
+  //   1. Parallel-stat the three sentinels (`.dormant`, `.compact-requested`,
+  //      `.compacting`) — 3 exec calls in parallel per identity (legacy path;
+  //      the batch sweep emits them on the SweepIdentityLine).
+  //   2. Compose isCondensing = compactRequested || compacting.
+  //   3. Skip-and-evict branch: if identity has live PID AND !isCondensing,
+  //      delete cache entry and continue (source A owns publish).
+  //   4. Fingerprint = `${dormant}|${condensing}|appearance|lastFinish`.
+  //      Compare against cached lastPublishedFingerprint; if identical,
+  //      advance cache and skip publish. If different (or first appearance),
+  //      publish source-B frame and update cache fingerprint.
+  //   5. When isCondensing is true, emit `fleet_status_condensing_armed` log
+  //      with identityName + hasLivePid + per-sentinel breakdown.
+  //
+  // Fail-open: if `ls` returns null (SSH error) or empty (no identities dir),
+  // log a debug and skip source B for this tick. Source A still fires normally.
+  //
+  // Shell-quoting via shellSingleQuote (T-52-01-02 mitigation): identity names
+  // from `ls` output are attacker-controlled (a compromised host could name
+  // an identity `; rm -rf $HOME`), so each stat command interpolates the FULL
+  // quoted argument — cannot escape.
+  // ---------------------------------------------------------------------------
+
+  async function pollDormantOnlyIdentities(
+    hostState: PerHostState,
+    liveTmuxSet: Set<string>,
+  ): Promise<void> {
+    const { host, channel, sourceBIdentityState } = hostState;
+
+    // Enumerate identity folders. Use `find -type d` (not `ls -1`) so
+    // leftover backup tarballs / notes / .DS_Store in ~/fleet/identities/
+    // (e.g. `pixie.pre-role-migration.20260804T050759Z.tar.gz` from role
+    // migrations) do NOT get enumerated as identity names — otherwise we
+    // fire ghost SSH-exec stat/find calls per tick against nonexistent
+    // identity dirs. `-mindepth 1 -maxdepth 1 -type d -printf '%f\n'`
+    // emits ONLY directory basenames (one per line) — same shape as the
+    // prior `ls -1` output. Managed hosts are all Linux (box-map.md
+    // § Managed hosts) so GNU find + `-printf` is available. Guard
+    // `2>/dev/null || true` mirrors the prior fail-open shape when the
+    // ~/fleet/identities/ dir doesn't exist.
+    const listing = await channel.exec(
+      "find ~/fleet/identities/ -mindepth 1 -maxdepth 1 -type d -printf '%f\\n' 2>/dev/null || true",
+    );
+    if (listing === null || listing.trim() === "") {
+      systemLogger.debug(
+        "Fleet-status: source B — no identities dir or SSH error",
+        {
+          operation: "fleet_status_source_b_skip",
+          fleetHostId: host.id,
+        },
+      );
+      return;
+    }
+
+    const identityNames = listing
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean);
+
+    // Phase 1 — parallel-stat all three sentinels per identity.
+    const fetchedStates = await Promise.all(
+      identityNames.map(async (name): Promise<PerIdentityFetchedState> => {
+        const quotedName = shellSingleQuote(name);
+        const [dormantOut, compactRequestedOut, compactingOut] = await Promise.all([
+          channel.exec(
+            `stat ~/fleet/identities/${quotedName}/.dormant 2>/dev/null >/dev/null && echo yes || echo no`,
+          ),
+          channel.exec(
+            `stat ~/fleet/identities/${quotedName}/.compact-requested 2>/dev/null >/dev/null && echo yes || echo no`,
+          ),
+          channel.exec(
+            `stat ~/fleet/identities/${quotedName}/.compacting 2>/dev/null >/dev/null && echo yes || echo no`,
+          ),
+        ]);
+        // T-52-01-01 mitigation: only "yes" or "no" are meaningful. Anything
+        // else (null, unexpected output) → treat as false. Per-tick reads with
+        // no fail-open cache for the raw stat outputs.
+        return {
+          name,
+          isDormant: dormantOut !== null && dormantOut.trim() === "yes",
+          isCompactRequested:
+            compactRequestedOut !== null && compactRequestedOut.trim() === "yes",
+          isCompacting: compactingOut !== null && compactingOut.trim() === "yes",
+          // Legacy path (pre-Phase-92 exec fan-out) has no appearance source;
+          // adding one would mean new SSH channels, which D-01 exists to avoid.
+          identityAppearance: null,
+        };
+      }),
+    );
+
+    // Phase 2-5 — sequential per-identity compose + skip/publish so cache
+    // updates stay deterministic.
+    for (const fetched of fetchedStates) {
+      const cached = sourceBIdentityState.get(fetched.name);
+      composeAndPublishPerIdentity(hostState, liveTmuxSet, fetched, cached);
+    }
+  }
+
+  /**
+   * composeAndPublishPerIdentity — full downstream of the per-identity
+   * iteration: OR compose the two condense sentinels, apply the skip-and-
+   * evict transition-edge, fingerprint suppression, publish, cache write.
+   * Zero SSH calls. Shared by the legacy and batch paths.
+   */
+  // A live agent keeps its live row while it condenses: source B's frame for
+  // it is the registry's current (source A) state with the source-B axes laid
+  // over it, not the dormant placeholder — a placeholder would fully replace
+  // the live row (sessionId, pid, status, title, last message) for every
+  // client that connects or reconnects during the condense. Null when there is
+  // no live row to build on (falls back to the placeholder).
+  function liveRowFor(hostId: string, name: string): SessionState | null {
+    const row = deps.registry
+      .getSnapshot()
+      .find((s) => s.hostId === hostId && s.tmuxSession === name && s.sessionId !== "__dormant__");
+    if (row === undefined) return null;
+    const { contextPct: _contextPct, ...rest } = row as SessionState & { contextPct?: unknown };
+    return rest as SessionState;
+  }
+
+  // Whether the registry still holds this identity as condensing (its latest
+  // row that carries the axis).
+  function registryCondensing(hostId: string, name: string): boolean {
+    const row = deps.registry
+      .getSnapshot()
+      .findLast((s) => s.hostId === hostId && s.tmuxSession === name && s.condensing !== undefined);
+    return row?.condensing === true;
+  }
+
+  // When a live agent stops condensing, source A must republish its full row
+  // (its own fingerprint never changed, so it would otherwise stay quiet).
+  function invalidateSourceAFingerprints(hostState: PerHostState, name: string): void {
+    for (const entry of hostState.livenessMap.values()) {
+      if (entry.tmuxSession === name) entry.lastPublishedFingerprint = "";
+    }
+  }
+
+  function composeAndPublishPerIdentity(
+    hostState: PerHostState,
+    liveTmuxSet: Set<string>,
+    fetched: PerIdentityFetchedState,
+    cached: SourceBIdentityCacheEntry | undefined,
+  ): void {
+    const { host, sourceBIdentityState } = hostState;
+    const { name, isDormant, isCompactRequested, isCompacting } = fetched;
+
+    // Phase 2 — OR compose: queued or in flight both count as condensing.
+    const isCondensing = isCompactRequested || isCompacting;
+
+    // Phase 3 — conditional skip. When identity has a live PID AND is NOT
+    // condensing, source A owns publish for the other axes — evict this
+    // identity's source-B cache and continue.
+    //
+    // TRANSITION EDGE (quick-260823-73o T1-vi lock): if we're about to skip-
+    // and-evict AND the cached source-B frame had condensing:true, publish a
+    // final condensing:false source-B frame BEFORE evicting so consumers see
+    // the transition.
+    //
+    // With no cache entry (the per-user watcher stopped and restarted, so this
+    // host's source-B cache started empty), fall back to the registry: it
+    // outlives the watcher and carries `condensing` forward on every source-A
+    // frame, so a compaction that finished while nobody was watching would
+    // otherwise stay stuck at condensing:true.
+    if (liveTmuxSet.has(name) && !isCondensing) {
+      let cachedCondensing = cached?.condensing ?? false;
+      if (cached === undefined && !hostState.registryCondensingChecked.has(name)) {
+        hostState.registryCondensingChecked.add(name);
+        cachedCondensing = registryCondensing(host.id, name);
+      }
+      if (cachedCondensing) {
+        // Phase 111 Plan 03: two construction sites, no factory — deliberate,
+        // see 111-03. Appearance carried on this pre-evict frame so no frame
+        // blanks appearance that a neighbouring frame carries (D-09).
+        const live = liveRowFor(host.id, name);
+        const state: SessionState = live
+          ? {
+              ...live,
+              updatedAt: deps.now(),
+              dormant: isDormant,
+              condensing: false,
+              identityAppearance: fetched.identityAppearance,
+            }
+          : {
+              hostId: host.id,
+              tmuxSession: name,
+              sessionId: "__dormant__",
+              pid: null,
+              status: "idle",
+              waitingFor: undefined,
+              backgroundTasks: [],
+              updatedAt: deps.now(),
+              lastMessageAt: null,
+              aiTitle: null,
+              dormant: isDormant,
+              condensing: false,
+              identityAppearance: fetched.identityAppearance,
+              ...lastFinishField(host.id, name),
+            };
+        deps.registry.publishSessionState(host.id, state);
+        invalidateSourceAFingerprints(hostState, name);
+        systemLogger.info(
+          "Fleet-status: source B frame published (condensing-false transition, pre-evict)",
+          {
+            operation: "fleet_status_source_b_publish",
+            fleetHostId: host.id,
+            identityName: name,
+            dormant: isDormant,
+            condensing: false,
+            previousDormant: cached?.dormant ?? null,
+            previousCondensing: cached?.condensing ?? null,
+            identityAppearanceResolved: state.identityAppearance !== null,
+          },
+        );
+      }
+      sourceBIdentityState.delete(name);
+      return;
+    }
+
+    // Phase 4 — fingerprint + publish/suppress.
+    // Phase 111 Plan 03: appearance segment appended at END per the append-at-END
+    // rule.
+    const fingerprint = `${isDormant ? "1" : "0"}|${isCondensing ? "1" : "0"}|${appearanceFingerprintSegment(fetched.identityAppearance)}|${turnFinishStore.get(host.id, name) ?? ""}`;
+
+    if (cached !== undefined && cached.lastPublishedFingerprint === fingerprint) {
+      // Cache hit — fingerprint identical → advance internal state but skip
+      // publish (source B fingerprint suppression contract).
+      // Phase 111 Plan 03: identityAppearance stamped here (suppress branch) so
+      // the cache stays lockstep with derivation (Pitfall 3 — missing this
+      // branch would silently stale-compare on the next tick that changes appearance).
+      sourceBIdentityState.set(name, {
+        dormant: isDormant,
+        condensing: isCondensing,
+        lastPublishedFingerprint: fingerprint,
+        identityAppearance: fetched.identityAppearance,
+      });
+      return;
+    }
+
+    // Fingerprint delta (or first appearance) → publish + update cache.
+    const previousDormant = cached?.dormant ?? null;
+    const previousCondensing = cached?.condensing ?? null;
+
+    // Phase 111 Plan 03: identityAppearance stamped here (publish branch).
+    sourceBIdentityState.set(name, {
+      dormant: isDormant,
+      condensing: isCondensing,
+      lastPublishedFingerprint: fingerprint,
+      identityAppearance: fetched.identityAppearance,
+    });
+
+    // Phase 111 Plan 03: two construction sites, no factory — deliberate, see
+    // 111-03. Appearance carried on this normal source-B frame (D-09: every
+    // frame-construction site carries appearance).
+    const live = liveTmuxSet.has(name) ? liveRowFor(host.id, name) : null;
+    const state: SessionState = live
+      ? {
+          ...live,
+          updatedAt: deps.now(),
+          dormant: isDormant,
+          condensing: isCondensing,
+          identityAppearance: fetched.identityAppearance,
+        }
+      : {
+          hostId: host.id,
+          tmuxSession: name,
+          sessionId: "__dormant__",
+          pid: null,
+          status: "idle",
+          waitingFor: undefined,
+          backgroundTasks: [],
+          updatedAt: deps.now(),
+          lastMessageAt: null,
+          aiTitle: null,
+          dormant: isDormant,
+          condensing: isCondensing,
+          identityAppearance: fetched.identityAppearance,
+          ...lastFinishField(host.id, name),
+        };
+    deps.registry.publishSessionState(host.id, state);
+
+    systemLogger.info("Fleet-status: source B frame published", {
+      operation: "fleet_status_source_b_publish",
+      fleetHostId: host.id,
+      identityName: name,
+      dormant: isDormant,
+      condensing: isCondensing,
+      previousDormant,
+      previousCondensing,
+      identityAppearanceResolved: state.identityAppearance !== null,
+    });
+
+    // Phase 5 — arm log.
+    if (isCondensing) {
+      systemLogger.info("Fleet-status: condensing axis armed", {
+        operation: "fleet_status_condensing_armed",
+        fleetHostId: host.id,
+        identityName: name,
+        hasLivePid: liveTmuxSet.has(name),
+        compactRequested: isCompactRequested,
+        compacting: isCompacting,
+        cachedCondensing: cached?.condensing ?? false,
+        cachedDormant: cached?.dormant ?? false,
+      });
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Phase 92 — processPid split into fetch + compose helpers.
+  //
+  // The historical pre-Phase-92 processPid interleaved ~9-11 SSH exec calls
+  // (RESEARCH.md A1..A12) with per-PID compose+publish+cache-write logic. That
+  // interleaving prevented a batch-mode caller from reusing the compose stage
+  // with pre-fetched values off the wire. Phase 92 splits the two phases at a
+  // deliberate seam:
+  //
+  //   fetchPerPidState(hostState, pid, cached)
+  //     → runs every SSH exec (A1-A12), no cache mutation, no publish.
+  //     → returns a PerPidFetchedState struct of raw / minimally-processed
+  //       values. Fail-open cache preservation happens in compose (see below).
+  //
+  //   composeAndPublishPerPid(hostState, pid, cached, isNew, fetched)
+  //     → runs parseSessionJson, sessionIdRotation detection, all
+  //       lastStopAt / activityMtime / stoppedMtime / lastMessageAt / aiTitle
+  //       fail-open reconciliation, fingerprint delta, publish, cache-write,
+  //       writeSessionFileCache. No SSH calls.
+  //
+  //   processPid(hostState, pid)
+  //     → thin wrapper: fetch → compose. Byte-identical observable behavior
+  //       to the pre-refactor function (verified by the existing 149-test
+  //       vitest suite; new batch-vs-legacy parity coverage lands in Plan 05).
+  //
+  // The batch path (pollOneHostBatch) skips fetchPerPidState and constructs a
+  // PerPidFetchedState directly from a SweepPidLine (schema alignment
+  // documented in sweep-schema.ts SWEEP_FIELD_PARITY), then calls
+  // composeAndPublishPerPid — driving byte-identical publish output as legacy.
+  //
+  // The single documented divergence: SWEEP_FIELD_PARITY.A3 skip. Sweep does
+  // not emit the box-wide `last-stop-payload.json`; batch path passes
+  // hookPayloadRaw=null, which flows through the existing perSessionUsable
+  // fallback branch to trigger emitHookPayloadWarn if per-session A9 is also
+  // absent. Legacy path preserves the A3 read + fallback verbatim.
+  //
+  // RESEARCH.md non-negotiables re-checked in this refactor:
+  //   G5 (inFlight guard): unchanged — operates outside processPid.
+  //   G6 (safe-char regex): applied caller-side in composeAndPublishPerPid
+  //       through the derived-*/perSessionHookPayloadRaw guard checks; batch
+  //       path additionally relies on Plan 02 server-side application. Belt-
+  //       and-suspenders preserved.
+  //   G7 (dual dormant reads): fetch produces freshDormant from A10; compose
+  //       reads SweepPidLine.dormant_a in the batch path — both feed the same
+  //       fail-open reconciliation and the same PidCacheEntry.dormant field.
+  //   G8 (writeSessionFileCache): moved from mid-legacy to compose helper —
+  //       fires in BOTH batch and legacy paths with the same shape.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * fetchPerPidState — runs the pre-Phase-92 A1..A12 exec fan-out for one PID.
+   *
+   * Zero cache mutation, zero publish, zero logging (except discovery logging
+   * inherited from discoverIdentityJsonlPathViaChannel + getIdentityLastSend).
+   * Returns a PerPidFetchedState struct that composeAndPublishPerPid consumes
+   * to produce the identical observable behavior as the pre-refactor
+   * processPid.
+   *
+   * Cache-awareness: fetch takes the `cached` entry so it can honour the same
+   * per-PID cache-conditional exec skips the pre-refactor code used (tmux
+   * resolution + jsonlPath discovery both skip when cached). This keeps the
+   * exec count byte-identical to pre-Phase-92 on cache-hit ticks — a key
+   * property the existing test suite asserts.
+   */
+  async function fetchPerPidState(
+    hostState: PerHostState,
+    pid: number,
+    cached: PidCacheEntry | undefined,
+  ): Promise<PerPidFetchedState> {
+    const { channel } = hostState;
+
+    // Kick off all parallel execs (A1 + A2 + A3)
+    const sessionJsonPromise = channel.exec(
+      `cat ~/.claude/sessions/${pid}.json`,
+    );
+    // Bounty 9c8d4a72 — readStatWithSentinel distinguishes SSH transport error
+    // (fail-OPEN, keep session live this tick) from real /proc/<pid>/stat ENOENT
+    // (reap). Prior code fed the null-on-transport-error return of channel.exec
+    // directly to isStaleFromStat and reaped live sessions on sshd MaxSessions
+    // saturation. See fix-wip-indicator-transport-vs-dead.md.
+    const statPromise = readStatWithSentinel(channel, pid);
+    const hookPayloadPromise = channel.exec(
+      `cat ${hookPayloadPath} 2>/dev/null || true`,
+    );
+
+    // environ + tmux only for new PIDs (or PIDs with no cached tmuxSession)
+    const isNew = cached === undefined;
+    const needsTmuxResolution = isNew || cached?.tmuxSession === null;
+
+    const [sessionJsonRaw, statResult, hookPayloadRaw] = await Promise.all([
+      sessionJsonPromise,
+      statPromise,
+      hookPayloadPromise,
+    ]);
+
+    // If session JSON is missing/mid-write, short-circuit — compose will see
+    // sessionJsonRaw === null and return early (no state to compute).
+    // identityAppearance: null — the legacy path has no appearance source; adding
+    // one would mean new SSH channels, which D-01 exists to avoid. Legacy
+    // contributes plain rows — today's behaviour, honest degradation.
+    if (sessionJsonRaw === null || sessionJsonRaw.trim() === "") {
+      return {
+        sessionJsonRaw,
+        statResult,
+        hookPayloadRaw,
+        tmuxSession: cached?.tmuxSession ?? null,
+        freshLastStopAt: null,
+        freshActivityMtime: null,
+        freshStoppedMtime: null,
+        perSessionHookPayloadRaw: null,
+        freshDormant: null,
+        jsonlPath: cached?.jsonlPath ?? null,
+        jsonlTail: null,
+        identityAppearance: null,
+      };
+    }
+
+    // Parse just enough of session JSON to gate the per-session reads below.
+    // The full parse happens again in compose (identical result) — this
+    // matches the pre-refactor pattern where both the safe-char regex gate
+    // AND the compose SessionState build read sessionJson.sessionId.
+    const sessionJsonPreview = parseSessionJson(sessionJsonRaw);
+    if (sessionJsonPreview === null) {
+      return {
+        sessionJsonRaw,
+        statResult,
+        hookPayloadRaw,
+        tmuxSession: cached?.tmuxSession ?? null,
+        freshLastStopAt: null,
+        freshActivityMtime: null,
+        freshStoppedMtime: null,
+        perSessionHookPayloadRaw: null,
+        freshDormant: null,
+        jsonlPath: cached?.jsonlPath ?? null,
+        jsonlTail: null,
+        identityAppearance: null,
+      };
+    }
+
+    // A4 + A5 — resolve tmuxSession (PID → environ → pane → tmux session name)
+    // Phase 44 Plan 02 — resolved EARLY so discovery (A11) below can key on
+    // the identity name.
+    let tmuxSession: string | null = cached?.tmuxSession ?? null;
+    if (needsTmuxResolution) {
+      tmuxSession = await resolvePidToTmuxSession(pid, {
+        readEnviron: async (_pid) => {
+          return channel.exec(`cat /proc/${pid}/environ`);
+        },
+        resolveTmuxName: async (pane) => {
+          return channel.exec(
+            `tmux display-message -p -t '${pane}' '#{session_name}'`,
+          );
+        },
+      });
+    }
+
+    // A6 — Phase 59 per-session Stop file mtime.
+    // Character-class discipline mirroring stop-hook.sh's write-side regex.
+    // Any sessionId that would not have been accepted for a per-session write
+    // must not be interpolated into a stat READ either — a `../` in sessionId
+    // could otherwise stat a foreign file and publish its mtime as lastStopAt.
+    // Shell-quoting alone is not enough — it prevents command injection but
+    // still allows path traversal inside the argument.
+    // (RESEARCH.md G6 belt-and-suspenders — same regex re-applied here.)
+    let freshLastStopAt: number | null = null;
+    if (/^[a-zA-Z0-9_-]+$/.test(sessionJsonPreview.sessionId)) {
+      const quotedSessionId = shellSingleQuote(sessionJsonPreview.sessionId);
+      const stopMtimeRaw = await channel.exec(
+        `stat -c %Y ~/.claude/fleet-status/stop-${quotedSessionId}.json 2>/dev/null || true`,
+      );
+      if (stopMtimeRaw !== null && stopMtimeRaw.trim() !== "") {
+        const parsed = parseInt(stopMtimeRaw.trim(), 10);
+        if (Number.isFinite(parsed)) {
+          freshLastStopAt = parsed * 1000;
+        }
+      }
+    }
+
+    // A7 — Phase 62 activity marker mtime.
+    let freshActivityMtime: number | null = null;
+    if (/^[a-zA-Z0-9_-]+$/.test(sessionJsonPreview.sessionId)) {
+      const quotedSessionId = shellSingleQuote(sessionJsonPreview.sessionId);
+      const activityMtimeRaw = await channel.exec(
+        `stat -c %Y ~/.claude/fleet-status/hooks/${quotedSessionId}/activity 2>/dev/null || true`,
+      );
+      if (activityMtimeRaw !== null && activityMtimeRaw.trim() !== "") {
+        const parsed = parseInt(activityMtimeRaw.trim(), 10);
+        if (Number.isFinite(parsed)) {
+          freshActivityMtime = parsed * 1000;
+        }
+      }
+    }
+
+    // A8 — Phase 62 stopped marker mtime.
+    let freshStoppedMtime: number | null = null;
+    if (/^[a-zA-Z0-9_-]+$/.test(sessionJsonPreview.sessionId)) {
+      const quotedSessionId = shellSingleQuote(sessionJsonPreview.sessionId);
+      const stoppedMtimeRaw = await channel.exec(
+        `stat -c %Y ~/.claude/fleet-status/hooks/${quotedSessionId}/stopped 2>/dev/null || true`,
+      );
+      if (stoppedMtimeRaw !== null && stoppedMtimeRaw.trim() !== "") {
+        const parsed = parseInt(stoppedMtimeRaw.trim(), 10);
+        if (Number.isFinite(parsed)) {
+          freshStoppedMtime = parsed * 1000;
+        }
+      }
+    }
+
+    // A9 — per-session Stop-hook payload.
+    let perSessionHookPayloadRaw: string | null = null;
+    if (/^[a-zA-Z0-9_-]+$/.test(sessionJsonPreview.sessionId)) {
+      const quotedSessionId = shellSingleQuote(sessionJsonPreview.sessionId);
+      perSessionHookPayloadRaw = await channel.exec(
+        `cat ~/.claude/fleet-status/stop-${quotedSessionId}.json 2>/dev/null || true`,
+      );
+    }
+
+    // A10 — source A dormant sentinel. Fail-open decoding: "yes" → true,
+    // "no" → false, anything else (null / unexpected) → null and compose
+    // preserves the cached value (T-52-01-01 mitigation).
+    let freshDormant: boolean | null = null;
+    if (tmuxSession !== null) {
+      const quotedTmuxSession = shellSingleQuote(tmuxSession);
+      const dormantRaw = await channel.exec(
+        `stat ~/fleet/identities/${quotedTmuxSession}/.dormant 2>/dev/null >/dev/null && echo yes || echo no`,
+      );
+      if (dormantRaw !== null) {
+        const trimmed = dormantRaw.trim();
+        if (trimmed === "yes") freshDormant = true;
+        else if (trimmed === "no") freshDormant = false;
+      }
+    }
+
+    // A11 — Phase 32 discovery. Cached across ticks; discovery fires ONCE per
+    // PID in the happy path.
+    let jsonlPath: string | null = cached?.jsonlPath ?? null;
+    if (tmuxSession !== null && jsonlPath === null) {
+      jsonlPath = await discoverIdentityJsonlPathViaChannel(channel, tmuxSession);
+    }
+
+    // A12 — 256KB JSONL tail (for scanTailForLatestAiTitle in compose).
+    let jsonlTail: string | null = null;
+    if (jsonlPath !== null) {
+      jsonlTail = await channel.exec(
+        `tail -c 262144 ${jsonlPath} 2>/dev/null || true`,
+      );
+    }
+
+    return {
+      sessionJsonRaw,
+      statResult,
+      hookPayloadRaw,
+      tmuxSession,
+      freshLastStopAt,
+      freshActivityMtime,
+      freshStoppedMtime,
+      perSessionHookPayloadRaw,
+      freshDormant,
+      jsonlPath,
+      jsonlTail,
+      // Legacy path has no appearance source; adding one would mean new SSH
+      // channels, which D-01 exists to avoid. Legacy contributes plain rows.
+      identityAppearance: null,
+    };
+  }
+
+  /**
+   * composeAndPublishPerPid — full downstream of processPid: parse, sessionId-
+   * rotation detection, fail-open reconciliation, send-log lookup, fingerprint
+   * delta, publish, cache write, writeSessionFileCache. Zero SSH calls (the
+   * only await is a local send-log DB read).
+   *
+   * Byte-identical observable behavior to the pre-refactor processPid tail:
+   * every branch, every mutation, every log op is preserved in order. Batch-
+   * path callers synthesize the `fetched` struct from a SweepPidLine and drive
+   * this same publish contract — parity guaranteed by shared code path.
+   *
+   * RESEARCH.md G8 — writeSessionFileCache fires HERE (compose layer, not
+   * fetch) so both batch and legacy paths trigger it equally per tick.
+   */
+  async function composeAndPublishPerPid(
+    hostState: PerHostState,
+    pid: number,
+    fetched: PerPidFetchedState,
+  ): Promise<void> {
+    const { host, livenessMap } = hostState;
+    const cached = livenessMap.get(pid);
+    const isNew = cached === undefined;
+
+    // Parse session JSON — the sessionId + procStart drive downstream state
+    // composition below. Phase 44 Plan 02: `cwd + sessionId` no longer drive
+    // the JSONL path derivation.
+    if (fetched.sessionJsonRaw === null || fetched.sessionJsonRaw.trim() === "") {
+      // File may be in mid-write; skip this PID for this tick.
+      return;
+    }
+    const sessionJson = parseSessionJson(fetched.sessionJsonRaw);
+    if (sessionJson === null) {
+      return;
+    }
+
+    const tmuxSession = fetched.tmuxSession;
+
+    // A6 fail-open reconciliation — mirrors the pre-refactor
+    // `let derivedLastStopAt = cached?.lastStopAt ?? null; if (…) …` shape.
+    // Guard: fetch already gated the exec on the safe-char regex (G6); a
+    // sessionId that failed the regex yields freshLastStopAt === null and
+    // this branch preserves the cached value (fail-open in the safe
+    // direction — indicator defaults to on when lastStopAt stays null).
+    let derivedLastStopAt: number | null = cached?.lastStopAt ?? null;
+    if (fetched.freshLastStopAt !== null) {
+      derivedLastStopAt = fetched.freshLastStopAt;
+    }
+
+    // A7 fail-open reconciliation — Phase 62 activity mtime.
+    let derivedActivityMtime: number | null = cached?.activityMtime ?? null;
+    if (fetched.freshActivityMtime !== null) {
+      derivedActivityMtime = fetched.freshActivityMtime;
+    }
+
+    // A8 fail-open reconciliation — Phase 62 stopped mtime.
+    let derivedStoppedMtime: number | null = cached?.stoppedMtime ?? null;
+    if (fetched.freshStoppedMtime !== null) {
+      derivedStoppedMtime = fetched.freshStoppedMtime;
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 59 Plan 02 — server-side status-delta tracking for the
+    // lastStatusChangeAt axis. MUST NOT source from sessionJson.updatedAt
+    // (Research § Common Pitfalls Pitfall 4).
+    //
+    // A PID whose sessionJson.sessionId has ROTATED since the previous poll
+    // (a Claude Code resume rotates sessionId in-place) is
+    // effectively a fresh session for stop-gate purposes even though isNew is
+    // false. Reset the three mtime axes back to null; the new sessionId's
+    // per-session files may not exist yet.
+    // -------------------------------------------------------------------------
+    const sessionIdRotated =
+      !isNew &&
+      cached !== undefined &&
+      cached.sessionId !== sessionJson.sessionId;
+    if (sessionIdRotated) {
+      derivedLastStopAt = null;
+      derivedActivityMtime = null;
+      derivedStoppedMtime = null;
+      // Phase 111 Plan 03: appearance is deliberately NOT reset on sessionId
+      // rotation. Appearance is IDENTITY-scoped, not session-scoped: a
+      // resume does not change what the agent looks like. The
+      // block's shape (resetting the three mtime axes) invites adding every
+      // new axis here — that would be wrong for appearance.
+    }
+
+    let derivedLastStatusChangeAt: number;
+    if (
+      isNew ||
+      sessionIdRotated ||
+      cached?.lastStatus === null ||
+      cached?.lastStatus === undefined
+    ) {
+      derivedLastStatusChangeAt = deps.now();
+    } else if (cached.lastStatus !== sessionJson.status) {
+      derivedLastStatusChangeAt = deps.now();
+    } else {
+      derivedLastStatusChangeAt = cached.lastStatusChangeAt;
+    }
+
+    // A10 fail-open reconciliation — dormant.
+    let derivedDormant: boolean = cached?.dormant ?? false;
+    if (fetched.freshDormant !== null) {
+      derivedDormant = fetched.freshDormant;
+    }
+
+    // A11 — jsonlPath was resolved in fetch (either cache hit or fresh
+    // discovery). Kept locally for the SessionState + cache-write below.
+    const jsonlPath = fetched.jsonlPath;
+
+    // Phase 85 (D-07) — lastMessageAt from identity-name-keyed send-log store.
+    // Async local DB read (no SSH). Kept in compose so batch and legacy paths
+    // hit the store identically per tick.
+    let derivedLastMessageAt: number | null = cached?.lastMessageAt ?? null;
+    let derivedAiTitle: string | null = cached?.aiTitle ?? null;
+    const nextStaleTailTickCount = cached?.staleTailTickCount ?? 0;
+
+    if (tmuxSession !== null) {
+      try {
+        const stored = await getIdentityLastSend(tmuxSession);
+        systemLogger.debug(
+          "Fleet-status: lastMessageAt derived from send-log store",
+          {
+            operation: "fleet_status_last_message_at_from_store",
+            fleetHostId: host.id,
+            identityName: tmuxSession,
+            lookupResult: stored,
+          },
+        );
+        if (stored !== null) {
+          derivedLastMessageAt = stored;
+        }
+      } catch (err) {
+        systemLogger.debug(
+          "Fleet-status: getIdentityLastSend failed — keeping cached lastMessageAt",
+          {
+            operation: "fleet_status_send_log_lookup_failed",
+            fleetHostId: host.id,
+            identityName: tmuxSession,
+            error: err instanceof Error ? err.message : "unknown",
+          },
+        );
+      }
+    }
+
+    // A12 — scanTailForLatestAiTitle over the fetched jsonlTail (fail-open
+    // preservation: null scan return preserves the cache).
+    if (fetched.jsonlTail !== null && fetched.jsonlTail.trim() !== "") {
+      const scannedAiTitle = scanTailForLatestAiTitle(fetched.jsonlTail);
+      if (scannedAiTitle !== null) {
+        derivedAiTitle = scannedAiTitle;
+      }
+    }
+
+    // Liveness check — bounty 9c8d4a72: branch on the tagged statResult BEFORE
+    // calling isStaleFromStat so SSH transport errors never trigger a reap.
+    if (
+      !fetched.statResult.ok &&
+      (fetched.statResult as Extract<StatReadResult, { ok: false }>).reason === "transport"
+    ) {
+      systemLogger.debug(
+        "Fleet-status: stat read transport error — skipping stale check this tick",
+        {
+          operation: "fleet_status_stat_transport_skip",
+          fleetHostId: host.id,
+          pid,
+          sessionId: sessionJson.sessionId,
+        },
+      );
+    } else {
+      const statContents = fetched.statResult.ok ? fetched.statResult.content : null;
+      const stale = isStaleFromStat(sessionJson.procStart, statContents);
+      if (stale) {
+        const entry = livenessMap.get(pid);
+        const entryTmuxSession = entry?.tmuxSession ?? tmuxSession;
+        const sessionId = entry?.sessionId ?? sessionJson.sessionId;
+        systemLogger.info("Fleet-status: session stale — publishing gone", {
+          operation: "fleet_status_stale_reap",
+          fleetHostId: host.id,
+          pid,
+          sessionId,
+        });
+        if (deps.registry.publishSessionGone(host.id, entryTmuxSession, sessionId, { pid })) {
+          invalidateSourceBFingerprint(hostState, entryTmuxSession);
+        }
+        livenessMap.delete(pid);
+        return;
+      }
+    }
+
+    // Fix (quick-260829-kmr): per-session preferred, box-wide fallback, both-
+    // missing → warn once. Batch path passes hookPayloadRaw=null (SWEEP_FIELD_
+    // PARITY.A3 skip), so the fallback is a no-op there — matches the schema-
+    // designer intent. Legacy path preserves the A3 fallback verbatim.
+    let backgroundTasks: SessionState["backgroundTasks"] = [];
+    const perSessionUsable =
+      fetched.perSessionHookPayloadRaw !== null &&
+      fetched.perSessionHookPayloadRaw.trim() !== "";
+    const selectedHookPayloadRaw: string | null = perSessionUsable
+      ? fetched.perSessionHookPayloadRaw
+      : fetched.hookPayloadRaw;
+    const isHookPayloadMissing =
+      selectedHookPayloadRaw === null || selectedHookPayloadRaw.trim() === "";
+
+    if (!isHookPayloadMissing) {
+      const payload = parseStopHookPayload(selectedHookPayloadRaw!);
+      if (payload !== null) {
+        backgroundTasks = filterAmbientTasks(payload.background_tasks);
+      } else {
+        emitHookPayloadWarn(hostState, host.id);
+      }
+    } else {
+      emitHookPayloadWarn(hostState, host.id);
+    }
+
+    // Phase 55 Plan 02 (RESEARCH G8) — publish resolved sessionFile to the
+    // shared session-file cache. Sits in COMPOSE (not fetch) so BOTH batch
+    // and legacy paths trigger the write identically per tick — a non-
+    // negotiable of Phase 92.
+    //
+    // Translate container-perspective → host-perspective at the cache
+    // boundary. On local hosts the sweep runs inside the Skynet container
+    // (acquireLocalChannel spawns bash with HOME=HOME_HOST_DIR), so the
+    // batch AND legacy jsonlPath resolvers both emit /host-home/... paths.
+    // Every downstream consumer of this cache is an SSH-exec consumer that
+    // runs against the HOST filesystem where /host-home does not exist
+    // (claude-session-server's connect-time totalLines probe, tail -F, and
+    // fetch_older_range). Companion to the 39e773b9 fix in
+    // discover-identity-session-file.ts's readLocalDiscovery — same
+    // principle, second entry point. No-op for remote hosts (their sweep
+    // runs via SSH with $HOME=/home/ubuntu, so paths are already host-side).
+    if (jsonlPath !== null && tmuxSession !== null) {
+      writeSessionFileCache(host.id, tmuxSession, {
+        sessionFile: toHostPerspectivePath(jsonlPath),
+        pid,
+      });
+    }
+
+    // Sidebar unread marks: the Stop-file mtime is this identity's finished-
+    // turn time. Record it durably (monotonic) so it outlives this session,
+    // then publish the stored value. Omitted from the frame when unknown.
+    let lastFinishAt: number | null = null;
+    if (tmuxSession !== null) {
+      if (derivedLastStopAt !== null) {
+        turnFinishStore.record(host.id, tmuxSession, derivedLastStopAt);
+      }
+      lastFinishAt = turnFinishStore.get(host.id, tmuxSession);
+      if (lastFinishAt !== null && fetched.jsonlTail !== null) {
+        markSeenOnUserReply(host.id, tmuxSession, lastFinishAt, fetched.jsonlTail);
+      }
+    }
+
+    // Compose SessionState — same shape as pre-refactor processPid.
+    // Phase 111 Plan 03: identityAppearance carried from the fetched struct.
+    const state: SessionState = {
+      hostId: host.id,
+      tmuxSession,
+      sessionId: sessionJson.sessionId,
+      pid,
+      status: sessionJson.status,
+      waitingFor:
+        sessionJson.status === "waiting" ? sessionJson.waitingFor : undefined,
+      backgroundTasks,
+      updatedAt: sessionJson.updatedAt,
+      lastMessageAt: derivedLastMessageAt,
+      aiTitle: derivedAiTitle,
+      dormant: derivedDormant,
+      // inline-260830-source-a-omit: condensing field OMITTED on source A
+      // frames. Source B is the sole condensing authority.
+      lastStopAt: derivedLastStopAt,
+      lastStatusChangeAt: derivedLastStatusChangeAt,
+      activityMtime: derivedActivityMtime,
+      stoppedMtime: derivedStoppedMtime,
+      identityAppearance: fetched.identityAppearance,
+      ...(lastFinishAt !== null ? { lastFinishAt } : {}),
+    };
+
+    // Delta semantics — only publish if fingerprint changed.
+    const newFingerprint = computeFingerprint(state);
+    const lastFingerprint = livenessMap.get(pid)?.lastPublishedFingerprint;
+
+    if (newFingerprint !== lastFingerprint) {
+      deps.registry.publishSessionState(host.id, state);
+      systemLogger.info("Fleet-status: session state published", {
+        operation: "fleet_status_session_state_published",
+        fleetHostId: host.id,
+        pid,
+        sessionId: sessionJson.sessionId,
+        status: sessionJson.status,
+        dormant: state.dormant,
+        lastStopAt: state.lastStopAt,
+        lastStatusChangeAt: state.lastStatusChangeAt,
+        activityMtime: state.activityMtime,
+        stoppedMtime: state.stoppedMtime,
+        lastFinishAt: state.lastFinishAt ?? null,
+        identityAppearanceResolved: state.identityAppearance !== null,
+      });
+      // Phase 111 Plan 03: identityAppearance stamped here (publish branch).
+      livenessMap.set(pid, {
+        sessionId: sessionJson.sessionId,
+        tmuxSession,
+        procStart: sessionJson.procStart,
+        lastPublishedFingerprint: newFingerprint,
+        lastMessageAt: derivedLastMessageAt,
+        aiTitle: derivedAiTitle,
+        jsonlPath,
+        staleTailTickCount: nextStaleTailTickCount,
+        dormant: derivedDormant,
+        lastStatus: sessionJson.status,
+        lastStatusChangeAt: derivedLastStatusChangeAt,
+        lastStopAt: derivedLastStopAt,
+        activityMtime: derivedActivityMtime,
+        stoppedMtime: derivedStoppedMtime,
+        identityAppearance: fetched.identityAppearance,
+      });
+    } else {
+      // Update procStart + tmux + fresh derivations in case they changed
+      // without a state-change (Research § Pitfall 3 — every axis MUST be
+      // stamped on both branches so the cache stays lockstep with derivation).
+      // Phase 111 Plan 03: identityAppearance stamped here (suppress branch).
+      livenessMap.set(pid, {
+        ...(livenessMap.get(pid) as PidCacheEntry),
+        procStart: sessionJson.procStart,
+        tmuxSession,
+        lastPublishedFingerprint: newFingerprint,
+        lastMessageAt: derivedLastMessageAt,
+        aiTitle: derivedAiTitle,
+        jsonlPath,
+        staleTailTickCount: nextStaleTailTickCount,
+        dormant: derivedDormant,
+        lastStatus: sessionJson.status,
+        lastStatusChangeAt: derivedLastStatusChangeAt,
+        lastStopAt: derivedLastStopAt,
+        activityMtime: derivedActivityMtime,
+        stoppedMtime: derivedStoppedMtime,
+        identityAppearance: fetched.identityAppearance,
+      });
+    }
+  }
+
+  /**
+   * processPid — legacy path entry point. Thin wrapper: fetch → compose.
+   *
+   * Observable behavior is byte-identical to the pre-refactor processPid.
+   * The existing 149-test vitest suite is the parity oracle — any behavioral
+   * drift here surfaces as a test failure.
+   */
+  async function processPid(
+    hostState: PerHostState,
+    pid: number,
+  ): Promise<void> {
+    const cached = hostState.livenessMap.get(pid);
+    const fetched = await fetchPerPidState(hostState, pid, cached);
+    await composeAndPublishPerPid(hostState, pid, fetched);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Rate-limited hook-payload warn
+  // ---------------------------------------------------------------------------
+
+  function emitHookPayloadWarn(hostState: PerHostState, hostId: string): void {
+    const now = deps.now();
+    if (now - hostState.lastHookWarnAt >= hookPayloadWarnCooldownMs) {
+      hostState.lastHookWarnAt = now;
+      systemLogger.warn(
+        "Fleet-status: Stop-hook payload file missing/empty/malformed — treating backgroundTasks as []",
+        {
+          operation: "fleet_status_hook_payload_missing",
+          fleetHostId: hostId,
+        },
+      );
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Poll all hosts
+  // ---------------------------------------------------------------------------
+
+  async function pollAllHosts(): Promise<void> {
+    if (stopped) return;
+
+    pollTickCount++;
+
+    // Periodically refresh the identity-host list
+    if (pollTickCount % hostRefreshEveryNTicks === 0) {
+      try {
+        const freshHosts = await deps.listIdentityHostingHosts();
+        // Add-branch: acquire channels for hosts that appeared in the fresh
+        // list but aren't tracked yet.
+        for (const host of freshHosts) {
+          if (!perHostState.has(host.id) && !reconnecting.has(host.id)) {
+            await tryAcquireHostChannel(host);
+          }
+        }
+        // A tracked host's machine id moves when its machine group is
+        // re-anchored (a row in the group was re-addressed). App frames carry
+        // it and app links name it, so keep the cached record current.
+        for (const host of freshHosts) {
+          const tracked = perHostState.get(host.id);
+          if (tracked && tracked.host.machineId !== host.machineId) {
+            systemLogger.info("Fleet-status: host machine id changed", {
+              operation: "fleet_status_host_machine_id_changed",
+              fleetHostId: host.id,
+              from: tracked.host.machineId ?? null,
+              to: host.machineId ?? null,
+            });
+            tracked.host.machineId = host.machineId;
+          }
+        }
+        // Evict-branch (quick-260820-tm0): hosts in perHostState but absent
+        // from freshHosts (e.g. admin-disabled `enable_ssh=false`) must be
+        // pruned — close the SSH channel via deps.releaseSshChannel, drop
+        // the entry, and clean up the paired inFlight/skipCount entries
+        // added by Task 1's per-host in-flight guard. Eviction runs INSIDE
+        // the same try that wraps listIdentityHostingHosts() — a rejected
+        // refresh preserves perHostState intact (a transient DB blip must
+        // NOT wipe the poll rotation).
+        const freshIds = new Set(freshHosts.map((h) => h.id));
+        for (const [hostId, hostState] of perHostState.entries()) {
+          if (freshIds.has(hostId)) continue;
+          systemLogger.info(
+            "Fleet-status: evicting host no longer in identity-host list",
+            {
+              operation: "fleet_status_host_evicted",
+              fleetHostId: hostState.host.id,
+              hostName: hostState.host.name,
+              reason: "no longer in identity-host list",
+            },
+          );
+          try {
+            deps.releaseSshChannel(hostState.host, hostState.channel);
+          } catch {
+            // best-effort release, mirrors the stop() defensive pattern
+          }
+          perHostState.delete(hostId);
+          // Paired cleanup for Task 1's in-flight guard structures. If this
+          // host is re-added later, skipCount must not carry a stale count.
+          inFlight.delete(hostId);
+          skipCount.delete(hostId);
+          // Same cleanup for SSH backoff — evicted host re-added shouldn't
+          // carry stale backoff state.
+          sshBackoffByHost.delete(hostId);
+        }
+      } catch (err) {
+        systemLogger.warn("Fleet-status: identity-host list refresh failed", {
+          operation: "fleet_status_host_list_refresh_failed",
+          error: err instanceof Error ? err.message : "unknown",
+        });
+      }
+    }
+
+    // Replace dead channels. A host that rebooted leaves its cached channel
+    // bound to a closed connection; every exec on it times out and the
+    // add-branch above never re-acquires (the host is still tracked). Drop
+    // the dead entry and acquire fresh — on failure the host stays untracked
+    // and the next refresh's add-branch retries it. Collected first so the
+    // re-insert doesn't land back in this tick's iteration twice; all of
+    // them are claimed in `reconnecting` up front so an overlapping tick
+    // leaves them alone.
+    const deadChannelHosts = [...perHostState.values()].filter(
+      (s) =>
+        !inFlight.has(s.host.id) &&
+        !reconnecting.has(s.host.id) &&
+        s.channel.isClosed?.() === true,
+    );
+    for (const hostState of deadChannelHosts) reconnecting.add(hostState.host.id);
+    for (const hostState of deadChannelHosts) {
+      const hostId = hostState.host.id;
+      if (stopped) {
+        reconnecting.delete(hostId);
+        continue;
+      }
+      systemLogger.warn("Fleet-status: SSH connection for host is closed — reconnecting", {
+        operation: "fleet_status_channel_dead_reacquire",
+        fleetHostId: hostId,
+        hostName: hostState.host.name,
+        peer: hostState.channel.peer,
+        tick: pollTickCount,
+      });
+      // No releaseSshChannel: the connection is already gone, and release
+      // closes whatever client is now cached for the host.
+      perHostState.delete(hostId);
+      skipCount.delete(hostId);
+      try {
+        await tryAcquireHostChannel(hostState.host);
+      } finally {
+        reconnecting.delete(hostId);
+      }
+      systemLogger.info("Fleet-status: SSH reconnect for host finished", {
+        operation: "fleet_status_channel_reacquire_result",
+        fleetHostId: hostId,
+        hostName: hostState.host.name,
+        reacquired: perHostState.has(hostId),
+      });
+    }
+
+    // Poll each known host (quick-260820-tm0: per-host in-flight guard —
+    // skip hosts whose prior tick's pollOneHost has not yet resolved).
+    for (const hostState of perHostState.values()) {
+      const hostId = hostState.host.id;
+      // SSH backoff — skip hosts in exponential-backoff after repeated
+      // SSH-level failures (see sshBackoffByHost setup above).
+      if (isHostInSshBackoff(hostId)) {
+        continue;
+      }
+      if (inFlight.has(hostId)) {
+        const nextSkip = (skipCount.get(hostId) ?? 0) + 1;
+        skipCount.set(hostId, nextSkip);
+        systemLogger.info(
+          "Fleet-status: poll skipped — prior tick still in flight",
+          {
+            operation: "fleet_status_poll_skipped_inflight",
+            fleetHostId: hostId,
+            hostName: hostState.host.name,
+            skipCount: nextSkip,
+            tick: pollTickCount,
+          },
+        );
+        continue;
+      }
+      inFlight.add(hostId);
+      skipCount.set(hostId, 0);
+      try {
+        await pollOneHost(hostState);
+      } catch (err) {
+        systemLogger.warn("Fleet-status: poll error for host", {
+          operation: "fleet_status_poll_error",
+          fleetHostId: hostState.host.id,
+          error: err instanceof Error ? err.message : "unknown",
+        });
+      } finally {
+        // Release the guard on BOTH happy-path return and thrown errors.
+        // Never leak a stuck in-flight flag (would silently freeze polls
+        // for this hostId forever). See Task 2 (quick-260820-tm0) for the
+        // paired eviction cleanup: inFlight.delete + skipCount.delete for
+        // evicted hostIds happens in the refresh block below.
+        inFlight.delete(hostId);
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Try to acquire an SSH channel for a host (fail-open)
+  // ---------------------------------------------------------------------------
+
+  async function tryAcquireHostChannel(host: HostRecord): Promise<void> {
+    try {
+      const channel = await deps.acquireSshChannel(host);
+      if (channel === null) {
+        noteSshFailure(host.id);
+        systemLogger.warn("Fleet-status: SSH channel unavailable for host", {
+          operation: "fleet_status_host_ssh_unreachable",
+          fleetHostId: host.id,
+          hostName: host.name,
+        });
+        return;
+      }
+      noteSshSuccess(host.id);
+
+      perHostState.set(host.id, {
+        host,
+        channel,
+        livenessMap: new Map(),
+        lastHookWarnAt: -Infinity,
+        // quick-260823-73o — source B per-identity cache (replaces the prior
+        // Phase 52 T3 dormantOnlyIdentities map). Populated by
+        // pollDormantOnlyIdentities on each tick with the full 3-axis pipeline
+        // state per identity.
+        sourceBIdentityState: new Map(),
+        registryCondensingChecked: new Set(),
+        // Phase 115 hotfix (2026-09-18): initialized empty so the FIRST
+        // successful sweep for this host publishes nothing gone (no previous
+        // tick to diff against). Subsequent ticks compare against this and
+        // emit publishSessionGone for anything that dropped from the live tree.
+        lastTickLiveTreeIdentities: new Set<string>(),
+        // Phase 118 Plan 118-04 (D-11): sibling reconciliation set for
+        // source-C app slugs. Initialized empty so the FIRST successful
+        // sweep for this host publishes nothing gone (no previous tick to
+        // diff against). Subsequent ticks compare against this and emit
+        // publishAppGoneByHostSlug for any slug that dropped out of the
+        // picture (folder deleted, unit removed, ceased passing D-01/D-02).
+        lastTickLiveApps: new Set<string>(),
+        viewerVisibleIdentities: new Map(),
+        viewerVisibleApps: new Map(),
+        registryReconciled: false,
+        emptySweepStreak: 0,
+        // Phase 92 — sweep-first / legacy-fallback dispatch cache. All three
+        // fields are per-SSH-channel-lifetime: reset when pollOneHost sees a
+        // fresh channel object reference (see PerHostState docblock above).
+        sweepScriptPresent: null,
+        sweepSchemaMismatchThisConnection: false,
+        lastProbeChannelRef: null,
+        // Per-identity raw cosmetics cache — see PerHostState docblock.
+        // Initialized empty; populated on every successful sweep tick.
+        identityCosmeticsCache: new Map(),
+      });
+    } catch (err) {
+      noteSshFailure(host.id);
+      systemLogger.warn("Fleet-status: SSH channel acquire threw for host", {
+        operation: "fleet_status_host_ssh_unreachable",
+        fleetHostId: host.id,
+        hostName: host.name,
+        error: err instanceof Error ? err.message : "unknown",
+      });
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // 30s stale sweep
+  // ---------------------------------------------------------------------------
+
+  async function sweepAllHostsForStalePids(): Promise<void> {
+    if (stopped) return;
+
+    systemLogger.info("Fleet-status: stale sweep running", {
+      operation: "fleet_status_sweep_run",
+      hostCount: perHostState.size,
+    });
+
+    for (const hostState of perHostState.values()) {
+      try {
+        await sweepOneHost(hostState);
+      } catch (err) {
+        systemLogger.warn("Fleet-status: sweep error for host", {
+          operation: "fleet_status_sweep_error",
+          fleetHostId: hostState.host.id,
+          error: err instanceof Error ? err.message : "unknown",
+        });
+      }
+    }
+  }
+
+  // One-shot, on a host state's first successful batch sweep: drop registry
+  // entries for this host that the sweep no longer shows. The registry is
+  // process-wide and outlives per-user pollers, while each poller's lastTick*
+  // diff sets start empty — so an identity/app that disappeared while
+  // no poller ran was never published gone and lingered as a ghost row/tile.
+  // Identity entries go out as identity_gone (closes open tabs, like a normal
+  // retire); entries without identity appearance as pid_stale.
+  function reconcileRegistryWithFirstSweep(
+    hostState: PerHostState,
+    liveNames: Set<string>,
+    liveApps: Set<string>,
+  ): void {
+    if (hostState.registryReconciled) return;
+    hostState.registryReconciled = true;
+    const { host } = hostState;
+    let identities = 0;
+    let apps = 0;
+    for (const st of deps.registry.getSnapshot()) {
+      if (st.hostId !== host.id || st.tmuxSession === null) continue;
+      if (liveNames.has(st.tmuxSession)) continue;
+      if (st.identityAppearance != null) {
+        deps.registry.publishIdentityGoneByName(host.id, st.tmuxSession);
+      } else {
+        deps.registry.publishSessionGone(host.id, st.tmuxSession, st.sessionId);
+      }
+      identities += 1;
+    }
+    for (const app of deps.registry.getAppSnapshot()) {
+      if (app.hostId !== host.id || liveApps.has(app.slug)) continue;
+      deps.registry.publishAppGoneByHostSlug(host.id, app.slug);
+      apps += 1;
+    }
+    if (identities + apps > 0) {
+      systemLogger.info("Fleet-status: first-sweep registry reconcile dropped ghosts", {
+        operation: "fleet_status_registry_reconcile",
+        fleetHostId: host.id,
+        identities,
+        apps,
+      });
+    }
+  }
+
+  // A pid_stale gone deletes the registry entry for (host, tmuxSession), but
+  // source B's per-identity fingerprint cache still remembers what it last
+  // published there — so a condensing:true state that was live before the
+  // reap would be suppressed as "unchanged" and never re-sent (the memory
+  // pie's "Condensing…" would clear early). Blank the fingerprint so the next
+  // source-B tick republishes.
+  function invalidateSourceBFingerprint(
+    hostState: PerHostState,
+    tmuxSession: string | null,
+  ): void {
+    if (tmuxSession === null) return;
+    const cached = hostState.sourceBIdentityState.get(tmuxSession);
+    if (cached !== undefined) cached.lastPublishedFingerprint = "";
+  }
+
+  async function sweepOneHost(hostState: PerHostState): Promise<void> {
+    const { host, channel, livenessMap } = hostState;
+
+    for (const [pid, entry] of livenessMap.entries()) {
+      try {
+        // Bounty 9c8d4a72 — see readStatWithSentinel docblock. Transport failure
+        // on this stat read must NOT reap the entry (fail-OPEN, sweep the rest
+        // of the PIDs); real ENOENT + field22 mismatch still reap as before.
+        const statResult = await readStatWithSentinel(channel, pid);
+        // Same Extract cast rationale as line 1645 — see the comment there.
+        if (!statResult.ok && (statResult as Extract<StatReadResult, { ok: false }>).reason === 'transport') {
+          systemLogger.debug(
+            "Fleet-status: sweep stat read transport error — skipping reap this sweep",
+            {
+              operation: "fleet_status_sweep_stat_transport_skip",
+              fleetHostId: host.id,
+              pid,
+              sessionId: entry.sessionId,
+            },
+          );
+          continue;
+        }
+        const statContents = statResult.ok ? statResult.content : null;
+        const stale = isStaleFromStat(entry.procStart, statContents);
+        if (stale) {
+          systemLogger.info(
+            "Fleet-status: stale sweep reaped PID",
+            {
+              operation: "fleet_status_stale_reap",
+              fleetHostId: host.id,
+              pid,
+              sessionId: entry.sessionId,
+            },
+          );
+          if (
+            deps.registry.publishSessionGone(
+              host.id,
+              entry.tmuxSession,
+              entry.sessionId,
+              { pid },
+            )
+          ) {
+            invalidateSourceBFingerprint(hostState, entry.tmuxSession);
+          }
+          livenessMap.delete(pid);
+        }
+      } catch (err) {
+        systemLogger.warn("Fleet-status: sweep stat read error", {
+          operation: "fleet_status_sweep_stat_error",
+          fleetHostId: host.id,
+          pid,
+          error: err instanceof Error ? err.message : "unknown",
+        });
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Public API
+  // ---------------------------------------------------------------------------
+
+  return {
+    async start(): Promise<void> {
+      stopped = false;
+
+      // Query identity-hosting hosts from DB
+      let initialHosts: HostRecord[] = [];
+      try {
+        initialHosts = await deps.listIdentityHostingHosts();
+      } catch (err) {
+        systemLogger.warn("Fleet-status: initial identity-host query failed", {
+          operation: "fleet_status_host_list_failed",
+          error: err instanceof Error ? err.message : "unknown",
+        });
+      }
+
+      // Acquire SSH channels for each host
+      for (const host of initialHosts) {
+        await tryAcquireHostChannel(host);
+      }
+
+      // Fire an immediate first poll (don't wait for the first interval tick)
+      await pollAllHosts();
+
+      // Set up 2s poll timer.
+      // fn returns Promise so tests can capture and await it directly.
+      pollTimer = deps.setInterval(pollAllHosts, pollIntervalMs);
+
+      // Set up 30s stale sweep timer.
+      sweepTimer = deps.setInterval(sweepAllHostsForStalePids, staleSweepIntervalMs);
+
+      systemLogger.info("Fleet-status orchestrator started", {
+        operation: "fleet_status_orchestrator_started",
+        identityHostCount: initialHosts.length,
+        channelCount: perHostState.size,
+        pollIntervalMs,
+        staleSweepIntervalMs,
+      });
+    },
+
+    stop(): void {
+      stopped = true;
+
+      if (pollTimer !== null) {
+        deps.clearInterval(pollTimer);
+        pollTimer = null;
+      }
+
+      if (sweepTimer !== null) {
+        deps.clearInterval(sweepTimer);
+        sweepTimer = null;
+      }
+
+      // Release all SSH channels
+      for (const hostState of perHostState.values()) {
+        try {
+          deps.releaseSshChannel(hostState.host, hostState.channel);
+        } catch {
+          // best-effort release
+        }
+      }
+      perHostState.clear();
+      sshBackoffByHost.clear();
+
+      systemLogger.info("Fleet-status orchestrator stopped", {
+        operation: "fleet_status_orchestrator_stopped",
+      });
+    },
+
+    getPollTickCount(): number {
+      return pollTickCount;
+    },
+
+    getCachedIdentityCosmetics(
+      hostIdStr: string,
+      identityName: string,
+    ): {
+      identityCosmetics: RawCosmetics | null;
+      roleCosmetics: RawCosmetics | null;
+      role: string | null;
+      /** Multi-role only: each listed role's cosmetics, for the gate. */
+      rolesCosmetics?: Array<RawCosmetics | null>;
+      roles?: string[];
+    } | null {
+      const hostState = perHostState.get(hostIdStr);
+      if (hostState === undefined) return null;
+      const entry = hostState.identityCosmeticsCache.get(identityName);
+      return entry ?? null;
+    },
+  };
+}

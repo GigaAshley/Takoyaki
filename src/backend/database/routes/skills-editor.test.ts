@@ -1,0 +1,1892 @@
+/**
+ * Phase 44 (SKILLED-01): Vitest coverage for /skills-editor router.
+ *
+ * Byte-shape mirror of `global-files-read-write.test.ts` (Phase 23) with:
+ *   - the whitelist-config mock dropped (no whitelist in Phase 44)
+ *   - per-endpoint happy-path + error-path coverage for all 7 endpoints
+ *   - a dedicated `describe("path-safety gate")` block with 8 SEC-labeled
+ *     attack-input tests proving every escape attempt returns 400 BEFORE
+ *     any SSH connection opens (RESEARCH.md § Common Pitfalls #1)
+ *
+ * Endpoints covered:
+ *   GET  /skills-editor/skills
+ *   GET  /skills-editor/files
+ *   POST /skills-editor/read
+ *   PUT  /skills-editor/write
+ *   POST /skills-editor/create
+ *   DELETE /skills-editor/file
+ *   DELETE /skills-editor/skill
+ *
+ * Test pattern: bare Express app + Node's built-in http module (mirrors
+ * roles-list-for-host.test.ts / identity-clone.test.ts patterns — no
+ * supertest dependency). All SSH primitives mocked at the module boundary.
+ */
+
+import {
+  describe,
+  it,
+  expect,
+  beforeEach,
+  afterEach,
+  vi,
+  type Mock,
+} from "vitest";
+import express from "express";
+import http from "node:http";
+import { Readable } from "node:stream";
+import type { AddressInfo } from "node:net";
+
+// ---------------------------------------------------------------------------
+// Auth manager mock — controls whether a request is authenticated
+// ---------------------------------------------------------------------------
+
+let mockUserId: string | null = "1";
+
+vi.mock("../../utils/auth-manager.js", () => {
+  const AuthManager = {
+    getInstance: () => ({
+      createAuthMiddleware: () =>
+        (
+          req: express.Request,
+          res: express.Response,
+          next: express.NextFunction,
+        ) => {
+          if (mockUserId === null) {
+            return res.status(401).json({ error: "Unauthorized" });
+          }
+          (req as express.Request & { userId: string }).userId = mockUserId;
+          next();
+        },
+    }),
+  };
+  return { AuthManager };
+});
+
+// ---------------------------------------------------------------------------
+// Mock SSH primitives BEFORE importing the module under test
+// ---------------------------------------------------------------------------
+
+vi.mock("../../ssh/ssh-one-shot.js", () => ({
+  connectOneShot: vi.fn(),
+}));
+
+vi.mock("../../ssh/tmux-helper.js", () => ({
+  execCommand: vi.fn(),
+}));
+
+vi.mock("../../ssh/host-resolver.js", () => ({
+  resolveHostById: vi.fn(),
+}));
+
+vi.mock("../../instance-wide/admin.js", () => ({
+  callerIsAdmin: vi.fn(),
+}));
+
+// Shared (instance-wide) skill names; tests set `mockSharedNames`.
+let mockSharedNames: string[] = [];
+// Host rows that receive shared skills (the synced row of a sync machine);
+// tests set `mockSyncedHostIds`.
+let mockSyncedHostIds: number[] = [];
+// Shared skills removed everywhere, still pending on a machine (by machine id).
+let mockPendingRemovals: Record<string, string[]> = {};
+vi.mock("../../instance-wide/production.js", () => ({
+  getInstanceWide: () => ({
+    listNames: async () => mockSharedNames,
+    isInstanceWide: async (_kind: string, name: string) => mockSharedNames.includes(name),
+    pendingRemovalNames: async (kind: string, machineId: string) =>
+      kind === "skill" ? (mockPendingRemovals[machineId] ?? []) : [],
+  }),
+  syncedMachineForHostRow: async (hostId: number) =>
+    mockSyncedHostIds.includes(hostId)
+      ? { machineId: String(hostId), hostName: "box", record: { id: String(hostId), _connDetails: {} } }
+      : null,
+}));
+
+vi.mock("../../claude-session/identity-artifact-reader.js", () => ({
+  writeMarkdownFileAtomic: vi.fn(),
+}));
+
+vi.mock("../../utils/logger.js", () => ({
+  sshLogger: { error: vi.fn(), info: vi.fn(), warn: vi.fn(), debug: vi.fn() },
+  databaseLogger: {
+    error: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    debug: vi.fn(),
+  },
+  logger: { error: vi.fn(), info: vi.fn(), warn: vi.fn(), debug: vi.fn() },
+}));
+
+// ---------------------------------------------------------------------------
+// Import mocked modules AFTER vi.mock() declarations
+// ---------------------------------------------------------------------------
+
+import { connectOneShot } from "../../ssh/ssh-one-shot.js";
+import { execCommand } from "../../ssh/tmux-helper.js";
+import { resolveHostById } from "../../ssh/host-resolver.js";
+import { callerIsAdmin } from "../../instance-wide/admin.js";
+import { writeMarkdownFileAtomic } from "../../claude-session/identity-artifact-reader.js";
+
+// ---------------------------------------------------------------------------
+// HTTP helper (mirrors roles-list-for-host.test.ts + identity-clone.test.ts)
+// ---------------------------------------------------------------------------
+
+function httpRequest(
+  server: http.Server,
+  opts: {
+    method: string;
+    path: string;
+    headers?: Record<string, string>;
+    body?: string;
+  },
+): Promise<{ status: number; body: unknown }> {
+  return new Promise((resolve, reject) => {
+    const { port } = server.address() as AddressInfo;
+
+    const headers: Record<string, string> = { ...(opts.headers ?? {}) };
+    if (opts.body !== undefined) {
+      headers["Content-Type"] = headers["Content-Type"] ?? "application/json";
+      headers["Content-Length"] = String(Buffer.byteLength(opts.body));
+    }
+
+    const req = http.request(
+      {
+        hostname: "127.0.0.1",
+        port,
+        method: opts.method,
+        path: opts.path,
+        headers,
+      },
+      (res) => {
+        let data = "";
+        res.on("data", (chunk: Buffer) => {
+          data += chunk.toString();
+        });
+        res.on("end", () => {
+          let body: unknown;
+          try {
+            body = JSON.parse(data);
+          } catch {
+            body = data;
+          }
+          resolve({ status: res.statusCode ?? 0, body });
+        });
+      },
+    );
+    req.on("error", reject);
+    if (opts.body !== undefined) {
+      req.write(opts.body);
+    }
+    req.end();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Stub SSH conn + host record
+// ---------------------------------------------------------------------------
+
+const stubConn = {
+  end: vi.fn(),
+  exec: vi.fn(),
+};
+
+const stubHost = {
+  id: 1,
+  name: "hostA",
+  ip: "10.0.0.1",
+  port: 22,
+  username: "ubuntu",
+  authType: "password" as const,
+  password: "secret",
+};
+
+// ---------------------------------------------------------------------------
+// Import the router under test (dynamic import AFTER vi.mock() declarations)
+// ---------------------------------------------------------------------------
+
+const { default: router, parseSkillListOutput } = await import("./skills-editor.js");
+
+let server: http.Server;
+
+/**
+ * Default exec behavior: canned outputs matching a healthy 2-skill / 2-file
+ * fixture. Tests override with `mockImplementation` where they want to
+ * exercise a specific branch (missing HOME, mtime drift, existence
+ * conflict, delete-skill guard, etc.).
+ */
+function defaultExecImpl(cmd: string): Promise<string> {
+  if (cmd === "echo $HOME") return Promise.resolve("/home/testuser\n");
+  if (cmd.startsWith("find") && cmd.includes("-maxdepth 1"))
+    return Promise.resolve(
+      "\x1ebuild\nname: build\ndescription: Deliver a feature end-to-end.\n" +
+        "\x1eexplain\nname: explain\n",
+    );
+  if (cmd.startsWith("find") && cmd.includes("-type f"))
+    return Promise.resolve("SKILL.md\ntests/basic.py\n");
+  if (cmd.startsWith("cat ")) return Promise.resolve("hello world");
+  if (cmd.includes("stat -c '%Y'")) return Promise.resolve("1700000042");
+  if (cmd.includes("stat -c '%s'")) return Promise.resolve("11");
+  if (cmd.startsWith("test -e")) return Promise.resolve("ok");
+  // Default: any `test -d ${skillRoot}` check assumes the skill folder
+  // exists (create-endpoint skill-existence gate — post-fix for the
+  // reviewer's Concern #2 about implicit skill creation).
+  if (cmd.startsWith("test -d ")) return Promise.resolve("exists");
+  if (cmd.startsWith("mkdir -p")) return Promise.resolve("");
+  if (cmd.startsWith("touch ")) return Promise.resolve("");
+  if (cmd.startsWith("rm ")) return Promise.resolve("");
+  return Promise.resolve("");
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  stubConn.end.mockClear();
+  mockUserId = "1";
+
+  // Default: user owns host 1; anything else → null (404).
+  (resolveHostById as Mock).mockImplementation((hostId: number) => {
+    if (hostId === 1) return Promise.resolve(stubHost);
+    return Promise.resolve(null);
+  });
+
+  (connectOneShot as Mock).mockResolvedValue(stubConn);
+  (execCommand as Mock).mockImplementation(
+    async (_conn: unknown, cmd: string) => defaultExecImpl(cmd),
+  );
+  (writeMarkdownFileAtomic as Mock).mockResolvedValue(undefined);
+  (callerIsAdmin as Mock).mockResolvedValue(false);
+
+  const app = express();
+  app.use("/skills-editor", router);
+
+  server = http.createServer(app);
+  server.listen(0);
+});
+
+afterEach(() => {
+  return new Promise<void>((resolve) => server.close(() => resolve()));
+});
+
+// ===========================================================================
+// GET /skills-editor/skills
+// ===========================================================================
+
+describe("GET /skills-editor/skills", () => {
+  it("200 with { skills: [{name, description?}...] } in listed order", async () => {
+    const res = await httpRequest(server, {
+      method: "GET",
+      path: "/skills-editor/skills?hostId=1",
+    });
+    expect(res.status).toBe(200);
+    const body = res.body as { skills: { name: string; description?: string }[] };
+    expect(body.skills).toEqual([
+      { name: "build", description: "Deliver a feature end-to-end." },
+      { name: "explain" },
+    ]);
+  });
+
+  it("400 on missing hostId", async () => {
+    const res = await httpRequest(server, {
+      method: "GET",
+      path: "/skills-editor/skills",
+    });
+    expect(res.status).toBe(400);
+    expect((res.body as { error: string }).error).toBe("hostId is required");
+  });
+
+  it("400 on non-integer hostId", async () => {
+    const res = await httpRequest(server, {
+      method: "GET",
+      path: "/skills-editor/skills?hostId=abc",
+    });
+    expect(res.status).toBe(400);
+    expect((res.body as { error: string }).error).toBe(
+      "hostId must be a positive integer",
+    );
+  });
+
+  it("404 on cross-user / unknown host", async () => {
+    const res = await httpRequest(server, {
+      method: "GET",
+      path: "/skills-editor/skills?hostId=999",
+    });
+    expect(res.status).toBe(404);
+  });
+
+  it("502 on SSH connect fail", async () => {
+    (connectOneShot as Mock).mockRejectedValueOnce(new Error("connect refused"));
+    const res = await httpRequest(server, {
+      method: "GET",
+      path: "/skills-editor/skills?hostId=1",
+    });
+    expect(res.status).toBe(502);
+    expect((res.body as { error: string }).error).toBe("SSH connect failed");
+  });
+
+  it("200 with { skills: [] } when the remote skills directory is missing", async () => {
+    (execCommand as Mock).mockImplementation(
+      async (_conn: unknown, cmd: string) => {
+        if (cmd === "echo $HOME") return "/home/testuser\n";
+        if (cmd.startsWith("find") && cmd.includes("-maxdepth 1")) return "";
+        return "";
+      },
+    );
+    const res = await httpRequest(server, {
+      method: "GET",
+      path: "/skills-editor/skills?hostId=1",
+    });
+    expect(res.status).toBe(200);
+    expect((res.body as { skills: unknown[] }).skills).toEqual([]);
+  });
+
+  it("list command slices each SKILL.md's frontmatter (for descriptions + the distributed flag)", async () => {
+    let capturedListCmd = "";
+    (execCommand as Mock).mockImplementation(
+      async (_conn: unknown, cmd: string) => {
+        if (cmd === "echo $HOME") return "/home/testuser\n";
+        if (cmd.startsWith("find") && cmd.includes("-maxdepth 1")) {
+          capturedListCmd = cmd;
+          return "\x1ebuild\n\x1eexplain\n";
+        }
+        return "";
+      },
+    );
+    const res = await httpRequest(server, {
+      method: "GET",
+      path: "/skills-editor/skills?hostId=1",
+    });
+    expect(res.status).toBe(200);
+    // Frontmatter-only scoping matters: a body line starting with
+    // `distributed:` must NOT mark its skill distributed.
+    expect(capturedListCmd).toContain("/^---$/{n++; if(n==2) exit} n==1");
+    // Each skill is emitted as a \036-prefixed record carrying its
+    // frontmatter.
+    expect(capturedListCmd).toContain("printf '\\036%s");
+  });
+
+  describe("distributed skills", () => {
+    beforeEach(() => {
+      (execCommand as Mock).mockImplementation(
+        async (_conn: unknown, cmd: string) => {
+          if (cmd === "echo $HOME") return "/home/testuser\n";
+          if (cmd.startsWith("find") && cmd.includes("-maxdepth 1"))
+            return (
+              "\x1ebuild\nname: build\n" +
+              "\x1estt\nname: stt\ndescription: Transcribe\ndistributed: true\n"
+            );
+          return "";
+        },
+      );
+    });
+
+    it("are left out by default, even for admins", async () => {
+      (callerIsAdmin as Mock).mockResolvedValue(true);
+      const res = await httpRequest(server, {
+        method: "GET",
+        path: "/skills-editor/skills?hostId=1",
+      });
+      expect(res.status).toBe(200);
+      expect((res.body as { skills: unknown[] }).skills).toEqual([{ name: "build" }]);
+    });
+
+    it("are listed with distributed: true for an admin who asks", async () => {
+      (callerIsAdmin as Mock).mockResolvedValue(true);
+      const res = await httpRequest(server, {
+        method: "GET",
+        path: "/skills-editor/skills?hostId=1&includeDistributed=1",
+      });
+      expect(res.status).toBe(200);
+      expect((res.body as { skills: unknown[] }).skills).toEqual([
+        { name: "build" },
+        { name: "stt", description: "Transcribe", distributed: true },
+      ]);
+    });
+
+    it("stay hidden from a non-admin who asks", async () => {
+      const res = await httpRequest(server, {
+        method: "GET",
+        path: "/skills-editor/skills?hostId=1&includeDistributed=1",
+      });
+      expect(res.status).toBe(200);
+      expect((res.body as { skills: unknown[] }).skills).toEqual([{ name: "build" }]);
+    });
+  });
+
+  describe("shared skills", () => {
+    beforeEach(() => {
+      mockSharedNames = ["house-style"];
+      mockSyncedHostIds = [1];
+      (execCommand as Mock).mockImplementation(
+        async (_conn: unknown, cmd: string) => {
+          if (cmd === "echo $HOME") return "/home/testuser\n";
+          if (cmd.startsWith("find") && cmd.includes("-maxdepth 1"))
+            return "\x1ebuild\nname: build\n\x1ehouse-style\nname: house-style\n";
+          return "";
+        },
+      );
+    });
+    afterEach(() => {
+      mockSharedNames = [];
+      mockSyncedHostIds = [];
+      mockPendingRemovals = {};
+    });
+
+    it("a shared skill just deleted everywhere isn't listed while its copy here is still being deleted", async () => {
+      (callerIsAdmin as Mock).mockResolvedValue(true);
+      mockSharedNames = [];
+      mockPendingRemovals = { "1": ["house-style"] };
+      const res = await httpRequest(server, { method: "GET", path: "/skills-editor/skills?hostId=1" });
+      expect(res.status).toBe(200);
+      expect((res.body as { skills: unknown[] }).skills).toEqual([{ name: "build" }]);
+    });
+
+    it("on a host outside sync a pending removal doesn't hide the user's own same-named skill", async () => {
+      (callerIsAdmin as Mock).mockResolvedValue(false);
+      mockSyncedHostIds = [];
+      mockPendingRemovals = { "1": ["house-style"] };
+      const res = await httpRequest(server, { method: "GET", path: "/skills-editor/skills?hostId=1" });
+      expect((res.body as { skills: unknown[] }).skills).toEqual([{ name: "build" }, { name: "house-style" }]);
+    });
+
+    it("are listed for everyone, marked shared on a host that receives them", async () => {
+      (callerIsAdmin as Mock).mockResolvedValue(false);
+      const res = await httpRequest(server, { method: "GET", path: "/skills-editor/skills?hostId=1" });
+      expect(res.status).toBe(200);
+      expect((res.body as { skills: unknown[] }).skills).toEqual([
+        { name: "build" },
+        { name: "house-style", shared: true },
+      ]);
+    });
+
+    it("on a host outside sync a same-named skill is the user's own — not marked", async () => {
+      (callerIsAdmin as Mock).mockResolvedValue(false);
+      mockSyncedHostIds = [];
+      const res = await httpRequest(server, { method: "GET", path: "/skills-editor/skills?hostId=1" });
+      expect((res.body as { skills: unknown[] }).skills).toEqual([{ name: "build" }, { name: "house-style" }]);
+    });
+
+    it("can be read by a non-admin", async () => {
+      (callerIsAdmin as Mock).mockResolvedValue(false);
+      await httpRequest(server, {
+        method: "POST",
+        path: "/skills-editor/read",
+        body: JSON.stringify({ hostId: 1, skill: "house-style", path: "SKILL.md" }),
+      });
+      expect(connectOneShot).toHaveBeenCalled();
+    });
+
+    it("can't be changed by a non-admin where it's the shared copy — 403 before any SSH", async () => {
+      (callerIsAdmin as Mock).mockResolvedValue(false);
+      const res = await httpRequest(server, {
+        method: "PUT",
+        path: "/skills-editor/write",
+        body: JSON.stringify({ hostId: 1, skill: "house-style", path: "SKILL.md", content: "x", expectedMtime: 1 }),
+      });
+      expect(res.status).toBe(403);
+      expect(connectOneShot).not.toHaveBeenCalled();
+    });
+
+    it("a same-named skill on a host outside sync stays the user's to change", async () => {
+      (callerIsAdmin as Mock).mockResolvedValue(false);
+      mockSyncedHostIds = [];
+      await httpRequest(server, {
+        method: "PUT",
+        path: "/skills-editor/write",
+        body: JSON.stringify({ hostId: 1, skill: "house-style", path: "SKILL.md", content: "x", expectedMtime: 1 }),
+      });
+      expect(connectOneShot).toHaveBeenCalled();
+    });
+
+    it("the shared master copy (hostId 0) is readable by a non-admin", async () => {
+      (callerIsAdmin as Mock).mockResolvedValue(false);
+      const list = await httpRequest(server, { method: "GET", path: "/skills-editor/skills?hostId=0" });
+      expect(list.status).not.toBe(404);
+    });
+
+    it("are listed for an admin", async () => {
+      (callerIsAdmin as Mock).mockResolvedValue(true);
+      const res = await httpRequest(server, { method: "GET", path: "/skills-editor/skills?hostId=1" });
+      expect(res.status).toBe(200);
+      expect((res.body as { skills: unknown[] }).skills).toEqual([
+        { name: "build" },
+        { name: "house-style", shared: true },
+      ]);
+    });
+  });
+});
+
+// ===========================================================================
+// Distributed skills are read-only on every mutating route
+// ===========================================================================
+
+describe("distributed-skill write guard", () => {
+  afterEach(() => {
+    delete (stubConn as typeof stubConn & { sftp?: unknown }).sftp;
+  });
+  let commands: string[];
+  // The binary writer opens SFTP on the stub connection; a call here = a write attempt.
+  let sftpOpened: Mock;
+  beforeEach(() => {
+    commands = [];
+    sftpOpened = vi.fn((cb: (e: Error | null) => void) => cb(new Error("no sftp in this test")));
+    (stubConn as typeof stubConn & { sftp?: unknown }).sftp = sftpOpened;
+    (execCommand as Mock).mockImplementation(
+      async (_conn: unknown, cmd: string) => {
+        commands.push(cmd);
+        if (cmd.startsWith("awk ") && cmd.includes("distributed: *true")) {
+          return cmd.includes("/skills/stt'") ? "distributed\n" : "ok\n";
+        }
+        return defaultExecImpl(cmd);
+      },
+    );
+  });
+
+  const cases: { name: string; method: string; path: string; body: object }[] = [
+    {
+      name: "PUT /write",
+      method: "PUT",
+      path: "/skills-editor/write",
+      body: { hostId: 1, skill: "stt", path: "SKILL.md", content: "x" },
+    },
+    {
+      name: "POST /create",
+      method: "POST",
+      path: "/skills-editor/create",
+      body: { hostId: 1, skill: "stt", path: "notes.md" },
+    },
+    {
+      name: "DELETE /file",
+      method: "DELETE",
+      path: "/skills-editor/file",
+      body: { hostId: 1, skill: "stt", path: "notes.md" },
+    },
+    {
+      name: "DELETE /skill",
+      method: "DELETE",
+      path: "/skills-editor/skill",
+      body: { hostId: 1, skill: "stt" },
+    },
+  ];
+
+  for (const c of cases) {
+    it(`${c.name} → 403 on a distributed skill, nothing changed`, async () => {
+      const res = await httpRequest(server, {
+        method: c.method,
+        path: c.path,
+        body: JSON.stringify(c.body),
+      });
+      expect(res.status).toBe(403);
+      expect((res.body as { error: string }).error).toBe("distributed skills are read-only");
+      expect(writeMarkdownFileAtomic).not.toHaveBeenCalled();
+      expect(commands.some((cmd) => /^(rm|touch|mkdir) /.test(cmd))).toBe(false);
+    });
+  }
+
+  it("PUT /write still works on a skill that isn't distributed", async () => {
+    const res = await httpRequest(server, {
+      method: "PUT",
+      path: "/skills-editor/write",
+      body: JSON.stringify({ hostId: 1, skill: "build", path: "SKILL.md", content: "x" }),
+    });
+    expect(res.status).toBe(200);
+    expect(writeMarkdownFileAtomic).toHaveBeenCalledTimes(1);
+  });
+
+  it("PUT /write-binary → 403 on a distributed skill, nothing written", async () => {
+    const res = await httpRequest(server, {
+      method: "PUT",
+      path: "/skills-editor/write-binary?hostId=1&skill=stt&path=a.pdf",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: "%PDF-1.4",
+    });
+    expect(res.status).toBe(403);
+    expect(sftpOpened).not.toHaveBeenCalled();
+  });
+
+  it("PUT /write-binary goes on to write a skill that isn't distributed", async () => {
+    await httpRequest(server, {
+      method: "PUT",
+      path: "/skills-editor/write-binary?hostId=1&skill=build&path=a.pdf",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: "%PDF-1.4",
+    });
+    expect(sftpOpened).toHaveBeenCalledTimes(1);
+  });
+
+  it("PUT /write-binary → 500 (not a connect error) when the check itself fails", async () => {
+    (execCommand as Mock).mockImplementation(async (_conn: unknown, cmd: string) => {
+      if (cmd.startsWith("awk ")) throw new Error("SSH exec timeout after 5000ms");
+      return defaultExecImpl(cmd);
+    });
+    const res = await httpRequest(server, {
+      method: "PUT",
+      path: "/skills-editor/write-binary?hostId=1&skill=build&path=a.pdf",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: "%PDF-1.4",
+    });
+    expect(res.status).toBe(500);
+    expect(sftpOpened).not.toHaveBeenCalled();
+  });
+
+  it("a save can't mark a skill distributed (it would lock the skill)", async () => {
+    const write = await httpRequest(server, {
+      method: "PUT",
+      path: "/skills-editor/write",
+      body: JSON.stringify({
+        hostId: 1,
+        skill: "build",
+        path: "SKILL.md",
+        content: "---\r\nname: build\r\ndistributed: true\r\n---\r\n# Build\r\n",
+      }),
+    });
+    expect(write.status).toBe(400);
+    expect(writeMarkdownFileAtomic).not.toHaveBeenCalled();
+
+    const binary = await httpRequest(server, {
+      method: "PUT",
+      path: "/skills-editor/write-binary?hostId=1&skill=build&path=SKILL.md",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: "---\nname: build\ndistributed: true\n---\n",
+    });
+    expect(binary.status).toBe(400);
+    expect(sftpOpened).not.toHaveBeenCalled();
+  });
+
+  it("a body line reading distributed: true is just text", async () => {
+    const res = await httpRequest(server, {
+      method: "PUT",
+      path: "/skills-editor/write",
+      body: JSON.stringify({
+        hostId: 1,
+        skill: "build",
+        path: "SKILL.md",
+        content: "---\nname: build\n---\ndistributed: true\n",
+      }),
+    });
+    expect(res.status).toBe(200);
+  });
+});
+
+// ===========================================================================
+// parseSkillListOutput (skill-actions menu descriptions)
+// ===========================================================================
+
+describe("parseSkillListOutput", () => {
+  it("returns [] for empty output", () => {
+    expect(parseSkillListOutput("")).toEqual([]);
+  });
+
+  it("ignores stray output before the first record (e.g. shell rc noise)", () => {
+    expect(parseSkillListOutput("Welcome to box!\n\x1ebuild\nname: build\n")).toEqual([
+      { name: "build" },
+    ]);
+  });
+
+  it("flattens folded / multi-line descriptions to one line", () => {
+    const out =
+      "\x1eapp-development\nname: app-development\ndescription: |\n  Builds a new app,\n  or edits one.\n" +
+      "\x1eopen\nname: open\ndescription: >\n  Open a piece\n  of work.\n";
+    expect(parseSkillListOutput(out)).toEqual([
+      { name: "app-development", description: "Builds a new app, or edits one." },
+      { name: "open", description: "Open a piece of work." },
+    ]);
+  });
+
+  it("handles quoted descriptions containing colons", () => {
+    const out = '\x1eid\nname: id\ndescription: "Load a named agent: by name."\n';
+    expect(parseSkillListOutput(out)).toEqual([
+      { name: "id", description: "Load a named agent: by name." },
+    ]);
+  });
+
+  it("lists the skill without a description when frontmatter is missing, malformed, or non-string", () => {
+    const out =
+      "\x1ebare\n\n" +
+      "\x1ebroken\ndescription: [unclosed\n" +
+      "\x1enumeric\ndescription: 42\n" +
+      "\x1eblank\ndescription: \"   \"\n";
+    expect(parseSkillListOutput(out)).toEqual([
+      { name: "bare" },
+      { name: "broken" },
+      { name: "numeric" },
+      { name: "blank" },
+    ]);
+  });
+
+  it("marks both invocation settings — user-invocable: false and disable-model-invocation: true", () => {
+    const out =
+      "\x1eagent-only\nuser-invocable: false\n" +
+      "\x1euser-only\ndisable-model-invocation: true\n" +
+      "\x1equoted\ndisable-model-invocation: 'true'\n" +
+      "\x1enobody\nuser-invocable: false\ndisable-model-invocation: true\n";
+    expect(parseSkillListOutput(out)).toEqual([
+      { name: "agent-only", userInvocable: false },
+      { name: "user-only", modelInvocable: false },
+      { name: "quoted", modelInvocable: false },
+      { name: "nobody", userInvocable: false, modelInvocable: false },
+    ]);
+  });
+
+  it("caps very long descriptions with an ellipsis", () => {
+    const long = "x".repeat(800);
+    const [skill] = parseSkillListOutput(`\x1elong\ndescription: ${long}\n`);
+    expect(skill.description).toHaveLength(500);
+    expect(skill.description?.endsWith("…")).toBe(true);
+  });
+});
+
+// ===========================================================================
+// GET /skills-editor/files
+// ===========================================================================
+
+describe("GET /skills-editor/files", () => {
+  it("200 with { files: [{path}...] } sorted alphabetically, path-relative", async () => {
+    const res = await httpRequest(server, {
+      method: "GET",
+      path: "/skills-editor/files?hostId=1&skill=build",
+    });
+    expect(res.status).toBe(200);
+    const body = res.body as { files: { path: string }[] };
+    expect(body.files).toEqual([
+      { path: "SKILL.md" },
+      { path: "tests/basic.py" },
+    ]);
+  });
+
+  it("400 on missing skill", async () => {
+    const res = await httpRequest(server, {
+      method: "GET",
+      path: "/skills-editor/files?hostId=1",
+    });
+    expect(res.status).toBe(400);
+    expect((res.body as { error: string }).error).toBe("invalid skill name");
+  });
+
+  it("404 on cross-user / unknown host", async () => {
+    const res = await httpRequest(server, {
+      method: "GET",
+      path: "/skills-editor/files?hostId=999&skill=build",
+    });
+    expect(res.status).toBe(404);
+  });
+
+  it("502 on SSH connect fail", async () => {
+    (connectOneShot as Mock).mockRejectedValueOnce(new Error("boom"));
+    const res = await httpRequest(server, {
+      method: "GET",
+      path: "/skills-editor/files?hostId=1&skill=build",
+    });
+    expect(res.status).toBe(502);
+  });
+
+  it("200 with { files: [] } when the skill has no files", async () => {
+    (execCommand as Mock).mockImplementation(
+      async (_conn: unknown, cmd: string) => {
+        if (cmd === "echo $HOME") return "/home/testuser\n";
+        if (cmd.startsWith("find") && cmd.includes("-type f")) return "";
+        return "";
+      },
+    );
+    const res = await httpRequest(server, {
+      method: "GET",
+      path: "/skills-editor/files?hostId=1&skill=build",
+    });
+    expect(res.status).toBe(200);
+    expect((res.body as { files: unknown[] }).files).toEqual([]);
+  });
+});
+
+// ===========================================================================
+// POST /skills-editor/read
+// ===========================================================================
+
+describe("POST /skills-editor/read", () => {
+  it("200 with { content, mtime, size, isText:true } for a text file", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/skills-editor/read",
+      body: JSON.stringify({ hostId: 1, skill: "build", path: "SKILL.md" }),
+    });
+    expect(res.status).toBe(200);
+    const body = res.body as {
+      content: string;
+      mtime: number;
+      size: number;
+      isText: boolean;
+    };
+    expect(body.content).toBe("hello world");
+    expect(body.mtime).toBe(1700000042);
+    expect(body.size).toBe(11);
+    expect(body.isText).toBe(true);
+  });
+
+  it("200 with isText:false and empty content when file contains NUL bytes", async () => {
+    (execCommand as Mock).mockImplementation(
+      async (_conn: unknown, cmd: string) => {
+        if (cmd === "echo $HOME") return "/home/testuser\n";
+        if (cmd.startsWith("cat ")) return " binary ";
+        if (cmd.includes("stat -c '%Y'")) return "1700000000";
+        if (cmd.includes("stat -c '%s'")) return "8";
+        return "";
+      },
+    );
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/skills-editor/read",
+      body: JSON.stringify({ hostId: 1, skill: "build", path: "img.png" }),
+    });
+    expect(res.status).toBe(200);
+    const body = res.body as { content: string; isText: boolean };
+    expect(body.isText).toBe(false);
+    expect(body.content).toBe("");
+  });
+
+  it("400 on invalid path (empty)", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/skills-editor/read",
+      body: JSON.stringify({ hostId: 1, skill: "build", path: "" }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("401 when unauthenticated", async () => {
+    mockUserId = null;
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/skills-editor/read",
+      body: JSON.stringify({ hostId: 1, skill: "build", path: "SKILL.md" }),
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("404 on unknown host", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/skills-editor/read",
+      body: JSON.stringify({ hostId: 999, skill: "build", path: "SKILL.md" }),
+    });
+    expect(res.status).toBe(404);
+  });
+
+  it("502 on SSH connect fail", async () => {
+    (connectOneShot as Mock).mockRejectedValueOnce(new Error("boom"));
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/skills-editor/read",
+      body: JSON.stringify({ hostId: 1, skill: "build", path: "SKILL.md" }),
+    });
+    expect(res.status).toBe(502);
+  });
+});
+
+// ===========================================================================
+// PUT /skills-editor/write
+// ===========================================================================
+
+describe("PUT /skills-editor/write", () => {
+  it("200 with { mtime } on valid write with matching expectedMtime", async () => {
+    const res = await httpRequest(server, {
+      method: "PUT",
+      path: "/skills-editor/write",
+      body: JSON.stringify({
+        hostId: 1,
+        skill: "build",
+        path: "SKILL.md",
+        content: "new content\n",
+        expectedMtime: 1700000042,
+      }),
+    });
+    expect(res.status).toBe(200);
+    const body = res.body as { mtime: number };
+    expect(body.mtime).toBe(1700000042);
+    expect((writeMarkdownFileAtomic as Mock).mock.calls).toHaveLength(1);
+    const [, sftpPath, sftpContent] = (writeMarkdownFileAtomic as Mock).mock
+      .calls[0] as [unknown, string, string];
+    expect(sftpPath).toBe("/home/testuser/.claude/skills/build/SKILL.md");
+    expect(sftpContent).toBe("new content\n");
+  });
+
+  it("409 with byte-identical Phase 23 mtime-mismatch shape on drift", async () => {
+    (execCommand as Mock).mockImplementation(
+      async (_conn: unknown, cmd: string) => {
+        if (cmd === "echo $HOME") return "/home/testuser\n";
+        if (cmd.includes("stat -c '%Y'")) return "1700000999";
+        if (cmd.startsWith("cat ")) return "actual disk content\n";
+        return "";
+      },
+    );
+    const res = await httpRequest(server, {
+      method: "PUT",
+      path: "/skills-editor/write",
+      body: JSON.stringify({
+        hostId: 1,
+        skill: "build",
+        path: "SKILL.md",
+        content: "my draft",
+        expectedMtime: 1700000042,
+      }),
+    });
+    expect(res.status).toBe(409);
+    const body = res.body as {
+      error: string;
+      currentMtime: number;
+      currentContent: string;
+    };
+    expect(body.error).toBe("mtime mismatch");
+    expect(body.currentMtime).toBe(1700000999);
+    expect(body.currentContent).toBe("actual disk content\n");
+    // 409 short-circuits BEFORE writeMarkdownFileAtomic runs.
+    expect((writeMarkdownFileAtomic as Mock).mock.calls).toHaveLength(0);
+  });
+
+  it("400 when content exceeds MAX_CONTENT_BYTES (2 MB)", async () => {
+    const oversized = "x".repeat(2_000_001);
+    const res = await httpRequest(server, {
+      method: "PUT",
+      path: "/skills-editor/write",
+      body: JSON.stringify({
+        hostId: 1,
+        skill: "build",
+        path: "SKILL.md",
+        content: oversized,
+      }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("400 on invalid path", async () => {
+    const res = await httpRequest(server, {
+      method: "PUT",
+      path: "/skills-editor/write",
+      body: JSON.stringify({
+        hostId: 1,
+        skill: "build",
+        path: "../etc/passwd",
+        content: "x",
+      }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("502 when writeMarkdownFileAtomic fails", async () => {
+    (writeMarkdownFileAtomic as Mock).mockRejectedValueOnce(
+      new Error("sftp broken"),
+    );
+    const res = await httpRequest(server, {
+      method: "PUT",
+      path: "/skills-editor/write",
+      body: JSON.stringify({
+        hostId: 1,
+        skill: "build",
+        path: "SKILL.md",
+        content: "new content",
+      }),
+    });
+    expect(res.status).toBe(502);
+  });
+});
+
+// ===========================================================================
+// POST /skills-editor/create
+// ===========================================================================
+
+describe("POST /skills-editor/create", () => {
+  it("200 with { path, mtime } on new file", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/skills-editor/create",
+      body: JSON.stringify({ hostId: 1, skill: "build", path: "new-file.md" }),
+    });
+    expect(res.status).toBe(200);
+    const body = res.body as { path: string; mtime: number };
+    expect(body.path).toBe("new-file.md");
+    expect(body.mtime).toBe(1700000042);
+    // Verify mkdir -p ran on the parent, then touch on the file.
+    const calls = (execCommand as Mock).mock.calls as [unknown, string][];
+    const mkdirCall = calls.find(([, cmd]) => cmd.startsWith("mkdir -p"));
+    expect(mkdirCall).toBeDefined();
+    const touchCall = calls.find(([, cmd]) => cmd.startsWith("touch "));
+    expect(touchCall).toBeDefined();
+    expect(touchCall![1]).toContain(
+      "'/home/testuser/.claude/skills/build/new-file.md'",
+    );
+  });
+
+  it("409 with { error: 'file exists' } when target already exists", async () => {
+    (execCommand as Mock).mockImplementation(
+      async (_conn: unknown, cmd: string) => {
+        if (cmd === "echo $HOME") return "/home/testuser\n";
+        if (cmd.startsWith("test -e")) return "exists";
+        return defaultExecImpl(cmd);
+      },
+    );
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/skills-editor/create",
+      body: JSON.stringify({ hostId: 1, skill: "build", path: "SKILL.md" }),
+    });
+    expect(res.status).toBe(409);
+    expect((res.body as { error: string }).error).toBe("file exists");
+    // Should NOT have called touch after the 409.
+    const calls = (execCommand as Mock).mock.calls as [unknown, string][];
+    const touchCall = calls.find(([, cmd]) => cmd.startsWith("touch "));
+    expect(touchCall).toBeUndefined();
+  });
+
+  it("400 on invalid skill name", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/skills-editor/create",
+      body: JSON.stringify({ hostId: 1, skill: "bad name", path: "x.md" }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("404 with { error: 'skill not found' } when the skill folder is missing (no implicit scaffolding)", async () => {
+    // Reviewer's Concern #2: without the skill-existence gate, `mkdir -p`
+    // silently creates the whole skill folder from thin air, violating the
+    // shape's "Creating a brand-new skill from scratch is out of scope" OUT.
+    // This test proves the gate refuses and no touch/mkdir on the skill root fires.
+    (execCommand as Mock).mockImplementation(
+      async (_conn: unknown, cmd: string) => {
+        if (cmd === "echo $HOME") return "/home/testuser\n";
+        // Skill folder does NOT exist.
+        if (cmd.startsWith("test -d ")) return "missing";
+        return defaultExecImpl(cmd);
+      },
+    );
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/skills-editor/create",
+      body: JSON.stringify({ hostId: 1, skill: "novel-skill", path: "hi.md" }),
+    });
+    expect(res.status).toBe(404);
+    expect((res.body as { error: string }).error).toBe("skill not found");
+    // Critical: no mkdir or touch fired after the 404 — no skill materialized.
+    const calls = (execCommand as Mock).mock.calls as [unknown, string][];
+    expect(calls.find(([, c]) => c.startsWith("mkdir -p"))).toBeUndefined();
+    expect(calls.find(([, c]) => c.startsWith("touch "))).toBeUndefined();
+  });
+});
+
+// ===========================================================================
+// POST /skills-editor/skill      (Phase 113)
+// ===========================================================================
+
+describe("POST /skills-editor/skill", () => {
+  it("200 with { slug, mtime } on new skill; mkdir + writeMarkdownFileAtomic called with byte-exact seed", async () => {
+    // Override defaultExecImpl: skill folder does NOT exist yet (test -d → "ok").
+    (execCommand as Mock).mockImplementation(
+      async (_conn: unknown, cmd: string) => {
+        if (cmd === "echo $HOME") return "/home/testuser\n";
+        if (cmd.startsWith("test -d ")) return "ok";
+        if (cmd.startsWith("mkdir -p")) return "";
+        if (cmd.includes("stat -c '%Y'")) return "1700000042";
+        return "";
+      },
+    );
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/skills-editor/skill",
+      body: JSON.stringify({
+        hostId: 1,
+        skill: "new-skill",
+        description: "A test skill.",
+      }),
+    });
+    expect(res.status).toBe(200);
+    const body = res.body as { slug: string; mtime: number };
+    expect(body.slug).toBe("new-skill");
+    expect(body.mtime).toBe(1700000042);
+    // Verify mkdir -p ran on the skill root.
+    const calls = (execCommand as Mock).mock.calls as [unknown, string][];
+    const mkdirCall = calls.find(([, c]) => c.startsWith("mkdir -p"));
+    expect(mkdirCall).toBeDefined();
+    expect(mkdirCall![1]).toContain(
+      "'/home/testuser/.claude/skills/new-skill'",
+    );
+    // Verify the atomic-write happened at the expected path + BYTE-EXACT seed (D-06 + D-07).
+    // Prettified-slug H1 appended 2026-10-03 — MDXEditor needs at least one
+    // markdown node in the body or Lexical renders empty + the silent-failure
+    // detector swaps to the code editor on first open. Deslugify: `-`/`_` →
+    // space, first char uppercased.
+    expect(writeMarkdownFileAtomic).toHaveBeenCalledWith(
+      expect.anything(),
+      "/home/testuser/.claude/skills/new-skill/SKILL.md",
+      '---\nname: new-skill\ndescription: "A test skill."\n---\n\n# New skill\n',
+    );
+  });
+
+  it("409 with { error: 'skill exists' } when skill folder already exists; no mkdir, no write", async () => {
+    // defaultExecImpl already returns "exists" for test -d — no override needed.
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/skills-editor/skill",
+      body: JSON.stringify({
+        hostId: 1,
+        skill: "build",
+        description: "hi",
+      }),
+    });
+    expect(res.status).toBe(409);
+    expect((res.body as { error: string }).error).toBe("skill exists");
+    const calls = (execCommand as Mock).mock.calls as [unknown, string][];
+    expect(calls.find(([, c]) => c.startsWith("mkdir -p"))).toBeUndefined();
+    expect(writeMarkdownFileAtomic).not.toHaveBeenCalled();
+  });
+
+  it("400 on invalid skill name; no SSH connect", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/skills-editor/skill",
+      body: JSON.stringify({
+        hostId: 1,
+        skill: "bad name",
+        description: "hi",
+      }),
+    });
+    expect(res.status).toBe(400);
+    expect((connectOneShot as Mock).mock.calls).toHaveLength(0);
+  });
+
+  it.each(["clear", "Compact", "id", "loop"])("400 on a blocked command name (%s); no SSH connect", async (skill) => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/skills-editor/skill",
+      body: JSON.stringify({ hostId: 1, skill, description: "hi" }),
+    });
+    expect(res.status).toBe(400);
+    expect((res.body as { error: string }).error).toBe("That name can't be used for a skill.");
+    expect((connectOneShot as Mock).mock.calls).toHaveLength(0);
+  });
+
+  it("400 on non-string description", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/skills-editor/skill",
+      body: JSON.stringify({
+        hostId: 1,
+        skill: "new-skill",
+        description: 123,
+      }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("400 on empty description after trim", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/skills-editor/skill",
+      body: JSON.stringify({
+        hostId: 1,
+        skill: "new-skill",
+        description: "   ",
+      }),
+    });
+    expect(res.status).toBe(400);
+    expect((res.body as { error: string }).error).toBe(
+      "description is required",
+    );
+  });
+
+  it("400 on overlength description (>4096 bytes)", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/skills-editor/skill",
+      body: JSON.stringify({
+        hostId: 1,
+        skill: "new-skill",
+        description: "x".repeat(5000),
+      }),
+    });
+    expect(res.status).toBe(400);
+    expect((res.body as { error: string }).error).toBe(
+      "description must be ≤4096 bytes",
+    );
+  });
+
+  it("400 on multi-line description", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/skills-editor/skill",
+      body: JSON.stringify({
+        hostId: 1,
+        skill: "new-skill",
+        description: "foo\nbar",
+      }),
+    });
+    expect(res.status).toBe(400);
+    expect((res.body as { error: string }).error).toBe(
+      "description must be single-line",
+    );
+  });
+
+  it("400 on path escape via '..'; no SSH connect", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/skills-editor/skill",
+      body: JSON.stringify({
+        hostId: 1,
+        skill: "..",
+        description: "hi",
+      }),
+    });
+    expect(res.status).toBe(400);
+    expect((connectOneShot as Mock).mock.calls).toHaveLength(0);
+  });
+
+  it("404 on cross-user / unknown host", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/skills-editor/skill",
+      body: JSON.stringify({
+        hostId: 999,
+        skill: "new-skill",
+        description: "hi",
+      }),
+    });
+    expect(res.status).toBe(404);
+  });
+
+  it("502 on SSH connect fail", async () => {
+    (connectOneShot as Mock).mockRejectedValueOnce(
+      new Error("connect refused"),
+    );
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/skills-editor/skill",
+      body: JSON.stringify({
+        hostId: 1,
+        skill: "new-skill",
+        description: "hi",
+      }),
+    });
+    expect(res.status).toBe(502);
+    expect((res.body as { error: string }).error).toBe("SSH connect failed");
+  });
+
+  it("502 + best-effort rm -rf cleanup when writeMarkdownFileAtomic rejects", async () => {
+    (execCommand as Mock).mockImplementation(
+      async (_conn: unknown, cmd: string) => {
+        if (cmd === "echo $HOME") return "/home/testuser\n";
+        if (cmd.startsWith("test -d ")) return "ok"; // skill does NOT exist yet
+        if (cmd.startsWith("mkdir -p")) return "";
+        if (cmd.startsWith("rm -rf")) return ""; // cleanup succeeds
+        if (cmd.includes("stat -c '%Y'")) return "0";
+        return "";
+      },
+    );
+    (writeMarkdownFileAtomic as Mock).mockRejectedValueOnce(
+      new Error("SFTP write failed"),
+    );
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/skills-editor/skill",
+      body: JSON.stringify({
+        hostId: 1,
+        skill: "new-skill",
+        description: "hi",
+      }),
+    });
+    expect(res.status).toBe(502);
+    expect((res.body as { error: string }).error).toBe("SSH exec failed");
+    // Pitfall #8: best-effort cleanup MUST have fired — rm -rf on the skill root.
+    const calls = (execCommand as Mock).mock.calls as [unknown, string][];
+    const rmrfCall = calls.find(([, cmd]) => cmd.startsWith("rm -rf"));
+    expect(rmrfCall).toBeDefined();
+    expect(rmrfCall![1]).toContain(
+      "'/home/testuser/.claude/skills/new-skill'",
+    );
+  });
+
+  it("YAML injection defense: description with embedded quote and backslash is byte-exact escaped (D-07)", async () => {
+    (execCommand as Mock).mockImplementation(
+      async (_conn: unknown, cmd: string) => {
+        if (cmd === "echo $HOME") return "/home/testuser\n";
+        if (cmd.startsWith("test -d ")) return "ok";
+        if (cmd.startsWith("mkdir -p")) return "";
+        if (cmd.includes("stat -c '%Y'")) return "1700000042";
+        return "";
+      },
+    );
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/skills-editor/skill",
+      body: JSON.stringify({
+        hostId: 1,
+        skill: "yaml-test",
+        description: 'has "quote" and \\ slash',
+      }),
+    });
+    expect(res.status).toBe(200);
+    // Order-sensitive escape (D-07 Pitfall #7): \ escaped FIRST, then ".
+    // Raw description:  has "quote" and \ slash
+    // After \-escape:   has "quote" and \\ slash
+    // After "-escape:   has \"quote\" and \\ slash
+    // Wrapped:          "has \"quote\" and \\ slash"
+    const expectedSeed =
+      '---\nname: yaml-test\ndescription: "has \\"quote\\" and \\\\ slash"\n---\n\n# Yaml test\n';
+    expect(writeMarkdownFileAtomic).toHaveBeenCalledWith(
+      expect.anything(),
+      "/home/testuser/.claude/skills/yaml-test/SKILL.md",
+      expectedSeed,
+    );
+  });
+});
+
+// ===========================================================================
+// DELETE /skills-editor/file
+// ===========================================================================
+
+describe("DELETE /skills-editor/file", () => {
+  it("200 with { ok:true } on valid input", async () => {
+    // Companion edit for Phase 113 D-22: pre-existing happy path used
+    // path: "SKILL.md" which is now hard-rejected by the SKILL.md guard.
+    // Any non-sentinel filename that passes isSafeRelativePath works.
+    const res = await httpRequest(server, {
+      method: "DELETE",
+      path: "/skills-editor/file",
+      body: JSON.stringify({
+        hostId: 1,
+        skill: "build",
+        path: "README.md",
+      }),
+    });
+    expect(res.status).toBe(200);
+    expect((res.body as { ok: boolean }).ok).toBe(true);
+    const calls = (execCommand as Mock).mock.calls as [unknown, string][];
+    const rmCall = calls.find(([, cmd]) => cmd.startsWith("rm -f "));
+    expect(rmCall).toBeDefined();
+    expect(rmCall![1]).toContain(
+      "'/home/testuser/.claude/skills/build/README.md'",
+    );
+  });
+
+  it("400 on invalid path", async () => {
+    const res = await httpRequest(server, {
+      method: "DELETE",
+      path: "/skills-editor/file",
+      body: JSON.stringify({
+        hostId: 1,
+        skill: "build",
+        path: "../etc/passwd",
+      }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("404 on unknown host", async () => {
+    // Companion edit for Phase 113 D-22: switch to a non-sentinel filename so
+    // the request reaches resolveHostById() and produces the 404 branch.
+    const res = await httpRequest(server, {
+      method: "DELETE",
+      path: "/skills-editor/file",
+      body: JSON.stringify({
+        hostId: 999,
+        skill: "build",
+        path: "README.md",
+      }),
+    });
+    expect(res.status).toBe(404);
+  });
+
+  it("400 with { error: 'cannot delete SKILL.md' } when path === 'SKILL.md'; no SSH opened (D-22, D-27)", async () => {
+    const res = await httpRequest(server, {
+      method: "DELETE",
+      path: "/skills-editor/file",
+      body: JSON.stringify({
+        hostId: 1,
+        skill: "build",
+        path: "SKILL.md",
+      }),
+    });
+    expect(res.status).toBe(400);
+    expect((res.body as { error: string }).error).toBe(
+      "cannot delete SKILL.md",
+    );
+    // Guard runs BEFORE resolveHostById → zero SSH cost.
+    expect((connectOneShot as Mock).mock.calls).toHaveLength(0);
+    expect((execCommand as Mock).mock.calls).toHaveLength(0);
+  });
+
+  it("SKILL.md.bak (sibling filename) is NOT guarded; deletes normally (D-27)", async () => {
+    const res = await httpRequest(server, {
+      method: "DELETE",
+      path: "/skills-editor/file",
+      body: JSON.stringify({
+        hostId: 1,
+        skill: "build",
+        path: "SKILL.md.bak",
+      }),
+    });
+    expect(res.status).toBe(200);
+    const calls = (execCommand as Mock).mock.calls as [unknown, string][];
+    const rmCall = calls.find(([, cmd]) => cmd.startsWith("rm -f "));
+    expect(rmCall).toBeDefined();
+    expect(rmCall![1]).toContain("SKILL.md.bak");
+  });
+
+  it("nested/SKILL.md (nested filename) is NOT guarded; deletes normally (D-27)", async () => {
+    const res = await httpRequest(server, {
+      method: "DELETE",
+      path: "/skills-editor/file",
+      body: JSON.stringify({
+        hostId: 1,
+        skill: "build",
+        path: "nested/SKILL.md",
+      }),
+    });
+    expect(res.status).toBe(200);
+    const calls = (execCommand as Mock).mock.calls as [unknown, string][];
+    const rmCall = calls.find(([, cmd]) => cmd.startsWith("rm -f "));
+    expect(rmCall).toBeDefined();
+    expect(rmCall![1]).toContain("nested/SKILL.md");
+  });
+});
+
+// ===========================================================================
+// DELETE /skills-editor/skill
+// ===========================================================================
+
+describe("DELETE /skills-editor/skill", () => {
+  it("200 with { ok:true } on valid skill; rm -rf against composed skillRoot", async () => {
+    const res = await httpRequest(server, {
+      method: "DELETE",
+      path: "/skills-editor/skill",
+      body: JSON.stringify({ hostId: 1, skill: "build" }),
+    });
+    expect(res.status).toBe(200);
+    expect((res.body as { ok: boolean }).ok).toBe(true);
+    const calls = (execCommand as Mock).mock.calls as [unknown, string][];
+    const rmrfCall = calls.find(([, cmd]) => cmd.startsWith("rm -rf "));
+    expect(rmrfCall).toBeDefined();
+    expect(rmrfCall![1]).toContain("'/home/testuser/.claude/skills/build'");
+  });
+
+  it("400 on invalid skill '../etc' BEFORE any rm -rf runs", async () => {
+    const res = await httpRequest(server, {
+      method: "DELETE",
+      path: "/skills-editor/skill",
+      body: JSON.stringify({ hostId: 1, skill: "../etc" }),
+    });
+    expect(res.status).toBe(400);
+    // rm -rf must NEVER have been called.
+    const calls = (execCommand as Mock).mock.calls as [unknown, string][];
+    const rmrfCall = calls.find(([, cmd]) => cmd.startsWith("rm -rf"));
+    expect(rmrfCall).toBeUndefined();
+    // SSH must NEVER have opened (validation runs before resolveHostById).
+    expect((connectOneShot as Mock).mock.calls).toHaveLength(0);
+  });
+
+  it("404 on unknown host", async () => {
+    const res = await httpRequest(server, {
+      method: "DELETE",
+      path: "/skills-editor/skill",
+      body: JSON.stringify({ hostId: 999, skill: "build" }),
+    });
+    expect(res.status).toBe(404);
+  });
+});
+
+// ===========================================================================
+// Path-safety gate — dedicated attack-input coverage (RESEARCH.md § Pitfall 1)
+// ===========================================================================
+
+describe("path-safety gate", () => {
+  it("SEC-1: rejects skill '..' with 400 before SSH", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/skills-editor/read",
+      body: JSON.stringify({ hostId: 1, skill: "..", path: "SKILL.md" }),
+    });
+    expect(res.status).toBe(400);
+    expect((connectOneShot as Mock).mock.calls).toHaveLength(0);
+    expect((execCommand as Mock).mock.calls).toHaveLength(0);
+  });
+
+  it("SEC-2: rejects skill '../etc' with 400 before SSH", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/skills-editor/read",
+      body: JSON.stringify({ hostId: 1, skill: "../etc", path: "SKILL.md" }),
+    });
+    expect(res.status).toBe(400);
+    expect((connectOneShot as Mock).mock.calls).toHaveLength(0);
+  });
+
+  it("SEC-3: rejects skill 'foo/bar' (embedded slash) with 400 before SSH", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/skills-editor/read",
+      body: JSON.stringify({ hostId: 1, skill: "foo/bar", path: "SKILL.md" }),
+    });
+    expect(res.status).toBe(400);
+    expect((connectOneShot as Mock).mock.calls).toHaveLength(0);
+  });
+
+  it("SEC-4: rejects path '../../etc/passwd' with 400 before SSH", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/skills-editor/read",
+      body: JSON.stringify({
+        hostId: 1,
+        skill: "build",
+        path: "../../etc/passwd",
+      }),
+    });
+    expect(res.status).toBe(400);
+    expect((connectOneShot as Mock).mock.calls).toHaveLength(0);
+  });
+
+  it("SEC-5: rejects path '/etc/passwd' (leading slash) with 400 before SSH", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/skills-editor/read",
+      body: JSON.stringify({
+        hostId: 1,
+        skill: "build",
+        path: "/etc/passwd",
+      }),
+    });
+    expect(res.status).toBe(400);
+    expect((connectOneShot as Mock).mock.calls).toHaveLength(0);
+  });
+
+  it("SEC-6: rejects path 'foo\\0.txt' (NUL byte) with 400 before SSH", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/skills-editor/read",
+      body: JSON.stringify({
+        hostId: 1,
+        skill: "build",
+        path: "foo .txt",
+      }),
+    });
+    expect(res.status).toBe(400);
+    expect((connectOneShot as Mock).mock.calls).toHaveLength(0);
+  });
+
+  it("SEC-7: rejects path 'foo/../bar' (embedded '..' segment) with 400 before SSH", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/skills-editor/read",
+      body: JSON.stringify({
+        hostId: 1,
+        skill: "build",
+        path: "foo/../bar",
+      }),
+    });
+    expect(res.status).toBe(400);
+    expect((connectOneShot as Mock).mock.calls).toHaveLength(0);
+  });
+
+  it("SEC-8: rejects DELETE /skill on skill '..' (life-critical rm -rf guard)", async () => {
+    const res = await httpRequest(server, {
+      method: "DELETE",
+      path: "/skills-editor/skill",
+      body: JSON.stringify({ hostId: 1, skill: ".." }),
+    });
+    expect(res.status).toBe(400);
+    // The whole point: rm -rf must NEVER have been dispatched.
+    const calls = (execCommand as Mock).mock.calls as [unknown, string][];
+    const rmrfCall = calls.find(([, cmd]) => cmd.startsWith("rm -rf"));
+    expect(rmrfCall).toBeUndefined();
+    // SSH must NEVER have opened either.
+    expect((connectOneShot as Mock).mock.calls).toHaveLength(0);
+  });
+});
+
+// ===========================================================================
+// GET /skills-editor/download
+// ===========================================================================
+
+describe("GET /skills-editor/download", () => {
+  it("rejects bad input before any SSH", async () => {
+    for (const q of [
+      "hostId=-1&skill=build&path=SKILL.md",
+      "hostId=1&skill=..&path=SKILL.md",
+      "hostId=1&skill=build&path=../../etc/passwd",
+    ]) {
+      const res = await httpRequest(server, { method: "GET", path: `/skills-editor/download?${q}` });
+      expect(res.status).toBe(400);
+    }
+    expect((connectOneShot as Mock).mock.calls).toHaveLength(0);
+  });
+
+  it("hostId=0 is the instance-wide section — never SSH", async () => {
+    const res = await httpRequest(server, {
+      method: "GET",
+      path: "/skills-editor/download?hostId=0&skill=build&path=SKILL.md",
+    });
+    expect(res.status).toBe(404);
+    expect((connectOneShot as Mock).mock.calls).toHaveLength(0);
+  });
+
+  it("404s a host the user doesn't own", async () => {
+    const res = await httpRequest(server, {
+      method: "GET",
+      path: "/skills-editor/download?hostId=2&skill=build&path=SKILL.md",
+    });
+    expect(res.status).toBe(404);
+  });
+
+  it("streams the file from inside the skill directory", async () => {
+    const realStub = stubConn as typeof stubConn & { sftp?: unknown };
+    realStub.sftp = (cb: (e: Error | null, s: unknown) => void) =>
+      cb(null, {
+        realpath: (p: string, done: (e: Error | null, r: string) => void) =>
+          done(null, p === "." ? "/home/testuser" : p),
+        stat: (_p: string, done: (e: Error | null, s: unknown) => void) =>
+          done(null, { size: 5, isFile: () => true }),
+        createReadStream: () => Readable.from([Buffer.from("hello")]),
+      });
+    try {
+      const res = await httpRequest(server, {
+        method: "GET",
+        path: "/skills-editor/download?hostId=1&skill=build&path=tests/basic.py",
+      });
+      expect(res.status).toBe(200);
+      expect(res.body).toBe("hello");
+    } finally {
+      delete realStub.sftp;
+    }
+  });
+});
+
+// ===========================================================================
+// PUT /skills-editor/write-binary
+// ===========================================================================
+
+describe("PUT /skills-editor/write-binary", () => {
+  const put = (q: string, body = "%PDF-1.7") =>
+    httpRequest(server, {
+      method: "PUT",
+      path: `/skills-editor/write-binary?${q}`,
+      headers: { "Content-Type": "application/octet-stream" },
+      body,
+    });
+
+  it("rejects bad input and empty bodies before any SSH", async () => {
+    expect((await put("hostId=1&skill=build&path=../x.pdf")).status).toBe(400);
+    expect((await put("hostId=1&skill=..&path=a.pdf")).status).toBe(400);
+    expect((await put("hostId=1&skill=build&path=a.pdf", "")).status).toBe(400);
+    expect((connectOneShot as Mock).mock.calls).toHaveLength(0);
+  });
+
+  it("404s a host the user doesn't own", async () => {
+    expect((await put("hostId=2&skill=build&path=a.pdf")).status).toBe(404);
+  });
+
+  it("writes the bytes inside the skill directory", async () => {
+    const realStub = stubConn as typeof stubConn & { sftp?: unknown };
+    const writes: string[] = [];
+    realStub.sftp = (cb: (e: Error | null, s: unknown) => void) =>
+      cb(null, {
+        realpath: (p: string, done: (e: Error | null, r: string) => void) =>
+          done(null, p === "." ? "/home/testuser" : p),
+        writeFile: (p: string, _d: Buffer, _o: unknown, done: (e: Error | null) => void) => {
+          writes.push(p);
+          done(null);
+        },
+        ext_openssh_rename: (_f: string, to: string, done: (e: Error | null) => void) => {
+          writes.push(`-> ${to}`);
+          done(null);
+        },
+        unlink: (_p: string, done: (e: Error | null) => void) => done(null),
+      });
+    try {
+      const res = await put("hostId=1&skill=build&path=docs/spec.pdf");
+      expect(res.status).toBe(200);
+      expect(writes.at(-1)).toBe("-> /home/testuser/.claude/skills/build/docs/spec.pdf");
+    } finally {
+      delete realStub.sftp;
+    }
+  });
+});
+
+// ===========================================================================
+// Folder ↔ name: POST /skills-editor/rename + PUT /write name gate
+// ===========================================================================
+
+describe("POST /skills-editor/rename", () => {
+  function rename(body: Record<string, unknown>) {
+    return httpRequest(server, {
+      method: "POST",
+      path: "/skills-editor/rename",
+      body: JSON.stringify(body),
+    });
+  }
+  const skillMd = "---\nname: build\ndescription: x\n---\n\n# Build\n";
+
+  function renameExec(moveResult: string) {
+    (execCommand as Mock).mockImplementation(async (_c: unknown, cmd: string) => {
+      if (cmd.startsWith("if [ ! -d ")) return moveResult;
+      if (cmd.startsWith("base64 -w0")) return Buffer.from(skillMd).toString("base64");
+      return defaultExecImpl(cmd);
+    });
+  }
+
+  it("moves the folder and rewrites SKILL.md's name:, keeping the trailing newline", async () => {
+    renameExec("ok");
+    const res = await rename({ hostId: 1, skill: "build", newName: "ship" });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ name: "ship", mtime: 1700000042 });
+    const cmds = (execCommand as Mock).mock.calls.map((c) => c[1] as string);
+    const mv = cmds.find((c) => c.startsWith("if [ ! -d "))!;
+    expect(mv).toContain("mv -T '/home/testuser/.claude/skills/build' '/home/testuser/.claude/skills/ship'");
+    expect(writeMarkdownFileAtomic).toHaveBeenCalledWith(
+      stubConn,
+      "/home/testuser/.claude/skills/ship/SKILL.md",
+      "---\nname: ship\ndescription: x\n---\n\n# Build\n",
+    );
+  });
+
+  it("leaves a SKILL.md without name: untouched", async () => {
+    (execCommand as Mock).mockImplementation(async (_c: unknown, cmd: string) => {
+      if (cmd.startsWith("if [ ! -d ")) return "ok";
+      if (cmd.startsWith("base64 -w0")) return Buffer.from("# no frontmatter\n").toString("base64");
+      return defaultExecImpl(cmd);
+    });
+    const res = await rename({ hostId: 1, skill: "build", newName: "ship" });
+    expect(res.status).toBe(200);
+    expect(writeMarkdownFileAtomic).not.toHaveBeenCalled();
+  });
+
+  it("409 when the new name is taken, 404 when the skill is missing", async () => {
+    renameExec("exists");
+    expect((await rename({ hostId: 1, skill: "build", newName: "explain" })).status).toBe(409);
+    renameExec("missing");
+    expect((await rename({ hostId: 1, skill: "nope", newName: "ship" })).status).toBe(404);
+    expect(writeMarkdownFileAtomic).not.toHaveBeenCalled();
+  });
+
+  it("refuses a distributed skill", async () => {
+    (execCommand as Mock).mockImplementation(async (_c: unknown, cmd: string) => {
+      if (cmd.startsWith("awk ")) return "distributed";
+      return defaultExecImpl(cmd);
+    });
+    const res = await rename({ hostId: 1, skill: "id", newName: "ident" });
+    expect(res.status).toBe(403);
+    const cmds = (execCommand as Mock).mock.calls.map((c) => c[1] as string);
+    expect(cmds.some((c) => c.includes("mv -T"))).toBe(false);
+  });
+
+  it("400s unsafe or no-op names before any SSH connect", async () => {
+    for (const body of [
+      { hostId: 1, skill: "build", newName: "../evil" },
+      { hostId: 1, skill: "build", newName: "a/b" },
+      { hostId: 1, skill: "..", newName: "ship" },
+      { hostId: 1, skill: "build", newName: "build" },
+      { hostId: 0, skill: "build", newName: "ship" },
+    ]) {
+      expect((await rename(body)).status).toBe(400);
+    }
+    expect(connectOneShot).not.toHaveBeenCalled();
+  });
+
+  it("400s a rename to a blocked command name before any SSH connect", async () => {
+    for (const newName of ["clear", "Resume", "id"]) {
+      const res = await rename({ hostId: 1, skill: "build", newName });
+      expect(res.status).toBe(400);
+      expect((res.body as { error: string }).error).toBe("That name can't be used for a skill.");
+    }
+    expect(connectOneShot).not.toHaveBeenCalled();
+  });
+});
+
+describe("PUT /skills-editor/write — SKILL.md name must match the folder", () => {
+  function write(path: string, content: string) {
+    return httpRequest(server, {
+      method: "PUT",
+      path: "/skills-editor/write",
+      body: JSON.stringify({ hostId: 1, skill: "build", path, content }),
+    });
+  }
+  function onDisk(skillMd: string) {
+    (execCommand as Mock).mockImplementation(async (_c: unknown, cmd: string) => {
+      if (cmd.startsWith("base64 -w0")) return Buffer.from(skillMd).toString("base64");
+      return defaultExecImpl(cmd);
+    });
+  }
+
+  it("400 name_mismatch when the write changes name: away from the folder", async () => {
+    onDisk("---\nname: build\n---\n");
+    const res = await write("SKILL.md", "---\nname: other\n---\nbody\n");
+    expect(res.status).toBe(400);
+    expect((res.body as { code: string }).code).toBe("name_mismatch");
+    expect(writeMarkdownFileAtomic).not.toHaveBeenCalled();
+  });
+
+  it("an older skill whose name already disagrees stays saveable while the name is untouched", async () => {
+    onDisk("---\nname: PDF Processing\n---\n");
+    expect((await write("SKILL.md", "---\nname: PDF Processing\n---\nedited\n")).status).toBe(200);
+    expect((await write("SKILL.md", "---\nname: Something Else\n---\n")).status).toBe(400);
+  });
+
+  it("allows a matching name, a missing or empty name, and other files", async () => {
+    onDisk("---\nname: build\n---\n");
+    expect((await write("SKILL.md", "---\nname: \"build\"\n---\n")).status).toBe(200);
+    expect((await write("SKILL.md", "---\ndescription: x\n---\n")).status).toBe(200);
+    expect((await write("SKILL.md", "---\nname:\n---\n")).status).toBe(200);
+    expect((await write("notes.md", "---\nname: other\n---\n")).status).toBe(200);
+  });
+});
+
+describe("POST /skills-editor/rename with a draft", () => {
+  function rename(body: Record<string, unknown>) {
+    return httpRequest(server, {
+      method: "POST",
+      path: "/skills-editor/rename",
+      body: JSON.stringify(body),
+    });
+  }
+
+  it("409 mtime mismatch before anything moves when SKILL.md changed underneath", async () => {
+    (execCommand as Mock).mockImplementation(async (_c: unknown, cmd: string) => {
+      if (cmd.startsWith("base64 -w0")) return Buffer.from("---\nname: build\n---\nnewer\n").toString("base64");
+      return defaultExecImpl(cmd); // stat → 1700000042
+    });
+    const res = await rename({
+      hostId: 1,
+      skill: "build",
+      newName: "ship",
+      content: "---\nname: ship\n---\n",
+      expectedMtime: 1,
+    });
+    expect(res.status).toBe(409);
+    expect((res.body as { error: string }).error).toBe("mtime mismatch");
+    const cmds = (execCommand as Mock).mock.calls.map((c) => c[1] as string);
+    expect(cmds.some((c) => c.includes("mv -T"))).toBe(false);
+  });
+
+  it("saves the draft into the renamed skill with name: forced to the new name", async () => {
+    (execCommand as Mock).mockImplementation(async (_c: unknown, cmd: string) => {
+      if (cmd.startsWith("if [ ! -d ")) return "ok";
+      return defaultExecImpl(cmd);
+    });
+    const res = await rename({
+      hostId: 1,
+      skill: "build",
+      newName: "ship",
+      content: "---\nname: ship\n---\nedited\n",
+      expectedMtime: 1700000042,
+    });
+    expect(res.status).toBe(200);
+    expect(writeMarkdownFileAtomic).toHaveBeenCalledWith(
+      stubConn,
+      "/home/testuser/.claude/skills/ship/SKILL.md",
+      "---\nname: ship\n---\nedited\n",
+    );
+  });
+
+  it("502 renamed:true when the folder moved but the draft write failed", async () => {
+    (execCommand as Mock).mockImplementation(async (_c: unknown, cmd: string) => {
+      if (cmd.startsWith("if [ ! -d ")) return "ok";
+      return defaultExecImpl(cmd);
+    });
+    (writeMarkdownFileAtomic as Mock).mockRejectedValueOnce(new Error("sftp"));
+    const res = await rename({ hostId: 1, skill: "build", newName: "ship", content: "x" });
+    expect(res.status).toBe(502);
+    expect((res.body as { renamed: boolean }).renamed).toBe(true);
+  });
+});

@@ -1,0 +1,1809 @@
+import axios, { AxiosError, type AxiosInstance } from "axios";
+import { toast } from "sonner";
+import { getBasePath } from "@/lib/base-path";
+import { clearSkynetSessionStorage } from "@/shell/TabContext";
+import type { SSHHost } from "@/types/index";
+
+// ============================================================================
+// RBAC TYPE DEFINITIONS
+// ============================================================================
+
+export interface Role {
+  id: number;
+  name: string;
+  displayName: string;
+  description: string | null;
+  isSystem: boolean;
+  permissions: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface UserRole {
+  userId: string;
+  roleId: number;
+  roleName: string;
+  roleDisplayName: string;
+  grantedBy: string;
+  grantedByUsername: string;
+  grantedAt: string;
+}
+
+export interface AccessRecord {
+  id: number;
+  targetType: "user" | "role";
+  userId: string | null;
+  roleId: number | null;
+  username: string | null;
+  roleName: string | null;
+  roleDisplayName: string | null;
+  grantedBy: string;
+  grantedByUsername: string;
+  permissionLevel: "view";
+  expiresAt: string | null;
+  createdAt: string;
+}
+import {
+  apiLogger,
+  authLogger,
+  sshLogger,
+  tunnelLogger,
+  fileLogger,
+  statsLogger,
+  dashboardLogger,
+  type LogContext,
+} from "@/lib/frontend-logger";
+import { dbHealthMonitor } from "@/lib/db-health-monitor";
+// Phase 111 Plan 04 (SKEW-04 / SKEW-06): client-side airtight stamping +
+// response drift detection. CLIENT_BUILD_ID is the Vite-`define`-baked
+// literal that goes on every request; skew-lock-store is the shell-level
+// state Wave 1 lanes converge on when either drift signal fires.
+import { CLIENT_BUILD_ID } from "@/lib/client-build-id";
+import {
+  getSkewLockedSnapshot,
+  lockSkewedSession,
+} from "@/state/skew-lock-store";
+
+export type ServerStatus = {
+  status: "online" | "offline";
+  lastChecked: string;
+};
+
+export type SSHHostWithStatus = SSHHost & {
+  status: "online" | "offline" | "unknown";
+};
+
+interface CpuMetrics {
+  percent: number | null;
+  cores: number | null;
+  load: [number, number, number] | null;
+}
+
+interface MemoryMetrics {
+  percent: number | null;
+  usedGiB: number | null;
+  totalGiB: number | null;
+}
+
+interface DiskMetrics {
+  percent: number | null;
+  usedHuman: string | null;
+  totalHuman: string | null;
+  availableHuman?: string | null;
+}
+
+export type ServerMetrics = {
+  cpu: CpuMetrics;
+  memory: MemoryMetrics;
+  disk: DiskMetrics;
+  lastChecked: string;
+};
+
+export interface AuthResponse {
+  success?: boolean;
+  is_admin?: boolean;
+  username?: string;
+  userId?: string;
+  is_oidc?: boolean;
+  totp_enabled?: boolean;
+  data_unlocked?: boolean;
+  requires_totp?: boolean;
+  temp_token?: string;
+  token?: string;
+}
+
+export interface UserInfo {
+  totp_enabled: boolean;
+  userId: string;
+  username: string;
+  is_admin: boolean;
+  is_oidc: boolean;
+  data_unlocked: boolean;
+  password_hash?: string;
+  /**
+   * Phase 90 Plan 05 Task 1 (W#8 resolution — Option A, smallest-diff path):
+   * the viewing user's Matrix mxid. Populated by the `/users/me` endpoint from
+   * `users.mxid` (Phase 88 slice A durable column). Optional at the type
+   * level for backward-compat with pre-Phase-90 cached responses / pre-Phase-88
+   * users who may still have `mxid=null` in the DB. Consumers (e.g.,
+   * `viewing-user-store.ts`) treat `undefined` and `null` identically as
+   * "no mxid known" and render accordingly.
+   */
+  mxid?: string | null;
+  /**
+   * Phase 137 D-30 — viewing user's avatar filename (populated from
+   * users.avatar_path via /users/me). Frontend uses this to conditionally
+   * render the sidebar footer avatar preview. Nullable — users without an
+   * uploaded avatar surface here as null.
+   */
+  avatarPath?: string | null;
+}
+
+interface UserCount {
+  count: number;
+}
+
+interface OIDCAuthorize {
+  auth_url: string;
+}
+
+type BrowserWindow = Window &
+  typeof globalThis & {
+    ReactNativeWebView?: unknown;
+  };
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+function getLoggerForService(serviceName: string) {
+  if (serviceName.includes("SSH") || serviceName.includes("ssh")) {
+    return sshLogger;
+  } else if (serviceName.includes("TUNNEL") || serviceName.includes("tunnel")) {
+    return tunnelLogger;
+  } else if (serviceName.includes("FILE") || serviceName.includes("file")) {
+    return fileLogger;
+  } else if (serviceName.includes("STATS") || serviceName.includes("stats")) {
+    return statsLogger;
+  } else if (serviceName.includes("AUTH") || serviceName.includes("auth")) {
+    return authLogger;
+  } else if (
+    serviceName.includes("DASHBOARD") ||
+    serviceName.includes("dashboard")
+  ) {
+    return dashboardLogger;
+  } else {
+    return apiLogger;
+  }
+}
+
+// R-54-02: Full-jitter exponential backoff — AWS canonical shape (Marc Brooker).
+// attempt is 1-indexed: attempt=1 → [0, 600ms), attempt=2 → [0, 1200ms).
+export function computeBackoffMs(attempt: number): number {
+  return Math.floor(Math.random() * (300 * Math.pow(2, attempt)));
+}
+
+// Retry-eligible network error codes (connection-level failures safe to retry for any method).
+const NETWORK_CODES = [
+  "ERR_NETWORK",
+  "ECONNREFUSED",
+  "ECONNABORTED",
+  "ECONNRESET",
+  "ETIMEDOUT",
+];
+
+// R-54-01: Retry classification tree — method-aware idempotency safeguard.
+export function isRetryable(
+  error: AxiosError,
+  config: AxiosRequestConfigExtended | undefined,
+): boolean {
+  // Escape hatches — checked first, no await needed.
+  if (config?.__noRetry === true) return false;
+  if (config?.__silentRetry === true) return false;
+
+  const method = (config?.method ?? "").toUpperCase();
+  const status = error.response?.status;
+  const code = error.code;
+
+  // Connection-level failure: no HTTP response reached us (status undefined or 0).
+  // Includes ECONNREFUSED, ERR_NETWORK, ECONNABORTED, etc. — and MockAdapter
+  // status-0 responses which represent the same condition in tests.
+  const isConnectionLevel =
+    (status === undefined || status === 0) &&
+    (NETWORK_CODES.includes(code ?? "") || error.response === undefined || status === 0);
+
+  const isIdempotent = method === "GET" || method === "HEAD" || method === "OPTIONS";
+
+  if (isConnectionLevel) {
+    if (isIdempotent) return true;
+    // POST, PUT, PATCH, DELETE: only a refused connection proves the request
+    // never left. A browser can't tell us that — it reports every drop as
+    // ERR_NETWORK, including a phone suspending the app after the server
+    // already acted — so in the browser these are never re-sent; re-sending
+    // could do the action twice. (ECONNREFUSED only appears outside a browser.)
+    return code === "ECONNREFUSED";
+  }
+
+  // 5xx gateway errors: only retry on idempotent methods.
+  if (status === 502 || status === 503 || status === 504) {
+    // POST, PUT, PATCH, DELETE — server may have processed; do NOT retry on 5xx.
+    return isIdempotent;
+  }
+
+  // 4xx and anything else (including 500, 501) — never retry.
+  return false;
+}
+
+export function setCookie(name: string, value: string, days = 7): void {
+  const expires = new Date(Date.now() + days * 864e5).toUTCString();
+  document.cookie = `${name}=${encodeURIComponent(value)}; expires=${expires}; path=/`;
+}
+
+export function getCookie(name: string): string | undefined {
+  const value = `; ${document.cookie}`;
+  const parts = value.split(`; ${name}=`);
+  const encodedToken =
+    parts.length === 2 ? parts.pop()?.split(";").shift() : undefined;
+  const token = encodedToken ? decodeURIComponent(encodedToken) : undefined;
+  return token;
+}
+
+let userWasAuthenticated = false;
+let latestAuthSuccessAt = 0;
+
+export function markUserAuthenticated(): void {
+  userWasAuthenticated = true;
+  latestAuthSuccessAt =
+    typeof performance !== "undefined" ? performance.now() : Date.now();
+}
+
+export function isCurrentAuthInvalidationError(error: unknown): boolean {
+  const authError = error as {
+    __staleAuthInvalidation?: boolean;
+  };
+
+  if (authError.__staleAuthInvalidation) {
+    return false;
+  }
+
+  const axiosError = error as AxiosError;
+  const apiError = error as ApiError;
+  const responseData = axiosError.response?.data as
+    | Record<string, unknown>
+    | undefined;
+  const errorCode = responseData?.code || apiError.code;
+  const errorMessage = responseData?.error || apiError.message;
+  const status = axiosError.response?.status || apiError.status;
+  const isMissingAuthenticationToken =
+    errorMessage === "Missing authentication token";
+
+  return (
+    status === 401 &&
+    (errorCode === "SESSION_EXPIRED" ||
+      errorCode === "SESSION_NOT_FOUND" ||
+      (errorCode === "AUTH_REQUIRED" && userWasAuthenticated) ||
+      errorMessage === "Invalid token" ||
+      (errorMessage === "Authentication required" && userWasAuthenticated) ||
+      (isMissingAuthenticationToken && userWasAuthenticated))
+  );
+}
+
+// Maximum total attempts (1 initial + 2 retries) for the retry interceptor.
+const MAX_ATTEMPTS = 3;
+
+// Suppress "🐌 Slow request" warnings when tab visibility was hidden at any point
+// during the request — performance.now() ticks real time even while the browser
+// throttles the tab's JS event loop, so a backgrounded PWA reports 8-18s waits
+// that are pure JS-scheduler delay, not real slowness. See close-out of bounty
+// auth-slow-requests-on-pwa-boot (2026-09-10).
+let lastVisibilityHiddenAt = -Infinity;
+if (typeof document !== "undefined") {
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") {
+      lastVisibilityHiddenAt = performance.now();
+    }
+  });
+}
+
+export function createApiInstance(
+  baseURL: string,
+  serviceName: string = "API",
+): AxiosInstance {
+  const instance = axios.create({
+    baseURL,
+    headers: { "Content-Type": "application/json" },
+    timeout: 30000,
+    withCredentials: true,
+  });
+
+  instance.interceptors.request.use((config: AxiosRequestConfig) => {
+    const startTime = performance.now();
+    const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+    const configWithMetadata = config as AxiosRequestConfigExtended;
+    configWithMetadata.startTime = startTime;
+    configWithMetadata.requestId = requestId;
+
+    const method = config.method?.toUpperCase() || "UNKNOWN";
+    const url = config.url || "UNKNOWN";
+    const fullUrl = `${config.baseURL}${url}`;
+
+    const context: LogContext = {
+      requestId,
+      method,
+      url: fullUrl,
+      operation: "request_start",
+    };
+
+    const logger = getLoggerForService(serviceName);
+
+    const isDevMode = process.env.NODE_ENV === "development";
+
+    if (isDevMode) {
+      logger.requestStart(method, fullUrl, context);
+    }
+
+    if (
+      typeof window !== "undefined" &&
+      (window as BrowserWindow).ReactNativeWebView
+    ) {
+      let platform = "Unknown";
+      if (typeof navigator !== "undefined" && navigator.userAgent) {
+        if (navigator.userAgent.includes("Android")) {
+          platform = "Android";
+        } else if (
+          navigator.userAgent.includes("iPhone") ||
+          navigator.userAgent.includes("iPad") ||
+          navigator.userAgent.includes("iOS")
+        ) {
+          platform = "iOS";
+        }
+      }
+      if (config.headers.set) {
+        config.headers.set("User-Agent", `Skynet-Mobile/${platform}`);
+      } else {
+        config.headers["User-Agent"] = `Skynet-Mobile/${platform}`;
+      }
+    }
+
+    // Phase 132 SKEW-04: airtight-by-construction client stamping. All 8
+    // axios instances derive from this factory; a single header set here
+    // covers every UI-initiated HTTP call. Parallel discipline lives in
+    // src/ui/lib/stamped-fetch.ts for the raw-fetch lane. The two-branch
+    // guard handles both header shapes — AxiosHeaders in real axios,
+    // plain-object headers under axios-mock-adapter in older tests.
+    if (config.headers.set) {
+      config.headers.set("X-Skynet-Client-Build", CLIENT_BUILD_ID);
+    } else {
+      config.headers["X-Skynet-Client-Build"] = CLIENT_BUILD_ID;
+    }
+
+    return config;
+  });
+
+  instance.interceptors.response.use(
+    (response: AxiosResponse) => {
+      const endTime = performance.now();
+      const responseConfig = response.config as AxiosRequestConfigExtended;
+      const startTime = responseConfig.startTime;
+      const requestId = responseConfig.requestId;
+      const responseTime = Math.round(endTime - (startTime || endTime));
+
+      const method = response.config.method?.toUpperCase() || "UNKNOWN";
+      const url = response.config.url || "UNKNOWN";
+      const fullUrl = `${response.config.baseURL}${url}`;
+
+      const context: LogContext = {
+        requestId,
+        method,
+        url: fullUrl,
+        status: response.status,
+        statusText: response.statusText,
+        responseTime,
+        operation: "request_success",
+      };
+
+      const logger = getLoggerForService(serviceName);
+
+      if (process.env.NODE_ENV === "development") {
+        logger.requestSuccess(
+          method,
+          fullUrl,
+          response.status,
+          responseTime,
+          context,
+        );
+      }
+
+      const tabWasHiddenDuringRequest =
+        (startTime !== undefined && lastVisibilityHiddenAt >= startTime) ||
+        (typeof document !== "undefined" &&
+          document.visibilityState === "hidden");
+      if (responseTime > 3000 && !tabWasHiddenDuringRequest) {
+        logger.warn(`🐌 Slow request: ${responseTime}ms`, context);
+      }
+
+      dbHealthMonitor.reportDatabaseSuccess();
+
+      // Phase 111 SKEW-06a: response tag mismatch drift detection (D-15 —
+      // only fires on SUCCESSFUL responses; failed requests during a deploy
+      // restart go through the existing reconnecting-affordance surface,
+      // not the skew-lock modal). Absence of the header (dev mode, non-
+      // versioned response path) passes through unchanged — mirrors the
+      // backend's mismatch-only enforcement in skew-lock-middleware. The
+      // idempotency check is a cheap short-circuit — the store already
+      // handles first-drift-wins internally, but skipping the call when
+      // already locked keeps the console quiet on rapid duplicate signals.
+      const serverBuild = response.headers["x-skynet-server-build"];
+      if (
+        typeof serverBuild === "string" &&
+        serverBuild !== CLIENT_BUILD_ID &&
+        !getSkewLockedSnapshot().locked
+      ) {
+        lockSkewedSession({
+          reason: "response_tag_mismatch",
+          clientBuild: CLIENT_BUILD_ID,
+          serverBuild,
+        });
+      }
+
+      return response;
+    },
+    async (error: AxiosErrorExtended) => {
+      const endTime = performance.now();
+      const startTime = error.config?.startTime;
+      const requestId = error.config?.requestId;
+      const responseTime = startTime
+        ? Math.round(endTime - startTime)
+        : undefined;
+
+      const method = error.config?.method?.toUpperCase() || "UNKNOWN";
+      const url = error.config?.url || "UNKNOWN";
+      const fullUrl = error.config ? `${error.config.baseURL}${url}` : url;
+      const status = error.response?.status;
+      const message =
+        (error.response?.data as { error?: string })?.error ||
+        (error as Error).message ||
+        "Unknown error";
+      const errorCode =
+        (error.response?.data as { code?: string })?.code || error.code;
+
+      const context: LogContext = {
+        requestId,
+        method,
+        url: fullUrl,
+        status,
+        responseTime,
+        errorCode,
+        errorMessage: message,
+        operation: "request_error",
+      };
+
+      const logger = getLoggerForService(serviceName);
+      // A caller can mark a request as a silent retry (see progressive /status
+      // retry) so we don't spam error logs / health events on each attempt.
+      const isSilentRetry = !!error.config?.__silentRetry;
+
+      if (process.env.NODE_ENV === "development" && !isSilentRetry) {
+        if (status === 401) {
+          logger.authError(method, fullUrl, context);
+        } else if (status === 0 || !status) {
+          logger.networkError(method, fullUrl, message, context);
+        } else {
+          logger.requestError(
+            method,
+            fullUrl,
+            status || 0,
+            message,
+            responseTime,
+            context,
+          );
+        }
+      }
+
+      // ── Retry interceptor (R-54-01, R-54-02, R-54-05, R-54-06) ─────────────
+      // Runs BEFORE the 401 fast-path: isRetryable returns false for all 4xx
+      // so 401 falls through to the existing handler with zero retry delay.
+      if (error.config) {
+        const config = error.config as AxiosRequestConfigExtended;
+        config.__retryAttempt = (config.__retryAttempt ?? 0) + 1;
+        const attempt = config.__retryAttempt;
+
+        if (attempt < MAX_ATTEMPTS && isRetryable(error, config)) {
+          const delayMs = computeBackoffMs(attempt);
+          logger.warn("http_retry_attempt", {
+            requestId,
+            method,
+            url: fullUrl,
+            attempt,
+            delayMs,
+            errorCode,
+            errorMessage: message,
+          });
+          await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+          // Re-fire the original request. The response interceptor's success
+          // branch calls dbHealthMonitor.reportDatabaseSuccess() — which
+          // satisfies R-54-06 on a successful retry without extra code here.
+          return instance.request(config);
+        }
+
+        if (attempt >= MAX_ATTEMPTS && isRetryable(error, config)) {
+          // Give-up summary log after exhausting all attempts.
+          logger.warn("retries_exhausted", {
+            requestId,
+            method,
+            url: fullUrl,
+            attempts: attempt,
+            finalErrorCode: errorCode,
+            finalErrorMessage: message,
+          });
+        }
+      }
+      // ── End retry interceptor ─────────────────────────────────────────────
+
+      // "Confirm it's you": the server refused a sensitive action because this
+      // sign-in hasn't proved itself in the last few minutes. Ask for the
+      // password (and code), then send the original request once more.
+      if (
+        status === 403 &&
+        errorCode === "REAUTH_REQUIRED" &&
+        error.config &&
+        !error.config.__reauthAttempted
+      ) {
+        const config = error.config;
+        config.__reauthAttempted = true;
+        const needsCode = !!(error.response?.data as { totpRequired?: boolean })
+          ?.totpRequired;
+        logger.info("reauth_prompt_shown", { requestId, method, url: fullUrl, needsCode });
+        const { kitConfirmIdentity } = await import("@/components/kit/dialogs");
+        const confirmed = await kitConfirmIdentity({
+          needsCode,
+          submit: (password, code) => confirmIdentity(password, code),
+        });
+        logger.info(confirmed ? "reauth_confirmed" : "reauth_cancelled", {
+          requestId,
+          method,
+          url: fullUrl,
+        });
+        if (confirmed) {
+          return instance.request(
+            config as unknown as Parameters<typeof instance.request>[0],
+          );
+        }
+        return Promise.reject(error);
+      }
+
+      // Phase 111 SKEW-06b: server-refused stale client (D-15). 409 with the
+      // canonical stale_client body triggers the lock. Non-stale_client 409s
+      // (business-logic conflicts) DO NOT fire the lock — body-shape check
+      // gates on `error === "stale_client"` in the JSON payload. Idempotent
+      // via the store's own first-drift-wins guard + the cheap snapshot
+      // short-circuit. Rejection still surfaces so caller cleanup fires —
+      // the lock modal is renderer-owned; the caller sees the reject as
+      // normal 409 behavior.
+      if (error.response?.status === 409) {
+        const body = error.response?.data as { error?: string } | undefined;
+        if (body?.error === "stale_client" && !getSkewLockedSnapshot().locked) {
+          const serverBuildHeader =
+            (error.response.headers?.["x-skynet-server-build"] as
+              | string
+              | undefined) || "unknown";
+          lockSkewedSession({
+            reason: "server_refused_stale_client",
+            clientBuild: CLIENT_BUILD_ID,
+            serverBuild: serverBuildHeader,
+          });
+        }
+      }
+
+      if (status === 401) {
+        const errorCode = (error.response?.data as Record<string, unknown>)
+          ?.code;
+        const errorMessage = (error.response?.data as Record<string, unknown>)
+          ?.error;
+        const isSessionExpired = errorCode === "SESSION_EXPIRED";
+        const isSessionNotFound = errorCode === "SESSION_NOT_FOUND";
+        const isMissingAuthenticationToken =
+          errorMessage === "Missing authentication token";
+        const isInvalidToken =
+          errorCode === "AUTH_REQUIRED" ||
+          errorMessage === "Invalid token" ||
+          errorMessage === "Authentication required" ||
+          (isMissingAuthenticationToken && userWasAuthenticated);
+
+        if (isSessionExpired || isSessionNotFound || isInvalidToken) {
+          const requestStartedAt =
+            typeof error.config?.startTime === "number"
+              ? error.config.startTime
+              : 0;
+          const isStaleAuthInvalidation =
+            latestAuthSuccessAt > 0 &&
+            requestStartedAt > 0 &&
+            requestStartedAt < latestAuthSuccessAt;
+
+          if (isStaleAuthInvalidation) {
+            (
+              error as { __staleAuthInvalidation?: boolean }
+            ).__staleAuthInvalidation = true;
+            return Promise.reject(error);
+          }
+
+          if (typeof window !== "undefined") {
+            document.cookie =
+              "jwt=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;";
+          }
+
+          if (isSessionExpired && typeof window !== "undefined") {
+            console.warn("Session expired - please log in again");
+            toast.warning("Session expired. Please log in again.");
+          }
+
+          dbHealthMonitor.reportSessionExpired();
+
+          userWasAuthenticated = false;
+        }
+      } else if (!isSilentRetry) {
+        const wasAuthenticated = userWasAuthenticated;
+        dbHealthMonitor.reportDatabaseError(error, wasAuthenticated);
+      }
+
+      return Promise.reject(error);
+    },
+  );
+
+  return instance;
+}
+
+// ============================================================================
+// API INSTANCES
+// ============================================================================
+
+function isDev(): boolean {
+  return (
+    process.env.NODE_ENV === "development" &&
+    (window.location.port === "3000" ||
+      window.location.port === "5173" ||
+      window.location.port === "" ||
+      window.location.hostname === "localhost" ||
+      window.location.hostname === "127.0.0.1")
+  );
+}
+
+const apiHost = import.meta.env.VITE_API_HOST || "localhost";
+
+interface AxiosRequestConfigExtended extends AxiosRequestConfig {
+  startTime?: number;
+  requestId?: string;
+  __silentRetry?: boolean;
+  __noRetry?: boolean;
+  __retryAttempt?: number;
+  __reauthAttempted?: boolean;
+}
+
+interface AxiosErrorExtended extends AxiosError {
+  config?: AxiosRequestConfigExtended;
+}
+
+function getApiUrl(path: string, defaultPort: number): string {
+  const devMode = isDev();
+
+  if (devMode) {
+    const protocol = window.location.protocol === "https:" ? "https" : "http";
+    const sslPort = protocol === "https" ? 8443 : defaultPort;
+    const url = `${protocol}://${apiHost}:${sslPort}${path}`;
+    return url;
+  } else {
+    return getBasePath() + path;
+  }
+}
+
+function initializeApiInstances() {
+  // Host Management API (port 30001) - supports SSH, RDP, VNC, Telnet
+  hostApi = createApiInstance(getApiUrl("/host", 30001), "HOST");
+  sshHostApi = hostApi;
+
+  // Tunnel Management API (port 30003)
+  tunnelApi = createApiInstance(getApiUrl("/ssh", 30003), "TUNNEL");
+
+  // File Manager Operations API (port 30004)
+  fileManagerApi = createApiInstance(
+    getApiUrl("/ssh/file_manager", 30004),
+    "FILE_MANAGER",
+  );
+
+  // Server Statistics API (port 30005)
+  statsApi = createApiInstance(getApiUrl("", 30005), "STATS");
+
+  // Authentication API (port 30001)
+  authApi = createApiInstance(getApiUrl("", 30001), "AUTH");
+
+  // Dashboard API (port 30006)
+  dashboardApi = createApiInstance(getApiUrl("", 30006), "DASHBOARD");
+
+  // RBAC API (port 30001)
+  rbacApi = createApiInstance(getApiUrl("", 30001), "RBAC");
+
+  // Docker Management API (port 30007)
+  dockerApi = createApiInstance(getApiUrl("/docker", 30007), "DOCKER");
+}
+
+// Host Management API (port 30001) - supports SSH, RDP, VNC, Telnet
+export let hostApi: AxiosInstance;
+// Backward compatibility
+export let sshHostApi: AxiosInstance;
+
+// Tunnel Management API (port 30003)
+export let tunnelApi: AxiosInstance;
+
+// File Manager Operations API (port 30004)
+export let fileManagerApi: AxiosInstance;
+
+// Server Statistics API (port 30005)
+export let statsApi: AxiosInstance;
+
+// Authentication API (port 30001)
+export let authApi: AxiosInstance;
+
+// Dashboard API (port 30006)
+export let dashboardApi: AxiosInstance;
+
+// RBAC API (port 30001)
+export let rbacApi: AxiosInstance;
+
+// Docker Management API (port 30007)
+export let dockerApi: AxiosInstance;
+
+// Pre-initialize with default values to avoid undefined errors during early mounting
+initializeApiInstances();
+
+let _resolveAppReady!: () => void;
+export const appReadyPromise: Promise<void> = new Promise((resolve) => {
+  _resolveAppReady = resolve;
+});
+
+function initializeApp() {
+  initializeApiInstances();
+  _resolveAppReady();
+}
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", initializeApp);
+} else {
+  initializeApp();
+}
+
+// ============================================================================
+// ERROR HANDLING
+// ============================================================================
+
+class ApiError extends Error {
+  constructor(
+    message: string,
+    public status?: number,
+    public code?: string,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+export function handleApiError(error: unknown, operation: string): never {
+  const context: LogContext = {
+    operation: "error_handling",
+    errorOperation: operation,
+  };
+
+  if (axios.isAxiosError(error)) {
+    const status = error.response?.status;
+    const message =
+      error.response?.data?.message ||
+      error.response?.data?.error ||
+      error.message;
+    const code = error.response?.data?.code || error.response?.data?.error;
+    const url = error.config?.url;
+    const method = error.config?.method?.toUpperCase();
+
+    const errorContext: LogContext = {
+      ...context,
+      method,
+      url,
+      status,
+      errorCode: code,
+      errorMessage: message,
+    };
+
+    if (status === 401) {
+      authLogger.warn(
+        `Auth failed: ${method} ${url} - ${message}`,
+        errorContext,
+      );
+
+      const isLoginEndpoint = url?.includes("/users/login");
+      const errorMessage = isLoginEndpoint
+        ? message
+        : "Authentication required. Please log in again.";
+
+      throw new ApiError(errorMessage, 401, code || "AUTH_REQUIRED");
+    } else if (status === 403) {
+      authLogger.warn(`Access denied: ${method} ${url}`, errorContext);
+      const apiError = new ApiError(
+        code === "TOTP_REQUIRED"
+          ? message
+          : "Access denied. You do not have permission to perform this action.",
+        403,
+        code || "ACCESS_DENIED",
+      );
+      (apiError as ApiError & { response?: unknown }).response = error.response;
+      throw apiError;
+    } else if (status === 404) {
+      apiLogger.warn(`Not found: ${method} ${url}`, errorContext);
+      throw new ApiError(
+        "Resource not found. The requested item may have been deleted.",
+        404,
+        "NOT_FOUND",
+      );
+    } else if (status === 409) {
+      apiLogger.warn(`Conflict: ${method} ${url}`, errorContext);
+      throw new ApiError(
+        "Conflict. The resource already exists or is in use.",
+        409,
+        "CONFLICT",
+      );
+    } else if (status === 422) {
+      apiLogger.warn(
+        `Validation error: ${method} ${url} - ${message}`,
+        errorContext,
+      );
+      throw new ApiError(
+        "Validation error. Please check your input and try again.",
+        422,
+        "VALIDATION_ERROR",
+      );
+    } else if (status && status >= 500) {
+      apiLogger.error(
+        `Server error: ${method} ${url} - ${message}`,
+        error,
+        errorContext,
+      );
+      throw new ApiError(
+        "Server error occurred. Please try again later.",
+        status,
+        "SERVER_ERROR",
+      );
+    } else if (status === 0) {
+      if (url.includes("no-server-configured")) {
+        apiLogger.error(
+          `No server configured: ${method} ${url}`,
+          error,
+          errorContext,
+        );
+        throw new ApiError(
+          "No server configured. Please configure a server first.",
+          0,
+          "NO_SERVER_CONFIGURED",
+        );
+      }
+      apiLogger.error(
+        `Network error: ${method} ${url} - ${message}`,
+        error,
+        errorContext,
+      );
+      throw new ApiError(
+        "Network error. Please check your connection and try again.",
+        0,
+        "NETWORK_ERROR",
+      );
+    } else {
+      apiLogger.error(
+        `Request failed: ${method} ${url} - ${message}`,
+        error,
+        errorContext,
+      );
+      throw new ApiError(message || `Failed to ${operation}`, status, code);
+    }
+  }
+
+  if (error instanceof ApiError) {
+    throw error;
+  }
+
+  const errorMessage = error instanceof Error ? error.message : "Unknown error";
+  apiLogger.error(
+    `Unexpected error during ${operation}: ${errorMessage}`,
+    error,
+    context,
+  );
+  throw new ApiError(
+    `Unexpected error during ${operation}: ${errorMessage}`,
+    undefined,
+    "UNKNOWN_ERROR",
+  );
+}
+
+// ============================================================================
+
+// ============================================================================
+// HOST-TO-HOST TRANSFER
+// ============================================================================
+
+export type TransferMethodPreference = "auto" | "tar" | "item_sftp";
+
+export interface TransferScanSummary {
+  fileCount: number;
+  totalBytes: number;
+  largestFileBytes: number;
+  incompressibleRatio: number;
+}
+
+export interface TransferMethodPreview {
+  methodPreference: TransferMethodPreference;
+  resolvedMethod: "tar" | "item_sftp";
+  reasonKey: string;
+  sourcePlatform: "unix" | "windows";
+  destPlatform: "unix" | "windows";
+  sourceHasTar: boolean;
+  destHasTar: boolean;
+  summary: TransferScanSummary;
+}
+
+export async function getTransferMethodPreview(
+  sourceSessionId: string,
+  sourcePaths: string[],
+  destSessionId: string,
+  destPath: string,
+  methodPreference?: TransferMethodPreference,
+): Promise<TransferMethodPreview> {
+  try {
+    const response = await fileManagerApi.post("/ssh/transferMethodPreview", {
+      sourceSessionId,
+      sourcePaths,
+      destSessionId,
+      destPath,
+      methodPreference: methodPreference ?? "auto",
+    });
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "preview transfer method");
+    throw error;
+  }
+}
+
+export interface TransferHopMetrics {
+  id: string;
+  mbPerSec?: number;
+}
+
+export interface TransferTimings {
+  prepareDestMs?: number;
+  compressMs?: number;
+  transferMs?: number;
+  extractMs?: number;
+  sourceDeleteMs?: number;
+  totalMs?: number;
+  transferBytes?: number;
+  endToEndMbPerSec?: number;
+  hops?: TransferHopMetrics[];
+}
+
+export function getTransferProgressPercent(
+  status: TransferProgressResponse,
+): number | undefined {
+  if (
+    status.bytesTransferred !== undefined &&
+    status.totalBytes !== undefined &&
+    status.totalBytes > 0
+  ) {
+    return Math.min(
+      100,
+      Math.round((status.bytesTransferred / status.totalBytes) * 100),
+    );
+  }
+  if (
+    status.itemsCompleted !== undefined &&
+    status.totalItems !== undefined &&
+    status.totalItems > 0
+  ) {
+    return Math.min(
+      100,
+      Math.round((status.itemsCompleted / status.totalItems) * 100),
+    );
+  }
+  return undefined;
+}
+
+export function formatTransferMbPerSec(
+  mbPerSec?: number,
+  _bytes?: number,
+  _ms?: number,
+): string {
+  if (mbPerSec === undefined || mbPerSec <= 0) return "";
+  if (mbPerSec < 1) return `${(mbPerSec * 1024).toFixed(0)} KB/s`;
+  return `${mbPerSec.toFixed(1)} MB/s`;
+}
+
+export function formatDurationMs(ms?: number): string {
+  if (ms === undefined) return "";
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
+  const minutes = Math.floor(ms / 60000);
+  const seconds = Math.round((ms % 60000) / 1000);
+  return `${minutes}m ${seconds}s`;
+}
+
+interface TransferProgressTracker {
+  update(status: TransferProgressResponse): {
+    rate: number | undefined;
+    stalled: boolean;
+  };
+}
+
+export function createTransferProgressTracker(): TransferProgressTracker {
+  let lastBytes: number | undefined;
+  let lastTime: number | undefined;
+  let lastRate: number | undefined;
+  let lastActivityTime: number | undefined;
+  const STALL_THRESHOLD_MS = 5000;
+
+  return {
+    update(status) {
+      const now = Date.now();
+      const bytes = status.bytesTransferred;
+
+      if (
+        bytes !== undefined &&
+        lastBytes !== undefined &&
+        lastTime !== undefined
+      ) {
+        const deltaBytes = bytes - lastBytes;
+        const deltaMs = now - lastTime;
+        if (deltaMs > 0 && deltaBytes >= 0) {
+          lastRate = (deltaBytes / deltaMs / 1024 / 1024) * 1000;
+          if (deltaBytes > 0) lastActivityTime = now;
+        }
+      } else if (bytes !== undefined) {
+        lastActivityTime = now;
+      }
+
+      lastBytes = bytes;
+      lastTime = now;
+
+      const stalled =
+        lastActivityTime !== undefined &&
+        now - lastActivityTime > STALL_THRESHOLD_MS &&
+        status.status === "running" &&
+        status.phase === "transferring";
+
+      return { rate: lastRate, stalled };
+    },
+  };
+}
+
+export interface TransferProgressResponse {
+  transferId: string;
+  status: "running" | "success" | "partial" | "error" | "cancelled";
+  phase: "compressing" | "transferring" | "extracting" | "reconnecting";
+  bytesTransferred?: number;
+  totalBytes?: number;
+  itemsCompleted?: number;
+  totalItems?: number;
+  failedPaths?: string[];
+  message?: string;
+  method?: "stream" | "tar" | "item_sftp";
+  sourcePaths?: string[];
+  destPath?: string;
+  sourceSessionId?: string;
+  destSessionId?: string;
+  startedAt?: number;
+  timings?: TransferTimings;
+  sourceDeleted?: boolean;
+  moveRequested?: boolean;
+  partialDestRemaining?: boolean;
+  cleanupCompleted?: boolean;
+  retryable?: boolean;
+  parallelSegmentCount?: number;
+}
+
+export async function transferToHost(
+  sourceSessionId: string,
+  sourcePaths: string[],
+  destSessionId: string,
+  destPath: string,
+  move?: boolean,
+  methodPreference?: TransferMethodPreference,
+  parallelSegmentCount = 2,
+): Promise<{ transferId: string }> {
+  try {
+    fileLogger.info("Starting host transfer", {
+      operation: "host_transfer",
+      sourceSessionId,
+      destSessionId,
+      sourcePaths,
+      destPath,
+      move,
+      methodPreference,
+      parallelSegmentCount,
+    });
+
+    const response = await fileManagerApi.post("/ssh/transferToHost", {
+      sourceSessionId,
+      sourcePaths,
+      destSessionId,
+      destPath,
+      move,
+      methodPreference: methodPreference ?? "auto",
+      parallelSegmentCount,
+    });
+
+    return response.data;
+  } catch (error) {
+    fileLogger.error("Failed to start host transfer", error, {
+      operation: "host_transfer",
+      sourceSessionId,
+      destSessionId,
+      sourcePaths,
+    });
+    handleApiError(error, "transfer to host");
+    throw error;
+  }
+}
+
+export async function getTransferStatus(
+  transferId: string,
+): Promise<TransferProgressResponse> {
+  try {
+    const response = await fileManagerApi.get(
+      `/ssh/transferStatus/${transferId}`,
+    );
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "get transfer status");
+    throw error;
+  }
+}
+
+export async function listActiveTransfers(): Promise<{
+  transfers: TransferProgressResponse[];
+}> {
+  try {
+    const response = await fileManagerApi.get("/ssh/activeTransfers");
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "list active transfers");
+    throw error;
+  }
+}
+
+export async function cancelTransferToHost(transferId: string): Promise<void> {
+  try {
+    await fileManagerApi.post(`/ssh/transferCancel/${transferId}`);
+  } catch (error) {
+    fileLogger.warn("Transfer cancel request failed (non-fatal)", {
+      operation: "host_transfer",
+      transferId,
+      error,
+    });
+  }
+}
+
+export async function cleanupCancelledTransfer(
+  transferId: string,
+): Promise<{ removedPaths: string[]; failedPaths: string[] }> {
+  try {
+    const response = await fileManagerApi.post(
+      `/ssh/transferCleanup/${transferId}`,
+    );
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "clean up cancelled transfer");
+    throw error;
+  }
+}
+
+export async function retryTransferToHost(
+  transferId: string,
+): Promise<{ ok: boolean; transferId: string }> {
+  try {
+    const response = await fileManagerApi.post(
+      `/ssh/transferRetry/${transferId}`,
+    );
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "retry transfer");
+    throw error;
+  }
+}
+
+export async function pollTransferUntilComplete(
+  transferId: string,
+  onProgress?: (status: TransferProgressResponse) => void,
+  intervalMs = 500,
+): Promise<TransferProgressResponse> {
+  return new Promise((resolve, reject) => {
+    const poll = async () => {
+      try {
+        const status = await getTransferStatus(transferId);
+        onProgress?.(status);
+
+        if (
+          status.status === "success" ||
+          status.status === "partial" ||
+          status.status === "error" ||
+          status.status === "cancelled"
+        ) {
+          resolve(status);
+          return;
+        }
+
+        setTimeout(poll, intervalMs);
+      } catch (err) {
+        reject(err);
+      }
+    };
+
+    void poll();
+  });
+}
+
+// ============================================================================
+// FILE MANAGER DATA
+// ============================================================================
+
+export interface TransferDestination {
+  id: number;
+  userId: string;
+  sourceHostId: number;
+  destHostId: number;
+  destPath: string;
+  destPathLabel?: string;
+  lastUsed?: string;
+}
+
+export async function getTransferRecent(
+  sourceHostId: number,
+): Promise<TransferDestination[]> {
+  try {
+    const response = await authApi.get("/host/transfer/recent", {
+      params: { sourceHostId },
+    });
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "get transfer recent destinations");
+    throw error;
+  }
+}
+
+export async function addTransferRecent(
+  sourceHostId: number,
+  destHostId: number,
+  destPath: string,
+  destPathLabel?: string,
+): Promise<Record<string, unknown>> {
+  try {
+    const response = await authApi.post("/host/transfer/recent", {
+      sourceHostId,
+      destHostId,
+      destPath,
+      destPathLabel,
+    });
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "add transfer recent destination");
+    throw error;
+  }
+}
+
+export {
+  getSSHHosts,
+  createSSHHost,
+  updateSSHHost,
+  wakeOnLan,
+  bulkImportSSHHosts,
+  bulkUpdateSSHHosts,
+  deleteSSHHost,
+  getSSHHostById,
+  exportSSHHostWithCredentials,
+  exportAllSSHHosts,
+  enableAutoStart,
+  disableAutoStart,
+  getAutoStartStatus,
+  testProxyConnection,
+} from "@/api/ssh-host-management-api";
+
+export {
+  getTunnelStatuses,
+  subscribeTunnelStatuses,
+  getTunnelStatusByName,
+  connectTunnel,
+  disconnectTunnel,
+  cancelTunnel,
+  getC2STunnelPresets,
+  createC2STunnelPreset,
+  updateC2STunnelPreset,
+  deleteC2STunnelPreset,
+} from "@/api/tunnel-api";
+
+export {
+  getFileManagerRecent,
+  addFileManagerRecent,
+  removeFileManagerRecent,
+  getFileManagerPinned,
+  addFileManagerPinned,
+  removeFileManagerPinned,
+  getFileManagerShortcuts,
+  addFileManagerShortcut,
+  removeFileManagerShortcut,
+} from "@/api/file-manager-metadata-api";
+
+export {
+  connectSSH,
+  disconnectSSH,
+  verifySSHTOTP,
+  verifySSHWarpgate,
+  quickConnect,
+  getSSHStatus,
+  keepSSHAlive,
+  listSSHFiles,
+  identifySSHSymlink,
+  resolveSSHPath,
+  readSSHFile,
+  writeSSHFile,
+  uploadSSHFile,
+  downloadSSHFile,
+  downloadSSHFileStream,
+  createSSHFile,
+  createSSHFolder,
+  deleteSSHItem,
+  setSudoPassword,
+  copySSHItem,
+  renameSSHItem,
+  moveSSHItem,
+  changeSSHPermissions,
+  extractSSHArchive,
+  compressSSHFiles,
+  ensureSSHSessionForHost,
+  browseSSHDirectory,
+  type HostConnectionState,
+  type EnsureSSHSessionResult,
+  type BrowseSSHDirectoryResult,
+} from "@/api/ssh-file-operations-api";
+
+export {
+  getRecentFiles,
+  addRecentFile,
+  removeRecentFile,
+  getPinnedFiles,
+  addPinnedFile,
+  removePinnedFile,
+  getFolderShortcuts,
+  addFolderShortcut,
+  removeFolderShortcut,
+} from "@/api/file-manager-data-api";
+
+export {
+  getAllServerStatuses,
+  getServerStatusById,
+  getServerMetricsById,
+  startMetricsPolling,
+  stopMetricsPolling,
+  sendMetricsHeartbeat,
+  registerMetricsViewer,
+  unregisterMetricsViewer,
+  submitMetricsTOTP,
+  refreshServerPolling,
+  notifyHostCreatedOrUpdated,
+} from "@/api/server-stats-api";
+
+export {
+  getGlobalMonitoringSettings,
+  updateGlobalMonitoringSettings,
+  getLogLevel,
+  updateLogLevel,
+  getSessionTimeout,
+  updateSessionTimeout,
+  getGuacamoleSettings,
+  updateGuacamoleSettings,
+} from "@/api/settings-api";
+
+// ============================================================================
+// AUTHENTICATION
+// ============================================================================
+
+// Creates the first admin on a brand-new instance. After that, accounts are
+// only made by an admin (the server refuses anyone else).
+export async function registerUser(
+  username: string,
+  password: string,
+  avatar: Blob,
+): Promise<Record<string, unknown>> {
+  try {
+    const form = new FormData();
+    form.append("username", username);
+    form.append("password", password);
+    form.append("avatar", avatar, "avatar.png");
+    const response = await authApi.post("/users/create", form, {
+      headers: { "Content-Type": "multipart/form-data" },
+    });
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "register user");
+  }
+}
+
+export async function loginUser(
+  username: string,
+  password: string,
+): Promise<AuthResponse> {
+  try {
+    const response = await authApi.post("/users/login", {
+      username,
+      password,
+    });
+
+    if (response.data.token) {
+      localStorage.setItem("jwt", response.data.token);
+    }
+
+    if (response.data.success && !response.data.requires_totp) {
+      markUserAuthenticated();
+    }
+
+    return {
+      success: response.data.success,
+      is_admin: response.data.is_admin,
+      username: response.data.username,
+      requires_totp: response.data.requires_totp,
+      temp_token: response.data.temp_token,
+      is_oidc: response.data.is_oidc,
+      totp_enabled: response.data.totp_enabled,
+      data_unlocked: response.data.data_unlocked,
+      token: response.data.token,
+    };
+  } catch (error) {
+    throw handleApiError(error, "login user");
+  }
+}
+
+export async function logoutUser(): Promise<{
+  success: boolean;
+  message: string;
+}> {
+  try {
+    const response = await authApi.post("/users/logout");
+
+    clearSkynetSessionStorage();
+
+    const isSecure = window.location.protocol === "https:";
+    const cookieString = isSecure
+      ? "jwt=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/; Secure; SameSite=Lax"
+      : "jwt=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/; SameSite=Lax";
+    document.cookie = cookieString;
+
+    return response.data;
+  } catch (error) {
+    clearSkynetSessionStorage();
+
+    const isSecure = window.location.protocol === "https:";
+    const cookieString = isSecure
+      ? "jwt=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/; Secure; SameSite=Lax"
+      : "jwt=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/; SameSite=Lax";
+    document.cookie = cookieString;
+    handleApiError(error, "logout user");
+  }
+}
+
+export async function getUserInfo(): Promise<UserInfo> {
+  try {
+    const response = await authApi.get("/users/me");
+    markUserAuthenticated();
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "fetch user info");
+  }
+}
+
+export async function getCurrentToken(): Promise<string | null> {
+  try {
+    const response = await authApi.get("/users/me/token");
+    return response.data?.token ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export async function unlockUserData(
+  password: string,
+): Promise<{ success: boolean; message: string }> {
+  try {
+    const response = await authApi.post("/users/unlock-data", { password });
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "unlock user data");
+  }
+}
+
+export async function getPasswordLoginAllowed(): Promise<{ allowed: boolean }> {
+  try {
+    const response = await authApi.get("/users/password-login-allowed");
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "check password login status");
+  }
+}
+
+export async function getOIDCConfig(): Promise<Record<string, unknown>> {
+  try {
+    const response = await authApi.get("/users/oidc-config");
+    return response.data;
+  } catch (error: unknown) {
+    console.warn(
+      "Failed to fetch OIDC config:",
+      error.response?.data?.error || error.message,
+    );
+    return null;
+  }
+}
+
+export async function getAdminOIDCConfig(): Promise<Record<string, unknown>> {
+  try {
+    const response = await authApi.get("/users/oidc-config/admin");
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "fetch admin OIDC config");
+  }
+}
+
+export async function getSetupRequired(): Promise<{ setup_required: boolean }> {
+  try {
+    const response = await authApi.get("/users/setup-required");
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "check setup status");
+  }
+}
+
+export async function getUserCount(): Promise<UserCount> {
+  try {
+    const response = await authApi.get("/users/count");
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "fetch user count");
+  }
+}
+
+/**
+ * "Confirm it's you" — re-prove this sign-in so sensitive actions work for
+ * the next few minutes. Resolves null when accepted, or the message to show.
+ */
+export async function confirmIdentity(
+  password: string,
+  totpCode: string,
+): Promise<string | null> {
+  // Quiet: a wrong password is an answer, not an outage, and isn't retried.
+  const quiet: Record<string, unknown> = { __silentRetry: true, __noRetry: true };
+  try {
+    await authApi.post("/users/confirm-identity", { password, totpCode }, quiet);
+    return null;
+  } catch (error) {
+    const data = (error as AxiosError).response?.data as
+      | { error?: string }
+      | undefined;
+    return data?.error || "Couldn't confirm. Try again.";
+  }
+}
+
+export async function changePassword(oldPassword: string, newPassword: string) {
+  try {
+    const response = await authApi.post("/users/change-password", {
+      oldPassword,
+      newPassword,
+    });
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "change password");
+  }
+}
+
+export async function getOIDCAuthorizeUrl(
+  rememberMe = false,
+  desktopCallbackPort?: number,
+): Promise<OIDCAuthorize> {
+  try {
+    const response = await authApi.get("/users/oidc/authorize", {
+      params: { rememberMe, desktopCallbackPort },
+    });
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "get OIDC authorize URL");
+  }
+}
+
+// ============================================================================
+export {
+  getUserList,
+  getSessions,
+  revokeSession,
+  revokeAllUserSessions,
+  createApiKey,
+  getApiKeys,
+  deleteApiKey,
+  makeUserAdmin,
+  removeAdminStatus,
+  deleteUser,
+  deleteAccount,
+  getOidcAutoProvision,
+  updateOidcAutoProvision,
+  updatePasswordLoginAllowed,
+  updateOIDCConfig,
+  disableOIDCConfig,
+  type ApiKey,
+  type CreatedApiKey,
+} from "@/api/user-management-api";
+
+export {
+  setupTOTP,
+  enableTOTP,
+  disableTOTP,
+  verifyTOTPLogin,
+  generateBackupCodes,
+  getUserAlerts,
+  dismissAlert,
+  getReleasesRSS,
+  getVersionInfo,
+  getDatabaseHealth,
+} from "@/api/system-status-api";
+
+// SSH CREDENTIALS MANAGEMENT
+// ============================================================================
+
+export {
+  getCredentials,
+  getCredentialDetails,
+  createCredential,
+  updateCredential,
+  deleteCredential,
+  getCredentialHosts,
+  getCredentialFolders,
+  getSSHHostWithCredentials,
+  getHostPassword,
+  applyCredentialToHost,
+  removeCredentialFromHost,
+  migrateHostToCredential,
+  getFoldersWithStats,
+  renameFolder,
+  getSSHFolders,
+  updateFolderMetadata,
+  deleteAllHostsInFolder,
+  renameCredentialFolder,
+  detectKeyType,
+  detectPublicKeyType,
+  validateKeyPair,
+  generatePublicKeyFromPrivate,
+  generateKeyPair,
+  deployCredentialToHost,
+} from "@/api/credentials-api";
+
+// ============================================================================
+// SNIPPETS API
+// ============================================================================
+
+export type {
+  NetworkTopologyNode,
+  NetworkTopologyEdge,
+  NetworkTopologyData,
+} from "@/api/snippets-api";
+export {
+  getSnippets,
+  createSnippet,
+  updateSnippet,
+  deleteSnippet,
+  executeSnippet,
+  getNetworkTopology,
+  saveNetworkTopology,
+  getSnippetFolders,
+  createSnippetFolder,
+  updateSnippetFolderMetadata,
+  renameSnippetFolder,
+  deleteSnippetFolder,
+  reorderSnippets,
+} from "@/api/snippets-api";
+
+// ============================================================================
+export type { UptimeInfo, RecentActivityItem } from "@/api/dashboard-api";
+export {
+  getUptime,
+  getRecentActivity,
+  logActivity,
+  resetRecentActivity,
+} from "@/api/dashboard-api";
+
+// ============================================================================
+export {
+  saveCommandToHistory,
+  getCommandHistory,
+  deleteCommandFromHistory,
+  clearCommandHistory,
+} from "@/api/command-history-api";
+
+export {
+  linkOIDCToPasswordAccount,
+  unlinkOIDCFromPasswordAccount,
+} from "@/api/oidc-account-api";
+
+export type {
+  GuacamoleTokenRequest,
+  GuacamoleTokenResponse,
+} from "@/api/guacamole-api";
+export {
+  getGuacamoleDpi,
+  getGuacamoleToken,
+  getGuacamoleTokenFromHost,
+  getGuacdStatus,
+} from "@/api/guacamole-api";
+
+// ============================================================================
+// RBAC MANAGEMENT
+// ============================================================================
+
+export {
+  getRoles,
+  createRole,
+  updateRole,
+  deleteRole,
+  getUserRoles,
+  assignRoleToUser,
+  removeRoleFromUser,
+  shareHost,
+  getHostAccess,
+  revokeHostAccess,
+  shareSnippet,
+  getSnippetAccess,
+  revokeSnippetAccess,
+  getSharedSnippets,
+} from "@/api/rbac-api";
+
+// ============================================================================
+// DOCKER MANAGEMENT API
+// ============================================================================
+
+export {
+  connectDockerSession,
+  verifyDockerTOTP,
+  verifyDockerWarpgate,
+  disconnectDockerSession,
+  keepaliveDockerSession,
+  getDockerSessionStatus,
+  validateDockerAvailability,
+  listDockerContainers,
+  getDockerContainerDetails,
+  startDockerContainer,
+  stopDockerContainer,
+  restartDockerContainer,
+  pauseDockerContainer,
+  unpauseDockerContainer,
+  removeDockerContainer,
+  getContainerLogs,
+  downloadContainerLogs,
+  getContainerStats,
+} from "@/api/docker-api";
+
+export {
+  getDashboardPreferences,
+  saveDashboardPreferences,
+  type DashboardLayout,
+} from "@/api/dashboard-preferences-api";
+
+export {
+  getOpenTabs,
+  syncOpenTabs,
+  deleteOpenTab,
+  patchOpenTab,
+  addOpenTab,
+  getActiveSessions,
+  getUserPreferences,
+  saveUserPreferences,
+  type OpenTabRecord,
+  type OpenTabSyncPayload,
+  type OpenTabUpsertPayload,
+  type ActiveSessionInfo,
+  type UserPreferences,
+} from "@/api/open-tabs-api";

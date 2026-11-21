@@ -1,0 +1,1214 @@
+/* ─── pretty-conversations.css ────────────────────────────────────────────────
+ * The sidebar — the conversation list (PrettyConversationsPanel and its rows,
+ * section headings, project folders, app icons) — plus a few rules for the
+ * search window's result rows, the legacy context menu and modal variant tabs.
+ *
+ * Look (shape-sidebar, apple-ux campaign): the windows' family. Neutral
+ * surfaces and text from the kit (--k-* in components/kit/kit.css), colour
+ * only where it means something — the open conversation is tinted in its
+ * agent's hue (--pv-hue, set inline per row), and so is the unread dot.
+ * Desktop is a compact one-line list; the phone (the .pv-row--mobile variant,
+ * < 768px) is grouped two-line lists. Phone text sizes are rem so they follow
+ * the user's text-size setting.
+ *
+ * Every text colour here meets the 4.5:1 contrast standard on the sidebar
+ * surface (3:1 for icons); --pv-sb-t3 is the kit's faint text brightened to
+ * do so. Desktop click targets are at least 24×24.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+:root {
+  --pv-sb-bg: #15161a;
+  --pv-sb-hover: rgba(255, 255, 255, 0.045);
+  --pv-sb-t3: rgba(236, 232, 223, 0.55);
+  --pv-sb-folder: hsl(220, 45%, 68%);
+}
+
+/* ═══ Surface ════════════════════════════════════════════════════════════ */
+
+.pv-sidebar-surface {
+  background: var(--pv-sb-bg);
+}
+
+/* ═══ Header ═════════════════════════════════════════════════════════════ */
+
+.pv-panel-header {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  padding: 12px 12px 6px 16px;
+}
+
+.pv-panel-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  gap: 8px;
+}
+
+/* The sidebar's open/close arrow sits over the header's left edge when the
+   sidebar is open on desktop — keep the logo clear of it. */
+.pv-panel-header[data-sidebar-toggle-overlaps="true"] {
+  padding-left: 48px;
+}
+
+.pv-panel-header .pv-title {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+}
+
+.pv-panel-header .pv-header-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.pv-panel-header .pv-header-logo {
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+}
+
+/* Round, quiet icon button — the header pencil and the footer buttons. */
+.pv-panel-header .pv-pencil,
+.pv-panel-footer .pv-footer-btn {
+  appearance: none;
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--k-t2);
+  cursor: pointer;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  transition: background-color 0.12s, color 0.12s;
+}
+.pv-panel-header .pv-pencil:hover,
+.pv-panel-footer .pv-footer-btn:hover {
+  background: var(--k-s2);
+  color: var(--k-t1);
+}
+.pv-panel-header .pv-pencil:focus-visible,
+.pv-panel-footer .pv-footer-btn:focus-visible {
+  outline: 2px solid var(--k-acc);
+  outline-offset: 1px;
+}
+.pv-panel-header .pv-pencil svg {
+  width: 18px;
+  height: 18px;
+  stroke-width: 1.8;
+}
+
+/* ═══ Search ═════════════════════════════════════════════════════════════ */
+
+.pv-sidebar-search {
+  padding: 2px 12px 10px;
+}
+.pv-sidebar-search-wrap {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 34px;
+  padding: 0 10px;
+  background: var(--k-s2);
+  border: 1px solid transparent;
+  border-radius: 10px;
+  transition: border-color 0.12s;
+}
+.pv-sidebar-search-wrap:focus-within {
+  border-color: var(--k-acc);
+}
+.pv-sidebar-search-icon {
+  width: 15px;
+  height: 15px;
+  color: var(--pv-sb-t3);
+  flex-shrink: 0;
+}
+.pv-sidebar-search-input {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  padding: 0;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--k-t1);
+  font: 400 13px/1 var(--font-sans);
+}
+.pv-sidebar-search-input::placeholder {
+  color: var(--pv-sb-t3);
+}
+/* "everywhere ↗" — hidden at rest (no width), fades in once the input has
+   content. Pointer events follow visibility so a hidden link can't be hit. */
+.pv-sidebar-search-everywhere {
+  display: inline-flex;
+  align-items: center;
+  padding: 0;
+  color: var(--k-acc-text);
+  font: 500 12px/1 var(--font-sans);
+  cursor: pointer;
+  white-space: nowrap;
+  background: transparent;
+  border: none;
+  opacity: 0;
+  max-width: 0;
+  overflow: hidden;
+  pointer-events: none;
+  transition: opacity 140ms ease, max-width 200ms ease, padding 200ms ease;
+}
+.pv-sidebar-search-everywhere.visible {
+  opacity: 1;
+  max-width: 120px;
+  padding: 0 2px 0 6px;
+  pointer-events: auto;
+}
+.pv-sidebar-search-everywhere:hover {
+  text-decoration: underline;
+}
+/* Clear ✕ — the kit's small icon button, sized down to sit inside the 34px
+   field and tucked toward its right edge. Hover uses s3 since the field is s2. */
+.pv-sidebar-search-clear.k-icon-btn {
+  width: 22px;
+  height: 22px;
+  margin-right: -5px;
+}
+.pv-sidebar-search-clear.k-icon-btn:hover {
+  background: var(--k-s3);
+}
+
+/* ═══ List ═══════════════════════════════════════════════════════════════ */
+
+.pv-panel-scroll {
+  flex: 1;
+  overflow-y: auto;
+  /* Never scroll sideways — rows truncate instead. */
+  overflow-x: hidden;
+  /* Keep end-of-scroll momentum inside the list (iOS otherwise hunts for a
+     scroll owner up the overflow-hidden shell and freezes the list). */
+  overscroll-behavior: contain;
+  padding: 0 8px 18px;
+  display: flex;
+  flex-direction: column;
+}
+
+.pv-panel-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.pv-projects-section {
+  gap: 0;
+}
+[id^="pv-project-section-content-"] > [data-conversation-id] + [data-conversation-id] {
+  margin-top: 2px;
+}
+/* Sub-projects sit above the parent's own rows; a little air before them. */
+[id^="pv-project-section-content-"] > .pv-project-section + [data-conversation-id] {
+  margin-top: 6px;
+}
+.pv-project-content {
+  padding-left: 10px;
+}
+
+/* Nothing in the sidebar matches the search. */
+.pv-sidebar-search-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 40px 24px;
+  text-align: center;
+}
+.pv-sidebar-search-empty-text {
+  font: 400 13px/1.4 var(--font-sans);
+  color: var(--pv-sb-t3);
+}
+.pv-sidebar-search-empty-cta {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  padding: 4px 8px;
+  border-radius: 8px;
+  font: 500 13px/1 var(--font-sans);
+  color: var(--k-acc-text);
+  cursor: pointer;
+}
+.pv-sidebar-search-empty-cta:hover {
+  background: var(--k-acc-soft);
+}
+
+/* ═══ Section titles — Apps, Pinned, Projects, Conversations, Remote desktop */
+
+.pv-section-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 20px 8px 6px;
+}
+.pv-section-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: 600 13px/1.25 var(--font-sans);
+  color: var(--pv-sb-t3);
+}
+/* Open/close arrow: right when closed, down when open. */
+.pv-section-chevron {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  color: var(--pv-sb-t3);
+  transform: rotate(-90deg);
+  transition: transform 0.15s;
+}
+.pv-section-chevron[data-open="true"] {
+  transform: none;
+}
+/* The Projects "+" — 24×24 target around a 14px glyph. */
+.pv-section-add {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  margin: -5px 0;
+  padding: 0;
+  flex-shrink: 0;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--pv-sb-t3);
+  cursor: pointer;
+}
+.pv-section-add:hover {
+  background: var(--k-s2);
+  color: var(--k-t1);
+}
+.pv-section-add svg {
+  width: 14px;
+  height: 14px;
+}
+/* Short notes under a heading (empty Pinned / project / Conversations / Apps,
+   the loading line). */
+.pv-section-note {
+  padding: 4px 8px 8px;
+  font: 400 12.5px/1.4 var(--font-sans);
+  color: var(--pv-sb-t3);
+}
+.pv-apps-grid > .pv-section-note {
+  grid-column: 1 / -1;
+}
+
+/* Heading menu (⋮) slot: never sets the heading's height; on desktop it takes
+   no room until hovered, focused, or its menu is open. */
+.pv-section-kebab-slot {
+  height: 14px;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  overflow: visible;
+}
+@media (min-width: 768px) {
+  [data-testid="pretty-conversations-apps-header"]:not(:hover):not(:focus-within):not(:has(button[data-state="open"]))
+    > .pv-section-kebab-slot,
+  [data-testid^="pv-project-section-header-"]:not(:hover):not(:focus-within):not(:has(button[data-state="open"]))
+    > .pv-section-kebab-slot {
+    width: 0;
+    margin-left: -6px; /* swallow the gap so no dead space remains */
+    overflow: hidden;
+    pointer-events: none;
+  }
+}
+
+/* A collapsed section with unread / DM'd conversations inside. */
+.pv-section-unread-dot {
+  display: inline-block;
+  flex-shrink: 0;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: hsl(220, 75%, 66%);
+}
+/* DM'd inside: the row's red envelope disc after the label, and the row's
+   red tint across the whole header. */
+.pv-section-dm-mark {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  background: #e5484d;
+  color: #fff;
+}
+.pv-section-dm-mark svg {
+  width: 11px;
+  height: 11px;
+  transform: translate(-0.5px, 0.5px);
+}
+:is(.pv-section-head, .pv-project-head):has(.pv-section-dm-mark) {
+  border-radius: 8px;
+  background: rgba(229, 72, 77, 0.16);
+}
+:is(.pv-section-head, .pv-project-head):has(.pv-section-dm-mark):hover {
+  background: rgba(229, 72, 77, 0.2);
+}
+:is(.pv-section-head, .pv-project-head):has(.pv-section-dm-mark) .pv-section-label {
+  color: var(--k-t1);
+}
+
+/* ═══ Projects — folders ═════════════════════════════════════════════════ */
+
+.pv-project-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 34px;
+  margin-top: 2px;
+  padding: 5px 8px 5px 4px;
+  border-radius: 8px;
+}
+.pv-project-head:hover {
+  background: var(--pv-sb-hover);
+}
+.pv-project-head .pv-section-chevron {
+  width: 13px;
+  height: 13px;
+}
+.pv-project-folder {
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+  color: var(--pv-sb-folder);
+}
+.pv-project-head .pv-section-label {
+  font: 550 14px/1.25 var(--font-sans);
+  color: var(--k-t1);
+}
+
+/* ═══ Menu buttons (⋮) on rows, headings and app icons ═══════════════════ */
+
+[data-testid="pretty-conversations-panel"] button[data-testid*="kebab-trigger"] {
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--k-t2);
+}
+[data-testid="pretty-conversations-panel"] button[data-testid*="kebab-trigger"]:hover,
+[data-testid="pretty-conversations-panel"] button[data-testid*="kebab-trigger"][data-state="open"] {
+  background: var(--k-s3);
+  color: var(--k-t1);
+}
+
+/* Row ⋮: right edge, centred. Desktop shows it on hover / keyboard focus /
+   while its menu is open; a narrow mouse window always shows it; touch
+   screens never do — press-and-hold opens the menu there. */
+.pv-row-kebab-slot {
+  position: absolute;
+  top: 50%;
+  right: 4px;
+  z-index: 5;
+  transform: translateY(-50%);
+  flex-shrink: 0;
+  transition: opacity 0.12s;
+}
+@media (min-width: 768px) {
+  .pv-row:not(:hover):not(:focus-within) .pv-row-kebab-slot:not(:has(button[data-state="open"])) {
+    opacity: 0;
+  }
+}
+/* Visually hidden, but still there for screen readers (their users can't
+   rely on a hold). */
+@media (pointer: coarse) {
+  .pv-row-kebab-slot > button {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    opacity: 0;
+  }
+}
+
+/* ═══ Conversation rows ══════════════════════════════════════════════════ */
+
+.pv-row {
+  --pv-hue: 216;
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 34px;
+  padding: 5px 8px;
+  border-radius: 8px;
+  color: var(--k-t1);
+  cursor: pointer;
+  overflow: hidden;
+  /* No text selection or iOS callout — rows are tap targets, and a
+     press-and-hold opens the row menu. */
+  -webkit-touch-callout: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  /* Vertical scrolling stays the browser's; a sideways move is ours (swipe). */
+  touch-action: pan-y;
+}
+/* Pictures inside rows and app icons never start their own drag or the
+   browser's image menu — the row's hold owns the long press. */
+.pv-avatar img,
+.pv-app-icon-img {
+  pointer-events: none;
+  -webkit-user-drag: none;
+}
+.pv-row:hover {
+  background: var(--pv-sb-hover);
+}
+.pv-row.selected,
+.pv-row.selected:hover {
+  background: hsla(var(--pv-hue), 62%, 55%, 0.2);
+}
+.pv-row.rdp.selected,
+.pv-row.rdp.selected:hover,
+.pv-row.pv-neutral.selected,
+.pv-row.pv-neutral.selected:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+.pv-row:focus-visible {
+  outline: 2px solid var(--k-acc);
+  outline-offset: -2px;
+}
+
+.pv-avatar {
+  position: relative;
+  overflow: visible; /* corner badges sit outside the disc */
+  z-index: 1;
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  background: var(--k-s3);
+  color: var(--k-t2);
+  font: 600 11px/1 var(--font-sans);
+}
+.pv-avatar .pv-avatar-fallback-icon svg {
+  width: 14px;
+  height: 14px;
+}
+
+.pv-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  position: relative;
+  z-index: 1;
+}
+/* Titles fade out at the right edge instead of ending in "…". */
+.pv-body .pv-label,
+.pv-body .pv-ai-title {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: clip;
+  -webkit-mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 22px), transparent 100%);
+          mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 22px), transparent 100%);
+}
+.pv-body .pv-label {
+  font: 400 14px/1.25 var(--font-sans);
+  color: var(--k-t2);
+}
+.pv-row--unread .pv-body .pv-label,
+.pv-row--dm .pv-body .pv-label,
+.pv-row.selected .pv-body .pv-label {
+  color: var(--k-t1);
+}
+.pv-row--unread .pv-body .pv-label,
+.pv-row--dm .pv-body .pv-label {
+  font-weight: 550;
+}
+/* "(Role)" after a name on rows without a task. */
+.pv-body .pv-label .pv-hostname-suffix {
+  font-weight: 400;
+  color: var(--pv-sb-t3);
+}
+.pv-body .pv-ai-title {
+  font: 400 13px/1.25 var(--font-sans);
+  color: var(--k-t2);
+}
+.pv-body .pv-ai-title strong {
+  font-weight: 400;
+}
+/* Desktop rows are one line. The second line stays in the DOM. */
+.pv-row--desktop .pv-body .pv-ai-title {
+  display: none;
+}
+
+/* Project apps: a row like a conversation's, the app's icon as a rounded
+   square in the picture's place. Unhealthy: greyed icon, muted-red title
+   (same signal as an Apps-grid tile). */
+.pv-avatar.pv-app-row-icon {
+  border-radius: 6px;
+  overflow: hidden;
+}
+.pv-app-row-icon .pv-app-icon-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.pv-app-row-icon .pv-app-row-glyph {
+  width: 14px;
+  height: 14px;
+}
+.pv-app-row--unhealthy .pv-app-row-icon {
+  filter: grayscale(1) brightness(0.6);
+  opacity: 0.55;
+}
+.pv-app-row--unhealthy .pv-body .pv-label {
+  color: #f4a09b;
+}
+
+/* Unread: a dot in the agent's own colour at the row's end. It steps aside
+   for the ⋮ while the row is hovered or focused on desktop. */
+.pv-unread-dot {
+  position: absolute;
+  top: 50%;
+  right: 10px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  transform: translateY(-50%);
+  background: hsl(var(--pv-hue), 75%, 64%);
+  pointer-events: none;
+}
+.pv-row.pv-neutral .pv-unread-dot,
+.pv-row.rdp .pv-unread-dot {
+  background: hsl(220, 75%, 66%);
+}
+.pv-row--unread .pv-body {
+  padding-right: 12px;
+}
+@media (min-width: 768px) {
+  .pv-row:is(:hover, :focus-within) .pv-unread-dot {
+    opacity: 0;
+  }
+  .pv-row:is(:hover, :focus-within) .pv-body {
+    padding-right: 24px;
+  }
+}
+
+/* DM'd — the agent DM'd this user: the whole row takes a red tint (the open
+   conversation keeps its own highlight), and a red envelope sits in the
+   unread dot's place, bigger, the same red on every row. The envelope steps
+   aside for the ⋮ like the dot. */
+.pv-row.pv-row--dm:not(.selected) {
+  background: rgba(229, 72, 77, 0.16);
+}
+.pv-row.pv-row--dm:not(.selected):hover {
+  background: rgba(229, 72, 77, 0.2);
+}
+.pv-dm-badge {
+  position: absolute;
+  top: 50%;
+  right: 6px;
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  transform: translateY(-50%);
+  background: #e5484d;
+  pointer-events: none;
+  transition: opacity 0.12s;
+}
+.pv-dm-badge .pv-dm-badge-icon {
+  width: 11px;
+  height: 11px;
+  color: #fff;
+  transform: translate(-0.5px, -0.25px);
+}
+.pv-row--dm .pv-body {
+  padding-right: 22px;
+}
+@media (min-width: 768px) {
+  .pv-row:is(:hover, :focus-within) .pv-dm-badge {
+    opacity: 0;
+  }
+}
+
+/* Local work not pushed to any remote: amber disc on the avatar's corner. */
+.pv-avatar .pv-trapped-work-indicator {
+  position: absolute;
+  bottom: -2px;
+  right: -4px;
+  z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 11px;
+  height: 11px;
+  border-radius: 999px;
+  background: var(--k-warn);
+  box-shadow: 0 0 0 2px var(--pv-sb-bg);
+}
+.pv-avatar .pv-trapped-work-indicator .pv-trapped-work-icon {
+  width: 7px;
+  height: 7px;
+  color: #1b1408;
+}
+
+/* ═══ Swipe-to-archive (touch) ═══════════════════════════════════════════ */
+
+[data-conversation-id] {
+  position: relative;
+}
+[data-conversation-id][data-swiping="true"] {
+  overflow: hidden;
+}
+.pv-row-swipe-action {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-right: 20px;
+  background: var(--k-danger);
+  color: #fff;
+  font: 600 0.82rem/1 var(--font-sans);
+  border-radius: inherit;
+}
+.pv-row-swipe-action svg {
+  width: 18px;
+  height: 18px;
+}
+.pv-panel-scroll [data-conversation-id][data-swiping="true"] > .pv-row {
+  background: var(--k-s1) !important;
+}
+
+/* ═══ Footer ═════════════════════════════════════════════════════════════ */
+
+.pv-panel-footer {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+  padding: 8px 10px 10px 12px;
+  border-top: 1px solid var(--k-hair);
+  flex-shrink: 0;
+}
+.pv-panel-footer .pv-footer-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.pv-panel-footer .pv-footer-anchor {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+/* The user's picture (or initials). */
+.pv-panel-footer .pv-footer-initials {
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--k-s3);
+  color: var(--k-t2);
+  font: 600 12px/1 var(--font-sans);
+  text-transform: uppercase;
+  user-select: none;
+}
+.pv-panel-footer .pv-footer-username {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: 500 13px/1.25 var(--font-sans);
+  color: var(--k-t1);
+}
+.pv-panel-footer .pv-footer-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+}
+.pv-panel-footer .pv-footer-btn {
+  width: 30px;
+  height: 30px;
+}
+.pv-panel-footer .pv-footer-btn svg {
+  width: 17px;
+  height: 17px;
+  stroke-width: 1.8;
+}
+
+/* ═══ Phone (< 768px) ════════════════════════════════════════════════════
+   Grouped two-line lists: each run of conversation rows sits on one rounded
+   panel with hairlines between rows. Text is rem (the user's text size). */
+
+@media (max-width: 767.98px) {
+  .pv-panel-header {
+    padding: 8px 10px 4px 18px;
+  }
+  .pv-panel-header .pv-header-logo {
+    width: 26px;
+    height: 26px;
+  }
+  .pv-panel-header .pv-pencil {
+    width: 44px;
+    height: 44px;
+  }
+  .pv-panel-header .pv-pencil svg {
+    width: 23px;
+    height: 23px;
+  }
+
+  .pv-sidebar-search {
+    padding: 4px 16px 8px;
+  }
+  .pv-sidebar-search-wrap {
+    height: 2.2rem;
+    border-radius: 11px;
+  }
+  .pv-sidebar-search-icon {
+    width: 18px;
+    height: 18px;
+  }
+  .pv-sidebar-search-clear.k-icon-btn {
+    width: 26px;
+    height: 26px;
+  }
+  .pv-sidebar-search-clear.k-icon-btn svg {
+    width: 16px;
+    height: 16px;
+  }
+  /* 16px minimum keeps iOS from zooming the page when the field is focused. */
+  .pv-sidebar-search-input {
+    font-size: max(16px, 0.95rem);
+  }
+
+  .pv-panel-scroll {
+    /* About half a row of air at the end so the last row clears the browser
+       chrome / home indicator. */
+    padding: 0 16px max(env(safe-area-inset-bottom), 28px);
+  }
+  .pv-panel-group {
+    gap: 0;
+  }
+  [id^="pv-project-section-content-"] > [data-conversation-id] + [data-conversation-id] {
+    margin-top: 0;
+  }
+
+  .pv-section-head {
+    gap: 8px;
+    padding: 22px 2px 8px;
+  }
+  .pv-section-label {
+    font-size: 1.05rem;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    color: var(--k-t1);
+  }
+  .pv-section-chevron {
+    width: 18px;
+    height: 18px;
+  }
+  .pv-section-add {
+    width: 32px;
+    height: 32px;
+    margin: -8px 0;
+  }
+  .pv-section-add svg {
+    width: 20px;
+    height: 20px;
+  }
+  .pv-section-note {
+    padding: 2px 2px 8px;
+    font-size: 0.85rem;
+  }
+
+  .pv-project-head {
+    min-height: 0;
+    margin-top: 0;
+    padding: 14px 2px 7px;
+    gap: 8px;
+    border-radius: 0;
+  }
+  .pv-project-head:hover {
+    background: transparent;
+  }
+  :is(.pv-section-head, .pv-project-head):has(.pv-section-dm-mark) {
+    padding-left: 10px;
+    padding-right: 10px;
+    border-radius: 12px;
+  }
+  .pv-section-dm-mark {
+    width: 22px;
+    height: 22px;
+  }
+  .pv-section-dm-mark svg {
+    width: 13px;
+    height: 13px;
+  }
+  .pv-project-head .pv-section-chevron {
+    width: 16px;
+    height: 16px;
+  }
+  .pv-project-folder {
+    width: 18px;
+    height: 18px;
+  }
+  .pv-project-head .pv-section-label {
+    font-size: 0.95rem;
+    font-weight: 600;
+  }
+
+  [data-testid="pretty-conversations-panel"] button[data-testid*="kebab-trigger"] {
+    width: 32px;
+    height: 32px;
+    color: var(--pv-sb-t3);
+  }
+  [data-testid="pretty-conversations-panel"] button[data-testid*="kebab-trigger"] svg {
+    width: 18px;
+    height: 18px;
+  }
+
+  /* Grouped rows. */
+  .pv-panel-scroll [data-conversation-id] {
+    background: var(--k-s1);
+  }
+  .pv-panel-scroll [data-conversation-id]:not([data-conversation-id] + [data-conversation-id]) {
+    border-top-left-radius: 14px;
+    border-top-right-radius: 14px;
+  }
+  .pv-panel-scroll [data-conversation-id]:not(:has(+ [data-conversation-id])) {
+    border-bottom-left-radius: 14px;
+    border-bottom-right-radius: 14px;
+  }
+  .pv-panel-scroll [data-conversation-id] > .pv-row {
+    border-radius: inherit;
+  }
+  /* Hairline between rows, starting where the text starts. */
+  .pv-panel-scroll [data-conversation-id] + [data-conversation-id] > .pv-row::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 70px;
+    right: 0;
+    height: 1px;
+    background: var(--k-hair);
+  }
+
+  .pv-row {
+    min-height: 0;
+    gap: 12px;
+    padding: 11px 44px 11px 12px;
+    border-radius: 0;
+  }
+  .pv-row:hover {
+    background: transparent;
+  }
+  .pv-row:active,
+  .pv-row.selected,
+  .pv-row.selected:hover,
+  .pv-row.pv-neutral.selected,
+  .pv-row.rdp.selected {
+    background: var(--k-s2);
+  }
+  /* Touch screens hide the ⋮, so the text can run to the edge. */
+  @media (pointer: coarse) {
+    .pv-row {
+      padding-right: 14px;
+    }
+  }
+  .pv-avatar {
+    width: 46px;
+    height: 46px;
+    font-size: 1.05rem;
+  }
+  .pv-avatar .pv-avatar-fallback-icon svg {
+    width: 20px;
+    height: 20px;
+  }
+  .pv-body .pv-label {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: var(--k-t1);
+  }
+  .pv-body .pv-ai-title {
+    font-size: 0.82rem;
+  }
+  /* No "…" second line on rows that have nothing to say there. */
+  .pv-body .pv-ai-title--placeholder {
+    display: none;
+  }
+  .pv-row--unread .pv-body {
+    padding-right: 16px;
+  }
+  .pv-unread-dot {
+    width: 9px;
+    height: 9px;
+    right: 14px;
+  }
+  @media (pointer: fine) {
+    .pv-unread-dot {
+      right: 46px;
+    }
+  }
+  .pv-row-kebab-slot {
+    right: 6px;
+  }
+  .pv-row--dm .pv-body {
+    padding-right: 30px;
+  }
+  .pv-dm-badge {
+    width: 22px;
+    height: 22px;
+    right: 10px;
+  }
+  @media (pointer: fine) {
+    .pv-dm-badge {
+      right: 42px;
+    }
+  }
+  .pv-dm-badge .pv-dm-badge-icon {
+    width: 13px;
+    height: 13px;
+  }
+  .pv-avatar .pv-trapped-work-indicator {
+    width: 18px;
+    height: 18px;
+    bottom: -2px;
+    right: -4px;
+    box-shadow: 0 0 0 2px var(--k-s1);
+  }
+  .pv-avatar .pv-trapped-work-indicator .pv-trapped-work-icon {
+    width: 11px;
+    height: 11px;
+  }
+
+  .pv-panel-footer {
+    padding: 6px 10px 8px 16px;
+  }
+  .pv-panel-footer .pv-footer-initials {
+    width: 36px;
+    height: 36px;
+    font-size: 15px;
+  }
+  .pv-panel-footer .pv-footer-username {
+    font-size: 0.9rem;
+  }
+  .pv-panel-footer .pv-footer-actions {
+    gap: 2px;
+  }
+  .pv-panel-footer .pv-footer-btn {
+    width: 44px;
+    height: 44px;
+  }
+  .pv-panel-footer .pv-footer-btn svg {
+    width: 23px;
+    height: 23px;
+  }
+}
+
+/* ═══ Apps — a phone-home-screen icon grid (AppTile.tsx) ═════════════════
+   Rounded-square icons with the name underneath, deliberately unlike the
+   conversation rows. Columns auto-fill, so a wider sidebar gets more.
+   Unhealthy (.pv-app-tile--unhealthy): greyed icon, ⚠ and a muted-red name;
+   with a mouse the health message moves into the tooltip, touch screens show
+   the line. Sizes are em so phone tiles follow the user's text size. */
+
+.pv-apps-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(4.5em, 1fr));
+  gap: 10px 4px;
+  padding: 6px 8px 10px;
+}
+
+.pv-app-tile {
+  --pv-app-icon: 3em;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 6px;
+  padding: 6px 2px;
+  color: var(--k-t1);
+  cursor: pointer;
+  -webkit-touch-callout: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  border-radius: 12px;
+  transition: background-color 0.12s;
+}
+/* Only where a pointer hovers — on a touch screen :hover sticks after a tap. */
+@media (hover: hover) {
+  .pv-app-tile:hover {
+    background: var(--pv-sb-hover);
+  }
+}
+/* Phone: an iPhone home screen's icon size (~67pt at a 20px text size). */
+.pv-app-tile.pv-app-tile--mobile {
+  --pv-app-icon: 3.35em;
+}
+
+/* Letter typography for the iconless fallback lives here; the child
+   .pv-app-icon-initial has no rule of its own. */
+.pv-app-icon-slot {
+  position: relative;
+  overflow: visible;
+  z-index: 1;
+  width: var(--pv-app-icon);
+  height: var(--pv-app-icon);
+  border-radius: calc(var(--pv-app-icon) * 0.225);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--k-s2);
+  border: 1px solid var(--k-hair);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+  color: var(--k-t2);
+  font-size: calc(var(--pv-app-icon) * 0.42);
+  font-weight: 600;
+  flex-shrink: 0;
+  transition: transform 140ms ease;
+}
+@media (hover: hover) {
+  .pv-app-tile:hover .pv-app-icon-slot {
+    transform: translateY(-2px) scale(1.04);
+  }
+}
+.pv-app-tile:active .pv-app-icon-slot {
+  transform: scale(0.94);
+}
+.pv-app-icon-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: inherit;
+}
+
+.pv-app-body {
+  flex: none;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 0;
+}
+.pv-app-title {
+  color: var(--k-t2);
+  font-size: 0.72em;
+  font-weight: 500;
+  line-height: 1.2;
+  text-align: center;
+  white-space: normal;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+.pv-app-tile--mobile .pv-app-title {
+  font-size: 0.78em;
+}
+
+.pv-app-unhealthy-message {
+  color: #f4a09b;
+  font-style: italic;
+  font-size: 0.62em;
+  line-height: 1.2;
+  text-align: center;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+}
+@media (hover: hover) and (pointer: fine) {
+  .pv-app-unhealthy-message {
+    display: none;
+  }
+}
+.pv-app-tile--unhealthy .pv-app-icon-slot {
+  filter: grayscale(1) brightness(0.6);
+  opacity: 0.55;
+}
+.pv-app-tile--unhealthy .pv-app-title {
+  color: #f4a09b;
+}
+.pv-app-tile--unhealthy .pv-app-title::before {
+  content: "⚠ ";
+}
+
+/* The icon's ⋮ shows only on keyboard focus: right-click is the menu with a
+   mouse, press-and-hold on a touch screen. */
+.pv-app-tile-kebab-slot {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  z-index: 5;
+  opacity: 0;
+  pointer-events: none;
+}
+.pv-app-tile:focus-within .pv-app-tile-kebab-slot,
+.pv-app-tile-kebab-slot:has(button[data-state="open"]) {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* ─── Variant-tabs — segmented pill toggle inside a modal head ──────────
+   Modal-unification 2026-09-29. Ported from modal-tasting.html
+   .variant-tabs. First consumer: EditableFileModal's SVG Rendered ↔
+   Source toggle. Reusable for any 2-way state switch inside a modal head
+   or body (Preferences About-you single/multi-host is the next expected
+   consumer). Uses `--pv-id-hue` cascaded from the parent <Modal>. */
+
+.pv-variant-tabs {
+  display: inline-flex;
+  gap: 4px;
+  padding: 3px;
+  background: rgba(0, 0, 0, 0.32);
+  border-radius: 8px;
+  border: 1px solid hsla(var(--pv-id-hue), 60%, 55%, 0.14);
+}
+
+.pv-variant-tab {
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 500;
+  color: hsla(var(--pv-id-hue), 22%, 88%, 0.6);
+  letter-spacing: 0.02em;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+
+.pv-variant-tab.on {
+  background: hsla(var(--pv-id-hue), 65%, 55%, 0.42);
+  color: #fbf5e8;
+}
+
+.pv-variant-tab:hover:not(.on) {
+  color: hsla(var(--pv-id-hue), 22%, 92%, 0.85);
+}

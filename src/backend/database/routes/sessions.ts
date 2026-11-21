@@ -1,0 +1,769 @@
+import type { AuthenticatedRequest } from "../../../types/index.js";
+import express from "express";
+import type { Request, Response } from "express";
+import { eq } from "drizzle-orm";
+import { db } from "../db/index.js";
+import { hosts } from "../db/schema.js";
+import { AuthManager } from "../../utils/auth-manager.js";
+import { SimpleDBOps } from "../../utils/simple-db-ops.js";
+import { sshLogger, databaseLogger, systemLogger } from "../../utils/logger.js";
+import { resolveHostById } from "../../ssh/host-resolver.js";
+import { connectOneShot } from "../../ssh/ssh-one-shot.js";
+import { execCommand } from "../../ssh/tmux-helper.js";
+import { isTeammateMessage } from "../../claude-session/session-file-parser.js";
+import {
+  readIdentityFile,
+  readRoleFileByName,
+  extractRoleFromMarkdown,
+  extractRolesFromMarkdown,
+  extractCosmeticsFromFrontmatter,
+} from "../../claude-session/identity-artifact-reader.js";
+// Phase 129 Plan 129-03: per-user visibility gate on GET /sessions/list —
+// D-7 deep-gate seam #2 (identities/ was #1 in Plan 129-02). The gate lives
+// in a companion pure function (identity-visibility-gate.ts) per the Phase
+// 111 T-111-08 one-cascade-authority invariant — call sites hold gate
+// authority so a grep for the gate function name in this file answers
+// "did we gate this call site?". The username-lookup helper translates the
+// JWT-authenticated userId into the Skynet username string the gate
+// compares against on-disk `users:` frontmatter lists (case-sensitive per
+// Pitfall 7 lock; see 129-01 SUMMARY for the design rationale).
+import {
+  isIdentityVisibleToUser,
+  resolveGateRoleSide,
+} from "../../fleet-status/identity-visibility-gate.js";
+import { getUsernameForUserId } from "../../utils/host-user-counter.js";
+// Orchestrator holder — used to short-circuit the per-row readIdentityFile
+// SSH read when the fleet-status sweep has already populated cosmetics for
+// this identity on this host. On cache miss (orchestrator not up, or the
+// sweep hasn't seen the identity yet), we fall through to the existing SSH
+// read path unchanged. Cuts the workstation per-page-load fanout from ~200
+// readIdentityFile execs to zero when the cache is warm.
+import { getOrchestrator } from "../../fleet-status/orchestrator-holder.js";
+// Phase 85 (D-07): identity-name-keyed send-log store — replaces the
+// byte-parallel `scanTailForNewestMessageAt` call for `/sessions/list`'s
+// `lastMessageAt` seed. AppShell reads `/sessions/list` on page load to
+// feed `seedSessionLastMessageAt` in the frontend working store; without
+// this swap the seed would be the stale JSONL-derived value and the next
+// WS-live orchestrator frame (Phase 85-04) would overwrite it ~2s later,
+// causing a visible flicker. The store lookup is DB-local, independent
+// of the SSH pathway, and cheap (indexed single-row SELECT per identity).
+// Phase 85-02 owns the module + monotonic-write + fail-open contracts.
+import { getIdentityLastSend } from "../../fleet-status/identity-send-log-store.js";
+// Phase 89 Plan 04 (D-15): relay-room sessions store — new peer path
+// alongside the SSH-derived harness sessions. Consumed by the merge block
+// below (post-Promise.all, pre-res.json) to append each user's active
+// relay-room rows to the flat response. Read-only DB lookup — cheap,
+// in-process, no new timeout budget needed. Wrapped in try/catch that
+// logs a warning and swallows on failure (best-effort merge — better to
+// return harness-only than 500 the entire endpoint).
+import { listActiveRelayRoomSessions } from "../../relay-sessions/relay-room-sessions-store.js";
+import {
+  mergeRelayRoomsIntoFlat,
+  type RelayRoomSessionRow,
+} from "./sessions-merge-helper.js";
+
+const router = express.Router();
+const authManager = AuthManager.getInstance();
+const authenticateJWT = authManager.createAuthMiddleware();
+
+// quick-260821-m36: split the historical single PER_HOST_TIMEOUT_MS into two
+// tiers so an unreachable candidate host (stale row whose IP no longer resolves
+// on tailnet — e.g., phantom hosts.id 14/15 rows purged out-of-band in the
+// plan's ops cleanup) fails fast at TCP+SSH connect instead of consuming the
+// full 30s discovery budget. When one dead host burned all 30s
+// of the wall-clock, the aggregate /sessions/list response pushed past the
+// frontend's axios 30s ceiling → axios rejected → PrettyConversationsPanel
+// never received fleet data (spinner stuck) and the WS-health pipeline fired
+// "Server connection lost, recovering…" toasts on desktop + iPad. Splitting
+// gives connectOneShot its own 5s cap while preserving the 30s roof for the
+// three legitimate discovery-heavy blocks below.
+//
+// 5s is comfortable margin over the healthy SSH handshake wall-clock (~200-
+// 800ms even on cold cross-region tailscale links) and small enough that a
+// single dead host contributes at most ~5s to the aggregate.
+const CONNECT_TIMEOUT_MS = 5_000;
+
+// Per-block timeout for the /sessions/list handler. Historically wrapped
+// the tmux list-sessions Promise.race, the per-session role-resolve
+// fallback path (readIdentityFile), and the (now-retired) per-session
+// aiTitle discovery + tail chain. With the cosmetics-cache fast path and
+// the aiTitle retirement, only the tmux list-sessions race and the SSH-
+// fallback readIdentityFile race still consume this budget. Kept at 30s
+// so the fallback path — which fires on cold cache and reads identity
+// files serially over one connection — has the same headroom the
+// concurrent-discovery era needed.
+//
+// quick-260821-m36 note: connectOneShot is NO LONGER wrapped by this cap
+// — it uses CONNECT_TIMEOUT_MS (5_000) above.
+const PER_HOST_TIMEOUT_MS = 30_000;
+
+// ---------------------------------------------------------------------------
+// Phase 43 Plan 01 — dormant-side lastMessageAt derivation
+// ---------------------------------------------------------------------------
+//
+// user 2026-08-23 lock: "only my real messages going to them" —
+// INVERTS the 2026-08-14 lock. See quick-260823-bap plan for the full
+// predicate matrix. Canonical copy lives in
+// `src/backend/fleet-status/ssh-poll-orchestrator.ts` (isRealUserTurn
+// helper + scanTailForNewestMessageAt). This file owns the byte-parallel copy
+// for the dormant /sessions/list path. If either copy ever needs to change,
+// update BOTH sites — a cross-cutting shared module was explicitly out of
+// scope for Phase 43 (43-CONTEXT.md "no new shared module" scope decision).
+
+/**
+ * user 2026-08-23 lock: "only my real messages going to them" —
+ * INVERTS the 2026-08-14 lock. Assistant activity, incoming/outgoing
+ * DMs, scheduled wakes, task notifications, skill-body injections all
+ * excluded. See quick-260823-bap plan for the full predicate matrix.
+ *
+ * Predicate: a JSONL line counts iff top-level type==="user" AND
+ * message.content is a plain string AND (starts with "<command-" OR
+ * NOT (starts with "<" AND ends with ">") on trimmed content) AND
+ * NOT a Ctrl-C kill signal (control-chars-only content) AND
+ * NOT an agent-supervisor /exit slash-command AND
+ * NOT an agent-supervisor resumed-injection sentinel.
+ *
+ * Independent JSON.parse (mirrors scanTailForLatestAiTitle pattern) —
+ * do NOT extend parseSessionLine to expose raw content. Parallel-copy
+ * discipline preserved per 43-CONTEXT.md scope decision (canonical
+ * copy in ssh-poll-orchestrator.ts must stay byte-parallel).
+ *
+ * user 2026-08-29 refinement: three additional harness-injected shapes
+ * confirmed on Tabitha's session file now explicitly rejected:
+ * - Ctrl-C kill signal: supervisor delivers "\x03\x03" as plain-string
+ *   content; after trimming, stripping all ASCII control chars yields "".
+ * - /exit slash-command: agent-supervisor fires `/exit` before a dormancy or archive shutdown;
+ *   content contains "<command-name>/exit</command-name>".
+ * - Resumed-injection sentinel: supervisor injects "Your session was just
+ *   resumed by the agent-supervisor…" as a type:"user" turn in some paths.
+ * - Teammate message: agent-team peer sends ("Another Claude session sent a
+ *   message:\n<teammate-message …") land as plain type:"user" string turns.
+ */
+function isRealUserTurn(rawLine: string): { ok: true; ts: number } | { ok: false } {
+  const trimmed = rawLine.trim();
+  if (trimmed === "") return { ok: false };
+  let obj: unknown;
+  try {
+    obj = JSON.parse(trimmed);
+  } catch {
+    return { ok: false };
+  }
+  if (obj === null || typeof obj !== "object") return { ok: false };
+  const top = obj as Record<string, unknown>;
+  // Step 2: top-level type must be "user" (excludes assistant, relay_outbound, etc.)
+  if (top.type !== "user") return { ok: false };
+  // Step 3: message.content must be a plain string (excludes list-content user turns:
+  // tool_result arrays, skill-body [{type:"text",text:…}] injections, etc.)
+  const msg = top.message;
+  if (msg === null || typeof msg !== "object") return { ok: false };
+  const content = (msg as Record<string, unknown>).content;
+  if (typeof content !== "string") return { ok: false };
+  // Step 4: apply the XML-wrapper exclusion.
+  const t = content.trim();
+  const isXmlWrapper = t.startsWith("<") && t.endsWith(">");
+  const isCommand = t.startsWith("<command-");
+  if (!isCommand && isXmlWrapper) return { ok: false };
+  // Step 5 (2026-08-29 refinement): drop /exit slash-command injected by agent-supervisor
+  // before shutting the harness down. user's own slash-commands (/id, /build, /gsd:*) are unaffected.
+  if (content.includes("<command-name>/exit</command-name>")) return { ok: false };
+  // Step 6 (2026-08-29 refinement): drop control-chars-only content (e.g. Ctrl-C kill
+  // signal "\x03\x03"). t is already trimmed of regular whitespace; stripping ASCII
+  // control chars from t and getting "" means the payload was pure control-char noise.
+  if (t.replace(/[\x00-\x1F]/g, "") === "") return { ok: false };
+  // Step 7 (2026-08-29 refinement): drop agent-supervisor resumed-injection sentinel.
+  // Prefix-anchored to avoid matching quoted mentions in real user prose.
+  if (content.startsWith("Your session was just resumed by the agent-supervisor")) return { ok: false };
+  // Step 8: drop agent-team teammate messages (harness-delivered peer sends, not user speech).
+  if (isTeammateMessage(content)) return { ok: false };
+  // Passed all gates — extract ts from the timestamp field.
+  const rawTs = top.timestamp;
+  if (typeof rawTs !== "string") return { ok: false };
+  const ts = Date.parse(rawTs);
+  if (!Number.isFinite(ts)) return { ok: false };
+  return { ok: true, ts };
+}
+
+/**
+ * Scan the raw stdout of a `tail -c 262144 <jsonl-path>` for the newest
+ * user-real-user-turn `ts` (unix millis) across all parseable lines.
+ * Returns null if zero qualifying lines are found (or the tail is empty).
+ *
+ * Mirrors the semantics of `scanTailForNewestMessageAt` in
+ * `ssh-poll-orchestrator.ts`. Empty and malformed lines are silently
+ * skipped — this is best-effort sampling, not a validation pass.
+ *
+ * Predicate: isRealUserTurn (user 2026-08-23 lock). The helper
+ * returns {ok, ts} so a single JSON.parse feeds both the gate and the ts
+ * extraction, avoiding a second parse on the keep path.
+ *
+ * Phase 85 (D-08): retired from the /sessions/list lastMessageAt
+ * derivation (see the Promise.all block in the route handler below —
+ * lastMessageAt now sources from getIdentityLastSend) but STAYS DEFINED
+ * as the byte-parallel copy of the ssh-poll-orchestrator export. If
+ * either copy changes, update BOTH per the file's parallel-copy
+ * discipline docblock above (L54-64). The `isRealUserTurn` helper
+ * this function calls (L93) is treated the same way — kept defined for
+ * the byte-parallel copy discipline even if this file has zero remaining
+ * callers post-swap. Do NOT delete either symbol.
+ */
+function scanTailForNewestMessageAt(tailContents: string): number | null {
+  let newest: number | null = null;
+  const lines = tailContents.split("\n");
+  for (const line of lines) {
+    if (line.trim() === "") continue;
+    const result = isRealUserTurn(line);
+    if (!result.ok) continue;
+    const { ts } = result;
+    if (newest === null || ts > newest) {
+      newest = ts;
+    }
+  }
+  return newest;
+}
+
+/**
+ * Phase 85 (D-08): test-only re-export of scanTailForNewestMessageAt for the
+ * byte-parallel-copy predicate-matrix regression suite. Follows the same
+ * convention as `__scanTailForNewestMessageAtForTests` in
+ * `src/backend/fleet-status/ssh-poll-orchestrator.ts` (Phase 85-04). The
+ * `/sessions/list` route no longer calls `scanTailForNewestMessageAt` on
+ * the lastMessageAt axis (lookup swapped to the send-log store), but the
+ * function definition + its `isRealUserTurn` dependency stay alive
+ * per the D-08 parallel-copy discipline. This export lets the
+ * quick-260823-bap predicate-matrix suite continue to assert the byte-level
+ * shape of the retired scanner without going through the route observable.
+ *
+ * Do NOT import from non-test code.
+ */
+export function __scanTailForNewestMessageAtForTests(
+  tailContents: string,
+): number | null {
+  return scanTailForNewestMessageAt(tailContents);
+}
+
+interface TmuxSessionRow {
+  // Phase 89 Plan 04 (D-15) — kind discriminator. Every construction site
+  // inside the Promise.all block MUST set `kind: "harness" as const` (the
+  // literal type makes this a compile-time invariant — a construction that
+  // omits or mistypes `kind` is a TypeScript build error). This marker
+  // lets slice D's frontend branch on how to render each item in the
+  // merged /sessions/list response. Peer type in sessions-merge-helper.ts
+  // uses `kind: "relay-room"` for the appended stored-table items.
+  kind: "harness";
+  hostId: number;
+  hostName: string;
+  sessionName: string;
+  created: number;
+  role: string | null;
+  lastMessageAt: number | null;
+  // Kept on the wire shape for backward compatibility with the frontend's
+  // FleetSession row (removing it would fan out through the working-store
+  // schema-version dance). Always null from this route now — live-session
+  // aiTitle continues to flow via the fleet-status WS pump.
+  aiTitle: string | null;
+}
+
+/**
+ * @openapi
+ * /sessions/list:
+ *   get:
+ *     summary: List tmux sessions across all SSH+autoTmux hosts
+ *     tags:
+ *       - Sessions
+ *     responses:
+ *       200:
+ *         description: Flat list of sessions. Hosts that error or time out are silently dropped.
+ */
+/**
+ * Lists a host's tmux sessions as `name|created` lines. tmux exits 1 when no
+ * server is running, i.e. the host has no sessions at all (e.g. after its last
+ * agent was archived); execCommand rejects any non-zero exit with empty output,
+ * which would mark the host unreachable and make the client keep its stale rows
+ * forever. So "no server" exits 0 with no output (zero sessions); every other
+ * failure keeps its error and exit code (still unreachable). stderr stays out of
+ * the listing: on a failure, tmux runs once more just to read its message.
+ */
+export const LIST_TMUX_SESSIONS_COMMAND = [
+  `out=$(tmux list-sessions -F '#{session_name}|#{session_created}' 2>/dev/null); rc=$?`,
+  `if [ "$rc" -ne 0 ]; then`,
+  `  err=$(tmux list-sessions 2>&1 >/dev/null)`,
+  `  case "$err" in "no server running"*|"error connecting to"*"(No such file or directory)"*) exit 0 ;; esac`,
+  `  printf '%s\\n' "$err" >&2; exit "$rc"`,
+  `fi`,
+  `printf '%s\\n' "$out"`,
+].join("\n");
+
+router.get("/list", authenticateJWT, async (req: Request, res: Response) => {
+  const userId = (req as AuthenticatedRequest).userId;
+  try {
+    // Phase 129 Plan 129-03: per-request callerUsername lookup for the D-2
+    // visibility gate applied per-session below. Fetched EXACTLY ONCE per
+    // request — not per host, not per session — matching this file's
+    // per-request-cost discipline (see the roleReadCache pattern established
+    // in Plan 129-02 identities.ts L361-386 for the analogous per-host memo
+    // rationale). Runs BEFORE the per-host fanout so every host + session
+    // shares the same resolved caller identity.
+    //
+    // A null result (unknown / orphaned userId) is a shape-violation
+    // defensive branch — we do NOT abort the request. Per D-8 the visibility
+    // gate is NOT a permission system; a defective username lookup must fall
+    // OPEN (return rows the current host-access predicate would allow)
+    // rather than empty out the caller's sidebar. isIdentityVisibleToUser
+    // short-circuits to `true` on a null callerUsername (Plan 129-01
+    // Task 2 Test 1 — the internal-server / test / admin-bypass semantic).
+    // Ops needs a log crumb to trace "why did the gate not run for this
+    // request?" so we emit a structured warn.
+    const callerUsername = await getUsernameForUserId(userId);
+    if (callerUsername === null) {
+      systemLogger.warn(
+        "Phase 129: GET /sessions/list callerUsername lookup failed — gate disabled for this request",
+        {
+          operation: "sessions_gate_username_missing",
+          userId,
+        },
+      );
+    }
+
+    // SimpleDBOps decrypts the encrypted columns (terminalConfig, etc.)
+    const rows = (await SimpleDBOps.select(
+      db.select().from(hosts).where(eq(hosts.userId, userId)),
+      "ssh_data",
+      userId,
+    )) as Array<Record<string, unknown>>;
+
+    const candidates = rows.filter((h) => {
+      if (!h.enableSsh) return false;
+      let cfg: Record<string, unknown> = {};
+      if (typeof h.terminalConfig === "string" && h.terminalConfig) {
+        try {
+          cfg = JSON.parse(h.terminalConfig as string);
+        } catch {
+          /* ignore */
+        }
+      } else if (h.terminalConfig && typeof h.terminalConfig === "object") {
+        cfg = h.terminalConfig as Record<string, unknown>;
+      }
+      return cfg.autoTmux !== false;
+    });
+
+    // Hosts whose list-sessions failed (unreachable / timeout). Their `[]`
+    // means "unknown", not "no sessions" — surfaced in a response header so
+    // the client keeps the rows it already has for them instead of wiping
+    // them on a wholesale replace.
+    const unreachableHostIds: number[] = [];
+    const results = await Promise.all(
+      candidates.map(async (h): Promise<TmuxSessionRow[]> => {
+        const hostId = h.id as number;
+        const hostName = ((h.name as string) || (h.ip as string) || "") as string;
+        try {
+          const resolved = await resolveHostById(hostId, userId);
+          if (!resolved) return [];
+          const conn = await connectOneShot(
+            resolved as unknown as Parameters<typeof connectOneShot>[0],
+            CONNECT_TIMEOUT_MS,
+          );
+          try {
+            const output = await Promise.race([
+              execCommand(conn, LIST_TMUX_SESSIONS_COMMAND),
+              new Promise<string>((_, reject) =>
+                setTimeout(
+                  () => reject(new Error("list-sessions timeout")),
+                  PER_HOST_TIMEOUT_MS,
+                ),
+              ),
+            ]);
+            if (!output) return [];
+            const rows = output
+              .split("\n")
+              .map((line) => line.trim())
+              .filter(Boolean)
+              .map((line) => {
+                const [name, created] = line.split("|");
+                return {
+                  // Phase 89 Plan 04 (D-15) — kind marker; compile-time
+                  // invariant via the `"harness"` literal on TmuxSessionRow.
+                  // Every row emitted by this handler through the harness
+                  // partition carries this marker; the merge block below
+                  // appends relay-room rows with `kind: "relay-room"`.
+                  kind: "harness" as const,
+                  hostId,
+                  hostName,
+                  sessionName: name,
+                  created: parseInt(created, 10) || 0,
+                  role: null as string | null,
+                  lastMessageAt: null as number | null,
+                  // Phase 47 Plan 02 — aiTitle third axis. Row-init null; the
+                  // recencySignalsBlock below will populate on discovery hit.
+                  aiTitle: null as string | null,
+                };
+              });
+
+            // Phase 129 Plan 129-03: per-host role-cosmetics memo. Multiple
+            // sessions of the same role on the same host must read the role
+            // file AT MOST ONCE (T-129-03-03 SSH DoS mitigation; mirrors
+            // identities.ts L399-424 roleReadCache pattern). Storing the
+            // in-flight Promise (not the resolved value) collapses parallel
+            // reads within the same Promise.all fanout — the second caller
+            // awaits the first caller's in-flight readRoleFileByName rather
+            // than kicking off a second SSH exec. Lives inside the per-host
+            // try block so it's fresh per request, not module-global.
+            //
+            // On read error the cache stores `null` — matches the D-8
+            // fail-open contract (visibility filter, not permission system):
+            // a role-file read failure must NOT convert into a false-positive
+            // HIDE via the gate.
+            const roleReadCache = new Map<
+              string,
+              Promise<ReturnType<typeof extractCosmeticsFromFrontmatter> | null>
+            >();
+            const readRoleCosmeticsMemoized = (
+              roleName: string,
+            ): Promise<
+              ReturnType<typeof extractCosmeticsFromFrontmatter> | null
+            > => {
+              const existing = roleReadCache.get(roleName);
+              if (existing !== undefined) return existing;
+              const p = (async () => {
+                try {
+                  const { markdown: roleMd } = await readRoleFileByName(
+                    conn,
+                    roleName,
+                  );
+                  return roleMd
+                    ? extractCosmeticsFromFrontmatter(roleMd)
+                    : {};
+                } catch {
+                  // Silent-swallow: role read failed. Return null so the
+                  // gate has no role-side users list to check — falls open
+                  // per D-8 (D-3 fallback: absent = "no gate on this side").
+                  return null;
+                }
+              })();
+              roleReadCache.set(roleName, p);
+              return p;
+            };
+
+            // Phase 129 Plan 129-03: per-session visibility decisions live
+            // in a parallel Map rather than a transient row field. This
+            // avoids the "did I mutate the wire shape?" audit question:
+            // TmuxSessionRow's compile-time shape stays exactly as-is; the
+            // Map is scoped to this per-host block and consulted at the
+            // return-time filter below.
+            //
+            // Convention: absence-in-map = "not yet decided" = "visible"
+            // (fail-open per D-8 — a row whose gate never ran, e.g. because
+            // the identity-file read threw BEFORE the gate could evaluate,
+            // is treated as visible). The `!== false` filter below preserves
+            // this contract at the return seam.
+            const visibleMap = new Map<string, boolean>();
+
+            // Resolve role AND derive recency-signals for each session in
+            // parallel. Three independent per-session blocks dispatched
+            // concurrently:
+            //
+            //   1. roleResolveBlock — reads the identity's frontmatter over
+            //      the same already-open SSH conn (Phase 129 Plan 129-03:
+            //      fused with the visibility gate — the SAME readIdentityFile
+            //      output feeds BOTH extractRoleFromMarkdown AND
+            //      extractCosmeticsFromFrontmatter, so no second SSH round-
+            //      trip per row; Assumption A5 lock; T-129-03-03 mitigation).
+            //   2. sendLogLookupBlock — reads the identity-name-keyed send-log
+            //      store for `lastMessageAt`. INDEPENDENT of the SSH pathway
+            //      (in-process DB lookup) so a slow tail-scan cannot null the
+            //      recency signal, and a timeout on the ai-title scan below
+            //      cannot regress `row.lastMessageAt` because it's already set
+            //      by this block.
+            //   3. aiTitleBlock — reads the JSONL tail for the harness
+            //      ai-title line. Wrapped in Promise.race(PER_HOST_TIMEOUT_MS)
+            //      + try/catch so one hung discovery does NOT kill the whole
+            //      host (Phase 47 Plan 02 <behavior> Test 6 lock).
+            //
+            // Phase 85 (D-07): source-swap parallel to Plan 85-04. The
+            // `/sessions/list` route is the initial-seed path that AppShell
+            // reads on page-load to feed `seedSessionLastMessageAt` in the
+            // frontend working store. Without this swap a fresh page-load
+            // would seed the stale JSONL-derived value, then the WS-live
+            // orchestrator frame (Plan 85-04) would overwrite ~2s later
+            // (visible flicker as rows re-sort). Swapping the seed to the
+            // store makes the initial paint authoritative-consistent with
+            // the WS-live frame from the moment the page loads.
+            //
+            // Phase 85 (D-08): `scanTailForNewestMessageAt` STAYS DEFINED in
+            // this file (see docblock above the function definition) —
+            // byte-parallel copy discipline with the ssh-poll-orchestrator
+            // export. Only the CALL retires; the function + its
+            // `isRealUserTurn` dependency remain.
+            await Promise.all(
+              rows.map(async (row) => {
+                // Phase 129 Plan 129-03: fused role + cosmetics + gate block.
+                // Single readIdentityFile per session (Assumption A5) whose
+                // markdown output feeds BOTH extractRoleFromMarkdown (for
+                // row.role — unchanged wire contract) AND
+                // extractCosmeticsFromFrontmatter (for the identity-side
+                // gate). A second SSH read here would double the per-row
+                // round-trip cost against the sshd MaxSessions=10 budget
+                // (T-129-03-03).
+                //
+                // Fail-open contract (D-8): if the identity-file read fails
+                // for any reason (SSH timeout, exec error, empty markdown),
+                // row.role stays null AND visibleMap stays UNSET for this
+                // row — the return-time `!== false` filter then keeps the
+                // row visible. Converting a read failure into a HIDE would
+                // be a permission-system behavior forbidden by D-8.
+                const roleResolveBlock = (async () => {
+                  // FAST PATH — consult THIS user's fleet-status sweep
+                  // cosmetics cache. Each Skynet user has their own
+                  // orchestrator (per-user watcher factory in starter.ts)
+                  // so the holder lookup is keyed on `userId`. When the
+                  // user's watcher is running and the sweep has enumerated
+                  // this identity, we get role + identity_cosmetics +
+                  // role_cosmetics without any SSH read. On cache miss
+                  // (no watcher yet, first tick hasn't run, identity not
+                  // enumerated), fall through to the SSH path below
+                  // unchanged.
+                  const orch = getOrchestrator(userId);
+                  if (orch !== null) {
+                    const cached = orch.getCachedIdentityCosmetics(
+                      String(hostId),
+                      row.sessionName,
+                    );
+                    if (cached !== null) {
+                      row.role = cached.role;
+                      const visible = isIdentityVisibleToUser(
+                        cached.identityCosmetics,
+                        cached.rolesCosmetics ?? cached.roleCosmetics,
+                        callerUsername,
+                      );
+                      visibleMap.set(row.sessionName, visible);
+                      if (!visible) {
+                        systemLogger.debug(
+                          "Phase 129: session hidden by visibility gate (sweep cache)",
+                          {
+                            operation: "sessions_gate_hidden",
+                            sessionName: row.sessionName,
+                            hostId,
+                            callerUsername,
+                            source: "sweep_cache",
+                          },
+                        );
+                      }
+                      return;
+                    }
+                  }
+
+                  // SLOW PATH — original per-row SSH read. Kicks in on
+                  // cache miss (fresh boot, orchestrator stopped between
+                  // subscribers, host not in the identity-hosting set).
+                  try {
+                    const { markdown } = await Promise.race([
+                      readIdentityFile(conn, row.sessionName),
+                      new Promise<{ markdown: string }>((_, reject) =>
+                        setTimeout(
+                          () => reject(new Error("per-identity role resolve timeout")),
+                          PER_HOST_TIMEOUT_MS,
+                        ),
+                      ),
+                    ]);
+                    const role = extractRoleFromMarkdown(markdown);
+                    row.role = role;
+
+                    // Phase 129 Plan 129-03: gate on identity + role users.
+                    // extractCosmeticsFromFrontmatter returns {} for empty
+                    // markdown; identityCos.users is absent → gate falls
+                    // open on the identity side (D-3 fallback).
+                    const identityCos =
+                      extractCosmeticsFromFrontmatter(markdown);
+                    // Multi-role: `role` is null (no single role), so gate
+                    // on every listed role instead.
+                    const roles = extractRolesFromMarkdown(markdown);
+                    const roleCos =
+                      roles.length > 1
+                        ? await resolveGateRoleSide(
+                            roles,
+                            readRoleCosmeticsMemoized,
+                          )
+                        : role !== null
+                          ? await readRoleCosmeticsMemoized(role)
+                          : null;
+                    const visible = isIdentityVisibleToUser(
+                      identityCos,
+                      roleCos,
+                      callerUsername,
+                    );
+                    visibleMap.set(row.sessionName, visible);
+                    if (!visible) {
+                      systemLogger.debug(
+                        "Phase 129: session hidden by visibility gate",
+                        {
+                          operation: "sessions_gate_hidden",
+                          sessionName: row.sessionName,
+                          hostId,
+                          callerUsername,
+                        },
+                      );
+                    }
+                  } catch (e) {
+                    sshLogger.debug("sessions/list: role resolve skipped for session", {
+                      operation: "sessions_list_role_resolve_skip",
+                      hostId,
+                      hostName,
+                      sessionName: row.sessionName,
+                      error: e instanceof Error ? e.message : "unknown",
+                    });
+                    row.role = null;
+                    // Deliberately leave visibleMap UNSET for this row —
+                    // the return-time `!== false` filter treats absent
+                    // entries as visible (fail-open per D-8).
+                  }
+                })();
+
+                // Phase 85 (D-07): per-session send-log store lookup for
+                // `lastMessageAt`. Fleet convention: identity name ===
+                // tmux session name === /id target (see 79-CONTEXT.md § D-02).
+                // The store owns the max-wins + fail-open contracts (Phase
+                // 85-02); the try/catch here is belt-and-suspenders on the
+                // per-row path. On store-null or throw → row.lastMessageAt
+                // stays at its row-init `null`, which is the same D-09
+                // first-ship "natural fill" contract the WS-live orchestrator
+                // frame uses.
+                const sendLogLookupBlock = (async () => {
+                  try {
+                    const stored = await getIdentityLastSend(row.sessionName);
+                    row.lastMessageAt = stored;
+                    sshLogger.debug(
+                      "sessions/list: lastMessageAt derived from send-log store",
+                      {
+                        operation: "sessions_list_last_message_at_from_store",
+                        hostId,
+                        hostName,
+                        sessionName: row.sessionName,
+                        lookupResult: stored,
+                      },
+                    );
+                  } catch (e) {
+                    sshLogger.debug(
+                      "sessions/list: getIdentityLastSend failed — leaving lastMessageAt null",
+                      {
+                        operation: "sessions_list_send_log_lookup_failed",
+                        hostId,
+                        hostName,
+                        sessionName: row.sessionName,
+                        error: e instanceof Error ? e.message : "unknown",
+                      },
+                    );
+                    row.lastMessageAt = null;
+                  }
+                })();
+
+                // Per-session ai-title derivation retired here — it fired
+                // a discover + `tail -c 262144` SSH exec pair per row, which
+                // on a 200-session host doubled workstation's page-load
+                // SSH-scope pressure alongside the readIdentityFile fanout
+                // (that one moved to sweep-cache lookup in the sibling
+                // chunk). Live sessions still populate aiTitle via the
+                // fleet-status WS pump (SweepPidLine.jsonl_tail → orch's
+                // per-PID compose path); dormant sessions surface with
+                // row.aiTitle = null and the frontend's PrettyConversation
+                // Row subtitle falls back to its null-placeholder shape.
+                // The subtitle line only renders on mobile and is going
+                // away in a near-term UI cut — accepting the null shape
+                // now avoids sustaining a per-page-load SSH amplifier for
+                // a decoration whose lifetime is shorter than the fix's.
+                row.aiTitle = null;
+
+                await Promise.all([
+                  roleResolveBlock,
+                  sendLogLookupBlock,
+                ]);
+              }),
+            );
+
+            // Phase 129 Plan 129-03: D-7 deep-gate filter. `!== false` (not
+            // `=== true`) preserves the D-8 fail-open contract — rows whose
+            // gate never ran (identity-file read threw before
+            // visibleMap.set) stay visible. Only rows where the gate ran
+            // AND returned false are dropped. The row is ABSENT from the
+            // response (no orphan with role=null; no ghost cosmetics).
+            return rows.filter(
+              (r) => visibleMap.get(r.sessionName) !== false,
+            );
+          } finally {
+            try {
+              conn.end();
+            } catch {
+              /* ignore */
+            }
+          }
+        } catch (e) {
+          sshLogger.debug("sessions/list: host skipped", {
+            operation: "sessions_list_host_skip",
+            hostId,
+            hostName,
+            error: e instanceof Error ? e.message : "unknown",
+          });
+          unreachableHostIds.push(hostId);
+          return [];
+        }
+      }),
+    );
+
+    // -----------------------------------------------------------------
+    // Phase 89 Plan 04 (D-15) merge — appends active relay-room rows to
+    // the harness-derived list. Every item in the merged response
+    // carries a `kind` marker so slice D can branch. Harness rows are
+    // sorted by `created` DESC (unchanged from Phase 47); relay rows
+    // are appended after — slice D re-sorts by `lastActivityAt` if
+    // desired per D-15 explicit deferral.
+    //
+    // Best-effort: listActiveRelayRoomSessions failure logs a warning
+    // and returns harness-only (better UX than 500-ing the entire
+    // endpoint). D-01 scope anchor: the harness-derivation path above
+    // is byte-identical; this block is APPEND-ONLY.
+    //
+    // Timeout budget: the DB query is local + cheap (indexed SELECT on
+    // relay_room_sessions filtered by (user_id, state='active')). It
+    // does NOT need the 30s PER_HOST_TIMEOUT_MS cap — running it
+    // outside any setTimeout wrapper is the intentional choice per
+    // D-15 CONTEXT.md note. Total endpoint response time remains
+    // trivially within the existing per-host budget.
+    // -----------------------------------------------------------------
+    const harnessFlat = results.flat();
+    let relayRows: RelayRoomSessionRow[] = [];
+    try {
+      const active = await listActiveRelayRoomSessions(userId);
+      relayRows = active.map((r) => ({
+        kind: "relay-room" as const,
+        id: r.id,
+        roomId: r.roomId,
+        roomTitle: r.roomTitle,
+        lastActivityAt: r.lastActivityAt,
+        createdAt: r.createdAt,
+        updatedAt: r.updatedAt,
+      }));
+    } catch (e) {
+      databaseLogger.warn(
+        "[phase-89] listActiveRelayRoomSessions failed — returning harness rows only (best-effort merge)",
+        {
+          operation: "sessions_list_relay_merge_failed",
+          userId,
+          error: e instanceof Error ? e.message : "unknown",
+        },
+      );
+      relayRows = [];
+    }
+
+    const flat = mergeRelayRoomsIntoFlat(harnessFlat, relayRows);
+    if (unreachableHostIds.length > 0) {
+      res.setHeader("X-Skynet-Unreachable-Hosts", unreachableHostIds.join(","));
+    }
+    return res.json(flat);
+  } catch (e) {
+    databaseLogger.error("Failed to list tmux sessions", e, {
+      operation: "sessions_list",
+      userId,
+    });
+    return res.status(500).json({ error: "Failed to list sessions" });
+  }
+});
+
+export default router;

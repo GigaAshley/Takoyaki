@@ -1,0 +1,1821 @@
+/**
+ * local-fleet-install.ts — Local-FS analog to run-sweep.ts + run-bootstrap.ts.
+ *
+ * ## Why this exists (quick 260918-5lb)
+ *
+ * The fleet-substrate distributor (server-substrate-orchestrator.ts) enumerates
+ * every runsFleetSubstrate:true host serially and SSHs into each to push
+ * substrate bytes (skills, helper scripts, systemd units) + run the bootstrap
+ * (systemctl enable, settings.json patch, host-parent/host-name writes).
+ *
+ * When the substrate host is the container's OWN host (`fleetHostId` is in the
+ * IDENTITIES_LOCAL_HOST_IDS env allowlist), SSH-to-self
+ * from inside the container occasionally HANGS INDEFINITELY in
+ * `deps.acquireChannel(host)`. The whole serial `for-of` loop wedges: every
+ * subsequent host never receives skill / helper-script updates until the
+ * container is manually recreated. That is the failure mode this module fixes.
+ *
+ * Bypass approach mirrors the Phase 116 scanner bypass pattern in
+ * `src/backend/utils/local-fleet-scan.ts` + the `isLocalHostId` branches in
+ * `spawn-requests/scan-orchestrator.ts` and `agent-services/engine/scan-orchestrator.ts`:
+ *   - The container has the host's user-home bind-mounted at
+ *     `getLocalHomeRoot()` (=`HOME_HOST_DIR`, typically `/host-home`), so
+ *     writes to `<home-root>/.claude/skills/…`, `<home-root>/.local/bin/…`,
+ *     `<home-root>/.config/systemd/user/…` land at the same paths a
+ *     `~/…`-based SSH push would touch on the local host's filesystem.
+ *   - Prior to the 2026-09-18 fix this used `path.dirname(IDENTITIES_HOST_DIR)`
+ *     assuming `~/` was mounted at `/fleet`; the mount actually only covered
+ *     `~/fleet`, so every `~/*` install landed under `/home/ubuntu/fleet/*`
+ *     instead of `/home/ubuntu/*` — invisible to systemd + the substrate
+ *     consumers. Fix: widened mount to full `~/` at `/host-home`, path
+ *     resolution now reads `HOME_HOST_DIR` directly rather than deriving.
+ *   - The orchestrator (Task 2, server-substrate-orchestrator.ts) checks
+ *     `isLocalHostId(parseInt(host.id, 10))` at the top of `executeSweeForHost`
+ *     and — when true — early-returns after calling this module's
+ *     `bootstrapFleetSubstrateLocally(host)` + `installFleetSubstrateLocally(...)`,
+ *     bypassing `deps.acquireChannel` entirely.
+ *
+ * ## Semantics — byte-identical to the SFTP path
+ *
+ * Every write here mirrors the ssh-push.ts + run-bootstrap.ts semantics:
+ *   - Hash-compare before write (Buffer.equals) → skip silently when bytes
+ *     already match. No `writeFile`, no `rename`, no `mtime` churn. Same
+ *     outcome as ssh-push's `decideItemAction → skip("bytes-match")` path.
+ *   - Atomic write via `<installPath>.<pid>.tmp` + `fs.rename`. Mirrors the
+ *     SFTP path's `base64 -d > tmp && mv tmp final` idiom.
+ *   - `computeInstallMode(bundledMode)` from sweep-logic.ts is used unchanged —
+ *     mask to low 9 bits, executable-bits from the bundled file's mode are
+ *     preserved on the installed side.
+ *   - For runtime rows (`sourceKind: "runtime"`), the resolver map's Buffer
+ *     value is treated as bytes with mode 0o644 (matches run-sweep.ts D-18).
+ *     A null value triggers the removal branch (unlink the installed file if
+ *     present).
+ *   - For `installMode: "system-root"` rows (the `instance-policy-claude-md`
+ *     twinkie), the write is gated on `process.geteuid?.() === 0`. In the
+ *     container the process is root; on a dev machine it is not — non-root
+ *     → skip-with-warn, `itemsFailed++`, no throw.
+ *
+ * ## Bootstrap coverage
+ *
+ * The SSH bootstrap (run-bootstrap.ts) has 5 steps: (1-3) systemd enable +
+ * settings.json patch + gsd-context-monitor cleanup, (4) host-parent write,
+ * (5) host-name write, (5b) host-id write, (6) usage-reporter retirement,
+ * (7) identity roles-key migration. This module implements the
+ * minimum viable set for the local box:
+ *   - Steps 4 + 5 + 5b (host-parent, host-name, host-id) — always implemented.
+ *   - Step 7 (roles-key migration) — always runs, via migrateRolesKeyUnder
+ *     (TS port of the SSH path's python script; the container has no python3).
+ *   - Step 7b (runbooks → role skills) — always runs, via
+ *     migrateRoleSkillsUnder (same TS-port arrangement).
+ *   - Steps 1-3 (systemd + settings patch + cleanup) — only when
+ *     `XDG_RUNTIME_DIR` is present in the container process env (evidence of
+ *     a running systemd-user session). Absent → skip-with-warn using
+ *     `operation: local_fleet_bootstrap_skip` and DO NOT mark `hadError:true`
+ *     (documented environmental limitation, mirrors the SSH path's own
+ *     "channel returned null" recovery). In production, the container
+ *     inherits the host's XDG_RUNTIME_DIR so this branch will fire; in tests
+ *     and dev containers it typically will not.
+ *
+ * ## Never-throw contract — load-bearing
+ *
+ * Neither `installFleetSubstrateLocally` nor `bootstrapFleetSubstrateLocally`
+ * ever propagates an exception. Every FS call is wrapped in try/catch that:
+ *   1. Bumps `itemsFailed++` (install) or sets `hadError: true` (bootstrap).
+ *   2. Logs via `systemLogger.warn` with a structured `operation:
+ *      local_fleet_install_error` or `local_fleet_bootstrap_error` field.
+ *   3. Includes `site:` naming the FS call that failed and `error:` with the
+ *      captured message. Mirrors the log-shape convention in
+ *      local-fleet-scan.ts.
+ * Belt-and-suspenders defense-in-depth try/catch wraps the outer loop bodies.
+ *
+ * A never-throw violation here would re-wedge the distributor's `for-of`
+ * loop — exactly the failure mode this module exists to fix. Tests NT1 + BE1
+ * lock in this invariant.
+ */
+
+import path from "path";
+import os from "os";
+import fs from "fs/promises";
+import { randomBytes } from "crypto";
+import { execFile as execFileCb } from "child_process";
+import { promisify } from "util";
+import { systemLogger } from "../utils/logger.js";
+import { computeInstallMode } from "./sweep-logic.js";
+import type { CatalogEntry } from "./catalog.js";
+import type { BootstrapResult } from "./run-bootstrap.js";
+import {
+  MACHINE_PEOPLE_REL_PATH,
+  SETTINGS_MERGE_JQ,
+  SETTINGS_CHECK_JQ,
+  SETTINGS_REQUIRED_KEY_COUNT,
+  GSD_MONITOR_DETECT_JQ,
+  GSD_MONITOR_STRIP_JQ,
+  USAGE_REPORTER_RETIRED_FILES,
+  RETIRED_SUBSTRATE_FILES,
+  RETIRED_SUBSTRATE_DIRS,
+  RETIRED_SUBSTRATE_TREES,
+  RETIRED_USER_UNITS,
+  RETIRED_USER_UNIT_PREFIX,
+  RETIRED_USER_UNIT_MARKER,
+  RETIRED_IDENTITY_STATE_FILES,
+  RETIRED_IDENTITY_STATE_DIRS,
+  CONTEXT_WATCH_RETIRED,
+  USAGE_REPORTER_RETIRED_DIR,
+} from "./run-bootstrap.js";
+import { migrateRolesKeyUnder } from "./roles-key-migration.js";
+import { migrateRoleSkillsUnder, logRoleSkillsMigration } from "./role-skills-migration.js";
+
+/**
+ * Read the WRAPPED= original statusLine command out of a usage-reporter.conf
+ * body. The conf was always written as `WRAPPED=<jq @sh / single-quoted>` —
+ * a single-quoted string with embedded quotes as `'\''`. Anything else
+ * (unquoted, multi-token, unparseable) returns "" so the caller drops
+ * statusLine rather than guessing.
+ */
+export function parseWrappedFromConf(conf: string): string {
+  const m = conf.match(/^WRAPPED=(.*)$/m);
+  if (!m) return "";
+  const v = m[1].trim();
+  if (!/^'(?:[^']|'\\'')*'$/.test(v)) return "";
+  return v.slice(1, -1).replace(/'\\''/g, "'");
+}
+
+const execFile = promisify(execFileCb);
+
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+/**
+ * Injected dependencies for the local install helper. Mirrors SweepDeps from
+ * run-sweep.ts so the orchestrator can call this helper with the same
+ * (readBundledBytes, resolvedRuntimeBytes, now) surface it already uses for
+ * runSweepForHost.
+ */
+export interface LocalInstallDeps {
+  readBundledBytes: (
+    bundledPath: string,
+  ) => Promise<{ bytes: Buffer; mode: number } | null>;
+  /** Optional — pre-resolved runtime bytes for `sourceKind: "runtime"` rows. */
+  resolvedRuntimeBytes?: Map<string, Buffer | null>;
+  /** Injectable clock for durationMs — defaults to Date.now. */
+  now?: () => number;
+  /**
+   * Optional injectable restart-hook firer (for tests). Defaults to the real
+   * `fireRestartHookLocally` which invokes systemd's `RestartUnit` method via
+   * `busctl --user call` against the host's user DBus session bus (requires
+   * the host-systemd override compose file to be enabled — see
+   * docker/docker-compose.host-systemd.override.yml).
+   */
+  fireRestartHook?: (
+    unitName: string,
+  ) => Promise<
+    { ok: true } | { ok: false; skipped: boolean; errorMessage: string }
+  >;
+}
+
+/**
+ * The result shape matches run-sweep.ts / runSweepForHost's return type
+ * so the orchestrator can apply identical bookkeeping (sweepedThisInstance,
+ * consecutiveFailures, persistentAlertFired) to either branch's result.
+ */
+export interface LocalInstallResult {
+  itemsChecked: number;
+  itemsChanged: number;
+  itemsFailed: number;
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Return the local user-home root — the container path where the host's
+ * `~/` is bind-mounted. In production: `/host-home` (via `HOME_HOST_DIR`).
+ * In dev: `os.homedir()`. This is the directory whose contents map 1:1
+ * onto the host user-home, so `~/.claude/skills/foo/SKILL.md` on the host
+ * is `<home-root>/.claude/skills/foo/SKILL.md` inside the container.
+ *
+ * Distinct from local-fleet-scan.ts's `getLocalFleetRoot()`, which returns
+ * the *fleet* root (`~/fleet`) — a subdirectory of this one.
+ */
+function getLocalHomeRoot(): string {
+  return process.env.HOME_HOST_DIR || os.homedir();
+}
+
+/**
+ * Restart a host user unit from inside the container by calling
+ * `org.freedesktop.systemd1.Manager.RestartUnit` via `busctl --user call`
+ * against the host's user DBus session bus. Mirrors `restartUserUnit` in
+ * ssh-push.ts but uses the bind-mounted session-bus socket (via the
+ * host-systemd compose override) instead of an SSH channel.
+ *
+ * Why busctl and not `systemctl --user restart`: `systemctl` bypasses the
+ * DBus session bus and connects directly to
+ * `$XDG_RUNTIME_DIR/systemd/private` — a systemd-internal socket whose
+ * handshake is version-locked to the systemd running the peer user manager.
+ * On co-located deployments where the container's systemd tooling (from
+ * Debian 12 bookworm: systemd 252) is older than the host's
+ * (Ubuntu 24.04 noble: systemd 255), that private-socket handshake fails
+ * with `Failed to connect to bus: No data available`. `busctl` instead
+ * speaks vanilla D-Bus to the dbus-daemon on the session bus, which routes
+ * to `org.freedesktop.systemd1` regardless of the manager's systemd
+ * version — structurally sidestepping the version-skew failure mode
+ * rather than assuming the two sides stay in lockstep.
+ *
+ * Requires the deployer to have opted-in via
+ * `docker/docker-compose.host-systemd.override.yml`, which bind-mounts
+ * `/run/user/1000:/run/user/1000`, sets `XDG_RUNTIME_DIR=/run/user/1000`
+ * in the container env, AND drops the container's AppArmor confinement so
+ * dbus-daemon's mediation accepts the `Hello` call. When the override is
+ * absent, `XDG_RUNTIME_DIR` is unset in the container process, and this
+ * function skip-with-warns using `operation: local_fleet_install_restart_skip`
+ * and does NOT count as a failure — same recovery shape as the SSH branch's
+ * "channel returned null" case (see restartUserUnit in ssh-push.ts) and the
+ * local-fleet-bootstrap's systemd_capability_check skip.
+ *
+ * Never throws — every exec is wrapped. Caller is responsible for the
+ * `itemsFailed++` / logItemFailed pattern when returning `{ok: false,
+ * skipped: false}`; a skip is not a failure.
+ */
+async function fireRestartHookLocally(
+  unitName: string,
+): Promise<
+  { ok: true } | { ok: false; skipped: boolean; errorMessage: string }
+> {
+  if (!process.env.XDG_RUNTIME_DIR) {
+    return {
+      ok: false,
+      skipped: true,
+      errorMessage:
+        "XDG_RUNTIME_DIR unset — host-systemd compose override not enabled",
+    };
+  }
+  try {
+    await execFile(
+      "busctl",
+      [
+        "--user",
+        "call",
+        "org.freedesktop.systemd1",
+        "/org/freedesktop/systemd1",
+        "org.freedesktop.systemd1.Manager",
+        "RestartUnit",
+        "ss",
+        unitName,
+        "replace",
+      ],
+      { env: process.env },
+    );
+    return { ok: true };
+  } catch (err) {
+    const errorMessage =
+      err instanceof Error
+        ? err.message.slice(0, 500)
+        : String(err).slice(0, 500);
+    return { ok: false, skipped: false, errorMessage };
+  }
+}
+
+/**
+ * Resolve a catalog entry's `installPath` to the on-disk path inside the
+ * container. Leading `~/` is replaced with `getLocalHomeRoot() + "/"`;
+ * absolute paths (e.g. `/etc/claude-code/CLAUDE.md`) are passed through
+ * verbatim.
+ */
+function resolveInstalledPath(installPath: string): string {
+  if (installPath.startsWith("~/")) {
+    return path.join(getLocalHomeRoot(), installPath.slice(2));
+  }
+  return installPath;
+}
+
+/**
+ * Read installed bytes at `finalPath`. Returns:
+ *   - { readOk: true, bytes: Buffer }   file exists, contents known
+ *   - { readOk: true, bytes: null }     file absent (ENOENT)
+ *   - { readOk: false, reason: "..." }  other fs failure (fail-closed)
+ * Never throws.
+ */
+async function readInstalledBytesLocal(
+  finalPath: string,
+): Promise<
+  { readOk: true; bytes: Buffer | null }
+  | { readOk: false; reason: string }
+> {
+  try {
+    const bytes = await fs.readFile(finalPath);
+    return { readOk: true, bytes };
+  } catch (err: unknown) {
+    if (
+      typeof err === "object" &&
+      err !== null &&
+      (err as NodeJS.ErrnoException).code === "ENOENT"
+    ) {
+      return { readOk: true, bytes: null };
+    }
+    return {
+      readOk: false,
+      reason: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+/**
+ * Atomic write: mkdir -p, writeFile to tmp path, chmod tmp, rename onto final.
+ * Never throws; returns { ok: false, site, error } on failure so the caller
+ * can bump counters + log.
+ */
+async function atomicWrite(
+  finalPath: string,
+  bytes: Buffer,
+  mode: number,
+): Promise<
+  { ok: true } | { ok: false; site: string; error: string }
+> {
+  // pid + random: two writers in this process (a sweep and the people-list
+  // refresh) must never share a temp file.
+  const tmpPath = `${finalPath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+  try {
+    await fs.mkdir(path.dirname(finalPath), { recursive: true });
+  } catch (err) {
+    return {
+      ok: false,
+      site: "mkdir",
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+  try {
+    await fs.writeFile(tmpPath, bytes);
+  } catch (err) {
+    return {
+      ok: false,
+      site: "writeFile",
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+  try {
+    await fs.chmod(tmpPath, mode);
+  } catch (err) {
+    // Best-effort tmp cleanup so we don't leave a stale tmp on chmod failure.
+    try { await fs.unlink(tmpPath); } catch { /* ignore */ }
+    return {
+      ok: false,
+      site: "chmod",
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+  try {
+    await fs.rename(tmpPath, finalPath);
+  } catch (err) {
+    try { await fs.unlink(tmpPath); } catch { /* ignore */ }
+    return {
+      ok: false,
+      site: "rename",
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+  return { ok: true };
+}
+
+// ---------------------------------------------------------------------------
+// Local ports of SSH-bootstrap steps 2 + 3 (settings.json patch +
+// gsd-context-monitor cleanup). Both never-throw. Both shell out to jq
+// (present in the container per docker/Dockerfile:76) with the SAME jq
+// expressions exported from run-bootstrap.ts — SETTINGS_MERGE_JQ /
+// SETTINGS_CHECK_JQ / GSD_MONITOR_DETECT_JQ / GSD_MONITOR_STRIP_JQ. Single
+// source of truth: change the jq body there, both surfaces pick it up.
+// The SSH path stores `$HOME/.local/bin/task-field-check` LITERALLY (bash
+// single-quotes don't expand). Local jq must ALSO not expand it — we pass
+// the expression via execFile's argv (no shell interpolation), so $HOME
+// stays a literal in the jq output.
+// ---------------------------------------------------------------------------
+
+/**
+ * Preserve ownership of a just-atomic-written file by mirroring the host
+ * user's uid/gid from `getLocalHomeRoot()` (the bind-mounted host home,
+ * whose owner IS the host user we want files to belong to). Otherwise the
+ * container's root process leaves settings.json owned root:root, silently
+ * poisoning future edits from the host user.
+ * Never throws — chown failure logs at warn and returns; the file still
+ * lives, just with the wrong owner (fs op still succeeded).
+ */
+async function chownToHostUser(
+  finalPath: string,
+  host: { id: string; name: string },
+  site: string,
+): Promise<void> {
+  try {
+    const homeStat = await fs.stat(getLocalHomeRoot());
+    await fs.chown(finalPath, homeStat.uid, homeStat.gid);
+  } catch (err) {
+    systemLogger.warn(
+      `local-fleet-bootstrap: chown after write failed for ${finalPath}`,
+      {
+        operation: "local_fleet_bootstrap_chown_failed",
+        site,
+        fleetHostId: host.id,
+        hostName: host.name,
+        error: err instanceof Error ? err.message : String(err),
+      },
+    );
+  }
+}
+
+/**
+ * Run `jq <expr>` against stdin/file input. Returns stdout on success, null
+ * on failure. Never throws. When `jqArgs` includes `-e`, exit code 1 is
+ * treated as a boolean-false result rather than an error — same convention
+ * jq itself uses.
+ */
+async function runJq(
+  jqArgs: string[],
+  stdin: string,
+  treatExit1AsFalse = false,
+): Promise<{ ok: true; stdout: string } | { ok: false; error: string }> {
+  return new Promise((resolve) => {
+    // Default encoding is utf8 → stdout/stderr are strings.
+    const child = execFileCb("jq", jqArgs, (err, stdout, stderr) => {
+      if (err) {
+        const code = (err as { code?: number } | undefined)?.code;
+        if (treatExit1AsFalse && code === 1) {
+          resolve({ ok: true, stdout: "false\n" });
+          return;
+        }
+        const stderrTrim = stderr.trim();
+        resolve({
+          ok: false,
+          error:
+            stderrTrim.length > 0
+              ? stderrTrim
+              : err instanceof Error
+                ? err.message
+                : String(err),
+        });
+        return;
+      }
+      resolve({ ok: true, stdout });
+    });
+    if (child.stdin) {
+      child.stdin.end(stdin);
+    }
+  });
+}
+
+/**
+ * Local port of SSH-bootstrap step 2 (~/.claude/settings.json seven-key merge).
+ * Shells out to jq (single source of truth: SETTINGS_MERGE_JQ +
+ * SETTINGS_CHECK_JQ exported from run-bootstrap.ts). Never-throws. Returns
+ * true on success (already-correct OR patched), false on any failure.
+ */
+async function patchSettingsJsonLocally(host: {
+  id: string;
+  name: string;
+}): Promise<boolean> {
+  const settingsPath = path.join(getLocalHomeRoot(), ".claude", "settings.json");
+  let raw: string;
+  try {
+    raw = await fs.readFile(settingsPath, "utf-8");
+  } catch (err) {
+    const errno = (err as { code?: string } | undefined)?.code;
+    if (errno === "ENOENT") {
+      raw = "{}";
+    } else {
+      systemLogger.warn(
+        `local-fleet-bootstrap: settings.json read failed for ${host.name}`,
+        {
+          operation: "local_fleet_settings_patch_error",
+          site: "read",
+          fleetHostId: host.id,
+          hostName: host.name,
+          error: err instanceof Error ? err.message : String(err),
+        },
+      );
+      return false;
+    }
+  }
+  // CHECK — skip write if all seven keys already correct.
+  const checkResult = await runJq(
+    ["-e", SETTINGS_CHECK_JQ],
+    raw,
+    /* treatExit1AsFalse */ true,
+  );
+  if (checkResult.ok === false) {
+    systemLogger.warn(
+      `local-fleet-bootstrap: jq CHECK failed for ${host.name}`,
+      {
+        operation: "local_fleet_settings_patch_error",
+        site: "jq_check",
+        fleetHostId: host.id,
+        hostName: host.name,
+        error: checkResult.error,
+      },
+    );
+    return false;
+  }
+  if (checkResult.stdout.trim() === "true") {
+    systemLogger.info(
+      `local-fleet-bootstrap: settings.json already has all ${SETTINGS_REQUIRED_KEY_COUNT} required keys for ${host.name}`,
+      {
+        operation: "local_fleet_settings_patch_noop",
+        fleetHostId: host.id,
+        hostName: host.name,
+      },
+    );
+    return true;
+  }
+  // MERGE — write patched contents atomically.
+  const mergeResult = await runJq([SETTINGS_MERGE_JQ], raw);
+  if (mergeResult.ok === false) {
+    systemLogger.warn(
+      `local-fleet-bootstrap: jq MERGE failed for ${host.name}`,
+      {
+        operation: "local_fleet_settings_patch_error",
+        site: "jq_merge",
+        fleetHostId: host.id,
+        hostName: host.name,
+        error: mergeResult.error,
+      },
+    );
+    return false;
+  }
+  const bytes = Buffer.from(mergeResult.stdout, "utf-8");
+  const w = await atomicWrite(settingsPath, bytes, 0o644);
+  if (w.ok === false) {
+    systemLogger.warn(
+      `local-fleet-bootstrap: settings.json atomic write failed for ${host.name}`,
+      {
+        operation: "local_fleet_settings_patch_error",
+        site: w.site,
+        fleetHostId: host.id,
+        hostName: host.name,
+        error: w.error,
+      },
+    );
+    return false;
+  }
+  await chownToHostUser(settingsPath, host, "settings_patch");
+  systemLogger.info(
+    `local-fleet-bootstrap: settings.json patched with ${SETTINGS_REQUIRED_KEY_COUNT} required keys for ${host.name}`,
+    {
+      operation: "local_fleet_settings_patch_ok",
+      fleetHostId: host.id,
+      hostName: host.name,
+    },
+  );
+  return true;
+}
+
+/**
+ * Stop + disable a retired host user unit via busctl (same session-bus route
+ * as fireRestartHookLocally — systemctl can't reach the host manager from
+ * here). Best effort: skipped when the host-systemd override is absent, and
+ * a failure (unit not loaded, etc.) is ignored — the caller removes the unit
+ * file and its .wants/ links either way.
+ */
+async function busctlUserManagerCall(
+  method: string,
+  signature: string,
+  args: string[],
+): Promise<void> {
+  if (!process.env.XDG_RUNTIME_DIR) return;
+  try {
+    await execFile(
+      "busctl",
+      [
+        "--user",
+        "call",
+        "org.freedesktop.systemd1",
+        "/org/freedesktop/systemd1",
+        "org.freedesktop.systemd1.Manager",
+        method,
+        ...(signature ? [signature] : []),
+        ...args,
+      ],
+      { env: process.env },
+    );
+  } catch {
+    // Best effort — see docstring.
+  }
+}
+
+/**
+ * Local port of the SSH-bootstrap step 3 tail (retired substrate files).
+ * Retires every present RETIRED_USER_UNITS unit and every im-*.service
+ * whose file contains RETIRED_USER_UNIT_MARKER (StopUnit +
+ * DisableUnitFiles over busctl, then unlinks the unit file and any
+ * *.wants/ link to it, then one Reload), unlinks every
+ * RETIRED_SUBSTRATE_FILES path under the local home root, rm -rf's every
+ * RETIRED_SUBSTRATE_TREES folder, and rmdir's every RETIRED_SUBSTRATE_DIRS
+ * folder only when it is empty (ENOENT / ENOTEMPTY are not errors), then
+ * the same file/folder steps for RETIRED_IDENTITY_STATE_* inside every
+ * ~/fleet/identities/<name>/ folder.
+ * Idempotent. Never-throws.
+ */
+async function removeRetiredSubstrateFilesLocally(host: {
+  id: string;
+  name: string;
+}): Promise<boolean> {
+  const homeRoot = getLocalHomeRoot();
+  let ok = true;
+  const warn = (site: string, target: string, err: unknown): void => {
+    ok = false;
+    systemLogger.warn(
+      `local-fleet-bootstrap: retired substrate cleanup failed for ${host.name}`,
+      {
+        operation: "local_fleet_retired_substrate_cleanup_error",
+        site,
+        target,
+        fleetHostId: host.id,
+        hostName: host.name,
+        error: err instanceof Error ? err.message : String(err),
+      },
+    );
+  };
+  const unlinkQuiet = async (site: string, target: string): Promise<void> => {
+    try {
+      await fs.unlink(target);
+    } catch (err) {
+      const errno = (err as { code?: string } | undefined)?.code;
+      if (errno !== "ENOENT") warn(site, target, err);
+    }
+  };
+  const unitDir = path.join(homeRoot, ".config", "systemd", "user");
+  let unitDirEntries: string[] = [];
+  try {
+    unitDirEntries = await fs.readdir(unitDir);
+  } catch (err) {
+    const errno = (err as { code?: string } | undefined)?.code;
+    if (errno !== "ENOENT") warn("readdir", unitDir, err);
+  }
+  const retiredUnits: string[] = [];
+  for (const name of unitDirEntries) {
+    if ((RETIRED_USER_UNITS as readonly string[]).includes(name)) {
+      retiredUnits.push(name);
+    } else if (
+      name.startsWith(RETIRED_USER_UNIT_PREFIX) &&
+      name.endsWith(".service")
+    ) {
+      // Unreadable (dangling link, etc.) → not provably a widget unit; skip.
+      const body = await fs
+        .readFile(path.join(unitDir, name), "utf-8")
+        .catch(() => "");
+      if (body.includes(RETIRED_USER_UNIT_MARKER)) retiredUnits.push(name);
+    }
+  }
+  if (retiredUnits.length > 0) {
+    const wantsDirs = unitDirEntries.filter((name) => name.endsWith(".wants"));
+    for (const unit of retiredUnits) {
+      await busctlUserManagerCall("StopUnit", "ss", [unit, "replace"]);
+      await busctlUserManagerCall("DisableUnitFiles", "asb", ["1", unit, "false"]);
+      for (const wants of wantsDirs) {
+        await unlinkQuiet("unlink_wants", path.join(unitDir, wants, unit));
+      }
+      await unlinkQuiet("unlink_unit", path.join(unitDir, unit));
+    }
+    await busctlUserManagerCall("Reload", "", []);
+  }
+  for (const rel of RETIRED_SUBSTRATE_FILES) {
+    await unlinkQuiet("unlink", path.join(homeRoot, rel));
+  }
+  for (const rel of RETIRED_SUBSTRATE_TREES) {
+    const target = path.join(homeRoot, rel);
+    try {
+      await fs.rm(target, { recursive: true, force: true });
+    } catch (err) {
+      warn("rm_tree", target, err);
+    }
+  }
+  const rmdirIfEmpty = async (target: string): Promise<void> => {
+    try {
+      await fs.rmdir(target);
+    } catch (err) {
+      const errno = (err as { code?: string } | undefined)?.code;
+      if (errno !== "ENOENT" && errno !== "ENOTEMPTY" && errno !== "EEXIST") {
+        warn("rmdir", target, err);
+      }
+    }
+  };
+  for (const rel of RETIRED_SUBSTRATE_DIRS) await rmdirIfEmpty(path.join(homeRoot, rel));
+  // The context watch goes only once the installed ambient-monitor no longer
+  // starts it (see CONTEXT_WATCH_RETIRED in run-bootstrap.ts).
+  let monitorStillStartsIt = false;
+  try {
+    const monitor = await fs.readFile(path.join(homeRoot, ".local/bin/ambient-monitor"), "utf-8");
+    monitorStillStartsIt = monitor.includes("context-watch");
+  } catch {
+    /* no monitor installed — nothing can start the watcher */
+  }
+  if (!monitorStillStartsIt) {
+    await unlinkQuiet("unlink", path.join(homeRoot, CONTEXT_WATCH_RETIRED));
+  }
+  const identitiesDir = path.join(homeRoot, "fleet", "identities");
+  let identities: string[] = [];
+  try {
+    identities = (await fs.readdir(identitiesDir, { withFileTypes: true }))
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name);
+  } catch (err) {
+    const errno = (err as { code?: string } | undefined)?.code;
+    if (errno !== "ENOENT") warn("readdir", identitiesDir, err);
+  }
+  for (const name of identities) {
+    for (const rel of RETIRED_IDENTITY_STATE_FILES) {
+      await unlinkQuiet("unlink", path.join(identitiesDir, name, rel));
+    }
+    for (const rel of RETIRED_IDENTITY_STATE_DIRS) {
+      await rmdirIfEmpty(path.join(identitiesDir, name, rel));
+    }
+  }
+  return ok;
+}
+
+/**
+ * Local port of SSH-bootstrap step 3 (gsd-context-monitor cleanup). Shells
+ * out to jq (single source of truth: GSD_MONITOR_DETECT_JQ +
+ * GSD_MONITOR_STRIP_JQ exported from run-bootstrap.ts). Idempotent.
+ * Never-throws.
+ */
+async function cleanupGsdContextMonitorLocally(host: {
+  id: string;
+  name: string;
+}): Promise<boolean> {
+  const homeRoot = getLocalHomeRoot();
+  const settingsPath = path.join(homeRoot, ".claude", "settings.json");
+  const hookPath = path.join(homeRoot, ".claude", "hooks", "gsd-context-monitor.js");
+  let raw: string | null = null;
+  try {
+    raw = await fs.readFile(settingsPath, "utf-8");
+  } catch (err) {
+    const errno = (err as { code?: string } | undefined)?.code;
+    if (errno !== "ENOENT") {
+      systemLogger.warn(
+        `local-fleet-bootstrap: settings.json read failed during gsd-context-monitor cleanup for ${host.name}`,
+        {
+          operation: "local_fleet_gsd_monitor_cleanup_error",
+          site: "read",
+          fleetHostId: host.id,
+          hostName: host.name,
+          error: err instanceof Error ? err.message : String(err),
+        },
+      );
+      return false;
+    }
+    // ENOENT: no settings.json → nothing to strip. Fall through to unlink.
+  }
+  let settingsChanged = false;
+  if (raw !== null) {
+    const detect = await runJq(
+      ["-e", GSD_MONITOR_DETECT_JQ],
+      raw,
+      /* treatExit1AsFalse */ true,
+    );
+    if (detect.ok === false) {
+      systemLogger.warn(
+        `local-fleet-bootstrap: jq DETECT failed during gsd-context-monitor cleanup for ${host.name}`,
+        {
+          operation: "local_fleet_gsd_monitor_cleanup_error",
+          site: "jq_detect",
+          fleetHostId: host.id,
+          hostName: host.name,
+          error: detect.error,
+        },
+      );
+      return false;
+    }
+    if (detect.stdout.trim() === "true") {
+      const strip = await runJq([GSD_MONITOR_STRIP_JQ], raw);
+      if (strip.ok === false) {
+        systemLogger.warn(
+          `local-fleet-bootstrap: jq STRIP failed during gsd-context-monitor cleanup for ${host.name}`,
+          {
+            operation: "local_fleet_gsd_monitor_cleanup_error",
+            site: "jq_strip",
+            fleetHostId: host.id,
+            hostName: host.name,
+            error: strip.error,
+          },
+        );
+        return false;
+      }
+      const bytes = Buffer.from(strip.stdout, "utf-8");
+      const w = await atomicWrite(settingsPath, bytes, 0o644);
+      if (w.ok === false) {
+        systemLogger.warn(
+          `local-fleet-bootstrap: settings.json atomic write failed during gsd-context-monitor cleanup for ${host.name}`,
+          {
+            operation: "local_fleet_gsd_monitor_cleanup_error",
+            site: w.site,
+            fleetHostId: host.id,
+            hostName: host.name,
+            error: w.error,
+          },
+        );
+        return false;
+      }
+      await chownToHostUser(settingsPath, host, "gsd_monitor_cleanup");
+      settingsChanged = true;
+    }
+  }
+  // Unlink the hook file if present. ENOENT is not an error (idempotent).
+  try {
+    await fs.unlink(hookPath);
+  } catch (err) {
+    const errno = (err as { code?: string } | undefined)?.code;
+    if (errno !== "ENOENT") {
+      systemLogger.warn(
+        `local-fleet-bootstrap: unlink of gsd-context-monitor hook failed for ${host.name}`,
+        {
+          operation: "local_fleet_gsd_monitor_cleanup_error",
+          site: "unlink_hook",
+          fleetHostId: host.id,
+          hostName: host.name,
+          error: err instanceof Error ? err.message : String(err),
+        },
+      );
+      return false;
+    }
+  }
+  systemLogger.info(
+    `local-fleet-bootstrap: gsd-context-monitor cleanup complete for ${host.name}` +
+      (settingsChanged ? " (settings entry stripped)" : " (nothing to clean)"),
+    {
+      operation: "local_fleet_gsd_monitor_cleanup_ok",
+      fleetHostId: host.id,
+      hostName: host.name,
+      settingsChanged,
+    },
+  );
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Public: installFleetSubstrateLocally
+// ---------------------------------------------------------------------------
+
+/**
+ * Iterate the catalog sequentially, install/skip each entry against the
+ * local bind-mounted filesystem. Mirrors run-sweep.ts's per-item shape but
+ * uses fs/promises instead of the SSH channel.
+ *
+ * NEVER REJECTS. Every risky call is wrapped; the outer function has a
+ * defense-in-depth try/catch that logs `operation: local_fleet_install_error`
+ * and returns whatever counters accumulated. Caller (orchestrator) applies
+ * the same {itemsChecked, itemsChanged, itemsFailed} bookkeeping it would
+ * apply to a runSweepForHost result.
+ */
+export async function installFleetSubstrateLocally(
+  host: { id: string; name: string },
+  catalog: readonly CatalogEntry[],
+  deps: LocalInstallDeps,
+): Promise<LocalInstallResult> {
+  const now = deps.now ?? Date.now;
+  const fireRestartHook = deps.fireRestartHook ?? fireRestartHookLocally;
+  const startMs = now();
+  let itemsChecked = 0;
+  let itemsChanged = 0;
+  let itemsFailed = 0;
+
+  try {
+    for (const entry of catalog) {
+      itemsChecked++;
+
+      try {
+        // ---- Source resolution ----
+        let bundledResult: { bytes: Buffer; mode: number } | null;
+        if (entry.sourceKind === "runtime") {
+          const runtimeBytes =
+            deps.resolvedRuntimeBytes?.get(entry.resolverKey) ?? null;
+          bundledResult =
+            runtimeBytes === null
+              ? null
+              : { bytes: runtimeBytes, mode: 0o644 };
+        } else {
+          bundledResult = await deps.readBundledBytes(entry.bundledPath);
+        }
+
+        // ---- Runtime removal branch (D-16 mirror) ----
+        // A runtime row with null bytes → file should be removed if present.
+        if (entry.sourceKind === "runtime" && bundledResult === null) {
+          const finalPath = resolveInstalledPath(entry.installPath);
+          let statOk = false;
+          try {
+            await fs.stat(finalPath);
+            statOk = true;
+          } catch (err: unknown) {
+            if (
+              typeof err !== "object" ||
+              err === null ||
+              (err as NodeJS.ErrnoException).code !== "ENOENT"
+            ) {
+              itemsFailed++;
+              systemLogger.warn(
+                `local-fleet-install: stat failed on removal-branch target for ${entry.slug}`,
+                {
+                  operation: "local_fleet_install_error",
+                  site: "stat",
+                  fleetHostId: host.id,
+                  hostName: host.name,
+                  entrySlug: entry.slug,
+                  installPath: entry.installPath,
+                  finalPath,
+                  error: err instanceof Error ? err.message : String(err),
+                },
+              );
+              continue;
+            }
+            // ENOENT — file already absent, clean-unset state. Silent skip.
+          }
+          if (statOk) {
+            try {
+              await fs.unlink(finalPath);
+              itemsChanged++;
+              systemLogger.info(
+                `local-fleet-install: removed ${entry.slug}`,
+                {
+                  operation: "local_fleet_install_removed",
+                  fleetHostId: host.id,
+                  hostName: host.name,
+                  entrySlug: entry.slug,
+                  installPath: entry.installPath,
+                  finalPath,
+                },
+              );
+            } catch (err) {
+              itemsFailed++;
+              systemLogger.warn(
+                `local-fleet-install: unlink failed on removal branch for ${entry.slug}`,
+                {
+                  operation: "local_fleet_install_error",
+                  site: "unlink",
+                  fleetHostId: host.id,
+                  hostName: host.name,
+                  entrySlug: entry.slug,
+                  installPath: entry.installPath,
+                  finalPath,
+                  error: err instanceof Error ? err.message : String(err),
+                },
+              );
+            }
+          }
+          continue;
+        }
+
+        // ---- Bundled read failure ----
+        if (bundledResult === null) {
+          itemsFailed++;
+          systemLogger.warn(
+            `local-fleet-install: bundled read returned null for ${entry.slug}`,
+            {
+              operation: "local_fleet_install_error",
+              site: "readBundledBytes",
+              fleetHostId: host.id,
+              hostName: host.name,
+              entrySlug: entry.slug,
+              bundledPath:
+                entry.sourceKind === "bundled" ? entry.bundledPath : "(runtime)",
+              installPath: entry.installPath,
+            },
+          );
+          continue;
+        }
+
+        // ---- system-root euid gate ----
+        // For rows whose installMode is "system-root" (currently just the
+        // /etc/claude-code/CLAUDE.md twinkie), require euid=0. In the
+        // container the process runs as root; on a dev host it does not.
+        // Gate BEFORE reading installed bytes so we don't touch /etc/ at all
+        // when we cannot write there.
+        const installMode = entry.installMode ?? "user-home";
+        if (installMode === "system-root") {
+          // process.geteuid is not defined on Windows — guard for undefined
+          // to keep the runtime type-safe. In production (Linux container)
+          // it is always defined.
+          const euid =
+            typeof process.geteuid === "function" ? process.geteuid() : -1;
+          if (euid !== 0) {
+            itemsFailed++;
+            systemLogger.warn(
+              `local-fleet-install: refusing system-root write as non-root (euid=${euid}) for ${entry.slug}`,
+              {
+                operation: "local_fleet_install_error",
+                site: "euid_gate",
+                fleetHostId: host.id,
+                hostName: host.name,
+                entrySlug: entry.slug,
+                installPath: entry.installPath,
+                euid,
+              },
+            );
+            continue;
+          }
+        }
+
+        // ---- Read installed bytes + hash-compare ----
+        const finalPath = resolveInstalledPath(entry.installPath);
+        const installed = await readInstalledBytesLocal(finalPath);
+
+        if (installed.readOk === false) {
+          itemsFailed++;
+          systemLogger.warn(
+            `local-fleet-install: readFile failed on installed side for ${entry.slug}`,
+            {
+              operation: "local_fleet_install_error",
+              site: "readFile_installed",
+              fleetHostId: host.id,
+              hostName: host.name,
+              entrySlug: entry.slug,
+              installPath: entry.installPath,
+              finalPath,
+              error: installed.reason,
+            },
+          );
+          continue;
+        }
+
+        if (
+          installed.bytes !== null &&
+          installed.bytes.equals(bundledResult.bytes)
+        ) {
+          // bytes-match — no counter bump beyond itemsChecked, silent skip.
+          continue;
+        }
+
+        // ---- Push via atomic write ----
+        const mode = computeInstallMode(bundledResult.mode);
+        const writeResult = await atomicWrite(
+          finalPath,
+          bundledResult.bytes,
+          mode,
+        );
+        if (writeResult.ok === false) {
+          itemsFailed++;
+          systemLogger.warn(
+            `local-fleet-install: atomic write failed at ${writeResult.site} for ${entry.slug}`,
+            {
+              operation: "local_fleet_install_error",
+              site: writeResult.site,
+              fleetHostId: host.id,
+              hostName: host.name,
+              entrySlug: entry.slug,
+              installPath: entry.installPath,
+              finalPath,
+              error: writeResult.error,
+            },
+          );
+          continue;
+        }
+
+        itemsChanged++;
+        let restartHookFired: string | null = null;
+        if (entry.restartHook !== null) {
+          const restartResult = await fireRestartHook(entry.restartHook);
+          if (restartResult.ok === true) {
+            restartHookFired = entry.restartHook;
+          } else if (restartResult.skipped) {
+            // Documented environmental skip (host-systemd override not
+            // enabled). Bytes DID update, restart just couldn't fire.
+            // Symmetric with local-fleet-bootstrap's systemd_capability_check
+            // skip — DO NOT bump itemsFailed.
+            systemLogger.warn(
+              `local-fleet-install: restart-hook skipped for ${entry.slug} — ${restartResult.errorMessage}`,
+              {
+                operation: "local_fleet_install_restart_skip",
+                site: "xdg_runtime_dir_gate",
+                fleetHostId: host.id,
+                hostName: host.name,
+                entrySlug: entry.slug,
+                restartHook: entry.restartHook,
+              },
+            );
+          } else {
+            // Real restart failure — bytes updated but the unit didn't
+            // cycle. Mirror the remote branch's per-item failure counter
+            // bump (run-sweep.ts:314-334).
+            itemsFailed++;
+            systemLogger.warn(
+              `local-fleet-install: restart-hook failed for ${entry.slug} — ${restartResult.errorMessage}`,
+              {
+                operation: "local_fleet_install_restart_error",
+                site: "busctl_exec",
+                fleetHostId: host.id,
+                hostName: host.name,
+                entrySlug: entry.slug,
+                restartHook: entry.restartHook,
+                error: restartResult.errorMessage,
+              },
+            );
+          }
+        }
+        systemLogger.info(
+          `local-fleet-install: installed ${entry.slug}`,
+          {
+            operation: "local_fleet_install_changed",
+            fleetHostId: host.id,
+            hostName: host.name,
+            entrySlug: entry.slug,
+            installPath: entry.installPath,
+            finalPath,
+            changeKind: installed.bytes === null ? "installed-new" : "bytes-updated",
+            restartHookFired,
+          },
+        );
+      } catch (err) {
+        // Defense-in-depth per-item catch — every risky call above is
+        // already wrapped, this is the seatbelt.
+        itemsFailed++;
+        systemLogger.warn(
+          `local-fleet-install: unexpected throw on ${entry.slug}`,
+          {
+            operation: "local_fleet_install_error",
+            site: "per_item_catchall",
+            fleetHostId: host.id,
+            hostName: host.name,
+            entrySlug: entry.slug,
+            installPath: entry.installPath,
+            error: err instanceof Error ? err.message : String(err),
+          },
+        );
+      }
+    }
+  } catch (err) {
+    // Outer defense-in-depth — never propagate a throw out to the
+    // orchestrator; that would re-wedge the for-of loop this module exists
+    // to unwedge.
+    systemLogger.warn(
+      `local-fleet-install: unexpected throw in catalog loop`,
+      {
+        operation: "local_fleet_install_error",
+        site: "outer_catchall",
+        fleetHostId: host.id,
+        hostName: host.name,
+        error: err instanceof Error ? err.message : String(err),
+      },
+    );
+  }
+
+  const durationMs = now() - startMs;
+  systemLogger.info(
+    `local-fleet-install: sweep completed for ${host.name}`,
+    {
+      operation: "local_fleet_install_result",
+      fleetHostId: host.id,
+      hostName: host.name,
+      itemsChecked,
+      itemsChanged,
+      itemsFailed,
+      durationMs,
+    },
+  );
+
+  return { itemsChecked, itemsChanged, itemsFailed };
+}
+
+// ---------------------------------------------------------------------------
+// Bootstrap helpers (mirror run-bootstrap.ts steps 4 + 5, plus a systemd
+// skip-with-warn for steps 1-3 when XDG_RUNTIME_DIR is absent)
+// ---------------------------------------------------------------------------
+
+/**
+ * Local port of SSH-bootstrap Step 6 — usage-reporter retirement. If
+ * settings.json.statusLine.command is still any usage-reporter command
+ * (~/.local/bin/usage-reporter, the old co-located `/host-home/...`
+ * mis-write, or the pre-distributor ~/.claude/usage/usage-reporter.sh), restore the
+ * WRAPPED= original from ~/.claude/usage/usage-reporter.conf, or drop
+ * statusLine when there was no real original. Only after that write lands,
+ * remove the retired files + ~/.claude/usage/. A statusLine that is not the
+ * wrapper is never touched. Returns true on success, false on any failure.
+ * Never throws.
+ */
+async function retireUsageReporterLocally(host: {
+  id: string;
+  name: string;
+}): Promise<boolean> {
+  const homeRoot = getLocalHomeRoot();
+  const settingsPath = path.join(homeRoot, ".claude", "settings.json");
+  const usageDir = path.join(homeRoot, USAGE_REPORTER_RETIRED_DIR);
+  const warn = (site: string, error: unknown, extra?: Record<string, unknown>) =>
+    systemLogger.warn(
+      `local-fleet-bootstrap: usage-reporter retirement failed (${site}) for ${host.name}`,
+      {
+        operation: "local_fleet_usage_reporter_retire_error",
+        site,
+        fleetHostId: host.id,
+        hostName: host.name,
+        error: error instanceof Error ? error.message : String(error),
+        ...extra,
+      },
+    );
+
+  let parsed: Record<string, unknown> | null = null;
+  try {
+    parsed = JSON.parse(await fs.readFile(settingsPath, "utf-8")) as Record<string, unknown>;
+  } catch (err) {
+    if ((err as { code?: string } | undefined)?.code !== "ENOENT") {
+      // Unreadable settings — don't delete the wrapper it may still exec.
+      warn("read_settings", err);
+      return false;
+    }
+  }
+
+  const statusLine = parsed?.statusLine as Record<string, unknown> | undefined;
+  const cmd = typeof statusLine?.command === "string" ? statusLine.command : "";
+  if (parsed && cmd.includes("usage-reporter")) {
+    let original = "";
+    try {
+      original = parseWrappedFromConf(
+        await fs.readFile(path.join(usageDir, "usage-reporter.conf"), "utf-8"),
+      );
+    } catch {
+      // No/unreadable conf — nothing to restore; drop statusLine.
+    }
+    if (original.includes("usage-reporter")) original = "";
+    if (original) {
+      parsed.statusLine = { ...statusLine, command: original };
+    } else {
+      delete parsed.statusLine;
+    }
+    const outcome = await writeContentDiffFile(
+      settingsPath,
+      JSON.stringify(parsed, null, 2) + "\n",
+    );
+    if (typeof outcome === "object") {
+      warn(outcome.site, outcome.error);
+      return false;
+    }
+    systemLogger.info(
+      `local-fleet-bootstrap: usage-reporter unwrapped from statusLine for ${host.name}`,
+      {
+        operation: "local_fleet_usage_reporter_unwrapped",
+        fleetHostId: host.id,
+        hostName: host.name,
+        restored: original ? "original" : "removed",
+      },
+    );
+  }
+
+  let ok = true;
+  for (const rel of USAGE_REPORTER_RETIRED_FILES) {
+    const target = path.join(homeRoot, rel);
+    try {
+      await fs.unlink(target);
+    } catch (err) {
+      if ((err as { code?: string } | undefined)?.code !== "ENOENT") {
+        warn("unlink", err, { path: target });
+        ok = false;
+      }
+    }
+  }
+  try {
+    await fs.rm(usageDir, { recursive: true, force: true });
+  } catch (err) {
+    warn("rm_usage_dir", err, { path: usageDir });
+    ok = false;
+  }
+  return ok;
+}
+
+/**
+ * Write bytes to a "single-line-content, content-diff idempotent" file.
+ * Used for all three host-config writes (parent, name, id). Never throws.
+ *
+ * Returns:
+ *   - "written"     — file did not match; new bytes written atomically.
+ *   - "unchanged"   — file already matches; silent no-op (no mtime churn).
+ *   - { error: string, site: string } — FS failure.
+ */
+async function writeContentDiffFile(
+  finalPath: string,
+  wantedContent: string,
+): Promise<
+  "written" | "unchanged" | { error: string; site: string }
+> {
+  // Content-diff check.
+  try {
+    const existing = await fs.readFile(finalPath, "utf-8");
+    if (existing === wantedContent) {
+      return "unchanged";
+    }
+  } catch (err: unknown) {
+    if (
+      typeof err === "object" &&
+      err !== null &&
+      (err as NodeJS.ErrnoException).code === "ENOENT"
+    ) {
+      // File absent — fall through to write.
+    } else {
+      return {
+        site: "readFile",
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
+
+  const bytes = Buffer.from(wantedContent, "utf-8");
+  const w = await atomicWrite(finalPath, bytes, 0o644);
+  if (w.ok === false) {
+    return { site: w.site, error: w.error };
+  }
+  return "written";
+}
+
+/**
+ * Write this machine's people file (machine-people.ts) when it differs —
+ * the local counterpart of run-bootstrap.ts writePeopleFileOverSsh, used by
+ * the orchestrator's people-list refresh. Returns null on success, else a
+ * short reason. Never throws.
+ */
+export async function writePeopleFileLocally(bytes: string): Promise<string | null> {
+  try {
+    const outcome = await writeContentDiffFile(
+      path.join(getLocalHomeRoot(), MACHINE_PEOPLE_REL_PATH),
+      bytes,
+    );
+    return typeof outcome === "object" ? `${outcome.site}: ${outcome.error}` : null;
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
+  }
+}
+
+/**
+ * Best-effort delete of a legacy file. Used by the host-config writers to
+ * clean up the pre-rename ~/.claude/skynet-{parent,hostname,hostid} files
+ * once the new ~/fleet/host/{parent,name,id} copies have been written.
+ * ENOENT is the expected steady state (file already gone) and is silent;
+ * any other error is logged but does not propagate — the write has already
+ * succeeded and steady-state fleet health should not depend on the legacy
+ * cleanup.
+ */
+async function removeLegacyFileIfPresent(legacyPath: string): Promise<void> {
+  try {
+    await fs.unlink(legacyPath);
+  } catch (err: unknown) {
+    if (
+      typeof err === "object" &&
+      err !== null &&
+      (err as NodeJS.ErrnoException).code === "ENOENT"
+    ) {
+      return;
+    }
+    systemLogger.warn(
+      `local-fleet-bootstrap: legacy file cleanup failed for ${legacyPath}`,
+      {
+        operation: "local_fleet_bootstrap_legacy_cleanup_error",
+        legacyPath,
+        error: err instanceof Error ? err.message : String(err),
+      },
+    );
+  }
+}
+
+/**
+ * Bootstrap the local host — steps 2 (settings.json patch) + 3
+ * (gsd-context-monitor cleanup) + 4 (~/fleet/host/parent) + 5
+ * (~/fleet/host/name) + 5b (~/fleet/host/id) always run. Step 1 (systemd enable) requires
+ * a working `systemctl --user` connection into the host session — until
+ * that's implemented locally it is skip-with-warn (`operation:
+ * local_fleet_bootstrap_skip`, `site: systemd_step_deferred`), DO NOT
+ * mark hadError (documented environmental limitation).
+ *
+ * The 2026-09-20 split: previously steps 1-3 were lumped into a single
+ * "systemd_steps_deferred" skip. Step 1 genuinely needs systemctl; steps 2
+ * and 3 are pure `fs` + `jq` work (jq is installed in the container per
+ * docker/Dockerfile:76) and had been collateral-skipped, meaning the
+ * task-field-check hook wire-up + gsd-context-monitor cleanup never
+ * reached the box the distributor runs on. Now they do.
+ *
+ * NEVER REJECTS. Same never-throw contract as installFleetSubstrateLocally.
+ */
+export async function bootstrapFleetSubstrateLocally(
+  host: { id: string; name: string; machineId?: string; peopleFile?: string | null },
+): Promise<BootstrapResult> {
+  let alreadyEnabled = false;
+  let bootstrapRan = false;
+  let daemonReloadRan = false;
+  let settingsPatchOk = false;
+  let gsdContextMonitorCleanupOk = false;
+  let hostParentOk = false;
+  let hostNameOk = false;
+  let hostIdOk = false;
+  let usageReporterRetireOk = false;
+  let rolesKeyMigrationOk = false;
+  let roleSkillsMigrationOk = false;
+  let hadError = false;
+
+  const claudeDir = path.join(getLocalHomeRoot(), ".claude");
+  const hostConfigDir = path.join(getLocalHomeRoot(), "fleet", "host");
+
+  // ---- Step 1: systemd enable + daemon-reload ----
+  // Genuinely needs systemctl --user against the host session bus. Deferred
+  // until load-bearing — the container image is built with the systemd-user
+  // unit already installed and enabled by other means, so this deferral
+  // does not cause a regression against the pre-2026-09-20 baseline (which
+  // never reached this step for the local host either).
+  systemLogger.warn(
+    `local-fleet-bootstrap: systemd step 1 not implemented on local branch for ${host.name}`,
+    {
+      operation: "local_fleet_bootstrap_skip",
+      site: "systemd_step_deferred",
+      fleetHostId: host.id,
+      hostName: host.name,
+    },
+  );
+  // alreadyEnabled / bootstrapRan / daemonReloadRan stay false, no hadError.
+
+  // ---- Step 2: settings.json seven-key patch ----
+  // Pure fs + jq — no systemd dependency. Runs unconditionally on every
+  // sweep. Idempotent (skip-write if all seven keys already correct).
+  // hadError:true parity with SSH path (run-bootstrap.ts) on failure.
+  try {
+    settingsPatchOk = await patchSettingsJsonLocally(host);
+    if (!settingsPatchOk) hadError = true;
+  } catch (err) {
+    // Belt-and-suspenders — patchSettingsJsonLocally is never-throw by
+    // contract but the outer try guards against future regression.
+    systemLogger.warn(
+      `local-fleet-bootstrap: settings.json patch threw for ${host.name}`,
+      {
+        operation: "local_fleet_settings_patch_error",
+        site: "outer_catch",
+        fleetHostId: host.id,
+        hostName: host.name,
+        error: err instanceof Error ? err.message : String(err),
+      },
+    );
+    settingsPatchOk = false;
+    hadError = true;
+  }
+
+  // ---- Step 3: gsd-context-monitor cleanup + retired substrate files ----
+  // Pure fs + jq — no systemd dependency. Idempotent (no-op on already-
+  // clean hosts, of which this box is one).
+  try {
+    const monitorOk = await cleanupGsdContextMonitorLocally(host);
+    // Step 3 tail: retired substrate files (always runs, even if the
+    // monitor cleanup above failed — the two are independent).
+    const retiredOk = await removeRetiredSubstrateFilesLocally(host);
+    gsdContextMonitorCleanupOk = monitorOk && retiredOk;
+    if (!gsdContextMonitorCleanupOk) hadError = true;
+  } catch (err) {
+    systemLogger.warn(
+      `local-fleet-bootstrap: gsd-context-monitor cleanup threw for ${host.name}`,
+      {
+        operation: "local_fleet_gsd_monitor_cleanup_error",
+        site: "outer_catch",
+        fleetHostId: host.id,
+        hostName: host.name,
+        error: err instanceof Error ? err.message : String(err),
+      },
+    );
+    gsdContextMonitorCleanupOk = false;
+    hadError = true;
+  }
+
+  // ---- Step 4: host-parent ----
+  //   Writes ~/fleet/host/parent (new rebrand-neutral path). After the
+  //   write succeeds, best-effort removes the legacy ~/.claude/skynet-parent
+  //   file so a rebranded fleet instance doesn't leak the vendor brand name
+  //   into agent-visible file paths.
+  try {
+    const url = process.env.SKYNET_PUBLIC_URL ?? "";
+    if (!url || !/^https:\/\//.test(url)) {
+      systemLogger.warn(
+        `local-fleet-bootstrap: SKYNET_PUBLIC_URL missing or malformed — skipping host-parent write for ${host.name}`,
+        {
+          operation: "local_fleet_bootstrap_skip",
+          site: "host_parent_url_gate",
+          fleetHostId: host.id,
+          hostName: host.name,
+        },
+      );
+      // Documented skip — DO NOT set hadError (RESEARCH Pitfall 4 parity).
+    } else {
+      const target = path.join(hostConfigDir, "parent");
+      const outcome = await writeContentDiffFile(target, url + "\n");
+      if (typeof outcome === "object") {
+        hadError = true;
+        systemLogger.warn(
+          `local-fleet-bootstrap: host-parent write failed for ${host.name}`,
+          {
+            operation: "local_fleet_bootstrap_error",
+            site: outcome.site,
+            fleetHostId: host.id,
+            hostName: host.name,
+            finalPath: target,
+            error: outcome.error,
+          },
+        );
+      } else {
+        hostParentOk = true;
+        await removeLegacyFileIfPresent(path.join(claudeDir, "skynet-parent"));
+      }
+    }
+  } catch (err) {
+    hadError = true;
+    systemLogger.warn(
+      `local-fleet-bootstrap: host-parent step threw unexpectedly for ${host.name}`,
+      {
+        operation: "local_fleet_bootstrap_error",
+        site: "host_parent_catchall",
+        fleetHostId: host.id,
+        hostName: host.name,
+        error: err instanceof Error ? err.message : String(err),
+      },
+    );
+  }
+
+  // ---- Step 5: host-name ----
+  try {
+    const target = path.join(hostConfigDir, "name");
+    const outcome = await writeContentDiffFile(target, host.name + "\n");
+    if (typeof outcome === "object") {
+      hadError = true;
+      systemLogger.warn(
+        `local-fleet-bootstrap: host-name write failed for ${host.name}`,
+        {
+          operation: "local_fleet_bootstrap_error",
+          site: outcome.site,
+          fleetHostId: host.id,
+          hostName: host.name,
+          finalPath: target,
+          error: outcome.error,
+        },
+      );
+    } else {
+      hostNameOk = true;
+      await removeLegacyFileIfPresent(path.join(claudeDir, "skynet-hostname"));
+    }
+  } catch (err) {
+    hadError = true;
+    systemLogger.warn(
+      `local-fleet-bootstrap: host-name step threw unexpectedly for ${host.name}`,
+      {
+        operation: "local_fleet_bootstrap_error",
+        site: "host_name_catchall",
+        fleetHostId: host.id,
+        hostName: host.name,
+        error: err instanceof Error ? err.message : String(err),
+      },
+    );
+  }
+
+  // ---- Step 5b: host-id ----
+  //   The box's machine id (falls back to the row id). Consumers: app-development skill's
+  //   create-app.sh reads this at scaffold time to burn PANE_BASE. Same
+  //   fail-soft shape as Step 5.
+  try {
+    const target = path.join(hostConfigDir, "id");
+    const outcome = await writeContentDiffFile(
+      target,
+      (host.machineId ?? host.id) + "\n",
+    );
+    if (typeof outcome === "object") {
+      hadError = true;
+      systemLogger.warn(
+        `local-fleet-bootstrap: host-id write failed for ${host.name}`,
+        {
+          operation: "local_fleet_bootstrap_error",
+          site: outcome.site,
+          fleetHostId: host.id,
+          hostName: host.name,
+          finalPath: target,
+          error: outcome.error,
+        },
+      );
+    } else {
+      hostIdOk = true;
+      await removeLegacyFileIfPresent(path.join(claudeDir, "skynet-hostid"));
+    }
+  } catch (err) {
+    hadError = true;
+    systemLogger.warn(
+      `local-fleet-bootstrap: host-id step threw unexpectedly for ${host.name}`,
+      {
+        operation: "local_fleet_bootstrap_error",
+        site: "host_id_catchall",
+        fleetHostId: host.id,
+        hostName: host.name,
+        error: err instanceof Error ? err.message : String(err),
+      },
+    );
+  }
+
+  // ---- Step 5c: people file ----
+  //   Everyone with access to this box and their relay IDs (machine-people.ts).
+  //   Skipped when no bytes were resolved, so a lookup failure never blanks
+  //   the list. Same fail-soft shape as Step 5.
+  let peopleFileOk: boolean | undefined;
+  if (typeof host.peopleFile === "string") {
+    peopleFileOk = false;
+    try {
+      const target = path.join(getLocalHomeRoot(), MACHINE_PEOPLE_REL_PATH);
+      const outcome = await writeContentDiffFile(target, host.peopleFile);
+      if (typeof outcome === "object") {
+        hadError = true;
+        systemLogger.warn(
+          `local-fleet-bootstrap: people-file write failed for ${host.name}`,
+          {
+            operation: "local_fleet_bootstrap_error",
+            site: outcome.site,
+            fleetHostId: host.id,
+            hostName: host.name,
+            finalPath: target,
+            error: outcome.error,
+          },
+        );
+      } else {
+        peopleFileOk = true;
+      }
+    } catch (err) {
+      hadError = true;
+      systemLogger.warn(
+        `local-fleet-bootstrap: people-file step threw unexpectedly for ${host.name}`,
+        {
+          operation: "local_fleet_bootstrap_error",
+          site: "people_file_catchall",
+          fleetHostId: host.id,
+          hostName: host.name,
+          error: err instanceof Error ? err.message : String(err),
+        },
+      );
+    }
+  }
+
+  // ---- Step 6: usage-reporter retirement ----
+  // Pure fs work — no systemd dependency. Parallel with SSH surface
+  // (run-bootstrap.ts Step 6). Idempotent.
+  try {
+    usageReporterRetireOk = await retireUsageReporterLocally(host);
+    if (!usageReporterRetireOk) hadError = true;
+  } catch (err) {
+    systemLogger.warn(
+      `local-fleet-bootstrap: usage-reporter retirement threw for ${host.name}`,
+      {
+        operation: "local_fleet_usage_reporter_retire_error",
+        site: "outer_catch",
+        fleetHostId: host.id,
+        hostName: host.name,
+        error: err instanceof Error ? err.message : String(err),
+      },
+    );
+    usageReporterRetireOk = false;
+    hadError = true;
+  }
+
+  // ---- Step 7: identity roles-key migration (`role:` → `roles:`) ----
+  // Parallel with SSH surface (run-bootstrap.ts Step 7); rules in
+  // roles-key-migration.ts. Logs only when something changed / conflicts.
+  try {
+    const counts = await migrateRolesKeyUnder(getLocalHomeRoot());
+    const { filesMigrated, baselinesMigrated, conflicts, conflictPaths } = counts;
+    if (filesMigrated + baselinesMigrated + conflicts > 0) {
+      systemLogger[conflicts > 0 ? "warn" : "info"](
+        `local-fleet-bootstrap: identity roles-key migration for ${host.name}` +
+          ` (${filesMigrated} file(s), ${baselinesMigrated} baseline(s), ${conflicts} conflict(s))`,
+        {
+          operation: "local_fleet_roles_key_migration",
+          fleetHostId: host.id,
+          hostName: host.name,
+          filesMigrated,
+          baselinesMigrated,
+          conflicts,
+          ...(conflicts > 0 ? { conflictPaths } : {}),
+        },
+      );
+    }
+    if (counts.errorCount > 0) {
+      hadError = true;
+      systemLogger.warn(
+        `local-fleet-bootstrap: identity roles-key migration had ${counts.errorCount} failure(s) for ${host.name}`,
+        {
+          operation: "local_fleet_roles_key_migration_error",
+          fleetHostId: host.id,
+          hostName: host.name,
+          errorCount: counts.errorCount,
+          errors: counts.errors,
+        },
+      );
+    } else if (counts.deferred > 0) {
+      // Not ok: the orchestrator counts this as a failed item, so the host
+      // is re-swept on the retry tick instead of being marked done.
+      systemLogger.warn(
+        `local-fleet-bootstrap: ${counts.deferred} identity file(s) changed mid roles-key migration for ${host.name} — will retry`,
+        {
+          operation: "local_fleet_roles_key_migration_deferred",
+          fleetHostId: host.id,
+          hostName: host.name,
+          deferred: counts.deferred,
+        },
+      );
+    } else {
+      rolesKeyMigrationOk = true;
+    }
+  } catch (err) {
+    systemLogger.warn(
+      `local-fleet-bootstrap: identity roles-key migration threw for ${host.name}`,
+      {
+        operation: "local_fleet_roles_key_migration_error",
+        site: "outer_catch",
+        fleetHostId: host.id,
+        hostName: host.name,
+        error: err instanceof Error ? err.message : String(err),
+      },
+    );
+    hadError = true;
+  }
+
+  // ---- Step 7b: runbooks → role skills ----
+  // Parallel with SSH surface (run-bootstrap.ts Step 7b); rules in
+  // role-skills-migration.ts. Logs only when something changed / conflicts.
+  try {
+    const counts = await migrateRoleSkillsUnder(getLocalHomeRoot());
+    logRoleSkillsMigration(host, counts, "local_fleet_role_skills_migration", "local-fleet-bootstrap");
+    if (counts.errorCount > 0) {
+      hadError = true;
+      systemLogger.warn(
+        `local-fleet-bootstrap: runbooks → role skills had ${counts.errorCount} failure(s) for ${host.name}`,
+        {
+          operation: "local_fleet_role_skills_migration_error",
+          fleetHostId: host.id,
+          hostName: host.name,
+          errorCount: counts.errorCount,
+          errors: counts.errors,
+        },
+      );
+    } else if (counts.deferred > 0) {
+      systemLogger.warn(
+        `local-fleet-bootstrap: ${counts.deferred} file(s) changed mid runbooks → role skills for ${host.name} — will retry`,
+        {
+          operation: "local_fleet_role_skills_migration_deferred",
+          fleetHostId: host.id,
+          hostName: host.name,
+          deferred: counts.deferred,
+        },
+      );
+    } else {
+      roleSkillsMigrationOk = true;
+    }
+  } catch (err) {
+    systemLogger.warn(
+      `local-fleet-bootstrap: runbooks → role skills threw for ${host.name}`,
+      {
+        operation: "local_fleet_role_skills_migration_error",
+        site: "outer_catch",
+        fleetHostId: host.id,
+        hostName: host.name,
+        error: err instanceof Error ? err.message : String(err),
+      },
+    );
+    hadError = true;
+  }
+
+  const result: BootstrapResult = {
+    alreadyEnabled,
+    bootstrapRan,
+    daemonReloadRan,
+    settingsPatchOk,
+    gsdContextMonitorCleanupOk,
+    hostParentOk,
+    hostNameOk,
+    hostIdOk,
+    ...(peopleFileOk === undefined ? {} : { peopleFileOk }),
+    usageReporterRetireOk,
+    rolesKeyMigrationOk,
+    roleSkillsMigrationOk,
+    // Step 8 (desktop packages) is SSH-only: the container can't install host
+    // packages, and agent-desktop's own first-use install covers this box.
+    desktopDeps: null,
+    hadError,
+    // Local branch doesn't run the scheduled-agents-scheduler.service
+    // enable step yet. The SSH branch (run-bootstrap.ts) enables it via
+    // `systemctl --user enable --now`. The local branch would need
+    // equivalent busctl-based Manager.EnableUnitFiles + StartUnit calls
+    // (systemctl itself fails at the private-socket handshake here — see
+    // fireRestartHookLocally comment for the version-skew rationale). Until
+    // that's added, an existing box requires a manual `systemctl --user enable --now
+    // scheduled-agents-scheduler.service` at ship time. Both fields shape-
+    // satisfy the BootstrapResult interface without lying about state.
+    scheduledAgentsSchedulerAlreadyEnabled: false,
+    scheduledAgentsSchedulerBootstrapped: false,
+    // sensor-runner.service shares the same gap: manual `systemctl --user
+    // enable --now sensor-runner.service` on it at ship time.
+    sensorRunnerAlreadyEnabled: false,
+    sensorRunnerBootstrapped: false,
+    // relay-mcp.service: same gap, but agent-supervisor starts it on demand
+    // before any launch that needs it.
+    relayMcpAlreadyEnabled: false,
+    relayMcpBootstrapped: false,
+  };
+
+  systemLogger[hadError ? "warn" : "info"](
+    `local-fleet-bootstrap: completed for ${host.name}`,
+    {
+      operation: "local_fleet_bootstrap_result",
+      fleetHostId: host.id,
+      hostName: host.name,
+      ...result,
+    },
+  );
+
+  return result;
+}

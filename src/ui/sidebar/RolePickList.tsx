@@ -1,0 +1,185 @@
+// RolePickList — the new-conversation dialog's roles, as a list in the
+// dialog itself (apple-ux shape-creation-and-search-dialogs) instead of a
+// drop-down.
+//
+// One group per machine (titled only when there are several), each starting
+// with "No roles", then that machine's roles: picture, name, the role's
+// one-line description, a check when picked. Several roles can be picked;
+// what picking means (No roles is exclusive, a role from another machine
+// moves the agent there) is the caller's — this only reports the next list
+// of picked values. A search box appears once there are more than eight
+// roles; "New role…" sits at the bottom. Rows are toggle buttons
+// (aria-pressed) so the picked state reaches screen readers too.
+
+import { useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { Check, CircleDashed, Plus } from "lucide-react";
+import {
+  KitAvatar,
+  KitEmpty,
+  KitLoading,
+  KitSearch,
+  KitSettingsGroup,
+  KitSettingsRow,
+} from "@/components/kit";
+
+export interface RolePickItem {
+  value: string;
+  label: string;
+  description?: string;
+  avatarSrc?: string | null;
+  /** The "No roles" entry of its machine. */
+  noRoles?: boolean;
+}
+
+export interface RolePickGroup {
+  key: string;
+  /** Shown only when there is more than one group. */
+  title: string;
+  items: RolePickItem[];
+}
+
+/** More roles than this and the list gets a search box. */
+const SEARCH_FROM = 8;
+
+export function RolePickList({
+  groups,
+  value,
+  onChange,
+  onNewRole,
+  loading,
+  disabled,
+}: {
+  groups: RolePickGroup[];
+  value: string[];
+  onChange: (next: string[]) => void;
+  onNewRole?: () => void;
+  /**
+   * Some machine's roles are still arriving. The groups that are there still
+   * show (each machine's "No roles" is always pickable); a "Loading roles…"
+   * line sits under them until every machine has answered.
+   */
+  loading?: boolean;
+  disabled?: boolean;
+}): JSX.Element {
+  const { t } = useTranslation();
+  const [query, setQuery] = useState("");
+  const searching = query.trim() !== "";
+  const roleCount = groups.reduce((n, g) => n + g.items.filter((i) => !i.noRoles).length, 0);
+  const shown = useMemo(() => {
+    const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    if (words.length === 0) return groups;
+    return groups
+      .map((g) => ({
+        ...g,
+        items: g.items.filter((i) => {
+          if (i.noRoles) return false;
+          const hay = `${i.label} ${i.description ?? ""} ${g.title}`.toLowerCase();
+          return words.every((w) => hay.includes(w));
+        }),
+      }))
+      .filter((g) => g.items.length > 0);
+  }, [groups, query]);
+
+  const searchLabel = t("nav.newSessionSearchRoles", { defaultValue: "Search roles" });
+  const noRolesDescription = t("nav.newSessionNoRolesDescription", {
+    defaultValue: "A plain agent — give it roles later if you like.",
+  });
+  const pickedLabel = t("nav.newSessionRolePicked", { defaultValue: "Picked" });
+
+  const toggle = (v: string): void => {
+    if (disabled) return;
+    onChange(value.includes(v) ? value.filter((x) => x !== v) : [...value, v]);
+  };
+
+  return (
+    <div className="flex flex-col gap-3 min-w-0" data-testid="role-pick-list">
+      {roleCount > SEARCH_FROM && (
+        <KitSearch
+          value={query}
+          onValueChange={setQuery}
+          placeholder={searchLabel}
+          aria-label={searchLabel}
+          disabled={disabled}
+          data-testid="role-pick-search"
+        />
+      )}
+      <div className="max-h-[min(46vh,360px)] sm:max-h-[min(58vh,640px)] overflow-y-auto overscroll-contain -mx-1 px-1">
+        {shown.length === 0 ? (
+          loading ? null : searching ? (
+            <KitEmpty
+              title={t("nav.newSessionNoMatchingRoles", { defaultValue: "No matching roles" })}
+              data-testid="role-pick-no-matches"
+            />
+          ) : (
+            <KitEmpty
+              title={t("nav.newSessionNoRolesToPick", { defaultValue: "No roles to pick from right now" })}
+              data-testid="role-pick-empty"
+            />
+          )
+        ) : (
+          shown.map((g) => (
+            <KitSettingsGroup key={g.key} title={groups.length > 1 ? g.title : undefined} data-testid={`role-pick-group-${g.key}`}>
+              {g.items.map((i) => {
+                const picked = value.includes(i.value);
+                return (
+                  <KitSettingsRow
+                    key={i.value}
+                    data-testid={`role-pick-${i.value}`}
+                    leading={
+                      i.noRoles ? (
+                        <span className="size-[34px] rounded-full grid place-items-center text-[var(--k-t3)] shrink-0">
+                          <CircleDashed className="size-5" aria-hidden="true" />
+                        </span>
+                      ) : (
+                        <KitAvatar src={i.avatarSrc} fallback={i.label.charAt(0).toUpperCase()} size={34} />
+                      )
+                    }
+                    label={<span className={picked ? "text-[var(--k-acc-text)]" : undefined}>{i.label}</span>}
+                    description={i.noRoles ? noRolesDescription : i.description || undefined}
+                    truncate
+                    chevron={false}
+                    disabled={disabled}
+                    onClick={() => toggle(i.value)}
+                    pressed={picked}
+                    control={
+                      picked ? (
+                        <Check className="size-[18px] text-[var(--k-acc-text)] shrink-0" aria-label={pickedLabel} />
+                      ) : (
+                        <span className="size-[18px] shrink-0" aria-hidden="true" />
+                      )
+                    }
+                  />
+                );
+              })}
+            </KitSettingsGroup>
+          ))
+        )}
+        {loading && (
+          <KitLoading
+            lines={0}
+            label={t("nav.newSessionLoadingRoles", { defaultValue: "Loading roles…" })}
+            data-testid="role-pick-loading"
+          />
+        )}
+        {onNewRole && (
+          <KitSettingsGroup className="mt-[22px]">
+            <KitSettingsRow
+              tone="accent"
+              chevron={false}
+              leading={
+                <span className="size-[34px] rounded-full grid place-items-center shrink-0">
+                  <Plus className="size-5" aria-hidden="true" />
+                </span>
+              }
+              label={t("nav.newSessionNewRole", { defaultValue: "New role…" })}
+              disabled={disabled}
+              onClick={onNewRole}
+              data-testid="role-pick-new-role"
+            />
+          </KitSettingsGroup>
+        )}
+      </div>
+    </div>
+  );
+}

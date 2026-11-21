@@ -1,0 +1,1543 @@
+/**
+ * workspace-routes.test.ts (Phase 118, Plan 118-01, Task 2)
+ *
+ * Vitest suite covering the 9-endpoint workspace CRUD router:
+ *   POST /workspace/list, /read-file, /rename, /mkdir, /create-file, /upload
+ *   PUT  /workspace/write-file
+ *   DELETE /workspace/entry
+ *   GET  /workspace/download
+ *
+ * Security gates covered:
+ *   - Auth: no JWT → 401
+ *   - Permission: canAccessHost false → 403 permission_denied
+ *   - Path traversal (static pre-SFTP check): relativePath "../../etc" → 400 path_traversal
+ *   - identityKey injection: "../../etc" → 400 invalid_identity_key
+ *   - resolveHostById null → 404 unknown_host
+ *   - Post-realpath symlink escape: sftp.realpath returns "/etc/passwd" → 400 path_traversal
+ *   - SFTP ENOENT error → 404 not_found (T-40-05: body never contains "ENOENT" substring)
+ *   - T-40-05 info-leak invariant: response body is exactly { error: "<class>" }
+ *   - DELETE: folder → one `rm -rf` exec; file or symlink → sftp.unlink of the entry itself
+ *   - PUT /write-file: createWriteStream called with tempPath ending in ".partial" then rename
+ *   - POST /upload: multer memoryStorage, no .skynet-export.sqlite filter
+ *   - Permission action: list uses "read", write-file uses "write"
+ *
+ * Mock scaffolding mirrors pretty-view-fetch-host-file.test.ts:
+ *   - Bare Express app + Node http module + vi.mock for 5 modules
+ *   - resolveHostById (NOT resolveHostByName) — workspace uses numeric hostId
+ */
+
+import { EventEmitter } from "node:events";
+import {
+  describe,
+  it,
+  expect,
+  vi,
+  beforeEach,
+  afterEach,
+  type Mock,
+} from "vitest";
+import express from "express";
+import { Readable } from "node:stream";
+import http from "node:http";
+import type { AddressInfo } from "node:net";
+
+/* --------------------------------------------------------------------- */
+/*  Auth mock — allow/deny via mockUserId                                */
+/* --------------------------------------------------------------------- */
+
+let mockUserId: string | null = "user-A";
+
+vi.mock("../../utils/auth-manager.js", () => {
+  const AuthManager = {
+    getInstance: () => ({
+      createAuthMiddleware:
+        () =>
+        (
+          req: express.Request,
+          res: express.Response,
+          next: express.NextFunction,
+        ) => {
+          if (mockUserId === null) {
+            return res.status(401).json({ error: "Unauthorized" });
+          }
+          (req as express.Request & { userId: string }).userId = mockUserId;
+          next();
+        },
+    }),
+  };
+  return { AuthManager };
+});
+
+/* --------------------------------------------------------------------- */
+/*  Permission manager mock — canAccessHost                              */
+/* --------------------------------------------------------------------- */
+
+let mockCanAccessHost: (
+  userId: string,
+  hostId: number,
+  action: string,
+) => Promise<{ hasAccess: boolean }> = async () => ({ hasAccess: true });
+
+vi.mock("../../utils/permission-manager.js", () => ({
+  PermissionManager: {
+    getInstance: () => ({
+      canAccessHost: (userId: string, hostId: number, action: string) =>
+        mockCanAccessHost(userId, hostId, action),
+    }),
+  },
+}));
+
+/* --------------------------------------------------------------------- */
+/*  Logger mock                                                          */
+/* --------------------------------------------------------------------- */
+
+vi.mock("../../utils/logger.js", () => ({
+  sshLogger: {
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    success: vi.fn(),
+  },
+  logger: {
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    success: vi.fn(),
+  },
+  databaseLogger: {
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    success: vi.fn(),
+  },
+}));
+
+/* --------------------------------------------------------------------- */
+/*  Host resolver mock — resolveHostById (NOT resolveHostByName)        */
+/* --------------------------------------------------------------------- */
+
+vi.mock("../../ssh/host-resolver.js", () => ({
+  resolveHostById: vi.fn(),
+}));
+
+/* --------------------------------------------------------------------- */
+/*  SSH connection pool + one-shot mocks                                 */
+/* --------------------------------------------------------------------- */
+
+vi.mock("../../ssh/ssh-one-shot.js", () => ({
+  connectOneShot: vi.fn(async () => stubClient),
+}));
+
+/**
+ * Stub SFTP + client — extended for workspace CRUD operations.
+ * All methods are vi.fn() so tests can assert call counts and arguments.
+ */
+interface StubSftp {
+  realpath: Mock;
+  stat: Mock;
+  readFile: Mock;
+  createReadStream: Mock;
+  readdir: Mock;
+  writeFile: Mock;
+  mkdir: Mock;
+  unlink: Mock;
+  rmdir: Mock;
+  lstat: Mock;
+  rename: Mock;
+  ext_openssh_rename: Mock;
+  createWriteStream: Mock;
+  end: Mock;
+}
+
+interface StubClient {
+  sftp: Mock;
+  exec: Mock;
+}
+
+/** Exit code the stub client's exec reports, and stderr it writes first. */
+let execExit = 0;
+let execStderr = "";
+
+let stubSftp: StubSftp;
+/** What the stub's createReadStream serves (stat reports size 5). */
+const fileBytes = Buffer.from("hello", "utf8");
+let stubClient: StubClient;
+
+/**
+ * Default createWriteStream mock: returns a WriteStream-like object
+ * where .end() triggers 'close' via queueMicrotask. Rename succeeds by default.
+ */
+function makeDefaultWriteStream() {
+  const handlers: Record<string, ((...args: unknown[]) => void)[]> = {};
+  return {
+    write: vi.fn(),
+    end: vi.fn(() => {
+      queueMicrotask(() => {
+        if (handlers["close"]) {
+          handlers["close"].forEach((h) => h());
+        }
+      });
+    }),
+    on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+      if (!handlers[event]) handlers[event] = [];
+      handlers[event].push(cb);
+    }),
+  };
+}
+
+function resetStubClient() {
+  const fakeWriteStream = makeDefaultWriteStream();
+  stubSftp = {
+    end: vi.fn(),
+    realpath: vi.fn(
+      (p: string, cb: (err: Error | null, resolved: string) => void) => {
+        queueMicrotask(() => cb(null, p));
+      },
+    ),
+    stat: vi.fn(
+      (
+        _p: string,
+        cb: (
+          err: Error | null,
+          stats?: {
+            size: number;
+            isFile: () => boolean;
+            isDirectory: () => boolean;
+          },
+        ) => void,
+      ) => {
+        queueMicrotask(() =>
+          cb(null, {
+            size: 5,
+            isFile: () => true,
+            isDirectory: () => false,
+          }),
+        );
+      },
+    ),
+    readFile: vi.fn(
+      (_p: string, cb: (err: Error | null, data: Buffer) => void) => {
+        queueMicrotask(() => cb(null, Buffer.from("hello", "utf8")));
+      },
+    ),
+    // Serves `fileBytes` (default "hello"), honouring the inclusive range.
+    createReadStream: vi.fn((_p: string, opts?: { start?: number; end?: number }) =>
+      Readable.from([fileBytes.subarray(opts?.start ?? 0, (opts?.end ?? fileBytes.length - 1) + 1)]),
+    ),
+    readdir: vi.fn(
+      (_p: string, cb: (err: Error | null, list: unknown[]) => void) => {
+        queueMicrotask(() =>
+          cb(null, [
+            {
+              filename: "test.txt",
+              attrs: {
+                size: 100,
+                mtime: 1700000000,
+                mode: 0o100644,
+                isFile: () => true,
+                isDirectory: () => false,
+                isSymbolicLink: () => false,
+              },
+            },
+          ]),
+        );
+      },
+    ),
+    writeFile: vi.fn((_p: string, _data: Buffer, cb: (err: Error | null) => void) => {
+      queueMicrotask(() => cb(null));
+    }),
+    mkdir: vi.fn((_p: string, cb: (err: Error | null) => void) => {
+      queueMicrotask(() => cb(null));
+    }),
+    unlink: vi.fn((_p: string, cb: (err: Error | null) => void) => {
+      queueMicrotask(() => cb(null));
+    }),
+    rmdir: vi.fn((_p: string, cb: (err: Error | null) => void) => {
+      queueMicrotask(() => cb(null));
+    }),
+    lstat: vi.fn(
+      (
+        _p: string,
+        cb: (err: Error | null, stats?: { isDirectory: () => boolean; isSymbolicLink: () => boolean }) => void,
+      ) => {
+        queueMicrotask(() => cb(null, { isDirectory: () => false, isSymbolicLink: () => false }));
+      },
+    ),
+    rename: vi.fn(
+      (_from: string, _to: string, cb: (err: Error | null) => void) => {
+        queueMicrotask(() => cb(null));
+      },
+    ),
+    ext_openssh_rename: vi.fn(
+      (_from: string, _to: string, cb: (err: Error | null) => void) => {
+        queueMicrotask(() => cb(null));
+      },
+    ),
+    createWriteStream: vi.fn(() => fakeWriteStream),
+  };
+
+  stubClient = {
+    sftp: vi.fn((cb: (err: Error | null, sftp: StubSftp) => void) => {
+      queueMicrotask(() => cb(null, stubSftp));
+    }),
+    exec: vi.fn((_cmd: string, cb: (err: Error | null, stream: unknown) => void) => {
+      const stream = Object.assign(new EventEmitter(), { stderr: new EventEmitter() });
+      queueMicrotask(() => {
+        cb(null, stream);
+        queueMicrotask(() => {
+          if (execStderr) stream.stderr.emit("data", Buffer.from(execStderr));
+          stream.emit("close", execExit);
+        });
+      });
+    }),
+  };
+  execExit = 0;
+  execStderr = "";
+}
+
+vi.mock("../../ssh/ssh-connection-pool.js", () => ({
+  hostPoolKey: (h: { userId?: string; ip: string; port?: number | null; username: string }) =>
+    `${h.userId}:${h.ip}:${h.port ?? 22}:${h.username}`,
+  withConnection: vi.fn(
+    async (
+      _key: string,
+      factory: () => Promise<StubClient>,
+      fn: (client: StubClient) => Promise<unknown>,
+    ) => {
+      const client = await factory();
+      return fn(client);
+    },
+  ),
+}));
+
+/* --------------------------------------------------------------------- */
+/*  Admin flag — gates the whole-host target                             */
+/* --------------------------------------------------------------------- */
+
+let mockIsAdmin = false;
+vi.mock("../../instance-wide/admin.js", () => ({
+  callerIsAdmin: vi.fn(async () => mockIsAdmin),
+}));
+
+/* --------------------------------------------------------------------- */
+/*  Import module under test AFTER all vi.mock declarations              */
+/* --------------------------------------------------------------------- */
+
+import { resolveHostById } from "../../ssh/host-resolver.js";
+
+const { workspaceRoutes } = await import("./workspace-routes.js");
+
+/* --------------------------------------------------------------------- */
+/*  HTTP helpers                                                         */
+/* --------------------------------------------------------------------- */
+
+function httpRequest(
+  server: http.Server,
+  opts: {
+    method: string;
+    path: string;
+    headers?: Record<string, string>;
+    body?: string;
+  },
+): Promise<{
+  status: number;
+  body: unknown;
+  rawBody: string;
+  headers: http.IncomingHttpHeaders;
+}> {
+  return new Promise((resolve, reject) => {
+    const { port } = server.address() as AddressInfo;
+    const headers: Record<string, string> = { ...(opts.headers ?? {}) };
+    if (opts.body !== undefined) {
+      headers["Content-Type"] =
+        headers["Content-Type"] ?? "application/json";
+      headers["Content-Length"] = String(Buffer.byteLength(opts.body));
+    }
+    const req = http.request(
+      {
+        hostname: "127.0.0.1",
+        port,
+        method: opts.method,
+        path: opts.path,
+        headers,
+      },
+      (res) => {
+        let data = "";
+        res.on("data", (chunk: Buffer) => {
+          data += chunk.toString();
+        });
+        res.on("end", () => {
+          let body: unknown;
+          try {
+            body = JSON.parse(data);
+          } catch {
+            body = data;
+          }
+          resolve({
+            status: res.statusCode ?? 0,
+            body,
+            rawBody: data,
+            headers: res.headers,
+          });
+        });
+      },
+    );
+    req.on("error", reject);
+    if (opts.body !== undefined) req.write(opts.body);
+    req.end();
+  });
+}
+
+/**
+ * Hand-built multipart/form-data body — avoids adding a supertest dependency.
+ * Follows RFC 7578 for basic field + file part.
+ */
+function buildMultipart(
+  boundary: string,
+  fields: Record<string, string>,
+  fileField: string,
+  fileBuffer: Buffer,
+  filename: string,
+): Buffer {
+  const parts: Buffer[] = [];
+  for (const [name, value] of Object.entries(fields)) {
+    parts.push(
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`,
+      ),
+    );
+  }
+  parts.push(
+    Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="${fileField}"; filename="${filename}"\r\nContent-Type: application/octet-stream\r\n\r\n`,
+    ),
+  );
+  parts.push(fileBuffer);
+  parts.push(Buffer.from(`\r\n--${boundary}--\r\n`));
+  return Buffer.concat(parts);
+}
+
+/* --------------------------------------------------------------------- */
+/*  Fixture host + mount setup                                           */
+/* --------------------------------------------------------------------- */
+
+const fixtureHost = {
+  id: 42,
+  name: "echo-box",
+  userId: "user-A",
+  ip: "100.101.1.1",
+  port: 22,
+  username: "ubuntu",
+  authType: "password" as const,
+  password: "secret",
+};
+
+let server: http.Server;
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  mockUserId = "user-A";
+  mockCanAccessHost = async () => ({ hasAccess: true });
+  mockIsAdmin = false;
+  resetStubClient();
+  (resolveHostById as Mock).mockImplementation(
+    async (hostId: number, _userId: string) => {
+      if (hostId === 42) return fixtureHost;
+      return null;
+    },
+  );
+
+  // Mount workspaceRoutes exactly as database.ts does
+  const app = express();
+  app.use("/workspace", workspaceRoutes);
+
+  server = http.createServer(app);
+  server.listen(0);
+});
+
+afterEach(() => {
+  return new Promise<void>((resolve) => server.close(() => resolve()));
+});
+
+/* --------------------------------------------------------------------- */
+/*  Test 1: POST /workspace/list success → 200 { entries, path }        */
+/* --------------------------------------------------------------------- */
+
+describe("POST /workspace/list", () => {
+  it("Test 1: valid auth + stub readdir → 200 { entries, path }", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/workspace/list",
+      body: JSON.stringify({ identityKey: "echo", hostId: 42, relativePath: "" }),
+    });
+    expect(res.status).toBe(200);
+    const body = res.body as { entries: unknown[]; path: string };
+    expect(Array.isArray(body.entries)).toBe(true);
+    expect(body.entries).toHaveLength(1);
+    expect(body.path).toBe("");
+    expect((body.entries[0] as { name: string }).name).toBe("test.txt");
+    // The SFTP session is closed once the listing is read.
+    expect(stubSftp.end).toHaveBeenCalledTimes(1);
+  });
+
+  it("Test 2: no auth (mockUserId = null) → 401 Unauthorized", async () => {
+    mockUserId = null;
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/workspace/list",
+      body: JSON.stringify({ identityKey: "echo", hostId: 42 }),
+    });
+    expect(res.status).toBe(401);
+    // Verify sftp was never opened
+    expect(stubSftp.realpath).not.toHaveBeenCalled();
+  });
+
+  it("Test 3: canAccessHost false → 403 permission_denied", async () => {
+    mockCanAccessHost = async () => ({ hasAccess: false });
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/workspace/list",
+      body: JSON.stringify({ identityKey: "echo", hostId: 42 }),
+    });
+    expect(res.status).toBe(403);
+    expect((res.body as { error: string }).error).toBe("permission_denied");
+    // Verify sftp was never opened
+    expect(stubSftp.readdir).not.toHaveBeenCalled();
+  });
+
+  it("Test 4: relativePath '../../etc' → 400 path_traversal; sftp.readdir NOT called", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/workspace/list",
+      body: JSON.stringify({ identityKey: "echo", hostId: 42, relativePath: "../../etc" }),
+    });
+    expect(res.status).toBe(400);
+    expect((res.body as { error: string }).error).toBe("path_traversal");
+    expect(stubSftp.readdir).not.toHaveBeenCalled();
+  });
+
+  it("Test 5: identityKey '../../etc' → 400 invalid_identity_key; resolveHostById NOT called", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/workspace/list",
+      body: JSON.stringify({ identityKey: "../../etc", hostId: 42 }),
+    });
+    expect(res.status).toBe(400);
+    expect((res.body as { error: string }).error).toBe("invalid_identity_key");
+    expect(resolveHostById).not.toHaveBeenCalled();
+  });
+
+  it("Test 6: resolveHostById returns null → 404 unknown_host", async () => {
+    (resolveHostById as Mock).mockResolvedValue(null);
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/workspace/list",
+      body: JSON.stringify({ identityKey: "echo", hostId: 999 }),
+    });
+    expect(res.status).toBe(404);
+    expect((res.body as { error: string }).error).toBe("unknown_host");
+  });
+
+  it("Test 7 (T-40-05): sftp.readdir ENOENT → 404 not_found; body has NO ENOENT substring, NO absolutePath, NO stack", async () => {
+    stubSftp.readdir.mockImplementation(
+      (_p: string, cb: (err: Error | null) => void) => {
+        queueMicrotask(() =>
+          cb(new Error("ENOENT no such file or directory")),
+        );
+      },
+    );
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/workspace/list",
+      body: JSON.stringify({ identityKey: "echo", hostId: 42 }),
+    });
+    expect(res.status).toBe(404);
+    const raw = JSON.stringify(res.body);
+    expect(raw).not.toContain("ENOENT");
+    expect(raw).not.toContain("/fleet/");
+    expect(raw).not.toContain("stack");
+    // T-40-05: body must be exactly { error: "<class>" }
+    expect(Object.keys(res.body as object)).toEqual(["error"]);
+    expect((res.body as { error: string }).error).toBe("not_found");
+  });
+
+  it("Test 8: post-realpath symlink escape (realpath returns /etc/passwd) → 400 path_traversal; sftp.readdir NOT called", async () => {
+    // First realpath call (for ".") returns home dir; subsequent calls for workspace path return /etc/passwd
+    let realpathCallCount = 0;
+    stubSftp.realpath.mockImplementation(
+      (p: string, cb: (err: Error | null, resolved: string) => void) => {
+        realpathCallCount++;
+        if (realpathCallCount === 1) {
+          // First call: sftpRealpath(sftp, ".") → home dir
+          queueMicrotask(() => cb(null, "/home/ubuntu"));
+        } else {
+          // Second call: sftpRealpath(sftp, absolutePath) → symlink escape
+          queueMicrotask(() => cb(null, "/etc/passwd"));
+        }
+      },
+    );
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/workspace/list",
+      body: JSON.stringify({ identityKey: "echo", hostId: 42, relativePath: "nasty-link" }),
+    });
+    expect(res.status).toBe(400);
+    expect((res.body as { error: string }).error).toBe("path_traversal");
+    expect(stubSftp.readdir).not.toHaveBeenCalled();
+  });
+
+  it("Test 13a: canAccessHost called with action 'read' for list", async () => {
+    let capturedAction = "";
+    mockCanAccessHost = async (_uid: string, _hid: number, action: string) => {
+      capturedAction = action;
+      return { hasAccess: true };
+    };
+    await httpRequest(server, {
+      method: "POST",
+      path: "/workspace/list",
+      body: JSON.stringify({ identityKey: "echo", hostId: 42 }),
+    });
+    expect(capturedAction).toBe("read");
+  });
+
+  /* ── Role-target coverage ─────────────────────────────────────────────
+   * The 9 endpoints share extractTarget + buildTargetRoot; testing role
+   * resolution against /list is representative — the other 8 use the same
+   * two helpers and are structurally identical. */
+
+  it("Test R1: kind='role' + valid roleSlug → 200; sftp.readdir called against ~/fleet/roles/<slug> path", async () => {
+    // Realpath returns "/home/ubuntu" for the initial "." call (home-dir
+    // discovery), then echoes back for subsequent calls (default stub).
+    let realpathCallCount = 0;
+    stubSftp.realpath.mockImplementation(
+      (p: string, cb: (err: Error | null, resolved: string) => void) => {
+        realpathCallCount++;
+        if (realpathCallCount === 1) {
+          queueMicrotask(() => cb(null, "/home/ubuntu"));
+        } else {
+          queueMicrotask(() => cb(null, p));
+        }
+      },
+    );
+
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/workspace/list",
+      body: JSON.stringify({
+        kind: "role",
+        roleSlug: "box-maintainer",
+        hostId: 42,
+        relativePath: "",
+      }),
+    });
+    expect(res.status).toBe(200);
+    // Verify the SFTP call landed on the role path, not an identity path.
+    const readdirCalls = stubSftp.readdir.mock.calls;
+    expect(readdirCalls.length).toBeGreaterThan(0);
+    expect(readdirCalls[0][0]).toBe("/home/ubuntu/fleet/roles/box-maintainer");
+  });
+
+  it("Test R2: kind='role' + roleSlug '../../etc' → 400 invalid_role_slug; resolveHostById NOT called", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/workspace/list",
+      body: JSON.stringify({
+        kind: "role",
+        roleSlug: "../../etc",
+        hostId: 42,
+      }),
+    });
+    expect(res.status).toBe(400);
+    expect((res.body as { error: string }).error).toBe("invalid_role_slug");
+    expect(resolveHostById).not.toHaveBeenCalled();
+  });
+
+  it("Test R3: kind='role' with missing roleSlug → 400 invalid_body", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/workspace/list",
+      body: JSON.stringify({
+        kind: "role",
+        hostId: 42,
+      }),
+    });
+    expect(res.status).toBe(400);
+    expect((res.body as { error: string }).error).toBe("invalid_body");
+  });
+
+  it("Test R4: absent kind (default) resolves to identity workspace path — legacy wire preserved", async () => {
+    let realpathCallCount = 0;
+    stubSftp.realpath.mockImplementation(
+      (p: string, cb: (err: Error | null, resolved: string) => void) => {
+        realpathCallCount++;
+        if (realpathCallCount === 1) {
+          queueMicrotask(() => cb(null, "/home/ubuntu"));
+        } else {
+          queueMicrotask(() => cb(null, p));
+        }
+      },
+    );
+
+    await httpRequest(server, {
+      method: "POST",
+      path: "/workspace/list",
+      body: JSON.stringify({ identityKey: "echo", hostId: 42, relativePath: "" }),
+    });
+    const readdirCalls = stubSftp.readdir.mock.calls;
+    expect(readdirCalls[0][0]).toBe(
+      "/home/ubuntu/fleet/identities/echo/workspace",
+    );
+  });
+});
+
+/* --------------------------------------------------------------------- */
+/*  Test 9: PUT /workspace/write-file — atomic write                     */
+/* --------------------------------------------------------------------- */
+
+describe("PUT /workspace/write-file", () => {
+  it("Test 9: valid body → 200; createWriteStream called with path ending '.partial', then ext_openssh_rename called", async () => {
+    let capturedTempPath = "";
+    let capturedRenameSrc = "";
+
+    stubSftp.createWriteStream.mockImplementation((p: string, _opts?: unknown) => {
+      capturedTempPath = p;
+      return makeDefaultWriteStream();
+    });
+    stubSftp.ext_openssh_rename.mockImplementation(
+      (from: string, _to: string, cb: (err: Error | null) => void) => {
+        capturedRenameSrc = from;
+        queueMicrotask(() => cb(null));
+      },
+    );
+
+    const res = await httpRequest(server, {
+      method: "PUT",
+      path: "/workspace/write-file",
+      body: JSON.stringify({
+        identityKey: "echo",
+        hostId: 42,
+        relativePath: "notes.txt",
+        content: "hello world",
+      }),
+    });
+    expect(res.status).toBe(200);
+    expect(capturedTempPath).toContain(".partial");
+    expect(capturedRenameSrc).toContain(".partial");
+  });
+
+  it("Test 13b: canAccessHost called with action 'write' for write-file", async () => {
+    let capturedAction = "";
+    mockCanAccessHost = async (_uid: string, _hid: number, action: string) => {
+      capturedAction = action;
+      return { hasAccess: true };
+    };
+    await httpRequest(server, {
+      method: "PUT",
+      path: "/workspace/write-file",
+      body: JSON.stringify({
+        identityKey: "echo",
+        hostId: 42,
+        relativePath: "notes.txt",
+        content: "test",
+      }),
+    });
+    expect(capturedAction).toBe("write");
+  });
+});
+
+/* --------------------------------------------------------------------- */
+/*  Test 10: DELETE /workspace/entry — directory vs file + ENOTEMPTY    */
+/* --------------------------------------------------------------------- */
+
+describe("DELETE /workspace/entry", () => {
+  function lstatAs(kind: "file" | "folder" | "link") {
+    stubSftp.lstat.mockImplementation(
+      (
+        _p: string,
+        cb: (err: Error | null, stats?: { isDirectory: () => boolean; isSymbolicLink: () => boolean }) => void,
+      ) => {
+        queueMicrotask(() =>
+          cb(null, { isDirectory: () => kind === "folder", isSymbolicLink: () => kind === "link" }),
+        );
+      },
+    );
+  }
+
+  it("Test 10a: a folder → removed with everything in it by one rm -rf (no rmdir, no unlink)", async () => {
+    lstatAs("folder");
+    const res = await httpRequest(server, {
+      method: "DELETE",
+      path: "/workspace/entry",
+      body: JSON.stringify({ identityKey: "echo", hostId: 42, relativePath: "mydir" }),
+    });
+    expect(res.status).toBe(200);
+    expect(stubClient.exec).toHaveBeenCalledTimes(1);
+    const cmd = stubClient.exec.mock.calls[0][0] as string;
+    expect(cmd).toMatch(/^rm -rf -- '.*\/fleet\/identities\/echo\/workspace\/mydir'$/);
+    expect(stubSftp.rmdir).not.toHaveBeenCalled();
+    expect(stubSftp.unlink).not.toHaveBeenCalled();
+  });
+
+  it("Test 10b: a folder name with a quote is passed to rm as one shell word", async () => {
+    lstatAs("folder");
+    const res = await httpRequest(server, {
+      method: "DELETE",
+      path: "/workspace/entry",
+      body: JSON.stringify({ identityKey: "echo", hostId: 42, relativePath: "it's; rm -rf ~" }),
+    });
+    expect(res.status).toBe(200);
+    const cmd = stubClient.exec.mock.calls[0][0] as string;
+    expect(cmd.endsWith(`/workspace/it'\\''s; rm -rf ~'`)).toBe(true);
+  });
+
+  it("Test 10c: rm fails with Permission denied → 403 permission_denied", async () => {
+    lstatAs("folder");
+    execExit = 1;
+    execStderr = "rm: cannot remove 'mydir/x': Permission denied";
+    const res = await httpRequest(server, {
+      method: "DELETE",
+      path: "/workspace/entry",
+      body: JSON.stringify({ identityKey: "echo", hostId: 42, relativePath: "mydir" }),
+    });
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ error: "permission_denied" });
+  });
+
+  it("Test 10d: a file → sftp.unlink called (no rm)", async () => {
+    const res = await httpRequest(server, {
+      method: "DELETE",
+      path: "/workspace/entry",
+      body: JSON.stringify({ identityKey: "echo", hostId: 42, relativePath: "file.txt" }),
+    });
+    expect(res.status).toBe(200);
+    expect(stubSftp.unlink).toHaveBeenCalled();
+    expect(stubClient.exec).not.toHaveBeenCalled();
+  });
+
+  it("Test 10e: a symlink to a folder → the link itself is unlinked; its target is untouched", async () => {
+    lstatAs("link");
+    // realpath follows the link to a folder elsewhere in the workspace.
+    stubSftp.realpath.mockImplementation((p: string, cb: (err: Error | null, r: string) => void) => {
+      queueMicrotask(() => cb(null, p.endsWith("/link-to-src") ? p.replace(/link-to-src$/, "src") : p));
+    });
+    const res = await httpRequest(server, {
+      method: "DELETE",
+      path: "/workspace/entry",
+      body: JSON.stringify({ identityKey: "echo", hostId: 42, relativePath: "link-to-src" }),
+    });
+    expect(res.status).toBe(200);
+    expect(stubSftp.unlink).toHaveBeenCalledTimes(1);
+    expect(stubSftp.unlink.mock.calls[0][0]).toMatch(/\/workspace\/link-to-src$/);
+    expect(stubClient.exec).not.toHaveBeenCalled();
+  });
+});
+
+/* --------------------------------------------------------------------- */
+/*  Test 11: POST /workspace/rename                                      */
+/* --------------------------------------------------------------------- */
+
+describe("POST /workspace/rename", () => {
+  it("Test 11: valid from and to → sftp.rename called with resolved absolute paths", async () => {
+    let capturedRenameFrom = "";
+    let capturedRenameTo = "";
+    stubSftp.rename.mockImplementation(
+      (from: string, to: string, cb: (err: Error | null) => void) => {
+        capturedRenameFrom = from;
+        capturedRenameTo = to;
+        queueMicrotask(() => cb(null));
+      },
+    );
+
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/workspace/rename",
+      body: JSON.stringify({
+        identityKey: "echo",
+        hostId: 42,
+        from: "old-name.txt",
+        to: "new-name.txt",
+      }),
+    });
+    expect(res.status).toBe(200);
+    expect(capturedRenameFrom).toContain("old-name.txt");
+    expect(capturedRenameTo).toContain("new-name.txt");
+    expect(capturedRenameFrom).toContain("/workspace/");
+  });
+
+  it("Test 11b: traversal in 'from' → 400 path_traversal", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/workspace/rename",
+      body: JSON.stringify({
+        identityKey: "echo",
+        hostId: 42,
+        from: "../../etc/passwd",
+        to: "safe.txt",
+      }),
+    });
+    expect(res.status).toBe(400);
+    expect((res.body as { error: string }).error).toBe("path_traversal");
+    expect(stubSftp.rename).not.toHaveBeenCalled();
+  });
+});
+
+/* --------------------------------------------------------------------- */
+/*  Test 12: POST /workspace/upload — multer memoryStorage              */
+/* --------------------------------------------------------------------- */
+
+describe("POST /workspace/upload", () => {
+  it("Test 12: multipart upload with buffer → 200; createWriteStream called; no .skynet-export.sqlite filter", async () => {
+    const boundary = "----FormBoundary12345";
+    const fileBuffer = Buffer.from("file contents here", "utf8");
+    const body = buildMultipart(
+      boundary,
+      {
+        identityKey: "echo",
+        hostId: "42",
+        relativePath: "uploaded.txt",
+      },
+      "file",
+      fileBuffer,
+      "uploaded.txt",
+    );
+
+    const res = await new Promise<{
+      status: number;
+      body: unknown;
+    }>((resolve, reject) => {
+      const { port } = server.address() as AddressInfo;
+      const req = http.request(
+        {
+          hostname: "127.0.0.1",
+          port,
+          method: "POST",
+          path: "/workspace/upload",
+          headers: {
+            "Content-Type": `multipart/form-data; boundary=${boundary}`,
+            "Content-Length": String(body.byteLength),
+          },
+        },
+        (res) => {
+          let data = "";
+          res.on("data", (chunk: Buffer) => {
+            data += chunk.toString();
+          });
+          res.on("end", () => {
+            let parsed: unknown;
+            try {
+              parsed = JSON.parse(data);
+            } catch {
+              parsed = data;
+            }
+            resolve({ status: res.statusCode ?? 0, body: parsed });
+          });
+        },
+      );
+      req.on("error", reject);
+      req.write(body);
+      req.end();
+    });
+
+    expect(res.status).toBe(200);
+    expect(stubSftp.createWriteStream).toHaveBeenCalled();
+    // The createWriteStream call should have a path (not the .skynet-export.sqlite filter)
+    const callArg = (stubSftp.createWriteStream as Mock).mock.calls[0]?.[0] as string;
+    expect(typeof callArg).toBe("string");
+    expect(callArg).toContain(".partial");
+  });
+
+  it("Test 12b: upload with invalid identityKey → 400 invalid_identity_key; no SFTP call", async () => {
+    const boundary = "----FormBoundaryBad";
+    const fileBuffer = Buffer.from("x", "utf8");
+    const body = buildMultipart(
+      boundary,
+      {
+        identityKey: "../../etc",
+        hostId: "42",
+        relativePath: "bad.txt",
+      },
+      "file",
+      fileBuffer,
+      "bad.txt",
+    );
+
+    const res = await new Promise<{
+      status: number;
+      body: unknown;
+    }>((resolve, reject) => {
+      const { port } = server.address() as AddressInfo;
+      const req = http.request(
+        {
+          hostname: "127.0.0.1",
+          port,
+          method: "POST",
+          path: "/workspace/upload",
+          headers: {
+            "Content-Type": `multipart/form-data; boundary=${boundary}`,
+            "Content-Length": String(body.byteLength),
+          },
+        },
+        (res) => {
+          let data = "";
+          res.on("data", (chunk: Buffer) => { data += chunk.toString(); });
+          res.on("end", () => {
+            let parsed: unknown;
+            try { parsed = JSON.parse(data); } catch { parsed = data; }
+            resolve({ status: res.statusCode ?? 0, body: parsed });
+          });
+        },
+      );
+      req.on("error", reject);
+      req.write(body);
+      req.end();
+    });
+
+    expect(res.status).toBe(400);
+    expect((res.body as { error: string }).error).toBe("invalid_identity_key");
+    expect(stubSftp.createWriteStream).not.toHaveBeenCalled();
+  });
+});
+
+/* --------------------------------------------------------------------- */
+/*  Test: GET /workspace/download                                        */
+/* --------------------------------------------------------------------- */
+
+describe("GET /workspace/download", () => {
+  it("Test 14: valid query → 200 streamed, Content-Disposition attachment", async () => {
+    const res = await httpRequest(server, {
+      method: "GET",
+      path: "/workspace/download?identityKey=echo&hostId=42&relativePath=notes.txt",
+    });
+    expect(res.status).toBe(200);
+    expect(res.rawBody).toBe("hello");
+    const cd = res.headers["content-disposition"] as string;
+    expect(cd).toContain("attachment");
+    expect(cd).toContain("notes.txt");
+    expect(res.headers["cache-control"]).toBe("no-store");
+    expect(res.headers["accept-ranges"]).toBe("bytes");
+    expect(stubSftp.readFile).not.toHaveBeenCalled();
+  });
+
+  it("Test 14c: inline=1 serves safe types inline with their real content-type", async () => {
+    const res = await httpRequest(server, {
+      method: "GET",
+      path: "/workspace/download?identityKey=echo&hostId=42&relativePath=clip.mp4&inline=1",
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers["content-type"]).toBe("video/mp4");
+    expect(res.headers["content-disposition"]).toBeUndefined();
+    expect(res.headers["x-content-type-options"]).toBe("nosniff");
+  });
+
+  it("Test 14d: inline=1 still forces attachment for html / svg (XSS lane)", async () => {
+    for (const name of ["page.html", "logo.svg"]) {
+      const res = await httpRequest(server, {
+        method: "GET",
+        path: `/workspace/download?identityKey=echo&hostId=42&relativePath=${name}&inline=1`,
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers["content-disposition"] as string).toContain("attachment");
+    }
+  });
+
+  it("Test 14e: Range request → 206 with Content-Range and only those bytes", async () => {
+    const res = await httpRequest(server, {
+      method: "GET",
+      path: "/workspace/download?identityKey=echo&hostId=42&relativePath=clip.mp4&inline=1",
+      headers: { Range: "bytes=1-3" },
+    });
+    expect(res.status).toBe(206);
+    expect(res.headers["content-range"]).toBe("bytes 1-3/5");
+    expect(res.rawBody).toBe("ell");
+  });
+
+  it("Test 14b: traversal in relativePath via query → 400 path_traversal", async () => {
+    const res = await httpRequest(server, {
+      method: "GET",
+      path: "/workspace/download?identityKey=echo&hostId=42&relativePath=../../etc/passwd",
+    });
+    expect(res.status).toBe(400);
+    expect((res.body as { error: string }).error).toBe("path_traversal");
+  });
+});
+
+/* --------------------------------------------------------------------- */
+/*  Test: POST /workspace/mkdir                                          */
+/* --------------------------------------------------------------------- */
+
+describe("POST /workspace/mkdir", () => {
+  it("Test 15: valid mkdir → 200; sftp.mkdir called", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/workspace/mkdir",
+      body: JSON.stringify({ identityKey: "echo", hostId: 42, relativePath: "new-folder" }),
+    });
+    expect(res.status).toBe(200);
+    expect(stubSftp.mkdir).toHaveBeenCalled();
+  });
+});
+
+/* --------------------------------------------------------------------- */
+/*  Test: POST /workspace/create-file                                    */
+/* --------------------------------------------------------------------- */
+
+describe("POST /workspace/create-file", () => {
+  it("Test 16: valid create-file → 200; createWriteStream called", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/workspace/create-file",
+      body: JSON.stringify({ identityKey: "echo", hostId: 42, relativePath: "newfile.txt" }),
+    });
+    expect(res.status).toBe(200);
+    expect(stubSftp.createWriteStream).toHaveBeenCalled();
+  });
+});
+
+/* --------------------------------------------------------------------- */
+/*  Test: T-40-05 info-leak invariant — response bodies on error paths   */
+/* --------------------------------------------------------------------- */
+
+describe("T-40-05 info-leak invariant", () => {
+  it("Test 7b: SFTP error body is exactly { error: '<class>' } — no err.message leak", async () => {
+    stubSftp.readdir.mockImplementation(
+      (_p: string, cb: (err: Error | null) => void) => {
+        queueMicrotask(() =>
+          cb(new Error("EACCES: Permission denied /very/secret/path/token-key.txt")),
+        );
+      },
+    );
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/workspace/list",
+      body: JSON.stringify({ identityKey: "echo", hostId: 42 }),
+    });
+    expect(res.status).toBe(403);
+    const raw = JSON.stringify(res.body);
+    expect(raw).not.toContain("EACCES");
+    expect(raw).not.toContain("token-key.txt");
+    expect(raw).not.toContain("/very/secret/");
+    // T-40-05: body must be exactly { error: "<class>" }
+    expect(Object.keys(res.body as object)).toEqual(["error"]);
+    const errStr = (res.body as { error: string }).error;
+    // error is a single token (no colon separator) — not "class: details"
+    expect(errStr.split(":")).toHaveLength(1);
+  });
+});
+
+/* --------------------------------------------------------------------- */
+/*  Test: multer memoryStorage — confirms dedicated instance behavior    */
+/* --------------------------------------------------------------------- */
+
+describe("Multer memoryStorage (Pitfall 6)", () => {
+  it("Test 12c: upload accepts arbitrary file extension (not .skynet-export.sqlite filter)", async () => {
+    const boundary = "----AnyFileBoundary";
+    const fileBuffer = Buffer.from("arbitrary binary content", "utf8");
+    const body = buildMultipart(
+      boundary,
+      {
+        identityKey: "echo",
+        hostId: "42",
+        relativePath: "image.png",
+      },
+      "file",
+      fileBuffer,
+      "image.png",
+    );
+
+    const res = await new Promise<{ status: number; body: unknown }>(
+      (resolve, reject) => {
+        const { port } = server.address() as AddressInfo;
+        const req = http.request(
+          {
+            hostname: "127.0.0.1",
+            port,
+            method: "POST",
+            path: "/workspace/upload",
+            headers: {
+              "Content-Type": `multipart/form-data; boundary=${boundary}`,
+              "Content-Length": String(body.byteLength),
+            },
+          },
+          (res) => {
+            let data = "";
+            res.on("data", (chunk: Buffer) => { data += chunk.toString(); });
+            res.on("end", () => {
+              let parsed: unknown;
+              try { parsed = JSON.parse(data); } catch { parsed = data; }
+              resolve({ status: res.statusCode ?? 0, body: parsed });
+            });
+          },
+        );
+        req.on("error", reject);
+        req.write(body);
+        req.end();
+      },
+    );
+
+    // Should NOT be rejected by a .skynet-export.sqlite filter — should proceed to SFTP
+    expect(res.status).toBe(200);
+    expect(stubSftp.createWriteStream).toHaveBeenCalled();
+  });
+});
+
+/* --------------------------------------------------------------------- */
+/*  Project target + reserved root file (project.md / <role>.md)          */
+/* --------------------------------------------------------------------- */
+
+describe("project target and reserved root file", () => {
+  /** "." resolves to the home dir; `links` maps a path to its symlink target. */
+  function stubHome(links: Record<string, string> = {}) {
+    stubSftp.realpath.mockImplementation(
+      (p: string, cb: (err: Error | null, resolved: string) => void) => {
+        queueMicrotask(() => cb(null, p === "." ? "/home/ubuntu" : (links[p] ?? p)));
+      },
+    );
+  }
+
+  function postJson(method: string, path: string, body: Record<string, unknown>) {
+    return httpRequest(server, { method, path, body: JSON.stringify(body) });
+  }
+
+  function upload(fields: Record<string, string>, filename: string) {
+    const boundary = "----ReservedBoundary";
+    const body = buildMultipart(boundary, fields, "file", Buffer.from("x"), filename);
+    return new Promise<{ status: number; body: unknown }>((resolve, reject) => {
+      const { port } = server.address() as AddressInfo;
+      const req = http.request(
+        {
+          hostname: "127.0.0.1",
+          port,
+          method: "POST",
+          path: "/workspace/upload",
+          headers: {
+            "Content-Type": `multipart/form-data; boundary=${boundary}`,
+            "Content-Length": String(body.byteLength),
+          },
+        },
+        (res) => {
+          let data = "";
+          res.on("data", (chunk: Buffer) => (data += chunk.toString()));
+          res.on("end", () => resolve({ status: res.statusCode ?? 0, body: JSON.parse(data) }));
+        },
+      );
+      req.on("error", reject);
+      req.write(body);
+      req.end();
+    });
+  }
+
+  const project = { kind: "project", projectSlug: "launch", hostId: 42 };
+
+  it("lists ~/fleet/projects/<slug> for kind='project'", async () => {
+    stubHome();
+    const res = await postJson("POST", "/workspace/list", { ...project, relativePath: "" });
+    expect(res.status).toBe(200);
+    expect(stubSftp.readdir.mock.calls[0][0]).toBe("/home/ubuntu/fleet/projects/launch");
+  });
+
+  it("rejects a bad project slug and the archive folder before touching the host", async () => {
+    for (const projectSlug of ["../../etc", "archive", "Bad Slug"]) {
+      const res = await postJson("POST", "/workspace/list", { ...project, projectSlug, relativePath: "" });
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({ error: "invalid_project_slug" });
+    }
+    const missing = await postJson("POST", "/workspace/list", { kind: "project", hostId: 42 });
+    expect(missing.body).toEqual({ error: "invalid_body" });
+    expect(resolveHostById).not.toHaveBeenCalled();
+  });
+
+  it("write-file onto project.md at the root → 409 reserved_file, nothing written", async () => {
+    stubHome();
+    for (const relativePath of ["project.md", "./project.md", "/project.md"]) {
+      const res = await postJson("PUT", "/workspace/write-file", { ...project, relativePath, content: "x" });
+      expect(res.status).toBe(409);
+      expect(res.body).toEqual({ error: "reserved_file" });
+    }
+    expect(stubSftp.createWriteStream).not.toHaveBeenCalled();
+  });
+
+  it("write-file to project.md inside a subfolder is allowed", async () => {
+    stubHome();
+    const res = await postJson("PUT", "/workspace/write-file", { ...project, relativePath: "notes/project.md", content: "x" });
+    expect(res.status).toBe(200);
+  });
+
+  it("write-file through a symlink that points at project.md → 409", async () => {
+    stubHome({ "/home/ubuntu/fleet/projects/launch/alias.md": "/home/ubuntu/fleet/projects/launch/project.md" });
+    const res = await postJson("PUT", "/workspace/write-file", { ...project, relativePath: "alias.md", content: "x" });
+    expect(res.status).toBe(409);
+    expect(stubSftp.createWriteStream).not.toHaveBeenCalled();
+  });
+
+  it("delete of project.md → 409, nothing unlinked", async () => {
+    stubHome();
+    const res = await postJson("DELETE", "/workspace/entry", { ...project, relativePath: "project.md" });
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: "reserved_file" });
+    expect(stubSftp.unlink).not.toHaveBeenCalled();
+  });
+
+  it("rename onto or away from project.md → 409, nothing renamed", async () => {
+    stubHome();
+    const onto = await postJson("POST", "/workspace/rename", { ...project, from: "draft.md", to: "project.md" });
+    const away = await postJson("POST", "/workspace/rename", { ...project, from: "project.md", to: "old.md" });
+    expect(onto.status).toBe(409);
+    expect(away.status).toBe(409);
+    expect(stubSftp.rename).not.toHaveBeenCalled();
+    expect(stubSftp.ext_openssh_rename).not.toHaveBeenCalled();
+  });
+
+  it("create-file and mkdir named project.md at the root → 409", async () => {
+    stubHome();
+    const file = await postJson("POST", "/workspace/create-file", { ...project, relativePath: "project.md" });
+    const dir = await postJson("POST", "/workspace/mkdir", { ...project, relativePath: "project.md" });
+    expect(file.body).toEqual({ error: "reserved_file" });
+    expect(dir.body).toEqual({ error: "reserved_file" });
+    expect(stubSftp.mkdir).not.toHaveBeenCalled();
+  });
+
+  it("upload named project.md at the root → 409", async () => {
+    stubHome();
+    const res = await upload({ kind: "project", projectSlug: "launch", hostId: "42", relativePath: "project.md" }, "project.md");
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: "reserved_file" });
+    expect(stubSftp.createWriteStream).not.toHaveBeenCalled();
+  });
+
+  it("matches the reserved name case-insensitively (case-insensitive host filesystems)", async () => {
+    stubHome();
+    const res = await postJson("PUT", "/workspace/write-file", { ...project, relativePath: "PROJECT.md", content: "x" });
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: "reserved_file" });
+  });
+
+  it("renaming the folder root itself is refused", async () => {
+    stubHome();
+    const res = await postJson("POST", "/workspace/rename", { ...project, from: "", to: "moved" });
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: "path_traversal" });
+    expect(stubSftp.rename).not.toHaveBeenCalled();
+    expect(stubSftp.ext_openssh_rename).not.toHaveBeenCalled();
+  });
+
+  it("the role file is reserved the same way in a role folder", async () => {
+    stubHome();
+    const role = { kind: "role", roleSlug: "box-maintainer", hostId: 42 };
+    const write = await postJson("PUT", "/workspace/write-file", { ...role, relativePath: "box-maintainer.md", content: "x" });
+    const del = await postJson("DELETE", "/workspace/entry", { ...role, relativePath: "box-maintainer.md" });
+    const up = await upload({ kind: "role", roleSlug: "box-maintainer", hostId: "42", relativePath: "box-maintainer.md" }, "box-maintainer.md");
+    expect([write.status, del.status, up.status]).toEqual([409, 409, 409]);
+    // project.md is an ordinary file in a role folder.
+    const other = await postJson("PUT", "/workspace/write-file", { ...role, relativePath: "project.md", content: "x" });
+    expect(other.status).toBe(200);
+  });
+
+  it("identity workspaces reserve nothing", async () => {
+    stubHome();
+    const res = await postJson("PUT", "/workspace/write-file", { identityKey: "echo", hostId: 42, relativePath: "project.md", content: "x" });
+    expect(res.status).toBe(200);
+  });
+
+  const archived = { kind: "archived-identity", identityKey: "olden", hostId: 42 };
+
+  /** Which files exist on the stub host (stat answers for those only). */
+  function stubFolders(existing: string[]) {
+    stubSftp.stat.mockImplementation(
+      (p: string, cb: (err: Error | null, st?: { size: number; isFile: () => boolean; isDirectory: () => boolean }) => void) => {
+        queueMicrotask(() =>
+          existing.includes(p)
+            ? cb(null, { size: 0, isFile: () => true, isDirectory: () => false })
+            : cb(new Error("No such file")),
+        );
+      },
+    );
+  }
+
+  it("an archived agent's workspace is read from its archived folder — the host decides", async () => {
+    stubHome();
+    stubFolders([]);
+    const res = await postJson("POST", "/workspace/list", { ...archived, relativePath: "" });
+    expect(res.status).toBe(200);
+    expect(stubSftp.readdir.mock.calls[0][0]).toBe("/home/ubuntu/fleet/identities-archive/olden/workspace");
+  });
+
+  it("a bare live folder doesn't count — only one holding the agent's file", async () => {
+    stubHome();
+    stubFolders(["/home/ubuntu/fleet/identities/olden"]);
+    const res = await postJson("POST", "/workspace/list", { ...archived, relativePath: "" });
+    expect(res.status).toBe(200);
+    expect(stubSftp.readdir.mock.calls[0][0]).toBe("/home/ubuntu/fleet/identities-archive/olden/workspace");
+  });
+
+  it("an archived view of an agent that's live again reads its live folder", async () => {
+    stubHome();
+    stubFolders(["/home/ubuntu/fleet/identities/olden/olden.md"]);
+    const res = await postJson("POST", "/workspace/list", { ...archived, relativePath: "" });
+    expect(res.status).toBe(200);
+    expect(stubSftp.readdir.mock.calls[0][0]).toBe("/home/ubuntu/fleet/identities/olden/workspace");
+  });
+
+  it("every change to an archived agent's workspace is refused before the host is touched", async () => {
+    stubHome();
+    const results = [
+      await postJson("PUT", "/workspace/write-file", { ...archived, relativePath: "a.txt", content: "x" }),
+      await postJson("DELETE", "/workspace/entry", { ...archived, relativePath: "a.txt" }),
+      await postJson("POST", "/workspace/rename", { ...archived, from: "a.txt", to: "b.txt" }),
+      await postJson("POST", "/workspace/mkdir", { ...archived, relativePath: "d" }),
+      await postJson("POST", "/workspace/create-file", { ...archived, relativePath: "c.txt" }),
+      await upload({ kind: "archived-identity", identityKey: "olden", hostId: "42", relativePath: "u.txt" }, "u.txt"),
+    ];
+    for (const r of results) {
+      expect(r.status).toBe(403);
+      expect(r.body).toEqual({ error: "read_only" });
+    }
+    expect(stubSftp.realpath).not.toHaveBeenCalled();
+  });
+});
+
+/* --------------------------------------------------------------------- */
+/*  Per-host semaphore cap (verify:ssh-cap)                              */
+/* --------------------------------------------------------------------- */
+
+describe("host target (admin-only home folder)", () => {
+  function stubHome(links: Record<string, string> = {}) {
+    stubSftp.realpath.mockImplementation(
+      (p: string, cb: (err: Error | null, resolved: string) => void) => {
+        queueMicrotask(() => cb(null, p === "." ? "/home/ubuntu" : (links[p] ?? p)));
+      },
+    );
+  }
+  function postJson(method: string, path: string, body: Record<string, unknown>) {
+    return httpRequest(server, { method, path, body: JSON.stringify(body) });
+  }
+  const host = { kind: "host", hostId: 42 };
+
+  it("refuses a non-admin with 403 before touching the host", async () => {
+    stubHome();
+    for (const [method, path, extra] of [
+      ["POST", "/workspace/list", { relativePath: "" }],
+      ["POST", "/workspace/read-file", { relativePath: "a.txt" }],
+      ["PUT", "/workspace/write-file", { relativePath: "a.txt", content: "x" }],
+      ["DELETE", "/workspace/entry", { relativePath: "a.txt" }],
+      ["POST", "/workspace/rename", { from: "a", to: "b" }],
+      ["POST", "/workspace/mkdir", { relativePath: "d" }],
+      ["POST", "/workspace/create-file", { relativePath: "n.txt" }],
+    ] as const) {
+      const res = await postJson(method, path, { ...host, ...extra });
+      expect(res.status, path).toBe(403);
+      expect(res.body).toEqual({ error: "permission_denied" });
+    }
+    const dl = await httpRequest(server, {
+      method: "GET",
+      path: "/workspace/download?kind=host&hostId=42&relativePath=a.txt",
+    });
+    expect(dl.status).toBe(403);
+    expect(resolveHostById).not.toHaveBeenCalled();
+    expect(stubSftp.readdir).not.toHaveBeenCalled();
+  });
+
+  it("lists the SSH account's home folder for an admin", async () => {
+    mockIsAdmin = true;
+    stubHome();
+    const res = await postJson("POST", "/workspace/list", { ...host, relativePath: "" });
+    expect(res.status).toBe(200);
+    expect(stubSftp.readdir.mock.calls[0][0]).toBe("/home/ubuntu");
+  });
+
+  it("still needs the admin's own access to the host", async () => {
+    mockIsAdmin = true;
+    mockCanAccessHost = async () => ({ hasAccess: false });
+    stubHome();
+    const res = await postJson("POST", "/workspace/list", { ...host, relativePath: "" });
+    expect(res.status).toBe(403);
+  });
+
+  it("keeps an admin inside the home folder", async () => {
+    mockIsAdmin = true;
+    stubHome({ "/home/ubuntu/etc-link": "/etc" });
+    const traversal = await postJson("POST", "/workspace/list", { ...host, relativePath: "../.." });
+    expect(traversal.body).toEqual({ error: "path_traversal" });
+    const escape = await postJson("POST", "/workspace/list", { ...host, relativePath: "etc-link" });
+    expect(escape.status).toBe(400);
+    expect(stubSftp.readdir).not.toHaveBeenCalled();
+  });
+
+  it("refuses an upload from a non-admin", async () => {
+    const boundary = "----HostBoundary";
+    const body = buildMultipart(boundary, { kind: "host", hostId: "42", relativePath: "" }, "file", Buffer.from("x"), "a.txt");
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/workspace/upload",
+      headers: { "Content-Type": `multipart/form-data; boundary=${boundary}` },
+      body: body.toString("binary"),
+    });
+    expect(res.status).toBe(403);
+    expect(resolveHostById).not.toHaveBeenCalled();
+  });
+
+  it("refuses a login whose home folder is the filesystem root", async () => {
+    mockIsAdmin = true;
+    stubSftp.realpath.mockImplementation(
+      (p: string, cb: (err: Error | null, resolved: string) => void) => {
+        queueMicrotask(() => cb(null, p === "." ? "/" : p));
+      },
+    );
+    const res = await postJson("POST", "/workspace/list", { ...host, relativePath: "" });
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: "path_forbidden" });
+    expect(stubSftp.readdir).not.toHaveBeenCalled();
+  });
+
+  it("lets an admin write anywhere in the home folder, no reserved file", async () => {
+    mockIsAdmin = true;
+    stubHome();
+    const res = await postJson("PUT", "/workspace/write-file", { ...host, relativePath: "project.md", content: "x" });
+    expect(res.status).toBe(200);
+  });
+});
+
+describe("per-host SSH semaphore", () => {
+  it("N concurrent /list requests on one host never exceed the semaphore cap", async () => {
+    const { withConnection } = await import("../../ssh/ssh-connection-pool.js");
+    const { getHostSemaphore, __resetHostSemaphoreRegistryForTests } = await import(
+      "../../ssh/host-semaphore-registry.js"
+    );
+    __resetHostSemaphoreRegistryForTests();
+    getHostSemaphore(42, 3);
+    let live = 0;
+    let peak = 0;
+    (withConnection as Mock).mockImplementation(
+      async (
+        _key: string,
+        factory: () => Promise<StubClient>,
+        fn: (client: StubClient) => Promise<unknown>,
+      ) => {
+        live++;
+        peak = Math.max(peak, live);
+        try {
+          const client = await factory();
+          await new Promise((r) => setTimeout(r, 5));
+          return await fn(client);
+        } finally {
+          live--;
+        }
+      },
+    );
+    const results = await Promise.all(
+      Array.from({ length: 10 }, () =>
+        httpRequest(server, {
+          method: "POST",
+          path: "/workspace/list",
+          body: JSON.stringify({ identityKey: "echo", hostId: 42, relativePath: "" }),
+        }),
+      ),
+    );
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(peak).toBeLessThanOrEqual(3);
+    expect(peak).toBeGreaterThan(1);
+    __resetHostSemaphoreRegistryForTests();
+  });
+});

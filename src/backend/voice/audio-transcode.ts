@@ -1,0 +1,256 @@
+/**
+ * Phase 98 plan 04 — audio format bridge (WebM → Ogg-Opus / FLAC via ffmpeg).
+ *
+ * Two subprocess-wrapper functions that translate the browser-recorded
+ * WebM/Opus blob (what `MediaRecorder` produces by default) into a
+ * Transcribe-accepted format. Consumed by Plan 06's rewritten
+ * `handleTranscribe` handler as a try/catch fallback pair:
+ *
+ *   try {
+ *     buf = await webmToOggOpus(rawWebmBuffer);   // fast remux, no re-encode
+ *     mediaEncoding = "ogg-opus";
+ *   } catch {
+ *     buf = await webmToFlac(rawWebmBuffer);       // full transcode fallback
+ *     mediaEncoding = "flac";
+ *   }
+ *   transcript = await transcribeBuffer(buf, mediaEncoding, 16000);
+ *
+ * Locked design decisions (from 98-CONTEXT.md + 98-RESEARCH.md):
+ *
+ * - **This module exists because Amazon Transcribe streaming REJECTS
+ *   WebM natively** (98-RESEARCH.md § Pitfall 1). Transcribe streaming's
+ *   supported list is strictly [FLAC, Ogg-Opus, PCM] — no WebM. Since
+ *   the client contract is locked as "browser uploads whatever
+ *   MediaRecorder gave it, backend translates" (D-Backend-owned-
+ *   orchestration), the backend MUST transcode/remux before pushing to
+ *   Transcribe. No pure-Node WebM demuxer exists; ffmpeg is the
+ *   canonical tool.
+ *
+ * - **ffmpeg MUST be installed in the docker image** (98-RESEARCH.md
+ *   § Pitfall 7 — SHIP BLOCKER). Plan 01 already added `ffmpeg` to
+ *   `docker/Dockerfile` Stage 5 apt-get list. Without it, the first
+ *   voice-in request in prod fails with `ENOENT: ffmpeg not found` and
+ *   the feature is dark. The `webmToOggOpus` / `webmToFlac` reject-on-
+ *   spawn-error path surfaces this loudly as an error, not silently as
+ *   "no transcript" — asserted by the unit tests.
+ *
+ * - **`webmToOggOpus` uses `-c:a copy` (REMUX, not transcode).** This
+ *   copies the Opus audio track from the WebM container into an Ogg
+ *   container WITHOUT re-encoding. Fast (few ms) and lossless because
+ *   MediaRecorder already produced Opus. This is the happy path — the
+ *   caller SHOULD prefer this and fall back only when it errors.
+ *
+ * - **`webmToFlac` re-encodes to 48 kHz mono FLAC.** This is the
+ *   fallback for edge cases where the Ogg-Opus remux fails. Notable
+ *   case per 98-RESEARCH.md § Pattern 5: Chrome sometimes produces
+ *   multi-channel (stereo) Opus, and Transcribe's Ogg-Opus mode expects
+ *   mono at 16 kHz — the remux preserves multi-channel, causing
+ *   `BadRequestException`. Full FLAC transcode with `-ar 48000 -ac 1`
+ *   flattens to mono @ 48 kHz, which Transcribe always accepts. Slower
+ *   (~50-200 ms) but bulletproof — validated against the bounty's
+ *   sample clips via `transcribe-flac.py`.
+ *
+ *   **This fallback pair is WIRED, not standalone dead code.** Plan 06's
+ *   `handleTranscribe` will `try webmToOggOpus / catch → webmToFlac`,
+ *   switching `MediaEncoding` from `"ogg-opus"` to `"flac"` when the
+ *   fallback fires. Verified in 98-04-PLAN.md § key_links.
+ *
+ * - **Argv contains ONLY literal strings; user data flows through
+ *   stdin only.** Threat T-98-04-04 (command injection): the ffmpeg
+ *   argument lists are hardcoded here — voice ID, text, and other user
+ *   input NEVER interpolate into argv. The only user-controlled bytes
+ *   are the audio buffer, which is piped to stdin (safe — bytes only).
+ *
+ * @see 98-RESEARCH.md § Pattern 5, § Pitfall 1, § Pitfall 7
+ * @see 98-PATTERNS.md § audio-transcode.ts (spawn shape from opkssh-auth.ts analog)
+ * @see src/backend/voice/transcribe-adapter.ts (consumer via Plan 06)
+ */
+
+import { spawn } from "node:child_process";
+
+// Silence-removal filter tuning for webmToFlac. Only silences ≥ MIN_SEC below
+// THRESHOLD_DB get trimmed, and each trim leaves PAD_SEC of padding so
+// Transcribe still sees a pause cue for punctuation. Exported so bench/tune
+// work can vary them without hunting the argv.
+export const SILENCE_TRIM_MIN_SEC = 1.0;
+export const SILENCE_TRIM_PAD_SEC = 0.3;
+export const SILENCE_TRIM_THRESHOLD_DB = -40;
+const SILENCE_FILTER = `silenceremove=stop_periods=-1:stop_duration=${SILENCE_TRIM_MIN_SEC}:stop_threshold=${SILENCE_TRIM_THRESHOLD_DB}dB:stop_silence=${SILENCE_TRIM_PAD_SEC}`;
+
+/**
+ * Shared subprocess wrapper. Spawns ffmpeg with the given args, pipes
+ * `inputBuffer` to stdin, collects stdout chunks, resolves the concatenated
+ * Buffer on exit code 0, and rejects on non-zero exit or spawn error.
+ *
+ * Exported for reuse by audio-chunker.ts (Phase 100) — sliceFlac delegates
+ * to this helper rather than duplicating the spawn/pipe body. The argv-safety
+ * constraint from T-98-04-04 still applies: every caller (webmToOggOpus,
+ * webmToFlac, sliceFlac) passes ONLY hardcoded literal strings and
+ * numeric-formatted values; user data flows through stdin only.
+ */
+export function runFfmpeg(inputBuffer: Buffer, args: readonly string[]): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const ff = spawn("ffmpeg", args as string[], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    const chunks: Buffer[] = [];
+    const errChunks: Buffer[] = [];
+
+    ff.stdout.on("data", (c: Buffer) => chunks.push(c));
+    ff.stderr.on("data", (c: Buffer) => errChunks.push(c));
+    ff.on("error", (err) => reject(err));
+    ff.on("close", (code: number | null) => {
+      if (code === 0) {
+        resolve(Buffer.concat(chunks));
+      } else {
+        const stderrText = Buffer.concat(errChunks).toString();
+        reject(new Error(`ffmpeg exited ${code}: ${stderrText}`));
+      }
+    });
+
+    // Swallow EPIPE on stdin — ffmpeg may exit early after reading enough input
+    // (e.g. `-ss X -t Y` slicing an early section of a large buffer; ffprobe
+    // header-only reads). The write of the remaining bytes then errors with
+    // EPIPE. That's expected and harmless — the `close` handler above uses the
+    // real exit code as the truth. Without this handler, EPIPE bubbles up as an
+    // "Unhandled error event" and crashes the process. Any non-EPIPE stdin
+    // error still rejects the promise so the caller can surface it.
+    ff.stdin.on("error", (err: NodeJS.ErrnoException) => {
+      if (err.code === "EPIPE") return;
+      reject(err);
+    });
+
+    ff.stdin.end(inputBuffer);
+  });
+}
+
+/**
+ * REMUX a WebM/Opus buffer into an Ogg/Opus container without re-encoding.
+ *
+ * Fast (few ms) and lossless — the Opus track from the WebM container is
+ * copied verbatim into an Ogg container. This is the happy path;
+ * `webmToFlac` is the fallback for edge cases (Chrome's multi-channel
+ * Opus output).
+ *
+ * @param webmBuffer - Raw WebM/Opus bytes as received from `MediaRecorder`.
+ * @returns Ogg/Opus bytes suitable for `transcribeBuffer(_, "ogg-opus")`.
+ * @throws With ffmpeg's stderr output on non-zero exit.
+ * @throws With the spawn error (e.g., ENOENT when ffmpeg is missing from
+ *   the container — see the Pitfall 7 note in the module docblock).
+ */
+export function webmToOggOpus(webmBuffer: Buffer): Promise<Buffer> {
+  return runFfmpeg(webmBuffer, [
+    "-i",
+    "pipe:0",
+    "-c:a",
+    "copy",
+    "-f",
+    "ogg",
+    "pipe:1",
+  ]);
+}
+
+/**
+ * Full-transcode fallback: re-encode a WebM/Opus buffer as 48 kHz mono
+ * FLAC.
+ *
+ * Slower (~50-200 ms) than `webmToOggOpus` because it decodes + re-
+ * encodes rather than remuxing, but bulletproof against Chrome's
+ * occasional multi-channel Opus output. Callers should try
+ * `webmToOggOpus` first and fall back to this only when the remux
+ * throws — see the fallback pair example in the module docblock.
+ *
+ * Sample rate matches the browser MediaRecorder's native 48 kHz to
+ * preserve consonant-band phonetic detail Transcribe uses for
+ * disambiguation — down-sampling to 16 kHz was throwing that away.
+ *
+ * @param webmBuffer - Raw WebM/Opus bytes as received from `MediaRecorder`.
+ * @returns FLAC bytes at 48 kHz mono, suitable for `transcribeBuffer(_, "flac", 48000)`.
+ * @throws With ffmpeg's stderr output on non-zero exit.
+ * @throws With the spawn error (e.g., ENOENT when ffmpeg is missing from
+ *   the container — see the Pitfall 7 note in the module docblock).
+ */
+export function webmToFlac(webmBuffer: Buffer): Promise<Buffer> {
+  return runFfmpeg(webmBuffer, [
+    "-i",
+    "pipe:0",
+    "-af",
+    SILENCE_FILTER,
+    "-ar",
+    "48000",
+    "-ac",
+    "1",
+    "-f",
+    "flac",
+    "pipe:1",
+  ]);
+}
+
+/**
+ * Full-transcode fallback path used by Plan 03: re-encode a WebM/Opus buffer
+ * as raw LPCM 16 kHz s16le mono for Amazon Nova Sonic audioInput events.
+ *
+ * Nova Sonic requires LPCM at 16 kHz per D-AUDIO — this is the only format
+ * the adapter's `audioInput` events accept. The Ogg-Opus / FLAC helpers (kept
+ * in this file through Wave 2) are Transcribe-era artifacts; they are removed
+ * as part of Plan 03's rewire when nothing consumes them.
+ *
+ * SILENCE_FILTER is preserved here because Nova Sonic bills per audio token
+ * (see CONTEXT.md § Cost estimate in the recon), so trimming leading/trailing
+ * silences pre-transcode still saves cost under the new provider.
+ *
+ * ffmpeg argv: `-i pipe:0 -af <SILENCE_FILTER> -ar 16000 -ac 1 -f s16le pipe:1`
+ * All argv entries are hardcoded literal strings; user bytes flow through stdin
+ * only (T-109-02-01 command-injection mitigation, mirrors T-98-04-04).
+ *
+ * @param webmBuffer - Raw WebM/Opus bytes as received from `MediaRecorder`.
+ * @returns Raw LPCM bytes at 16 kHz s16le mono, suitable for Nova Sonic
+ *   `audioInput` events (see Plan 03's `transcodeForTranscribe`).
+ * @throws With ffmpeg's stderr output on non-zero exit.
+ * @throws With the spawn error (e.g., ENOENT when ffmpeg is missing from
+ *   the container — see the Pitfall 7 note in the module docblock).
+ */
+export function webmToPcm16k(webmBuffer: Buffer): Promise<Buffer> {
+  return runFfmpeg(webmBuffer, [
+    "-i",
+    "pipe:0",
+    "-af",
+    SILENCE_FILTER,
+    "-ar",
+    "16000",
+    "-ac",
+    "1",
+    "-f",
+    "s16le",
+    "pipe:1",
+  ]);
+}
+
+// Nova Sonic returns an empty transcript on very short clips — the streaming
+// ASR needs audio AFTER the words to commit to a result. Empirically (2026-09-28
+// investigation on Morgana), a 1.08s "yes" transcribes to "" but pads of 2s+
+// trailing silence produce the correct "yes". 3s total is the observed floor;
+// leading silence alone does NOT help — the tail is what matters. Fix: after
+// webmToPcm16k trims silences via SILENCE_FILTER, right-pad the s16le buffer
+// with zero-bytes (which ARE silence in s16le) to guarantee a minimum audible
+// length for Nova Sonic's segmenter to fire.
+export const MIN_PCM_DURATION_MS = 3000;
+
+/**
+ * Right-pad an s16le mono PCM buffer with zero-bytes (silence) so its total
+ * duration is at least `minDurationMs`. Returns the original buffer unchanged
+ * if already at or above the threshold — no copy in the common (long-clip) case.
+ *
+ * s16le mono @ 16 kHz: 16000 samples/s × 2 bytes = 32000 bytes/s.
+ */
+export function padPcmToMinDuration(
+  pcmBuf: Buffer,
+  minDurationMs: number = MIN_PCM_DURATION_MS,
+  sampleRateHz: number = 16000,
+): Buffer {
+  const bytesPerSec = sampleRateHz * 2;
+  const requiredBytes = Math.ceil((minDurationMs / 1000) * bytesPerSec);
+  if (pcmBuf.length >= requiredBytes) return pcmBuf;
+  return Buffer.concat([pcmBuf, Buffer.alloc(requiredBytes - pcmBuf.length)]);
+}

@@ -1,0 +1,419 @@
+/**
+ * identity-artifact-reader.avatar-read.test.ts — Phase 66 Plan 66-03 Task 1
+ *
+ * Unit tests for the two new READ-side exports co-located in
+ * identity-artifact-reader.ts under section "6c. Cosmetics reads — Phase 66
+ * Plan 03":
+ *
+ *   1) readAvatarSiblingFile(conn, identityKey) → {bytes, mime, ext} | null
+ *      - LOCAL branch (conn === null): fs.readFile with extension-discovery
+ *        cascade through AVATAR_EXT_VALUES = [webp,png,jpg,gif,svg]
+ *      - REMOTE branch (conn is SSHClient): single `ls` round-trip to find
+ *        the sibling file's extension, then SFTP-reads that file.
+ *      - Frontmatter is AUTHORITATIVE when present — if the identity's .md
+ *        names avatar: <key>.<ext>, that ext wins.
+ *      - Returns null when no sibling file exists (LOCAL ENOENT / REMOTE
+ *        empty ls output).
+ *      - Throws on SSH-layer errors, invalid identityKey, or oversized files.
+ *
+ *   2) extractCosmeticsFromFrontmatter(markdown) → { displayName?, title?,
+ *      colorHue?, voice?, avatar? }
+ *      - Same regex + yaml.load pattern as extractRoleFromMarkdown.
+ *      - Type-narrows each field (typeof string+non-empty for scalars;
+ *        typeof number + 0-359 range for colorHue).
+ *      - Malformed / missing → {} (empty object; caller sees "no cosmetics").
+ *
+ * Test layout follows identity-artifact-reader.remote-writes.test.ts:
+ *   - vi.mock tmux-helper for the REMOTE branch's ls exec
+ *   - mock ssh2 Client's .sftp() for sftp.readFile spy
+ *   - LOCAL branch: vi.mock node:fs/promises for fs.readFile
+ */
+
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import type { Client as SSHClientType } from "ssh2";
+type SFTPWrapper = import("ssh2").SFTPWrapper;
+
+// ---------------------------------------------------------------------------
+// Mocks — declared BEFORE the dynamic import of identity-artifact-reader
+// ---------------------------------------------------------------------------
+
+const execCommandMock = vi.fn();
+vi.mock("../ssh/tmux-helper.js", () => ({
+  execCommand: (conn: unknown, cmd: string) => execCommandMock(conn, cmd),
+}));
+
+// Mock fs/promises for LOCAL-branch tests. The mock's readFile is a spy that
+// we swap behavior per-test (per-ext success/ENOENT). Same shape as the
+// concrete node:fs/promises API used by writeAvatarSiblingFile's LOCAL branch.
+const fsReadFileMock = vi.fn();
+vi.mock("fs/promises", () => ({
+  default: {
+    readFile: (p: string, opts?: unknown) => fsReadFileMock(p, opts),
+    writeFile: vi.fn(),
+    rename: vi.fn(),
+    mkdir: vi.fn(),
+    readdir: vi.fn(),
+    unlink: vi.fn(),
+  },
+  readFile: (p: string, opts?: unknown) => fsReadFileMock(p, opts),
+  writeFile: vi.fn(),
+  rename: vi.fn(),
+  mkdir: vi.fn(),
+  readdir: vi.fn(),
+  unlink: vi.fn(),
+}));
+
+// Import AFTER the vi.mock so the mock is bound to the module graph.
+import {
+  readAvatarSiblingFile,
+  extractCosmeticsFromFrontmatter,
+  AVATAR_MIME_FROM_EXT,
+  IDMEDIT_MAX_AVATAR_BYTES,
+} from "./identity-artifact-reader.js";
+
+// ---------------------------------------------------------------------------
+// Mock SSH client builder for REMOTE branch
+// ---------------------------------------------------------------------------
+
+function buildMockConn(sftpReadResult: Buffer | Error): {
+  conn: SSHClientType;
+  sftp: {
+    readFile: ReturnType<typeof vi.fn>;
+    end: ReturnType<typeof vi.fn>;
+  };
+} {
+  const sftp = {
+    readFile: vi.fn((_path: string, cb: (err: Error | undefined, data?: Buffer) => void) => {
+      if (sftpReadResult instanceof Error) return cb(sftpReadResult);
+      cb(undefined, sftpReadResult);
+    }),
+    end: vi.fn(),
+  };
+
+  const conn = {
+    sftp: (cb: (err: Error | undefined, s: SFTPWrapper) => void) => {
+      cb(undefined, sftp as unknown as SFTPWrapper);
+    },
+  } as unknown as SSHClientType;
+
+  return { conn, sftp };
+}
+
+// ---------------------------------------------------------------------------
+// Setup
+// ---------------------------------------------------------------------------
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  // ENOENT by default for every LOCAL fs.readFile — tests override per-case.
+  fsReadFileMock.mockImplementation(() => {
+    const err = new Error("ENOENT") as NodeJS.ErrnoException;
+    err.code = "ENOENT";
+    return Promise.reject(err);
+  });
+});
+
+afterEach(() => {
+  vi.clearAllMocks();
+});
+
+// ===========================================================================
+// readAvatarSiblingFile
+// ===========================================================================
+
+describe("readAvatarSiblingFile — LOCAL branch (fs)", () => {
+  it("Test A: LOCAL, sibling file exists as tina.png (no frontmatter avatar key) → returns {bytes, mime:'image/png', ext:'png'} after ext cascade", async () => {
+    // No frontmatter .md read succeeds (ENOENT) → fall through to ext cascade.
+    // Cascade order: webp, png, jpg, gif, svg. Fail webp (ENOENT), succeed png.
+    const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+    fsReadFileMock.mockImplementation((filePath: string) => {
+      if (filePath.endsWith("tina.md")) {
+        const err = new Error("ENOENT") as NodeJS.ErrnoException;
+        err.code = "ENOENT";
+        return Promise.reject(err);
+      }
+      if (filePath.endsWith("tina.png")) return Promise.resolve(pngBytes);
+      const err = new Error("ENOENT") as NodeJS.ErrnoException;
+      err.code = "ENOENT";
+      return Promise.reject(err);
+    });
+
+    const result = await readAvatarSiblingFile(null, "tina");
+    expect(result).not.toBeNull();
+    expect(result!.mime).toBe("image/png");
+    expect(result!.ext).toBe("png");
+    expect(result!.bytes.equals(pngBytes)).toBe(true);
+  });
+
+  it("Test B: LOCAL, no sibling file at all → returns null", async () => {
+    // ENOENT default for every path.
+    const result = await readAvatarSiblingFile(null, "ghost");
+    expect(result).toBeNull();
+  });
+
+  it("Test C: LOCAL, frontmatter names tina.webp AND file exists → returns webp result (frontmatter authoritative)", async () => {
+    const webpBytes = Buffer.from([0x52, 0x49, 0x46, 0x46]);
+    const markdown = "---\nroles: box-maintainer\navatar: tina.webp\n---\n\n# tina\n";
+    fsReadFileMock.mockImplementation((filePath: string, opts?: unknown) => {
+      if (filePath.endsWith("tina.md") && opts === "utf-8") return Promise.resolve(markdown);
+      if (filePath.endsWith("tina.webp")) return Promise.resolve(webpBytes);
+      const err = new Error("ENOENT") as NodeJS.ErrnoException;
+      err.code = "ENOENT";
+      return Promise.reject(err);
+    });
+
+    const result = await readAvatarSiblingFile(null, "tina");
+    expect(result).not.toBeNull();
+    expect(result!.mime).toBe("image/webp");
+    expect(result!.ext).toBe("webp");
+    expect(result!.bytes.equals(webpBytes)).toBe(true);
+  });
+});
+
+describe("readAvatarSiblingFile — REMOTE branch (SSH)", () => {
+  it("Test D: REMOTE, ls returns 'tina.webp' → SFTP-reads webp, returns webp result", async () => {
+    const webpBytes = Buffer.from([0x52, 0x49, 0x46, 0x46, 0xde, 0xad]);
+    // First exec: read markdown (frontmatter). Return empty (no md file) so we
+    // fall through to the ls-cascade. Second exec: the ls command returns basename.
+    execCommandMock.mockImplementation((_conn: unknown, cmd: string) => {
+      if (cmd.includes(".md")) return Promise.resolve(""); // no md file
+      if (cmd.includes("ls ")) return Promise.resolve("tina.webp\n");
+      if (cmd.includes("echo $HOME")) return Promise.resolve("/home/tester\n");
+      return Promise.resolve("");
+    });
+
+    const { conn, sftp } = buildMockConn(webpBytes);
+    const result = await readAvatarSiblingFile(conn, "tina");
+
+    expect(result).not.toBeNull();
+    expect(result!.mime).toBe("image/webp");
+    expect(result!.ext).toBe("webp");
+    expect(result!.bytes.equals(webpBytes)).toBe(true);
+    expect(sftp.readFile).toHaveBeenCalledTimes(1);
+    expect(sftp.end).toHaveBeenCalledTimes(1);
+  });
+
+  it("Test E: REMOTE, ls returns empty → returns null (no sibling file exists)", async () => {
+    execCommandMock.mockImplementation((_conn: unknown, cmd: string) => {
+      if (cmd.includes(".md")) return Promise.resolve("");
+      if (cmd.includes("ls ")) return Promise.resolve(""); // ls found nothing
+      if (cmd.includes("echo $HOME")) return Promise.resolve("/home/tester\n");
+      return Promise.resolve("");
+    });
+
+    const { conn, sftp } = buildMockConn(Buffer.alloc(0));
+    const result = await readAvatarSiblingFile(conn, "ghost");
+
+    expect(result).toBeNull();
+    expect(sftp.readFile).not.toHaveBeenCalled();
+  });
+});
+
+// ===========================================================================
+// extractCosmeticsFromFrontmatter
+// ===========================================================================
+
+describe("extractCosmeticsFromFrontmatter", () => {
+  it("Test F: all 5 keys present → returns all 5", async () => {
+    const md =
+      "---\nroles: box-maintainer\ndisplayName: Tina\ntitle: The Coder\ncolorHue: 220\nvoice: Elena.wav\navatar: tina.png\n---\n\n# tina\n";
+    const cos = extractCosmeticsFromFrontmatter(md);
+    expect(cos.displayName).toBe("Tina");
+    expect(cos.title).toBe("The Coder");
+    expect(cos.colorHue).toBe(220);
+    expect(cos.voice).toBe("Elena.wav");
+    expect(cos.avatar).toBe("tina.png");
+  });
+
+  it("Test G: malformed YAML → returns {}", async () => {
+    const md = "---\n: : broken : : yaml : :\n  invalid: [unclosed\n---\n\n# body\n";
+    const cos = extractCosmeticsFromFrontmatter(md);
+    expect(cos).toEqual({});
+  });
+
+  it("Test H: colorHue out of range (400) → colorHue omitted from result", async () => {
+    const md = "---\nroles: x\ndisplayName: Tina\ncolorHue: 400\n---\n\n# body\n";
+    const cos = extractCosmeticsFromFrontmatter(md);
+    expect(cos.displayName).toBe("Tina");
+    expect("colorHue" in cos).toBe(false);
+  });
+
+  it("Test I: explicit YAML null (title: null) → title omitted", async () => {
+    const md = "---\nroles: x\ndisplayName: Tina\ntitle: null\n---\n\n# body\n";
+    const cos = extractCosmeticsFromFrontmatter(md);
+    expect(cos.displayName).toBe("Tina");
+    expect("title" in cos).toBe(false);
+  });
+});
+
+// ===========================================================================
+// Phase 67 Plan 67-01: coordinator field narrowing
+// ===========================================================================
+//
+// Phase 67 adds ONE MORE optional cosmetic scalar to the on-disk YAML
+// frontmatter: `coordinator: true|false`. Purely additive extension of the
+// Phase 66 pipeline. Six cases mirror the existing narrowing contract:
+// present-true keeps it, present-false keeps it, absent drops it, non-boolean
+// (string or number) drops it, and malformed YAML returns {}.
+
+describe("extractCosmeticsFromFrontmatter — coordinator field (Phase 67 Plan 67-01)", () => {
+  it("COORD-1: frontmatter with coordinator: true + other cosmetics → coordinator: true alongside narrowed fields", async () => {
+    const md =
+      "---\nroles: box-maintainer\ndisplayName: Nelly\ntitle: The Fleet Warden\ncolorHue: 15\nvoice: Sabrina.wav\navatar: nelly.png\ncoordinator: true\n---\n\n# body\n";
+    const result = extractCosmeticsFromFrontmatter(md);
+    expect(result.displayName).toBe("Nelly");
+    expect(result.title).toBe("The Fleet Warden");
+    expect(result.colorHue).toBe(15);
+    expect(result.voice).toBe("Sabrina.wav");
+    expect(result.avatar).toBe("nelly.png");
+    expect(result.coordinator).toBe(true);
+  });
+
+  it("COORD-2: frontmatter with coordinator: false → coordinator: false present (NOT dropped)", async () => {
+    const md =
+      "---\nroles: box-maintainer\ndisplayName: Tina\ncoordinator: false\n---\n\n# body\n";
+    const result = extractCosmeticsFromFrontmatter(md);
+    expect(result.displayName).toBe("Tina");
+    expect("coordinator" in result).toBe(true);
+    expect(result.coordinator).toBe(false);
+  });
+
+  it("COORD-3: frontmatter with NO coordinator key → coordinator absent from result", async () => {
+    const md =
+      "---\nroles: box-maintainer\ndisplayName: Tina\ntitle: The Coder\n---\n\n# body\n";
+    const result = extractCosmeticsFromFrontmatter(md);
+    expect(result.displayName).toBe("Tina");
+    expect("coordinator" in result).toBe(false);
+  });
+
+  it("COORD-4: frontmatter with coordinator: 'yes' (non-boolean string) → coordinator DROPPED", async () => {
+    const md =
+      "---\nroles: box-maintainer\ndisplayName: Tina\ncoordinator: \"yes\"\n---\n\n# body\n";
+    const result = extractCosmeticsFromFrontmatter(md);
+    expect(result.displayName).toBe("Tina");
+    expect("coordinator" in result).toBe(false);
+  });
+
+  it("COORD-5: frontmatter with coordinator: 1 (number) → coordinator DROPPED", async () => {
+    const md =
+      "---\nroles: box-maintainer\ndisplayName: Tina\ncoordinator: 1\n---\n\n# body\n";
+    const result = extractCosmeticsFromFrontmatter(md);
+    expect(result.displayName).toBe("Tina");
+    expect("coordinator" in result).toBe(false);
+  });
+
+  // Post-tolerant-parse contract (2026-09-24 atlantis-zoho leak fix): a
+  // malformed block no longer zeros out sibling cleanly-parsed fields. Here
+  // `coordinator: true` on the last frontmatter line parses cleanly around
+  // the noise above it, so the extractor surfaces it — this is the intended
+  // shape of the recovery. The security-relevant assertion is that the
+  // narrower still rejects garbage-shaped values (the empty-key nested-map
+  // mess doesn't leak into any of the typed cosmetic fields).
+  it("COORD-6: malformed YAML block above coordinator: true → coordinator survives via tolerant parse; garbage keys stay dropped", async () => {
+    const md =
+      "---\n: : broken : : yaml : :\n  invalid: [unclosed\ncoordinator: true\n---\n\n# body\n";
+    const result = extractCosmeticsFromFrontmatter(md);
+    expect(result.coordinator).toBe(true);
+    // Nothing else legitimate parsed; every unknown key stays dropped by the
+    // typed narrower.
+    expect("displayName" in result).toBe(false);
+    expect("title" in result).toBe(false);
+    expect("colorHue" in result).toBe(false);
+    expect("avatar" in result).toBe(false);
+  });
+});
+
+// ===========================================================================
+// Phase 80 Plan 80-03: task field narrowing
+// ===========================================================================
+//
+// Phase 80 adds ONE MORE optional cosmetic scalar to the on-disk YAML
+// frontmatter: `task: <string>` (write-once at identity creation per D-05).
+// Purely additive extension of the Phase 66 pipeline. Cases mirror the
+// existing narrowing contract: present-and-non-empty keeps it, empty string
+// drops it, non-string drops it, absent drops it, malformed YAML returns {}.
+
+describe("extractCosmeticsFromFrontmatter — task field (Phase 80 Plan 80-03)", () => {
+  it("TASK-1: frontmatter with task: 'build the pool-pick endpoint' → task returned verbatim", async () => {
+    const md =
+      "---\nroles: box-maintainer\ndisplayName: Tina\ntask: build the pool-pick endpoint\n---\n\n# body\n";
+    const result = extractCosmeticsFromFrontmatter(md);
+    expect(result.displayName).toBe("Tina");
+    expect(result.task).toBe("build the pool-pick endpoint");
+  });
+
+  it("TASK-2: frontmatter with task: '' (empty string) → task DROPPED (absent-⇒-omit)", async () => {
+    const md =
+      "---\nroles: box-maintainer\ndisplayName: Tina\ntask: \"\"\n---\n\n# body\n";
+    const result = extractCosmeticsFromFrontmatter(md);
+    expect(result.displayName).toBe("Tina");
+    expect("task" in result).toBe(false);
+  });
+
+  it("TASK-3: frontmatter with task: 42 (non-string number) → task DROPPED", async () => {
+    const md =
+      "---\nroles: box-maintainer\ndisplayName: Tina\ntask: 42\n---\n\n# body\n";
+    const result = extractCosmeticsFromFrontmatter(md);
+    expect(result.displayName).toBe("Tina");
+    expect("task" in result).toBe(false);
+  });
+
+  it("TASK-4: frontmatter with NO task key → task absent from result", async () => {
+    const md =
+      "---\nroles: box-maintainer\ndisplayName: Tina\ntitle: The Coder\n---\n\n# body\n";
+    const result = extractCosmeticsFromFrontmatter(md);
+    expect(result.displayName).toBe("Tina");
+    expect("task" in result).toBe(false);
+  });
+
+  // Post-tolerant-parse contract (2026-09-24 atlantis-zoho leak fix): the
+  // clean `task: something` on the last frontmatter line parses around the
+  // noise above and survives into cosmetics — this replaces the old strict
+  // {} return. See COORD-6 for the analogous rewrite and the docblock on
+  // extractRoleFromMarkdown for the full rationale.
+  it("TASK-5: malformed YAML block above task: something → task survives via tolerant parse; garbage keys stay dropped", async () => {
+    const md =
+      "---\n: : broken : : yaml : :\n  invalid: [unclosed\ntask: something\n---\n\n# body\n";
+    const result = extractCosmeticsFromFrontmatter(md);
+    expect(result.task).toBe("something");
+    expect("displayName" in result).toBe(false);
+    expect("title" in result).toBe(false);
+    expect("colorHue" in result).toBe(false);
+    expect("coordinator" in result).toBe(false);
+  });
+});
+
+// ===========================================================================
+// Invalid identityKey guard
+// ===========================================================================
+
+describe("readAvatarSiblingFile — invalid identityKey", () => {
+  it("Test J: invalid identityKey ('Bad Key') throws", async () => {
+    await expect(readAvatarSiblingFile(null, "Bad Key")).rejects.toThrow(
+      /invalid identityKey/,
+    );
+  });
+});
+
+// ===========================================================================
+// AVATAR_MIME_FROM_EXT sanity
+// ===========================================================================
+
+describe("AVATAR_MIME_FROM_EXT", () => {
+  it("has correct MIME strings for all 5 canonical extensions", () => {
+    expect(AVATAR_MIME_FROM_EXT.webp).toBe("image/webp");
+    expect(AVATAR_MIME_FROM_EXT.png).toBe("image/png");
+    expect(AVATAR_MIME_FROM_EXT.jpg).toBe("image/jpeg");
+    expect(AVATAR_MIME_FROM_EXT.gif).toBe("image/gif");
+    expect(AVATAR_MIME_FROM_EXT.svg).toBe("image/svg+xml");
+  });
+});
+
+// Reference IDMEDIT_MAX_AVATAR_BYTES to keep the import used (defensive
+// upper-bound behavior is documented in the impl comments; not a functional
+// test case because a 5MB sibling file mock would slow the suite unnecessarily).
+describe("IDMEDIT_MAX_AVATAR_BYTES", () => {
+  it("is exposed and equals 5_000_000", () => {
+    expect(IDMEDIT_MAX_AVATAR_BYTES).toBe(5_000_000);
+  });
+});

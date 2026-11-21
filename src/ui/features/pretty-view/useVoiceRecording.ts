@@ -1,0 +1,716 @@
+/**
+ * useVoiceRecording — state machine hook for voice recording + STT transcription.
+ *
+ * Canonical golden-copy for the [subsystem] event key=value log-line shape used
+ * across the app (D-11). All structured logs in this hook use the `[voice]` prefix
+ * (per D-13 taxonomy), template-literal-composed `msg` strings, explicit field
+ * extraction from DOM events (D-05), and level semantics per D-14: `info` for
+ * expected transitions, `warn` for unexpected-but-not-fatal paths, `error` for
+ * real failures. Future patches MUST follow this file's shape (D-04 going-forward
+ * rule — see box-maintainer.md § Standing directives).
+ *
+ * Owns:
+ *   - State machine: idle → starting → recording → transcribing → idle
+ *   - MediaRecorder lifecycle (getUserMedia, start, stop, cleanup)
+ *   - Fetch to POST /voice/transcribe with FormData `file` field
+ *   - Transcript-to-text glue rule (single space if currentText does not end in whitespace)
+ *   - Audio feedback: 4 sounds at meaningful state transitions (start/stop/cancel/error)
+ *
+ * Does NOT own:
+ *   - The textarea value (caller manages and passes currentText to endAppend/endSend)
+ *   - The send action (endSend returns transcript+glued so caller can invoke send)
+ *   - Persistence (blob is transient; only transcript enters the textarea)
+ *
+ * CRITICAL iOS Safari constraint (D-16-02, Nelly warning):
+ *   `start()` is a PLAIN FUNCTION (NOT async). Its first non-conditional statement
+ *   is `navigator.mediaDevices.getUserMedia({ audio: true })`. Any `await` before
+ *   getUserMedia queues a microtask that iOS Safari uses to detect the call is not
+ *   from a direct user gesture, silently killing the mic permission prompt.
+ *   The hook's `start` calls getUserMedia as its first action, then wires `.then/.catch`
+ *   to handle the resolved stream.
+ *
+ * Return shape:
+ *   {
+ *     state: "idle" | "starting" | "recording" | "transcribing"
+ *     errorMessage: string | null
+ *     start: () => void                                       — call from tap handler (no await)
+ *     cancel: () => Promise<void>                             — drops blob, transitions to idle
+ *     endAppend: (currentText: string) => Promise<{transcript: string, glued: string} | null>
+ *     endSend: (currentText: string) => Promise<{transcript: string, glued: string} | null>
+ *   }
+ *
+ * endAppend and endSend both return Promise<{transcript, glued} | null>.
+ *   - On success: { transcript: "<STT text>", glued: "<currentText + glue + transcript>" }
+ *   - On STT error or fetch failure: null (errorMessage is set on the hook)
+ * The caller decides what to do with glued: endAppend → set textarea value;
+ * endSend → set textarea value AND call the existing send handler.
+ */
+
+import { useEffect, useRef, useState } from "react";
+import startUrl from "../../assets/sounds/mic/start.mp3?url";
+import stopUrl from "../../assets/sounds/mic/stop.mp3?url";
+import cancelUrl from "../../assets/sounds/mic/cancel.mp3?url";
+import errorUrl from "../../assets/sounds/mic/error.mp3?url";
+import { stampedFetch } from "@/lib/stamped-fetch";
+import {
+  closeLevelContext,
+  createLevelContext,
+  createMicLevelMonitor,
+  describeMicTrack,
+  micTracks,
+  type MicLevelMonitor,
+  type MicLevelSummary,
+} from "./mic-level-monitor";
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const TRANSCRIBE_URL = "/voice/transcribe";
+
+const MIC_SILENT_RESULT_MESSAGE = "Mic was silent — nothing was recorded. Check your input device or mute";
+const NO_SPEECH_MESSAGE = "Couldn't make out any words";
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/**
+ * Four-state machine for voice recording:
+ *
+ *   "idle"         — no active recording, microphone not in use.
+ *
+ *   "starting"     — the mic is opening: getUserMedia was asked for in the tap
+ *                    and hasn't answered yet (up to ~1.5 s on an iPhone cold
+ *                    start, or as long as a permission prompt is up). The UI
+ *                    shows the recording as on its way; nothing is captured yet.
+ *
+ *   "recording"    — recording in progress; start.mp3 has played.
+ *
+ *   "transcribing" — recorder stopped, blob uploaded to /voice/transcribe, awaiting
+ *                    STT response. Transitions back to "idle" when transcription
+ *                    completes (or fails).
+ */
+export type VoiceRecordingState = "idle" | "starting" | "recording" | "transcribing";
+
+export interface VoiceRecordingResult {
+  transcript: string;
+  glued: string;
+}
+
+/** Optional context passed by the caller so log lines carry hostId/sessionId per D-12. */
+export interface VoiceLogContext {
+  hostId?: number;
+  sessionId?: string;
+}
+
+export interface UseVoiceRecordingReturn {
+  state: VoiceRecordingState;
+  errorMessage: string | null;
+  start: () => void;
+  /** `silent` skips cancel.mp3 (used when a long-press hands off to voice mode). */
+  cancel: (opts?: { silent?: boolean }) => Promise<void>;
+  endAppend: (currentText: string) => Promise<VoiceRecordingResult | null>;
+  endSend: (currentText: string) => Promise<VoiceRecordingResult | null>;
+  /** Live mic input level (RMS 0–1) for the waveform; null when unreadable or not recording. */
+  readLevel: () => number | null;
+  /** The recording is paused: it takes in no sound until resumed. */
+  paused: boolean;
+  togglePause: () => void;
+}
+
+// ---------------------------------------------------------------------------
+// Hook
+// ---------------------------------------------------------------------------
+
+export function useVoiceRecording(
+  logContext?: VoiceLogContext,
+): UseVoiceRecordingReturn {
+  const [state, setState] = useState<VoiceRecordingState>("idle");
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [paused, setPaused] = useState(false);
+  const pausedRef = useRef(false);
+  /** Paused at some point in this recording — its silence isn't a dead mic. */
+  const pausedDuringRef = useRef(false);
+
+  // stateRef mirrors the useState value synchronously so callbacks (cancel,
+  // start's .then()) always read the CURRENT state rather
+  // than the closure snapshot baked in at render time. Updated by useEffect on
+  // every state change — approach (a) from the plan spec.
+  const stateRef = useRef<VoiceRecordingState>("idle");
+  useEffect(() => {
+    stateRef.current = state;
+  }, [state]);
+
+  // Refs hold the mutable recorder state so they survive re-renders without
+  // causing additional renders (mirrors the prototype's module-level locals).
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+
+  // Defensive: set true if cancel() is called while getUserMedia is still
+  // resolving. Consumed by the streamPromise.then() callback in start() to
+  // abort the recording setup before MediaRecorder is constructed. Prevents
+  // a race where a cancel lands during the mic-permission grant window and
+  // would otherwise leave the mic hot indefinitely.
+  const pendingCancelRef = useRef<boolean>(false);
+
+  // True while start()'s getUserMedia is in flight — see start().
+  const acquiringRef = useRef<boolean>(false);
+
+
+  // Input-level monitor for the live recording (see mic-level-monitor.ts);
+  // lastLevelRef holds the finished recording's summary for the empty-transcript
+  // message.
+  const levelMonitorRef = useRef<MicLevelMonitor | null>(null);
+  const lastLevelRef = useRef<MicLevelSummary | null>(null);
+  useEffect(() => () => {
+    levelMonitorRef.current?.stop();
+    levelMonitorRef.current = null;
+  }, []);
+
+  // Audio feedback instances — lazy-initialized once on first render via ref.
+  // Persists across renders so we don't reconstruct Audio objects on every render.
+  const startAudioRef = useRef<HTMLAudioElement | null>(null);
+  const stopAudioRef = useRef<HTMLAudioElement | null>(null);
+  const cancelAudioRef = useRef<HTMLAudioElement | null>(null);
+  const errorAudioRef = useRef<HTMLAudioElement | null>(null);
+  if (!startAudioRef.current) startAudioRef.current = new Audio(startUrl);
+  if (!stopAudioRef.current) stopAudioRef.current = new Audio(stopUrl);
+  if (!cancelAudioRef.current) cancelAudioRef.current = new Audio(cancelUrl);
+  if (!errorAudioRef.current) errorAudioRef.current = new Audio(errorUrl);
+
+  // Convenience: log-line suffix carrying D-12 standard fields (best-effort).
+  const ctxSuffix = `hostId=${logContext?.hostId ?? "n/a"} sessionId=${logContext?.sessionId ?? "n/a"}`;
+
+  // ---------------------------------------------------------------------------
+  // Internal: playSound — resets currentTime and plays; swallows any rejection.
+  // Audio feedback is UX polish — a failed play() MUST NOT disrupt recording.
+  // ---------------------------------------------------------------------------
+
+  function playSound(audio: HTMLAudioElement | null): void {
+    if (!audio) return;
+    audio.currentTime = 0;
+    // Wrap in Promise.resolve — real browsers return a Promise from play(),
+    // but jsdom's HTMLMediaElement.play() returns undefined, so a bare
+    // .catch() throws in tests that render the full ComposeBox tree without
+    // the Audio mock (fixes 5 pre-existing ComposeBox.voice.test.tsx failures
+    // in #209's ship; see patch #211).
+    Promise.resolve(audio.play()).catch(() => {});
+  }
+
+  // ---------------------------------------------------------------------------
+  // Internal: stopRecording — wraps recorder.stop() and resolves on onstop.
+  // Returns the assembled Blob, or null if no recorder is active.
+  // ---------------------------------------------------------------------------
+
+  function finishLevelMonitor(): void {
+    const monitor = levelMonitorRef.current;
+    if (!monitor) return;
+    levelMonitorRef.current = null;
+    const summary = monitor.stop();
+    lastLevelRef.current = summary;
+    const line = `[voice] mic-level-summary silent=${summary.silent === null ? "unknown" : summary.silent} peakDb=${summary.peakDb.toFixed(1)} heardMs=${summary.heardMs} allZero=${summary.allZero} measuredMs=${summary.measuredMs} ctxState=${summary.ctxState} ${ctxSuffix}`;
+    if (summary.silent === true) console.warn(line);
+    else console.info(line);
+  }
+
+  function stopRecording(): Promise<Blob | null> {
+    finishLevelMonitor();
+    return new Promise((resolve) => {
+      const recorder = recorderRef.current;
+      if (!recorder) {
+        console.warn(`[voice] stop-recording recorder-null resolving=null ${ctxSuffix}`);
+        resolve(null);
+        return;
+      }
+      // Non-recording guard: on iOS Safari, if a prior stopRecording() hung
+      // because the browser's onstop event dropped, subsequent stopRecording()
+      // calls would reassign recorder.onstop and call recorder.stop() again
+      // on an already-inactive recorder — hanging identically. Bail early
+      // when the recorder is inactive so the caller's null-blob branch
+      // (endAppend/endSend line ~294/335) recovers state to idle. This is the
+      // fix for the cascade-of-hangs case (presses 2+ after first drop). A
+      // paused recorder (the user paused dictation) stops normally.
+      if (recorder.state === "inactive") {
+        console.warn(`[voice] stop-recording recorder-state-not-recording state=${recorder.state} resolving=null ${ctxSuffix}`);
+        resolve(null);
+        return;
+      }
+      console.info(`[voice] stop-recording calling-stop recorderState=${recorder.state} ${ctxSuffix}`);
+      // Race between onstop firing (happy path) and an 8s watchdog (iOS Safari
+      // dropped-event recovery). Whichever wins flips `resolved`; the loser
+      // must no-op so we never double-cleanup or double-resolve.
+      let resolved = false;
+      let watchdogHandle: ReturnType<typeof setTimeout> | undefined;
+
+      // D-05: explicitly extract fields from MediaRecorder events.
+      recorder.onerror = (event: MediaRecorderErrorEvent) => {
+        const err = event.error;
+        console.error(`[voice] recorder-error errName="${err?.name ?? "unknown"}" errMessage="${err?.message ?? "no message"}" recorderState=${recorder.state} ${ctxSuffix}`);
+      };
+
+      recorder.onstop = () => {
+        if (resolved) return;
+        resolved = true;
+        if (watchdogHandle) clearTimeout(watchdogHandle);
+        const type = recorder.mimeType || "audio/webm";
+        const blob = new Blob(chunksRef.current, { type });
+        console.info(`[voice] stop-recording onstop-fired blobSize=${blob.size} blobType=${type} ${ctxSuffix}`);
+        chunksRef.current = [];
+        // Stop all stream tracks and clear refs.
+        if (streamRef.current) {
+          const tracks = streamRef.current.getTracks();
+          tracks.forEach((t) => t.stop());
+          console.info(`[voice] stream-released tracks=${tracks.length} states=${tracks.map((t) => t.readyState).join(",")} ${ctxSuffix}`);
+          streamRef.current = null;
+        }
+        recorderRef.current = null;
+        resolve(blob);
+      };
+      watchdogHandle = setTimeout(() => {
+        if (resolved) return;
+        resolved = true;
+        console.warn(`[voice] stop-recording watchdog-fired onstopNeverFiredAfter=8s forcing-cleanup ${ctxSuffix}`);
+        if (streamRef.current) {
+          streamRef.current.getTracks().forEach((t) => t.stop());
+          streamRef.current = null;
+        }
+        recorderRef.current = null;
+        chunksRef.current = [];
+        resolve(null);
+      }, 8000);
+      recorder.stop();
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Internal: transcribeBlob — POSTs blob to /voice/transcribe, returns text.
+  // Returns null on error (also sets errorMessage).
+  // ---------------------------------------------------------------------------
+
+  async function transcribeBlob(blob: Blob): Promise<string | null> {
+    // Pick filename extension from blob.type (mirrors prototype ext-picking logic).
+    const ext = blob.type.includes("webm")
+      ? "webm"
+      : blob.type.includes("mp4")
+        ? "mp4"
+        : blob.type.includes("wav")
+          ? "wav"
+          : "bin";
+
+    const fd = new FormData();
+    fd.append("file", blob, `clip.${ext}`);
+    // Phase 34: pass target-pane context so the backend can SSH-fetch the
+    // skill catalog and apply the server-side slash-command transform when
+    // the transcript begins with the "slash <content>" wake-word. Server
+    // fail-opens (returns raw transcript) if either field is absent.
+    if (logContext?.hostId !== undefined) {
+      fd.append("hostId", String(logContext.hostId));
+    }
+    if (logContext?.sessionId !== undefined) {
+      fd.append("tmuxSession", logContext.sessionId);
+    }
+
+    console.info(`[voice] transcribe-post url=${TRANSCRIBE_URL} blobSize=${blob.size} ext=${ext} ${ctxSuffix}`);
+
+    let res: Response;
+    try {
+      // Phase 111 SKEW-04: stamped-fetch lane (STT upload).
+      res = await stampedFetch(TRANSCRIBE_URL, { method: "POST", body: fd });
+    } catch (err) {
+      const errName = err instanceof Error ? err.name : "unknown";
+      const errMessage = err instanceof Error ? err.message : String(err);
+      console.error(`[voice] transcribe-fetch-threw errName="${errName}" errMessage="${errMessage}" ${ctxSuffix}`);
+      playSound(errorAudioRef.current);
+      setErrorMessage(`STT error: ${errMessage}`);
+      return null;
+    }
+
+    if (res.ok) {
+      console.info(`[voice] transcribe-fetch-resolved status=${res.status} ok=${res.ok} ${ctxSuffix}`);
+    } else {
+      console.warn(`[voice] transcribe-fetch-not-ok status=${res.status} ok=${res.ok} ${ctxSuffix}`);
+      playSound(errorAudioRef.current);
+      // Prefer the server's human-readable message (e.g. quota exhausted)
+      // over the bare status code.
+      let serverMessage: string | undefined;
+      try {
+        const body = (await res.json()) as { message?: unknown };
+        if (typeof body.message === "string" && body.message) serverMessage = body.message;
+      } catch {
+        // Non-JSON error body — fall back to the status code.
+      }
+      setErrorMessage(serverMessage ?? `STT error: ${res.status}`);
+      return null;
+    }
+
+    try {
+      const json = (await res.json()) as { text?: string };
+      console.info(`[voice] transcribe-json-parsed textLen=${(json.text ?? "").length} ${ctxSuffix}`);
+      return json.text ?? "";
+    } catch (err) {
+      const errName = err instanceof Error ? err.name : "unknown";
+      const errMessage = err instanceof Error ? err.message : String(err);
+      console.error(`[voice] transcribe-json-parse-threw errName="${errName}" errMessage="${errMessage}" ${ctxSuffix}`);
+      playSound(errorAudioRef.current);
+      setErrorMessage("STT error: invalid response");
+      return null;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Internal: applyGlue — applies the single-space glue rule.
+  // "if (cur && !/\s$/.test(cur)) glue = ' '"
+  // ---------------------------------------------------------------------------
+
+  function reportEmptyTranscript(): void {
+    const silent = lastLevelRef.current?.silent ?? null;
+    const wasPaused = pausedDuringRef.current;
+    console.warn(`[voice] empty-transcript micSilent=${silent === null ? "unknown" : silent} wasPaused=${wasPaused} ${ctxSuffix}`);
+    setErrorMessage(silent === true && !wasPaused ? MIC_SILENT_RESULT_MESSAGE : NO_SPEECH_MESSAGE);
+  }
+
+  function applyGlue(currentText: string, transcript: string): string {
+    const glue = currentText && !/\s$/.test(currentText) ? " " : "";
+    return currentText + glue + transcript;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Public API
+  // ---------------------------------------------------------------------------
+
+  /**
+   * start(opts?) — initiates recording.
+   *
+   * MUST be a plain function (NOT async). Its FIRST non-conditional statement
+   * is navigator.mediaDevices.getUserMedia({ audio: true }) — called
+   * synchronously inside the user-gesture handler so iOS Safari presents
+   * the mic permission prompt (D-16-02 lock, Nelly warning 2026-07-27).
+   *
+   * No-op unless idle (gates a rapid second tap while the mic is opening).
+   * State is "starting" until getUserMedia answers, then "recording" with
+   * start.mp3.
+   *
+   * Race defense: a cancel() while the mic is opening arms pendingCancelRef;
+   * the .then() re-checks it before and after building the recorder and tears
+   * the arriving stream down instead of recording.
+   */
+  function start(): void {
+    // Never ask for a second stream while one is on its way: a home-screen app
+    // on iOS refuses it ("No AVAudioSessionCaptureDevice device") and the mic
+    // stays refused after it.
+    if (acquiringRef.current) {
+      console.info(`[voice] start-joined-inflight ${ctxSuffix}`);
+      return;
+    }
+
+    // Clear stale pending-cancel flag so a prior cancel cannot kill this fresh start.
+    pendingCancelRef.current = false;
+
+    // stateRef (not state): a second tap finds "starting", not "idle".
+    if (stateRef.current !== "idle") return;
+
+    // ⚠️ MUST be the first non-conditional statement — NO await before this.
+    // iOS Safari requires getUserMedia to be called synchronously in the tap
+    // handler. Any microtask (await) before this line kills the permission prompt.
+    const streamPromise = navigator.mediaDevices.getUserMedia({ audio: true });
+    acquiringRef.current = true;
+    // The mic is opening: the UI shows the recording on its way at once.
+    stateRef.current = "starting";
+    setState("starting");
+    // Level-meter context — created here, still inside the gesture, so iOS
+    // lets it run (see mic-level-monitor.ts).
+    const levelCtx = createLevelContext();
+
+    streamPromise
+      .then((stream) => {
+        acquiringRef.current = false;
+        // Pre-construction pending-cancel check: if cancel() was called while
+        // getUserMedia was resolving (i.e., state === "idle" → cancel armed
+        // pendingCancelRef), tear down the just-arrived stream before building
+        // the recorder. This is the existing PC-A / PC-C path.
+        if (pendingCancelRef.current) {
+          pendingCancelRef.current = false;
+          stream.getTracks().forEach((t) => t.stop());
+          closeLevelContext(levelCtx);
+          // Do NOT setState (stays "idle"), do NOT play start sound, do NOT
+          // construct MediaRecorder. Nothing to clean up in refs — the pre-.then()
+          // path did not touch streamRef / chunksRef / recorderRef.
+          return;
+        }
+
+        streamRef.current = stream;
+        chunksRef.current = [];
+        // Each recording starts unpaused.
+        pausedRef.current = false;
+        pausedDuringRef.current = false;
+        setPaused(false);
+
+        console.info(`[voice] mic-track ${describeMicTrack(stream)} ${ctxSuffix}`);
+        for (const track of micTracks(stream)) {
+          track.onmute = () => console.warn(`[voice] mic-track-muted label="${track.label}" ${ctxSuffix}`);
+          track.onunmute = () => console.info(`[voice] mic-track-unmuted label="${track.label}" ${ctxSuffix}`);
+          track.onended = () => console.warn(`[voice] mic-track-ended label="${track.label}" ${ctxSuffix}`);
+        }
+        lastLevelRef.current = null;
+        // The live waveform (readLevel) is the user-facing signal; these
+        // lines only log when the feed goes / stops being silent.
+        levelMonitorRef.current = createMicLevelMonitor(levelCtx, stream, (silent) => {
+          if (silent) {
+            console.warn(`[voice] mic-silent-detected paused=${pausedRef.current} ${describeMicTrack(stream)} ${ctxSuffix}`);
+          } else {
+            console.info(`[voice] mic-silent-cleared input-detected ${ctxSuffix}`);
+          }
+        });
+
+        const recorder = new MediaRecorder(stream);
+        recorderRef.current = recorder;
+
+        // D-05: explicitly extract data from MediaRecorder events.
+        recorder.onstart = () => {
+          console.info(`[voice] recorder-start mimeType=${recorder.mimeType} state=${recorder.state} ${ctxSuffix}`);
+        };
+
+        recorder.ondataavailable = (e) => {
+          if (e.data.size > 0) {
+            chunksRef.current.push(e.data);
+            console.info(`[voice] recorder-data-available size=${e.data.size} type=${e.data.type} ${ctxSuffix}`);
+          }
+        };
+
+        recorder.start();
+        console.info(`[voice] recording-started ${ctxSuffix}`);
+
+        // Post-recorder.start() orphan guard: a cancel() that landed after
+        // the check above still wins — the mic must not stay hot.
+        if (pendingCancelRef.current) {
+          pendingCancelRef.current = false;
+          recorder.stop();
+          stream.getTracks().forEach((t) => t.stop());
+          levelMonitorRef.current?.stop();
+          levelMonitorRef.current = null;
+          recorderRef.current = null;
+          streamRef.current = null;
+          chunksRef.current = [];
+          return;
+        }
+
+        setErrorMessage(null);
+        setState("recording");
+        stateRef.current = "recording";
+        playSound(startAudioRef.current);
+      })
+      .catch((err: Error) => {
+        // Surface mic-denied state — matches prototype's error string.
+        // Do NOT play error.mp3 here — permission-denied may happen before any
+        // user gesture on Safari, and the errorMessage signal alone is sufficient.
+        const errName = err instanceof Error ? err.name : "unknown";
+        const errMessage = err instanceof Error ? err.message : String(err);
+        acquiringRef.current = false;
+        stateRef.current = "idle";
+        setState("idle");
+        console.error(`[voice] mic-denied errName="${errName}" errMessage="${errMessage}" ${ctxSuffix}`);
+        closeLevelContext(levelCtx);
+        setErrorMessage(`mic denied: ${err.name || "error"}`);
+      });
+  }
+
+  /**
+   * cancel() — stops recording, discards blob, returns to idle.
+   *
+   * Handles three cases:
+   *   1. state === "idle" (nothing started): arms pendingCancelRef defensively
+   *      so a start() already on its way tears down the arriving stream.
+   *
+   *   2. state === "starting" (the mic is opening): arms pendingCancelRef so
+   *      start()'s .then() tears down the arriving stream instead of
+   *      recording, and returns to idle at once.
+   *
+   *   3. state === "recording": stopRecording() + cancel.mp3 + idle.
+   */
+  async function cancel(opts?: { silent?: boolean }): Promise<void> {
+    const currentState = stateRef.current;
+    console.info(`[voice] cancel-entry state=${currentState} ${ctxSuffix}`);
+
+    if (currentState !== "recording" && currentState !== "starting") {
+      // Defensive: an in-flight start()'s .then() tears the stream down.
+      pendingCancelRef.current = true;
+      console.warn(`[voice] cancel-gate-rejected state=${currentState} expected=recording-or-starting pending-cancel-armed=true ${ctxSuffix}`);
+      return;
+    }
+
+    // The mic is still opening: start()'s .then() tears the stream down when
+    // it arrives.
+    if (currentState === "starting" && recorderRef.current === null) {
+      pendingCancelRef.current = true;
+      console.warn(`[voice] cancel-starting-no-recorder state=${currentState} pending-cancel-armed=true ${ctxSuffix}`);
+      setState("idle");
+      stateRef.current = "idle";
+      return;
+    }
+
+    // A recording is live: tear it down here; no pending cancel is needed.
+    pendingCancelRef.current = false;
+    // AudioSession-safety: play cancel.mp3 AFTER recorder teardown, not before.
+    // iOS Safari shares one AudioSession between MediaRecorder and Audio playback;
+    // starting playback while recording is active can drop MediaRecorder.onstop and
+    // orphan the buffered audio (bounty voice-recording-audio-feedback-ordering-onstop-drop).
+    //
+    // D-07 boundary logs: if AudioSession bug re-appears (onstop stops firing after
+    // audio.play), the phase progression in logs reveals whether feedback fired
+    // BEFORE or AFTER teardown — immediately narrowing the diagnosis.
+    console.info(`[voice] feedback-playback-order phase=before-teardown ${ctxSuffix}`);
+    await stopRecording();
+    console.info(`[voice] feedback-playback-order phase=after-teardown-before-feedback ${ctxSuffix}`);
+    const cancelAudio = opts?.silent === true ? null : cancelAudioRef.current;
+    if (cancelAudio) {
+      cancelAudio.currentTime = 0;
+      Promise.resolve(cancelAudio.play()).then(() => {
+        console.info(`[voice] feedback-playback-order phase=feedback-play-resolved sound=cancel ${ctxSuffix}`);
+      }).catch((err: unknown) => {
+        console.warn(`[voice] feedback-playback-order phase=feedback-play-rejected sound=cancel errName="${err instanceof Error ? err.name : "unknown"}" errMessage="${err instanceof Error ? err.message : String(err)}" ${ctxSuffix}`);
+      });
+    }
+    console.info(`[voice] cancel-exit stopRecording-resolved setting-state=idle ${ctxSuffix}`);
+    // Blob is discarded — no fetch.
+    setState("idle");
+  }
+
+  /**
+   * endAppend(currentText) — stops recording, transcribes, returns {transcript, glued}.
+   * Caller sets textarea.value = glued.
+   * Returns null on STT error (errorMessage is set).
+   * No-op if state !== "recording" (nothing to stop while the mic is still opening).
+   */
+  async function endAppend(
+    currentText: string,
+  ): Promise<VoiceRecordingResult | null> {
+    console.info(`[voice] end-append-entry state=${stateRef.current} currentTextLen=${currentText.length} ${ctxSuffix}`);
+    if (stateRef.current !== "recording") {
+      console.warn(`[voice] end-append-gate-rejected state=${stateRef.current} expected=recording ${ctxSuffix}`);
+      return null;
+    }
+
+    // AudioSession-safety: play stop.mp3 AFTER recorder teardown — see cancel() above.
+    // D-07 boundary logs for feedback-playback ordering (patch #382 regression guard).
+    console.info(`[voice] feedback-playback-order phase=before-teardown ${ctxSuffix}`);
+    const blob = await stopRecording();
+    console.info(`[voice] feedback-playback-order phase=after-teardown-before-feedback ${ctxSuffix}`);
+    const stopAudio = stopAudioRef.current;
+    if (stopAudio) {
+      stopAudio.currentTime = 0;
+      Promise.resolve(stopAudio.play()).then(() => {
+        console.info(`[voice] feedback-playback-order phase=feedback-play-resolved sound=stop ${ctxSuffix}`);
+      }).catch((err: unknown) => {
+        console.warn(`[voice] feedback-playback-order phase=feedback-play-rejected sound=stop errName="${err instanceof Error ? err.name : "unknown"}" errMessage="${err instanceof Error ? err.message : String(err)}" ${ctxSuffix}`);
+      });
+    }
+    console.info(`[voice] end-append-stop-resolved blob=${blob ? `size=${blob.size}` : "null"} setting-state=transcribing ${ctxSuffix}`);
+    setState("transcribing");
+
+    if (!blob) {
+      console.warn(`[voice] end-append-blob-null setting-state=idle returning=null ${ctxSuffix}`);
+      setState("idle");
+      return null;
+    }
+
+    const transcript = await transcribeBlob(blob);
+    console.info(`[voice] end-append-transcribe-resolved transcript=${transcript === null ? "null" : `len=${transcript.length}`} setting-state=idle ${ctxSuffix}`);
+    setState("idle");
+
+    if (transcript === null) return null;
+
+    if (transcript === "") {
+      playSound(errorAudioRef.current);
+      reportEmptyTranscript();
+    }
+
+    const glued = applyGlue(currentText, transcript);
+    return { transcript, glued };
+  }
+
+  /**
+   * endSend(currentText) — stops recording, transcribes, returns {transcript, glued}.
+   * Caller sets textarea.value = glued AND calls the existing send handler.
+   * Returns null on STT error (errorMessage is set).
+   * No-op if state !== "recording" (cannot end-send during the "starting" grey zone).
+   */
+  async function endSend(
+    currentText: string,
+  ): Promise<VoiceRecordingResult | null> {
+    console.info(`[voice] end-send-entry state=${stateRef.current} currentTextLen=${currentText.length} ${ctxSuffix}`);
+    if (stateRef.current !== "recording") {
+      console.warn(`[voice] end-send-gate-rejected state=${stateRef.current} expected=recording ${ctxSuffix}`);
+      return null;
+    }
+
+    // AudioSession-safety: play stop.mp3 AFTER recorder teardown — see cancel() above.
+    // D-07 boundary logs for feedback-playback ordering (patch #382 regression guard).
+    console.info(`[voice] feedback-playback-order phase=before-teardown ${ctxSuffix}`);
+    const blob = await stopRecording();
+    console.info(`[voice] feedback-playback-order phase=after-teardown-before-feedback ${ctxSuffix}`);
+    const stopAudio2 = stopAudioRef.current;
+    if (stopAudio2) {
+      stopAudio2.currentTime = 0;
+      Promise.resolve(stopAudio2.play()).then(() => {
+        console.info(`[voice] feedback-playback-order phase=feedback-play-resolved sound=stop ${ctxSuffix}`);
+      }).catch((err: unknown) => {
+        console.warn(`[voice] feedback-playback-order phase=feedback-play-rejected sound=stop errName="${err instanceof Error ? err.name : "unknown"}" errMessage="${err instanceof Error ? err.message : String(err)}" ${ctxSuffix}`);
+      });
+    }
+    console.info(`[voice] end-send-stop-resolved blob=${blob ? `size=${blob.size}` : "null"} setting-state=transcribing ${ctxSuffix}`);
+    setState("transcribing");
+
+    if (!blob) {
+      console.warn(`[voice] end-send-blob-null setting-state=idle returning=null ${ctxSuffix}`);
+      setState("idle");
+      return null;
+    }
+
+    const transcript = await transcribeBlob(blob);
+    console.info(`[voice] end-send-transcribe-resolved transcript=${transcript === null ? "null" : `len=${transcript.length}`} setting-state=idle ${ctxSuffix}`);
+    setState("idle");
+
+    if (transcript === null) return null;
+
+    if (transcript === "") {
+      playSound(errorAudioRef.current);
+      reportEmptyTranscript();
+    }
+
+    const glued = applyGlue(currentText, transcript);
+    return { transcript, glued };
+  }
+
+  function readLevel(): number | null {
+    return levelMonitorRef.current?.read() ?? null;
+  }
+
+  /**
+   * Pause: the recorder pauses (no long silent stretch for the transcriber to
+   * invent words in) and the mic's tracks are disabled, so nothing is taken
+   * in and the waveform goes flat even where the recorder can't pause.
+   */
+  function togglePause(): void {
+    const stream = streamRef.current;
+    if (!stream) return;
+    const next = !pausedRef.current;
+    pausedRef.current = next;
+    if (next) pausedDuringRef.current = true;
+    setPaused(next);
+    for (const track of micTracks(stream)) track.enabled = !next;
+    const recorder = recorderRef.current;
+    let recorderState = recorder?.state ?? "none";
+    try {
+      if (next && recorder?.state === "recording") recorder.pause();
+      else if (!next && recorder?.state === "paused") recorder.resume();
+      recorderState = recorder?.state ?? "none";
+    } catch (err) {
+      console.warn(`[voice] recorder-${next ? "pause" : "resume"}-failed errMessage="${err instanceof Error ? err.message : String(err)}" ${ctxSuffix}`);
+    }
+    console.info(`[voice] recording-${next ? "paused" : "resumed"} state=${stateRef.current} recorderState=${recorderState} ${describeMicTrack(stream)} ${ctxSuffix}`);
+  }
+
+  return { state, errorMessage, start, cancel, endAppend, endSend, readLevel, paused, togglePause };
+}

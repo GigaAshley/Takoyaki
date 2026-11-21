@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# image-gen — generate images from a prompt via the fleet's image provider.
+#
+# Canonical copy lives in the app's source repo at substrate/scripts/image-gen and is
+# distributed to every managed host (including the app's own host) by the
+# fleet-substrate distributor (see src/backend/distributor/catalog.ts).
+# Installed per-box at ~/.local/bin/image-gen. Do NOT hand-edit the installed
+# copy.
+#
+# Thin wrapper over fleet-service (the shared agent-services client); the
+# backend side is src/backend/agent-services/services/image-gen/.
+#
+# Usage:
+#   image-gen "a cat"
+#   image-gen "a portrait" --size 1024x1024 --n 2 --quality high
+#   image-gen "a landscape" --out ~/pictures/land.png
+#   image-gen "a cat with hat" --ref /tmp/base-cat.png      # image-to-image
+#   image-gen --json /path/to/input.json [--ref /path/to/ref.png]
+#
+# Env overrides:
+#   IMAGE_GEN_TIMEOUT_SEC   wait in seconds (default 300 = 5 min)
+#
+# Exit status:
+#   0  success. One image path per line on stdout; metadata JSON on stderr.
+#   1  failure or timeout. {reason, message?} JSON on stderr; nothing on stdout.
+#   2  usage or local error.
+
+set -uo pipefail
+
+OUT_DIR="${HOME}/fleet/image-gen-outputs"
+TIMEOUT_SEC="${IMAGE_GEN_TIMEOUT_SEC:-300}"
+FLEET_SERVICE="$(dirname -- "$(readlink -f -- "$0")")/fleet-service"
+[ -x "$FLEET_SERVICE" ] || FLEET_SERVICE="fleet-service"
+
+usage() {
+  cat >&2 <<'USAGE'
+usage: image-gen <prompt> [--size WxH] [--n N] [--quality low|medium|high]
+                          [--out <path>] [--ref <path>] [--json <file>]
+       image-gen --json <file> [--ref <path>]
+       image-gen -h | --help
+
+Prints generated image path(s) on stdout, one per line, on exit 0.
+Prints failure JSON on stderr on non-zero exit.
+USAGE
+}
+
+prompt=""
+size=""
+n=""
+quality=""
+out=""
+ref=""
+json_file=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --size)    size="${2:-}";    shift 2;;
+    --n)       n="${2:-}";       shift 2;;
+    --quality) quality="${2:-}"; shift 2;;
+    --out)     out="${2:-}";     shift 2;;
+    --ref)     ref="${2:-}";     shift 2;;
+    --json)    json_file="${2:-}"; shift 2;;
+    -h|--help) usage; exit 0;;
+    --) shift; break;;
+    -*)
+      printf 'image-gen: unknown flag: %s\n' "$1" >&2
+      usage
+      exit 2
+      ;;
+    *)
+      if [ -n "$prompt" ]; then
+        printf 'image-gen: unexpected positional arg after prompt: %s\n' "$1" >&2
+        usage
+        exit 2
+      fi
+      prompt="$1"
+      shift
+      ;;
+  esac
+done
+
+if [ -z "$prompt" ] && [ -z "$json_file" ]; then
+  printf 'image-gen: prompt (positional) OR --json <file> is required\n' >&2
+  usage
+  exit 2
+fi
+if [ -n "$json_file" ] && [ ! -f "$json_file" ]; then
+  printf 'image-gen: --json file not found: %s\n' "$json_file" >&2
+  exit 2
+fi
+if [ -n "$ref" ] && [ ! -f "$ref" ]; then
+  printf 'image-gen: --ref file not found: %s\n' "$ref" >&2
+  exit 2
+fi
+if [ -n "$n" ] && ! [[ "$n" =~ ^[0-9]+$ ]]; then
+  printf 'image-gen: --n must be a whole number\n' >&2
+  exit 2
+fi
+command -v jq >/dev/null 2>&1 || {
+  printf 'image-gen: jq is required but not installed (apt install jq)\n' >&2
+  exit 2
+}
+
+# ---- build the service input -------------------------------------------------
+
+if [ -n "$json_file" ]; then
+  # Escape hatch: the file is the input object. Fields the old request
+  # format carried at the top level (requested_at, ref) are dropped; the
+  # reference image goes through --ref.
+  if ! input=$(jq -c 'del(.requested_at, .ref)' "$json_file"); then
+    printf 'image-gen: --json file is not valid JSON: %s\n' "$json_file" >&2
+    exit 2
+  fi
+else
+  input=$(jq -cn --arg p "$prompt" --arg s "$size" --arg q "$quality" --arg n "$n" '
+    {prompt: $p}
+    + (if $s != "" then {size: $s} else {} end)
+    + (if $q != "" then {quality: $q} else {} end)
+    + (if $n != "" then {n: ($n | tonumber)} else {} end)')
+fi
+
+attach=()
+[ -n "$ref" ] && attach=(--attach "ref=$ref")
+
+response=$(
+  printf '%s' "$input" |
+    "$FLEET_SERVICE" call image-gen --input - "${attach[@]}" \
+      --timeout "$TIMEOUT_SEC" --out-dir "$OUT_DIR"
+)
+status=$?
+[ "$status" -eq 2 ] && exit 2
+
+if [ "$status" -ne 0 ]; then
+  jq -c '.error | {reason: .code} + del(.code)' <<<"$response" >&2
+  exit 1
+fi
+
+# ---- success: optionally move images to --out, print paths -------------------
+
+paths=()
+i=0
+while IFS= read -r src; do
+  [ -n "$src" ] || continue
+  dest="$src"
+  if [ -n "$out" ]; then
+    # First image lands at --out verbatim; later ones get -<i> before the
+    # extension: --out /tmp/foo.png with n=2 → /tmp/foo.png, /tmp/foo-1.png.
+    out_dir=$(dirname -- "$out")
+    out_base=$(basename -- "$out")
+    if [ "$i" -eq 0 ]; then
+      dest="$out"
+    else
+      dest="$out_dir/${out_base%.*}-$i.${out_base##*.}"
+    fi
+    mkdir -p -- "$out_dir" 2>/dev/null || true
+    if ! mv -- "$src" "$dest"; then
+      printf 'image-gen: failed to move %s -> %s\n' "$src" "$dest" >&2
+      dest="$src"
+    fi
+  fi
+  paths+=("$dest")
+  i=$(( i + 1 ))
+done < <(jq -r '.files[]' <<<"$response")
+
+jq -c '.result + {images: $ARGS.positional}' --args "${paths[@]}" <<<"$response" >&2
+for p in "${paths[@]}"; do
+  printf '%s\n' "$p"
+done
+exit 0

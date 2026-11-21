@@ -1,0 +1,1440 @@
+/**
+ * Phase 35 — pretty-view compose-send migrated onto claude-session WS.
+ *
+ * Unit tests for the new `input` + `interrupt` message handlers exported
+ * as test seams from claude-session-server.ts. Mirrors the
+ * __applyWakeMessageForTests test pattern from dormant-poll.test.ts
+ * + the fake-timers gate from claude-session-server.aside.test.ts:376-403.
+ * No live WebSocket server or SSH connection needed.
+ *
+ * INPUT TESTS (describe block 1):
+ *   - sshConn null → no execCommand, no throw
+ *   - currentTmuxSession null → no execCommand, no throw
+ *   - empty data → no execCommand (regardless of mqid)
+ *   - data.length > MAX_INPUT_BYTES (17KB) → no execCommand, one sshLogger.warn
+ *   - NON-SPLIT (no mqid, data = "hello") → one execCommand with -l flag, no Enter
+ *   - NON-SPLIT (mqid = "", data = "hello\r") → one execCommand (empty mqid = non-split)
+ *   - NON-SPLIT (mqid = "x", data = "hello" — no trailing \r) → one execCommand
+ *   - SPLIT-SEND timing gate (mqid + \r) under fake timers → 250ms boundary enforced
+ *   - SPLIT-SEND with empty body (data = "\r") → zero body calls, ONE Enter call at 250ms
+ *   - Trust boundary → command contains "legit-session", not "spoofed-session"
+ *   - execCommand throws on body call → caught; no rethrow; no Enter fires; sshLogger.warn
+ *   - execCommand throws on non-split call → caught; no rethrow; sshLogger.warn
+ *
+ * INTERRUPT TESTS (describe block 2):
+ *   - sshConn null → no execCommand, no throw
+ *   - currentTmuxSession null → no execCommand, no throw
+ *   - happy path → ONE execCommand with C-c, no -l, no Enter
+ *   - regression guard — must NOT send Escape (Escape needs a fast double-press to clear
+ *     a draft, and the throttle blocks that; Ctrl-C clears in one press — that is the fix)
+ *   - execCommand throws → caught; no rethrow; sshLogger.warn
+ *   - same-pane collapse: second interrupt within 2500ms → ONE keystroke + interrupt_throttled warn
+ *   - cross-pane independence: two interrupts at same instant on different panes → BOTH send
+ *   - post-window release: second interrupt after 2500ms → TWO keystrokes, no throttle
+ */
+
+import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
+
+// Bounty: pv-claude-session-ws-zombie-after-tmux-teardown — mock the logger
+// module so the new sshLogger.warn drop-log emitted at claude-session-server.ts
+// :2567 is silent AND assertable via vi.mocked(sshLogger.warn). Full logger
+// surface mocked so transitive imports in claude-session-server don't blow up
+// (mirrors context-pct-from-jsonl.test.ts and dormant-poll.test.ts).
+vi.mock("../utils/logger.js", () => {
+  const makeLogger = () => ({
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    success: vi.fn(),
+  });
+  const systemLogger = makeLogger();
+  return {
+    sshLogger: makeLogger(),
+    authLogger: makeLogger(),
+    databaseLogger: makeLogger(),
+    apiLogger: makeLogger(),
+    systemLogger,
+    fileLogger: makeLogger(),
+    statsLogger: makeLogger(),
+    tunnelLogger: makeLogger(),
+    dashboardLogger: makeLogger(),
+    guacLogger: makeLogger(),
+    versionLogger: makeLogger(),
+    logger: systemLogger,
+    setGlobalLogLevel: vi.fn(),
+    getGlobalLogLevel: vi.fn(() => "info"),
+  };
+});
+
+import {
+  __applyInputMessageForTests,
+  MAX_INPUT_BYTES,
+  __applyInterruptMessageForTests,
+  __applyOnLineNotifyForTests,
+  __interruptThrottleForTests,
+  INTERRUPT_MARKER_WAIT_MS,
+} from "./claude-session-server.js";
+import { InterruptCancelTracker } from "./interrupt-cancel-tracker.js";
+import {
+  armPvSendWatchdog,
+  clearPvSendWatchdog,
+  __resetPvSendWatchdogForTests,
+} from "./pv-send-watchdog.js";
+import { sshLogger } from "../utils/logger.js";
+
+// Stub ssh2 Client — execCommand is injected so conn is never accessed.
+const fakeConn = {} as import("ssh2").Client;
+
+// ─── __applyInputMessageForTests ──────────────────────────────────────────────
+
+describe("__applyInputMessageForTests", () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+    vi.useRealTimers();
+  });
+
+  it("input: sshConn null → no execCommand call, no throw", async () => {
+    const exec = vi.fn();
+    await expect(
+      __applyInputMessageForTests({
+        sshConn: null,
+        currentTmuxSession: "legit-session",
+        currentHostId: 1,
+        execCommand: exec,
+        data: "hello",
+      }),
+    ).resolves.toBeUndefined();
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("input: currentTmuxSession null → no execCommand call, no throw", async () => {
+    const exec = vi.fn();
+    await expect(
+      __applyInputMessageForTests({
+        sshConn: fakeConn,
+        currentTmuxSession: null,
+        currentHostId: 1,
+        execCommand: exec,
+        data: "hello",
+      }),
+    ).resolves.toBeUndefined();
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  // ── Bounty: pv-claude-session-ws-zombie-after-tmux-teardown ─────────────────
+  // The entry guard at claude-session-server.ts:2567 was silently returning;
+  // add coverage for the new sshLogger.warn drop-log with the bounty's exact
+  // payload shape. Close-with-reason on teardown (transitionToDead + FALLBACK
+  // -01) is not covered here — no test seam exists for teardownPane in this
+  // file, and Task 1 does not add one. Coverage for the close side of the fix
+  // is deferred to a future integration seam or manual UAT (bounty UAT #1:
+  // sending a message via PV triggers a client-side reconnect + fresh WS
+  // handshake). All three cases assert the log fires exactly once with the
+  // exact operation + payload keys; message-string content is prose and NOT
+  // asserted beyond the `operation` field (may drift).
+  it("input: guard-drop log fires when sshConn null (tmuxSession bound)", async () => {
+    vi.mocked(sshLogger.warn).mockClear();
+    const exec = vi.fn();
+    await __applyInputMessageForTests({
+      sshConn: null,
+      currentTmuxSession: "legit-session",
+      currentHostId: 1,
+      execCommand: exec,
+      data: "hello",
+      messageQueueItemId: "pv-optim-123",
+    });
+    expect(exec).not.toHaveBeenCalled();
+    expect(sshLogger.warn).toHaveBeenCalledTimes(1);
+    const [, payload] = vi.mocked(sshLogger.warn).mock.calls[0];
+    expect(payload).toMatchObject({
+      operation: "pv_input_drop_no_session",
+      mqid: "pv-optim-123",
+      hostId: 1,
+      hasSshConn: false,
+      hasTmuxSession: true,
+      dataLen: 5,
+    });
+  });
+
+  it("input: guard-drop log fires when currentTmuxSession null (sshConn bound; mqid omitted → 'none')", async () => {
+    vi.mocked(sshLogger.warn).mockClear();
+    const exec = vi.fn();
+    await __applyInputMessageForTests({
+      sshConn: fakeConn,
+      currentTmuxSession: null,
+      currentHostId: 7,
+      execCommand: exec,
+      data: "x",
+      // messageQueueItemId omitted → mqid stringified as "none" (matches :2597 idiom)
+    });
+    expect(exec).not.toHaveBeenCalled();
+    expect(sshLogger.warn).toHaveBeenCalledTimes(1);
+    const [, payload] = vi.mocked(sshLogger.warn).mock.calls[0];
+    expect(payload).toMatchObject({
+      operation: "pv_input_drop_no_session",
+      mqid: "none",
+      hostId: 7,
+      hasSshConn: true,
+      hasTmuxSession: false,
+      dataLen: 1,
+    });
+  });
+
+  it("input: guard-drop log fires when both null with empty data (drop-log ordering: sshConn/tmuxSession guard runs BEFORE the empty-data guard)", async () => {
+    // Note: the empty-data guard is BELOW the sshConn/tmuxSession guard in
+    // the current code (compose-send.ts :2585 vs. :2588), so the drop-log
+    // fires first even for empty data. This documents that ordering intent.
+    vi.mocked(sshLogger.warn).mockClear();
+    const exec = vi.fn();
+    await __applyInputMessageForTests({
+      sshConn: null,
+      currentTmuxSession: null,
+      currentHostId: null,
+      execCommand: exec,
+      data: "",
+    });
+    expect(exec).not.toHaveBeenCalled();
+    expect(sshLogger.warn).toHaveBeenCalledTimes(1);
+    const [, payload] = vi.mocked(sshLogger.warn).mock.calls[0];
+    expect(payload).toMatchObject({
+      operation: "pv_input_drop_no_session",
+      mqid: "none",
+      hostId: null,
+      hasSshConn: false,
+      hasTmuxSession: false,
+      dataLen: 0,
+    });
+  });
+
+  it("input: empty data → no execCommand call (regardless of mqid)", async () => {
+    const exec = vi.fn();
+    await __applyInputMessageForTests({
+      sshConn: fakeConn,
+      currentTmuxSession: "legit-session",
+      currentHostId: 1,
+      execCommand: exec,
+      data: "",
+      messageQueueItemId: "pv-test-mqid-1",
+    });
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("input: data.length > MAX_INPUT_BYTES → no execCommand call, send_keys_error too_large sent at once", async () => {
+    const exec = vi.fn();
+    const wsSend = vi.fn();
+    const bigData = "x".repeat(MAX_INPUT_BYTES + 1) + "\r";
+    await __applyInputMessageForTests({
+      sshConn: fakeConn,
+      currentTmuxSession: "legit-session",
+      currentHostId: 1,
+      execCommand: exec,
+      data: bigData,
+      messageQueueItemId: "mq-big",
+      wsSend,
+    });
+    expect(exec).not.toHaveBeenCalled();
+    expect(wsSend).toHaveBeenCalledTimes(1);
+    expect(wsSend.mock.calls[0][0]).toMatchObject({
+      type: "send_keys_error",
+      mqid: "mq-big",
+      reason: "too_large",
+    });
+    expect(wsSend.mock.calls[0][0].message).toMatch(/Too long to send \(257 KB; the limit is 256 KB\)/);
+  });
+
+  it("input: an oversize send to a dormant pane is refused before any wake (nothing exec'd)", async () => {
+    const exec = vi.fn().mockResolvedValue("");
+    const wsSend = vi.fn();
+    const setWakeTriggerTs = vi.fn();
+    await __applyInputMessageForTests({
+      sshConn: fakeConn,
+      currentTmuxSession: "legit-session",
+      currentHostId: 1,
+      execCommand: exec,
+      data: "x".repeat(MAX_INPUT_BYTES + 1) + "\r",
+      messageQueueItemId: "mq-big-dormant",
+      wsSend,
+      dormantLastEmitted: () => true,
+      setWakeTriggerTs,
+      markerCommand: vi.fn().mockResolvedValue(null),
+      now: () => 1,
+    });
+    expect(exec).not.toHaveBeenCalled();
+    expect(setWakeTriggerTs).not.toHaveBeenCalled();
+    expect(wsSend).toHaveBeenCalledWith(expect.objectContaining({ type: "send_keys_error", reason: "too_large" }));
+  });
+
+  it("input: a 17.8 KB dictation (over tmux's ~16 KB command limit) is pasted in one go from a chunk-built buffer, then Enter", async () => {
+    vi.useFakeTimers();
+    try {
+      const exec = vi.fn().mockResolvedValue("");
+      const body = "word ".repeat(3566); // 17,830 chars, the size that was dropped
+      const p = __applyInputMessageForTests({
+        sshConn: fakeConn,
+        currentTmuxSession: "legit-session",
+        currentHostId: 1,
+        execCommand: exec,
+        data: body + "\r",
+        messageQueueItemId: "mq-long",
+      });
+      await vi.runAllTimersAsync();
+      await p;
+      const cmds = exec.mock.calls.map((c) => c[1] as string);
+      const typed = cmds.filter((c) => c.includes("tmux set-buffer"));
+      expect(typed).toHaveLength(1); // one shell command: 3 set-buffer calls + one paste
+      const calls = typed[0].split(" && ");
+      expect(calls.length).toBe(4);
+      expect(calls[3]).toMatch(/^tmux paste-buffer -p -r -d -b 'skynet-send-[0-9a-f]+' -t 'legit-session'$/);
+      for (const call of calls) expect(call.length).toBeLessThan(16 * 1024);
+      expect(cmds[cmds.length - 1]).toMatch(/send-keys -t 'legit-session' Enter$/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("input: NON-SPLIT case (no mqid, data = 'hello') → exactly ONE execCommand with -l flag, no Enter", async () => {
+    const exec = vi.fn().mockResolvedValue("");
+    await __applyInputMessageForTests({
+      sshConn: fakeConn,
+      currentTmuxSession: "legit-session",
+      currentHostId: 1,
+      execCommand: exec,
+      data: "hello",
+    });
+    expect(exec).toHaveBeenCalledTimes(1);
+    const cmd = exec.mock.calls[0][1] as string;
+    expect(cmd).toContain("send-keys");
+    expect(cmd).toContain("-l");
+    expect(cmd).toContain("-t 'legit-session'");
+    expect(cmd).toContain("'hello'");
+    expect(cmd).not.toMatch(/\sEnter\s*$/);
+  });
+
+  it("input: NON-SPLIT case (mqid = '', data = 'hello\\r') → exactly ONE execCommand (empty mqid → non-split even though \\r present)", async () => {
+    const exec = vi.fn().mockResolvedValue("");
+    await __applyInputMessageForTests({
+      sshConn: fakeConn,
+      currentTmuxSession: "legit-session",
+      currentHostId: 1,
+      execCommand: exec,
+      data: "hello\r",
+      messageQueueItemId: "",
+    });
+    // mqid is empty string → isSplitSend = false → one call
+    expect(exec).toHaveBeenCalledTimes(1);
+    const cmd = exec.mock.calls[0][1] as string;
+    expect(cmd).toContain("-l");
+    expect(cmd).not.toMatch(/\sEnter\s*$/);
+  });
+
+  it("input: NON-SPLIT case (mqid = 'x', data = 'hello' — no trailing \\r) → exactly ONE execCommand", async () => {
+    const exec = vi.fn().mockResolvedValue("");
+    await __applyInputMessageForTests({
+      sshConn: fakeConn,
+      currentTmuxSession: "legit-session",
+      currentHostId: 1,
+      execCommand: exec,
+      data: "hello",
+      messageQueueItemId: "x",
+    });
+    // data does not end in \r → isSplitSend = false → one call
+    expect(exec).toHaveBeenCalledTimes(1);
+    const cmd = exec.mock.calls[0][1] as string;
+    expect(cmd).toContain("-l");
+    expect(cmd).not.toMatch(/\sEnter\s*$/);
+  });
+
+  it("input: body starting with '-' is passed after `--` so tmux doesn't parse it as a flag (non-split)", async () => {
+    const exec = vi.fn().mockResolvedValue("");
+    await __applyInputMessageForTests({
+      sshConn: fakeConn,
+      currentTmuxSession: "legit-session",
+      currentHostId: 1,
+      execCommand: exec,
+      data: "- a list item",
+    });
+    const cmd = exec.mock.calls[0][1] as string;
+    expect(cmd).toContain(" -- '- a list item'");
+  });
+
+  it("input: body starting with '-' is passed after `--` so tmux doesn't parse it as a flag (split-send)", async () => {
+    vi.useFakeTimers();
+    const exec = vi.fn().mockResolvedValue("");
+    const promise = __applyInputMessageForTests({
+      sshConn: fakeConn,
+      currentTmuxSession: "legit-session",
+      currentHostId: 1,
+      execCommand: exec,
+      data: "-- **Badge** diff line\r",
+      messageQueueItemId: "pv-test-mqid-dash",
+    });
+    await vi.advanceTimersByTimeAsync(1000);
+    await promise;
+    const cmd1 = exec.mock.calls[0][1] as string;
+    expect(cmd1).toContain(" -- '-- **Badge** diff line'");
+  });
+
+  it("input: SPLIT-SEND case under fake timers → 1000ms boundary enforced", async () => {
+    // Gate: at t=999ms still ONE call; at t=1000ms exactly TWO calls.
+    // Mirrors claude-session-server.aside.test.ts:376-403 (200ms gate for injectBtw),
+    // substituting 999/1 for the 1000ms boundary (bumped from 250ms 2026-08-21
+    // by tina after diagnosing stuck sends; see claude-session-server.ts's
+    // SPLIT_SEND_DELAY block for reasoning).
+    vi.useFakeTimers();
+    const exec = vi.fn().mockResolvedValue("");
+
+    // Kick off without awaiting so we can interleave timer ticks.
+    const promise = __applyInputMessageForTests({
+      sshConn: fakeConn,
+      currentTmuxSession: "legit-session",
+      currentHostId: 1,
+      execCommand: exec,
+      data: "hello\r",
+      messageQueueItemId: "pv-test-mqid-1",
+    });
+
+    // Flush microtasks so call #1 (body write) completes before timer gate check.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // At 999ms — body write has fired, Enter (at 1000ms) has NOT yet fired.
+    await vi.advanceTimersByTimeAsync(999);
+    expect(exec.mock.calls.length).toBe(1);
+
+    // Body call: must have -l flag, must NOT be the Enter call
+    const cmd1 = exec.mock.calls[0][1] as string;
+    expect(cmd1).toContain("send-keys");
+    expect(cmd1).toContain("-l");
+    expect(cmd1).toContain("-t 'legit-session'");
+    expect(cmd1).toContain("'hello'");
+    expect(cmd1).not.toMatch(/\sEnter\s*$/);
+
+    // Advance 1ms more (total 1000ms) — setTimeout fires, Enter write executes.
+    await vi.advanceTimersByTimeAsync(1);
+    // Flush microtasks triggered by the timer.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(exec.mock.calls.length).toBe(2);
+
+    // Enter call: NO -l flag, command ends with Enter
+    const cmd2 = exec.mock.calls[1][1] as string;
+    expect(cmd2).toContain("send-keys");
+    expect(cmd2).not.toContain("-l");
+    expect(cmd2).toContain("-t 'legit-session'");
+    expect(cmd2).toMatch(/\sEnter\s*$/);
+
+    await promise;
+  });
+
+  it("input: SPLIT-SEND with empty body (mqid = 'x', data = '\\r') → SKIP body write, ONE Enter call at 1000ms", async () => {
+    // Edge case: data is just \r with a non-empty mqid → isSplitSend=true, body is empty.
+    // Body write is SKIPPED (body.length === 0); only the Enter call fires after 1000ms.
+    vi.useFakeTimers();
+    const exec = vi.fn().mockResolvedValue("");
+
+    const promise = __applyInputMessageForTests({
+      sshConn: fakeConn,
+      currentTmuxSession: "legit-session",
+      currentHostId: 1,
+      execCommand: exec,
+      data: "\r",
+      messageQueueItemId: "x",
+    });
+
+    // Flush microtasks — body write is skipped so at t=0 there are ZERO calls.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(exec.mock.calls.length).toBe(0);
+
+    // Advance past 1000ms — Enter fires.
+    await vi.advanceTimersByTimeAsync(1000);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(exec.mock.calls.length).toBe(1);
+    const cmd = exec.mock.calls[0][1] as string;
+    expect(cmd).toMatch(/\sEnter\s*$/);
+    expect(cmd).not.toContain("-l");
+
+    await promise;
+  });
+
+  it("input: trust boundary — command contains 'legit-session', NOT any spoofed value", async () => {
+    // The seam signature takes currentTmuxSession as a parameter and never reads
+    // any client-supplied hostId/tmuxSession from the payload. The trust assertion
+    // is trivially structural — the seam doesn't have a "msg" parameter — but the
+    // command-string assertion serves as a regression-guard + documentation.
+    // Mirrors T-14-02-01 / T-cd6-01 posture from CONTEXT.md § Trust Boundary.
+    const exec = vi.fn().mockResolvedValue("");
+    await __applyInputMessageForTests({
+      sshConn: fakeConn,
+      currentTmuxSession: "legit-session",
+      currentHostId: 1,
+      execCommand: exec,
+      data: "hello",
+      // Note: the seam signature has NO hostId/tmuxSession fields from the payload —
+      // the trust boundary is enforced structurally. There is no "spoofed" field to pass.
+      // The test verifies the emitted command uses the explicit currentTmuxSession value.
+    });
+    expect(exec).toHaveBeenCalledTimes(1);
+    const cmd = exec.mock.calls[0][1] as string;
+    // Command must contain the session name we passed (shell-quoted)
+    expect(cmd).toContain("'legit-session'");
+    // Confirm command does NOT contain some other value that could indicate a spoof
+    expect(cmd).not.toContain("spoofed-session");
+  });
+
+  it("input: execCommand throws on body call in split-send → caught; no rethrow; Enter does NOT fire", async () => {
+    // The try block wraps BOTH the body await and the Enter await. A throw on the body
+    // call short-circuits the Enter — this is documented behavior (log-and-swallow posture
+    // per D-PVWS-05 mirrors raw_keystrokes at :4041-4051).
+    vi.useFakeTimers();
+    const exec = vi.fn().mockRejectedValue(new Error("SSH channel closed"));
+
+    // Must resolve without throwing (log-and-swallow).
+    const promise = __applyInputMessageForTests({
+      sshConn: fakeConn,
+      currentTmuxSession: "legit-session",
+      currentHostId: 1,
+      execCommand: exec,
+      data: "hello\r",
+      messageQueueItemId: "pv-test-mqid-1",
+    });
+
+    // Advance timers past 1000ms — the throw already caught in catch block; Enter never fires.
+    await vi.advanceTimersByTimeAsync(1100);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    await expect(promise).resolves.toBeUndefined();
+    // Only one execCommand attempt was made (the body call that threw)
+    expect(exec).toHaveBeenCalledTimes(1);
+  });
+
+  it("input: execCommand throws on non-split call → caught; no rethrow", async () => {
+    const exec = vi.fn().mockRejectedValue(new Error("exec error"));
+    await expect(
+      __applyInputMessageForTests({
+        sshConn: fakeConn,
+        currentTmuxSession: "legit-session",
+        currentHostId: 1,
+        execCommand: exec,
+        data: "hello",
+      }),
+    ).resolves.toBeUndefined();
+    expect(exec).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── __applyInterruptMessageForTests ─────────────────────────────────────────
+//
+// shape-interrupt-button: Escape, then a transcript-only verdict from the
+// connection's cancel tracker; one Ctrl-C only to clear a rewound prompt.
+
+/** Tracker whose latest prompt was already answered (an idle press). */
+function idleTracker(): InterruptCancelTracker {
+  const t = new InterruptCancelTracker();
+  t.observe({ type: "user", uuid: "p1", parentUuid: "root", message: { content: "hi" } }, "hi");
+  t.observe({ type: "assistant", uuid: "a1", parentUuid: "p1", message: { content: [{ type: "text", text: "hello" }] } }, null);
+  return t;
+}
+
+/** Tracker whose latest prompt has nothing but its attachments (rewindable). */
+function rewindableTracker(): InterruptCancelTracker {
+  const t = new InterruptCancelTracker();
+  t.observe({ type: "user", uuid: "p1", parentUuid: "root", message: { content: "write a poem" } }, "write a poem");
+  t.observe({ type: "attachment", uuid: "at1", parentUuid: "p1" }, null);
+  return t;
+}
+
+/** Manual clock + wait that advances it, so the marker wait never sleeps. */
+function manualClock(start: number) {
+  const clock = { t: start, waits: 0 };
+  return {
+    clock,
+    now: () => clock.t,
+    wait: async (ms: number) => {
+      clock.waits += 1;
+      clock.t += ms;
+    },
+  };
+}
+
+describe("__applyInterruptMessageForTests", () => {
+  beforeEach(() => {
+    // The throttle Map is module-scope and persists across tests.
+    __interruptThrottleForTests.clear();
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+    vi.useRealTimers();
+  });
+
+  it("sshConn null → refused, no keystroke", async () => {
+    const exec = vi.fn();
+    const tracker = idleTracker();
+    await expect(
+      __applyInterruptMessageForTests({
+        sshConn: null,
+        currentTmuxSession: "legit-session",
+        currentHostId: 1,
+        execCommand: exec,
+        tracker: () => tracker,
+      }),
+    ).resolves.toBeNull();
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("currentTmuxSession null → refused, no keystroke", async () => {
+    const exec = vi.fn();
+    const tracker = idleTracker();
+    await expect(
+      __applyInterruptMessageForTests({
+        sshConn: fakeConn,
+        currentTmuxSession: null,
+        currentHostId: 1,
+        execCommand: exec,
+        tracker: () => tracker,
+      }),
+    ).resolves.toBeNull();
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("idle press → exactly ONE keystroke, Escape (tmux key name, no -l, no Enter); verdict none", async () => {
+    const exec = vi.fn().mockResolvedValue("");
+    const tracker = idleTracker();
+    const { now, wait } = manualClock(1_000);
+    const verdict = await __applyInterruptMessageForTests({
+      sshConn: fakeConn,
+      currentTmuxSession: "legit-session",
+      currentHostId: 1,
+      execCommand: exec,
+      tracker: () => tracker,
+      now,
+      wait,
+    });
+    expect(verdict).toEqual({ verdict: "none", reason: "agent_output" });
+    expect(exec).toHaveBeenCalledTimes(1);
+    const cmd = exec.mock.calls[0][1] as string;
+    expect(cmd).toBe("tmux send-keys -t 'legit-session' Escape");
+    expect(cmd).not.toContain("-l");
+    expect(cmd).not.toContain("C-c");
+  });
+
+  it("marker wait is bounded: an idle press waits INTERRUPT_MARKER_WAIT_MS then stops polling", async () => {
+    const exec = vi.fn().mockResolvedValue("");
+    const tracker = idleTracker();
+    const { clock, now, wait } = manualClock(5_000);
+    await __applyInterruptMessageForTests({
+      sshConn: fakeConn,
+      currentTmuxSession: "bounded",
+      currentHostId: 1,
+      execCommand: exec,
+      tracker: () => tracker,
+      now,
+      wait,
+    });
+    expect(clock.t - 5_000).toBe(INTERRUPT_MARKER_WAIT_MS);
+    expect(clock.waits).toBe(INTERRUPT_MARKER_WAIT_MS / 100);
+  });
+
+  it("stopped: the marker lands during the wait → verdict stopped, never a Ctrl-C", async () => {
+    const exec = vi.fn().mockResolvedValue("");
+    const tracker = new InterruptCancelTracker();
+    tracker.observe({ type: "user", uuid: "p1", parentUuid: "root", message: { content: "long job" } }, "long job");
+    tracker.observe({ type: "assistant", uuid: "a1", parentUuid: "p1", message: { content: [{ type: "text", text: "partial" }] } }, null);
+    const { clock, now } = manualClock(10_000);
+    const wait = async (ms: number) => {
+      clock.t += ms;
+      // the harness writes its marker right after the stop
+      tracker.observe(
+        { type: "user", uuid: "m1", parentUuid: "a1", message: { content: [{ type: "text", text: "[Request interrupted by user]" }] } },
+        null,
+      );
+    };
+    const verdict = await __applyInterruptMessageForTests({
+      sshConn: fakeConn,
+      currentTmuxSession: "stop-pane",
+      currentHostId: 3,
+      execCommand: exec,
+      tracker: () => tracker,
+      now,
+      wait,
+    });
+    expect(verdict).toEqual({ verdict: "stopped" });
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(exec.mock.calls[0][1]).toContain("Escape");
+    expect(clock.t - 10_000).toBe(100); // stopped polling as soon as the marker landed
+  });
+
+  it("cancelled: nothing from the agent and no marker → Escape then ONE Ctrl-C to clear; prompt marked cancelled", async () => {
+    const exec = vi.fn().mockResolvedValue("");
+    const tracker = rewindableTracker();
+    const { now, wait } = manualClock(20_000);
+    const verdict = await __applyInterruptMessageForTests({
+      sshConn: fakeConn,
+      currentTmuxSession: "cancel-pane",
+      currentHostId: 4,
+      execCommand: exec,
+      tracker: () => tracker,
+      now,
+      wait,
+    });
+    expect(verdict?.verdict).toBe("cancelled");
+    if (verdict?.verdict === "cancelled") {
+      expect(verdict.prompt.uuid).toBe("p1");
+      expect(verdict.prompt.visibleText).toBe("write a poem");
+    }
+    expect(exec.mock.calls.map((c) => c[1])).toEqual([
+      "tmux send-keys -t 'cancel-pane' Escape",
+      "tmux send-keys -t 'cancel-pane' C-c",
+    ]);
+    // A later press on the same prompt never re-cancels (no stray Ctrl-C).
+    expect(tracker.decide(tracker.snapshot())).toEqual({ verdict: "none", reason: "already_cancelled" });
+  });
+
+  it("work indicator: stop and cancel touch the session's stopped marker; an idle press and a bad id do not", async () => {
+    const sid = "0c0919a4-b61b-43ff-bece-8b5e49d6d836";
+    const run = async (tracker: InterruptCancelTracker, sessionIdFromFile: string, pane: string) => {
+      __interruptThrottleForTests.clear();
+      const exec = vi.fn().mockResolvedValue("");
+      const { now, wait } = manualClock(30_000);
+      await __applyInterruptMessageForTests({
+        sshConn: fakeConn,
+        currentTmuxSession: pane,
+        currentHostId: 5,
+        execCommand: exec,
+        tracker: () => tracker,
+        sessionIdFromFile,
+        now,
+        wait,
+      });
+      return exec.mock.calls.map((c) => c[1] as string);
+    };
+    const touch = `mkdir -p "$HOME/.claude/fleet-status/hooks/${sid}" && touch "$HOME/.claude/fleet-status/hooks/${sid}"/stopped`;
+
+    expect(await run(rewindableTracker(), sid, "p")).toEqual([
+      "tmux send-keys -t 'p' Escape",
+      "tmux send-keys -t 'p' C-c",
+      touch,
+    ]);
+
+    const working = new InterruptCancelTracker();
+    working.observe({ type: "user", uuid: "p1", parentUuid: "r", message: { content: "go" } }, "go");
+    working.observe({ type: "assistant", uuid: "a1", parentUuid: "p1", message: { content: [{ type: "text", text: "…" }] } }, null);
+    working.observe({ type: "user", uuid: "m1", parentUuid: "a1", message: { content: [{ type: "text", text: "[Request interrupted by user]" }] } }, null);
+    // marker already present before the press does not count — only markers after it
+    expect(await run(working, sid, "q")).toEqual(["tmux send-keys -t 'q' Escape"]);
+
+    expect(await run(idleTracker(), sid, "r")).toEqual(["tmux send-keys -t 'r' Escape"]);
+    expect(await run(rewindableTracker(), "../../etc", "s")).toEqual([
+      "tmux send-keys -t 's' Escape",
+      "tmux send-keys -t 's' C-c",
+    ]);
+  });
+
+  it("Escape send throws → caught, interrupt_send_error warned, no further keystroke, refused", async () => {
+    const exec = vi.fn().mockRejectedValue(new Error("SSH channel closed"));
+    const tracker = rewindableTracker();
+    vi.mocked(sshLogger.warn).mockClear();
+    await expect(
+      __applyInterruptMessageForTests({
+        sshConn: fakeConn,
+        currentTmuxSession: "legit-session",
+        currentHostId: 1,
+        execCommand: exec,
+        tracker: () => tracker,
+      }),
+    ).resolves.toBeNull();
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(sshLogger.warn).mock.calls[0][1]).toMatchObject({ operation: "interrupt_send_error", key: "Escape" });
+  });
+
+  it("throttle — same-pane collapse: second press within 2500ms sends nothing and warns interrupt_throttled", async () => {
+    const { clock, now, wait } = manualClock(1_000_000);
+    const exec = vi.fn().mockResolvedValue("");
+    const tracker = idleTracker();
+    vi.mocked(sshLogger.warn).mockClear();
+    const deps = {
+      sshConn: fakeConn,
+      currentTmuxSession: "throttle-test-same",
+      currentHostId: 42,
+      execCommand: exec,
+      tracker: () => tracker,
+      now,
+      wait,
+    };
+    await __applyInterruptMessageForTests(deps);
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(sshLogger.warn)).not.toHaveBeenCalled();
+
+    // The first press already spent 1500ms waiting; 500ms more is 2000ms total.
+    clock.t += 500;
+    await expect(__applyInterruptMessageForTests(deps)).resolves.toEqual({ verdict: "none", reason: "throttled" });
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(sshLogger.warn)).toHaveBeenCalledTimes(1);
+    const [, payload] = vi.mocked(sshLogger.warn).mock.calls[0];
+    expect(payload).toMatchObject({
+      operation: "interrupt_throttled",
+      hostId: 42,
+      tmuxSession: "throttle-test-same",
+    });
+    expect((payload as { elapsedMs: number }).elapsedMs).toBe(2000);
+  });
+
+  it("throttle — cross-pane independence: presses on different panes at the same instant all send", async () => {
+    const tracker = idleTracker();
+    const execs = [vi.fn(), vi.fn(), vi.fn(), vi.fn()].map((f) => f.mockResolvedValue(""));
+    vi.mocked(sshLogger.warn).mockClear();
+    const panes: Array<[string, number]> = [
+      ["pane-alpha", 10],
+      ["pane-beta", 10],
+      ["shared-session-name", 20],
+      ["shared-session-name", 21],
+    ];
+    for (let i = 0; i < panes.length; i++) {
+      const { now, wait } = manualClock(2_000_000);
+      await __applyInterruptMessageForTests({
+        sshConn: fakeConn,
+        currentTmuxSession: panes[i][0],
+        currentHostId: panes[i][1],
+        execCommand: execs[i],
+        tracker: () => tracker,
+        now,
+        wait,
+      });
+    }
+    execs.forEach((e) => expect(e).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(sshLogger.warn)).not.toHaveBeenCalled();
+  });
+
+  it("throttle — post-window release: a press 2600ms after the last sends normally", async () => {
+    const tracker = idleTracker();
+    const exec = vi.fn().mockResolvedValue("");
+    vi.mocked(sshLogger.warn).mockClear();
+    const first = manualClock(3_000_000);
+    await __applyInterruptMessageForTests({
+      sshConn: fakeConn,
+      currentTmuxSession: "post-window-pane",
+      currentHostId: 99,
+      execCommand: exec,
+      tracker: () => tracker,
+      now: first.now,
+      wait: first.wait,
+    });
+    const second = manualClock(3_002_600);
+    await __applyInterruptMessageForTests({
+      sshConn: fakeConn,
+      currentTmuxSession: "post-window-pane",
+      currentHostId: 99,
+      execCommand: exec,
+      tracker: () => tracker,
+      now: second.now,
+      wait: second.wait,
+    });
+    expect(exec).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(sshLogger.warn)).not.toHaveBeenCalled();
+    expect(exec.mock.calls.every((c) => (c[1] as string).endsWith("Escape"))).toBe(true);
+  });
+
+  // Guards the record-BEFORE-await ordering: execCommand has unbounded latency,
+  // so two presses can be in flight on one pane at once.
+  it("throttle — concurrent in-flight on one pane: slow exec still collapses to ONE keystroke", async () => {
+    const { clock, now, wait } = manualClock(4_000_000);
+    let releaseFirstExec: () => void = () => {};
+    let signalFirstExecStarted: () => void = () => {};
+    const firstExecStarted = new Promise<void>((resolve) => {
+      signalFirstExecStarted = resolve;
+    });
+    const exec = vi.fn().mockImplementation(
+      () =>
+        new Promise<string>((resolveExec) => {
+          releaseFirstExec = () => resolveExec("");
+          signalFirstExecStarted();
+        }),
+    );
+    const tracker = idleTracker();
+    vi.mocked(sshLogger.warn).mockClear();
+    const deps = {
+      sshConn: fakeConn,
+      currentTmuxSession: "concurrent-pane",
+      currentHostId: 7,
+      execCommand: exec,
+      tracker: () => tracker,
+      now,
+      wait,
+    };
+
+    const first = __applyInterruptMessageForTests(deps);
+    await firstExecStarted;
+    expect(exec).toHaveBeenCalledTimes(1);
+
+    clock.t += 10;
+    await __applyInterruptMessageForTests(deps);
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(sshLogger.warn)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(sshLogger.warn).mock.calls[0][1]).toMatchObject({
+      operation: "interrupt_throttled",
+      hostId: 7,
+      tmuxSession: "concurrent-pane",
+    });
+
+    releaseFirstExec();
+    await first;
+    expect(exec).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── Phase 50 Plan 02 Task 2 — pv-send-watchdog wire-up + send_keys_error frame ─
+//
+// Tests for the new wire-up between __applyInputMessageForTests and the
+// pv-send-watchdog module (Task 1). Also covers the send_keys_error frame
+// emission on execCommand throw (D-21) and the WS-close cleanup path (Test 6,
+// MANDATORY per checker Warning #5).
+//
+// The seam signature was widened with three OPTIONAL injectable deps:
+//   • sessionId    — threaded to arm-time key
+//   • wsSend       — used both for send_keys_error emission and passed to
+//                    the watchdog for later paste_send_failed escalation
+//   • armWatchdog  — injectable so tests can spy without needing the real
+//                    module-level Map state
+//   • trackMqid    — caller-supplied hook that records the mqid in the
+//                    per-connection pendingMqidsForThisConnection Set
+//
+// All four are optional to preserve pre-existing test call sites (see the
+// describe block above — those calls omit the new deps and take the pre-
+// Phase-50 behavior path unchanged).
+
+describe("__applyInputMessageForTests — pv-send-watchdog wire-up (Task 2)", () => {
+  beforeEach(() => {
+    __resetPvSendWatchdogForTests();
+  });
+
+  afterEach(() => {
+    __resetPvSendWatchdogForTests();
+    vi.clearAllMocks();
+    vi.useRealTimers();
+  });
+
+  it("Test 1: split-send with mqid → armPvSendWatchdog called without contentHash", async () => {
+    vi.useFakeTimers();
+    const exec = vi.fn().mockResolvedValue("");
+    const wsSend = vi.fn();
+    const armWatchdog = vi.fn();
+    const trackMqid = vi.fn();
+
+    const promise = __applyInputMessageForTests({
+      sshConn: fakeConn,
+      currentTmuxSession: "legit-session",
+      currentHostId: 1,
+      execCommand: exec,
+      data: "hello\r",
+      messageQueueItemId: "m1",
+      sessionId: "sess-A",
+      wsSend,
+      armWatchdog,
+      trackMqid,
+    });
+
+    // Advance past the 1000ms split-send gate so Enter completes.
+    await vi.advanceTimersByTimeAsync(1100);
+    await Promise.resolve();
+    await Promise.resolve();
+    await promise;
+
+    // Body + Enter fired
+    expect(exec).toHaveBeenCalledTimes(2);
+    // Watchdog armed exactly once, after successful Enter
+    expect(armWatchdog).toHaveBeenCalledTimes(1);
+    const armArgs = armWatchdog.mock.calls[0][0] as {
+      sessionId: string;
+      mqid: string;
+      body: string;
+      tmuxTarget: string;
+      wsSend: unknown;
+      execCommand: unknown;
+    };
+    expect(armArgs.sessionId).toBe("sess-A");
+    expect(armArgs.mqid).toBe("m1");
+    expect(armArgs.body).toBe("hello");
+    expect(armArgs.tmuxTarget).toBe("legit-session");
+    expect(armArgs.wsSend).toBe(wsSend);
+    expect(typeof armArgs.execCommand).toBe("function");
+    // trackMqid called with the mqid
+    expect(trackMqid).toHaveBeenCalledTimes(1);
+    expect(trackMqid).toHaveBeenCalledWith("m1");
+    // No error frame
+    expect(wsSend).not.toHaveBeenCalled();
+  });
+
+  it("Test 2: non-split (no mqid) → armPvSendWatchdog NOT called", async () => {
+    const exec = vi.fn().mockResolvedValue("");
+    const wsSend = vi.fn();
+    const armWatchdog = vi.fn();
+    const trackMqid = vi.fn();
+
+    await __applyInputMessageForTests({
+      sshConn: fakeConn,
+      currentTmuxSession: "legit-session",
+      currentHostId: 1,
+      execCommand: exec,
+      data: "hello",
+      sessionId: "sess-A",
+      wsSend,
+      armWatchdog,
+      trackMqid,
+    });
+
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(armWatchdog).not.toHaveBeenCalled();
+    expect(trackMqid).not.toHaveBeenCalled();
+    expect(wsSend).not.toHaveBeenCalled();
+  });
+
+  it("Test 2b (Fix #1): bare-Enter split-send (data='\\r' + mqid) → armPvSendWatchdog NOT called and pending Map stays empty", async () => {
+    // Regression: MessageQueueDrawer sends two separate WS events for its
+    // queued send — (a) body without \r without mqid, then (b) bare "\r"
+    // with mqid ~60ms later. Event (b) enters __applyInputMessageForTests
+    // with data="\r" + non-empty mqid → isSplitSend=true but body="".
+    //
+    // Previously we armed a watchdog against sha256("").slice(0,32). The
+    // parser never emits an empty-content message frame → notifyMatched
+    // NEVER fires for that hash → guaranteed T+2.5s retry Enter, T+5.5s
+    // full re-send, T+20s paste_send_failed. Silent noise on every
+    // queue-drawer send.
+    //
+    // Fix: skip the arm entirely when body.length === 0 — the message
+    // body was already written by a prior WS input event (queue-drawer
+    // step (a)); the bare Enter alone does not need signal-driven retry
+    // escalation.
+    vi.useFakeTimers();
+    __resetPvSendWatchdogForTests();
+    const exec = vi.fn().mockResolvedValue("");
+    const wsSend = vi.fn();
+    const trackMqid = vi.fn();
+
+    // Use the REAL armPvSendWatchdog so we can observe module-level pending
+    // Map state — a spied vi.fn() would not exercise the real behavior we
+    // want to protect against (the module-level Map growing an entry for
+    // sha256("") that no signal will ever clear).
+    const promise = __applyInputMessageForTests({
+      sshConn: fakeConn,
+      currentTmuxSession: "legit-session",
+      currentHostId: 1,
+      execCommand: exec,
+      data: "\r",
+      messageQueueItemId: "mqid-bare-enter",
+      sessionId: "sess-A",
+      wsSend,
+      armWatchdog: armPvSendWatchdog,
+      trackMqid,
+    });
+
+    // Advance past the 1000ms split-send gate so the Enter completes.
+    await vi.advanceTimersByTimeAsync(1000);
+    await Promise.resolve();
+    await Promise.resolve();
+    await promise;
+
+    // Split-send fired only the Enter (body write was skipped for body="").
+    expect(exec).toHaveBeenCalledTimes(1);
+    const cmd = exec.mock.calls[0][1] as string;
+    expect(cmd).toMatch(/\sEnter\s*$/);
+
+    // armPvSendWatchdog MUST NOT have been called → trackMqid not invoked.
+    expect(trackMqid).not.toHaveBeenCalled();
+
+    // Observable side-effect proof: advance past all three watchdog stages.
+    // If a watchdog HAD been armed against sha256("").slice(0,32), it would
+    // fire retry Enter (2500ms), full-resend C-u+body+Enter (5500ms), and
+    // paste_send_failed (20000ms). None of those should occur.
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    // exec still at 1 (no retry Enter → 2, no full-resend → 4).
+    expect(exec).toHaveBeenCalledTimes(1);
+    // wsSend never emitted paste_send_failed.
+    const escalations = wsSend.mock.calls.filter((c: unknown[]) => {
+      const f = c[0] as { type?: string };
+      return f?.type === "paste_send_failed" || f?.type === "send_keys_error";
+    });
+    expect(escalations.length).toBe(0);
+  });
+
+  it("Test 2c (2026-08-21, tina): non-split with data ending in \\r + no mqid → arm retry-Enter-only watchdog with synthetic mqid", async () => {
+    // Non-split-path safety net: the frontend chain sometimes loses the
+    // messageQueueItemId (diagnosed 2026-08-21 — 2/6 sends this session
+    // took the non-split path with body pasted + literal \r → composer
+    // newline, no submit, watchdog never armed). This test locks in the
+    // rescue: on non-split with data.length > 1 && data.endsWith("\r"),
+    // arm a retry-Enter-only watchdog with a synthetic backend-side mqid.
+    // The retry Enter at T+2500ms submits whatever's in the composer.
+    const exec = vi.fn().mockResolvedValue("");
+    const wsSend = vi.fn();
+    const armWatchdog = vi.fn();
+    const trackMqid = vi.fn();
+
+    await __applyInputMessageForTests({
+      sshConn: fakeConn,
+      currentTmuxSession: "legit-session",
+      currentHostId: 1,
+      execCommand: exec,
+      data: "hello\r",
+      // No messageQueueItemId — this is the trap: frontend meant to submit
+      // but lost the mqid somewhere; backend takes the non-split path.
+      sessionId: "sess-A",
+      wsSend,
+      armWatchdog,
+      trackMqid,
+    });
+
+    // Body written once via the non-split path (`send-keys -l <data>`).
+    expect(exec).toHaveBeenCalledTimes(1);
+    const bodyCmd = exec.mock.calls[0][1] as string;
+    expect(bodyCmd).toContain("-l");
+    expect(bodyCmd).toContain("hello");
+    // \r survives inside the single-quoted argument as a literal byte.
+    expect(bodyCmd).toContain("\r");
+
+    // Watchdog armed exactly once with retryEnterOnly=true and a synthetic mqid.
+    expect(armWatchdog).toHaveBeenCalledTimes(1);
+    const armArgs = armWatchdog.mock.calls[0][0] as {
+      sessionId: string;
+      mqid: string;
+      body: string;
+      tmuxTarget: string;
+      retryEnterOnly?: boolean;
+    };
+    expect(armArgs.sessionId).toBe("sess-A");
+    expect(armArgs.mqid).toMatch(/^backend-synth-\d+-[a-z0-9]{8}$/);
+    expect(armArgs.body).toBe("hello"); // data without trailing \r
+    expect(armArgs.tmuxTarget).toBe("legit-session");
+    expect(armArgs.retryEnterOnly).toBe(true);
+
+    // Synthetic mqid tracked on the connection for orphan-frame prevention.
+    expect(trackMqid).toHaveBeenCalledTimes(1);
+    expect(trackMqid.mock.calls[0][0]).toBe(armArgs.mqid);
+  });
+
+  it("Test 2d (2026-08-21, tina): non-split with data='\\r' only (1 byte) → do NOT arm the retry-Enter-only watchdog", async () => {
+    // Boundary check: the non-split arm gate requires data.length > 1. A
+    // bare \r on the non-split path (data='\r' without mqid) is not a
+    // compose-submit shape — it's a raw single-byte write. Do not arm.
+    const exec = vi.fn().mockResolvedValue("");
+    const armWatchdog = vi.fn();
+    const trackMqid = vi.fn();
+
+    await __applyInputMessageForTests({
+      sshConn: fakeConn,
+      currentTmuxSession: "legit-session",
+      currentHostId: 1,
+      execCommand: exec,
+      data: "\r",
+      sessionId: "sess-A",
+      wsSend: vi.fn(),
+      armWatchdog,
+      trackMqid,
+    });
+
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(armWatchdog).not.toHaveBeenCalled();
+    expect(trackMqid).not.toHaveBeenCalled();
+  });
+
+  it("Test 3: execCommand throws on body → send_keys_error frame emitted with reason exec_throw_body; armWatchdog NOT called", async () => {
+    vi.useFakeTimers();
+    const exec = vi.fn().mockRejectedValue(new Error("SSH channel closed"));
+    const wsSend = vi.fn();
+    const armWatchdog = vi.fn();
+    const trackMqid = vi.fn();
+
+    const promise = __applyInputMessageForTests({
+      sshConn: fakeConn,
+      currentTmuxSession: "legit-session",
+      currentHostId: 1,
+      execCommand: exec,
+      data: "hello\r",
+      messageQueueItemId: "m1",
+      sessionId: "sess-A",
+      wsSend,
+      armWatchdog,
+      trackMqid,
+    });
+
+    await vi.advanceTimersByTimeAsync(1100);
+    await Promise.resolve();
+    await Promise.resolve();
+    await promise;
+
+    // Only body exec attempted (threw)
+    expect(exec).toHaveBeenCalledTimes(1);
+    // wsSend called with send_keys_error
+    expect(wsSend).toHaveBeenCalledTimes(1);
+    const frame = wsSend.mock.calls[0][0] as {
+      type: string;
+      mqid: string | null;
+      reason: string;
+      message: string;
+    };
+    expect(frame.type).toBe("send_keys_error");
+    expect(frame.mqid).toBe("m1");
+    expect(frame.reason).toBe("exec_throw_body");
+    expect(frame.message).toContain("SSH channel closed");
+    // armWatchdog NOT called — no signal will ever arrive for a failed send
+    expect(armWatchdog).not.toHaveBeenCalled();
+    expect(trackMqid).not.toHaveBeenCalled();
+  });
+
+  it("Test 4: execCommand throws on Enter (after body succeeded) → send_keys_error with reason exec_throw_enter; armWatchdog NOT called", async () => {
+    vi.useFakeTimers();
+    // Body call succeeds, Enter call throws.
+    let call = 0;
+    const exec = vi.fn().mockImplementation(async () => {
+      call += 1;
+      if (call === 1) return ""; // body OK
+      throw new Error("Enter exec failed");
+    });
+    const wsSend = vi.fn();
+    const armWatchdog = vi.fn();
+    const trackMqid = vi.fn();
+
+    const promise = __applyInputMessageForTests({
+      sshConn: fakeConn,
+      currentTmuxSession: "legit-session",
+      currentHostId: 1,
+      execCommand: exec,
+      data: "hello\r",
+      messageQueueItemId: "m1",
+      sessionId: "sess-A",
+      wsSend,
+      armWatchdog,
+      trackMqid,
+    });
+
+    await vi.advanceTimersByTimeAsync(1100);
+    await Promise.resolve();
+    await Promise.resolve();
+    await promise;
+
+    expect(exec).toHaveBeenCalledTimes(2);
+    expect(wsSend).toHaveBeenCalledTimes(1);
+    const frame = wsSend.mock.calls[0][0] as {
+      type: string;
+      mqid: string | null;
+      reason: string;
+      message: string;
+    };
+    expect(frame.type).toBe("send_keys_error");
+    expect(frame.mqid).toBe("m1");
+    expect(frame.reason).toBe("exec_throw_enter");
+    expect(frame.message).toContain("Enter exec failed");
+    expect(armWatchdog).not.toHaveBeenCalled();
+    expect(trackMqid).not.toHaveBeenCalled();
+  });
+
+  it("Test 5: non-split exec throws → send_keys_error with reason exec_throw (no split, no mqid)", async () => {
+    // Non-split throw path — reason is a generic 'exec_throw', mqid is null.
+    const exec = vi.fn().mockRejectedValue(new Error("connection reset"));
+    const wsSend = vi.fn();
+    const armWatchdog = vi.fn();
+
+    await __applyInputMessageForTests({
+      sshConn: fakeConn,
+      currentTmuxSession: "legit-session",
+      currentHostId: 1,
+      execCommand: exec,
+      data: "hello",
+      // no mqid → non-split
+      sessionId: "sess-A",
+      wsSend,
+      armWatchdog,
+    });
+
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(wsSend).toHaveBeenCalledTimes(1);
+    const frame = wsSend.mock.calls[0][0] as {
+      type: string;
+      mqid: string | null;
+      reason: string;
+      message: string;
+    };
+    expect(frame.type).toBe("send_keys_error");
+    expect(frame.mqid).toBeNull();
+    expect(frame.reason).toBe("exec_throw");
+    expect(frame.message).toContain("connection reset");
+    expect(armWatchdog).not.toHaveBeenCalled();
+  });
+
+  it("Test 6 (MANDATORY per checker Warning #5): WS-close cleanup — arm two mqids on same connection, close → clearPvSendWatchdog called for each; no paste_send_failed emits", async () => {
+    // Simulates the wire-up in claude-session-server.ts's ws-connection scope:
+    //   • per-connection `pendingMqidsForThisConnection` Set
+    //   • trackMqid adds each arm's mqid
+    //   • ws.on("close") iterates the Set + calls clearPvSendWatchdog
+    vi.useFakeTimers();
+    const wsSend = vi.fn();
+
+    // Per-connection Set (mirrors production's declaration at ws-connection outer scope).
+    const pendingMqidsForThisConnection = new Set<string>();
+    const trackMqid = (mqid: string) => pendingMqidsForThisConnection.add(mqid);
+
+    // Arm two watchdogs using the REAL armPvSendWatchdog (imported at top-of-file).
+    // The Task 2 wiring under test is the trackMqid.add call — verify it happens.
+    armPvSendWatchdog({
+      sessionId: "sess-A",
+      mqid: "m1",
+      body: "one",
+      execCommand: async () => "",
+      tmuxTarget: "legit-session",
+      wsSend,
+    });
+    trackMqid("m1");
+
+    await vi.advanceTimersByTimeAsync(100);
+
+    armPvSendWatchdog({
+      sessionId: "sess-A",
+      mqid: "m2",
+      body: "two",
+      execCommand: async () => "",
+      tmuxTarget: "legit-session",
+      wsSend,
+    });
+    trackMqid("m2");
+
+    // Both mqids recorded in the per-connection Set
+    expect(pendingMqidsForThisConnection.size).toBe(2);
+    expect(pendingMqidsForThisConnection.has("m1")).toBe(true);
+    expect(pendingMqidsForThisConnection.has("m2")).toBe(true);
+
+    // Fire the ws.on("close") cleanup synchronously (spy on clearPvSendWatchdog
+    // is difficult because it's a module import — use the observable side-effect
+    // instead: after clearing, advancing past 20000ms must NOT emit paste_send_failed).
+    for (const mqid of pendingMqidsForThisConnection) {
+      clearPvSendWatchdog(mqid);
+    }
+    pendingMqidsForThisConnection.clear();
+
+    // Advance past all three timer stages for both mqids.
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    // No paste_send_failed emitted for either mqid — cleared before escalation.
+    const escalations = wsSend.mock.calls.filter((c: unknown[]) => {
+      const f = c[0] as { type?: string };
+      return f?.type === "paste_send_failed";
+    });
+    expect(escalations.length).toBe(0);
+  });
+});
+
+// ─── __applyOnLineNotifyForTests — single-notify order-based (quick-260908-bqx) ─
+//
+// Backend watchdog match primitive replaced with FIFO head-pop (order-based),
+// matching PrettyView.tsx:1961-1979. CC processes input serially, JSONL is
+// written in order, WS preserves order — SEND ORDER is the match signal.
+// notifyMatched is called with just (sessionId) — no content arg — clearing
+// the OLDEST pending arm on that session regardless of content shape.
+
+describe("__applyOnLineNotifyForTests — single-notify order-based (quick-260908-bqx)", () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("Test 1 (slash-command wrapper, WITH args): notifyMatched called EXACTLY ONCE with just (sessionId)", () => {
+    const content =
+      "<command-message>id</command-message>" +
+      "<command-name>/id</command-name>" +
+      "<command-args>tabitha</command-args>";
+
+    const spy = vi.fn();
+    __applyOnLineNotifyForTests({
+      frame: { type: "message", role: "user", content },
+      sessionIdFromFile: "sess-A",
+      notifyMatched: spy,
+    });
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledWith("sess-A");
+  });
+
+  it("user image frame (Claude Code inlined pasted image paths): notifyMatched called once", () => {
+    const spy = vi.fn();
+    __applyOnLineNotifyForTests({
+      frame: { type: "image", role: "user", text: "[Image #1] see this" },
+      sessionIdFromFile: "sess-A",
+      notifyMatched: spy,
+    });
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledWith("sess-A");
+  });
+
+  it("assistant image frame: notifyMatched NOT called", () => {
+    const spy = vi.fn();
+    __applyOnLineNotifyForTests({
+      frame: { type: "image", role: "assistant", text: "chart" },
+      sessionIdFromFile: "sess-A",
+      notifyMatched: spy,
+    });
+
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("Test 2 (plain user turn): notifyMatched called EXACTLY ONCE with just (sessionId)", () => {
+    const spy = vi.fn();
+    __applyOnLineNotifyForTests({
+      frame: { type: "message", role: "user", content: "hello" },
+      sessionIdFromFile: "sess-A",
+      notifyMatched: spy,
+    });
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledWith("sess-A");
+  });
+
+  it("Test 3 (multi-line user turn): notifyMatched called EXACTLY ONCE with just (sessionId)", () => {
+    const spy = vi.fn();
+    __applyOnLineNotifyForTests({
+      frame: { type: "message", role: "user", content: "line one\nline two" },
+      sessionIdFromFile: "sess-A",
+      notifyMatched: spy,
+    });
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledWith("sess-A");
+  });
+
+  it("Test 4 (guard — wrong type): frame with type 'assistant' → notifyMatched NOT called", () => {
+    const spy = vi.fn();
+    __applyOnLineNotifyForTests({
+      frame: { type: "assistant", role: "user", content: "hello" },
+      sessionIdFromFile: "sess-A",
+      notifyMatched: spy,
+    });
+
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("Test 5 (guard — empty content): frame with empty string content → notifyMatched NOT called", () => {
+    const spy = vi.fn();
+    __applyOnLineNotifyForTests({
+      frame: { type: "message", role: "user", content: "" },
+      sessionIdFromFile: "sess-A",
+      notifyMatched: spy,
+    });
+
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("Test 6 (guard — null sessionIdFromFile): valid frame but no session → notifyMatched NOT called", () => {
+    const spy = vi.fn();
+    __applyOnLineNotifyForTests({
+      frame: { type: "message", role: "user", content: "hello" },
+      sessionIdFromFile: null,
+      notifyMatched: spy,
+    });
+
+    expect(spy).not.toHaveBeenCalled();
+  });
+});

@@ -1,0 +1,160 @@
+/**
+ * identity-visibility-gate.test.ts — Phase 129 Plan 01 Task 2
+ *
+ * Full-matrix unit tests for isIdentityVisibleToUser — the pure companion
+ * function to resolveIdentityAppearance's cosmetics merge. Zero DB / express /
+ * logger imports; three-arg pure function, so no fixture builder needed.
+ *
+ * The 10-case matrix covers:
+ *   [nullCaller × emptyLists × userOnBoth × userOnRoleOnly
+ *    × userOnIdOnly × zoeOnBoth-userEmpty × case-sensitivity
+ *    × nullCosmetics × sharedRoleNarrowIdentity]
+ *
+ * Design locks under test:
+ *   - D-2 intersection: both sides must pass; empty/absent = "no gate on that side"
+ *   - D-3 fallback: empty/absent list on either side means "open on that side"
+ *   - null callerUsername disables gate entirely (internal / test bypass)
+ *   - Pitfall 7: case-sensitive comparison (no toLowerCase/toUpperCase)
+ */
+import { describe, it, expect } from "vitest";
+import {
+  isIdentityVisibleToUser,
+  resolveGateRoleSide,
+} from "./identity-visibility-gate.js";
+
+describe("isIdentityVisibleToUser — Phase 129 per-user visibility gate", () => {
+  it("Test 1: null caller username disables the gate entirely (returns true)", () => {
+    expect(isIdentityVisibleToUser(null, null, null)).toBe(true);
+    expect(isIdentityVisibleToUser({}, {}, null)).toBe(true);
+    expect(
+      isIdentityVisibleToUser(
+        { users: ["user"] },
+        { users: ["riley"] },
+        null,
+      ),
+    ).toBe(true);
+  });
+
+  it("Test 2: both sides empty/absent → open per D-3 fallback", () => {
+    expect(isIdentityVisibleToUser({}, {}, "user")).toBe(true);
+    expect(isIdentityVisibleToUser(null, null, "user")).toBe(true);
+    expect(
+      isIdentityVisibleToUser({ users: [] }, { users: [] }, "user"),
+    ).toBe(true);
+  });
+
+  it("Test 3: both sides list User → open for User", () => {
+    expect(
+      isIdentityVisibleToUser(
+        { users: ["user"] },
+        { users: ["user"] },
+        "user",
+      ),
+    ).toBe(true);
+  });
+
+  it("Test 4: both sides list User → CLOSED for Riley (D-2 intersection)", () => {
+    expect(
+      isIdentityVisibleToUser(
+        { users: ["user"] },
+        { users: ["user"] },
+        "riley",
+      ),
+    ).toBe(false);
+  });
+
+  it("Test 5: role open + identity narrow → CLOSED for non-matching user", () => {
+    // Identity side lists user; role side is empty (open). Riley fails
+    // identity gate → hidden.
+    expect(
+      isIdentityVisibleToUser({ users: ["user"] }, {}, "riley"),
+    ).toBe(false);
+  });
+
+  it("Test 6: role narrow + identity open → CLOSED for non-matching user", () => {
+    // Role side lists user; identity side is empty (open). Riley fails
+    // role gate → hidden.
+    expect(
+      isIdentityVisibleToUser({}, { users: ["user"] }, "riley"),
+    ).toBe(false);
+  });
+
+  it("Test 7: shared role, identity-side narrow to User → CLOSED for Riley", () => {
+    // The intersection-semantics headliner: a role shared by user+riley can
+    // still contain identities each narrowed further via identity.users.
+    expect(
+      isIdentityVisibleToUser(
+        { users: ["user"] },
+        { users: ["user", "riley"] },
+        "riley",
+      ),
+    ).toBe(false);
+  });
+
+  it("Test 8: shared role AND shared identity → open for both users", () => {
+    expect(
+      isIdentityVisibleToUser(
+        { users: ["user", "riley"] },
+        { users: ["user", "riley"] },
+        "user",
+      ),
+    ).toBe(true);
+    expect(
+      isIdentityVisibleToUser(
+        { users: ["user", "riley"] },
+        { users: ["user", "riley"] },
+        "riley",
+      ),
+    ).toBe(true);
+  });
+
+  it("Test 9: case-sensitive comparison — 'User' does NOT match 'user' (Pitfall 7 lock)", () => {
+    expect(
+      isIdentityVisibleToUser(
+        { users: ["User"] },
+        { users: ["User"] },
+        "user",
+      ),
+    ).toBe(false);
+  });
+
+  it("Test 10: null cosmetics on either side → treated as 'no gate'", () => {
+    // null identityCos treated as "no gate on identity side".
+    // Role side lists user → open for user.
+    expect(
+      isIdentityVisibleToUser(null, { users: ["user"] }, "user"),
+    ).toBe(true);
+    // null roleCos treated as "no gate on role side".
+    // Identity side lists user → closed for riley.
+    expect(
+      isIdentityVisibleToUser({ users: ["user"] }, null, "riley"),
+    ).toBe(false);
+  });
+});
+
+describe("isIdentityVisibleToUser — multi-role (role side is a list)", () => {
+  it("every listed role's users gate must pass", () => {
+    const roles = [{ users: ["user", "riley"] }, { users: ["user"] }];
+    expect(isIdentityVisibleToUser(null, roles, "user")).toBe(true);
+    expect(isIdentityVisibleToUser(null, roles, "riley")).toBe(false);
+  });
+
+  it("ungated roles (null / no users) fall open; identity side still applies", () => {
+    expect(isIdentityVisibleToUser(null, [null, {}], "riley")).toBe(true);
+    expect(
+      isIdentityVisibleToUser({ users: ["user"] }, [null, {}], "riley"),
+    ).toBe(false);
+  });
+});
+
+describe("resolveGateRoleSide", () => {
+  it("one role → that role's cosmetics; several → index-aligned list; none → null", async () => {
+    const read = async (r: string) => ({ users: [r] });
+    expect(await resolveGateRoleSide([], read)).toBeNull();
+    expect(await resolveGateRoleSide(["a"], read)).toEqual({ users: ["a"] });
+    expect(await resolveGateRoleSide(["a", "b"], read)).toEqual([
+      { users: ["a"] },
+      { users: ["b"] },
+    ]);
+  });
+});

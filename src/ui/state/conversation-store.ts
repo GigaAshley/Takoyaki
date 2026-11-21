@@ -1,0 +1,3344 @@
+// ─── Conversation store ──────────────────────────────────────────────────────
+// Module-scoped store for the Telegram-style conversation list.
+//
+// Contract (per Phase 41 Plan 01, CONTEXT.md §Sort model — middle section;
+// amended Phase 44 Plan 04 to flip Rule 1 to null-to-bottom):
+//   - Three-zone conversation list: pinned (top, stable), middle (flat, recency-
+//     desc with null-to-bottom), rdpGroup (bottom, stable).
+//   - Pinned zone + activeSet + RDP zone use `compareByHostRoleLabel`
+//     — (host outer, role middle, label inner), case-insensitive, null-role
+//     sorts last. Pre-Phase-41 the middle also used this comparator; Phase 41
+//     flipped the middle to `compareByRecencyDesc` (freshest activity first;
+//     rows with `lastMessageAt == null` sort to the BOTTOM per Phase 44 Plan 04;
+//     ties + no-history rows fall back to insertion-order key for deterministic
+//     stability).
+//   - Middle is FLAT: no host bucketing, no per-host separators, no hostTree
+//     walk. All non-pinned / non-active-set / non-RDP identity-tmux + fleet-
+//     synthetic rows land in a single `middle: ConversationRow[]` array.
+//   - RDP zone is emitted iff at least one host has `enableRdp === true`. When
+//     zero RDP-eligible hosts exist, `rdpGroup === null` (user lock: no
+//     empty RDP header). RDP rows internally follow hostTree order (see the
+//     synthesis pass below), then sort by compareByHostRoleLabel.
+//   - Plan 03 (deferred, full-stack) will populate `lastMessageAt` on rows via
+//     a fleet-status protocol extension. Until then, EVERY row has
+//     `lastMessageAt: null` (no-history branch), so the middle zone degrades
+//     cleanly to insertion-order fallback.
+//   - Pins float above the middle. Per-session (not per-host). Session
+//     end removes the row AND clears its pin in the same mutation (T-06-01-01
+//     stale-selection defense also lives here — a selected id no longer in
+//     openTabs is coerced to null).
+//   - Persistence is in-memory only (module-scoped Map/Set +
+//     React `useSyncExternalStore`). Nothing written to any browser storage
+//     layer per TG-05 — a full page refresh resets the store.
+//   - Tabs excluded from the conversation list: "dashboard". This is a
+//     singleton non-conversation surface; the conversation list is
+//     "sessions I'm talking to" (terminal / rdp / vnc / telnet on a host).
+//   - Phase 14A retired the "files", "docker", "stats", "tunnel",
+//     "host-manager", "user-profile", "admin-settings", "network_graph"
+//     tab types entirely — they're absent from the TabType union so the
+//     set below only lists what actually exists.
+//
+// Pattern is deliberately the same as src/ui/state/identities-store.ts —
+// module-scoped `state` + `Set<() => void>` listener registry + a snapshot
+// version counter so `useSyncExternalStore` gets a stable reference across
+// no-op updates but a new reference on every real mutation.
+//
+// No React imports at module scope; hooks live inside the exported use*
+// functions. No dependency on zustand / jotai / redux / mobx — the fork
+// rolls its own stores (identities-store.ts is the reference).
+
+import { useSyncExternalStore } from "react";
+import type { Host, HostFolder, Tab, TabType } from "@/types/ui-types";
+import { setIdentityPinned } from "@/api/user-preferences-api";
+import type { Identity } from "@/api/identities-api";
+import { sessionMatchKey } from "@/features/terminal/session-hue";
+import {
+  readUserScopedCache,
+  writeUserScopedCache,
+} from "@/state/user-scoped-cache";
+// Phase 92 Plan 04 (H2 lock): pin toggle callsites REUSE the existing
+// fleetSessions → identityHosts derivation from identities-store. Do NOT
+// re-implement this locally with `sessionName.toLowerCase()` — that
+// pattern crashes on the relay-room `sessionName === undefined` case (see
+// L710-731 relay-room branch) and diverges from the semantics the
+// identities-store fetch already uses.
+import {
+  buildIdentityHostsFromFleet,
+  patchIdentityFlag,
+  refreshIdentities,
+} from "./identities-store";
+// Phase 41 Plan 03 — bridge to the working-store cache for the wire-side
+// lastMessageAt signal + a subscribe hook so a working-store publish invalidates
+// our memoized snapshot (row derivation re-runs and re-picks up fresh recency).
+import {
+  getSessionLastMessageAt,
+  subscribeSessionWorkingStore,
+} from "./session-working-store";
+import {
+  childrenByParent,
+  projectKey,
+  resolveEffectiveParents,
+} from "./project-tree";
+import {
+  getLastDmAt,
+  getLastFinishAt,
+  getSortFinishAt,
+  getUnseenDmAt,
+  getUnseenDmAtForSort,
+  isUnread,
+  isUnreadForSort,
+  subscribeAttention,
+} from "./attention-store";
+
+// ─── Public derived types ────────────────────────────────────────────────────
+
+export type ProjectSection = {
+  slug: string;
+  // Project slugs are only unique per host — sections are per (host, slug).
+  // Optional on the type for test fixtures that predate it.
+  hostId?: string;
+  displayName: string;
+  rows: ConversationRow[];
+  /**
+   * Resolved parent section key (`${hostId}::${slug}`), or null for top level.
+   * A missing parent or a parent loop resolves to null (project-tree.ts).
+   * Optional on the type for test fixtures that predate nesting.
+   */
+  parentKey?: string | null;
+  /** 0 for top level, +1 per nesting level. */
+  depth?: number;
+};
+
+export type ConversationRow = {
+  id: string;
+  type: TabType;
+  label: string;
+  host: Host | undefined;
+  targetTmuxSession: string | null;
+  // Plan 07-01 (TG-12, TG-13, TG-14): INTERNAL routing marker for detached-
+  // row-click plumbing. `true` on synthetic fleet-derived rows that have no
+  // corresponding entry in `openTabs`; `undefined` on openTabs-derived rows
+  // (deliberately OMITTED, not set to `false`, so the row-shape stays as
+  // close as possible to the Phase 6 5-key contract — see Test 8's filter
+  // in conversation-store.test.ts). ConversationRow.tsx MUST render both
+  // states identically per TG-13 shape lock; this field exists only so
+  // ConversationsPanel's row-click handler can branch to
+  // `onDetachedRowClick(row)` (Plan 07-01 Task 2) vs `selectConversation`.
+  fleetOnly?: boolean;
+  // Plan 07-02 (TG-15): INTERNAL routing marker for RDP-host-row-click
+  // plumbing. `true` on synthetic rows synthesized from a Host with
+  // `enableRdp === true` (fleet fact, NOT tab state — the row exists as long
+  // as the host has RDP enabled, regardless of whether an RDP tab is
+  // currently open). RDP rows live in a sentinel HostGroup with
+  // `hostId === "__rdp__"` at the BOTTOM of the derived ConversationList.
+  // The panel-layer uses this marker to route click → onRdpRowClick(row) →
+  // AppShell → openTab(host, "rdp"). Never present on openTabs-derived rows
+  // or fleet-only rows.
+  rdpHostRow?: boolean;
+  // Set on an `rdpHostRow` that stands for an open RDP tab. The row carries
+  // the tab's id (so selection + split-tree glow match it) and a click
+  // focuses that tab instead of opening another. Open RDP tabs on RDP-enabled
+  // hosts never emit rows in pinned/middle — they stay in the RDP section.
+  rdpTabOpen?: boolean;
+  // Phase 25 (Plan 25-02): identity role resolved from identity file frontmatter
+  // at row-construction time. Used as the middle sort key in compareByHostRoleLabel
+  // (host outer, role middle, label inner). Deliberately OMITTED (not set to null)
+  // when the row has no identity resolution — same "omit-when-null" convention as
+  // `fleetOnly` and `rdpHostRow`. `undefined` and `null` both sort last in
+  // compareByHostRoleLabel via the `a.role ?? null` normalization.
+  role?: string | null;
+  // Phase 41 (Plan 01) — amended Phase 44 Plan 04: the "message either
+  // direction" activity timestamp used by `compareByRecencyDesc` to order the
+  // flat middle zone. Set to `null` when no history exists (row sorts to the
+  // BOTTOM of the middle per the Phase 44 Plan 04 null-to-bottom flip; the
+  // pre-Phase-44 null-to-top lock was retired per 44-CONTEXT.md § Comparator
+  // change). Plan 03 populates this via a fleet-status protocol extension +
+  // Plan 44-03 max-wins reconciliation chokepoint at the working-store.
+  // Deliberately OPTIONAL so existing row constructors (which don't yet set
+  // it) still typecheck; the comparator normalizes `undefined` → `null`.
+  lastMessageAt?: number | null;
+  // Phase 90 Plan 07 Task 3 — Phase-89 kind discriminator + relay-room
+  // identity fields carried FROM the FleetSession THROUGH the row shape
+  // TO the panel's handleRowSelect. The row-click branch reads these to
+  // decide whether to dispatch to onRelayRoomRowClick (relay-room) vs the
+  // existing rdp/fleetOnly/selectConversation branches (harness).
+  //
+  // All three are optional so pre-Phase-90 row constructors (openTab-derived
+  // rows, RDP synthetic rows) that never set them still typecheck; the
+  // panel's branch reads them as `row.kind === "relay-room"` and treats
+  // undefined as harness (backward-compat rule per PATTERNS.md).
+  //
+  // Populated at synthetic-row build time (see fleetSyntheticRows loop
+  // below at ~L660) from the corresponding FleetSession fields.
+  kind?: "harness" | "relay-room";
+  roomId?: string;
+  roomTitle?: string | null;
+  // Sidebar unread mark: the agent finished a turn this user hasn't seen
+  // (attention-store). Set on agent rows at snapshot time; absent otherwise.
+  unread?: boolean;
+  // Sidebar DM mark: the agent DM'd this user and they haven't seen the
+  // conversation since. `dmAt` is that DM's time, the recency key within the
+  // DM'd tier. Both absent otherwise.
+  dm?: boolean;
+  dmAt?: number;
+  // The DM'd / unread tiers the sort uses. Same as the marks once the read
+  // state has loaded; before that, judged from the saved picture
+  // (attention-store § Sort order before the server answers). Absent otherwise.
+  sortDmAt?: number;
+  sortUnread?: boolean;
+  // Most recent activity from either side — the later of lastMessageAt (the
+  // user sent) and the agent's last finished turn. The recency key for the
+  // Conversations list and the rows inside a project.
+  activityAt?: number | null;
+};
+
+export type HostGroup = {
+  hostId: string;
+  hostName: string;
+  rows: ConversationRow[];
+};
+
+// Phase 41 (Plan 01): three-zone shape.
+//   - `activeSet`: rows currently in user's active-set (state.activeSet),
+//     sorted by (host, role, label). Structurally UNCHANGED from Phase 25.
+//   - `pinned`: rows pinned but NOT in activeSet, sorted by (host, role, label).
+//     Structurally UNCHANGED from Phase 25.
+//   - `middle`: FLAT list of remaining identity-tmux + fleet-synthetic rows
+//     (non-pinned, non-active-set, non-RDP). Sorted by `compareByRecencyDesc`
+//     — rows with timestamps sort DESC (freshest first); no-history rows
+//     (lastMessageAt == null) sort to the BOTTOM (Phase 44 Plan 04 null-to-
+//     bottom flip; the pre-Phase-44 null-to-top lock was retired); ties +
+//     no-history rows fall back to insertion-order key for deterministic
+//     stability. Replaces the pre-Phase-41 `grouped: HostGroup[]` for the
+//     middle tier.
+//   - `rdpGroup`: sentinel HostGroup (`hostId: "__rdp__"`) containing all
+//     RDP-eligible rows, OR `null` when zero hosts have `enableRdp === true`.
+//     No empty header renders in the panel when null (user lock).
+export type ConversationList = {
+  activeSet: ConversationRow[];
+  pinned: ConversationRow[];
+  middle: ConversationRow[];
+  rdpGroup: HostGroup | null;
+  // ─── Phase 117 Plan 117-07 (D-05, D-07, D-08, D-11, D-15, D-16, D-19, D-39) ─
+  // Projects-derived selector output. Additive to the pre-Phase-117 shape —
+  // existing consumers keep using `pinned/middle/rdpGroup`. New Wave 4 (117-08)
+  // consumers use `pinnedUnassigned/projectSections/rdp`. Rendering choice
+  // between the two views is a per-consumer decision; the store computes both.
+  /**
+   * Pinned rows that have NO project assignment. These float to the sidebar's
+   * top pinned zone per D-19's "pinned + unassigned" branch. Pinned rows that
+   * DO have a project assignment float to the top of their project section
+   * (see `projectSections[i].rows[0]`) instead — NOT here.
+   */
+  pinnedUnassigned: ConversationRow[];
+  /**
+   * Per-project buckets in tree order: each project followed by its
+   * sub-projects, siblings alphabetical by displayName (D-15). Each section's
+   * rows are alphabetical by displayName (D-16). Rows whose project slug
+   * points to a nonexistent project fall to `middle` instead (D-07 graceful
+   * degradation). RDP rows never appear here (D-08).
+   */
+  projectSections: ProjectSection[];
+  /**
+   * RDP-eligible synthetic host rows. Same content as `rdpGroup.rows` (a
+   * duplicate reference to keep the "one bucket per new-shape field" symmetry
+   * clean). Null iff no RDP-eligible hosts (mirrors rdpGroup).
+   */
+  rdp: HostGroup | null;
+};
+
+// Plan 07-01 (TG-12): fleet-discovered tmux session shape. Re-declared here
+// (not imported from `@/api/sessions-api`) so the UI-state layer does NOT
+// depend on the API layer — matches the fork's layering discipline from
+// Phase 6 §layering. AppShell fetches getSessionList() then feeds the result
+// into `updateFleetSessions(...)` via a one-shot mount effect (no polling).
+// Shape mirrors `RemoteTmuxSession` in @/api/sessions-api verbatim.
+export type FleetSession = {
+  hostId: number;
+  hostName: string;
+  sessionName: string;
+  created: number;
+  role: string | null;
+  // Phase 44 Plan 04 — inline recency signal carried from /sessions/list (Plan
+  // 44-01). Consumed by AppShell to feed seedSessionLastMessageAt (Plan 44-03
+  // chokepoint); NOT stamped on rows (that path stays via working-store
+  // max-wins). Optional so pre-Phase-44 backend responses (or a v1 cache
+  // rehydrate that predates this field) deserialize into a FleetSession object
+  // that simply omits the field — seed loop then calls with `?? null`.
+  lastMessageAt?: number | null;
+  // Phase 47 Plan 01 — inline current-work hint carried from /sessions/list.
+  // Consumed by AppShell to feed seedSessionAiTitle (Plan 47-03 chokepoint);
+  // NOT stamped on ConversationRow directly (that path stays via working-store
+  // useSessionAiTitle hook — last-wins reconciliation, not row-derived).
+  // Optional so pre-Phase-47 backend responses (or a v2 cache rehydrate that
+  // predates this field) deserialize into a FleetSession object that simply
+  // omits the field — seed loop then calls with `?? null`.
+  aiTitle?: string | null;
+  // Phase 90 Plan 01 — Phase-89 `kind` discriminator + relay-room identity
+  // fields carried from /sessions/list (Phase 89 Plan 04). Row-shape mirror
+  // of `RemoteTmuxSession` (see @/api/sessions-api). All three fields
+  // optional so a v3 cache rehydrate (pre-Phase-90 client) deserializes
+  // into a FleetSession that simply omits them — backward-compat rule:
+  // consumers reading `kind` treat undefined as "harness".
+  //
+  // Consumed downstream at tab-open time: the sidebar row-click handler
+  // propagates `kind` + `roomId` + `roomTitle` onto the created Tab's
+  // `sessionKind` / `relayRoomId` / `relayRoomTitle` fields (see Plan 07),
+  // where the pane-mount dispatcher branches on `sessionKind` to render
+  // PrettyView (either source variant: harness or relay per Phase 93).
+  //
+  // Cache-version bump v3 → v4 (see FLEET_CACHE_KEY comment below) forces
+  // one clean cold-start after deploy so persisted v3 objects — which
+  // predate these fields — are discarded rather than deserialized into a
+  // stale shape without the new relay identity axis.
+  kind?: "harness" | "relay-room";
+  roomId?: string;
+  roomTitle?: string | null;
+  // Phase 91 UAT fix 2026-09-09 — relay-room-only fields on the wire
+  // (Skynet backend appends these when kind === "relay-room"; see
+  // sessions-merge-helper.ts RelayRoomSessionRow). Optional so harness
+  // rehydrates keep typechecking. Consumed by the relay-room row-builder
+  // branch in computeSnapshot() (fleetSyntheticRows loop).
+  id?: string;
+  lastActivityAt?: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+type SnapshotForTest = ConversationList & {
+  selectedId: string | null;
+  pinnedIds: ReadonlySet<string>;
+  // quick-260821-m36: exposed for AppShell.persistence.test.tsx Test 5's
+  // flag-flip-on-fetch-failure assertion. Same shape as state.fleetSessions
+  // + state.fleetSessionsLoaded — read-only observability for tests, not
+  // meant for production callers (they use useFleetSessionsLoaded() hook +
+  // useSyncExternalStore-based fleet selectors).
+  fleetSessions: FleetSession[];
+  fleetSessionsLoaded: boolean;
+};
+
+// Phase 41 (Plan 01): retire the `activeSet` field's ambient-visual mention in
+// the State type comment. The `state.activeSet: Set<string>` field survives
+// AS-IS — it still drives the deactivate-action semantics (per user lock #5).
+// Only the visual tier's ambient-recession rendering was retired; the field
+// itself is load-bearing for deactivate menu-item gating.
+
+// ─── Which tab types are "conversations" ─────────────────────────────────────
+// A tab is a "conversation" iff it targets a host and represents a session-
+// like remote surface. Everything else (dashboard, settings singletons,
+// tunnel, network_graph) is excluded from the list.
+
+const CONVERSATION_TAB_TYPES = new Set<TabType>([
+  "terminal",
+  "rdp",
+  "vnc",
+  "telnet",
+]);
+
+// Patch #137: sessionStorage key for the activeSet persistence layer. Value is
+// a JSON array of conversation ids; sessionStorage semantics = per-tab, dies
+// on tab close. See hydrateActiveSetFromStorage() + addToActiveSet() +
+// removeFromActiveSet() below. quick-260727-gm3 introduced remove semantics
+// (user 2026-07-27 deactivate action) — the pre-gm3 lock ("no remove API by
+// design") was intentionally lifted; the set now grows AND shrinks within a
+// session, but still dies on tab close.
+const ACTIVE_SET_STORAGE_KEY = "pv-conv-active-set";
+
+// Phase 122 Plan 04 (D-17 removal): the SEARCH_HIDDEN_SENTINEL_KEY constant
+// (Phase 41 Plan 02) and its only=1 clear in hydrateActiveSetFromStorage were
+// retired together with PrettyConversationsPanel's inline filter-as-you-type
+// input the modal (Phase 122 Plan 03) replaced. The activeSet clear below is
+// preserved — it belongs to a different feature (pv-conv-active-set).
+
+// Patch #137: rehydrate the activeSet from sessionStorage on module load.
+// Wrapped in try/catch so malformed JSON, missing key, empty string, quota
+// errors, or an absent sessionStorage (SSR/JSDOM edge) ALL silently fall
+// back to an empty Set — a corrupt persistence layer must never crash the
+// UI thread.
+//
+// user 2026-08-05 (fix chain 70q→7rq→53a36a6→ea0098c→THIS): Move-to-new-
+// window / Open-in-new-window URLs carry `only=1` in the hash. Since we drop
+// `noopener` on window.open (PrettyConversationRow.tsx uo4-noopener-fix so
+// the null-check for popup-blocker safety works), the child window inherits
+// the opener's sessionStorage — including this key. Without the guard below,
+// the new window's hydrate would pull the opener's whole activeSet in on
+// module load, causing Move-to-new-window to bring along every origin-active
+// row alongside the target row. Detect `only=1` in the URL hash and start
+// fresh: return an empty Set AND remove the storage key so any later
+// addToActiveSet calls persist onto a clean slate. AppShell's URL-restore
+// path (patch #230) enrolls the URL-supplied tabs into the active set via
+// its normal enroll logic, so the new window ends up with only the URL's
+// tabs active — matching what `only=1` was designed to promise.
+function hydrateActiveSetFromStorage(): Set<string> {
+  try {
+    if (typeof sessionStorage === "undefined") return new Set<string>();
+
+    // only=1 sessionStorage-bleed guard — see block comment above.
+    // Phase 122 Plan 04 (D-17 removal): the pv-conv-search-hidden-once clear
+    // was retired together with the panel's inline search input (Phase 41
+    // Plan 02) that owned it. Only the activeSet clear remains.
+    if (typeof window !== "undefined" && window.location?.hash) {
+      const hash = window.location.hash.startsWith("#")
+        ? window.location.hash.slice(1)
+        : window.location.hash;
+      const params = new URLSearchParams(hash);
+      if (params.get("only") === "1") {
+        try {
+          sessionStorage.removeItem(ACTIVE_SET_STORAGE_KEY);
+        } catch {
+          /* best-effort clear */
+        }
+        return new Set<string>();
+      }
+    }
+
+    const raw = sessionStorage.getItem(ACTIVE_SET_STORAGE_KEY);
+    if (!raw) return new Set<string>();
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return new Set<string>();
+    const out = new Set<string>();
+    for (const v of parsed) if (typeof v === "string") out.add(v);
+    return out;
+  } catch {
+    return new Set<string>();
+  }
+}
+
+function isConversationTab(tab: Tab): boolean {
+  if (!CONVERSATION_TAB_TYPES.has(tab.type)) return false;
+  // Phase 91 UAT fix 2026-09-09 (user): relay-room tabs are host-less by
+  // design (the room lives on the Matrix relay, not a fleet host). Admit
+  // them so an openTab-derived row shows in the sidebar with row.id ===
+  // tab.id — matches the selectedId set by selectConversationDeferred(tabId),
+  // so the selection border renders.
+  if (tab.sessionKind === "relay-room" && tab.relayRoomId) return true;
+  // An archived conversation opened from search has no sidebar row.
+  if (tab.sessionKind === "archived") return false;
+  if (!tab.host) return false;
+  return true;
+}
+
+// ─── Module-scoped state ─────────────────────────────────────────────────────
+
+type State = {
+  hostTree: HostFolder | null;
+  openTabs: Tab[];
+  pinnedIds: Set<string>;
+  selectedId: string | null;
+  // Plan 07-01 (TG-12, TG-17): fleet-discovery snapshot input. Fed ONCE per
+  // page-load by AppShell's mount effect (empty dep array useEffect). No
+  // polling, no interval, no focus refetch. Absence = openTabs-only rendering
+  // (Phase 6 baseline). Combined with openTabs via the union+dedup logic
+  // inside computeSnapshot().
+  fleetSessions: FleetSession[];
+  // quick-260727-kbw: has updateFleetSessions been called at least once this
+  // session? Starts false; flips true on the first call (empty [] counts as
+  // loaded). Consumed by PrettyConversationsPanel's mount-effect gate for the
+  // getPinnedIds fetch — see PrettyConversationsPanel.tsx §Phase 15 (Wave 3)
+  // mount effect §(d). Gates the *initial* hydratePinnedIdsFromServer fetch
+  // until state.fleetSessions has populated at least once, avoiding a same-
+  // tick race against updateFleetSessions and unnecessary re-hydration
+  // ordering fragility on WS reconnect. (quick-260818-l8n retired the
+  // updateOpenTabs pin scrubbing — pinnedIds are never touched by
+  // openTabs/fleetSessions membership anymore — so this flag now survives
+  // purely as the initial-fetch-ordering gate.)
+  fleetSessionsLoaded: boolean;
+  // Plan 07-01 (TG-14): flat hostId → Host lookup so the click-a-detached-row
+  // handler can resolve a fleet row (identified by numeric hostId +
+  // sessionName) to a Host object openTab requires. Populated by AppShell's
+  // hostsById memo (keyed on stableHostTreeKey — reuses the Phase 6 NOTE-05
+  // thrash-guard). Used both for fleet-row Host enrichment during rendering
+  // (see computeSnapshot) AND — pending Plan 07-02 — for RDP row derivation
+  // filtered on `host.enableRdp === true`.
+  hostsFlat: Map<number, Host>;
+  // Phase 25 (Plan 25-02): identityKey.toLowerCase() → Identity lookup for
+  // role resolution at row-construction time. Fed by AppShell via
+  // updateIdentitiesByKey on identity-store change — mirrors the hostsFlat
+  // pattern. keyed identically to identities-store.ts byKey (identityKey.toLowerCase()).
+  identitiesByKey: Map<string, Identity>;
+  // Patch #137: sessionStorage-backed set of conversation ids user has
+  // selected in this browser-tab session. Persisted under key
+  // "pv-conv-active-set" as a JSON array. Rehydrated on module load;
+  // add + remove APIs (quick-260727-gm3 added removeFromActiveSet as the
+  // pure reverse of tap-ambient-to-activate); dies on tab close
+  // (sessionStorage semantics).
+  // Feeds PrettyConversationRow's ambient-recession branch (rows NOT in
+  // the set visually recede) and the ready-for-attention dot render
+  // condition (dot renders iff inActiveSet && isWorking===false).
+  activeSet: Set<string>;
+  // ─── Phase 117 Plan 117-07 (D-05, D-37, D-39) — projects slice ────────────
+  // Backend-authoritative list of projects, hydrated from two sources:
+  //   1. Boot-time HTTP hydration via `listProjects(hostId)` (per-host fetch,
+  //      aggregated to a flat ProjectRow[] before setProjects fires).
+  //   2. Wire-event updates via `onProjectListChanged` on fleet-status-client
+  //      (the WS publishes the full array on every create/archive/rename per
+  //      117-03's registry.publishProjectListChanged).
+  // Both paths funnel through `setProjects` — identity-equal-skip absorbs
+  // no-op reemissions (see setProjects body).
+  projects: ProjectRow[];
+  // Per-identity project-membership assignment. Keyed on `${hostId}::${identityKey}`
+  // (matching the identity's home box + on-disk name). Populated by AppShell's
+  // identity-hydration path — reads identity.project from GET /identities and
+  // stitches (hostId, identityKey) → slug. The projects-derived selector reads
+  // this map to route each identity conversation into its project section
+  // (D-05 identity carrier — frontmatter is the source of truth).
+  identityProjectAssignments: Map<string, string>;
+  // Relay-room project-membership assignment. Keyed on roomId (m.tag account_data
+  // event is per-user-per-room in Matrix, so one slot per room suffices).
+  // Populated by AppShell's boot-time hydration via GET /relay-rooms/project-tags
+  // (117-07 relay-room-project-tags-list route) — D-05 relay-room carrier is
+  // the u.project.<slug> Matrix account_data tag.
+  roomProjectAssignments: Map<string, string>;
+};
+
+/**
+ * Phase 117 Plan 117-07 (D-37, D-39): shape of a project entry in the
+ * frontend. Mirrors the wire event payload from 117-03
+ * (FrontendProjectListChangedFrame's `projects[]` element). The setter
+ * `setProjects` accepts this array shape verbatim from the fleet-status
+ * client's `onProjectListChanged` callback + from the boot-time
+ * `listProjects(hostId)` HTTP hydration path.
+ */
+export type ProjectRow = {
+  slug: string;
+  displayName: string;
+  hostId: string;
+  hostname: string;
+  archived: boolean;
+  /**
+   * Raw `parent:` slug from project.md — a project on the SAME host — or
+   * null/absent for top level. The snapshot resolves it: a missing parent
+   * or a loop renders at top level (see project-tree.ts).
+   */
+  parent?: string | null;
+};
+
+// Hoisted above state init so readProjectsCache (called at module load
+// during the state seed below) sees an initialized const, not TDZ. Read/
+// write function bodies and canonical block-comment live further down the
+// file near the fleet-cache functions — see "Projects cache" block.
+// Bumped v1 → v2 to add the owner-tag wrapper. See FLEET_CACHE_KEY note.
+const PROJECTS_CACHE_KEY = "skynet:projects-cache:v2";
+const PROJECTS_CACHE_LEGACY_KEYS = ["skynet:projects-cache:v1"];
+
+// Same hoisting rationale as PROJECTS_CACHE_KEY above — read/write function
+// bodies live near the fleet-cache functions ("Pinned IDs cache" block).
+// Bumped v1 → v2 to add the owner-tag wrapper. See FLEET_CACHE_KEY note.
+const PINNED_IDS_CACHE_KEY = "skynet:pinned-ids-cache:v2";
+const PINNED_IDS_CACHE_LEGACY_KEYS = ["skynet:pinned-ids-cache:v1"];
+
+// Module-load seed for the projects slice from localStorage: paint project
+// sections + membership on cold refresh BEFORE the aggregated per-host
+// listProjects / listRelayRoomProjectTags fetches resolve. Empty / missing /
+// malformed cache falls back to empty maps + array; readProjectsCache is
+// silent by contract.
+const _cachedProjects = readProjectsCache();
+
+let state: State = {
+  hostTree: null,
+  openTabs: [],
+  // Phase 92 Plan 04 — pinned IDs are server-authoritative on
+  // identity.pinned; localStorage cache is a cold-boot paint hint so pinned
+  // rows appear immediately on refresh instead of flickering blank until
+  // GET /identities resolves. hydratePinnedIdsFromServer overwrites the
+  // seed within ~200ms; the cache is refreshed on every real change.
+  pinnedIds: new Set<string>(readPinnedIdsCache()),
+  selectedId: null,
+  fleetSessions: [],
+  fleetSessionsLoaded: false,
+  hostsFlat: new Map<number, Host>(),
+  identitiesByKey: new Map<string, Identity>(),
+  activeSet: hydrateActiveSetFromStorage(),
+  // Phase 117 Plan 117-07 (D-37): projects hydrate from AppShell's boot-time
+  // listProjects fetch + wire event. Seeded from localStorage on module load
+  // for cold-boot paint; fresh HTTP fetches overwrite via setProjects.
+  projects: _cachedProjects.projects,
+  identityProjectAssignments: _cachedProjects.identityProjectAssignments,
+  roomProjectAssignments: _cachedProjects.roomProjectAssignments,
+};
+
+// Plan 06-04 race defense (T-06-04-04): openTab's setTabs is batched — the
+// new tab id is NOT visible in `state.openTabs` synchronously after openTab
+// returns. `selectConversationDeferred(newTabId)` parks the id here; the next
+// `updateOpenTabs` call that includes the id flushes it into `state.selectedId`.
+// A direct `selectConversation` call (post stale-guard) also clears pending —
+// see the re-decided placement in selectConversation() below (NOTE-03).
+let pendingSelectId: string | null = null;
+
+// Version bump on every real mutation. Snapshot memoization is keyed on it —
+// consumers of `useSyncExternalStore` see a stable ConversationList reference
+// as long as `snapshotVersion` is unchanged, so React does NOT tear.
+let snapshotVersion = 0;
+
+// Memoized derived-list snapshot. Recomputed lazily on demand when
+// `snapshotVersion` has advanced past `cachedSnapshotVersion`.
+let cachedSnapshot: ConversationList | null = null;
+let cachedSnapshotVersion = -1;
+
+const listeners = new Set<() => void>();
+
+// Pending-archive filter: composite `${hostId}::${sessionName}` keys for
+// identities whose archive was just fired from the sidebar. handleArchive in
+// PrettyConversationsPanel drops the row via removeFleetSession + applyIdentity
+// Change immediately after firing archiveIdentity, but the identity keeps
+// pulsing fleet-status for ~15s until the supervisor's scan tick retires it.
+// Without this filter, the next `update` frame's upsertFleetSession would
+// re-insert the row (row-flicker back on screen).
+//
+// Lifecycle — the mark must not outlive the archive, or a later un-archive /
+// same-name re-birth stays invisible in this tab until reload:
+//   - cleared on archive-failure rollback (clearPendingArchive)
+//   - cleared when the supervisor's retire lands (`identity_gone` frame,
+//     AppShell onGone)
+//   - cleared when an un-archive of the same identity succeeds
+//   - expires after PENDING_ARCHIVE_TTL_MS as a backstop (supervisor retire
+//     failing and retrying forever would otherwise hide a live identity)
+// Value = expiry epoch-ms. Module-scope, in-memory only.
+export const PENDING_ARCHIVE_TTL_MS = 2 * 60 * 1000;
+const pendingArchiveKeys = new Map<string, number>();
+
+function pendingArchiveKey(hostId: number, sessionName: string): string {
+  // Case-folded: the mark is set from a row's tmux session name but cleared
+  // from an identity key (un-archive); identity keys are lowercase.
+  return `${hostId}::${sessionName.toLowerCase()}`;
+}
+
+function isPendingArchive(hostId: number, sessionName: string): boolean {
+  if (pendingArchiveKeys.size === 0) return false;
+  const key = pendingArchiveKey(hostId, sessionName);
+  const expiresAt = pendingArchiveKeys.get(key);
+  if (expiresAt === undefined) return false;
+  if (Date.now() >= expiresAt) {
+    pendingArchiveKeys.delete(key);
+    console.warn({
+      operation: "pending_archive_expired",
+      hostId,
+      sessionName,
+      ttlMs: PENDING_ARCHIVE_TTL_MS,
+    });
+    return false;
+  }
+  return true;
+}
+
+export function markPendingArchive(hostId: number, sessionName: string): void {
+  pendingArchiveKeys.set(
+    pendingArchiveKey(hostId, sessionName),
+    Date.now() + PENDING_ARCHIVE_TTL_MS,
+  );
+}
+
+export function clearPendingArchive(hostId: number, sessionName: string): void {
+  pendingArchiveKeys.delete(pendingArchiveKey(hostId, sessionName));
+}
+
+function notify(): void {
+  snapshotVersion += 1;
+  cachedSnapshot = null; // invalidate — will be rebuilt on next getSnapshot()
+  for (const l of listeners) l();
+}
+
+function subscribe(cb: () => void): () => void {
+  listeners.add(cb);
+  return () => {
+    listeners.delete(cb);
+  };
+}
+
+// ─── Derivation ──────────────────────────────────────────────────────────────
+
+// Phase 41 Plan 01: test-only injection map for row.lastMessageAt.
+// Keyed on row id (or fleet-synthetic id for fleet rows). Plan 03 has now
+// landed the real fleet-status wire-side signal (session-working-store's
+// per-key cache is the primary source); this map SURVIVES as the test-only
+// injection API for the store's own unit tests, which don't want to go
+// through the wire path for every assertion. Production callers never touch
+// it. Defense-in-depth: resolves to `null` for any id not in the map.
+const lastMessageAtByRowId = new Map<string, number | null>();
+
+/**
+ * Phase 41 Plan 03 — derive the working-store session-key for a row's
+ * (host, targetTmuxSession) pair. Mirrors sessionWorkingKey() at
+ * PrettyConversationsPanel.tsx:127-130 verbatim — a change to that helper
+ * MUST be mirrored here (search for "sessionWorkingKey" for the sibling
+ * callsite). Returns null when the row lacks a host (fleet-only pre-resolution
+ * race, mirroring the panel's dot-suppression path).
+ */
+function sessionWorkingKeyForRow(
+  host: Host | undefined,
+  targetTmuxSession: string | null | undefined,
+): string | null {
+  if (!host) return null;
+  return `${host.id}:${targetTmuxSession ?? ""}`;
+}
+
+/**
+ * Phase 41 Plan 01 + Plan 03 — resolve lastMessageAt for a row at snapshot
+ * derivation time. Precedence:
+ *   1. Test injection map (Plan 01 __setLastMessageAtForTest hook). Kept as
+ *      the primary path in tests so unit tests don't need to plumb the wire
+ *      publish just to exercise the comparator.
+ *   2. Working-store cache (Plan 03 — real wire-side signal from the
+ *      fleet-status WS). Derived from (host, targetTmuxSession) via
+ *      sessionWorkingKeyForRow.
+ * Returns null when neither source has a value.
+ */
+function resolveLastMessageAt(
+  rowId: string,
+  host: Host | undefined,
+  targetTmuxSession: string | null | undefined,
+): number | null {
+  const injected = lastMessageAtByRowId.get(rowId);
+  if (injected !== undefined) return injected;
+  const key = sessionWorkingKeyForRow(host, targetTmuxSession);
+  return getSessionLastMessageAt(key);
+}
+
+function rowFromTab(tab: Tab, sessionRoleByKey: Map<string, string | null>): ConversationRow {
+  // Phase 91 UAT fix 2026-09-09 (user): relay-room tabs have no host and
+  // no tmux session — carry their kind + roomId + roomTitle onto the row so
+  // handleRowSelect routes clicks to onRelayRoomRowClick. row.id === tab.id
+  // is what makes the selection border render (selectedId === tab.id after
+  // the click-open flow).
+  if (tab.sessionKind === "relay-room" && tab.relayRoomId) {
+    // Phase 97 UAT batch #8 (2026-09-10): tab-derived relay-room rows must
+    // carry the fleet-session lastActivityAt so click-open doesn't sink the
+    // row to the bottom of the middle tier. Pre-click, the row is
+    // fleet-synthetic and carries `lastMessageAt` from wire's `lastActivityAt`
+    // (see fleetSyntheticRows loop, ~L725). Post-click, openTabs-entry-wins
+    // dedup skips the synthetic branch, and the tab-derived row is used
+    // instead. Prior to this fix, the tab branch only consulted the test-only
+    // injection map + working-store cache (which returns null for
+    // host===undefined), so lastMessageAt collapsed to null and the null-to-
+    // bottom rule in compareByRecencyDesc jumped the row to the bottom.
+    // Fix: mirror the synthetic branch's lookup by finding the fleet session
+    // that matches this relayRoomId.
+    const matchingSession = state.fleetSessions.find(
+      (s) => s.kind === "relay-room" && s.roomId === tab.relayRoomId,
+    );
+    const fleetLastActivityAt = matchingSession?.lastActivityAt;
+    const injectedLastMessageAt = resolveLastMessageAt(tab.id, undefined, null);
+    return {
+      id: tab.id,
+      type: tab.type,
+      label: tab.label,
+      host: undefined,
+      targetTmuxSession: null,
+      kind: "relay-room",
+      roomId: tab.relayRoomId,
+      roomTitle: tab.relayRoomTitle ?? null,
+      ...(fleetLastActivityAt !== undefined && fleetLastActivityAt !== null
+        ? { lastMessageAt: new Date(fleetLastActivityAt).getTime() }
+        : injectedLastMessageAt !== null
+          ? { lastMessageAt: injectedLastMessageAt }
+          : { lastMessageAt: null }),
+    };
+  }
+  // Role lookup: prefer fleet-authoritative session.role (resolved on the identity's home box
+  // via same SSH conn as tmux list-sessions), fall back to identitiesByKey as defense-in-depth.
+  let role: string | null = null;
+  if (tab.host && tab.targetTmuxSession) {
+    const hostIdStr = String(parseInt(tab.host.id));
+    const dedupK = dedupKey(hostIdStr, tab.targetTmuxSession);
+    if (sessionRoleByKey.has(dedupK)) {
+      role = sessionRoleByKey.get(dedupK) ?? null;
+    } else {
+      const matchKey = sessionMatchKey(tab.targetTmuxSession);
+      role = matchKey ? (state.identitiesByKey.get(matchKey)?.role ?? null) : null;
+    }
+  }
+  const lastMessageAt = resolveLastMessageAt(
+    tab.id,
+    tab.host,
+    tab.targetTmuxSession,
+  );
+  return {
+    id: tab.id,
+    type: tab.type,
+    label: tab.label,
+    host: tab.host,
+    targetTmuxSession: tab.targetTmuxSession ?? null,
+    ...(role !== null ? { role } : {}),
+    ...(lastMessageAt !== null ? { lastMessageAt } : {}),
+  };
+}
+
+function isHostFolder(node: Host | HostFolder): node is HostFolder {
+  return "children" in node;
+}
+
+// Depth-first host-tree walk. Emits host ids in the exact order SidebarTree
+// renders them today — no alphabetical / recency override.
+function collectHostOrder(tree: HostFolder | null): { id: string; name: string }[] {
+  if (!tree) return [];
+  const out: { id: string; name: string }[] = [];
+  const walk = (folder: HostFolder): void => {
+    for (const child of folder.children) {
+      if (isHostFolder(child)) {
+        walk(child);
+      } else {
+        out.push({ id: child.id, name: child.name });
+      }
+    }
+  };
+  walk(tree);
+  return out;
+}
+
+// Plan 07-01 dedup key. Uses `\0` (null byte) as separator: guaranteed absent
+// from user-typed tmux session names (tmux itself rejects control chars in
+// session names) AND from Host.id strings (numeric-string coercion via
+// String(parseInt(...))). Internal helper — NOT exported (test coverage is
+// via the dedup-behavior tests, not a direct dedupKey unit test, so this
+// stays a private implementation detail we can change if needed).
+function dedupKey(hostIdStr: string, sessionName: string): string {
+  return `${hostIdStr}\0${sessionName}`;
+}
+
+// Plan 07-01: canonical fleet-row id prefix. Format: `fleet::${hostId}::${sessionName}`.
+// VISIBLE-ASCII `::` separator so ids are inspectable in DevTools
+// (data-conversation-id attributes) — the null-byte dedup separator is
+// INTERNAL only. Kept as a small helper so the AppShell click handler and
+// the row-shape assertions in tests read from a single source of truth if
+// they need to.
+export function fleetRowId(hostId: number, sessionName: string): string {
+  return `fleet::${hostId}::${sessionName}`;
+}
+
+// Phase 25 (Plan 25-02) — three-key sort comparator for all five row-bucket
+// sort sites in computeSnapshot. Implements the LOCKED tuple from
+// 25-CONTEXT.md §Sort semantics: (host, role, label) case-insensitive
+// alphabetical with null-role-last (25-CONTEXT.md §Null-role handling).
+//
+// Key order:
+//   Outer  — host.name (case-insensitive, no numeric-natural: host names rarely
+//             have "host10 vs host9" ordering needs, and host-tree walk order
+//             governs Tier 3's outer bucket structure anyway — the comparator's
+//             host key is defense-in-depth for Tier 1 + Tier 2).
+//   Middle — role (null/undefined sorts AFTER any real role per CONTEXT.md
+//             §Null-role handling). `a.role ?? null` normalises both `undefined`
+//             (field omitted per §ConversationRow-omit convention) and `null` to
+//             a single null value before comparison.
+//   Inner  — label (case-insensitive, numeric-natural — same as the pre-Phase-25
+//             label-only sort so ordering within (host, role) tuples matches the
+//             prior behaviour exactly).
+const compareByHostRoleLabel = (a: ConversationRow, b: ConversationRow): number => {
+  // Outer: host name (case-insensitive)
+  const hostA = a.host?.name ?? "";
+  const hostB = b.host?.name ?? "";
+  const hostCmp = hostA.localeCompare(hostB, undefined, { sensitivity: "base" });
+  if (hostCmp !== 0) return hostCmp;
+
+  // Middle: role (null/undefined sorts AFTER any real role)
+  const roleA = a.role ?? null;
+  const roleB = b.role ?? null;
+  if (roleA !== roleB) {
+    if (roleA === null) return 1;  // null role → sort later
+    if (roleB === null) return -1;
+    const roleCmp = roleA.localeCompare(roleB, undefined, { sensitivity: "base" });
+    if (roleCmp !== 0) return roleCmp;
+  }
+
+  // Inner: label (case-insensitive, numeric-natural — identical to the pre-Phase-25 label sort)
+  return a.label.localeCompare(b.label, undefined, { numeric: true, sensitivity: "base" });
+};
+
+// Phase 44 Plan 04 — flipped Rule 1 from null-to-top to null-to-bottom. Retires
+// user's 2026-08-14 no-history-to-top lock per 44-CONTEXT.md § Comparator
+// change — retire no-history-to-top. Middle-zone recency comparator.
+//
+// Ordering contract (§Sort model — middle section, Phase 44 lock 2026-08-18):
+//   (1) Rows with `lastMessageAt == null` (no history) sort AFTER rows with
+//       any real timestamp — null-to-bottom. Freshest known activity floats to
+//       the top; genuinely-no-history rows (fresh session pre-first-message;
+//       discovery failed; identity never invoked /id as first turn) sink to the
+//       bottom of the middle zone.
+//   (2) Among no-history rows: fall back to `middleInsertionOrder` (a WeakMap
+//       populated during computeSnapshot's middle-build pass — see the flat
+//       middleRows push loop below) so ordering is deterministic across
+//       snapshot recomputes.
+//   (3) Among rows with real timestamps: `lastMessageAt` DESC (freshest first).
+//   (4) When two rows have identical `lastMessageAt`: fall back to
+//       `middleInsertionOrder` for stability.
+//
+// The lastMessageAt signal is populated end-to-end as of Phase 44 (Plan 44-01
+// dormant path via /sessions/list; Plan 44-02 live path via ssh-poll-orchestrator
+// JSONL discovery; Plan 44-03 max-wins reconciliation chokepoint at the
+// working-store; Plan 44-04 wire-consumer at AppShell + this comparator flip).
+//
+// The insertion-order map is passed in as a parameter (not read from
+// module-scope) so the comparator stays pure and the sort is deterministic
+// even if computeSnapshot fires concurrently (which it can't today — the
+// store's snapshot cache is version-keyed — but the discipline stays honest).
+const compareByRecencyDesc = (
+  insertionOrder: WeakMap<ConversationRow, number>,
+) => (a: ConversationRow, b: ConversationRow): number => {
+  const aTs = a.lastMessageAt ?? null;
+  const bTs = b.lastMessageAt ?? null;
+  // Rule (1): null-to-bottom (Phase 44 Plan 04 flip). Rows with null sort
+  // AFTER rows with a timestamp (return > 0 when a is null and b is not).
+  if (aTs === null && bTs !== null) return 1;
+  if (aTs !== null && bTs === null) return -1;
+  // Rule (3): both have timestamps → DESC by lastMessageAt.
+  if (aTs !== null && bTs !== null && aTs !== bTs) {
+    return bTs - aTs; // b - a for DESC
+  }
+  // Rule (2)/(4) fallback: insertion-order key. Rows not tracked in the map
+  // sort AFTER tracked rows (defensive default; should never happen in
+  // practice since every middle row is registered during the build pass).
+  const aKey = insertionOrder.get(a) ?? Number.MAX_SAFE_INTEGER;
+  const bKey = insertionOrder.get(b) ?? Number.MAX_SAFE_INTEGER;
+  return aKey - bKey;
+};
+
+// ─── Unread marks + attention ordering ───────────────────────────────────────
+//
+// Conversations and the rows inside each project sort in tiers: DM'd first
+// (most recent DM first), then unread, then the rest — the last two by most
+// recent activity (either side), null-to-bottom, then a stable fallback.
+// Pinned keeps its fixed host/role/label order; its rows still carry the marks.
+//
+// Holding a row in place: when the user opens a DM'd or unread conversation,
+// its sort position (tier + recency at that moment) is frozen while it
+// stays put, so the row doesn't slide out from under the click. The hold
+// ends when the user opens a different conversation, its agent finishes
+// another turn, or its agent DMs again — not when they merely step away.
+
+// Tier 2 = DM'd, 1 = unread, 0 = everything else.
+type SortKey = { tier: 0 | 1 | 2; recency: number | null };
+type RowHold = SortKey & { finishAt: number | null; dmAt: number | null };
+const heldRows = new Map<string, RowHold>();
+let visibleConversationIds: ReadonlySet<string> = new Set();
+
+function attentionKeyForRow(row: ConversationRow): string | null {
+  if (row.rdpHostRow === true || row.kind === "relay-room" || row.roomId !== undefined) return null;
+  if (!row.targetTmuxSession) return null;
+  return sessionWorkingKeyForRow(row.host, row.targetTmuxSession);
+}
+
+function decorateAttention(row: ConversationRow): void {
+  const k = attentionKeyForRow(row);
+  // Sort inputs fall back to the saved picture until the server's lands, so a
+  // fresh page opens in the order last seen; the marks below never do.
+  const finishAt = getSortFinishAt(k);
+  const sent = row.lastMessageAt ?? null;
+  const activityAt =
+    finishAt === null ? sent : sent === null ? finishAt : Math.max(sent, finishAt);
+  // Omitted when unknown, like the other optional row fields.
+  if (activityAt !== null) row.activityAt = activityAt;
+  else delete row.activityAt;
+  if (k !== null && isUnread(k)) row.unread = true;
+  else delete row.unread;
+  const dmAt = getUnseenDmAt(k);
+  if (dmAt !== null) {
+    row.dm = true;
+    row.dmAt = dmAt;
+  } else {
+    delete row.dm;
+    delete row.dmAt;
+  }
+  const sortDmAt = getUnseenDmAtForSort(k);
+  if (sortDmAt !== null) row.sortDmAt = sortDmAt;
+  else delete row.sortDmAt;
+  if (k !== null && isUnreadForSort(k)) row.sortUnread = true;
+  else delete row.sortUnread;
+}
+
+function rowSortKey(row: ConversationRow): SortKey {
+  if (row.sortDmAt !== undefined) return { tier: 2, recency: row.sortDmAt };
+  return { tier: row.sortUnread === true ? 1 : 0, recency: row.activityAt ?? null };
+}
+
+function effectiveSortKey(row: ConversationRow): SortKey {
+  const hold = heldRows.get(row.id);
+  if (hold) {
+    const k = attentionKeyForRow(row);
+    if (hold.finishAt === getLastFinishAt(k) && hold.dmAt === getLastDmAt(k)) {
+      return { tier: hold.tier, recency: hold.recency };
+    }
+  }
+  return rowSortKey(row);
+}
+
+const compareByAttention = (
+  fallback: (a: ConversationRow, b: ConversationRow) => number,
+) => (a: ConversationRow, b: ConversationRow): number => {
+  const ka = effectiveSortKey(a);
+  const kb = effectiveSortKey(b);
+  if (ka.tier !== kb.tier) return kb.tier - ka.tier;
+  if (ka.recency === null && kb.recency !== null) return 1;
+  if (ka.recency !== null && kb.recency === null) return -1;
+  if (ka.recency !== null && kb.recency !== null && ka.recency !== kb.recency) {
+    return kb.recency - ka.recency;
+  }
+  return fallback(a, b);
+};
+
+/**
+ * Tell the store which conversations are on screen right now (open in a
+ * visible pane of a tab the user is looking at). Call BEFORE marking them
+ * seen: a conversation that is DM'd or unread as it comes on screen is held
+ * in place.
+ */
+export function setVisibleConversationIds(ids: Iterable<string>): void {
+  const next = new Set(ids);
+  let changed = false;
+  // A conversation coming on screen that isn't already held means the user
+  // opened something else: that releases the holds on everything not still
+  // on screen. Stepping away without opening anything (phone back to the
+  // list, sidebar over a narrow screen, browser tab in the background)
+  // releases nothing — the row is still where they left it when they return.
+  const openedSomethingElse = [...next].some(
+    (id) => !visibleConversationIds.has(id) && !heldRows.has(id),
+  );
+  if (openedSomethingElse) {
+    for (const id of heldRows.keys()) {
+      if (!next.has(id)) {
+        heldRows.delete(id);
+        changed = true;
+      }
+    }
+  }
+  const newlyVisible = [...next].filter(
+    (id) => !visibleConversationIds.has(id) && !heldRows.has(id),
+  );
+  if (newlyVisible.length > 0) {
+    const snap = getSnapshot();
+    const rowsById = new Map<string, ConversationRow>();
+    for (const r of snap.middle) rowsById.set(r.id, r);
+    for (const sec of snap.projectSections) for (const r of sec.rows) rowsById.set(r.id, r);
+    for (const id of newlyVisible) {
+      const row = rowsById.get(id);
+      if (row?.unread === true || row?.dm === true) {
+        heldRows.set(id, {
+          ...rowSortKey(row),
+          finishAt: getLastFinishAt(attentionKeyForRow(row)),
+          dmAt: getLastDmAt(attentionKeyForRow(row)),
+        });
+        changed = true;
+      }
+    }
+  }
+  visibleConversationIds = next;
+  if (changed) notify();
+}
+
+function computeSnapshot(): ConversationList {
+  // RDP tabs on RDP-enabled hosts live in the RDP section (see rdpRows
+  // below) — never as their own row in pinned/middle, so they can't be
+  // pinned or filed into a project there either.
+  const openRdpTabsByHostId = new Map<number, Tab[]>();
+  const rdpSectionTabs = new Set<Tab>();
+  for (const tab of state.openTabs) {
+    if (tab.type !== "rdp" || !tab.host) continue;
+    const hostId = Number(tab.host.id);
+    if (state.hostsFlat.get(hostId)?.enableRdp !== true) continue;
+    const list = openRdpTabsByHostId.get(hostId) ?? [];
+    list.push(tab);
+    openRdpTabsByHostId.set(hostId, list);
+    rdpSectionTabs.add(tab);
+  }
+  const conversationTabs = state.openTabs.filter(
+    (tab) => isConversationTab(tab) && !rdpSectionTabs.has(tab),
+  );
+
+  // Build a (hostId, sessionName) → role Map from fleet sessions FIRST so rowFromTab
+  // can prefer fleet-authoritative role (resolved on the identity's home box via same
+  // SSH conn as tmux list-sessions) over the pre-fix identitiesByKey fallback.
+  // Keyed on dedupKey(hostIdStr, sessionName) — same key space as openTabsSessionKeys.
+  const sessionRoleByKey = new Map<string, string | null>();
+  for (const session of state.fleetSessions) {
+    const hostIdStr = String(session.hostId);
+    sessionRoleByKey.set(dedupKey(hostIdStr, session.sessionName), session.role);
+  }
+
+  // Plan 07-01: build the openTabs session-identity set for dedup FIRST (own
+  // pass over conversationTabs) so the tier-assignment loops below can iterate
+  // from scratch with clean semantics. A null/empty targetTmuxSession tab does
+  // NOT enter the dedup set (Test 26): its identity is "attached to hostA
+  // without a known session", not the same as any named fleet session on hostA.
+  const openTabsSessionKeys = new Set<string>();
+  // Phase 91 UAT fix 2026-09-09: parallel dedup set for relay-room tabs so
+  // an openTab-derived row wins over the FleetSession-derived synthetic row
+  // (openTabs-entry-wins, mirrors the harness dedup pattern above).
+  const openTabsRelayRoomIds = new Set<string>();
+  for (const tab of conversationTabs) {
+    if (tab.sessionKind === "relay-room" && tab.relayRoomId) {
+      openTabsRelayRoomIds.add(tab.relayRoomId);
+      continue;
+    }
+    if (!tab.host) continue;
+    const tmux = tab.targetTmuxSession;
+    if (tmux !== null && tmux !== "") {
+      openTabsSessionKeys.add(dedupKey(String(parseInt(tab.host.id)), tmux));
+    }
+  }
+
+  // Plan 07-01: build the merged fleet-derived synthetic-row list. Emit one
+  // ConversationRow per FleetSession whose (hostId, sessionName) identity is
+  // NOT already represented in openTabs (openTabs-entry-wins). Collect the
+  // rows as { hostIdStr, row } tuples so the Tier 3 bucketing loop below
+  // doesn't need to re-parse the fleet id.
+  //
+  // Host resolution: prefer state.hostsFlat.get(hostId) (a real Host with all
+  // fields); fall back to undefined when hostsFlat hasn't populated yet (Test 28).
+  // Also collect per-fleet-hostId hostName fallback so the HostGroup header can
+  // render even when the host is absent from hostTree AND hostsFlat (Test 28).
+  const fleetHostNameFallback = new Map<string, string>();
+  const fleetSyntheticRows: { hostIdStr: string; row: ConversationRow }[] = [];
+  for (const session of state.fleetSessions) {
+    // Phase 91 UAT fix 2026-09-09 (user): relay-room sessions on the wire
+    // have a completely different shape from harness sessions — no hostId,
+    // no hostName, no sessionName, no role. Passing them through the harness
+    // synthetic-row loop below produces a malformed row (host:undefined,
+    // id="fleet::undefined::undefined") that never surfaces in the sidebar.
+    // Build a proper relay-room row here and continue.
+    if (session.kind === "relay-room") {
+      if (session.id === undefined || session.roomId === undefined) continue;
+      // openTabs-entry-wins: skip when a relay-room tab already covers this
+      // roomId (its rowFromTab-derived row has row.id === tab.id, matching
+      // selectedId after click).
+      if (openTabsRelayRoomIds.has(session.roomId)) continue;
+      const relayRow: ConversationRow = {
+        id: session.id,
+        type: "terminal",
+        label: session.roomTitle ?? session.roomId,
+        host: undefined,
+        targetTmuxSession: null,
+        kind: "relay-room",
+        roomId: session.roomId,
+        roomTitle: session.roomTitle ?? null,
+        ...(session.lastActivityAt !== undefined && session.lastActivityAt !== null
+          ? { lastMessageAt: new Date(session.lastActivityAt).getTime() }
+          : { lastMessageAt: null }),
+      };
+      fleetSyntheticRows.push({ hostIdStr: "__relay__", row: relayRow });
+      continue;
+    }
+    const hostIdStr = String(session.hostId);
+    const key = dedupKey(hostIdStr, session.sessionName);
+    if (openTabsSessionKeys.has(key)) continue; // openTabs-entry-wins
+    const resolvedHost = state.hostsFlat.get(session.hostId);
+    // Role is now authoritative from the backend session row (resolved on same SSH conn
+    // as tmux list-sessions). The pre-fix identitiesByKey lookup returned null for every
+    // non-tina identity because /identities used LOCAL-only resolveRoleForIdentity.
+    const role = session.role;
+    const fleetSyntheticId = fleetRowId(session.hostId, session.sessionName);
+    const lastMessageAt = resolveLastMessageAt(
+      fleetSyntheticId,
+      resolvedHost,
+      session.sessionName,
+    );
+    const syntheticRow: ConversationRow = {
+      id: fleetSyntheticId,
+      type: "terminal",
+      label: session.sessionName,
+      host: resolvedHost,
+      targetTmuxSession: session.sessionName,
+      fleetOnly: true,
+      ...(role !== null ? { role } : {}),
+      ...(lastMessageAt !== null ? { lastMessageAt } : {}),
+      // Phase 90 Plan 07 Task 3 — propagate Phase-89 kind + relay-room
+      // identity axis so the row reaches the panel's handleRowSelect with
+      // enough info to route to onRelayRoomRowClick for relay-room rows.
+      // Undefined-vs-explicit distinction preserved on `kind` and `roomId`
+      // per Plan 01 reader-boundary discipline (consumers treat undefined
+      // as harness backward-compat). roomTitle uses `?? null` coerce to
+      // match the same discipline lastMessageAt + aiTitle already follow.
+      ...(session.kind !== undefined ? { kind: session.kind } : {}),
+      ...(session.roomId !== undefined ? { roomId: session.roomId } : {}),
+      ...(session.kind === "relay-room"
+        ? { roomTitle: session.roomTitle ?? null }
+        : {}),
+    };
+    fleetSyntheticRows.push({ hostIdStr, row: syntheticRow });
+    if (!fleetHostNameFallback.has(hostIdStr)) {
+      fleetHostNameFallback.set(hostIdStr, session.hostName);
+    }
+  }
+
+  // Tier-assignment dedup tracker — populated by the Tier 2 (pinned) loops
+  // below so Tier 3 (middle) can skip ids already claimed by the pinned tier.
+  //
+  // Phase 42 UAT amendment 2026-08-17 (user verbatim):
+  // "sessions are still showing above the pinned area when they are active
+  //  in the current instance of the client. That shouldn't happen. Also the
+  //  pinned header should go away entirely."
+  // The former Tier-1 activeSet render tier is retired — active-and-pinned rows
+  // stay in the pinned tier; active-and-not-pinned rows fall through to
+  // middle by recency. The `activeSet` field in the returned snapshot shape
+  // is kept as an always-empty ConversationRow[] to avoid destructure churn
+  // at every panel/consumer call site.
+  const emittedIds = new Set<string>();
+
+  // ── Tier 2 (pinned): rows in pinnedIds ──────────────────────────────────────
+  // Patch #149 B: previously iterated only conversationTabs; now ALSO iterates
+  // fleetSyntheticRows so fleet-derived pinned rows surface at the top.
+  const pinned: ConversationRow[] = [];
+  for (const tab of conversationTabs) {
+    // patch #230 B: a URL-restored (or freshly-opened) tab has a
+    // dynamic openTab id (`hostname-terminal-${Date.now()}-${counter}`,
+    // AppShell.openTab L1033) that never matches the fleet-format id
+    // (`fleet::${hostId}::${sessionName}`) server-persisted pins use.
+    // When the openTab shadows a fleet session, the fleet synthetic
+    // row gets deduped out at L324 ("openTabs-entry-wins"), so a pin
+    // whose id is the fleet form must ALSO be recognized against the
+    // openTab's fleet-shadow id here — else the pin has nowhere to
+    // render (fleet row gone, openTab id doesn't match pinnedIds) and
+    // silently disappears from the pinned tier despite surviving in
+    // state.pinnedIds. Post-quick-260818-l8n (retire pin pruner),
+    // state.pinnedIds is never pruned by openTabs/fleetSessions
+    // changes, so a pin whose id is the fleet form is always available
+    // for the shadow-id match here — this render-side pass is the sole
+    // gate that decides whether the pin surfaces as a tile.
+    const shadowFleetId =
+      tab.host && tab.targetTmuxSession
+        ? fleetRowId(parseInt(tab.host.id), tab.targetTmuxSession)
+        : null;
+    const isPinned =
+      state.pinnedIds.has(tab.id) ||
+      (shadowFleetId !== null && state.pinnedIds.has(shadowFleetId));
+    if (!isPinned) continue;
+    // Defensive dedup — trivially unreachable post-2026-08-17 (no upstream
+    // tier populates emittedIds before this point) but kept as an intent
+    // marker for future re-wiring.
+    if (emittedIds.has(tab.id)) continue;
+    pinned.push(rowFromTab(tab, sessionRoleByKey));
+    emittedIds.add(tab.id);
+  }
+  for (const { row } of fleetSyntheticRows) {
+    if (!state.pinnedIds.has(row.id)) continue;
+    // Defensive dedup — see comment above.
+    if (emittedIds.has(row.id)) continue;
+    pinned.push(row);
+    emittedIds.add(row.id);
+  }
+  pinned.sort(compareByHostRoleLabel);
+  for (const row of pinned) decorateAttention(row);
+
+  // ── Middle zone (Phase 41 Plan 01): FLAT list of non-pinned / non-RDP
+  //    identity-tmux + fleet-synthetic rows, sorted by compareByRecencyDesc.
+  //    (Phase 42 UAT amendment 2026-08-17: the former "non-active-set" filter
+  //    is gone — the Tier 1 activeSet render tier was retired; active-set
+  //    rows now flow through to pinned (if pinned) or middle (by recency).)
+  //
+  // Phase 41 retired the per-host bucketing (`byHostId` map + hostTree walk
+  // + orphan-host fallback groups) that built the pre-Phase-41
+  // `grouped: HostGroup[]` shape. The middle is now ONE flat array.
+  //
+  // Insertion-order key: each row's push-index into `middleRows` is captured in
+  // a WeakMap keyed on row-object identity. The comparator reads the map for
+  // the deterministic-stability fallback (see `compareByRecencyDesc` above).
+  // The map is scoped to this single computeSnapshot invocation — a fresh
+  // WeakMap on every call — so the "stable across a single snapshot" contract
+  // holds regardless of how many times computeSnapshot fires.
+  //
+  // `collectHostOrder(state.hostTree)` is NOT consumed by the middle-build
+  // anymore; it survives below in the RDP synthesis pass, which still uses
+  // hostTree order to make the RDP section deterministic during initial-load.
+  const middleRows: ConversationRow[] = [];
+  const middleInsertionOrder = new WeakMap<ConversationRow, number>();
+  let middlePushIndex = 0;
+  for (const tab of conversationTabs) {
+    if (emittedIds.has(tab.id)) continue; // already in pinned tier
+    // Phase 91 UAT fix 2026-09-09: relay-room tabs are host-less by design;
+    // they were admitted by isConversationTab and MUST NOT be filtered out
+    // here. Harness tabs still require a host.
+    const isRelayRoomTab =
+      tab.sessionKind === "relay-room" && !!tab.relayRoomId;
+    if (!tab.host && !isRelayRoomTab) continue;
+    const row = rowFromTab(tab, sessionRoleByKey);
+    middleRows.push(row);
+    middleInsertionOrder.set(row, middlePushIndex++);
+  }
+  for (const { row } of fleetSyntheticRows) {
+    if (emittedIds.has(row.id)) continue; // already in pinned tier
+    middleRows.push(row);
+    middleInsertionOrder.set(row, middlePushIndex++);
+  }
+  for (const row of middleRows) decorateAttention(row);
+  middleRows.sort(compareByAttention(compareByRecencyDesc(middleInsertionOrder)));
+  // Consume the fleet hostName fallback + host-tree order to keep the
+  // ESLint no-unused-vars / TypeScript unused-symbol linters quiet — both
+  // survived the retirement for downstream consumers (RDP synthesis below
+  // reads orderedHosts). fleetHostNameFallback is now inert for the middle
+  // path but still populated by the fleetSyntheticRows loop above; retire
+  // its middle-side consumption by referencing it as an intentional no-op
+  // read to avoid a variable-cleanup churn diff.
+  void fleetHostNameFallback;
+  const orderedHosts = collectHostOrder(state.hostTree);
+
+  // Plan 07-02 (TG-15): synthesize RDP-host rows from state.hostsFlat filtered
+  // on strict `enableRdp === true` (T-07-02-01 mitigation — undefined on
+  // legacy Host records must NOT emit a row). Placed in a SENTINEL HostGroup
+  // (`hostId: "__rdp__"`, `hostName: ""`) emitted as `rdpGroup` at the BOTTOM
+  // of the ConversationsPanel scroller per shape-file "one row per RDP-enabled
+  // host at the bottom of the list." Phase 41 retired the `grouped: HostGroup[]`
+  // shape; RDP now emits as a standalone field `rdpGroup: HostGroup | null`.
+  //
+  // ConversationsPanel special-cases `hostId === "__rdp__"` to suppress the
+  // semibold host-header render (see NOTE-A in 07-PLAN-CHECK.md) — otherwise
+  // an empty header would render above the RDP rows. Rendering the rows with
+  // a monitor icon + host name (no identity hue, no avatar, no host secondary
+  // line) is the panel's responsibility; the store only supplies the shape.
+  //
+  // Ordering: iterate the hostTree walk order first (so RDP rows for hosts
+  // present in the tree follow the same top-to-bottom order as their
+  // identity-tmux groups above), then any RDP-eligible hosts NOT in the
+  // tree (orphan — host record exists in hostsFlat but the tree hasn't seen
+  // it yet, mirroring the fallback path above). This makes the RDP section
+  // deterministic even during initial-load races.
+  //
+  // Row shape: id `rdp-host::${host.id}` (deterministic per host — a fleet
+  // fact, not tied to any tab-lifecycle counter), type "rdp", label
+  // `host.name`, host: resolvedHost, targetTmuxSession: null, rdpHostRow: true.
+  //
+  // RDP rows are NEVER considered for Tier 1 or Tier 2: activeSet excludes
+  // them per patch #137 contract, and the tier loops above only iterate
+  // conversationTabs + fleetSyntheticRows. rdpRows is a separate synthesized
+  // list that never joins those sets.
+  // One row per host with no RDP tab open; otherwise one row per open RDP tab
+  // on that host (normally just one — a click on an open row focuses its tab
+  // rather than opening another). An open row carries its tab's id, so
+  // selection + split-tree glow match it.
+  const buildRdpHostRows = (host: Host): ConversationRow[] => {
+    const rdpRowId = `rdp-host::${host.id}`;
+    const lastMessageAt = resolveLastMessageAt(rdpRowId, host, null);
+    const base: ConversationRow = {
+      id: rdpRowId,
+      type: "rdp",
+      label: host.name,
+      host,
+      targetTmuxSession: null,
+      rdpHostRow: true,
+      ...(lastMessageAt !== null ? { lastMessageAt } : {}),
+    };
+    const openTabs = openRdpTabsByHostId.get(Number(host.id));
+    if (!openTabs || openTabs.length === 0) return [base];
+    return openTabs.map((tab) => ({ ...base, id: tab.id, rdpTabOpen: true }));
+  };
+  const rdpRows: ConversationRow[] = [];
+  const rdpEmittedHostIds = new Set<number>();
+  // Hosts in hostTree order first
+  for (const { id } of orderedHosts) {
+    const numericId = Number(id);
+    if (!Number.isFinite(numericId)) continue;
+    const host = state.hostsFlat.get(numericId);
+    if (!host) continue;
+    if (host.enableRdp !== true) continue; // strict check per T-07-02-01
+    {
+      rdpRows.push(...buildRdpHostRows(host));
+    }
+    rdpEmittedHostIds.add(numericId);
+  }
+  // Orphan RDP hosts (in hostsFlat but not in hostTree) — appended after.
+  // Uses hostsFlat's Map iteration order (insertion order in JS Maps).
+  for (const [numericId, host] of state.hostsFlat) {
+    if (rdpEmittedHostIds.has(numericId)) continue;
+    if (host.enableRdp !== true) continue;
+    rdpRows.push(...buildRdpHostRows(host));
+  }
+  rdpRows.sort(compareByHostRoleLabel);
+  // Phase 41 (Plan 01): rdpGroup is `null` iff zero RDP-eligible hosts exist.
+  // This preserves the pre-Phase-41 store-level gate at L632 verbatim (user
+  // lock #7 — no empty RDP header renders when no RDP hosts).
+  const rdpGroup: HostGroup | null =
+    rdpRows.length > 0
+      ? { hostId: "__rdp__", hostName: "", rows: rdpRows }
+      : null;
+
+  // ─── Phase 117 Plan 117-07 — projects-derived selector (D-05, D-07, D-08,
+  //   D-11, D-15, D-16, D-19, D-39) ─────────────────────────────────────────
+  //
+  // Bucket every row into one of: `pinnedUnassigned` (pinned + no project),
+  // per-project section (pinned float to top of section per D-19; otherwise
+  // sorted alphabetical by displayName per D-16), `middle` (unpinned + no
+  // project or dangling project ref per D-07), or `rdp` (unchanged — RDP
+  // rows never enter a project section per D-08).
+  //
+  // Resolver contract (per D-05 two-carrier membership):
+  //   1. RDP row → assignment = null (defense-in-depth D-08 exclusion).
+  //   2. Relay-room row (row.roomId set) → look up state.roomProjectAssignments.
+  //   3. Identity-associated row (row.host set) → look up
+  //      state.identityProjectAssignments keyed on `${hostId}::${identityKey}`
+  //      where identityKey is derived from targetTmuxSession (falls back to
+  //      the sessionMatchKey helper for the same convention identities-store uses).
+  //   4. Slug returned but not in state.projects → treat as null (D-07).
+  //
+  // The pinned + middle rows built above are re-bucketed here into the new
+  // shape. Existing `pinned`, `middle`, `rdpGroup` fields remain populated for
+  // backward-compat with pre-Phase-117 consumers.
+  // Projects are host-scoped: the same slug on two hosts is two projects.
+  // Sections and buckets key on `${hostId}::${slug}` (the slug alone merged
+  // both hosts' members into one section, and archiving it hit both).
+  const projectsByKey = new Map<string, ProjectRow>();
+  const firstProjectKeyBySlug = new Map<string, string>();
+  for (const p of state.projects) {
+    const k = projectKey(p.hostId, p.slug);
+    projectsByKey.set(k, p);
+    if (!firstProjectKeyBySlug.has(p.slug)) firstProjectKeyBySlug.set(p.slug, k);
+  }
+
+  // Helper: resolve a row → project key (or null).
+  function projectForRow(row: ConversationRow): string | null {
+    if (row.rdpHostRow === true) return null; // D-08 defense
+    if (row.roomId !== undefined) {
+      const raw = state.roomProjectAssignments.get(row.roomId);
+      if (raw === undefined) return null;
+      // Room tags are fleet-wide (slug only) — resolve to the first project
+      // carrying that slug. D-07 graceful degradation: dangling slug → null.
+      return firstProjectKeyBySlug.get(raw) ?? null;
+    }
+    // Identity-associated: key = `${hostId}::${identityKey}`. Use
+    // targetTmuxSession (canonical identity name lives in the tmux session
+    // name convention). Falls back to null when host is undefined (e.g.
+    // relay-room rows already handled above; pure fleet-only rows without
+    // a resolved host on this tick).
+    if (!row.host) return null;
+    const identityKey =
+      row.targetTmuxSession !== null && row.targetTmuxSession !== ""
+        ? sessionMatchKey(row.targetTmuxSession) ?? row.targetTmuxSession
+        : null;
+    if (identityKey === null) return null;
+    const mapKey = `${row.host.id}::${identityKey}`;
+    const raw = state.identityProjectAssignments.get(mapKey);
+    if (raw === undefined) return null;
+    // An identity's `project:` names a project on its OWN host.
+    const k = projectKey(row.host.id, raw);
+    return projectsByKey.has(k) ? k : null;
+  }
+
+  // Row → displayName for the intra-project D-16 alphabetical sort. For
+  // identity rows, use the identity's displayName if available on
+  // identitiesByKey; else fall back to row.label (which mirrors the tmux
+  // session name for identity conversations). For relay-room rows, use
+  // row.roomTitle. Case-insensitive throughout.
+  function rowDisplayName(row: ConversationRow): string {
+    if (row.roomId !== undefined) {
+      return row.roomTitle ?? row.label ?? "";
+    }
+    // Identity: prefer identitiesByKey (matches Phase 25's role sort convention).
+    if (row.targetTmuxSession) {
+      const matchKey = sessionMatchKey(row.targetTmuxSession);
+      if (matchKey) {
+        const identity = state.identitiesByKey.get(matchKey);
+        if (identity?.displayName) return identity.displayName;
+      }
+    }
+    return row.label ?? "";
+  }
+
+  // Aggregate every candidate row (pinned + middle + fleet-synthetic) so the
+  // selector considers the full universe when bucketing into project sections.
+  // We deliberately walk `pinned` (from the pinned tier above) + `middleRows`
+  // (from the middle tier above); RDP rows are handled separately.
+  const pinnedUnassigned: ConversationRow[] = [];
+  const projectRowsByKey = new Map<string, ConversationRow[]>();
+  // Middle for the new derived shape — starts from the existing middleRows
+  // then filters out rows that get promoted into a project section.
+  const derivedMiddle: ConversationRow[] = [];
+
+  // Pinned rows: a pinned row with a project goes to that project section as
+  // an ordinary member (project outranks pin); otherwise to pinnedUnassigned.
+  for (const row of pinned) {
+    const slug = projectForRow(row);
+    if (slug === null) {
+      pinnedUnassigned.push(row);
+    } else {
+      const bucket = projectRowsByKey.get(slug) ?? [];
+      bucket.push(row);
+      projectRowsByKey.set(slug, bucket);
+    }
+  }
+
+  // Middle rows: assign to project section OR keep in derivedMiddle.
+  for (const row of middleRows) {
+    const slug = projectForRow(row);
+    if (slug === null) {
+      derivedMiddle.push(row);
+    } else {
+      const bucket = projectRowsByKey.get(slug) ?? [];
+      bucket.push(row);
+      projectRowsByKey.set(slug, bucket);
+    }
+  }
+
+  // Build projectSections. Every project in state.projects gets a section,
+  // even if empty (D-11). Rows within each section are alphabetical by
+  // displayName (D-16) — pinned and in-a-project are mutually exclusive, so
+  // a row that is somehow both (a stale `.pinned` an agent left behind)
+  // shows as a plain project member: project membership outranks the pin.
+  //
+  // Nested projects: sections come out in tree order — each project followed
+  // by its sub-projects (recursively), siblings alphabetical by displayName
+  // (D-15). `parentKey` is the RESOLVED parent (a missing parent or a loop
+  // resolves to null = top level, see project-tree.ts) and `depth` is 0 for
+  // top level. Consumers that ignore both still see every project once.
+  const effectiveParents = resolveEffectiveParents(state.projects);
+  const sectionsByKey = new Map<string, ProjectSection>();
+  for (const project of state.projects) {
+    const k = projectKey(project.hostId, project.slug);
+    const rows = [...(projectRowsByKey.get(k) ?? [])];
+    rows.sort(
+      compareByAttention((a, b) =>
+        rowDisplayName(a).localeCompare(rowDisplayName(b), undefined, {
+          sensitivity: "base",
+        }),
+      ),
+    );
+    sectionsByKey.set(k, {
+      slug: project.slug,
+      hostId: project.hostId,
+      displayName: project.displayName,
+      rows,
+      parentKey: effectiveParents.get(k) ?? null,
+      depth: 0,
+    });
+  }
+  const childKeys = childrenByParent(effectiveParents);
+  const byDisplayName = (a: string, b: string) =>
+    sectionsByKey.get(a)!.displayName.localeCompare(
+      sectionsByKey.get(b)!.displayName,
+      undefined,
+      { sensitivity: "base" },
+    );
+  const projectSections: ProjectSection[] = [];
+  const walk = (keys: string[], depth: number) => {
+    for (const k of [...keys].sort(byDisplayName)) {
+      const section = sectionsByKey.get(k)!;
+      section.depth = depth;
+      projectSections.push(section);
+      walk(childKeys.get(k) ?? [], depth + 1);
+    }
+  };
+  walk(childKeys.get(null) ?? [], 0);
+
+  // The snapshot carries EVERY row. (Phase 115 Plan 115-02: the earlier
+  // Phase 107 Hidden section — including its hiddenIds subscription and
+  // canonicalHideIdForRow resolver — was retired per D-21. The archive
+  // gesture ships in 115-06 with a distinct archived-tree data source.)
+  // Phase 117 Plan 117-07 (D-39): rows that land in a project section (which
+  // requires state.projects to be non-empty AND a valid assignment through
+  // identityProjectAssignments / roomProjectAssignments) are promoted out of
+  // `middle`. Pre-Phase-117 code paths — where state.projects is empty and no
+  // assignment maps are populated — see `middle` unchanged from the
+  // pre-Phase-117 shape (all non-pinned non-RDP rows). So this is
+  // backward-compatible in practice: the pre-Phase-117 sidebar continues to
+  // render `middle` verbatim until Wave 4 (117-08) swaps to the new fields.
+  return {
+    activeSet: [],
+    pinned,
+    middle: derivedMiddle,
+    rdpGroup,
+    // Phase 117 Plan 117-07 (D-39): projects-derived output. Wave 4 (117-08)
+    // reads pinnedUnassigned / projectSections / rdp INSTEAD of pinned / middle
+    // / rdpGroup for the projects-aware render. The pinnedUnassigned field
+    // subsumes the "top pinned zone" from pre-Phase-117; pinned-in-project
+    // rows flow into their project section instead (D-19).
+    pinnedUnassigned,
+    projectSections,
+    rdp: rdpGroup,
+  };
+}
+
+// ─── Structural sharing ──────────────────────────────────────────────────────
+// notify() fires for every working-store publish anywhere in the fleet (any
+// session's isWorking / dormant / aiTitle / lastMessageAt), which used to hand
+// useConversations() a brand-new list — and fresh row objects — each time, so
+// the whole sidebar re-rendered for an event that changed none of its rows.
+// After recomputing, reuse every row / array / section / group from the
+// previous snapshot that is shallow-equal, and the previous snapshot itself
+// when nothing changed. Consumers then see a stable reference (no re-render)
+// and memoized rows re-render only when their own row object changes.
+// Rows are flat records (primitives + a Host ref), so a shallow compare is a
+// full compare.
+function shallowEqualRow(a: ConversationRow, b: ConversationRow): boolean {
+  if (a === b) return true;
+  const aKeys = Object.keys(a) as (keyof ConversationRow)[];
+  if (aKeys.length !== Object.keys(b).length) return false;
+  for (const k of aKeys) {
+    if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
+    if (a[k] !== b[k]) return false;
+  }
+  return true;
+}
+
+function sameElements<T>(a: readonly T[], b: readonly T[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+function shareWithPrevious(
+  prev: ConversationList,
+  next: ConversationList,
+): ConversationList {
+  const prevById = new Map<string, ConversationRow>();
+  const collect = (rows: readonly ConversationRow[]) => {
+    for (const r of rows) if (!prevById.has(r.id)) prevById.set(r.id, r);
+  };
+  collect(prev.pinned);
+  collect(prev.middle);
+  collect(prev.pinnedUnassigned);
+  for (const sec of prev.projectSections) collect(sec.rows);
+  if (prev.rdpGroup) collect(prev.rdpGroup.rows);
+
+  // The same row object can sit in several fields (pinned + pinnedUnassigned,
+  // rdpGroup === rdp) — memo per object so all fields map to one canonical.
+  const canon = new Map<ConversationRow, ConversationRow>();
+  const canonRow = (r: ConversationRow): ConversationRow => {
+    const hit = canon.get(r);
+    if (hit) return hit;
+    const old = prevById.get(r.id);
+    const out = old !== undefined && shallowEqualRow(old, r) ? old : r;
+    canon.set(r, out);
+    return out;
+  };
+  const shareRows = (
+    prevRows: ConversationRow[],
+    nextRows: ConversationRow[],
+  ): ConversationRow[] => {
+    const mapped = nextRows.map(canonRow);
+    return sameElements(prevRows, mapped) ? prevRows : mapped;
+  };
+
+  const activeSet = shareRows(prev.activeSet, next.activeSet);
+  const pinned = shareRows(prev.pinned, next.pinned);
+  const middle = shareRows(prev.middle, next.middle);
+  const pinnedUnassigned = shareRows(prev.pinnedUnassigned, next.pinnedUnassigned);
+
+  const shareGroup = (
+    prevG: HostGroup | null,
+    nextG: HostGroup | null,
+  ): HostGroup | null => {
+    if (nextG === null) return null;
+    const rows = shareRows(prevG?.rows ?? [], nextG.rows);
+    if (
+      prevG !== null &&
+      prevG.hostId === nextG.hostId &&
+      prevG.hostName === nextG.hostName &&
+      prevG.rows === rows
+    ) {
+      return prevG;
+    }
+    return { ...nextG, rows };
+  };
+  const rdpGroup = shareGroup(prev.rdpGroup, next.rdpGroup);
+  const rdp =
+    next.rdp === next.rdpGroup ? rdpGroup : shareGroup(prev.rdp, next.rdp);
+
+  const sectionKey = (s: { slug: string; hostId?: string }) =>
+    `${s.hostId ?? ""}::${s.slug}`;
+  const prevSections = new Map(
+    prev.projectSections.map((s) => [sectionKey(s), s] as const),
+  );
+  const mappedSections = next.projectSections.map((s) => {
+    const old = prevSections.get(sectionKey(s));
+    const rows = shareRows(old?.rows ?? [], s.rows);
+    if (
+      old !== undefined &&
+      old.slug === s.slug &&
+      old.hostId === s.hostId &&
+      old.displayName === s.displayName &&
+      // Nested projects: a move changes only where the section sits.
+      old.parentKey === s.parentKey &&
+      old.depth === s.depth &&
+      old.rows === rows
+    ) {
+      return old;
+    }
+    return { ...s, rows };
+  });
+  const projectSections = sameElements(prev.projectSections, mappedSections)
+    ? prev.projectSections
+    : mappedSections;
+
+  if (
+    activeSet === prev.activeSet &&
+    pinned === prev.pinned &&
+    middle === prev.middle &&
+    rdpGroup === prev.rdpGroup &&
+    pinnedUnassigned === prev.pinnedUnassigned &&
+    projectSections === prev.projectSections &&
+    rdp === prev.rdp
+  ) {
+    return prev;
+  }
+  return {
+    activeSet,
+    pinned,
+    middle,
+    rdpGroup,
+    pinnedUnassigned,
+    projectSections,
+    rdp,
+  };
+}
+
+// Last computed snapshot, kept across notify() invalidations (cachedSnapshot
+// is nulled by notify) so the next computation can share structure with it.
+let lastSnapshot: ConversationList | null = null;
+
+function getSnapshot(): ConversationList {
+  if (cachedSnapshot !== null && cachedSnapshotVersion === snapshotVersion) {
+    return cachedSnapshot;
+  }
+  const fresh = computeSnapshot();
+  cachedSnapshot =
+    lastSnapshot === null ? fresh : shareWithPrevious(lastSnapshot, fresh);
+  lastSnapshot = cachedSnapshot;
+  cachedSnapshotVersion = snapshotVersion;
+  return cachedSnapshot;
+}
+
+// ─── Actions (public API) ────────────────────────────────────────────────────
+
+export function updateHostTree(tree: HostFolder | null): void {
+  if (tree === state.hostTree) return; // reference-equal no-op
+  state = { ...state, hostTree: tree };
+  notify();
+}
+
+export function updateOpenTabs(tabs: Tab[]): void {
+  // Reference-equal AND same-length no-op check for the hot path (identical
+  // ref array from React unchanged prev). We can't compare tab-by-tab cheaply,
+  // but reference equality catches the common batched-no-op case.
+  if (tabs === state.openTabs) return;
+
+  const nextIds = new Set<string>();
+  for (const t of tabs) nextIds.add(t.id);
+
+  // quick-260818-l8n (retire pin pruner): updateOpenTabs no longer touches
+  // state.pinnedIds. Pins are sticky across openTabs / fleetSessions churn.
+  //
+  // user: "Pins are pins. Doesn't matter if they are open or anything
+  // else." — deploy-race scenario: on WebSocket reconnect, updateOpenTabs
+  // and updateFleetSessions fire with partial/empty payloads before every
+  // managed host re-reports. Any pruner running in that transient window
+  // nuked legitimate pins from the in-memory Set; user's next pin/unpin
+  // action then wrote the pruned Set to the server via putPinnedIds and
+  // the loss went durable. The render-side skip in computeSnapshot Tier 2
+  // (see L636-675) already drops orphan pin ids gracefully — an id with
+  // no matching openTab and no matching fleet session yields zero pinned
+  // tiles at render time, and the id itself SURVIVES in state.pinnedIds
+  // so the pin re-materializes the moment the session returns. Pruning
+  // is therefore redundant and harmful; the entire pruner block was
+  // removed. See `conversation-store: pins are sticky across
+  // updateOpenTabs (quick-260818-l8n)` describe for the invariant guards.
+
+  // Coerce selection if it points at a tab that no longer exists
+  let nextSelectedId = state.selectedId;
+  if (nextSelectedId !== null && !nextIds.has(nextSelectedId)) {
+    nextSelectedId = null;
+  }
+
+  // Plan 06-04 race defense (T-06-04-04): if a pending deferred-select id
+  // has arrived in the new tabs, promote it into selectedId and clear the
+  // pending slot. Runs AFTER the stale-selection coercion so a pending
+  // arrival takes precedence over a coerced-to-null selection on the same
+  // tick (e.g. the previously-selected tab closed AND the new tab arrived
+  // in the same setTabs commit). Runs BEFORE the no-op short-circuit so a
+  // same-array re-emission that happens to satisfy the pending id still
+  // fires — updateOpenTabs is the flush point.
+  if (pendingSelectId !== null && nextIds.has(pendingSelectId)) {
+    nextSelectedId = pendingSelectId;
+    pendingSelectId = null;
+  }
+
+  // Was there a REAL change? We already know tabs !== state.openTabs by ref,
+  // but the array MAY be a re-emission with the same contents. Check length
+  // + shallow per-element ref equality; if identical, treat as no-op.
+  let tabsChanged = tabs.length !== state.openTabs.length;
+  if (!tabsChanged) {
+    for (let i = 0; i < tabs.length; i++) {
+      if (tabs[i] !== state.openTabs[i]) {
+        tabsChanged = true;
+        break;
+      }
+    }
+  }
+
+  if (!tabsChanged && nextSelectedId === state.selectedId) {
+    return; // full no-op — do not bump snapshotVersion
+  }
+
+  state = {
+    ...state,
+    openTabs: tabs,
+    selectedId: nextSelectedId,
+  };
+  notify();
+}
+
+// Live-frame membership changes, keyed `${hostId}::${sessionName}` → when
+// and which way. GET /sessions/list is SSH-backed and can take seconds; a
+// `gone` or a newborn's first upsert that lands while it is in flight must not
+// be undone by the (older) response — `gone` is one-shot and an upsert only
+// re-fires on a fingerprint change, so a clobbered row stays wrong.
+const fleetRowTouches = new Map<string, { kind: "added" | "removed"; at: number }>();
+const FLEET_ROW_TOUCH_RETAIN_MS = 5 * 60 * 1000;
+
+function noteFleetRowTouch(hostId: number, sessionName: string, kind: "added" | "removed"): void {
+  const now = Date.now();
+  fleetRowTouches.set(`${hostId}::${sessionName}`, { kind, at: now });
+  if (fleetRowTouches.size > 500) {
+    for (const [k, v] of fleetRowTouches) {
+      if (now - v.at > FLEET_ROW_TOUCH_RETAIN_MS) fleetRowTouches.delete(k);
+    }
+  }
+}
+
+/**
+ * Apply a GET /sessions/list response that was REQUESTED at `startedAt`,
+ * reconciling it against what changed since instead of replacing wholesale:
+ *   - rows removed by a live `gone` after startedAt stay removed;
+ *   - rows added by a live upsert after startedAt (absent from the response)
+ *     are kept;
+ *   - rows for hosts the backend couldn't reach (their `[]` means unknown,
+ *     not empty) are kept as-is.
+ * Then hands the result to updateFleetSessions (pending-archive filter,
+ * empty-preserve and no-op guards all still apply).
+ */
+export function reconcileFleetSessionsFromList(
+  fresh: FleetSession[],
+  opts: { startedAt: number; unreachableHostIds?: readonly number[] },
+): void {
+  const unreachable = new Set(opts.unreachableHostIds ?? []);
+  const key = (s: FleetSession) => `${s.hostId}::${s.sessionName}`;
+  const isHarness = (s: FleetSession) =>
+    s.kind !== "relay-room" && typeof s.sessionName === "string" && s.sessionName !== "";
+  const touchedSince = (s: FleetSession, kind: "added" | "removed") => {
+    const t = fleetRowTouches.get(key(s));
+    return t !== undefined && t.kind === kind && t.at >= opts.startedAt;
+  };
+
+  const out = fresh.filter((s) => {
+    if (!isHarness(s)) return true;
+    if (unreachable.has(s.hostId)) return true;
+    return !touchedSince(s, "removed");
+  });
+  const outKeys = new Set(out.filter(isHarness).map(key));
+  let kept = 0;
+  for (const existing of state.fleetSessions) {
+    if (!isHarness(existing) || outKeys.has(key(existing))) continue;
+    if (unreachable.has(existing.hostId) || touchedSince(existing, "added")) {
+      out.push(existing);
+      outKeys.add(key(existing));
+      kept += 1;
+    }
+  }
+  if (kept > 0 || unreachable.size > 0) {
+    console.info({
+      operation: "fleet_sessions_list_reconciled",
+      keptRows: kept,
+      unreachableHostIds: [...unreachable],
+    });
+  }
+  updateFleetSessions(out);
+}
+
+// Plan 07-01 (TG-12, TG-17): fleet-discovery snapshot input. AppShell calls
+// this ONCE per page-load after getSessionList() resolves. No polling — the
+// hard shape lock (see 07-CONTEXT.md §Scope Fence item #2) forbids any
+// interval/focus/visibility refetch that would produce visible list
+// mutations after page-load. Cross-device staleness is deliberately
+// acceptable; user refreshes to update.
+//
+// Same reference-equality + per-element ref no-op story as updateHostTree /
+// updateOpenTabs — a fresh array from a fresh fetch that happens to be
+// content-equal to the last one still fires (we do NOT deep-equal; the
+// polling-thrash-guard lives upstream at the AppShell memoization layer).
+// Test 27 asserts both the ref-equal no-op and the different-ref-same-
+// content DOES-fire semantics.
+export function updateFleetSessions(sessions: FleetSession[]): void {
+  // Pending-archive filter (companion to the Guard 4 in upsertFleetSession).
+  // Any (hostId, sessionName) currently in pendingArchiveKeys was optimistically
+  // removed by handleArchive; a fresh GET /sessions/list can still return it
+  // for ~15s until the supervisor retires the identity. Filter here so the
+  // bulk-replace path never re-inserts a row we've committed to hiding.
+  if (pendingArchiveKeys.size > 0) {
+    sessions = sessions.filter(
+      (s) => !isPendingArchive(s.hostId, s.sessionName),
+    );
+  }
+  // quick-260727-kbw: compute shallow no-op WITHOUT early-return — the
+  // fleetSessionsLoaded flag transition (false→true) can force a notify()
+  // even when the sessions array itself is a shallow no-op. The first call
+  // to updateFleetSessions ALWAYS transitions the flag (starts false), so
+  // the very first call must always notify() even if the caller happens to
+  // pass an empty [] or a same-content array.
+  const sessionsRefEqual = sessions === state.fleetSessions;
+  let sessionsShallowEqual = sessionsRefEqual;
+  if (!sessionsRefEqual && sessions.length === state.fleetSessions.length) {
+    let allSame = true;
+    for (let i = 0; i < sessions.length; i++) {
+      if (sessions[i] !== state.fleetSessions[i]) {
+        allSame = false;
+        break;
+      }
+    }
+    if (allSame) sessionsShallowEqual = true;
+  }
+  const needsFlagFlip = !state.fleetSessionsLoaded;
+
+  // Full no-op path: sessions are a shallow no-op AND the flag is already
+  // true. Nothing has changed — do NOT bump snapshotVersion.
+  if (sessionsShallowEqual && !needsFlagFlip) return;
+
+  // Phase 111 additive-membership property: an empty-array bulk-replace
+  // MUST NOT blank rows already in state.fleetSessions. Callers pass [] in
+  // three shapes — a getSessionList() rejection (AppShell.tsx onCatch), a
+  // legitimate empty successful response, and a cold-cache seed. In all
+  // three, the pulse (upsertFleetSession) may have already populated rows;
+  // blanking them here would undo the whole "list arrives complete and
+  // stays live" contract on any network hiccup. Individual removal is the
+  // pulse's job via removeFleetSession (fired from onGone), not a bulk
+  // wipe. When the caller has no information (incoming is empty) but we
+  // already know some rows, keep the rows and only advance the flag.
+  const preservePulseRows =
+    sessions.length === 0 && state.fleetSessions.length > 0;
+  const nextSessions = sessionsShallowEqual || preservePulseRows
+    ? state.fleetSessions
+    : sessions;
+  state = {
+    ...state,
+    fleetSessions: nextSessions,
+    fleetSessionsLoaded: true,
+  };
+  notify();
+}
+
+/**
+ * Surgically remove one FleetSession from state (by hostId + sessionName)
+ * AND trim it out of the localStorage cache so a page reload does not briefly
+ * re-show the row from stale cache before the next getSessionList() resolves.
+ *
+ * Idempotent no-op when the (hostId, sessionName) tuple is not present in
+ * state.fleetSessions — same shape as updateFleetSessions' same-content
+ * short-circuit (skip notify(), skip cache write).
+ *
+ * Used by AppShell.onKillRow (quick-260810-oig) after a successful tmux
+ * kill-session so the fleet-synthetic row disappears immediately without
+ * waiting for a page reload. Companion to closeTab, which only removes
+ * openTabs-derived rows; non-identity throwaway rows are fleet-synthetic and
+ * closeTab is a no-op for them.
+ */
+export function removeFleetSession(hostId: number, sessionName: string): void {
+  noteFleetRowTouch(hostId, sessionName, "removed");
+  const nextFleetSessions = state.fleetSessions.filter(
+    (s) => !(s.hostId === hostId && s.sessionName === sessionName),
+  );
+  // No-op path: tuple was not present — no state mutation, no cache write, no notify.
+  if (nextFleetSessions.length === state.fleetSessions.length) return;
+
+  state = { ...state, fleetSessions: nextFleetSessions };
+  notify();
+
+  // Cache trim. Silent on write failure — mirrors writeFleetSessionsCache's
+  // own failure policy. Do NOT block or unwind the in-memory update if the
+  // cache write throws (localStorage quota, disabled storage, private mode).
+  try {
+    writeFleetSessionsCache(nextFleetSessions);
+  } catch {
+    // Silent — cache-write failure is non-fatal; next getSessionList() fetch
+    // on the next page load will re-persist the fresh (post-kill) snapshot.
+  }
+}
+
+/**
+ * Pulse's single-row door — additive upsert for one FleetSession.
+ *
+ * Mirrors removeFleetSession's three contract properties:
+ *   1. Narrow (hostId, sessionName) tuple match — never blasts the whole array.
+ *   2. Idempotent no-op when the resulting entry would be field-for-field
+ *      identical to the current one — skips notify() AND cache write so an
+ *      upsert per identity per snapshot frame doesn't thrash row-list recompute
+ *      every couple of seconds (T-111-30).
+ *   3. Cache sync on mutation — same silent-failure policy as removeFleetSession.
+ *
+ * Deliberately does NOT flip `fleetSessionsLoaded`. That flag gates the
+ * PrettyConversationsPanel's both-loaded hydrate effect AND interacts with the
+ * pin-pruner. Flipping it from the pulse is the fleetSessionsLoaded twin of the
+ * D-10 `loaded` hazard in identities-store — same class of bug, different flag.
+ * Its absence from the state assignment below is the greppable proof.
+ *
+ * Rejects relay-room and malformed input at the door:
+ *   - kind === "relay-room": relay rows arrive ONLY via /sessions/list and are
+ *     appended server-side after the harness partition; the pulse must never
+ *     manufacture one (T-111-26).
+ *   - empty/undefined sessionName: would produce the fleet::undefined::undefined
+ *     malformed row recorded in the relay-room comment in computeSnapshot (T-111-26).
+ *   - non-finite hostId: same malformed-row prevention.
+ *
+ * Used by AppShell.applyFleetState (Phase 111 Plan 05) AFTER mergeIdentityAppearance
+ * so a pulse-created row always paints dressed on its first render (T-111-28).
+ */
+export function upsertFleetSession(session: FleetSession): void {
+  // Guard 1: reject relay-room sessions — they arrive only via /sessions/list,
+  // never from the pulse. The pulse emits harness-shaped frames only.
+  if (session.kind === "relay-room") return;
+
+  // Guard 2: reject missing/empty sessionName — would produce a malformed row
+  // with id "fleet::${hostId}::undefined" or "fleet::${hostId}::" (see relay-room
+  // comment in computeSnapshot).
+  if (!session.sessionName) return;
+
+  // Guard 3: reject non-finite hostId — same malformed-row prevention; also
+  // required for the composite (hostId::sessionName) key to be well-formed.
+  if (!Number.isFinite(session.hostId)) return;
+
+  // Guard 4: silent-drop if the identity is mid-archive. The row was removed
+  // optimistically by handleArchive; the identity keeps pulsing fleet-status
+  // until the supervisor retires it (~15s), so without this guard the very
+  // next update frame would re-insert the row.
+  if (isPendingArchive(session.hostId, session.sessionName)) return;
+
+  const idx = state.fleetSessions.findIndex(
+    (s) => s.hostId === session.hostId && s.sessionName === session.sessionName,
+  );
+
+  let nextFleetSessions: FleetSession[];
+
+  if (idx === -1) {
+    // Absent → append. Appending is correct here, unlike in identities-store
+    // where appending on miss would poison the existence discriminator. fleetSessions
+    // is a pure membership list; the row-builder handles ordering downstream.
+    nextFleetSessions = [...state.fleetSessions, session];
+    noteFleetRowTouch(session.hostId, session.sessionName, "added");
+  } else {
+    // Present → additive field merge. List every FleetSession field explicitly
+    // (advanceSessionAiTitle pattern) so a future field addition is a visible
+    // review event rather than a silent pass-through. Principle: an answer that
+    // knows less must never blank one that knows more (D-09 / T-111-29).
+    const existing = state.fleetSessions[idx];
+    const next: FleetSession = {
+      // Identity tuple — unchanged by definition.
+      hostId: existing.hostId,
+      sessionName: existing.sessionName,
+      // hostName: take the incoming value when it is a non-empty string, else keep
+      // the existing. A pulse upsert whose hostsFlat lookup missed passes "", and
+      // that must not blank a good name the fetch supplied.
+      hostName:
+        typeof session.hostName === "string" && session.hostName.length > 0
+          ? session.hostName
+          : existing.hostName,
+      // created: keep the existing value always. The fetch's value is authoritative;
+      // bumping it on every tick would reshuffle ordering continuously.
+      created: existing.created,
+      // role: take the incoming value when it is a non-null string, else keep the
+      // existing. Same never-blank rule.
+      role:
+        typeof session.role === "string" && session.role !== null
+          ? session.role
+          : existing.role,
+      // lastMessageAt / aiTitle: keep the EXISTING values. The pulse does not
+      // carry them on this path; they flow through the working-store's own
+      // max-wins / last-wins chokepoints. Writing them here would be a second
+      // authority for axes that already have one.
+      lastMessageAt: existing.lastMessageAt,
+      aiTitle: existing.aiTitle,
+      // kind / roomId / roomTitle / id / lastActivityAt / createdAt / updatedAt:
+      // preserve existing verbatim. The pulse never sets these on harness frames.
+      kind: existing.kind,
+      roomId: existing.roomId,
+      roomTitle: existing.roomTitle,
+      id: existing.id,
+      lastActivityAt: existing.lastActivityAt,
+      createdAt: existing.createdAt,
+      updatedAt: existing.updatedAt,
+    };
+
+    // Idempotence guard: if every field is already identical, return with no
+    // state write, no notify(), and no cache write. Matters most here because
+    // the upsert runs for every identity on every snapshot frame.
+    if (
+      next.hostId === existing.hostId &&
+      next.sessionName === existing.sessionName &&
+      next.hostName === existing.hostName &&
+      next.created === existing.created &&
+      next.role === existing.role &&
+      next.lastMessageAt === existing.lastMessageAt &&
+      next.aiTitle === existing.aiTitle &&
+      next.kind === existing.kind &&
+      next.roomId === existing.roomId &&
+      next.roomTitle === existing.roomTitle &&
+      next.id === existing.id &&
+      next.lastActivityAt === existing.lastActivityAt &&
+      next.createdAt === existing.createdAt &&
+      next.updatedAt === existing.updatedAt
+    ) {
+      return;
+    }
+
+    nextFleetSessions = [
+      ...state.fleetSessions.slice(0, idx),
+      next,
+      ...state.fleetSessions.slice(idx + 1),
+    ];
+  }
+
+  // Write state WITHOUT touching fleetSessionsLoaded. That flag gates the
+  // panel's both-loaded hydrate effect and interacts with the pin-pruner, so
+  // flipping it from the pulse is the fleetSessionsLoaded twin of the D-10
+  // `loaded` hazard. Its absence from this object literal is the greppable proof.
+  state = { ...state, fleetSessions: nextFleetSessions };
+  notify();
+
+  // Cache sync matching removeFleetSession's policy exactly — silent on write
+  // failure, non-fatal, does not unwind the in-memory update.
+  try {
+    writeFleetSessionsCache(nextFleetSessions);
+  } catch {
+    // Silent — cache-write failure is non-fatal; next getSessionList() fetch
+    // on the next page load will re-persist the fresh snapshot.
+  }
+}
+
+// ─── FleetSession localStorage cache (quick-260805-tub) ──────────────────────
+// Persist the fleet snapshot across page refreshes so the first paint after a
+// reload shows the last-known conversation-list row set instead of an empty
+// list for the ~200ms it takes getSessionList() to return. Row EXISTENCE only
+// — activeSet, WIP, pin state, hostTree are still live-derived and NOT cached
+// (user 2026-08-05).
+//
+// Versioned key so a shape change to FleetSession can invalidate every
+// client's cache in one deploy just by bumping the suffix.
+//
+// Phase 44 Plan 04 — bumped v1 → v2 because FleetSession gained
+// `lastMessageAt?: number | null`. While isFleetSession accepts the field's
+// ABSENCE (optional), rehydrating a v1 cache on Phase 44 first-load would seed
+// the frontend with objects whose lastMessageAt is undefined → resolveLastMessageAt
+// falls through to the working-store getter (which is empty on cold boot) →
+// null → the flipped Rule 1 (null-to-bottom) sorts them to the BOTTOM instead
+// of respecting whatever /sessions/list is about to return. Bumping to v2
+// forces one clean cold-start after deploy; small acceptable UX cost, and
+// avoids a transient wrong-order paint under the flipped comparator.
+//
+// Phase 47 Plan 01 — bumped v2 → v3 because FleetSession gained
+// `aiTitle?: string | null`. Same rationale as Phase 44's v1→v2 bump: a v2
+// rehydrate would seed FleetSession objects lacking aiTitle (undefined →
+// coerced to null by readFleetSessionsCache → AppShell seed loop's
+// `s.aiTitle ?? null` fires seedSessionAiTitle with null → last-wins no-op →
+// working-store cache stays empty for that session's aiTitle → row subtitle
+// renders the fallback ellipsis instead of the last-known ai-title from the
+// v2 cache). Because ai-title reconciliation is LAST-WINS (not max-wins),
+// we prefer a clean cold-start over a silently-empty rehydrate for cached
+// rows on deploy — small acceptable UX cost.
+//
+// Phase 90 Plan 01 — bumped v3 → v4 because FleetSession gained the
+// Phase-89 `kind` discriminator + `roomId` / `roomTitle` relay identity
+// fields. A v3 rehydrate on a Phase-90 client would seed FleetSession
+// objects lacking the relay axis; while every downstream consumer treats
+// `kind === undefined` as `"harness"` (backward-compat rule, PATTERNS.md),
+// the CORRECT interpretation of a v3 cache is "we don't know which kind —
+// force a re-fetch". A cached row that IS a relay-room but rehydrates as
+// harness would route through the wrong pane on click (harness pane won't
+// find a matching tmux session, PrettyView error state). Forcing one clean
+// cold-start after deploy trades ~200ms of empty-sidebar paint for correct
+// pane routing on first click. Same rationale as v1→v2 (Phase 44) and
+// v2→v3 (Phase 47): small acceptable UX cost, avoids a semantic
+// misinterpretation on rehydrate.
+// Bumped v4 → v5 to add the owner-tag wrapper: `{owner: username, payload: FleetSession[]}`.
+// Pre-v5 payloads were bare `FleetSession[]` with no owner tag, which allowed
+// user A's sidebar sessions to flash in user B's UI during the cold-start
+// paint after a logout → login-as-different-user flow on the same browser.
+// The owner check runs on every read via readUserScopedCache, so it covers
+// explicit logout AND auth expiry / browser-close paths equally.
+const FLEET_CACHE_KEY = "skynet:convo-fleet-cache:v5";
+const FLEET_CACHE_LEGACY_KEYS = [
+  "skynet:convo-fleet-cache:v1",
+  "skynet:convo-fleet-cache:v2",
+  "skynet:convo-fleet-cache:v3",
+  "skynet:convo-fleet-cache:v4",
+];
+
+function isFleetSession(x: unknown): x is FleetSession {
+  if (!x || typeof x !== "object") return false;
+  const r = x as Record<string, unknown>;
+  // Phase 90 Plan 01: accept undefined OR the two known kind literals.
+  // Reject other strings defensively — a corrupt entry with kind="banana"
+  // could route a row through the wrong pane orchestrator downstream.
+  // quick-260910-jqx: this discriminator check is HOISTED above the
+  // harness-shape gate so we know which branch to take before validating
+  // shape. The kind-literal filter itself is unchanged from Phase 90 Plan 01.
+  if (
+    r.kind !== undefined &&
+    r.kind !== "harness" &&
+    r.kind !== "relay-room"
+  ) {
+    return false;
+  }
+  // quick-260910-jqx: kind-aware validator — relay-room rows lack
+  // hostId/hostName/sessionName/created (backend emits
+  // {kind:'relay-room', id, roomId, roomTitle, lastActivityAt,
+  // createdAt, updatedAt}; see sessions.ts:592-601). Require a non-empty
+  // roomId on the relay branch; keep the strict harness-shape gate for
+  // kind==='harness' and kind===undefined (backward-compat: legacy v3-shape
+  // rows have no kind field and must continue to route as harness — Phase 90
+  // doctrine, see readFleetSessionsCache comment at lines 1322-1329). Before
+  // this fix every relay-row cache entry was silently filtered on read,
+  // forcing user's ~10s /sessions/list wait before relay rooms painted.
+  if (r.kind === "relay-room") {
+    if (typeof r.roomId !== "string" || r.roomId.length === 0) {
+      return false;
+    }
+  } else {
+    // Harness / legacy (kind === "harness" OR kind === undefined) branch —
+    // preserve the pre-existing strict harness-shape check verbatim.
+    if (
+      typeof r.hostId !== "number" ||
+      typeof r.hostName !== "string" ||
+      typeof r.sessionName !== "string" ||
+      typeof r.created !== "number" ||
+      !(r.role === null || typeof r.role === "string")
+    ) {
+      return false;
+    }
+  }
+  // Phase 44 Plan 04: accept undefined, null, or number for lastMessageAt.
+  // Reject other types defensively so a corrupt cache entry never seeds the
+  // working-store with a non-numeric ts (which would poison max-wins).
+  if (
+    r.lastMessageAt !== undefined &&
+    r.lastMessageAt !== null &&
+    typeof r.lastMessageAt !== "number"
+  ) {
+    return false;
+  }
+  // Phase 47 Plan 01: accept undefined, null, or string for aiTitle. Reject
+  // other types defensively so a corrupt cache entry never seeds the working-
+  // store with a non-string aiTitle. Reconciliation at the working-store is
+  // LAST-WINS (not max-wins), so a bogus value would poison the store with
+  // garbage until the next legitimate write — hence the defensive filter.
+  if (
+    r.aiTitle !== undefined &&
+    r.aiTitle !== null &&
+    typeof r.aiTitle !== "string"
+  ) {
+    return false;
+  }
+  // Phase 90 Plan 01: accept undefined or string for roomId. Reject other
+  // types — roomId is a Matrix opaque identifier, always a string when
+  // present. A non-string value would poison the tab-open handler. The
+  // relay branch above already tightened this to required-non-empty; this
+  // check still catches a harness row with a bogus non-string roomId.
+  if (r.roomId !== undefined && typeof r.roomId !== "string") {
+    return false;
+  }
+  // Phase 90 Plan 01: accept undefined, null, or string for roomTitle
+  // (Matrix rooms may have no title set — null is a legal value on the
+  // wire, mirroring the RelayRoomSessionRow contract).
+  if (
+    r.roomTitle !== undefined &&
+    r.roomTitle !== null &&
+    typeof r.roomTitle !== "string"
+  ) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Read the cached fleet snapshot from localStorage. Returns `[]` on any
+ * failure mode (missing key, malformed JSON, non-array top level, elements
+ * that don't match FleetSession shape) — the caller treats an empty cache
+ * identically to a cold start, so the store's Phase 6 openTabs-only fallback
+ * still handles it.
+ *
+ * Silent by contract: no throws, no console noise, no toasts.
+ */
+export function readFleetSessionsCache(): FleetSession[] {
+  try {
+    // v5: owner-tagged payload — readUserScopedCache verifies the owner matches
+    // the currently-logged-in user, clears the key + returns null on mismatch
+    // (covers logout, auth-expiry, cross-user browser share). Legacy v1-v4
+    // keys are swept here too so they don't accumulate forever after a long
+    // user never explicitly logs out.
+    const parsed = readUserScopedCache<unknown>(
+      FLEET_CACHE_KEY,
+      FLEET_CACHE_LEGACY_KEYS,
+    );
+    if (!Array.isArray(parsed)) return [];
+    const valid: FleetSession[] = [];
+    for (const item of parsed) {
+      if (isFleetSession(item)) {
+        // Defensive filter: only the canonical fields make it back into
+        // memory even if a future writer accidentally serialized more.
+        // Phase 44 Plan 04 — carry lastMessageAt through the round-trip;
+        // undefined → null so downstream (AppShell seed loop) has a
+        // consistent shape.
+        // Phase 47 Plan 01 — same coerce-undefined-to-null treatment for
+        // aiTitle; downstream (AppShell seed loop) always sees null or string.
+        // Phase 90 Plan 01 — carry `kind` / `roomId` / `roomTitle` through
+        // the round-trip. Unlike lastMessageAt/aiTitle, `kind` and `roomId`
+        // are NOT coerced to null on undefined: `kind === undefined` is a
+        // load-bearing signal that the row predates the Phase-90 wire
+        // extension (backward-compat rule: consumers treat undefined as
+        // "harness"). Preserving the undefined-vs-explicit distinction lets
+        // the tab-open handler distinguish "definitely harness" from
+        // "definitely relay-room" from "unknown, assume harness".
+        // (After the v3 → v4 cache bump this only matters for the
+        // theoretical case of a client that gets a v4-key entry from
+        // somewhere without kind populated — defense in depth.)
+        valid.push({
+          hostId: item.hostId,
+          hostName: item.hostName,
+          sessionName: item.sessionName,
+          created: item.created,
+          role: item.role,
+          lastMessageAt: item.lastMessageAt ?? null,
+          aiTitle: item.aiTitle ?? null,
+          kind: item.kind,
+          roomId: item.roomId,
+          roomTitle: item.roomTitle ?? null,
+        });
+      }
+    }
+    return valid;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Write the fleet snapshot to localStorage. Overwrites; no TTL, no merge.
+ * Silent on any storage error (QuotaExceededError, disabled storage,
+ * private-mode failures) — losing the cache is not a user-visible failure.
+ *
+ * Serializes only the canonical `FleetSession` fields so future field
+ * additions on FleetSession don't silently leak to storage.
+ *
+ * v5: wrapped in `{owner, payload}` by writeUserScopedCache. Write is a
+ * no-op when no user is logged in — writing without an owner tag would
+ * create a payload that no future reader could accept.
+ */
+export function writeFleetSessionsCache(sessions: FleetSession[]): void {
+  try {
+    if (typeof localStorage === "undefined") return;
+    // Phase 44 Plan 04 — persist lastMessageAt in the cache. A stale-but-close-
+    // enough value on cold-start paint is better than null (which the flipped
+    // Rule 1 sinks to the bottom); the fresh fetch overwrites within ~200ms.
+    // Phase 47 Plan 01 — persist aiTitle in the cache alongside lastMessageAt.
+    // Same rationale: a stale-but-close-enough ai-title on cold-start paint is
+    // better than null (which renders the fallback ellipsis); the fresh fetch
+    // overwrites within ~200ms.
+    // Phase 90 Plan 01 — persist `kind` / `roomId` / `roomTitle` so a page
+    // refresh paints the correct pane orchestrator on first click without
+    // waiting for the fresh /sessions/list. Undefined kind is intentionally
+    // preserved (JSON.stringify drops it) so a legacy row without the field
+    // rehydrates as kind=undefined → backward-compat "harness" fallback.
+    // roomTitle coerces undefined → null (Matrix's "no title" wire value).
+    const canonical = sessions.map((s) => ({
+      hostId: s.hostId,
+      hostName: s.hostName,
+      sessionName: s.sessionName,
+      created: s.created,
+      role: s.role,
+      lastMessageAt: s.lastMessageAt ?? null,
+      aiTitle: s.aiTitle ?? null,
+      kind: s.kind,
+      roomId: s.roomId,
+      roomTitle: s.roomTitle ?? null,
+    }));
+    writeUserScopedCache(FLEET_CACHE_KEY, canonical);
+  } catch {
+    // Silent — cache-write failure is non-fatal.
+  }
+}
+
+// ─── Projects cache ─────────────────────────────────────────────────────────
+//
+// Cold-boot paint for the sidebar's project sections + membership. Composite
+// key holds all three axes (project list + identity→project assignments +
+// room→project assignments) so the section headers, in-project identity
+// rows, and in-project relay rooms all paint together on refresh without
+// waiting for the aggregated per-host listProjects + listRelayRoomProjectTags
+// HTTP fetches. Bump the version suffix on any schema change to ProjectRow
+// or the assignment-map key/value contract.
+//
+// PROJECTS_CACHE_KEY is hoisted above the state-init block (see near
+// ProjectRow) — readProjectsCache runs at module load and would hit its TDZ
+// if the const stayed here.
+
+type CachedProjectsSlice = {
+  projects: ProjectRow[];
+  identityProjectAssignments: Map<string, string>;
+  roomProjectAssignments: Map<string, string>;
+};
+
+function isProjectRow(x: unknown): x is ProjectRow {
+  if (!x || typeof x !== "object") return false;
+  const r = x as Record<string, unknown>;
+  if (typeof r.slug !== "string") return false;
+  if (typeof r.displayName !== "string") return false;
+  if (typeof r.hostId !== "string") return false;
+  if (typeof r.hostname !== "string") return false;
+  if (typeof r.archived !== "boolean") return false;
+  if (r.parent !== undefined && r.parent !== null && typeof r.parent !== "string") {
+    return false;
+  }
+  return true;
+}
+
+function isStringPairArray(x: unknown): x is Array<[string, string]> {
+  if (!Array.isArray(x)) return false;
+  for (const entry of x) {
+    if (!Array.isArray(entry) || entry.length !== 2) return false;
+    if (typeof entry[0] !== "string" || typeof entry[1] !== "string") {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function readProjectsCache(): CachedProjectsSlice {
+  const empty: CachedProjectsSlice = {
+    projects: [],
+    identityProjectAssignments: new Map(),
+    roomProjectAssignments: new Map(),
+  };
+  try {
+    // v2: owner-tagged — mismatch returns null + clears the key.
+    const parsed = readUserScopedCache<unknown>(
+      PROJECTS_CACHE_KEY,
+      PROJECTS_CACHE_LEGACY_KEYS,
+    );
+    if (!parsed || typeof parsed !== "object") return empty;
+    const p = parsed as Record<string, unknown>;
+    const projects: ProjectRow[] = [];
+    if (Array.isArray(p.projects)) {
+      for (const item of p.projects) {
+        if (isProjectRow(item)) {
+          projects.push({
+            slug: item.slug,
+            displayName: item.displayName,
+            hostId: item.hostId,
+            hostname: item.hostname,
+            archived: item.archived,
+            parent: item.parent ?? null,
+          });
+        }
+      }
+    }
+    const identityProjectAssignments = new Map<string, string>();
+    if (isStringPairArray(p.identityProjectAssignments)) {
+      for (const [k, v] of p.identityProjectAssignments) {
+        identityProjectAssignments.set(k, v);
+      }
+    }
+    const roomProjectAssignments = new Map<string, string>();
+    if (isStringPairArray(p.roomProjectAssignments)) {
+      for (const [k, v] of p.roomProjectAssignments) {
+        roomProjectAssignments.set(k, v);
+      }
+    }
+    return { projects, identityProjectAssignments, roomProjectAssignments };
+  } catch {
+    return empty;
+  }
+}
+
+export function writeProjectsCache(slice: CachedProjectsSlice): void {
+  try {
+    if (typeof localStorage === "undefined") return;
+    const payload = {
+      projects: slice.projects.map((p) => ({
+        slug: p.slug,
+        displayName: p.displayName,
+        hostId: p.hostId,
+        hostname: p.hostname,
+        archived: p.archived,
+        // Nested projects: without it the sidebar paints flat on reload and
+        // then jumps into the tree when the live list lands.
+        parent: p.parent ?? null,
+      })),
+      identityProjectAssignments: Array.from(
+        slice.identityProjectAssignments.entries(),
+      ),
+      roomProjectAssignments: Array.from(
+        slice.roomProjectAssignments.entries(),
+      ),
+    };
+    writeUserScopedCache(PROJECTS_CACHE_KEY, payload);
+  } catch {
+    // Silent — cache-write failure is non-fatal.
+  }
+}
+
+/**
+ * Read current state and persist all three project axes as one composite
+ * payload. Called after any of setProjects / setIdentityProjectAssignments /
+ * setRoomProjectAssignments mutates. Cheap enough to run on every real
+ * change — the sidebar projects surface is small.
+ */
+function persistProjectsSlice(): void {
+  writeProjectsCache({
+    projects: state.projects,
+    identityProjectAssignments: state.identityProjectAssignments,
+    roomProjectAssignments: state.roomProjectAssignments,
+  });
+}
+
+// ─── Pinned IDs cache ───────────────────────────────────────────────────────
+//
+// Cold-boot paint for the sidebar's pinned rows. The server holds
+// authoritative pin state on identity.pinned; the cache is a paint hint so
+// pinned rows appear immediately on refresh rather than flickering blank
+// until GET /identities lands. hydratePinnedIdsFromServer overwrites the
+// seed within ~200ms; the cache is refreshed on every real change (add,
+// remove, or server hydrate that differs).
+//
+// PINNED_IDS_CACHE_KEY is hoisted above the state-init block for TDZ
+// reasons (see the const near ProjectRow).
+
+export function readPinnedIdsCache(): string[] {
+  try {
+    // v2: owner-tagged — mismatch returns null + clears the key.
+    const parsed = readUserScopedCache<unknown>(
+      PINNED_IDS_CACHE_KEY,
+      PINNED_IDS_CACHE_LEGACY_KEYS,
+    );
+    if (!Array.isArray(parsed)) return [];
+    const valid: string[] = [];
+    for (const item of parsed) {
+      if (typeof item === "string" && item.length > 0) {
+        valid.push(item);
+      }
+    }
+    return valid;
+  } catch {
+    return [];
+  }
+}
+
+export function writePinnedIdsCache(ids: Iterable<string>): void {
+  try {
+    if (typeof localStorage === "undefined") return;
+    writeUserScopedCache(PINNED_IDS_CACHE_KEY, Array.from(ids));
+  } catch {
+    // Silent — cache-write failure is non-fatal.
+  }
+}
+
+function persistPinnedIds(): void {
+  writePinnedIdsCache(state.pinnedIds);
+}
+
+// Plan 07-01 (TG-14): hostId → Host flat lookup. AppShell maintains a memo
+// keyed on stableHostTreeKey (the NOTE-05 thrash-guard from Phase 6) and
+// pushes the Map here whenever the memo re-derives.
+//
+// hostsFlat feeds two rendering paths:
+//   1. This plan: synthetic fleet-row Host enrichment inside computeSnapshot
+//      so the detached-row-click handler at AppShell has a real Host object
+//      to hand to openTab(host, "terminal", ...).
+//   2. Plan 07-02 (RDP rows at bottom): iterate hostsFlat, filter on strict
+//      `host.enableRdp === true`, emit one row per matching host at the end
+//      of `grouped`.
+//
+// Because both paths consume hostsFlat via computeSnapshot(), any change
+// MUST bump snapshotVersion. Same ref-equality no-op story as the other
+// inputs; Test 29 asserts same-ref no-op and different-Map-same-content
+// DOES fire.
+export function updateHostsFlat(hostsById: Map<number, Host>): void {
+  if (hostsById === state.hostsFlat) return; // reference-equal no-op
+  state = { ...state, hostsFlat: hostsById };
+  notify();
+}
+
+// Phase 25 (Plan 25-02): plumb identity.role onto ConversationRow at row-construction
+// time for the (host, role, label) sort comparator (compareByHostRoleLabel).
+// Mirrors the hostsFlat pattern: AppShell drives the Map here on identity-store change
+// via a useEffect; computeSnapshot reads from state.identitiesByKey directly inside
+// rowFromTab() and fleetSyntheticRows construction.
+// Reference-equal no-op guard: if byKey is the same Map reference that was previously
+// pushed in (identities-store rebuilds byKey on setIdentities — same ref = no change),
+// skip the snapshot invalidation.
+export function updateIdentitiesByKey(byKey: Map<string, Identity>): void {
+  if (byKey === state.identitiesByKey) return; // reference-equal no-op
+  state = { ...state, identitiesByKey: byKey };
+  notify();
+}
+
+export function selectConversation(id: string | null): void {
+  // T-06-01-01 stale-id guard runs FIRST — a select of a nonexistent id
+  // must NOT clear pendingSelectId (a stale call shouldn't cancel an
+  // in-flight deferred select).
+  if (id !== null) {
+    let found = false;
+    for (const t of state.openTabs) {
+      if (t.id === id) {
+        found = true;
+        break;
+      }
+    }
+    if (!found) return; // silent no-op
+  }
+  // Plan 06-04 NOTE-03 re-decision: clear pendingSelectId AFTER the stale
+  // guard has passed but BEFORE the "no change" short-circuit — so a direct
+  // selectConversation(id) call ALWAYS cancels an in-flight deferred select,
+  // even when the id being selected is the id we're already on. Otherwise a
+  // same-id call would leak a stale pending id past its owner's intent.
+  pendingSelectId = null;
+  // Patch #137: every non-null selection is an active-set engagement signal —
+  // record it BEFORE the same-selectedId short-circuit so a re-select of the
+  // currently-selected id still counts as engagement. addToActiveSet is
+  // idempotent so this is a cheap no-op when the id is already present.
+  // Deselect (id === null) does NOT touch activeSet — deselecting is not
+  // positive engagement.
+  if (id !== null) addToActiveSet(id);
+  if (id === state.selectedId) return; // no-op — already selected
+  state = { ...state, selectedId: id };
+  notify();
+}
+
+// Plan 06-04 (T-06-04-04): defends against the openTab-setTabs / immediate-
+// select race. If the id is already in openTabs, this behaves exactly like
+// selectConversation(id). Otherwise the id is parked in pendingSelectId; the
+// next updateOpenTabs(tabs) that includes it flushes selection to it.
+// Last-write-wins on repeated deferred calls before the flush.
+export function selectConversationDeferred(id: string): void {
+  for (const t of state.openTabs) {
+    if (t.id === id) {
+      // Already present — this is not really "deferred"; delegate to the
+      // direct path (which clears pending as a side effect per re-decision).
+      selectConversation(id);
+      return;
+    }
+  }
+  pendingSelectId = id;
+  // Deliberately NO notify() here — nothing user-visible has changed. The
+  // flush emit happens inside updateOpenTabs when the id arrives.
+}
+
+// Patch #137: activeSet mutator. Idempotent no-op when the id is already
+// present (avoids gratuitous sessionStorage writes on repeat selects).
+// Silent try/catch on sessionStorage so SSR/JSDOM/quota-exceeded errors
+// never crash the UI thread — an in-memory update still fires and notify()
+// still runs so the UI stays functional for the current session even if
+// persistence fails.
+export function addToActiveSet(id: string): void {
+  if (state.activeSet.has(id)) return;
+  const nextActiveSet = new Set(state.activeSet);
+  nextActiveSet.add(id);
+  try {
+    if (typeof sessionStorage !== "undefined") {
+      sessionStorage.setItem(
+        ACTIVE_SET_STORAGE_KEY,
+        JSON.stringify([...nextActiveSet]),
+      );
+    }
+  } catch {
+    // Silent — do not block state update on storage failure.
+  }
+  state = { ...state, activeSet: nextActiveSet };
+  notify();
+}
+
+// quick-260727-gm3: activeSet reverse-mutator. Idempotent no-op when the id is
+// absent (avoids gratuitous sessionStorage writes on repeat deactivate clicks).
+// Silent try/catch on sessionStorage so SSR/JSDOM/quota-exceeded errors never
+// crash the UI thread — an in-memory update still fires and notify() still
+// runs so the UI stays functional for the current session even if persistence
+// fails. Deliberately does NOT touch state.selectedId — deactivation is
+// orthogonal to selection at the store layer; the panel wires closeTab
+// separately (see PrettyConversationsPanel.handleRowDeactivate + AppShell's
+// onDeactivateRow → closeTab bridge). user 2026-07-27: agent keeps running
+// under the hood; tapping the row again reactivates it.
+export function removeFromActiveSet(id: string): void {
+  if (!state.activeSet.has(id)) return;
+  const nextActiveSet = new Set(state.activeSet);
+  nextActiveSet.delete(id);
+  try {
+    if (typeof sessionStorage !== "undefined") {
+      sessionStorage.setItem(
+        ACTIVE_SET_STORAGE_KEY,
+        JSON.stringify([...nextActiveSet]),
+      );
+    }
+  } catch {
+    // Silent — mirrors addToActiveSet's storage-failure policy.
+  }
+  state = { ...state, activeSet: nextActiveSet };
+  notify();
+}
+
+// Parse a row id emitted by fleetRowId(hostId, sessionName) → the identity
+// key + hostId used to patch the identities-store's per-identity sentinel
+// after a successful pin/unpin/hide/unhide server write. Returns null hostId
+// on non-composite ids (openTabs-derived rows, relay-room ids, test fixtures
+// that pass a bare key) — patchIdentityFlag falls back to bare-name match
+// in that case.
+function parseFleetRowId(id: string): {
+  identityKey: string;
+  hostId: number | null;
+} {
+  const parts = id.split("::");
+  if (parts.length === 3 && parts[0] === "fleet") {
+    const parsedHost = Number.parseInt(parts[1], 10);
+    return {
+      identityKey: parts[2],
+      hostId: Number.isFinite(parsedHost) ? parsedHost : null,
+    };
+  }
+  return { identityKey: id, hostId: null };
+}
+
+// Sync a successful pin server write back into the identities-store's
+// per-identity `pinned` sentinel so a subsequent PrettyConversationsPanel
+// remount (mobile list→session→list unmounts the panel per AppShell.tsx
+// L2632) doesn't re-derive from stale identities data and clobber the local
+// set via hydratePinnedIdsFromServer. Mirror on both directions (add/remove).
+// (Phase 115 Plan 115-02: the sibling `hidden` axis retired per D-21.)
+function syncIdentityFlagAfterWrite(
+  id: string,
+  field: "pinned",
+  value: boolean,
+): void {
+  const { identityKey, hostId } = parseFleetRowId(id);
+  patchIdentityFlag(identityKey, hostId, field, value);
+}
+
+// In-flight pin intents: row id → { pinned, seq }. A pin/unpin is optimistic,
+// but the panel's disk-recompute effect (hydratePinnedIdsFromServer) can fire
+// mid-request from an identities-store that hasn't seen the write yet — and
+// would revert the click (flicker) until the request lands. Hydrate overlays
+// these intents on its input. Cleared when the request settles; `seq` makes a
+// superseded settle (pin then quick unpin) a no-op.
+const pendingPinIntents = new Map<string, { pinned: boolean; seq: number }>();
+// Per-row tail of the pin write chain (see writePin).
+const pinWriteChains = new Map<string, Promise<void>>();
+let pinIntentSeq = 0;
+
+// Resolve a pin row id to the identity it targets. Fleet-synthetic ids carry
+// the host; bare/legacy ids fall back to the fleet-session host map. Returns
+// null for anything that isn't an identity (relay rooms, plain terminals) —
+// those have no `.pinned` sentinel to write.
+function resolvePinTarget(id: string): { identityKey: string; hostId: number } | null {
+  const parsed = parseFleetRowId(id);
+  const identityKey = parsed.identityKey.toLowerCase();
+  const hostId =
+    parsed.hostId ?? buildIdentityHostsFromFleet(state.fleetSessions)[identityKey] ?? null;
+  if (hostId === null) return null;
+  return { identityKey, hostId };
+}
+
+function setPinnedLocal(id: string, pinned: boolean): void {
+  if (state.pinnedIds.has(id) === pinned) return;
+  const nextPinnedIds = new Set(state.pinnedIds);
+  if (pinned) nextPinnedIds.add(id);
+  else nextPinnedIds.delete(id);
+  state = { ...state, pinnedIds: nextPinnedIds };
+  persistPinnedIds();
+  notify();
+}
+
+function writePin(id: string, pinned: boolean): void {
+  const target = resolvePinTarget(id);
+  if (target === null) {
+    // Not an identity (relay room, plain terminal, legacy tab id): there is
+    // no `.pinned` sentinel to write, so this pin is local-only. The row UI
+    // doesn't offer Pin for these rows; unpin still clears legacy pins.
+    console.info({ operation: "pin_local_only_non_identity", id, pinned });
+    setPinnedLocal(id, pinned);
+    return;
+  }
+  const seq = ++pinIntentSeq;
+  pendingPinIntents.set(id, { pinned, seq });
+  setPinnedLocal(id, pinned);
+  // Writes for one row go out strictly in click order — each PUT opens its
+  // own SSH connection, so a quick pin→unpin could otherwise land on the
+  // host reversed and leave disk disagreeing with the screen.
+  const prev = pinWriteChains.get(id);
+  const write =
+    prev === undefined
+      ? setIdentityPinned(target.identityKey, target.hostId, pinned)
+      : prev
+          .catch(() => {})
+          .then(() => setIdentityPinned(target.identityKey, target.hostId, pinned));
+  pinWriteChains.set(id, write);
+  void write.finally(() => {
+    if (pinWriteChains.get(id) === write) pinWriteChains.delete(id);
+  }).catch(() => {});
+  write
+    .then(() => {
+      // Mirror into identities-store so a panel remount / re-derive agrees
+      // with the write (mobile list→session→list unmount — fern 2026-09-13).
+      syncIdentityFlagAfterWrite(id, "pinned", pinned);
+    })
+    .catch((err: unknown) => {
+      console.warn({
+        operation: "pin_write_failed",
+        id,
+        pinned,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      // Roll back — unless a newer click on this row already superseded us.
+      if (pendingPinIntents.get(id)?.seq === seq) setPinnedLocal(id, !pinned);
+      refreshIdentities().catch(() => {});
+    })
+    .finally(() => {
+      if (pendingPinIntents.get(id)?.seq === seq) pendingPinIntents.delete(id);
+    });
+}
+
+export function pinConversation(id: string): void {
+  if (state.pinnedIds.has(id)) return; // already pinned — no-op
+  writePin(id, true);
+}
+
+export function unpinConversation(id: string): void {
+  if (!state.pinnedIds.has(id)) return; // not pinned — no-op
+  writePin(id, false);
+}
+
+export function togglePinConversation(id: string): void {
+  if (state.pinnedIds.has(id)) unpinConversation(id);
+  else pinConversation(id);
+}
+
+// (Phase 115 Plan 115-02: the Phase 107 hide/unhide/toggle mutators
+//  (hideConversation, unhideConversation, toggleHideConversation) and the
+//  hydrateHiddenIdsFromServer reconciler were retired per D-21 alongside
+//  the backend HIDDEN FANOUT block removal. The archive gesture ships in
+//  115-06 via a dedicated POST endpoint.)
+
+// Phase 15: server-authoritative reconciliation. Called by PrettyConversations
+// Panel's mount effect after a successful GET /user-preferences fetch.
+// Replaces state.pinnedIds with the fetched set; drops any stale in-memory pins
+// the server doesn't know about. Same-content guard mirrors updateFleetSessions
+// at L611-625 — skip notify() when the incoming set matches the current set to
+// avoid gratuitous re-renders on identical refetches.
+export function hydratePinnedIdsFromServer(ids: string[]): void {
+  // AUTHORITATIVE: callers that may fire eagerly against a partial picture
+  // (the PrettyConversationsPanel hydrate effect) MUST guard empty derivations
+  // at their own callsite. This function trusts its input.
+  const nextPinnedIds = new Set(ids);
+  // Overlay in-flight pin/unpin clicks — the disk projection can't reflect
+  // them yet, and adopting it would flicker the row back.
+  for (const [id, intent] of pendingPinIntents) {
+    if (intent.pinned) nextPinnedIds.add(id);
+    else nextPinnedIds.delete(id);
+  }
+  if (nextPinnedIds.size === state.pinnedIds.size) {
+    let allSame = true;
+    for (const id of nextPinnedIds) {
+      if (!state.pinnedIds.has(id)) {
+        allSame = false;
+        break;
+      }
+    }
+    if (allSame) return;
+  }
+  state = { ...state, pinnedIds: nextPinnedIds };
+  persistPinnedIds();
+  notify();
+}
+
+// ─── React hooks ─────────────────────────────────────────────────────────────
+
+export function useConversations(): ConversationList {
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+}
+
+// The selected-id snapshot is just the state.selectedId value; useSyncExternal
+// -Store compares by Object.is, so returning a primitive is safe and stable.
+function getSelectedIdSnapshot(): string | null {
+  return state.selectedId;
+}
+export function useSelectedConversationId(): string | null {
+  return useSyncExternalStore(
+    subscribe,
+    getSelectedIdSnapshot,
+    getSelectedIdSnapshot,
+  );
+}
+
+// Return the current pinnedIds Set. React compares by Object.is; because we
+// build a new Set on every pin/unpin (see actions above), the identity flips
+// on every real change → consumers re-render, and stays stable across no-ops.
+function getPinnedIdsSnapshot(): ReadonlySet<string> {
+  return state.pinnedIds;
+}
+export function usePinnedIds(): ReadonlySet<string> {
+  return useSyncExternalStore(
+    subscribe,
+    getPinnedIdsSnapshot,
+    getPinnedIdsSnapshot,
+  );
+}
+
+// (Phase 115 Plan 115-02: useHiddenIds hook + getHiddenIdsSnapshot retired
+//  per D-21 alongside state.hiddenIds.
+//  Phase 115 Plan 115-06 archived-rows slice / setters / useArchivedFleetRows
+//  hook retired in the Phase 122 shape follow-up alongside the sidebar
+//  Archived section + wire pump.)
+
+// ─── Phase 117 Plan 117-07 (D-05, D-37, D-39): projects slice ────────────────
+// Backend-authoritative project list, fed from two sources through this
+// single setter: (a) boot-time HTTP hydration via `listProjects(hostId)`
+// aggregated across managed hosts; (b) wire-event updates via
+// `onProjectListChanged` on the fleet-status-client. Both paths hit
+// `setProjects` — identity-equal-skip absorbs no-op re-emissions so an
+// unchanged wire snapshot on reconnect does not churn subscribers.
+
+/**
+ * Replace the projects array with `rows`. Identity-equal skip: same length AND
+ * every entry field-equal to the current slot → no mutation, no notify.
+ */
+export function setProjects(rows: readonly ProjectRow[]): void {
+  const cur = state.projects;
+  if (rows.length === cur.length) {
+    let equal = true;
+    for (let i = 0; i < rows.length; i++) {
+      const a = rows[i];
+      const b = cur[i];
+      if (
+        a.slug !== b.slug ||
+        a.displayName !== b.displayName ||
+        a.hostId !== b.hostId ||
+        a.hostname !== b.hostname ||
+        a.archived !== b.archived ||
+        (a.parent ?? null) !== (b.parent ?? null)
+      ) {
+        equal = false;
+        break;
+      }
+    }
+    if (equal) return;
+  }
+  state = { ...state, projects: rows.slice() };
+  persistProjectsSlice();
+  notify();
+}
+
+export function getProjectsSnapshot(): readonly ProjectRow[] {
+  return state.projects;
+}
+
+export function useProjects(): readonly ProjectRow[] {
+  return useSyncExternalStore(
+    subscribe,
+    getProjectsSnapshot,
+    getProjectsSnapshot,
+  );
+}
+
+/**
+ * Per-host merge on the projects list. Called from AppShell's wire
+ * `onProjectListChanged` callback — the wire frame is scoped to one
+ * hostId and carries the FULL projects list for that host only. Drops
+ * every existing state.projects entry with matching hostId and splices
+ * in `rows`. Entries for other hosts are left untouched.
+ *
+ * Pre-fix, the wire handler called setProjects(rows) with a per-host
+ * payload, which wholesale-replaced state.projects and vaporized every
+ * project on every OTHER host from the client until the next bootstrap
+ * refetch — see the visual-bug incident where archiving one project
+ * caused an adjacent-host project section to disappear + its
+ * conversations to fall into the unassigned bucket until refresh.
+ *
+ * Empty `rows` is a legitimate delta ("this host now has zero projects"
+ * — e.g. last project archived) and DOES drop this host's entries.
+ *
+ * Field-equal skip: if the current entries for hostId already match rows
+ * byte-for-byte in shape and order, no mutation and no notify.
+ */
+export function mergeProjectsForHost(
+  hostId: string,
+  rows: readonly ProjectRow[],
+): void {
+  const cur = state.projects;
+  const currentForHost = cur.filter((p) => p.hostId === hostId);
+  if (currentForHost.length === rows.length) {
+    let equal = true;
+    for (let i = 0; i < rows.length; i++) {
+      const a = rows[i];
+      const b = currentForHost[i];
+      if (
+        a.slug !== b.slug ||
+        a.displayName !== b.displayName ||
+        a.hostId !== b.hostId ||
+        a.hostname !== b.hostname ||
+        a.archived !== b.archived ||
+        (a.parent ?? null) !== (b.parent ?? null)
+      ) {
+        equal = false;
+        break;
+      }
+    }
+    if (equal) return;
+  }
+  const preserved = cur.filter((p) => p.hostId !== hostId);
+  state = { ...state, projects: [...preserved, ...rows] };
+  persistProjectsSlice();
+  notify();
+}
+
+/**
+ * Replace the identity → project map with `map` (D-05 identity carrier).
+ * Keyed on `${hostId}::${identityKey}`. Called by AppShell's identity
+ * hydration path after listIdentities resolves. Same-content skip via
+ * shallow Map-equality (size + every key/value pair match).
+ */
+export function setIdentityProjectAssignments(
+  map: ReadonlyMap<string, string>,
+): void {
+  const cur = state.identityProjectAssignments;
+  if (map.size === cur.size) {
+    let equal = true;
+    for (const [k, v] of map) {
+      if (cur.get(k) !== v) {
+        equal = false;
+        break;
+      }
+    }
+    if (equal) return;
+  }
+  state = { ...state, identityProjectAssignments: new Map(map) };
+  persistProjectsSlice();
+  notify();
+}
+
+/**
+ * Replace the room → project map with `map` (D-05 relay-room carrier).
+ * Keyed on Matrix roomId. Called by AppShell's boot-time hydration via GET
+ * /relay-rooms/project-tags aggregated per host. Same-content skip via
+ * shallow Map-equality.
+ */
+export function setRoomProjectAssignments(
+  map: ReadonlyMap<string, string>,
+): void {
+  const cur = state.roomProjectAssignments;
+  if (map.size === cur.size) {
+    let equal = true;
+    for (const [k, v] of map) {
+      if (cur.get(k) !== v) {
+        equal = false;
+        break;
+      }
+    }
+    if (equal) return;
+  }
+  state = { ...state, roomProjectAssignments: new Map(map) };
+  persistProjectsSlice();
+  notify();
+}
+
+// Optimistic single-room project re-tag. The relay-room tag write
+// (POST /relay-rooms/:roomId/project) publishes no wire frame and room
+// assignments are otherwise only hydrated at boot, so without this a move /
+// remove never showed until reload. Returns a rollback for the caller's
+// failure path — it restores the previous slug only if the assignment still
+// holds the value this call set (a newer move wins).
+export function patchRoomProjectAssignment(
+  roomId: string,
+  slug: string | null,
+): () => void {
+  const prev = state.roomProjectAssignments.get(roomId) ?? null;
+  const apply = (value: string | null): void => {
+    const next = new Map(state.roomProjectAssignments);
+    if (value === null) next.delete(roomId);
+    else next.set(roomId, value);
+    setRoomProjectAssignments(next);
+  };
+  apply(slug);
+  return () => {
+    if ((state.roomProjectAssignments.get(roomId) ?? null) === slug) apply(prev);
+  };
+}
+
+// Test-only reset — same shape as __resetPinnedIdsForTest et al. Also clears
+// the localStorage cache so cross-test bleed via seed-on-load can't happen.
+export function __resetProjectsForTest(): void {
+  try {
+    if (typeof localStorage !== "undefined") {
+      localStorage.removeItem(PROJECTS_CACHE_KEY);
+    }
+  } catch {
+    // Silent.
+  }
+  state = {
+    ...state,
+    projects: [],
+    identityProjectAssignments: new Map<string, string>(),
+    roomProjectAssignments: new Map<string, string>(),
+  };
+  notify();
+}
+
+// quick-260727-kbw: fleet-loaded gate for the panel's mount-effect
+// getPinnedIds fetch. The panel MUST NOT fire the *initial* hydratePinned
+// IdsFromServer fetch until state.fleetSessions has been populated at
+// least once — the gate prevents a same-tick race between hydrate and
+// updateFleetSessions on WS (re)connect, keeping the hydrate → fleet
+// ordering deterministic and avoiding an unnecessary re-hydration on the
+// next fleet update. quick-260818-l8n: the gate is NO LONGER protecting
+// against any pin scrubbing — updateOpenTabs no longer touches pinnedIds,
+// so the whole "hydrated-fleet-pin gets nuked by a follow-up openTabs
+// mutation" failure mode is dead. The gate stays purely as the initial-
+// fetch-ordering gate. Primitive boolean is Object.is-safe; no memoization
+// needed. Panel subscribes via useSyncExternalStore so the false→true
+// flip triggers a re-render → mount effect body runs → hydration fetch
+// begins. See PrettyConversationsPanel.tsx §(d) for the mirrored comment
+// on the panel side.
+function getFleetSessionsLoadedSnapshot(): boolean {
+  return state.fleetSessionsLoaded;
+}
+export function useFleetSessionsLoaded(): boolean {
+  return useSyncExternalStore(
+    subscribe,
+    getFleetSessionsLoadedSnapshot,
+    getFleetSessionsLoadedSnapshot,
+  );
+}
+
+// Patch #137: activeSet subscription. Mirrors usePinnedIds semantics — a new
+// Set reference on every real mutation (see addToActiveSet), same reference
+// across no-ops (idempotent second addToActiveSet(id) returns early without
+// bumping snapshotVersion). Consumers get a stable ReadonlySet identity
+// across renders that didn't touch activeSet.
+function getActiveSetSnapshot(): ReadonlySet<string> {
+  return state.activeSet;
+}
+export function useActiveSet(): ReadonlySet<string> {
+  return useSyncExternalStore(
+    subscribe,
+    getActiveSetSnapshot,
+    getActiveSetSnapshot,
+  );
+}
+
+// ─── Phase 97 UAT follow-up (2026-09-10): relay-room title snapshot ──────────
+//
+// A URL-restore for a relay room opens the tab with `label = spec.roomId`
+// (raw `!xxx:server`) because the friendly title isn't known yet. When the
+// fleet session list arrives later with `roomTitle`, we need to sync that
+// back into the tab so the conv-list item + browser tab title re-derive.
+//
+// This snapshot exposes a Map<roomId, roomTitle> that AppShell subscribes to
+// via a sync effect (there's no name-store per-room; fleet sessions are the
+// canonical source). Returns a NEW Map instance only when the derived
+// content changes — Object.is stability across no-ops via a cached ref
+// (mirrors the pinnedIds pattern).
+let cachedRelayRoomTitlesRef: ReadonlyMap<string, string> = new Map();
+let cachedRelayRoomTitlesFleetRef: FleetSession[] | null = null;
+function getRelayRoomTitlesSnapshot(): ReadonlyMap<string, string> {
+  if (state.fleetSessions === cachedRelayRoomTitlesFleetRef) {
+    return cachedRelayRoomTitlesRef;
+  }
+  const next = new Map<string, string>();
+  for (const session of state.fleetSessions) {
+    if (
+      session.kind === "relay-room" &&
+      session.roomId !== undefined &&
+      typeof session.roomTitle === "string" &&
+      session.roomTitle.length > 0
+    ) {
+      next.set(session.roomId, session.roomTitle);
+    }
+  }
+  // Object.is stability: only publish a new reference when the derived
+  // content actually differs. Same-content-same-reference means the sync
+  // effect in AppShell doesn't re-run needlessly on unrelated fleet
+  // updates.
+  if (
+    cachedRelayRoomTitlesRef.size === next.size &&
+    Array.from(next.entries()).every(
+      ([k, v]) => cachedRelayRoomTitlesRef.get(k) === v,
+    )
+  ) {
+    cachedRelayRoomTitlesFleetRef = state.fleetSessions;
+    return cachedRelayRoomTitlesRef;
+  }
+  cachedRelayRoomTitlesRef = next;
+  cachedRelayRoomTitlesFleetRef = state.fleetSessions;
+  return cachedRelayRoomTitlesRef;
+}
+export function useRelayRoomTitles(): ReadonlyMap<string, string> {
+  return useSyncExternalStore(
+    subscribe,
+    getRelayRoomTitlesSnapshot,
+    getRelayRoomTitlesSnapshot,
+  );
+}
+
+// ─── Phase 66 Plan 05 — cross-store accessors for identities-store enrichment ─
+// The identities-store's fetchOnce needs to construct an identityHosts map
+// (identityKey → hostId) from the fleet-sessions snapshot before it calls
+// listIdentities, so first-render cosmetics come back POPULATED from disk
+// instead of safe-defaults. Two thin accessor exports are enough:
+//   - getFleetSessionsSnapshot() — read-only view of state.fleetSessions.
+//     Returns the live array reference; identities-store's helper does not
+//     mutate it (only iterates), so a shallow-copy would just cost memory.
+//   - subscribeConversationStore(cb) — mirrors the internal subscribe(cb)
+//     so identities-store can wire a one-shot re-fetch after the false→true
+//     fleetSessionsLoaded flip. Guarded on the identities-store side.
+// sessionMatchKey is imported DIRECTLY by identities-store from
+// @/features/terminal/session-hue per W4 — do NOT re-export it here (that
+// would add a second import path and risk a circular-dep loop if session-hue
+// ever imports from conversation-store).
+export function getFleetSessionsSnapshot(): FleetSession[] {
+  return state.fleetSessions;
+}
+export function subscribeConversationStore(cb: () => void): () => void {
+  return subscribe(cb);
+}
+
+// ─── Test-only helpers ───────────────────────────────────────────────────────
+// Underscore-prefixed exports for Vitest. NOT part of the public API — do not
+// consume from production code. Kept exported (rather than gated on
+// `import.meta.env.MODE === "test"`) because Vite's tree-shaker will drop
+// them from the production bundle if no production code imports them.
+
+export function __subscribeForTest(cb: () => void): () => void {
+  return subscribe(cb);
+}
+
+export function __getSnapshotForTest(): SnapshotForTest {
+  const list = getSnapshot();
+  return {
+    activeSet: list.activeSet,
+    pinned: list.pinned,
+    middle: list.middle,
+    rdpGroup: list.rdpGroup,
+    // Phase 117 Plan 117-07: pass through the projects-derived fields so
+    // tests reading __getSnapshotForTest see the same shape hooks return.
+    pinnedUnassigned: list.pinnedUnassigned,
+    projectSections: list.projectSections,
+    rdp: list.rdp,
+    selectedId: state.selectedId,
+    pinnedIds: state.pinnedIds,
+    // quick-260821-m36: exposed for the flag-flip-on-fetch-failure test.
+    fleetSessions: state.fleetSessions,
+    fleetSessionsLoaded: state.fleetSessionsLoaded,
+  };
+}
+
+// Plan 06-04 Task 1: expose the module-scoped pendingSelectId slot so tests
+// can assert the deferred-select semantics (set on absent id / cleared on
+// arrival / cleared on direct selectConversation / last-write-wins).
+export function __getPendingSelectIdForTest(): string | null {
+  return pendingSelectId;
+}
+
+// Patch #137: reset the module-scoped activeSet to whatever
+// hydrateActiveSetFromStorage returns for the current sessionStorage
+// contents. Used by conversation-store.test.ts's beforeEach so a prior test's
+// selectConversation-driven addToActiveSet write doesn't leak into later
+// tests. Called AFTER sessionStorage.clear() so the resulting activeSet is
+// empty; when a test wants to exercise the hydration path it can setItem +
+// __resetActiveSetForTest to re-hydrate from the seeded storage.
+export function __resetActiveSetForTest(): void {
+  state = { ...state, activeSet: hydrateActiveSetFromStorage() };
+  notify();
+}
+
+// Phase 15: reset the module-scoped pinnedIds set to empty. Used by
+// conversation-store.test.ts's beforeEach so a prior test's
+// pinConversation / unpinConversation writes don't leak forward. Also
+// clears the localStorage cache so cross-test bleed via seed-on-load
+// can't happen.
+export function __resetPinnedIdsForTest(): void {
+  try {
+    if (typeof localStorage !== "undefined") {
+      localStorage.removeItem(PINNED_IDS_CACHE_KEY);
+    }
+  } catch {
+    // Silent.
+  }
+  pendingPinIntents.clear();
+  pinWriteChains.clear();
+  state = { ...state, pinnedIds: new Set<string>() };
+  notify();
+}
+
+// (Phase 115 Plan 115-02: __resetHiddenIdsForTest retired per D-21 alongside
+//  state.hiddenIds. Callers used it for beforeEach cleanup; no callers remain
+//  after the frontend hide code path is retired in this same plan.)
+
+// quick-260727-kbw: reset the module-scoped fleetSessionsLoaded flag to
+// false + fleetSessions to []. Used by conversation-store.test.ts to
+// exercise the false→true flip semantics of updateFleetSessions() from
+// a known-clean starting point (beforeEach in that file otherwise fires
+// updateFleetSessions([]) which — post-fix — flips the flag true, so
+// tests that need to observe the flip subscribe AFTER this reset).
+export function __resetFleetSessionsForTest(): void {
+  pendingArchiveKeys.clear();
+  fleetRowTouches.clear();
+  state = { ...state, fleetSessions: [], fleetSessionsLoaded: false };
+  notify();
+}
+
+// Phase 41 Plan 01: test-only setter for row.lastMessageAt. Populates the
+// injection map that `rowFromTab` + the fleet-synthetic + RDP row builders
+// read. Plan 03 will replace this with a real fleet-status wire-side signal;
+// until then, tests seed known lastMessageAt values through this API to
+// exercise the middle-zone recency comparator (compareByRecencyDesc).
+//
+// After calling this, callers must trigger a snapshot recompute (any real
+// state mutation via updateOpenTabs / selectConversation / etc.) so the
+// cached snapshot is invalidated and rowFromTab re-runs with the new values.
+export function __setLastMessageAtForTest(rowId: string, ts: number | null): void {
+  if (ts === null) {
+    lastMessageAtByRowId.delete(rowId);
+  } else {
+    lastMessageAtByRowId.set(rowId, ts);
+  }
+  notify(); // invalidate cachedSnapshot so next getSnapshot() re-derives.
+}
+
+// Phase 41 Plan 01: reset the test-only lastMessageAt injection map. Used
+// by tests' beforeEach so a prior test's stamps don't leak forward.
+export function __resetLastMessageAtForTest(): void {
+  lastMessageAtByRowId.clear();
+  notify();
+}
+
+// Plan 07-01 Task 1 (updated Phase 41 Plan 01): expose all fleet-derived rows
+// (across activeSet + pinned + middle + rdpGroup) for test assertions.
+// `fleetOnly === true` rows are synthetic — they came from state.fleetSessions
+// and did NOT dedup with any openTabs entry. rdpGroup rows carry
+// `rdpHostRow: true` (not `fleetOnly`), so the rdpGroup iteration below is
+// technically a no-op but preserved for completeness.
+export function __getFleetOnlyRowsForTest(): ConversationRow[] {
+  const list = getSnapshot();
+  const out: ConversationRow[] = [];
+  for (const r of list.activeSet) if (r.fleetOnly) out.push(r);
+  for (const r of list.pinned) if (r.fleetOnly) out.push(r);
+  for (const r of list.middle) if (r.fleetOnly) out.push(r);
+  if (list.rdpGroup) {
+    for (const r of list.rdpGroup.rows) if (r.fleetOnly) out.push(r);
+  }
+  return out;
+}
+
+// ─── Phase 41 Plan 03 — cross-store bridge to session-working-store ──────────
+// The working-store owns the wire-side lastMessageAt cache; conversation-store
+// reads it via getSessionLastMessageAt at row-derivation time. When the
+// working-store publishes ANY change (isWorking flip OR lastMessageAt advance),
+// bump conversation-store's notify() so its memoized snapshot invalidates and
+// the next getSnapshot() re-derives with fresh recency values.
+//
+// This registration fires ONCE at module import — the returned disposer is
+// intentionally discarded because both stores live for the browser session's
+// lifetime. If the working-store ever adds selective per-key subscribes, we
+// can tighten this to only fire on lastMessageAt changes; the current shape
+// is fine because working-store already has a per-key no-op notify guard that
+// suppresses spurious publishes (see publishFleetStatusSessionState).
+// Most of these publishes (isWorking / dormant / aiTitle flips, or any
+// session without a row) leave every row unchanged; getSnapshot's structural
+// sharing (shareWithPrevious) then returns the previous list object, so
+// useConversations() consumers do not re-render for them.
+subscribeSessionWorkingStore(() => {
+  notify();
+});
+subscribeAttention(() => {
+  notify();
+});
+
+export function __resetRowHoldsForTest(): void {
+  heldRows.clear();
+  visibleConversationIds = new Set();
+}

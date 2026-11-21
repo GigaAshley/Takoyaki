@@ -1,0 +1,70 @@
+/**
+ * attention-schema.ts — tables behind the sidebar's unread marks.
+ *
+ *   identity_turn_log       — per (host, identity): when its agent last
+ *                             finished a turn (the per-session Stop file
+ *                             mtime, max-wins). Survives dormancy, recycles
+ *                             and restarts, which the live session frame
+ *                             does not.
+ *   conversation_read_state — per (user, host, identity): the newest finished
+ *                             turn that user has seen. Compared against the
+ *                             turn log value itself, never against a clock,
+ *                             so host/server clock skew cannot create or
+ *                             swallow a mark.
+ *   user_read_baseline      — per user: when read tracking started for them.
+ *                             When it is created, every turn already in the
+ *                             turn log is recorded as seen (so launch day
+ *                             starts all-read without comparing clocks). The
+ *                             time itself only matters for a conversation
+ *                             whose first finished turn lands after that, and
+ *                             compares server time to the agent machine's
+ *                             Stop-file time — fine at the scale of minutes,
+ *                             which is all a never-seen conversation needs.
+ *   conversation_dm_state   — per (user, host, identity): when that agent last
+ *                             DM'd that user (the Matrix event's server
+ *                             time, max-wins) and the newest such DM the user
+ *                             has seen. Like the read state, the seen value
+ *                             is an echo of last_dm_at, never a clock. Only
+ *                             DMs the push-trigger loop observes after it
+ *                             starts are recorded, so launch day has none.
+ *
+ * No imports: db/index.ts execs this at boot and tests exec it against an
+ * in-memory database.
+ */
+
+export const MAX_IDENTITY_NAME_LEN = 256;
+
+/** A plausible identity name for the attention tables (bounds the PK). */
+export function isValidIdentityName(name: unknown): name is string {
+  return typeof name === "string" && name.length > 0 && name.length <= MAX_IDENTITY_NAME_LEN;
+}
+export const ATTENTION_TABLES_SQL = `
+  CREATE TABLE IF NOT EXISTS identity_turn_log (
+      host_id TEXT NOT NULL,
+      identity_name TEXT NOT NULL,
+      last_finish_at INTEGER NOT NULL,
+      PRIMARY KEY (host_id, identity_name)
+  );
+  CREATE TABLE IF NOT EXISTS conversation_read_state (
+      user_id TEXT NOT NULL,
+      host_id TEXT NOT NULL,
+      identity_name TEXT NOT NULL,
+      seen_finish_at INTEGER NOT NULL,
+      PRIMARY KEY (user_id, host_id, identity_name),
+      FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+  );
+  CREATE TABLE IF NOT EXISTS conversation_dm_state (
+      user_id TEXT NOT NULL,
+      host_id TEXT NOT NULL,
+      identity_name TEXT NOT NULL,
+      last_dm_at INTEGER NOT NULL,
+      seen_dm_at INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (user_id, host_id, identity_name),
+      FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+  );
+  CREATE TABLE IF NOT EXISTS user_read_baseline (
+      user_id TEXT PRIMARY KEY,
+      baseline_at INTEGER NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+  );
+`;

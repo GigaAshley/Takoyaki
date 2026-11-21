@@ -1,0 +1,130 @@
+import { describe, it, expect } from "vitest";
+import {
+  SERVE_SUBDOMAIN_ORIGIN_RE,
+  isServeSubdomainOrigin,
+  rejectServeSubdomain,
+} from "./ws-origin-guard.js";
+
+// Phase 103 Plan 06 — Origin-guard for WebSocketServer endpoints. Tests are
+// the RED-gate; source lives at ./ws-origin-guard.ts. Behavior enumerated in
+// the plan's Task 1 <behavior> block — each `it()` below maps 1:1 to a bullet.
+
+describe("SERVE_SUBDOMAIN_ORIGIN_RE", () => {
+  it("is a RegExp instance", () => {
+    expect(SERVE_SUBDOMAIN_ORIGIN_RE).toBeInstanceOf(RegExp);
+  });
+
+  it("matches a real https serve-subdomain origin", () => {
+    expect(
+      SERVE_SUBDOMAIN_ORIGIN_RE.test("https://x-1.serve.term.example.com"),
+    ).toBe(true);
+  });
+});
+
+// The `serve` label is matched WITHOUT the instance's own primary-domain
+// labels. An earlier revision hardcoded `.serve.term.` — harbor's subdomain —
+// so this deny-guard silently failed OPEN on every other Skynet instance.
+// These cases pin the instance-agnostic behavior: without them the suite
+// passes either way and proves nothing.
+describe("isServeSubdomainOrigin — instance-agnostic (not just term.*)", () => {
+  it("returns true for a serve subdomain on a non-term instance", () => {
+    expect(
+      isServeSubdomainOrigin("https://foo-8080.serve.skynet.example.com"),
+    ).toBe(true);
+  });
+
+  it("returns true for a serve subdomain on a single-label parent", () => {
+    expect(isServeSubdomainOrigin("https://foo-8080.serve.example")).toBe(true);
+  });
+
+  it("returns true for an AWS-default host name on a non-term instance", () => {
+    expect(
+      isServeSubdomainOrigin(
+        "https://ip-172-31-209-239-3020.serve.skynet.example.com",
+      ),
+    ).toBe(true);
+  });
+
+  it("returns false for a non-term primary origin (no serve label)", () => {
+    expect(isServeSubdomainOrigin("https://skynet.example.com")).toBe(false);
+  });
+});
+
+describe("isServeSubdomainOrigin", () => {
+  it("returns true for https://foo-8080.serve.term.example.com", () => {
+    expect(
+      isServeSubdomainOrigin("https://foo-8080.serve.term.example.com"),
+    ).toBe(true);
+  });
+
+  it("returns true for http:// scheme (dev/preview)", () => {
+    expect(
+      isServeSubdomainOrigin("http://foo-8080.serve.term.example.com"),
+    ).toBe(true);
+  });
+
+  it("returns false for primary origin https://term.example.com", () => {
+    expect(isServeSubdomainOrigin("https://term.example.com")).toBe(false);
+  });
+
+  it("returns false for sibling origin https://files.example.com", () => {
+    expect(isServeSubdomainOrigin("https://files.example.com")).toBe(
+      false,
+    );
+  });
+
+  it("returns false for undefined origin (non-browser clients)", () => {
+    expect(isServeSubdomainOrigin(undefined)).toBe(false);
+  });
+
+  it("returns false for empty-string origin", () => {
+    expect(isServeSubdomainOrigin("")).toBe(false);
+  });
+
+  it("returns false for null origin", () => {
+    expect(isServeSubdomainOrigin(null)).toBe(false);
+  });
+
+  it("returns false for bare serve.term.<domain> (no subdomain prefix)", () => {
+    // Regex requires a subdomain segment BEFORE `.serve.term.`, so bare
+    // is naturally excluded — Plan 01 redirects it away anyway; this is
+    // extra safety.
+    expect(isServeSubdomainOrigin("https://serve.term.example.com")).toBe(
+      false,
+    );
+  });
+});
+
+describe("rejectServeSubdomain", () => {
+  it("returns true when request Origin matches serve subdomain", () => {
+    expect(
+      rejectServeSubdomain({
+        headers: { origin: "https://foo-8080.serve.term.example.com" },
+      }),
+    ).toBe(true);
+  });
+
+  it("returns false for a request with primary-domain Origin", () => {
+    expect(
+      rejectServeSubdomain({
+        headers: { origin: "https://term.example.com" },
+      }),
+    ).toBe(false);
+  });
+
+  it("returns false for a request with no Origin header", () => {
+    expect(rejectServeSubdomain({ headers: {} })).toBe(false);
+  });
+
+  it("returns false when Origin is an array (defensive — non-browser weirdness)", () => {
+    expect(
+      rejectServeSubdomain({
+        headers: {
+          origin: [
+            "https://foo-8080.serve.term.example.com",
+          ] as unknown as string,
+        },
+      }),
+    ).toBe(false);
+  });
+});

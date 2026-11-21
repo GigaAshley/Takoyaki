@@ -1,0 +1,275 @@
+import type { DragEvent as ReactDragEvent, ReactElement, ReactNode } from "react";
+import { useEffect, useRef, useState } from "react";
+import { ChevronLeft } from "lucide-react";
+
+import { KitScopeContext, type KitScopeValue } from "@/components/kit/scope";
+
+import {
+  RowKebabMenu,
+  useRowKebabContextMenu,
+  type RowKebabMenuItem,
+} from "@/features/pretty-conversations/RowKebabMenu";
+import { isCoarsePointer } from "@/features/pretty-conversations/row-touch-gestures";
+import { useIsMobile } from "@/hooks/use-mobile";
+import { useIsTouchDevice } from "@/hooks/use-is-touch-device";
+import { navigateToList } from "@/lib/mobile-flow";
+import { systemLogger } from "@/lib/frontend-logger";
+import { armOutboundDrag, mintDragId } from "./cross-window-drag";
+import "@/components/kit/kit.css";
+import "./pane-bar.css";
+
+// ─── PaneBar — the bar across the top of a non-conversation pane ───────────
+//
+// Shared by AppPane (apps), RemotePane (RDP/VNC/telnet) and FilePane (files). The bar is the
+// pane's handle in the split view, the same job an IdentityBadge does for a
+// conversation:
+//   - The WHOLE bar (minus its buttons) is draggable and writes the same
+//     application/x-skynet-badge payload an IdentityBadge does, so every
+//     existing badge drop path (split edges/center, the drop lane's Close
+//     zone, cross-window via the descriptor) applies with no pane-specific
+//     branch. Not draggable on mobile (no split view there).
+//   - Clicking the bar selects the pane (split focus).
+//   - A ⋯ button at the right end, and right-click anywhere on the bar, open
+//     the pane's RowKebabMenu, in the kit's menu look (kit scope).
+//   - On touch devices the bar is taller and leads with the round
+//     back-to-conversations button; AppShell hides its floating one while a
+//     barred pane sits top-left, so it doesn't cover the bar.
+//
+// The pane supplies its own left-hand buttons, title glyph and menu items.
+// Look: solid, one hairline, quiet buttons — pane-bar.css.
+
+// Skynet's floating sidebar-collapse toggle sits fixed at the content area's
+// top-left. Returns how far the bar's contents must shift right to clear it
+// (0 when the toggle isn't over the bar). The toggle only counts when its
+// vertical middle falls inside the bar. Exported for unit tests.
+export function sidebarToggleClearance(
+  barRect: Pick<DOMRect, "left" | "top" | "bottom">,
+  toggleRect: Pick<DOMRect, "left" | "right" | "top" | "bottom" | "width"> | null,
+): number {
+  if (toggleRect === null || toggleRect.width === 0) return 0;
+  const overlapsX = toggleRect.right > barRect.left && toggleRect.left < barRect.left + 40;
+  const middleY = (toggleRect.top + toggleRect.bottom) / 2;
+  const overlapsY = middleY >= barRect.top && middleY <= barRect.bottom;
+  if (!overlapsX || !overlapsY) return 0;
+  return Math.ceil(toggleRect.right - barRect.left) + 6;
+}
+
+// Columns: the two sides share the spare width equally (so the title sits
+// centred) but never shrink below their buttons; the title takes what's left
+// and truncates — it can never overlap the buttons, and on a phone it isn't
+// squeezed by a right side padded out to match the wider left one.
+const GRID_COLUMNS = "minmax(max-content, 1fr) minmax(0, max-content) minmax(max-content, 1fr)";
+// Touch devices: the bar is taller and holds the back-to-conversations
+// button at its left, in place of the floating one AppShell shows over
+// conversations (which would otherwise sit over the pane's top-left corner).
+const BACK_TO_LIST_GAP = 6;
+
+// The bar's ⋯ menu takes the kit look, like the sidebar's menus.
+const PANE_BAR_KIT_SCOPE: KitScopeValue = { hue: 220 };
+
+/** Class for the icon buttons a pane puts in the bar's left group. Back and
+ *  forward also set data-icon="arrow" for their larger chevrons. */
+export const PANE_BAR_BUTTON_CLASS = "pane-bar-btn";
+
+/** Utilities that bring the read-aloud button (its own component, styled with
+ *  utilities) into line with the bar's quiet buttons. */
+export const PANE_BAR_SPEAK_CLASS =
+  "size-[30px] rounded-lg border-0 bg-transparent hover:bg-[var(--k-s2)] text-[var(--k-t2)] hover:text-[var(--k-t1)] focus-visible:outline-2 focus-visible:outline-solid focus-visible:outline-offset-1 focus-visible:outline-[var(--k-acc)]";
+
+export interface PaneBarProps {
+  tabId: string;
+  /** Prefix for every data-testid on the bar (`${prefix}-bar`, …). */
+  testIdPrefix: string;
+  /** Log tag + operation prefix, e.g. "app-bar" → `[app-bar-drag]`, `app_bar_drag_start`. */
+  logTag: string;
+  /** Extra fields on every bar log line (hostId, slug, …). */
+  logContext: Record<string, unknown>;
+  /** Badge payload fields beyond tabId + dragId (identityKey, hostId, descriptor). */
+  dragPayload: Record<string, unknown>;
+  /** The pane's own buttons, left of the title. */
+  navButtons: ReactNode;
+  /** Glyph in the 20px tile left of the title. */
+  titleIcon: ReactNode;
+  /** The glyph is a picture filling the tile (an app's icon): no grey tile. */
+  titleIconIsPicture?: boolean;
+  title: string;
+  /** A faint second line under the name, for a pane whose state matters at a
+   *  glance (an agent's desktop: view only / under your control). */
+  subtitle?: string;
+  /** Controls left of the ⋯ (e.g. a view switcher). */
+  rightControls?: ReactNode;
+  menuItems: RowKebabMenuItem[];
+  onSelectPane?: (tabId: string) => void;
+  /**
+   * Touch screens: what the back button does, and its label. Absent → back to
+   * the conversation list.
+   */
+  back?: { label: string; onBack: () => void };
+}
+
+export function PaneBar({
+  tabId,
+  testIdPrefix,
+  logTag,
+  logContext,
+  dragPayload,
+  navButtons,
+  titleIcon,
+  titleIconIsPicture = false,
+  title,
+  subtitle,
+  rightControls,
+  menuItems,
+  onSelectPane,
+  back,
+}: PaneBarProps): ReactElement {
+  const barRef = useRef<HTMLDivElement>(null);
+  const isMobile = useIsMobile();
+  const isTouchDevice = useIsTouchDevice();
+  const barContextMenu = useRowKebabContextMenu(menuItems);
+  const opPrefix = logTag.replace(/-/g, "_");
+
+  // Clear the AppShell's fixed sidebar-toggle chevron when it sits over the
+  // bar's left end (desktop, sidebar collapsed, pane top-left). Re-measured
+  // on bar resize, window resize, and the sidebar's width transition.
+  const [clearance, setClearance] = useState(0);
+  useEffect(() => {
+    const bar = barRef.current;
+    if (bar === null) return;
+    const measure = () => {
+      const toggle = document.querySelector<HTMLElement>("[data-sidebar-toggle]");
+      // While the sidebar peeks, the toggle rides the peek's edge over the
+      // panes; the bar keeps the clearance of the toggle's resting spot.
+      if (toggle?.dataset.peeking === "true") return;
+      setClearance(
+        sidebarToggleClearance(
+          bar.getBoundingClientRect(),
+          toggle ? toggle.getBoundingClientRect() : null,
+        ),
+      );
+    };
+    measure();
+    const ro = typeof ResizeObserver !== "undefined" ? new ResizeObserver(measure) : null;
+    ro?.observe(bar);
+    window.addEventListener("resize", measure);
+    window.addEventListener("transitionend", measure, true);
+    return () => {
+      ro?.disconnect();
+      window.removeEventListener("resize", measure);
+      window.removeEventListener("transitionend", measure, true);
+    };
+  }, []);
+
+  // In a real browser, dragstart fires on the draggable bar even when the
+  // press began on one of its buttons — so remember where the press started.
+  const pressOnButtonRef = useRef(false);
+  // Touch screens drag nothing — a press-and-hold there opens the menu.
+  const isDragSource = !isMobile && !isCoarsePointer();
+  const onBarDragStart = (e: ReactDragEvent<HTMLDivElement>) => {
+    // A press that began on a button never drags the pane.
+    if (pressOnButtonRef.current) {
+      e.preventDefault();
+      return;
+    }
+    const dragId = mintDragId();
+    armOutboundDrag(dragId, tabId);
+    e.dataTransfer.setData("text/plain", tabId);
+    e.dataTransfer.setData(
+      "application/x-skynet-badge",
+      JSON.stringify({ tabId, dragId, ...dragPayload }),
+    );
+    e.dataTransfer.effectAllowed = "move";
+    systemLogger.info(`[${logTag}-drag] tabId=${tabId} dragId=${dragId}`, {
+      operation: `${opPrefix}_drag_start`,
+      tabId,
+      ...logContext,
+    });
+  };
+
+  return (
+    <KitScopeContext.Provider value={PANE_BAR_KIT_SCOPE}>
+      <div
+        ref={barRef}
+        data-testid={`${testIdPrefix}-bar`}
+        data-touch={isTouchDevice ? "true" : undefined}
+        draggable={isDragSource}
+        onPointerDownCapture={(e) => {
+          pressOnButtonRef.current = (e.target as HTMLElement).closest("button") !== null;
+        }}
+        onDragStart={isDragSource ? onBarDragStart : undefined}
+        onClick={() => onSelectPane?.(tabId)}
+        onContextMenu={barContextMenu.onContextMenu}
+        {...barContextMenu.holdProps}
+        className={`pane-bar relative z-[1] grid flex-none items-center gap-2.5 px-2 select-none [-webkit-touch-callout:none] ${
+          isDragSource ? "cursor-grab active:cursor-grabbing" : ""
+        }`}
+        style={{
+          gridTemplateColumns: GRID_COLUMNS,
+          paddingLeft: clearance > 0 ? clearance : undefined,
+        }}
+      >
+        <div className="flex items-center gap-0.5">
+          {isTouchDevice && (
+            <button
+              type="button"
+              data-testid={`${testIdPrefix}-back-to-list`}
+              aria-label={back?.label ?? "Back to conversations"}
+              title={back?.label ?? "Back to conversations"}
+              draggable={false}
+              onClick={(e) => {
+                e.stopPropagation();
+                systemLogger.info(`[${logTag}] back`, {
+                  operation: `${opPrefix}_back_to_list`,
+                  tabId,
+                  to: back ? "custom" : "list",
+                  ...logContext,
+                });
+                if (back) back.onBack();
+                else navigateToList();
+              }}
+              className="pane-bar-btn pane-bar-back"
+              style={{ marginRight: BACK_TO_LIST_GAP - 2 }}
+            >
+              <ChevronLeft aria-hidden="true" />
+            </button>
+          )}
+          {navButtons}
+        </div>
+        <div
+          data-testid={`${testIdPrefix}-title`}
+          className="justify-self-center max-w-full flex items-center gap-2 min-w-0 pointer-events-none"
+        >
+          <span className="pane-bar-icon" data-picture={titleIconIsPicture ? "true" : undefined} aria-hidden="true">
+            {titleIcon}
+          </span>
+          {subtitle ? (
+            <span className="flex flex-col min-w-0 leading-tight">
+              <span className="pane-bar-title truncate">{title}</span>
+              <span className="pane-bar-subtitle truncate" data-testid={`${testIdPrefix}-subtitle`}>
+                {subtitle}
+              </span>
+            </span>
+          ) : (
+            <span className="pane-bar-title truncate">{title}</span>
+          )}
+        </div>
+        <div
+          className="justify-self-end flex items-center gap-1"
+          data-testid={`${testIdPrefix}-kebab-slot`}
+        >
+          {rightControls}
+          {/* No items (e.g. a remote pane on a phone) → no ⋯ that opens nothing. */}
+          {menuItems.length > 0 && (
+            <RowKebabMenu
+              items={menuItems}
+              ariaLabel={`${title} menu`}
+              testId={`${testIdPrefix}-kebab-trigger`}
+              triggerClassName="pane-bar-menu"
+            />
+          )}
+        </div>
+        {barContextMenu.menu}
+      </div>
+    </KitScopeContext.Provider>
+  );
+}

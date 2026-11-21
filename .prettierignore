@@ -1,0 +1,23 @@
+build
+coverage
+dist
+dist-ssr
+release
+
+node_modules
+src/mcp-server/node_modules
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+
+db
+
+.env
+
+*.min.js
+*.min.css
+openapi.json
+
+# Vendored fleet substrate — canonical shape lives in the box-maintainer role;
+# do not reformat (feature 02 slice 1).
+substrate

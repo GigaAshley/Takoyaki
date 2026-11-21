@@ -1,0 +1,4800 @@
+// ─── PrettyConversationsPanel ────────────────────────────────────────────────
+// The flat-list composition of the Phase 10 pretty-conversations rework
+// (as amended by Phase 41 Plan 01, user 2026-08-14 — three-zone reshape).
+// Wraps Wave 1's `PrettyConversationRow` into a full conversation panel
+// matching the user-signed-off prototypes (prototype.html for mobile,
+// desktop.html for desktop):
+//
+//   - Pinned rows at the top with a "Pinned" divider chip (patch #234)
+//   - Middle: FLAT recency-sorted rows (Phase 41 Plan 01). No per-host
+//     divider chips. All non-pinned / non-active-set / non-RDP rows land
+//     in `snapshot.middle` as a single flat array. Rendered in one
+//     container with no host bucketing.
+//   - RDP sentinel group rendered from `snapshot.rdpGroup` (nullable). When
+//     `rdpGroup === null` (zero RDP-eligible hosts) the entire section —
+//     divider chip + rows — is suppressed per user lock #7.
+//     (The row's `data-rdp-host-row="true"` attribute already suppresses
+//     pin+swipe intrinsically per Wave 1's contract.)
+//   - Load-in-flight affordance: a compact "Loading conversations…" strip
+//     with a spinning Loader2 renders at the top of the scroll region
+//     while `useFleetSessionsLoaded()` is still false. Sits above whatever
+//     rows have already arrived (RDP + openTab rows tend to land first
+//     while the fleet enumeration is still in flight). No dedicated
+//     empty-state card — the header chrome (SKYNET logo, pencil, filter)
+//     is affordance enough for a truly-empty list.
+//   - Header carries a `variant` prop-driven layout:
+//       * variant="mobile"  → pencil icon ONLY (right-aligned); no title
+//       * variant="desktop" → title "Conversations" (left) + pencil (right)
+//   - Pencil opens the existing NewSessionDialog VERBATIM (no dialog redesign)
+//   - Gear (shadcn dropdown) removed in patch #133 — panel is now
+//     shadcn-free.
+//   - settingsRowSlot prop retired in Phase 11 (user's "no settings" lock —
+//     SettingsRow deleted alongside AppRail).
+//   - quick-260802-pq2: the mobile swipe-coordination layer
+//     (currentlySwipedId + handleSwipeOpenChange + forceClosedFor + row-level
+//     forceClosed/onSwipeOpenChange props) was retired alongside the row's
+//     swipe state machine. Mobile row actions now flow through the same
+//     PrettyConversationContextMenu desktop uses — reached via long-press on
+//     mobile and right-click on desktop. Panel no longer coordinates row
+//     open-state because there is no row open-state to coordinate.
+//
+// Store consumption is verbatim from ConversationsPanel.tsx — same three
+// hooks (useConversations / useSelectedConversationId / usePinnedIds) and
+// the same core action imports (selectConversation, plus pin/unpin — see
+// handleTogglePin below for the both-shape write). No store reshape. No new
+// derivations. The panel is a thin composition layer.
+//
+// Wave 3 (AppShell cutover) does the mount-site swap; this panel is NOT
+// yet mounted anywhere. Wave 4 retires ConversationsPanel.tsx +
+// ConversationRow.tsx.
+//
+// NO diagnostic spew — Patch #111e F3-diag scoped to the old panel is being
+// retired in Wave 4 and NOT ported forward here.
+
+import { announceAgentArchived } from "@/features/archived-view/archived-identity";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+// Phase 41 Plan 01: `Server` icon retired alongside the per-host divider chips.
+// Phase 41 Plan 02: `Search` and `X` icons added for the always-in-DOM search
+// input mounted at the top of the pv-panel-scroll region.
+// Phase 119 Plan 04 (D-02): `AppWindow` glyph added for the new Apps section
+// header at `size-3 text-[#5c6070]/85 shrink-0` typography.
+// UAT 2026-09-19: `Pin` glyph added for the reinstated Pinned section header
+// (reverses the 2026-08-17 "pinned header should go away entirely" lock — the
+// Apps section landing above the flat middle re-introduced ambiguity between
+// Apps and pinned rows that the earlier design didn't have).
+// Phase 143 D-09 (retired by shape-sidebar-header-affordances): the Archive
+// (aliased ArchivedBoxIcon) glyph was the always-visible archived-apps trigger
+// on the Apps section header. Migrated into the Apps header RowKebabMenu
+// (single "Archived apps" item); icon import removed.
+import { ChevronDown, Clock, Crown, Drama, Loader2, Mail, MessageSquare, Plus, Search, Settings, SquarePen, X, Zap } from "lucide-react";
+import SkillsEditorModal from "@/features/pretty-view/SkillsEditorModal";
+// Phase 137 D-08: PreferencesModal — opened from the sidebar footer gear button.
+import PreferencesModal from "@/features/pretty-view/PreferencesModal";
+// Admin control surface — opened from the shield button next to the gear;
+// only rendered for admins.
+import AdminModal from "@/features/admin/AdminModal";
+// The roles window (library → role → runbook, new role, archived) — opened
+// from the footer's Roles button and from the new-conversation dialog's
+// "New role…".
+import { RolesWindow, type RolesWindowStart } from "@/features/pretty-view/roles-window/RolesWindow";
+import {
+  NEW_CONVERSATION_REQUEST_EVENT,
+  takeNewConversationRequest,
+  type NewConversationRequest,
+} from "@/lib/new-conversation-request";
+import { useTranslation } from "react-i18next";
+import { isCoarsePointer } from "./row-touch-gestures";
+import { useDragPreviewClaim } from "@/shell/drag-preview-session";
+import {
+  BADGE_MIME,
+  getDraggedBadge,
+  hasBadgeMime,
+  parseBadgePayload,
+  type DraggedBadge,
+} from "@/shell/badge-drag";
+
+import {
+  useConversations,
+  useSelectedConversationId,
+  usePinnedIds,
+  useActiveSet,
+  useFleetSessionsLoaded,
+  // Phase 92 Plan 04: hydrate effect reads the fleet-sessions snapshot to
+  // build the identityHosts map for the deriveDiskPinnedIds projection.
+  getFleetSessionsSnapshot,
+  upsertFleetSession,
+  selectConversation,
+  addToActiveSet,
+  removeFromActiveSet,
+  fleetRowId,
+  pinConversation,
+  unpinConversation,
+  hydratePinnedIdsFromServer,
+  // Phase 117 Plan 117-08 (D-09, D-15, D-39): projects-derived selector output.
+  // The panel reads pinnedUnassigned/projectSections/rdp from the same
+  // useConversations() snapshot the store now emits (117-07 additive fields).
+  // useProjects is subscribed alongside so we react to fleet-status wire updates
+  // (project-list-changed frames flow through setProjects → notify → re-render).
+  useProjects,
+  // handleArchive uses these for optimistic sidebar removal: mark the identity
+  // pending-archive so mid-flight fleet-status upserts stay filtered out, then
+  // drop the fleet-session row so the sidebar updates without waiting for the
+  // supervisor's ~15s retire tick.
+  removeFleetSession,
+  patchRoomProjectAssignment,
+  markPendingArchive,
+  clearPendingArchive,
+  mergeProjectsForHost,
+  getProjectsSnapshot,
+  type ConversationRow as ConversationRowShape,
+  type ProjectSection,
+} from "@/state/conversation-store";
+import {
+  endProjectDrag,
+  getDraggedProject,
+  hasProjectMime,
+  type DraggedProject,
+} from "./project-drag";
+// Phase 117 Plan 117-08 (D-40): per-project collapse state (localStorage-backed
+// via the hook landed in 117-07). Consumers pass the collapsed set + toggle
+// callback into each PrettyProjectSectionHeader.
+import { useCollapsedProjectSlugs } from "@/state/use-collapsed-project-slugs";
+import { useProjectsSectionCollapsed } from "@/state/use-projects-section-collapsed";
+import { projectKey } from "@/state/project-tree";
+// Phase 117 Plan 117-08 (D-22): project drop-handler API surface. Landed by
+// 117-06 as thin authApi wrappers; called fire-and-forget from the panel's
+// handleProjectDrop / handleFlatMiddleDrop.
+import { setSessionProject, setRelayRoomProject } from "@/api/session-project-api";
+// Phase 117 Plan 117-09 Task 2 (D-28, D-29, D-30) — archive-project cascade.
+// handleArchiveProject collects the section's members, presents the D-29
+// verbatim confirmation, fires Promise.allSettled across archiveIdentity +
+// setRelayRoomProject(null) member ops, then archiveProject as the folder-move.
+import {
+  archiveProject,
+  getArchivePreflight,
+  getProjectFile,
+  setProjectParent,
+  updateProjectFile,
+} from "@/api/project-list-api";
+// Phase 117 Plan 117-09 Task 2 (D-14) — reusable right-click / long-press
+// context menu chrome. The section header binds onContextMenu, which opens
+// this menu at the pointer coords with Edit + Archive items.
+// Phase 117 Plan 117-08: viewing user's Matrix mxid — required for the
+// relay-room drop branch (setRelayRoomProject's second argument). Sourced from
+// the same hook the shared chat surface uses (viewing-user-store, Phase 90 P5).
+import { useViewingUserMxid } from "@/state/viewing-user-store";
+// Phase 117 Plan 117-08 Task 1 — per-project section wrapper landed earlier
+// in this plan. Consumes projectSections from the store selector; emits
+// onDropRow → panel's handleProjectDrop (which resolves identity vs
+// relay-room routing).
+import { PrettyProjectSectionHeader, type PrettyProjectDropPayload } from "./PrettyProjectSectionHeader";
+// Phase 117 Plan 117-09 Task 1 — CreateProjectModal: swap-target for the
+// 117-08 placeholder marker. Controlled modal wired to the header
+// "Create project" button; on 200 fires onCreated with the backend-echoed
+// slug (D-25 backend-authoritative slugify per Pitfall 1).
+import { CreateProjectModal } from "./CreateProjectModal";
+// ProjectModal (Project file + Files tabs), opened from the section-header
+// kebab's "Edit project" item. Wired below in handleOpenProject / mounted
+// alongside the other project modals.
+import { ProjectModal } from "./ProjectModal";
+// Phase 122 Plan 03 Task 3 — ConversationSearchModal: opened via the
+// header magnifying-glass button below (first child of .pv-header-actions).
+// The modal owns its query + results store (module-scoped search-store) so
+// state persists across open/close cycles (D-05). Active-result click
+// bubbles up through onSearchResultOpenActive → AppShell's tab-open flow
+// (mirrors onDetachedRowClick shape at AppShell.tsx:3068). Plan 03 does
+// NOT remove the existing filter-as-you-type — that lands in Plan 04
+// (D-18 ordering: modal usable BEFORE filter removed).
+import { ConversationSearchModal } from "./ConversationSearchModal";
+// Phase 135 Plan 135-01 Task 4 (shape 3, wake-ups-redesign) — ScheduledAgentsModal:
+// portal-mounted sibling of ConversationSearchModal, opened via the new
+// Clock header button below (position 6 in the .pv-header-actions
+// cluster, between Edit-global-files and the kebab).
+// Owns its own list + form + refetch lifecycle (D-03 no client cache);
+// controlled open state lifted to this panel per D-26 (mirrors sibling
+// modals). Consumes the fleet-wide LIST + CRUD helpers from
+// src/ui/api/scheduled-agents-api.ts, which layer over shape 2's REST endpoints.
+import { ScheduledAgentsModal } from "./ScheduledAgentsModal";
+import {
+  OPEN_SCHEDULED_TASKS_EVENT,
+  type ScheduledTasksFilter,
+} from "./open-scheduled-tasks";
+// Phase 143 D-09: ArchivedAppsModal — opened from the Apps section header's
+// RowKebabMenu "Archived apps" item (see mount below at <RolesListModal>
+// sibling block). shape-sidebar-header-affordances migrated the trigger from
+// an inline icon-button to the shared kebab primitive.
+import { ArchivedAppsModal } from "./ArchivedAppsModal";
+// shape-sidebar-header-affordances: shared kebab primitive used for every
+// sidebar section-header affordance that has at least one action to offer.
+// Hover-reveal on desktop + always-visible on mobile is applied at each
+// consumer site via a group/group-hover wrapper (RowKebabMenu itself is
+// always-visible — the reveal discipline lives at the consumer, not in
+// the primitive).
+import {
+  RowKebabMenu,
+  useRowKebabContextMenu,
+  type RowKebabMenuItem,
+  type RowKebabSubmenuItem,
+} from "./RowKebabMenu";
+import type { ConversationSearchResult } from "@/api/conversation-search-api";
+import {
+  useSessionIsWorking,
+  // Phase 47 Plan 04 — subscribes PrettyConversationRowLive to the working-
+  // store's aiTitle axis (Plan 47-03 LAST-WINS chokepoint). Threaded through
+  // to PrettyConversationRow as a new prop; Plan 47-05 consumes the value
+  // as the row's subtitle content. Same key shape as useSessionIsWorking.
+  useSessionAiTitle,
+  // Phase 52 Plan 03 — useSessionIsDormant: hook for the dormant axis added by
+  // Plan 01 (source A + source B). Used in PrettyConversationRowLive per the
+  // same per-row hook pattern as useSessionIsWorking.
+  // getSessionWorkingSnapshot + subscribeSessionWorkingStore: imperative snapshot
+  // read via useSyncExternalStore for building the panel-level rowSessionStates
+  // map consumed by matchesFilterForRow's Ready predicate.
+  useSessionIsDormant,
+  getSessionWorkingSnapshot,
+  subscribeSessionWorkingStore,
+} from "@/state/session-working-store";
+// Phase 92 Plan 04: panel hydrate effect derives pinnedIds from the
+// identities-store's `pinned: boolean` field (populated on-demand from disk
+// by the backend per Plan 92-02) rather than fetching from GET /user-
+// preferences. buildIdentityHostsFromFleet is the H2 lock helper shared
+// with pin-toggle writes.
+// Phase 104 Plan 02+03: trapped-work poller is the sole per-identity
+// polling loop mounted here — the sibling bounty-count wire was retired
+// in Plan 03 (bounty-counts-store deleted).
+import {
+  useIdentities,
+  buildIdentityHostsFromFleet,
+  deriveDiskPinnedIds,
+  refreshIdentities,
+  // handleArchive: optimistic-remove from the identities-store alongside the
+  // fleet-session drop so downstream row-builders see the identity vanish
+  // immediately, not on the supervisor's retire tick.
+  applyIdentityChange,
+} from "@/state/identities-store";
+import { startTrappedWorkPoller } from "@/state/trapped-work-store";
+import { sessionMatchKey } from "@/features/terminal/session-hue";
+import { NewSessionDialog, type NewSessionOnCreateOpts } from "@/sidebar/NewSessionDialog";
+// Phase 92 Plan 04: getPinnedIds is retired. The panel projects the pin state
+// from the identities-store's `pinned: boolean` field via deriveDiskPinnedIds
+// (imported above).
+// (Phase 115 Plan 115-02: the Phase 107 `.hidden` hydrate + deriveDiskHiddenIds
+//  path was retired per D-21 alongside the backend .hidden fanout removal.)
+import type { Host, HostFolder } from "@/types/ui-types";
+
+import { PrettyConversationRowView, resolveRowIdentity } from "./PrettyConversationRow";
+import type { Identity } from "@/api/identities-api";
+// shape-sidebar-search-inline: pure filter helpers for the sidebar-search
+// input row. Extracts the union of every candidate string that could render
+// on either of a row's two lines, matches against a case-insensitive
+// substring, resolves an identity for a row using the panel's existing maps.
+import {
+  rowMatchesSearchQuery,
+  resolveIdentityForRow,
+  appTileMatches,
+  nameMatchedSectionKeys,
+  searchProjectSections,
+} from "./sidebar-search-match";
+// shape-sidebar-search-inline: pre-populate the ConversationSearchModal's
+// module-scoped query state AND kick off the initial fetch so the modal
+// opens already showing results (no second Enter needed). Same store
+// primitives the modal's own Enter handler uses (ConversationSearchModal
+// handleEnter), so the modal renders "Searching..." → results transition
+// naturally off the store's isFetching/results.
+import {
+  startNewSearch,
+  appendResults,
+  setError as setSearchStoreError,
+} from "@/state/search-store";
+import { searchConversations } from "@/api/conversation-search-api";
+// Phase 115 Plan 115-06 (Task 2): archive API client — invoked by row context
+// menu; archived identities are searchable via the Phase 122 modal.
+import { archiveIdentity } from "@/api/identity-archive-api";
+// Phase 119 Plan 04 (D-01/D-02/D-03/D-04/D-05): sidebar Apps section. Consumes
+// the useAppTiles() hook (Plan 119-02, backed by the fleet-status app-frame
+// channel) and renders one <AppTile app={...}/> per entry (Plan 119-03) inside
+// a new .pv-apps-section group. Not gated on `.length > 0` (D-05: always
+// present so the empty-expanded prompt is discoverable).
+import { AppTile } from "./AppTile";
+import { ProjectAppRow } from "./ProjectAppRow";
+import { droppedApp, endAppDrag, getDraggedApp, hasAppMime, type DraggedApp } from "./app-drag";
+import { moveApp } from "./app-menu-items";
+import type { AppState } from "../../api/fleet-status-types";
+import { useAppTiles } from "@/state/app-tiles-store";
+// Phase 70 Plan 04: header lockup (small icon + wordmark) now sourced from
+// brandingConfig (Plan 70-03) so operator-provided assets swap in. Prior
+// hardcoded inline-SVG logo import removed — no remaining consumers in this
+// file after the JSX below switched to <img src={brandingConfig.iconPath}>.
+import { useBrandingConfig } from "@/branding/branding-store";
+// Leaf-level subscription to the useSyncExternalStore singleton that tells
+// us whether feedback is enabled on this deployment. Consumed at the top
+// of the component body — controls the full-width "Send feedback" CTA's
+// DOM presence above the sidebar footer (button ABSENT when disabled, not
+// disabled-and-hidden).
+import { useFeedbackEnabled } from "@/feedback/feedback-store";
+import { getBasePath } from "@/lib/base-path";
+import { roleDisplayName } from "@/lib/role-display-name";
+import { KitButton, KitIconButton, kitAlert, kitConfirm, kitPrompt } from "@/components/kit";
+import { toast } from "sonner";
+import { systemLogger } from "@/lib/frontend-logger";
+import {
+  ARCHIVE_AGENT_BODY,
+  checkActiveWakeups,
+  checkActiveWakeupsForAgents,
+  claimArchivePrompt,
+  multiAgentWakeupWarning,
+  releaseArchivePrompt,
+  singleAgentArchiveBody,
+  type WakeupCheck,
+} from "@/shell/archive-wakeup-check";
+import { KitScopeContext, type KitScopeValue } from "@/components/kit/scope";
+
+// Phase 122 Plan 04 (D-17 removal): the SEARCH_HIDDEN_SENTINEL_KEY constant
+// and its one-shot cold-load scroll-hide useEffect at ~L950 were retired
+// together with the inline filter-as-you-type input the Plan 03 modal
+// replaced. The store-side clear in conversation-store.ts is also retired.
+
+// quick-260818-q73 (shape: .planning/shapes/shape-auto-deactivate-idle-convs.md):
+// Per-tab idle-sweep tunables. `IDLE_DEACTIVATE_THRESHOLD_MS` = the wall-clock
+// window a conv can sit un-selected in this tab before the sweep fires the
+// existing `handleRowDeactivate(row)` against it. `IDLE_DEACTIVATE_SWEEP_MS` =
+// how often the sweep walks the active-set looking for stale rows.
+//
+// Colocated by convention — this project has no shared app config module;
+// other tunable UI constants live at their consumer's module top (see
+// BACKPRESSURE_POLL_MS in use-pretty-view-uploads.ts, STICK_ARM_MS in
+// use-auto-scroll.ts). Bumping the threshold = editing this constant.
+//
+// The whole feature is per-tab / in-memory only: no persistence, no server
+// value, no cross-tab coordination, no URL param, no settings UI. The
+// currently-selected conv is exempt from the sweep. Silent operation — no
+// toast, no ARIA update, no console entry — a swept row disappears from the
+// active-set exactly the way a manual click makes it disappear.
+const IDLE_DEACTIVATE_THRESHOLD_MS = 300_000; // 5 min — shape default
+const IDLE_DEACTIVATE_SWEEP_MS = 30_000;
+
+// Patch #513: sentinel empty Set for the visibleInSplitTreeTabIds default.
+// A single frozen module-level Set keeps the .has() call sites happy without
+// re-allocating on every render, AND keeps the effect dep-array's identity
+// stable when the caller omits the prop (which most tests do).
+const EMPTY_VISIBLE_SET: ReadonlySet<string> = new Set();
+
+// Patch #137: derive the (hostId:tmuxSessionName) key used by the session-
+// working-store to look up the row's live isWorking state. Rows without a
+// host (fleet-only pre-resolution races) resolve to null → the store hook
+// short-circuits to null → dot suppressed at the row level. RDP rows carry
+// targetTmuxSession=null and resolve to `${hostId}:` — a well-formed key
+// whose store entry stays null (Terminal.tsx never publishes to it).
+// The sidebar row an open pane's badge stands for, as the row-drag payload
+// the section drop handlers take — null when it has no (fileable) row. Open
+// tab ids don't always equal row ids, so fall back to the room, or to
+// host + session.
+function badgeRowDropPayload(
+  badge: DraggedBadge,
+  rows: readonly ConversationRowShape[],
+): PrettyProjectDropPayload | null {
+  // An archived conversation has no row and can't be filed anywhere.
+  if (badge.sessionKind === "archived") return null;
+  const key = sessionMatchKey(badge.targetTmuxSession ?? badge.identityKey);
+  const row =
+    rows.find((r) => r.id === badge.tabId) ??
+    (badge.relayRoomId !== null
+      ? rows.find((r) => r.roomId === badge.relayRoomId)
+      : badge.hostId !== null && key !== null
+        ? rows.find(
+            (r) =>
+              r.host?.id === String(badge.hostId) &&
+              sessionMatchKey(r.targetTmuxSession) === key,
+          )
+        : undefined);
+  if (!row || row.rdpHostRow === true) return null;
+  return {
+    id: row.id,
+    host: row.host ?? null,
+    targetTmuxSession: row.targetTmuxSession ?? null,
+    matrixRoomId: row.roomId ?? null,
+    rdpHostRow: false,
+    identityKey: null,
+  };
+}
+
+function sessionWorkingKey(row: ConversationRowShape): string | null {
+  if (!row.host) return null;
+  return `${row.host.id}:${row.targetTmuxSession ?? ""}`;
+}
+
+// Phase 117 M-I follow-up (2026-09-19): flatten a HostFolder into a list of
+// Hosts via DFS. Used to filter the tree to a single host when the new-agent
+// dialog opens in project context (destination host is implied). Mirrors
+// the collectAllHosts helper inlined in CreateRoleDialog / NewSessionDialog /
+// CreateProjectModal — kept local to avoid a shared-util migration for one
+// call site.
+function collectHostsFromFolder(folder: HostFolder): Host[] {
+  const out: Host[] = [];
+  const walk = (children: (Host | HostFolder)[]): void => {
+    for (const child of children) {
+      if ("children" in child) walk(child.children);
+      else out.push(child);
+    }
+  };
+  walk(folder.children ?? []);
+  return out;
+}
+
+// (Phase 115 Plan 115-02: the Phase 107 `canonicalHideIdForRow` +
+//  `isRowHidden` helpers were retired per D-21 alongside the Hide menu
+//  affordance. 115-06 introduces an Archive equivalent with a distinct
+//  discriminator sourced from the archived-tree sweep, not from these
+//  helpers.)
+
+// Phase 115 Plan 115-06 (D-01, D-04): affordance-narrowing gate for the
+// Archive menu item — mirrors the deleted `canonicalHideIdForRow` (115-02).
+// Returns the canonical fleet-synthetic id (`fleet::<hostId>::<key>`) for a
+// row when the Archive item should be offered, or null when the row is NOT
+// an eligible target:
+//   - RDP host-rows (`row.rdpHostRow === true`)   → null (RDP has no identity backing).
+//   - Relay-room rows (`row.kind === "relay-room"`) → null (rooms are not identities).
+//   - Rows without host + targetTmuxSession       → null (fleet-synthetic id
+//                                                    cannot be constructed).
+// The panel only threads `onArchive` on rows whose gate returns non-null,
+// which the row component then renders as the "Archive" menu entry.
+// Rewrite the `displayName:` value inside the leading YAML frontmatter fence
+// of a project.md body. If the file has a `---` fence with a `displayName:`
+// key, that value is swapped; if the fence exists without the key, the key is
+// injected; if there is no fence at all, one is prepended. The new value is
+// YAML-quoted only when it contains a character that would break bare-string
+// parsing (colon, hash, leading dash, etc.) — matches the shape written by
+// writeProjectFile in identity-artifact-reader.ts.
+//
+// Exported for the frontend test suite; not called at runtime outside the
+// panel's handleRenameProject.
+export function rewriteDisplayNameInFrontmatter(
+  markdown: string,
+  nextDisplayName: string,
+): string {
+  const yamlValue = /[:#\-\[\]\{\},&*!|>'"%@`\n]/.test(nextDisplayName)
+    ? JSON.stringify(nextDisplayName)
+    : nextDisplayName;
+
+  const fenceMatch = markdown.match(/^---\r?\n([\s\S]*?)\r?\n---(\r?\n|$)/);
+  if (fenceMatch) {
+    const fmBody = fenceMatch[1];
+    const rest = markdown.slice(fenceMatch[0].length);
+    const dnLine = /^displayName:.*$/m;
+    const newFmBody = dnLine.test(fmBody)
+      ? fmBody.replace(dnLine, `displayName: ${yamlValue}`)
+      : `${fmBody}\ndisplayName: ${yamlValue}`;
+    return `---\n${newFmBody}\n---\n${rest}`;
+  }
+
+  return `---\ndisplayName: ${yamlValue}\n---\n${markdown}`;
+}
+
+function canonicalArchiveIdForRow(row: ConversationRowShape): string | null {
+  if (row.rdpHostRow === true) return null;
+  if (row.kind === "relay-room") return null;
+  if (!row.host || !row.targetTmuxSession) return null;
+  const hostIdNum = parseInt(row.host.id, 10);
+  if (!Number.isFinite(hostIdNum)) return null;
+  return fleetRowId(hostIdNum, row.targetTmuxSession);
+}
+
+// Row-level actions, each taking the row it acts on. The panel hands every
+// row ONE stable object (identity never changes across renders; each method
+// forwards to the panel's latest handler via a ref), so a memoized row never
+// re-renders just because the panel re-rendered and re-created its handlers.
+type RowActions = {
+  select: (row: ConversationRowShape) => void;
+  setPinned: (row: ConversationRowShape, wantPinned: boolean) => void;
+  deactivate: (row: ConversationRowShape) => void;
+  kill: (row: ConversationRowShape) => void;
+  archive: (row: ConversationRowShape) => void;
+  swipeArchive: (row: ConversationRowShape) => void;
+  moveToProject: (row: ConversationRowShape, slug: string | null) => void;
+  createProject: (row: ConversationRowShape) => void;
+};
+
+const SIDEBAR_KIT_SCOPE: KitScopeValue = { hue: 220 };
+
+// How long a swipe-archive can be undone before it is carried out.
+export const SWIPE_UNDO_MS = 5000;
+
+const EMPTY_SUBMENU_PROJECTS: readonly { slug: string; displayName: string; depth: number }[] = [];
+const noopTogglePin = () => {};
+
+// Wraps PrettyConversationRowView with the row's live working-store state.
+// Memoized: with the stable `actions` object and primitive / store-shared
+// props, a row re-renders only when its own data (row object, identity,
+// selection, pin/project state) or its own session's working-store state
+// changes — not when some other agent in the fleet changes state.
+//
+// Callback props are derived here from `actions` + flags, preserving the
+// exact presence/absence semantics the row's menu builder gates on:
+//   - pinMode "toggle" → onTogglePin flips the shown pin state; "noop" → a
+//     no-op handler (RDP rows); "none" → omitted (row can't be pinned).
+//   - archivable → onArchive only for rows canonicalArchiveIdForRow accepts.
+//   - projectActions → onMoveToProject (non-RDP, this host has projects) and
+//     onCreateProject (non-RDP, relay room or row with a host).
+//
+// Patch #137 / Phase 53 Plan 03 / Phase 47 Plan 04: the working-store hooks
+// sit at this stable hook-call site (not inside a .map() callback); all share
+// the `${hostId}:${tmuxSession ?? ""}` key shape via sessionWorkingKey().
+const PrettyConversationRowLive = memo(function PrettyConversationRowLive(props: {
+  row: ConversationRowShape;
+  identity: Identity | null;
+  selected: boolean;
+  pinned: boolean;
+  variant: "mobile" | "desktop";
+  actions: RowActions;
+  pinMode: "toggle" | "noop" | "none";
+  archivable: boolean;
+  projectActions: boolean;
+  projects?: readonly { slug: string; displayName: string }[];
+  currentProjectSlug?: string | null;
+  inActiveSet: boolean;
+  sessionKey: string | null;
+  subtitleMode?: "hostname" | "identityTitle";
+}) {
+  const {
+    row,
+    actions,
+    pinned,
+    pinMode,
+    archivable,
+    projectActions,
+    projects,
+    sessionKey,
+    inActiveSet,
+  } = props;
+  const isWorking = useSessionIsWorking(sessionKey);
+  const aiTitle = useSessionAiTitle(sessionKey);
+  const isRdp = row.rdpHostRow === true;
+  const isRelayRoom = typeof row.roomId === "string" && row.roomId.length > 0;
+  return (
+    <PrettyConversationRowView
+      row={row}
+      identity={props.identity}
+      selected={props.selected}
+      pinned={pinned}
+      variant={props.variant}
+      onSelect={() => actions.select(row)}
+      onTogglePin={
+        pinMode === "toggle"
+          ? () => actions.setPinned(row, !pinned)
+          : pinMode === "noop"
+            ? noopTogglePin
+            : undefined
+      }
+      onDeactivate={() => actions.deactivate(row)}
+      onKill={() => actions.kill(row)}
+      onArchive={
+        archivable && canonicalArchiveIdForRow(row) !== null
+          ? () => actions.archive(row)
+          : undefined
+      }
+      onSwipeArchive={
+        archivable && canonicalArchiveIdForRow(row) !== null
+          ? () => actions.swipeArchive(row)
+          : undefined
+      }
+      onMoveToProject={
+        projectActions && !isRdp && (projects?.length ?? 0) > 0
+          ? (slug: string | null) => actions.moveToProject(row, slug)
+          : undefined
+      }
+      onCreateProject={
+        projectActions && !isRdp && (isRelayRoom || !!row.host)
+          ? () => actions.createProject(row)
+          : undefined
+      }
+      projects={projects}
+      currentProjectSlug={props.currentProjectSlug}
+      subtitleMode={props.subtitleMode}
+      isWorking={isWorking}
+      inActiveSet={inActiveSet}
+      aiTitle={aiTitle}
+    />
+  );
+});
+
+// Module-scoped scrollTop cache for the conversation-list scroll region.
+// On mobile the panel unmounts when the user opens a conversation (only the
+// list-screen wrapper mounts it — the view-screen path doesn't), so React
+// state on the panel is destroyed across the list→view→list cycle. Persisting
+// scrollTop at module scope survives that unmount so the restore below lands
+// at the position the user last scrolled to. On desktop the panel stays
+// mounted and the save/restore reduces to a no-op.
+let savedListScrollTop = 0;
+
+export function PrettyConversationsPanel({
+  variant,
+  onConversationSelected,
+  hostTree,
+  onCreateSession,
+  onDetachedRowClick,
+  onRdpRowClick,
+  onRelayRoomRowClick,
+  onDeactivateRow,
+  onKillRow,
+  sidebarToggleOverlaps = false,
+  visibleInSplitTreeTabIds,
+  isAdmin = false,
+  username = null,
+  onOpenApp,
+  onArchiveApp,
+  onOpenFeedback,
+  onSearchResultOpenActive,
+  userId = "",
+  avatarPath = null,
+  onAvatarChanged,
+  userPrefs,
+  onUserPrefsChanged,
+}: {
+  // NEW in Wave 2: drives BOTH the header layout branching AND the child
+  // rows' pin mechanism (mobile=swipe / desktop=hover-reveal). AppShell
+  // (Wave 3) will resolve this from `useIsMobile()` at the mount site.
+  variant: "mobile" | "desktop";
+  // Fired AFTER the store's selectConversation (or the detached/RDP-branch
+  // callbacks) run on a row tap. AppShell's mobile branch passes a handler
+  // that transitions list→view.
+  onConversationSelected?: (id: string) => void;
+  // Phase 11 Plan 03: settingsRowSlot prop RETIRED (SettingsRow deleted
+  // alongside AppRail per user's "no settings" lock).
+  // Host tree fed into the NewSessionDialog's host picker. Optional so
+  // tests can render the panel without wiring the picker.
+  hostTree?: HostFolder | null;
+  // Fired when the user completes the NewSessionDialog. The pencil-icon
+  // header button is only mounted when this callback is provided (matches
+  // the ConversationsPanel gate that used to be on the old inline
+  // new-session button affordance).
+  onCreateSession?: (opts: NewSessionOnCreateOpts) => void;
+  // Detached-fleet-row click (Plan 07-01, TG-14) — same contract as
+  // ConversationsPanel: fired instead of selectConversation when the row
+  // is fleet-only. When omitted, fleet-only rows fall through to
+  // selectConversation (which silent-no-ops at the store level).
+  onDetachedRowClick?: (row: ConversationRowShape) => void;
+  // RDP-host-row click (Plan 07-02, TG-15) — same contract as
+  // ConversationsPanel. When omitted, RDP rows fall through to
+  // selectConversation (silent-no-op at the store level).
+  onRdpRowClick?: (row: ConversationRowShape) => void;
+  // Phase 90 Plan 07 Task 3 — relay-room-row click. Fired when the user
+  // clicks a row whose FleetSession carries `kind === "relay-room"` (Phase
+  // 89 sidebar merge; Plan 01 widened FleetSession + Plan 07 propagated the
+  // fields onto the ConversationRow shape). AppShell owns the tab-spawn
+  // side effect: constructs a Tab with sessionKind + relayRoomId +
+  // relayRoomTitle set so tabUtils's dispatcher routes the tab to the
+  // shared chat surface (PrettyView with source.kind === "relay" per
+  // Phase 93 Slice 4). Priority in handleRowSelect: AFTER
+  // rdpHostRow + fleetOnly branches (which gate on their own row-shape
+  // markers), BEFORE the default selectConversation path. When omitted,
+  // relay-room rows fall through to selectConversation (matches
+  // rdpHostRow/fleetOnly semantics — silent-no-op at the store level).
+  onRelayRoomRowClick?: (row: ConversationRowShape) => void;
+  // quick-260727-gm3: fired when user clicks the red-tinted X on an
+  // active-set row. AppShell wires this to closeTab(row.id) so
+  // the deactivate action reuses the existing tab-close plumbing verbatim
+  // (including the confirm-tab-close toast branch). Required — the panel
+  // composes removeFromActiveSet(row.id) + onDeactivateRow(row) at the
+  // handleRowDeactivate call site; making the prop required forces every
+  // caller (production AppShell + tests) to explicitly wire the tab-close
+  // side. Test files that don't care pass `onDeactivateRow={() => {}}`.
+  onDeactivateRow: (row: ConversationRowShape) => void;
+  /**
+   * quick-260810-n3a: Fired when user confirms the Kill dialog.
+   * AppShell wires this to POST /host/:hostId/session/kill + closeTab(row.id).
+   * Optional so tests can render the panel without wiring it.
+   */
+  onKillRow?: (row: ConversationRowShape) => void | Promise<void>;
+  // Patch #142 (Fix 5): when the desktop sidebar is open, the fixed
+  // top-left chevron overlaps the "Conversations" title. This prop adds
+  // padding-left clearance via data-sidebar-toggle-overlaps attribute +
+  // CSS rule. Mobile unaffected (mobile hides the desktop title already).
+  sidebarToggleOverlaps?: boolean;
+  // Patch #513: tabIds currently rendered as leaves in the AppShell
+  // splitTree. Drives two things: (1) row "selected" glow visibility so
+  // every session on-screen in the split view shows the selected-ring
+  // treatment, not just the single selectedId (before Phase 56 only ONE
+  // session could be visible at a time so selectedId alone sufficed);
+  // (2) idle-sweep exemption — sessions in the tree are held in view by
+  // the user, must not be silently deactivated by the 5-min sweep.
+  // Optional so tests + non-AppShell renders default to the pre-Phase-56
+  // single-visible behavior via an empty set.
+  visibleInSplitTreeTabIds?: ReadonlySet<string>;
+  // Sourced from /users/me.is_admin (AppShell state); default false so tests
+  // and any non-AppShell caller render as non-admin (admin-only affordances hidden).
+  isAdmin?: boolean;
+  // Sidebar-footer "you" anchor — current user's username, sourced from
+  // /users/me.username (AppShell state). Feeds both the display name and
+  // the initials-circle glyph. Null/undefined/empty → footer renders
+  // without the anchor slot; footer action affordances still render.
+  username?: string | null;
+  /**
+   * Phase 120 D-06 — Fired when the user left-clicks an AppTile in the Apps
+   * section. AppShell wires this to
+   * `openTab(null, "app", ..., { app: { hostId, slug }, label: title })`,
+   * creating a new app-type pane leaf. Optional so tests + non-integrated
+   * mount sites can render the panel without wiring the callback (Phase 119
+   * shipped AppTile.tsx with a deliberate no-op click; Plan 07 activates it
+   * end-to-end through this prop hole).
+   */
+  onOpenApp?: (hostId: number, slug: string, title: string) => void;
+  /**
+   * Fired when the user confirms Archive on an AppTile (both dialogs
+   * accepted). AppShell wires this to close any open tabs / split-tree
+   * leaves whose Tab.app matches (hostId, slug) so the pane vanishes
+   * together with the tile, rather than lingering as a dead-app iframe
+   * until the tab bar catches up. Optional; the AppTile still fires the
+   * store optimistic-remove + backend archive on its own — this callback
+   * is strictly the tab-close side effect.
+   */
+  onArchiveApp?: (hostId: number, slug: string, title: string) => void;
+  /**
+   * Fired when the user clicks the full-width "Send feedback" CTA docked
+   * just above the sidebar footer. AppShell lifts its existing
+   * feedbackOpen state atom to "general", opening the shared FeedbackModal
+   * mounted at AppShell. Optional so tests can render the panel without
+   * wiring feedback (the button will still render if feedbackEnabled is
+   * true — clicking it with no callback is a silent no-op via optional
+   * chaining).
+   */
+  onOpenFeedback?: () => void;
+  /**
+   * Phase 122 Plan 03 Task 3 — Fired when the user clicks an ACTIVE
+   * (isArchived === false) result in the ConversationSearchModal. AppShell
+   * resolves the hostId to a Host and calls openTab(host, "terminal",
+   * undefined, { targetTmuxSession: result.tmuxSessionName, ... }) —
+   * verbatim mirror of the onDetachedRowClick handler at AppShell.tsx:3068.
+   * The modal itself calls onOpenChange(false) after invoking this callback
+   * (D-04 jump-and-close). Optional so tests + non-AppShell mounts can
+   * render the panel without wiring the callback (the modal button will
+   * still open the modal, but clicking a result becomes a silent no-op —
+   * fine for unit tests).
+   */
+  onSearchResultOpenActive?: (result: ConversationSearchResult) => void;
+  /**
+   * Phase 137 D-30: current user's server userId from /users/me.userId.
+   * Threaded through AppShell → PrettyConversationsPanel → PreferencesModal
+   * → PreferencesAccountPane for the avatar PUT/DELETE endpoints.
+   */
+  userId?: string;
+  /**
+   * Phase 137 D-30: current user's avatar filename from /users/me.avatarPath.
+   * Drives the sidebar footer conditional: truthy → <img>; falsy → initials <span>.
+   * Live-synced after upload via onAvatarChanged callback.
+   */
+  avatarPath?: string | null;
+  /**
+   * Phase 137 D-30: callback to update meAvatarPath in AppShell.
+   * Called with the new avatarPath after a successful upload, or with null
+   * after a successful remove. Drives the sidebar footer re-render without
+   * a page refresh.
+   */
+  onAvatarChanged?: (path: string | null) => void;
+  /**
+   * Phase 137 D-14: current user preferences from AppShell.
+   * Threaded into PreferencesModal → PreferencesVoicePane as initial value.
+   */
+  userPrefs?: import("@/api/open-tabs-api").UserPreferences;
+  /**
+   * Phase 137 D-16 wire-through (H2 fix): Voice pane's autosave delta
+   * bubbles up to AppShell.setUserPrefs so PrettyView's speak-flow
+   * resolution picks up the new fallbackVoice without a page refresh.
+   */
+  onUserPrefsChanged?: (prefs: Partial<import("@/api/open-tabs-api").UserPreferences>) => void;
+}) {
+  const visibleInSplitTree = visibleInSplitTreeTabIds ?? EMPTY_VISIBLE_SET;
+  const { t } = useTranslation();
+  // Phase 70 Plan 04: header lockup below (small icon + wordmark) reads
+  // from the branding store instead of importing an inline-SVG logo /
+  // hardcoding the wordmark asset path.
+  const brandingConfig = useBrandingConfig();
+  // Leaf-level subscription to the feedback-enabled useSyncExternalStore
+  // singleton. Gates the full-width "Send feedback" CTA docked above the
+  // sidebar footer. Starts as false (default-disabled sentinel) and
+  // resolves after feedback-fetch answers — small load-time pop-in
+  // is accepted.
+  const feedbackEnabled = useFeedbackEnabled();
+  // Phase 41 Plan 01: destructure the three-zone shape — `middle` (flat
+  // recency-sorted rows) + `rdpGroup` (nullable RDP sentinel group) replace
+  // the retired `grouped: HostGroup[]` field.
+  // Phase 117 Plan 117-08 (D-09, D-39): the store's derived selector now also
+  // emits pinnedUnassigned + projectSections + rdp alongside the pre-Phase-117
+  // pinned + middle + rdpGroup fields (117-07 additive extension). This plan
+  // consumes the NEW fields for the projects-aware render pass and keeps
+  // `pinned` (unchanged upstream — same array reference contract) for
+  // continuity with existing display filters (bounty toggle, etc). The
+  // pinned tier switches from `pinned` → `pinnedUnassigned` in the render
+  // block below so pinned-in-project rows float to their project section
+  // (D-19) instead of the top pinned zone.
+  const {
+    activeSet: activeSetRows,
+    pinned,
+    middle,
+    rdpGroup,
+    pinnedUnassigned,
+    projectSections,
+  } = useConversations();
+  // Marks through collapsed headers: which project sections have an unread
+  // (or DM'd) conversation anywhere in their subtree (own rows or any
+  // sub-project, any depth), and whether any project has one at all (the
+  // collapsed Projects super-header). A DM mark outranks the unread dot.
+  const { unreadSectionKeys, anyProjectUnread, dmSectionKeys, anyProjectDm } = useMemo(() => {
+    const keyOfSec = (sec: ProjectSection) => projectKey(sec.hostId ?? "", sec.slug);
+    const parentOf = new Map<string, string | null>();
+    for (const sec of projectSections) parentOf.set(keyOfSec(sec), sec.parentKey ?? null);
+    const markedSections = (has: (r: ConversationRowShape) => boolean) => {
+      const keys = new Set<string>();
+      for (const sec of projectSections) {
+        if (!sec.rows.some(has)) continue;
+        // Mark this section and every ancestor (guarding against loops).
+        let k: string | null = keyOfSec(sec);
+        while (k !== null && !keys.has(k)) {
+          keys.add(k);
+          k = parentOf.get(k) ?? null;
+        }
+      }
+      return keys;
+    };
+    const unread = markedSections((r) => r.unread === true);
+    const dm = markedSections((r) => r.dm === true);
+    return {
+      unreadSectionKeys: unread,
+      anyProjectUnread: unread.size > 0,
+      dmSectionKeys: dm,
+      anyProjectDm: dm.size > 0,
+    };
+  }, [projectSections]);
+  // Subscribe to the projects list so the panel re-renders when the wire
+  // event flushes a new set through setProjects. useProjects() also feeds
+  // the derived selector's projectSections computation — subscribing here is
+  // required for the snapshot version to bump on project mutations. Phase
+  // 117 Plan 117-09 Task 2 additionally uses the returned list to look up
+  // a project's hostId when firing archiveProject.
+  const projectsList = useProjects();
+  // Per-project collapse state (D-40). Toggle is a callback threaded through
+  // PrettyProjectSectionHeader's `onToggleCollapse` prop.
+  const { collapsed: collapsedProjectSlugs, toggle: toggleProjectCollapse } =
+    useCollapsedProjectSlugs();
+  // Whole-zone collapse for the "Projects" super-header (persisted per browser).
+  const { collapsed: projectsSectionCollapsed, toggle: toggleProjectsSection } =
+    useProjectsSectionCollapsed();
+  // Viewing user's mxid — required for the relay-room drop branch
+  // (setRelayRoomProject signature: roomId, userMxid, slug). Null before the
+  // /users/me fetch resolves — drop guards below refuse to fire when null.
+  const viewingUserMxid = useViewingUserMxid();
+  const selectedId = useSelectedConversationId();
+  const pinnedIds = usePinnedIds();
+  // (Phase 115 Plan 115-02: prior useHiddenIds subscription retired per D-21.
+  //  115-06 introduces an archived-tree subscription driven off the sweep,
+  //  not off a hiddenIds set.)
+  // Quick 260727-tb1: identity map for the bounty-count poller's getTargets
+  // callback. Same hook the row uses to resolve identity — subscribing at
+  // the panel level lets the poller enumerate every visible row's identity
+  // without a second per-row identities-store subscription.
+  //
+  // quick-260912-0t4: destructure BOTH byHostKey and byKey — cosmetics
+  // consumers below try the hostId-scoped composite key first (fixes
+  // cross-host name collisions) and fall back to bare-name byKey when the
+  // composite misses. The fallback preserves compat with test fixtures that
+  // seed only byKey and with any transitional wire state where the row has
+  // no hostId yet. See identities-store.ts byHostKey JSDoc for the
+  // additive-vs-rename rationale.
+  const { byHostKey: identitiesByHostKey, byKey: identitiesByKey } = useIdentities();
+  // Patch #137: hoisted once so all row-level activeSet.has(row.id) reads
+  // hit a stable ReadonlySet reference (Set identity flips only on real
+  // additions; consumers get a memoized reference across no-ops).
+  const activeSet = useActiveSet();
+  // quick-260727-kbw: fleet-loaded gate for the mount hydration effect
+  // below (see §(d) in the block comment above the effect). Subscribes
+  // via useSyncExternalStore; a false→true flip in the store bumps
+  // snapshotVersion → this hook returns true on the next render → the
+  // mount effect's [fleetSessionsLoaded] dep triggers the body to run.
+  const fleetSessionsLoaded = useFleetSessionsLoaded();
+
+  // Patch #144 Fix (d): every selectedId change enrolls the id in the
+  // active set — not just click-driven selection via handleRowSelect.
+  // URL-fragment restore, keyboard nav, and any other programmatic path
+  // that mutates selectedId now lights the row up with the full pretty-
+  // view bubble treatment instead of the ambient flat treatment. user's
+  // 2026-07-24 diag showed 32/32 rendered rows as ambient because
+  // fragment-restore never touched the click path. addToActiveSet is
+  // idempotent (early-return when id present), so double-fires from
+  // click-that-also-changes-selectedId are harmless no-ops.
+  useEffect(() => {
+    if (selectedId) addToActiveSet(selectedId);
+  }, [selectedId]);
+
+  // Phase 15 (Wave 3): mount-fetch for server-authoritative pinnedIds.
+  //   (a) First-render UX is "empty pinned tier hydrates on fetch-complete"
+  //       per 15-CONTEXT.md § "No sessionStorage/localStorage fallback layer"
+  //       — the panel renders immediately with an empty pinned tier and the
+  //       fetch resolves in a microtask. Sibling of the L182-184 addToActiveSet
+  //       effect (patch #144 Fix d), NOT a modification of it.
+  //   (b) Silent try/catch on failure — state.pinnedIds stays as-is (empty on
+  //       first mount, whatever's in memory on subsequent mounts). The natural
+  //       retry cadence is the next pin/unpin click (which fires a PUT with
+  //       the current in-memory set) OR the next remount (which fires a fresh
+  //       GET). Matches 15-CONTEXT.md § Deferred: "No offline queue / durable
+  //       client-side retry beyond next-sync".
+  //   (c) Cancel-token guards against post-unmount hydrate for React 18
+  //       StrictMode double-mount in dev + real navigate-away in production —
+  //       a stale resolve from an unmounted effect early-returns before
+  //       touching store state (T-15-13 + T-15-14 mitigations).
+  //   (d) quick-260727-kbw fleet-loaded gate — the fetch-then-hydrate IIFE is
+  //       deferred until useFleetSessionsLoaded() returns true so that the
+  //       first background updateOpenTabs after hydration has a populated
+  //       fleetPinKeepSet (from state.fleetSessions) and does NOT nuke
+  //       freshly-hydrated fleet pins via the pruner at conversation-store.ts
+  //       L540-547. Depends on [fleetSessionsLoaded, identitiesByKey] so the
+  //       body reruns when the fleet loads AND every time identities grows —
+  //       idempotent per the sink-side additive-on-empty guards in
+  //       hydratePinnedIdsFromServer.
+  //       (Phase 115 Plan 115-02: prior sibling hydrateHiddenIdsFromServer
+  //        gate retired per D-21 alongside the deriveDiskHiddenIds call.)
+  useEffect(() => {
+    if (!fleetSessionsLoaded) return;
+    // 2026-09-17: gate loosened from `identitiesLoaded` (the slow /identities
+    // fetch flip) to `identitiesByKey.size > 0` (any identity data present).
+    // The pulse populates identities-store with pinned/hidden well before
+    // /identities returns; waiting on identitiesLoaded added ~7-8s of
+    // pin/hide-out-of-place time after the row-set already dressed. The
+    // quick-260912-5q2 protection (empty derivation MUST NOT wipe pinnedIds)
+    // is enforced at THIS callsite via the `if (pinnedIds.length > 0)` skip
+    // in the async IIFE below — a partial store may derive [], and skipping
+    // preserves whatever's already in state.pinnedIds until identities is
+    // complete. Legitimate "user unpinned via disk" wipes still land via
+    // identities-store's reprojectDiskPinHideIntoRows path, which is gated on
+    // state.loaded (authoritative) and is trusted to project [] as real.
+    if (identitiesByKey.size === 0) return;
+    // hydratedRef retired 2026-09-17. The effect is idempotent — the empty-
+    // projection skip in the IIFE below plus the sink's same-content guard
+    // together ensure re-firing as identities grow does no wrong work.
+    // Keeping the ref would re-introduce the "one shot, wrong moment"
+    // failure mode this change exists to remove.
+    let cancelled = false;
+    (async () => {
+      // Phase 92 Plan 04 (D-04): pinnedConversationIds no longer fetches from
+      // GET /user-preferences. Instead the panel projects the identities-store's
+      // per-identity `pinned: boolean` field (populated by the backend fanout
+      // per Plan 92-02) into the row id space via deriveDiskPinnedIds.
+      //
+      // H2 identityHosts lock: buildIdentityHostsFromFleet is the SINGLE
+      // fleetSessions → identityHosts helper in the codebase (identities-
+      // store.ts:74-85). It uses sessionMatchKey to derive keys — correctly
+      // handles relay-room sessions (skipped: sessionMatchKey(undefined) →
+      // null → identities-store L80 continues past). Do NOT replace this
+      // with a local iterator that calls .toLowerCase() on sessionName —
+      // that pattern is forbidden per H2 and would crash on the relay-room
+      // undefined-sessionName case (see conversation-store.ts L710-731).
+      const identityHosts = buildIdentityHostsFromFleet(
+        getFleetSessionsSnapshot(),
+      );
+      const pinnedIds = deriveDiskPinnedIds(identityHosts);
+      if (cancelled) return;
+      // Empty-projection skip (2026-09-17, replaces the retired
+      // identitiesLoaded gate): this effect fires eagerly as identities grow
+      // — an empty projection from a partial store is indistinguishable from
+      // a real "nothing pinned" answer, and the sink hydrate function is
+      // authoritative (would wipe on empty). Skip empty here; a subsequent
+      // fire once identities are complete will project the real set.
+      // Legitimate "user unpinned via disk" transitions still land via
+      // identities-store's reprojectDiskPinHideIntoRows, which is gated on
+      // state.loaded (authoritative) and does trust empty projections.
+      if (pinnedIds.length > 0) {
+        hydratePinnedIdsFromServer(pinnedIds);
+      }
+
+      // (Phase 115 Plan 115-02: sibling `.hidden` hydrate block retired per
+      //  D-21 — the deriveDiskHiddenIds projection + hydrateHiddenIdsFromServer
+      //  call are gone alongside the backend `.hidden` fanout removal.)
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [fleetSessionsLoaded, identitiesByKey]);
+
+  // Phase 42 UAT amendment 2026-08-17: `activeSetRowsRef` retired alongside
+  // the Tier 1 active-set render tier — the store's snapshot.activeSet is now
+  // always an empty array, so the ref-and-iterate in the (now-retired) bounty-
+  // count poller getTargets closure was a trivially-empty no-op.
+  //
+  // Phase 104 Plan 03: bounty-count poller mount retired alongside the wire.
+  // The trapped-work poller below is now the sole per-identity polling loop.
+
+  // Agents ("hostId::identityKey") whose swipe-archive Undo bar is up.
+  const [swipePending, setSwipePending] = useState<ReadonlySet<string>>(() => new Set());
+  const swipePendingRef = useRef<ReadonlySet<string>>(swipePending);
+  const pinnedRowsRef = useRef(pinned);
+  // Phase 41 Plan 01: refs for the new three-zone shape. `middleRef` replaces
+  // `groupedRef`; `rdpGroupRef` is new. Both stay bumped on every render.
+  const middleRef = useRef(middle);
+  const rdpGroupRef = useRef(rdpGroup);
+  // quick-260912-0t4: ref mirrors of BOTH maps — poller uses byHostKey with
+  // byKey fallback to survive test fixtures that only seed the bare-name map.
+  const identitiesByHostKeyRef = useRef(identitiesByHostKey);
+  // Read by handleSetPinned, which is defined before these values exist.
+  const rowIdToProjectSlugRef = useRef<ReadonlyMap<string, string>>(new Map());
+  const handleRowMoveToProjectRef = useRef<
+    ((row: ConversationRowShape, slug: string | null) => void) | null
+  >(null);
+  const identitiesByKeyRef = useRef(identitiesByKey);
+  pinnedRowsRef.current = pinned;
+  middleRef.current = middle;
+  rdpGroupRef.current = rdpGroup;
+  identitiesByHostKeyRef.current = identitiesByHostKey;
+  identitiesByKeyRef.current = identitiesByKey;
+
+  // Phase 104 Plan 02: trapped-work poller mount (D-08 cadence: 60_000 ms +
+  // window.focus refresh). getTargets walks pinned + middle + rdpGroup,
+  // resolves identities via the identitiesByHostKeyRef, dedupes by composite
+  // key. Per Pitfall #5 in RESEARCH.md, this MUST cover dormant identities
+  // (the whole rescue-oriented signal breaks if we gate on activeSet).
+  //
+  // quick-260912-0t4: identity resolution now uses the hostId-scoped
+  // byHostKey map (`${hostIdNum}::${matchKey}`) so two identities sharing a
+  // name across different hosts resolve to their per-host row rather than
+  // collapsing on the bare-name byKey lookup.
+  useEffect(() => {
+    const getTargets = () => {
+      const idsSeen = new Set<string>();
+      const targets: Array<{ identityKey: string; hostId: number | null }> = [];
+      const collect = (row: ConversationRowShape) => {
+        const matchKey = sessionMatchKey(row.targetTmuxSession);
+        if (!matchKey) return;
+        // Phase 104 code-review finding #3: match the WS handler's coercion.
+        // Server side (claude-session-server.ts:1211-1216) treats hostIdRaw > 0
+        // as remote, everything else as local (null). If we let 0 or negative
+        // slip through here as-is, our composite-key uses `${...}:0` but the
+        // response echoes hostId=null → row lookup misses. hostIds come from
+        // SQLite auto-increment starting at 1, so 0 is effectively "not a
+        // valid hostId" and should route local. Client + server now agree.
+        // Hoisted above the identity lookup for quick-260912-0t4 — the same
+        // hostIdNum drives both the byHostKey composite and the target hostId.
+        const hostIdNum = row.host ? parseInt(row.host.id, 10) : NaN;
+        const hostId =
+          Number.isFinite(hostIdNum) && hostIdNum > 0 ? hostIdNum : null;
+        // The backend no longer routes a hostless probe to the co-located
+        // box (it answers "hostId is required"), so don't send one.
+        if (hostId === null) return;
+        // quick-260912-0t4: try hostId-scoped composite first, fall back to
+        // bare-name byKey when the composite misses (test-fixture compat +
+        // pre-quick-260912-0t4 wire responses that omit hostId on the row).
+        let ident = Number.isFinite(hostIdNum)
+          ? identitiesByHostKeyRef.current?.get(`${hostIdNum}::${matchKey}`)
+          : undefined;
+        if (!ident) ident = identitiesByKeyRef.current?.get(matchKey);
+        if (!ident) return;
+        const composite = `${ident.identityKey}:${hostId ?? "local"}`;
+        if (idsSeen.has(composite)) return;
+        idsSeen.add(composite);
+        targets.push({ identityKey: ident.identityKey, hostId });
+      };
+      for (const row of pinnedRowsRef.current) collect(row);
+      for (const row of middleRef.current) collect(row);
+      if (rdpGroupRef.current !== null) {
+        for (const row of rdpGroupRef.current.rows) collect(row);
+      }
+      return targets;
+    };
+    const stop = startTrappedWorkPoller(getTargets, 60_000);
+    return stop;
+  }, []);
+
+  // Quick 260727-tb1 identity:bounty-priority-updated piggyback comment
+  // RETIRED in Phase 104 Plan 03 alongside the bounty-count wire deletion.
+
+  // Local state: NewSessionDialog open/closed toggle (opened by pencil).
+  const [newSessionDialogOpen, setNewSessionDialogOpen] = useState(false);
+  // The roles window: open + where it starts. `hop` marks the
+  // new-conversation dialog's "New role…" (back and create return there).
+  const [rolesWindow, setRolesWindow] = useState<{ open: boolean; start: RolesWindowStart; hop: boolean }>({
+    open: false,
+    start: { view: "library" },
+    hop: false,
+  });
+  // Phase 22 (SRIC-05): chain-into-create-identity pre-fill payload. Set when
+  // the roles window's new-role hop creates a role ({role, host}); consumed by
+  // the NewSessionDialog mount as its initialHost + initialRole props. Cleared
+  // when NewSessionDialog closes (either via successful submit or user cancel)
+  // so subsequent manual opens via the pencil don't inherit stale chain state
+  // (regression gate — Test 13).
+  const [chainPrefill, setChainPrefill] = useState<{
+    role?: string;
+    roles?: string[];
+    name?: string | null;
+    host: Host | null;
+    description?: string;
+  } | null>(null);
+  // "New role…" hop from the new-agent dialog's Roles dropdown: the dialog is
+  // swapped for the roles window's new-role form, and this remembers what to
+  // restore when the user comes back (role created → picks + new role;
+  // backed out → picks as they were).
+  // The pending project slug/hostId state is deliberately left untouched
+  // across the hop so a per-project new-agent flow keeps its project.
+  // `host` is null when the hop starts before any role is picked (the
+  // new-agent dialog has no host step; the host follows the roles).
+  const newRoleHopRef = useRef<{ host: Host | null; roles: string[]; name: string | null } | null>(null);
+  const [createRoleInitialHost, setCreateRoleInitialHost] = useState<Host | null>(null);
+
+  // Scroll region ref for save/restore across unmount — see savedListScrollTop
+  // at module scope for why. Attached to the .pv-panel-scroll div below.
+  const scrollRegionRef = useRef<HTMLDivElement | null>(null);
+  useLayoutEffect(() => {
+    const el = scrollRegionRef.current;
+    if (!el) return;
+    el.scrollTop = savedListScrollTop;
+    const onScroll = () => {
+      savedListScrollTop = el.scrollTop;
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      savedListScrollTop = el.scrollTop;
+      el.removeEventListener("scroll", onScroll);
+    };
+  }, []);
+  // Phase 122 Plan 03 Task 3 — ConversationSearchModal open/closed toggle.
+  // shape-sidebar-search-inline: no longer opened via a magnifier icon in the
+  // header cluster (that button is retired); the everywhere-link inside the
+  // sidebar-search input row now opens this modal, pre-populated with the
+  // current sidebar-search query. Query + accumulated results live in the
+  // module-scoped search-store, NOT in this useState — this flag is only
+  // whether the modal is currently mounted-open (D-05 persistence uses the
+  // store, this useState is the visibility gate).
+  const [searchModalOpen, setSearchModalOpen] = useState(false);
+  // shape-sidebar-search-inline: query for the dedicated sidebar-search input
+  // row (below the header icon-button row, above the scroll region). Ephemeral
+  // — resets to "" on every mount (no localStorage persistence per the shape's
+  // "reset every time" invariant). Empty string = no filter (all rows visible).
+  const [sidebarSearchQuery, setSidebarSearchQuery] = useState("");
+  // shape-sidebar-search-inline: imperative handle to the sidebar-search input
+  // so Escape (task 6) can programmatically blur, and the all-empty fallback's
+  // "search everywhere" CTA can pre-populate the modal from the current query.
+  const sidebarSearchInputRef = useRef<HTMLInputElement | null>(null);
+  // shape-sidebar-search-inline: escalation helper. Fires the search on the
+  // store AND opens the ConversationSearchModal, so the modal renders already
+  // showing "Searching..." then results — no second Enter needed. Wired from
+  // (a) the everywhere-link inside the search input, (b) Enter-key-in-input,
+  // (c) the all-empty fallback CTA. Empty query = open modal only (nothing to
+  // fetch). Fetch/store logic mirrors ConversationSearchModal.handleEnter so
+  // the modal's UI transitions (isFetching/results/error) flow naturally off
+  // the store the same way as an in-modal Enter.
+  const openSearchEverywhere = useCallback(() => {
+    const q = sidebarSearchQuery.trim();
+    setSearchModalOpen(true);
+    // Escalation hands the query to the modal; clear the sidebar search so
+    // the sidebar isn't left filtered once the modal takes over.
+    setSidebarSearchQuery("");
+    if (q.length === 0) return;
+    const reqId = startNewSearch(q);
+    void (async () => {
+      try {
+        const response = await searchConversations(q, 0, 20);
+        appendResults(response.results, response.hasMore, reqId);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "unknown_error";
+        setSearchStoreError(msg, reqId);
+      }
+    })();
+  }, [sidebarSearchQuery]);
+  // Phase 44 SKILLED-01: SkillsEditorModal open/closed toggle (opened from menu item, sibling of GlobalFilesModal).
+  const [skillsEditorModalOpen, setSkillsEditorModalOpen] = useState(false);
+  // Phase 137 D-08: PreferencesModal open/closed toggle (opened from the
+  // sidebar footer gear button — was previously an inert <span> placeholder).
+  const [preferencesModalOpen, setPreferencesModalOpen] = useState(false);
+  // AdminModal open/closed toggle (sidebar footer shield button, admins only).
+  const [adminModalOpen, setAdminModalOpen] = useState(false);
+  // Phase 117 M-F follow-up (2026-09-18): the per-project SquarePen new-conv
+  // button opens the NEW-AGENT dialog with a pending project slug that gets
+  // applied to the freshly-minted identity via setSessionProject after
+  // onCreate resolves.
+  const [newSessionPendingProjectSlug, setNewSessionPendingProjectSlug] =
+    useState<string | null>(null);
+  // Phase 117 M-I follow-up (2026-09-19): also stash the project's hostId
+  // so the NewSessionDialog mount can pass a filtered single-host hostTree
+  // — the picker auto-hides in project context because the destination
+  // host is implied (projects live on a specific host; agents-in-project
+  // must be born on the same host to appear under the section).
+  const [newSessionPendingProjectHostId, setNewSessionPendingProjectHostId] =
+    useState<number | null>(null);
+  // Phase 117 M-I follow-up: when the new-agent dialog is opened via the
+  // per-project SquarePen, it gets a synthetic single-host tree so its
+  // auto-hide-when-single-host logic kicks in — the destination host is
+  // implied (project lives on one host; agent must be born there to appear
+  // under the section). Header pencil (pendingProjectHostId===null) gets the
+  // full tree. Memoized: the dialog's open effect keys on this tree, so a
+  // fresh object every render re-fires it.
+  // "Start a conversation" from a role (the roles window, wherever it was
+  // opened): the new-conversation dialog opens with that role picked.
+  useEffect(() => {
+    const answer = (req: NewConversationRequest): void => {
+      const { hostId: reqHostId, role } = req;
+      const host = hostTree
+        ? (collectHostsFromFolder(hostTree).find((h) => parseInt(h.id, 10) === reqHostId) ?? null)
+        : null;
+      console.log(`[new-conversation-request] role=${role} hostId=${reqHostId} hostFound=${host !== null}`);
+      setNewSessionPendingProjectSlug(null);
+      setNewSessionPendingProjectHostId(null);
+      setChainPrefill({ host, role, roles: [role] });
+      setNewSessionDialogOpen(true);
+    };
+    const onRequest = (): void => {
+      // Hold it until the machines are known, so the dialog opens on the
+      // asked-for machine (this re-runs when the tree arrives).
+      if (!hostTree) return;
+      const req = takeNewConversationRequest();
+      if (req) answer(req);
+    };
+    onRequest(); // asked while this list wasn't mounted
+    window.addEventListener(NEW_CONVERSATION_REQUEST_EVENT, onRequest);
+    return () => window.removeEventListener(NEW_CONVERSATION_REQUEST_EVENT, onRequest);
+  }, [hostTree]);
+  const newSessionHostTree = useMemo(() => {
+    const fullTree = hostTree ?? null;
+    if (newSessionPendingProjectHostId === null || !fullTree) return fullTree;
+    const projectHost = collectHostsFromFolder(fullTree).find(
+      (h) => parseInt(h.id, 10) === newSessionPendingProjectHostId,
+    );
+    if (!projectHost) return fullTree; // fall back to full tree if not found
+    return { name: fullTree.name, children: [projectHost] };
+  }, [hostTree, newSessionPendingProjectHostId]);
+  // Phase 143 D-09: ArchivedAppsModal open/closed toggle. Opened by the
+  // archived-box icon-button on the Apps section header (see header edit below).
+  const [archivedAppsModalOpen, setArchivedAppsModalOpen] = useState(false);
+  // Apps section header kebab items — shared by the ⋮ trigger and right-click
+  // on the header row (useRowKebabContextMenu).
+  const appsHeaderKebabItems = useMemo<RowKebabMenuItem[]>(
+    () => [
+      {
+        label: "Archived apps",
+        onClick: () => setArchivedAppsModalOpen(true),
+        testId: "pretty-conversations-archived-apps-item",
+      },
+    ],
+    [],
+  );
+  const appsHeaderContextMenu = useRowKebabContextMenu(appsHeaderKebabItems);
+  // Phase 129 (shape 3, wake-ups-redesign) Plan 129-01 Task 4 — controlled
+  // open state for the new ScheduledAgentsModal. Opened via the Clock button
+  // in .pv-header-actions below (inserted after the Edit-global-files
+  // Globe, before the kebab). No preserved query
+  // state — modal refetches every open (D-03) and resets filter state on
+  // close (D-17). Sibling of ConversationSearchModal's controlled state.
+  const [scheduledAgentsModalOpen, setScheduledAgentsModalOpen] = useState(false);
+  // Filter the window opens with — set by a role's "N scheduled tasks"
+  // shortcut (via OPEN_SCHEDULED_TASKS_EVENT); the footer clock opens it bare.
+  const [scheduledAgentsFilter, setScheduledAgentsFilter] =
+    useState<ScheduledTasksFilter | null>(null);
+  useEffect(() => {
+    const handle = (e: Event) => {
+      const filter = (e as CustomEvent<ScheduledTasksFilter | null>).detail ?? null;
+      setScheduledAgentsFilter(filter);
+      setScheduledAgentsModalOpen(true);
+    };
+    window.addEventListener(OPEN_SCHEDULED_TASKS_EVENT, handle);
+    return () => window.removeEventListener(OPEN_SCHEDULED_TASKS_EVENT, handle);
+  }, []);
+
+  // Phase 119 Plan 04 (D-03): Apps section collapsed by default on every
+  // mount. Content is lazy-rendered via `{appsExpanded && ...}` in the JSX
+  // block (D-03 invariant: NO CSS `hidden` class, NO aria-only approach —
+  // content is not in the DOM at all until the user expands).
+  //
+  // Phase 119 Plan 04 (D-14 pass-through): `useAppTiles()` subscribes to the
+  // module-scoped app-tiles-store (Plan 119-02). Every frame notify from the
+  // fleet-status client (Plan 119-01 switch → Plan 119-02 publish fn) re-runs
+  // the memoised selector and yields a stable-sorted (D-15) array. Panel
+  // performs zero re-filtering / re-sorting — backend `app-frame-filter.ts`
+  // is the sole authority for host visibility per D-14 + Phase 118 D-15.
+  const [appsExpanded, setAppsExpanded] = useState(false);
+  // convo-scoped apps: conversation apps (owner set) never appear in the
+  // sidebar grid — they're reached through chips and the identity modal's
+  // Apps tab. The store holds them too, for those surfaces.
+  const allAppTiles = useAppTiles();
+  // project-scoped apps: project apps sit under their project instead.
+  const appTiles = useMemo(() => allAppTiles.filter((a) => !a.owner && !a.project), [allAppTiles]);
+  // project-scoped apps: each project's own apps, keyed like project sections
+  // (`hostId::slug`), in the store's sort order.
+  const projectAppsByKey = useMemo(() => {
+    const out = new Map<string, AppState[]>();
+    for (const a of allAppTiles) {
+      if (a.owner || !a.project) continue;
+      const key = `${a.hostId}::${a.project}`;
+      const list = out.get(key) ?? [];
+      list.push(a);
+      out.set(key, list);
+    }
+    return out;
+  }, [allAppTiles]);
+
+  // shape-sidebar-search-inline: sidebar search lives in a dedicated input
+  // row directly below the header icon-button row (added in task 2). It
+  // filters visible rows against the union of every candidate string that
+  // could render on either of a row's two lines. ConversationSearchModal
+  // remains as the "search everywhere" escalation target, opened from the
+  // everywhere-link that materializes on-input in that search row.
+
+  // Phase 26 D-02 / Phase 104 Plan 03 D-11: the pinned + needs-desk bounty-
+  // count filter toggles are RETIRED alongside the bounty-count wire. The
+  // Ready filter (Phase 52) survives as dead code — its UI entry point (the
+  // Filter popover) was removed in quick-260914-liu. The state and predicate
+  // machinery is retained intentionally (the operator's explicit decision: not worth
+  // the render-path refactor risk to clean up). The filter flag is permanently
+  // false, so displayedPinned / displayedMiddle pass rows through unfiltered.
+  const [readyOnly, setReadyOnly] = useState(false);
+  const anyFilterOn = readyOnly;
+
+  // Phase 52 Plan 03 — per-row (isWorking, isDormant) map for the Ready predicate.
+  // Built via useSyncExternalStore over the working-store snapshot so the panel
+  // re-renders when the store notifies — preserves reactivity without calling
+  // hooks inside the pure matchesFilterForRow function (Rules-of-Hooks compliance).
+  // Keyed by sessionMatchKey (same shape as useSessionIsWorking + useSessionIsDormant).
+  // Only pinned + middle rows are included; RDP rows pass through unfiltered and
+  // are absent from the map (matchesFilterForRow's early-return-false on null
+  // matchKey handles RDP correctly). Rows absent from the working-store snapshot
+  // are omitted — matchesFilterForRow's fail-CLOSED default handles them.
+  //
+  // Referential stability: useSyncExternalStore requires getSnapshot to return the
+  // SAME object reference when the underlying data has not changed (React's tearing
+  // check calls getSnapshot twice per commit and forces a re-render if it sees
+  // different references). We use a ref-based cache with a `dirty` flag. The dirty
+  // flag is set in the subscribe callback (i.e., when the store notifies) and cleared
+  // after each rebuild. Additionally, if the pinned/middle input arrays changed (new
+  // render with different conversation data), we also rebuild. This guarantees that
+  // React's two consecutive tearing-check calls to getSnapshot both return the same
+  // cached Map reference, preventing the infinite re-render loop.
+  const rowSessionStatesCacheRef = useRef<{
+    dirty: boolean;
+    pinnedRowsRef: typeof pinned;
+    middleRef: typeof middle;
+    result: Map<string, { isWorking: boolean; isDormant: boolean }>;
+  }>({ dirty: true, pinnedRowsRef: pinned, middleRef: middle, result: new Map() });
+
+  // Stable subscribe wrapper that marks the cache dirty on store notify, then
+  // calls the useSyncExternalStore listener so React schedules a re-render.
+  const subscribeRowSessionStates = useCallback(
+    (onStoreChange: () => void) => {
+      return subscribeSessionWorkingStore(() => {
+        rowSessionStatesCacheRef.current.dirty = true;
+        onStoreChange();
+      });
+    },
+    [], // stable — subscribeSessionWorkingStore is a module-level export
+  );
+
+  const rowSessionStates = useSyncExternalStore(
+    subscribeRowSessionStates,
+    () => {
+      const cache = rowSessionStatesCacheRef.current;
+      // Return cached result when the store has not notified AND input arrays unchanged.
+      if (!cache.dirty && cache.pinnedRowsRef === pinned && cache.middleRef === middle) {
+        return cache.result;
+      }
+      const snapshot = getSessionWorkingSnapshot();
+      const out = new Map<string, { isWorking: boolean; isDormant: boolean }>();
+      for (const row of [...pinned, ...middle]) {
+        const matchKey = sessionMatchKey(row.targetTmuxSession);
+        if (!matchKey) continue;
+        const record = snapshot.get(matchKey);
+        if (record === undefined) continue; // absent from working-store — fail-CLOSED default in matchesFilterForRow
+        out.set(matchKey, {
+          isWorking: record.isWorking === true,
+          isDormant: record.dormant === true,
+        });
+      }
+      // The working store notifies for every session in the fleet; most of
+      // those publishes don't change any visible row's (isWorking,
+      // isDormant). Keep the previous Map when the entries are identical so
+      // useSyncExternalStore sees the same reference and the panel does not
+      // re-render for them.
+      const prevResult = cache.result;
+      let same = prevResult.size === out.size;
+      if (same) {
+        for (const [k, v] of out) {
+          const p = prevResult.get(k);
+          if (p === undefined || p.isWorking !== v.isWorking || p.isDormant !== v.isDormant) {
+            same = false;
+            break;
+          }
+        }
+      }
+      const result = same ? prevResult : out;
+      rowSessionStatesCacheRef.current = { dirty: false, pinnedRowsRef: pinned, middleRef: middle, result };
+      return result;
+    },
+    () => new Map<string, { isWorking: boolean; isDormant: boolean }>(),
+  );
+
+  // Phase 26 D-02 / Phase 52 Plan 03 / Phase 104 Plan 03 D-11:
+  // Ready-predicate-only filter helper. "Is this row Ready?"
+  //   matchesFilterForRow(row) = !readyOnly || (rowState defined && !isWorking && !isDormant)
+  // Rows with no resolvable identity → false (filtered out when the toggle is
+  // on). Wrapped in useMemo so the helper identity is stable across renders
+  // that don't change identitiesByHostKey, readyOnly, or rowSessionStates.
+  //
+  // Phase 104 Plan 03: the pinned + needs-desk filter branches (and their
+  // store dependencies) were retired alongside their data source. Only the
+  // Ready predicate remains.
+  //
+  // quick-260912-0t4: identity resolution uses the hostId-scoped byHostKey
+  // composite key so cross-host name collisions don't collapse on lookup.
+  const matchesFilterForRow = useMemo(() => {
+    return (row: ConversationRowShape): boolean => {
+      const matchKey = sessionMatchKey(row.targetTmuxSession);
+      if (!matchKey) return false;
+      const hostIdNum = row.host ? parseInt(row.host.id, 10) : NaN;
+      // quick-260912-0t4: byHostKey first, byKey fallback for compat.
+      let ident = Number.isFinite(hostIdNum)
+        ? identitiesByHostKey?.get(`${hostIdNum}::${matchKey}`)
+        : undefined;
+      if (!ident) ident = identitiesByKey?.get(matchKey);
+      if (!ident) return false;
+      // Phase 52 Plan 03 — Ready predicate: !isWorking && !isDormant per CONTEXT.md § decisions § Filter semantic.
+      // Row's session state is looked up from the pre-computed rowSessionStates map keyed by matchKey.
+      // FAIL-CLOSED default (plan-checker W-3 fix, 2026-08-20): a row absent from rowSessionStates
+      // (no working-store publish for this key) is treated as NOT ready. Plan 01's source B publishes
+      // dormant frames for identities that have no live PID, so an undefined rowState now genuinely
+      // represents "no wire signal at all" — which the Ready filter conservatively treats as
+      // "not confirmed ready" and hides.
+      const rowState = rowSessionStates.get(matchKey);
+      const readyOk = !readyOnly || (rowState !== undefined && !rowState.isWorking && !rowState.isDormant);
+      return readyOk;
+    };
+  }, [identitiesByHostKey, identitiesByKey, readyOnly, rowSessionStates]);
+
+  // Phase 26 D-02 (as amended by Phase 41 Plan 01, Phase 42 UAT amendment
+  // 2026-08-17): apply the AND-intersect filter to each render collection when
+  // EITHER toggle is on.
+  //   - `displayedPinned` = pinned tier, filtered when a toggle is on.
+  //   - `displayedMiddle` = FLAT middle zone, filtered when a toggle is on
+  //     (was: `displayedGrouped: HostGroup[]` with per-group empty-drop; now
+  //     just a flat ConversationRow[] filter). Phase 41 retired per-host
+  //     bucketing in the middle.
+  //   - `displayedRdpGroup` = the RDP sentinel group. RDP is NOT filtered by
+  //     the bounty-count toggles today (inherits the pre-Phase-41 policy:
+  //     RDP rows never match the filter predicate anyway — no identity, no
+  //     bounty counts). Pass through verbatim. When `rdpGroup === null` the
+  //     downstream renderer skips the entire section (user lock #7).
+  //   - The former `displayedActiveSetRows` (D-06 exemption) is retired
+  //     alongside the Tier 1 activeSet render tier; `activeSetRows` in the
+  //     destructure is now always an empty array from the store snapshot.
+  //
+  // (Phase 115 Plan 115-02: prior visible-vs-hidden partition retired per
+  //  D-21 — every row in the pinned/middle tiers is unconditionally visible
+  //  now. 115-06 will re-introduce an archived partition sourced from the
+  //  sweep's archived-tree, not from a hiddenIds set.)
+  // Phase 117 Plan 117-08 (D-09, D-19): the pinned tier now renders
+  // `pinnedUnassigned` (pinned rows with NO project assignment). Pinned rows
+  // that DO have a project assignment float to the top of their project
+  // section per D-19 — they're already inside projectSections[i].rows[0..].
+  // Pre-Phase-117 tests that never seed projectSections see
+  // pinnedUnassigned === pinned (identical arrays via the store's derived
+  // selector) so the switch is a no-op for them.
+  // A swiped row waiting out its Undo bar stays hidden — including the copy
+  // an open pane keeps in the list (the pane only closes on commit).
+  const notSwipePending = (row: ConversationRowShape): boolean =>
+    swipePending.size === 0 || !row.host || !row.targetTmuxSession ||
+    !swipePending.has(`${parseInt(row.host.id, 10)}::${row.targetTmuxSession}`);
+  // Non-admins never see a plain terminal row: a terminal row that doesn't
+  // resolve to a known identity (a bare tmux shell, or an agent whose host
+  // sweep is unreachable so its identity isn't loaded) is left out entirely.
+  const hideTerminalRows = !isAdmin;
+  const isPlainTerminalRow = (row: ConversationRowShape): boolean =>
+    row.type === "terminal" &&
+    row.kind !== "relay-room" &&
+    resolveIdentityForRow(row, identitiesByHostKey, identitiesByKey) === null;
+  const keepRow = (row: ConversationRowShape): boolean =>
+    notSwipePending(row) &&
+    (!hideTerminalRows || !isPlainTerminalRow(row)) &&
+    (!anyFilterOn || matchesFilterForRow(row));
+  const filterRows = anyFilterOn || swipePending.size > 0 || hideTerminalRows;
+  const displayedPinned = filterRows
+    ? pinnedUnassigned.filter(keepRow)
+    : pinnedUnassigned;
+  const displayedMiddle = filterRows
+    ? middle.filter(keepRow)
+    : middle;
+  const displayedRdpGroup = rdpGroup;
+  // Phase 117 Plan 117-08: filter each project section's rows through the
+  // bounty-count filter when active. Sections stay in the derived selector's
+  // alphabetical order (D-15) regardless of filter state — empty sections
+  // continue to render as header-only per D-11.
+  const displayedProjectSections = filterRows
+    ? projectSections.map((s) => ({
+        ...s,
+        rows: s.rows.filter(keepRow),
+      }))
+    : projectSections;
+
+  // ── shape-sidebar-search-inline: derive per-section arrays after applying
+  //    the sidebar-search substring filter, on top of the bounty toggles
+  //    (both filters are AND-intersected — a row survives only if it passes
+  //    both). Each derivation is O(n) over its section; identity lookups
+  //    reuse the maps already in scope. Aggregate flags below drive task 4's
+  //    section-collapse + all-empty fallback render behavior.
+  const trimmedSidebarSearchQuery = sidebarSearchQuery.trim();
+  const sidebarSearchActive = trimmedSidebarSearchQuery.length > 0;
+
+  const searchFilterRow = (row: ConversationRowShape): boolean => {
+    if (!sidebarSearchActive) return true;
+    const identity = resolveIdentityForRow(row, identitiesByHostKey, identitiesByKey);
+    return rowMatchesSearchQuery(row, identity, trimmedSidebarSearchQuery);
+  };
+
+  // Pinned / flat middle: rows filter individually. No "section header
+  // matches all rows" semantics because these are categorical labels, not
+  // per-user-authored titles.
+  const searchedPinned = sidebarSearchActive
+    ? displayedPinned.filter(searchFilterRow)
+    : displayedPinned;
+  const searchedMiddle = sidebarSearchActive
+    ? displayedMiddle.filter(searchFilterRow)
+    : displayedMiddle;
+
+  // Projects: a project whose NAME matches reveals itself, its whole
+  // subtree and all their conversations; elsewhere rows filter individually
+  // via searchFilterRow. A shown project's ancestors show as the path down
+  // to it. With nesting, a sub-project several levels down is hard to reach
+  // by scrolling, so the name is a real navigation target again (nested
+  // projects shape, superseding the 2026-09-29 flat-list call). Sections
+  // that end up with nothing to show drop out.
+  // A project with a matching app shows too (its apps filter by title).
+  const searchedProjectSections = sidebarSearchActive
+    ? searchProjectSections(
+        displayedProjectSections,
+        searchFilterRow,
+        trimmedSidebarSearchQuery,
+        (sec) =>
+          (projectAppsByKey.get(`${sec.hostId ?? ""}::${sec.slug}`) ?? []).some((a) =>
+            appTileMatches(a.title, trimmedSidebarSearchQuery),
+          ),
+      )
+    : displayedProjectSections;
+  // Projects shown whole under the search (their name or an ancestor's
+  // matches): all their apps show, unfiltered.
+  const nameMatchedProjectKeys = useMemo(
+    () =>
+      sidebarSearchActive
+        ? nameMatchedSectionKeys(displayedProjectSections, trimmedSidebarSearchQuery)
+        : null,
+    [sidebarSearchActive, displayedProjectSections, trimmedSidebarSearchQuery],
+  );
+
+  // RDP group: hostname + username are match candidates on the row itself
+  // (see getRowCandidateStrings). The store's rdpGroup carries a rows array;
+  // apply the same per-row filter when a search is active.
+  const searchedRdpGroup =
+    sidebarSearchActive && displayedRdpGroup !== null
+      ? { ...displayedRdpGroup, rows: displayedRdpGroup.rows.filter(searchFilterRow) }
+      : displayedRdpGroup;
+
+  // Apps: filter tile array by tile name. Task 4 will hide the entire Apps
+  // section when this ends up empty under an active search.
+  const searchedAppTiles = sidebarSearchActive
+    ? appTiles.filter((a) => appTileMatches(a.title, trimmedSidebarSearchQuery))
+    : appTiles;
+
+  // Aggregate — does ANY section have at least one visible row under the
+  // active search? Drives task 4's all-empty fallback CTA. When no search
+  // is active this is always true (feature off = normal render).
+  const sidebarSearchHasAnyMatch =
+    !sidebarSearchActive ||
+    searchedPinned.length > 0 ||
+    searchedMiddle.length > 0 ||
+    searchedProjectSections.length > 0 ||
+    (searchedRdpGroup !== null && searchedRdpGroup.rows.length > 0) ||
+    searchedAppTiles.length > 0;
+
+  // (Phase 115 Plan 115-02: prior `hiddenRows` accumulator retired per D-21
+  //  alongside the Hidden section render block. Phase 115 Plan 115-06's
+  //  `archivedRows` counterpart retired in the Phase 122 shape follow-up;
+  //  archived identities surface via the ConversationSearchModal.)
+
+  // Current-render row lookup for the idle-deactivate sweep below, which
+  // resolves an active-set id back to a row object.
+  const rowsByIdRef = useRef(new Map<string, ConversationRowShape>());
+  const rowsById = useMemo(() => {
+    const out = new Map<string, ConversationRowShape>();
+    for (const r of activeSetRows) out.set(r.id, r);
+    for (const r of pinned) out.set(r.id, r);
+    for (const r of middle) out.set(r.id, r);
+    if (rdpGroup !== null) {
+      for (const r of rdpGroup.rows) out.set(r.id, r);
+    }
+    return out;
+  }, [activeSetRows, pinned, middle, rdpGroup]);
+  rowsByIdRef.current = rowsById;
+
+  // Phase 122 Plan 04 (D-17 removal): the Phase 41 Plan 02 `matchesSearch`
+  // label-only filter predicate + the `trimmedSearchQuery` / `searchMatches`
+  // useMemo were retired together with the inline filter-as-you-type input.
+  // Content-search across active + archived conversations is now performed by
+  // ConversationSearchModal (Phase 122 Plan 03) via POST /conversation-search.
+  // The three-zone view (pinned / middle / rdpGroup / activeSet) below now
+  // renders unconditionally — the `searchMatches !== null` branch is gone.
+
+  // quick-260802-pq2: swipe-coordination state (currentlySwipedId +
+  // handleSwipeOpenChange + forceClosedFor) removed alongside the row's
+  // swipe state machine. Mobile now uses long-press → PrettyConversation
+  // ContextMenu; there is no row open-state to coordinate.
+
+  const showPencilButton = typeof onCreateSession === "function";
+  // Project sections the sidebar actually renders: during an active search,
+  // searchProjectSections already dropped the ones with nothing to show.
+  const visibleProjectSections = searchedProjectSections;
+  const isMobileVariant = variant === "mobile";
+
+  // Row-click dispatcher — VERBATIM behavior from ConversationsPanel.tsx
+  // lines 153-183 MINUS the [F3-diag] diagnostic spew (patch #111e retired
+  // in Wave 4). Priority order:
+  //   1. `row.rdpHostRow` → onRdpRowClick (openTab host, "rdp"), unless its
+  //      RDP tab is already open (`rdpTabOpen`) → default select below
+  //   2. `row.fleetOnly`  → onDetachedRowClick (openTab host, "terminal", …)
+  //   3. default          → selectConversation(row.id)
+  // All branches fire onConversationSelected so the mobile list→view
+  // transition (Plan 06-03) fires identically for every click.
+  //
+  // quick-260802-pq2: prior implementation reset currentlySwipedId here as
+  // belt-and-suspenders for the swipe-open race; both the state and the
+  // race are gone with the swipe machinery.
+  const handleRowSelect = (row: ConversationRowShape) => {
+    // (Phase 115 Plan 115-02: prior "hidden means hidden" click note retired
+    //  per D-21 alongside the Hide affordance. Once 115-06 lands the Archive
+    //  affordance, an archived row won't have a context menu at all (D-06),
+    //  so the click path doesn't need special handling for it.)
+    // An RDP row that's about to open a tab doesn't enroll its own
+    // `rdp-host::` id: the row takes the new tab's id (enrolled when it's
+    // selected), and a stale host id would light the row up — with a no-op
+    // Close — every time it reverts after the tab closes.
+    if (!(row.rdpHostRow && !row.rdpTabOpen)) addToActiveSet(row.id);
+    if (row.rdpHostRow && !row.rdpTabOpen && onRdpRowClick) {
+      onRdpRowClick(row);
+      onConversationSelected?.(row.id);
+      return;
+    }
+    if (row.fleetOnly && onDetachedRowClick) {
+      onDetachedRowClick(row);
+      onConversationSelected?.(row.id);
+      return;
+    }
+    // Phase 90 Plan 07 Task 3 (BLOCKER #3 fix) — relay-room branch. Placed
+    // AFTER rdpHostRow + fleetOnly to preserve their existing priority (a
+    // row is at most one of these types — a relay-room row is neither
+    // rdpHostRow nor fleetOnly). Discipline mirrors the two branches above:
+    // early return + fire onConversationSelected alongside. Defensive path
+    // on missing roomId: log-and-fall-through to the default
+    // selectConversation path (backend shouldn't emit this state per Plan
+    // 04 wire discipline; belt-and-suspenders).
+    if (row.kind === "relay-room" && onRelayRoomRowClick) {
+      if (!row.roomId) {
+        // eslint-disable-next-line no-console
+        console.warn("relay-room row missing roomId", { rowId: row.id });
+        // Fall through to default path.
+      } else {
+        onRelayRoomRowClick(row);
+        onConversationSelected?.(row.id);
+        return;
+      }
+    }
+    selectConversation(row.id);
+    onConversationSelected?.(row.id);
+  };
+
+  // quick-260727-gm3: pure reverse of handleRowSelect — removes the id from
+  // the activeSet (row visually recedes to ambient) AND fires
+  // onDeactivateRow so AppShell can closeTab(row.id). Deliberately paired at
+  // the panel level (not the row) so the row stays a dumb consumer of a
+  // single callback and the panel owns the "store mutation + tab close"
+  // composition — same architectural shape as handleRowSelect +
+  // selectConversation + onConversationSelected.
+  //
+  // Order matters: removeFromActiveSet FIRST so the store update lands
+  // before closeTab kicks off any UI transition. Both operations are
+  // synchronous store mutations at the boundary; the flip order is a
+  // defense-in-depth choice, not a correctness requirement.
+  //
+  // quick-260727-s8g: purge BOTH id shapes. Rationale — activeSet may hold
+  // BOTH `row.id` (openTab id shape, e.g. `tab-xxx`) AND the fleet-synthetic
+  // id shape (`fleet::HOSTID::SESSIONNAME`) when the row was reached via
+  // ambient-fleet-row tap: handleRowSelect adds the fleet id, then AppShell
+  // opens a tab whose different id shape gets added by the selectedId
+  // useEffect. If we only purge `row.id`, the next computeSnapshot un-
+  // suppresses the fleet-synthetic entry (openTab is gone) and Tier 1 re-
+  // promotes the row with `.active-set` glow because activeSet still has the
+  // fleet id. Same class of id-shape-mismatch bug as the queued #149
+  // followup-1 pin-nuke (scoped to pinnedIds), separately queued. The
+  // guard skips the fleet-id purge for rows without host or
+  // targetTmuxSession so we never construct a bogus `fleet::null::` string.
+  // removeFromActiveSet is idempotent so calling it with an id that's not
+  // present is a safe no-op.
+  const handleRowDeactivate = (row: ConversationRowShape) => {
+    removeFromActiveSet(row.id);
+    if (row.host && row.targetTmuxSession) {
+      removeFromActiveSet(fleetRowId(parseInt(row.host.id, 10), row.targetTmuxSession));
+    }
+    onDeactivateRow(row);
+  };
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // quick-260818-q73: per-tab idle sweep
+  // ────────────────────────────────────────────────────────────────────────────
+  // Shape: .planning/shapes/shape-auto-deactivate-idle-convs.md
+  //
+  // Policy: any active-set row whose "last moment it stopped being the
+  // selected conv" is older than IDLE_DEACTIVATE_THRESHOLD_MS is fed to the
+  // existing `handleRowDeactivate(row)` above — the SAME function the manual
+  // red-X click passes to `onDeactivate` on each row. Zero new mechanism,
+  // zero visible signal, zero backend touch.
+  //
+  // Data:
+  //   - `lastUnfocusedAtRef` — per-tab, in-memory ONLY. Never persisted,
+  //     never sent to the server, never shared with other tabs/devices. Dies
+  //     on tab close. Values are `performance.now()` millisecond timestamps.
+  //     The currently-selected conv's clock is NOT running — it lives outside
+  //     this map (see selectedId tracker below).
+  //   - `previousSelectedIdRef` — one-slot memory of the last selectedId so
+  //     the tracker knows which id just became un-selected on a change.
+  //   - `activeSetRef` / `selectedIdRef` — mirror the two hook-subscribed
+  //     values so the mount-only sweep reads the LATEST snapshot every tick
+  //     instead of a stale closure over first-render values.
+  //   - `handleRowDeactivateRef` — mirror of `handleRowDeactivate` so the
+  //     mount-only sweep calls the current function reference rather than
+  //     the first-render capture. handleRowDeactivate is defined inline in
+  //     the component body (no useCallback), so its identity churns on every
+  //     render; the ref keeps the sweep pointed at the fresh copy.
+  const lastUnfocusedAtRef = useRef<Map<string, number>>(new Map());
+  const previousSelectedIdRef = useRef<string | null>(null);
+  const activeSetRef = useRef(activeSet);
+  const projectSectionsRef = useRef(projectSections);
+  projectSectionsRef.current = projectSections;
+  const selectedIdRef = useRef(selectedId);
+  const handleRowDeactivateRef = useRef(handleRowDeactivate);
+  // Patch #513: idle-sweep exemption for sessions currently rendered in
+  // the AppShell splitTree. user's user-focus signal is "I have this
+  // pane on screen right now" — deactivating a session she can see is
+  // the sweep firing against a user-attention row and breaks the
+  // deactivate-when-idle contract. Ref-mirror pattern matches the
+  // existing activeSet + selectedId refs so the mount-only sweep reads
+  // the latest snapshot rather than a first-render capture.
+  const visibleInSplitTreeRef = useRef<ReadonlySet<string>>(visibleInSplitTree);
+  // Track the effective visible set (selectedId ∪ splitTree tabIds) so
+  // transitions can correctly stamp/unstamp lastUnfocusedAtRef entries.
+  // Without this, dragging a session OUT of the tree would keep whatever
+  // stale stamp existed from when it was previously un-selected — and if
+  // that stamp is older than 5 min, the very next sweep would deactivate
+  // a session user was looking at moments ago.
+  const previousVisibleSetRef = useRef<ReadonlySet<string>>(EMPTY_VISIBLE_SET);
+
+  // Ref-sync: keep the sweep's view of activeSet + selectedId +
+  // handleRowDeactivate in sync with the current render values. Single-line
+  // ref writes — no work in the effect body beyond `.current = value`.
+  useEffect(() => {
+    activeSetRef.current = activeSet;
+  }, [activeSet]);
+  useEffect(() => {
+    selectedIdRef.current = selectedId;
+  }, [selectedId]);
+  useEffect(() => {
+    handleRowDeactivateRef.current = handleRowDeactivate;
+  }, [handleRowDeactivate]);
+  useEffect(() => {
+    visibleInSplitTreeRef.current = visibleInSplitTree;
+  }, [visibleInSplitTree]);
+
+  // Patch #513: unified visible-set tracker. The pre-Phase-56 tracker
+  // fired only on selectedId change; that was sufficient when exactly
+  // ONE session could be on-screen at a time. Now with the split tree,
+  // "visible" means: selectedId OR any tabId in the tree. On every
+  // change to that set:
+  //   1. For each id that just LEFT the set (was visible last render,
+  //      not visible now) → stamp with `now` so the sweep counts from
+  //      the moment the session actually left the user's view.
+  //   2. For each id that IS visible now → delete its stamp so the
+  //      sweep never fires against it (idempotent for entries with no
+  //      prior stamp).
+  //   3. Update previousSelectedIdRef + previousVisibleSetRef for the
+  //      next transition.
+  useEffect(() => {
+    const now = performance.now();
+    const nextVisible = new Set<string>(visibleInSplitTree);
+    if (selectedId !== null) nextVisible.add(selectedId);
+    const prevVisible = previousVisibleSetRef.current;
+    for (const id of prevVisible) {
+      if (!nextVisible.has(id)) {
+        lastUnfocusedAtRef.current.set(id, now);
+      }
+    }
+    for (const id of nextVisible) {
+      lastUnfocusedAtRef.current.delete(id);
+    }
+    previousVisibleSetRef.current = nextVisible;
+    previousSelectedIdRef.current = selectedId;
+  }, [selectedId, visibleInSplitTree]);
+
+  // Mount-only sweep: fire every IDLE_DEACTIVATE_SWEEP_MS. Body reads all
+  // dependencies from refs so no stale-closure hazard exists. For each id in
+  // the current active-set that (a) is NOT the currently-selected id, (b)
+  // HAS a stamp in the map, and (c) whose stamp is older than the threshold,
+  // resolve the row via the current-render `rowsByIdRef` and call
+  // `handleRowDeactivate(row)` — verbatim, no wrapper, no re-implementation.
+  // Silent: no console log, no toast, no ARIA update.
+  useEffect(() => {
+    const sweep = () => {
+      const now = performance.now();
+      const currentSelected = selectedIdRef.current;
+      const currentActive = activeSetRef.current;
+      const currentVisibleInSplitTree = visibleInSplitTreeRef.current;
+      const handleRowDeactivate = handleRowDeactivateRef.current;
+      for (const id of currentActive) {
+        if (id === currentSelected) continue; // HARD INVARIANT: never sweep the selected conv
+        // Patch #513: HARD INVARIANT — never sweep a session currently
+        // rendered as a leaf in the AppShell splitTree. Deactivating a
+        // session user can see on-screen violates the sweep's
+        // user-focus contract.
+        if (currentVisibleInSplitTree.has(id)) continue;
+        const stamp = lastUnfocusedAtRef.current.get(id);
+        if (stamp === undefined) continue; // never focused-then-unfocused in this tab
+        if (now - stamp < IDLE_DEACTIVATE_THRESHOLD_MS) continue;
+        const row = rowsByIdRef.current.get(id);
+        if (!row) continue; // row unknown to the panel — silently skip
+        handleRowDeactivate(row);
+        // Delete after firing so a still-active-set entry (e.g. reactivate
+        // path re-adds later) doesn't re-fire on the very next tick against
+        // the same stale stamp.
+        lastUnfocusedAtRef.current.delete(id);
+      }
+    };
+    const handle = setInterval(sweep, IDLE_DEACTIVATE_SWEEP_MS);
+    return () => clearInterval(handle);
+  }, []);
+  // ────────────────────────────────────────────────────────────────────────────
+  // end quick-260818-q73 idle sweep
+  // ────────────────────────────────────────────────────────────────────────────
+
+  // quick-260810-n3a: panel-level Kill handler. Shows a native confirm dialog
+  // naming the tmux session + host before forwarding to onKillRow. The dialog
+  // is the user-facing mitigation (T-n3a-06) — user reads session name + host
+  // before clicking OK. Only fires onKillRow when confirm=true.
+  const handleRowKill = async (row: ConversationRowShape) => {
+    const tmuxSession = row.targetTmuxSession;
+    const hostName = row.host?.name ?? row.host?.ip ?? "the host";
+    if (!tmuxSession) return; // defense-in-depth; row-side gate should have prevented
+    const ok = await kitConfirm({
+      title: `Kill tmux session "${tmuxSession}"?`,
+      body: `It ends on ${hostName}. This cannot be undone.`,
+      confirmLabel: "Kill session",
+      destructive: true,
+    });
+    if (!ok) return;
+    onKillRow?.(row);
+  };
+
+  // quick-260731-tgg: panel-level togglePin with mutual exclusion — unhide before pin.
+  // quick-260807 followup to e4s: takes the whole row and handles BOTH pin
+  // id shapes symmetrically (openTab id + fleet-synthetic shadow id). e4s
+  // fixed only the READ side (isRowPinned) — this closes the WRITE side:
+  // when the pin was persisted under the fleet-synthetic shape but the row
+  // renders in the active-set/grouped tier under its openTab id, a click on
+  // Unpin used to hit togglePinConversation(openTabId), find openTabId NOT
+  // in pinnedIds, and treat it as a PIN (adding a second stale entry) —
+  // leaving the fleet-shadow pin in place forever. Now: if EITHER shape is
+  // pinned, remove BOTH; if NEITHER, pin the canonical (fleet-synthetic
+  // when host+targetTmuxSession are available so the pin survives openTab
+  // id churn across URL-restores).
+  // Pin writes an identity's `.pinned` sentinel, so only identity rows are
+  // pinnable — relay rooms and plain terminals have nothing to persist (and a
+  // non-identity id in the pin set used to fail every later pin write).
+  // Resolved through refs so the drop handler's useCallback stays stable.
+  const isIdentityRow = (p: {
+    host?: { id: string } | null;
+    targetTmuxSession?: string | null;
+  }): boolean => {
+    if (!p.host || !p.targetTmuxSession) return false;
+    const matchKey = sessionMatchKey(p.targetTmuxSession);
+    if (matchKey === null) return false;
+    const hostIdNum = parseInt(p.host.id, 10);
+    return (
+      (Number.isFinite(hostIdNum) &&
+        identitiesByHostKeyRef.current?.get(`${hostIdNum}::${matchKey}`) !== undefined) ||
+      identitiesByKeyRef.current?.get(matchKey) !== undefined
+    );
+  };
+  // Pinned non-identity rows (legacy pins from before the gate) keep Unpin.
+  // `shownPinned` is what the row displays — a project-section row shows
+  // unpinned even if a stale `.pinned` exists (project outranks pin), so its
+  // Pinned entry must PIN (and thereby leave the project), never toggle off.
+  // The row's onTogglePin (built in PrettyConversationRowLive) then calls
+  // handleSetPinned(row, !shownPinned).
+  const pinModeFor = (row: ConversationRowShape): "toggle" | "none" =>
+    isIdentityRow(row) || isRowPinned(row) ? "toggle" : "none";
+
+  // Pinned and in-a-project are mutually exclusive. Pinning a project member
+  // takes it out of the project: the backend pin route clears `project:` and
+  // fans out session-project-changed. If the row already carries a (stale)
+  // pin, pinConversation is a no-op and the PUT never fires — clear the
+  // project directly instead.
+  const handleSetPinned = (row: ConversationRowShape, wantPinned: boolean) => {
+    const shadowFleetId =
+      row.host && row.targetTmuxSession
+        ? fleetRowId(parseInt(row.host.id, 10), row.targetTmuxSession)
+        : null;
+    const openTabPinned = pinnedIds.has(row.id);
+    const shadowPinned = shadowFleetId !== null && pinnedIds.has(shadowFleetId);
+    if (!wantPinned) {
+      if (openTabPinned) unpinConversation(row.id);
+      if (shadowPinned && shadowFleetId !== null) unpinConversation(shadowFleetId);
+      return;
+    }
+    if (openTabPinned || shadowPinned) {
+      if (rowIdToProjectSlugRef.current.has(row.id)) {
+        console.info(`[pin] stale pin on project member — clearing project rowId=${row.id}`);
+        handleRowMoveToProjectRef.current?.(row, null);
+      }
+      return;
+    }
+    console.info(`[pin] pin rowId=${row.id} inProject=${rowIdToProjectSlugRef.current.has(row.id)}`);
+    pinConversation(shadowFleetId ?? row.id);
+  };
+
+  // Moving a row into a project unpins it (mutual exclusivity). The backend
+  // project route removes `.pinned` too; this drops the local pin ids so the
+  // row doesn't flash back into Pinned before the next disk hydrate.
+  const unpinForProjectMove = (p: {
+    id: string;
+    host?: { id: string } | null;
+    targetTmuxSession?: string | null;
+  }) => {
+    const shadowFleetId =
+      p.host && p.targetTmuxSession
+        ? fleetRowId(parseInt(p.host.id, 10), p.targetTmuxSession)
+        : null;
+    if (pinnedIds.has(p.id)) unpinConversation(p.id);
+    if (shadowFleetId !== null && pinnedIds.has(shadowFleetId)) unpinConversation(shadowFleetId);
+  };
+  const unpinForProjectMoveRef = useRef(unpinForProjectMove);
+  unpinForProjectMoveRef.current = unpinForProjectMove;
+
+  // (Phase 115 Plan 115-02: prior `handleToggleHide` handler retired per
+  //  D-21 alongside the Hide/Show context-menu item on both the sidebar row
+  //  and the identity badge.)
+  //
+  // Phase 115 Plan 115-06 (D-01, D-03, D-04, D-05): handleArchive — the
+  // panel-level composition invoked by the row menu's Archive item.
+  // Sequence:
+  //   1. Gate on canonicalArchiveIdForRow — the same fleet-synthetic-
+  //      identity-backed gate the deleted Hide handler used (RDP synthetic
+  //      rows, relay-room rows, and rows without host + targetTmuxSession
+  //      are excluded — the row-side menu builder never even shows the item
+  //      for those cases, but the guard is defense-in-depth).
+  //   2. kit confirm "Archive \"<label>\"?" (destructive),
+  //      where <label> mirrors the sidebar row's label preference: task if
+  //      present, else displayName, else identityKey fallback (when the
+  //      identity hasn't yet resolved on the frontend).
+  //   3. If confirm=false → return immediately, no API call, no pane close.
+  //   4. If confirm=true → D-04 side effect: if the row is in the active-set
+  //      (identity has a visible pane), call handleRowDeactivate(row) to
+  //      close the pane BEFORE firing the API call. This mirrors the deleted
+  //      handleToggleHide's `handleRowDeactivate` composition.
+  //   5. Optimistic sidebar removal: mark pending-archive, then drop the
+  //      fleet-session row + identity-store entry. The identity keeps pulsing
+  //      fleet-status for ~15s until the supervisor's scan tick retires it;
+  //      the pending-archive filter in conversation-store's upsert/update
+  //      paths keeps the row from flickering back in during that window.
+  //   6. await archiveIdentity. On success the pending flag stays set until
+  //      the supervisor's onGone frame arrives (harmless — the identity is
+  //      gone), and gets naturally GC'd on page reload. On failure we roll
+  //      back: clearPendingArchive so the next fleet-status pulse re-inserts
+  //      the row, then a kit notice so the user knows the archive did not
+  //      land.
+  //
+  // D-05 lock: no un-archive branch. One-way gesture.
+  // Optimistic archive removal + its undo. The undo can't wait for the next
+  // fleet-status pulse to re-insert the row — pulses are fingerprint-
+  // suppressed, so an idle identity may not publish again for hours. Put
+  // the captured session row back directly and re-fetch identities (the
+  // removal also dropped it from the identities store).
+  const optimisticArchiveRemove = (hostId: number, sessionName: string, identityKey: string) => {
+    const removed = getFleetSessionsSnapshot().find(
+      (fs) => fs.hostId === hostId && fs.sessionName === sessionName,
+    );
+    // Kept so a rollback can put the identity back at once: a non-admin's
+    // sidebar hides a terminal row with no identity behind it, so waiting on
+    // the refresh below would leave the restored row invisible.
+    const matchKey = sessionMatchKey(identityKey);
+    const removedIdentity =
+      matchKey === null
+        ? undefined
+        : (identitiesByHostKey?.get(`${hostId}::${matchKey}`) ?? identitiesByKey.get(matchKey));
+    markPendingArchive(hostId, sessionName);
+    removeFleetSession(hostId, sessionName);
+    applyIdentityChange(null, identityKey, hostId);
+    return () => {
+      clearPendingArchive(hostId, sessionName);
+      if (removedIdentity) applyIdentityChange(removedIdentity);
+      if (removed) upsertFleetSession(removed);
+      refreshIdentities({ [identityKey]: hostId }).catch(() => {});
+    };
+  };
+
+  // Resolves an archivable row to what archiving it needs, or null.
+  const archiveTarget = (row: ConversationRowShape) => {
+    if (canonicalArchiveIdForRow(row) === null) return null;
+    if (!row.host || !row.targetTmuxSession) return null; // gate above already ensures this; TS narrowing
+    const hostIdNum = parseInt(row.host.id, 10);
+    if (!Number.isFinite(hostIdNum)) return null;
+    const identityKey = row.targetTmuxSession;
+    const resolved =
+      identitiesByHostKey?.get(`${hostIdNum}::${identityKey}`) ?? identitiesByKey.get(identityKey);
+    // Mirror the sidebar row's label preference (PrettyConversationRow.tsx):
+    // task if present, else displayName, else identityKey.
+    const label = resolved?.task || resolved?.displayName || identityKey;
+    return { hostIdNum, identityKey, label };
+  };
+
+  // The archive call itself, after the row is already gone from the sidebar.
+  // On failure the row comes back and the user is told.
+  const commitArchive = async (hostIdNum: number, identityKey: string, undoRemove: () => void) => {
+    try {
+      await archiveIdentity(hostIdNum, identityKey);
+      // Archived: every open copy of the conversation in this window closes.
+      announceAgentArchived(hostIdNum, identityKey);
+    } catch (err) {
+      // Rollback: put the row back now (see optimisticArchiveRemove).
+      undoRemove();
+      console.warn({
+        operation: "identity_archive_failed",
+        hostId: hostIdNum,
+        identityKey,
+        errMessage: err instanceof Error ? err.message : String(err),
+      });
+      void kitAlert({
+        title: "Couldn't archive",
+        body: err instanceof Error ? err.message : String(err),
+      });
+    }
+  };
+
+  const handleArchive = async (row: ConversationRowShape) => {
+    const target = archiveTarget(row);
+    if (target === null) return;
+    // The confirm names the wake-ups that would stop once the check is back.
+    await confirmThenArchive(row, target, () => checkActiveWakeups(target.hostIdNum, target.identityKey));
+  };
+
+  // The confirm (naming any wake-ups that would stop) and, on yes, the archive.
+  // While the confirm is up, another Archive on the same agent is ignored.
+  const confirmThenArchive = async (
+    row: ConversationRowShape,
+    target: { hostIdNum: number; identityKey: string; label: string },
+    getCheck: () => Promise<WakeupCheck>,
+  ) => {
+    const { hostIdNum, identityKey, label } = target;
+    if (!claimArchivePrompt(hostIdNum, identityKey)) return;
+    let ok: boolean;
+    try {
+      // Opens at once; Archive waits for the check, which fills in the warning.
+      ok = await kitConfirm({
+        title: `Archive "${label}"?`,
+        body: ARCHIVE_AGENT_BODY,
+        ready: getCheck().then((check) => ({ body: singleAgentArchiveBody(check) })),
+        confirmLabel: "Archive",
+        destructive: true,
+      });
+    } finally {
+      releaseArchivePrompt(hostIdNum, identityKey);
+    }
+    if (!ok) return;
+    if (activeSetRef.current.has(row.id)) { // latest — the confirm doesn't freeze the page
+      handleRowDeactivate(row);
+    }
+    // Optimistic removal — mark pending FIRST so any in-flight fleet-status
+    // frame that races with the removes below is silent-dropped rather than
+    // re-inserting the row.
+    const undoRemove = optimisticArchiveRemove(hostIdNum, identityKey, identityKey);
+    await commitArchive(hostIdNum, identityKey, undoRemove);
+  };
+
+  // Swipe-to-archive on touch (shape-sidebar): no confirm. The row leaves at
+  // once and an "Archived … · Undo" bar shows for SWIPE_UNDO_MS; the archive
+  // call — and closing the conversation's pane, if open — only happen once
+  // the bar goes (timed out or swiped away). Undo puts the row back with
+  // nothing to restore. Leaving the page inside the window archives nothing —
+  // the row is back on the next load.
+  // The agent's wake-ups are checked alongside, and the archive never goes
+  // ahead before that check is back (it gives up within CHECK_TIMEOUT_MS). An
+  // agent with active wake-ups doesn't archive from the swipe: the bar goes,
+  // the row comes back and the warning confirm opens. A failed check archives
+  // as normal, with the bar saying so.
+  const handleSwipeArchive = (row: ConversationRowShape) => {
+    const target = archiveTarget(row);
+    if (target === null) return;
+    const { hostIdNum, identityKey, label } = target;
+    const pendingKey = `${hostIdNum}::${identityKey}`;
+    if (swipePendingRef.current.has(pendingKey)) return; // one Undo bar per agent
+    const setPending = (on: boolean) => {
+      const next = new Set(swipePendingRef.current);
+      if (on) next.add(pendingKey);
+      else next.delete(pendingKey);
+      swipePendingRef.current = next;
+      setSwipePending(next);
+    };
+    setPending(true);
+    const undoRemove = optimisticArchiveRemove(hostIdNum, identityKey, identityKey);
+    const logCtx = { operation: "swipe_archive", hostId: hostIdNum, identityKey };
+    systemLogger.info("swipe-archive pending", { ...logCtx, event: "pending" });
+    const checkPromise = checkActiveWakeups(hostIdNum, identityKey);
+    let checkFailureShown = false;
+    const hasActiveWakeups = (check: WakeupCheck) => check.status === "checked" && check.active.length > 0;
+    let settled = false;
+    // Put the row back and ask instead, naming the wake-ups that would stop.
+    const warnInstead = (check: WakeupCheck) => {
+      systemLogger.info("swipe-archive held for wake-ups", { ...logCtx, event: "wakeup_warning" });
+      setPending(false);
+      undoRemove();
+      void confirmThenArchive(row, target, async () => check);
+    };
+    const commit = () => {
+      if (settled) return;
+      settled = true;
+      void checkPromise.then((check) => {
+        if (hasActiveWakeups(check)) {
+          warnInstead(check);
+          return;
+        }
+        systemLogger.info("swipe-archive commit", { ...logCtx, event: "commit", wakeupCheck: check.status });
+        if (activeSetRef.current.has(row.id)) handleRowDeactivate(row);
+        setPending(false);
+        // The bar went before a failed check could say so on it: say it now.
+        if (check.status === "unknown" && !checkFailureShown) {
+          toast(`Archived "${label}"`, { description: "Couldn't check its scheduled wake-ups first — any it had have stopped." });
+        }
+        void commitArchive(hostIdNum, identityKey, undoRemove);
+      });
+    };
+    const undo = () => {
+      if (settled) return;
+      settled = true;
+      systemLogger.info("swipe-archive undo", { ...logCtx, event: "undo" });
+      setPending(false);
+      undoRemove();
+    };
+    const toastOpts = {
+      duration: SWIPE_UNDO_MS,
+      action: { label: "Undo", onClick: undo },
+      onAutoClose: commit,
+      onDismiss: commit,
+    };
+    const toastId = toast(`Archived "${label}"`, toastOpts);
+    void checkPromise.then((check) => {
+      if (settled) return; // the bar already went; commit() acts on this check
+      if (hasActiveWakeups(check)) {
+        settled = true;
+        toast.dismiss(toastId);
+        warnInstead(check);
+      } else if (check.status === "unknown") {
+        checkFailureShown = true;
+        toast(`Archived "${label}"`, {
+          ...toastOpts,
+          id: toastId,
+          description: "Couldn't check its scheduled wake-ups — any it has will stop.",
+        });
+      }
+    });
+  };
+
+  // quick-260807-e4s (patch #149 followup-1 pin-nuke): mirror the store's
+  // Tier 2 shadow-fleet-id pinned check (conversation-store.ts:493-499) so
+  // active-set + grouped rows render "Unpin" when the pin was persisted
+  // under the fleet-synthetic id shape.
+  const isRowPinned = (row: ConversationRowShape): boolean => {
+    const shadowFleetId =
+      row.host && row.targetTmuxSession
+        ? fleetRowId(parseInt(row.host.id, 10), row.targetTmuxSession)
+        : null;
+    return (
+      pinnedIds.has(row.id) ||
+      (shadowFleetId !== null && pinnedIds.has(shadowFleetId))
+    );
+  };
+
+  // quick-260802-pq2: handleSwipeOpenChange + forceClosedFor removed —
+  // the row's swipe machinery was retired; there is no per-row open-state
+  // to coordinate. Mobile actions flow through the long-press context menu.
+
+  // RDP rows get a no-op togglePin (pinMode "noop" → module-level
+  // noopTogglePin) — belt-and-suspenders: Wave 1's contract already
+  // suppresses pin intrinsically for RDP, but hand a no-op anyway so nothing
+  // fires if the invariant ever regresses.
+
+  // ─── Phase 117 Plan 117-08 — projects DnD + create-project state ─────────────
+  //
+  // (a) createProjectModalOpen — state toggle wired to the header "Create
+  //     project" button. The actual CreateProjectModal component lands in
+  //     117-09; this plan only mounts a placeholder marker so downstream
+  //     tests + integration can verify the state flip. The placeholder gets
+  //     swapped for the real modal at 117-09's task-2 render insertion site.
+  //
+  // (b) pendingProjectSlug — set by handleNewConversationInProject when the
+  //     per-section new-conversation button fires. The 117-09 modal reads
+  //     this to pre-select the project in its dropdown. Cleared on close.
+  //
+  // (c) rowIdToProjectSlug — lookup table for the D-22 gesture #2 (drop-in-
+  //     middle clears). Built from the derived selector's projectSections so
+  //     the panel can answer "is this row currently assigned to a project?"
+  //     without a second store subscription. O(N) construction, O(1) lookup.
+  const [createProjectModalOpen, setCreateProjectModalOpen] = useState(false);
+  // Row whose "Move to → New project…" opened the create modal; it is moved
+  // into the project once the create lands. Null = that modal is closed.
+  const [createProjectForRow, setCreateProjectForRow] =
+    useState<ConversationRowShape | null>(null);
+  const [pendingProjectSlug, setPendingProjectSlug] = useState<string | null>(null);
+
+  // Phase 117 Plan 117-09 Task 2 (D-14) — per-section context menu state
+  // RETIRED by shape-sidebar-header-affordances. Right-click + long-press on
+  // the project section header are retired; the four section-scoped actions
+  // (open project, new conversation, rename, archive project) now live
+  // in the section header's RowKebabMenu, which calls the per-action handlers
+  // directly without an intermediate coord-based menu-open state.
+
+  // ProjectModal open state. Populated when the user clicks "Edit project"
+  // in the section kebab (handleOpenProject below); reset when the modal
+  // dismisses. hostId is resolved from projectsList at click time so the
+  // modal endpoints hit the correct host.
+  const [projectModal, setProjectModal] = useState<
+    | { slug: string; displayName: string; hostId: number }
+    | null
+  >(null);
+
+  // Phase 117 M-G follow-up (2026-09-18): CreateProjectModal now takes the
+  // full hostTree and owns its own host picker (Phase-84 pattern — hidden
+  // when the user has exactly one pickable host, visible listbox otherwise).
+  // The previous defaultCreateProjectHostId derivation (silently picked the
+  // first host in the tree) was retired because on multi-host fleets it
+  // routinely picked the wrong host (a multi-user box, hostId=3) when the user
+  // meant the local host — the user creates a project without noticing
+  // where it landed. The picker moves the choice into the UI.
+
+  // Row-id → project-slug lookup (derived from projectSections). Used by
+  // handleFlatMiddleDrop to answer "was this row assigned to a project?".
+  const rowIdToProjectSlug = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const section of projectSections) {
+      for (const row of section.rows) m.set(row.id, section.slug);
+    }
+    return m;
+  }, [projectSections]);
+  rowIdToProjectSlugRef.current = rowIdToProjectSlug;
+
+  // (d) handleProjectDrop — fired by PrettyProjectSectionHeader's onDropRow.
+  //     The section-level component has already:
+  //       - type-gated on application/x-skynet-row
+  //       - parsed the payload safely
+  //       - validated `id` is a non-empty string
+  //       - refused rdpHostRow=true payloads (D-08 defense-in-depth)
+  //     The panel handler routes based on row kind:
+  //       - matrixRoomId set → relay-room row → setRelayRoomProject
+  //         (requires viewingUserMxid — if not yet resolved, log + skip)
+  //       - identityKey + host set → identity row → setSessionProject
+  //       - neither → console.warn + no-op (defensive; the derived selector
+  //         should never emit a row shape that misses both carriers)
+  //
+  // (e) handleFlatMiddleDrop — fired on the flat-middle container's onDrop.
+  //     Type-gated on application/x-skynet-row so badge drags + OS file drops
+  //     fall through (they're handled elsewhere in the panel). Clears the
+  //     project field only if the row IS currently in a project (per
+  //     rowIdToProjectSlug lookup). Non-project rows are no-ops.
+  //
+  // (f) handleNewConversationInProject — records the pending slug + opens
+  //     the modal. Full pre-fill behavior lands in 117-09 (modal reads
+  //     pendingProjectSlug to pre-select the project in its dropdown).
+  const handleProjectDrop = useCallback(
+    (
+      slug: string,
+      payload: {
+        id: string;
+        host?: { id: string } | null;
+        targetTmuxSession?: string | null;
+        matrixRoomId?: string | null;
+        rdpHostRow?: boolean;
+        identityKey?: string | null;
+      },
+    ) => {
+      // Defense-in-depth: RDP short-circuit (also handled at section-level).
+      if (payload.rdpHostRow === true) return;
+      // Relay-room path — matrixRoomId is the carrier.
+      if (typeof payload.matrixRoomId === "string" && payload.matrixRoomId.length > 0) {
+        if (!viewingUserMxid) {
+          // viewing-user mxid not yet resolved — skip rather than fire with a
+          // placeholder. The user will see the row stay in place; a fresh
+          // drop after the mxid fetch settles will succeed.
+          console.warn(`[project-drop] skipping relay-room drop — viewing user mxid not yet resolved (roomId=${payload.matrixRoomId})`);
+          return;
+        }
+        console.info(`[project-drop] slug=${slug} kind=relay-room roomId=${payload.matrixRoomId}`);
+        unpinForProjectMoveRef.current({ id: payload.id });
+        const rollbackDrop = patchRoomProjectAssignment(payload.matrixRoomId, slug);
+        setRelayRoomProject(payload.matrixRoomId, viewingUserMxid, slug).catch(
+          (err: unknown) => {
+            rollbackDrop();
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error(`[project-drop] setRelayRoomProject failed: ${msg}`);
+          },
+        );
+        return;
+      }
+      // Identity path — need host + identityKey. Fall back to
+      // targetTmuxSession when identityKey isn't in the payload (older
+      // clients pre-117-08 didn't carry identityKey; sessionMatchKey is the
+      // canonical identity-name derivation).
+      if (!payload.host || typeof payload.host.id !== "string") return;
+      const hostIdNum = parseInt(payload.host.id, 10);
+      if (!Number.isFinite(hostIdNum) || hostIdNum <= 0) return;
+      const identityKey =
+        payload.identityKey ??
+        (payload.targetTmuxSession
+          ? sessionMatchKey(payload.targetTmuxSession) ?? payload.targetTmuxSession
+          : null);
+      if (!identityKey) {
+        console.warn(`[project-drop] identity row missing identityKey (rowId=${payload.id})`);
+        return;
+      }
+      console.info(`[project-drop] slug=${slug} kind=identity hostId=${hostIdNum} key=${identityKey}`);
+      setSessionProject(hostIdNum, identityKey, slug)
+        .then(() => {
+          // After the write lands (see handleRowMoveToProject).
+          unpinForProjectMoveRef.current({ id: payload.id, host: payload.host, targetTmuxSession: payload.targetTmuxSession });
+        })
+        .catch((err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`[project-drop] setSessionProject failed: ${msg}`);
+        });
+    },
+    [viewingUserMxid],
+  );
+
+  // shape-move-to-project-context-menu (2026-09-23): sidebar-order project
+  // list piped into every non-RDP row's "Move to" submenu. Same
+  // ordering the sidebar renders its project sections in (projectSections
+  // is the authoritative order from the derived selector) — the menu's
+  // mental map matches the sidebar's. Displayed even for the currently-
+  // assigned project (checkmarked in place), so the ordering does not
+  // change based on which row opened the menu.
+  //
+  // hostId is carried alongside slug/displayName here so the per-row
+  // narrowing below (submenuProjectsForRow) can filter identity rows to
+  // projects that live on that row's host. Sourced from projectsList
+  // (ProjectRow carries hostId; projectSections does not).
+  const submenuProjects = useMemo(() => {
+    const hostBySlug = new Map<string, string>();
+    for (const p of projectsList) hostBySlug.set(p.slug, p.hostId);
+    // projectSections is in tree order; `depth` indents sub-projects so the
+    // menu mirrors the sidebar tree.
+    return projectSections.map((s) => ({
+      slug: s.slug,
+      displayName: s.displayName,
+      hostId: s.hostId ?? hostBySlug.get(s.slug) ?? null,
+      depth: s.depth ?? 0,
+    }));
+  }, [projectSections, projectsList]);
+
+  // Project slugs are only unique per host, so project lookups take the
+  // section's hostId when known (fixtures without it fall back to slug-only).
+  const findProject = useCallback(
+    (slug: string, hostId?: string) =>
+      projectsList.find((p) => p.slug === slug && (hostId === undefined || p.hostId === hostId)),
+    [projectsList],
+  );
+
+  // Per-row narrowing for the projects in the "Move to" submenu.
+  //
+  // Identity rows are host-scoped: projects live under the identity's
+  // host's ~/fleet/projects/ tree (D-01), and setSessionProject writes
+  // to that host's identity file. Offering a cross-host project would
+  // fire setSessionProject(row.host.id, key, slug-that-lives-on-another-
+  // host) which the writer can't satisfy — the project directory doesn't
+  // exist on the row's host. Filter to matching hostId so the menu can't
+  // list options the wire would then bounce.
+  //
+  // Relay-room rows are cross-host by design (the setRelayRoomProject
+  // payload is {roomId, userMxid, slug} with no hostId; the room-project
+  // tag is per-user, not per-host). No natural host key to filter on —
+  // return the full list.
+  //
+  // hostId=null entries (project not yet in projectsList — race window
+  // between projectSections update and useProjects snapshot bump) are
+  // conservatively hidden from identity rows to avoid a wire call whose
+  // routing we can't verify.
+  // Per-host submenu arrays, built once per projects change and reused across
+  // renders so each row's `projects` prop keeps its identity (memoized rows
+  // would otherwise re-render on every panel render). submenuProjects itself
+  // re-derives whenever any project section's rows change, so the cache is
+  // keyed on the (slug, displayName, hostId, depth) content, not the array identity.
+  const submenuProjectsCacheRef = useRef<{
+    sig: string;
+    all: readonly { slug: string; displayName: string; depth: number }[];
+    byHost: Map<string, readonly { slug: string; displayName: string; depth: number }[]>;
+  } | null>(null);
+  const submenuProjectsCache = useMemo(() => {
+    const sig = JSON.stringify(
+      submenuProjects.map((p) => [p.slug, p.displayName, p.hostId, p.depth]),
+    );
+    const prev = submenuProjectsCacheRef.current;
+    if (prev !== null && prev.sig === sig) return prev;
+    const all = submenuProjects.map(({ slug, displayName, depth }) => ({
+      slug,
+      displayName,
+      depth,
+    }));
+    const byHost = new Map<string, { slug: string; displayName: string; depth: number }[]>();
+    for (const p of submenuProjects) {
+      if (typeof p.hostId !== "string") continue;
+      const list = byHost.get(p.hostId) ?? [];
+      list.push({ slug: p.slug, displayName: p.displayName, depth: p.depth });
+      byHost.set(p.hostId, list);
+    }
+    const next = { sig, all, byHost };
+    submenuProjectsCacheRef.current = next;
+    return next;
+  }, [submenuProjects]);
+
+  const submenuProjectsForRow = useCallback(
+    (
+      row: ConversationRowShape,
+    ): readonly { slug: string; displayName: string; depth: number }[] => {
+      // Relay-room rows: fleet-wide tags — offer every project.
+      if (typeof row.roomId === "string" && row.roomId.length > 0) {
+        return submenuProjectsCache.all;
+      }
+      // Identity rows: only projects on the row's own host.
+      const rowHostId = row.host?.id;
+      if (!rowHostId) return EMPTY_SUBMENU_PROJECTS;
+      return submenuProjectsCache.byHost.get(rowHostId) ?? EMPTY_SUBMENU_PROJECTS;
+    },
+    [submenuProjectsCache],
+  );
+
+  // shape-move-to-project-context-menu (2026-09-23): context-menu path for
+  // setting a row's project assignment. Mirrors handleProjectDrop's routing
+  // (relay-room vs identity; RDP refusal; identityKey fallback via
+  // sessionMatchKey) but also accepts a null slug for the "Remove from
+  // project" leaf. Same-project taps arrive here filtered out — the row
+  // pre-guards the currently-assigned project as a silent no-op before
+  // firing the callback (see PrettyConversationRow.tsx items[] gate).
+  const handleRowMoveToProject = useCallback(
+    (row: ConversationRowShape, slug: string | null) => {
+      if (row.rdpHostRow === true) return; // defense-in-depth
+      // Relay-room path — roomId is the carrier (matches DnD payload's
+      // `matrixRoomId` field).
+      const roomId = row.roomId;
+      if (typeof roomId === "string" && roomId.length > 0) {
+        if (!viewingUserMxid) {
+          console.warn(
+            `[project-menu] skipping relay-room move — viewing user mxid not yet resolved (roomId=${roomId})`,
+          );
+          return;
+        }
+        console.info(
+          `[project-menu] slug=${slug ?? "(null)"} kind=relay-room roomId=${roomId}`,
+        );
+        if (slug !== null) unpinForProjectMoveRef.current(row);
+        const rollbackMenu = patchRoomProjectAssignment(roomId, slug);
+        setRelayRoomProject(roomId, viewingUserMxid, slug).catch(
+          (err: unknown) => {
+            rollbackMenu();
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error(`[project-menu] setRelayRoomProject failed: ${msg}`);
+          },
+        );
+        return;
+      }
+      // Identity path — need host + identityKey. identityKey resolution
+      // prefers the identities-store lookup (real identityKey from the
+      // Identity object) and falls back to sessionMatchKey(targetTmuxSession)
+      // ?? targetTmuxSession, matching handleProjectDrop / handleFlatMiddleDrop
+      // when their DnD payload didn't carry a real identityKey.
+      if (!row.host) return;
+      const hostIdNum = parseInt(row.host.id, 10);
+      if (!Number.isFinite(hostIdNum) || hostIdNum <= 0) return;
+      const sessionKey =
+        (row.targetTmuxSession
+          ? sessionMatchKey(row.targetTmuxSession) ?? row.targetTmuxSession
+          : null) ?? null;
+      const scopedId =
+        sessionKey !== null
+          ? identitiesByHostKey.get(`${hostIdNum}::${sessionKey}`)
+          : undefined;
+      const globalId =
+        sessionKey !== null ? identitiesByKey.get(sessionKey) : undefined;
+      const identityKey =
+        scopedId?.identityKey ?? globalId?.identityKey ?? sessionKey;
+      if (!identityKey) {
+        console.warn(
+          `[project-menu] identity row missing identityKey (rowId=${row.id})`,
+        );
+        return;
+      }
+      console.info(
+        `[project-menu] slug=${slug ?? "(null)"} kind=identity hostId=${hostIdNum} key=${identityKey}`,
+      );
+      // Unpin only once the project write landed — a failed write must not
+      // cost the row its pin (the backend already removed `.pinned`; this
+      // just catches the local pin set up).
+      setSessionProject(hostIdNum, identityKey, slug)
+        .then(() => {
+          if (slug !== null) unpinForProjectMoveRef.current(row);
+        })
+        .catch((err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`[project-menu] setSessionProject failed: ${msg}`);
+        });
+    },
+    [viewingUserMxid, identitiesByHostKey, identitiesByKey],
+  );
+  handleRowMoveToProjectRef.current = handleRowMoveToProject;
+
+  // ─── Stable row actions ──────────────────────────────────────────────────
+  // One object for every row, created once; each method forwards to the
+  // latest handler through rowActionsImplRef (refreshed every render), so
+  // handlers always see current state while memoized rows see an unchanged
+  // `actions` prop. Presence/absence of each row callback is decided in
+  // PrettyConversationRowLive from flags (pinMode / archivable /
+  // projectActions + the row's own shape).
+  //
+  // moveToProject: "Move to" submenu pick. Projects are hidden from that
+  // submenu (onMoveToProject omitted) for RDP rows OR zero projects ON THIS
+  // ROW'S HOST — both hide-not-grey per shape; the zero-projects check uses
+  // submenuProjectsForRow so an identity on a host with no local projects
+  // hides the item even when other hosts have projects. "Remove from project"
+  // (slug null) lands the row in Conversations — any pin it carries is a
+  // stale one the project was outranking, so drop it too or the row would
+  // surface in Pinned instead. (handleSetPinned calls handleRowMoveToProject
+  // directly to clear a project while KEEPING the pin, so this lives here,
+  // not there.)
+  //
+  // createProject: "Move to → New project…", offered on every non-RDP row
+  // that handleRowMoveToProject can route (a relay room, or a row with a
+  // host), including hosts with no projects yet.
+  const rowActionsImplRef = useRef<RowActions | null>(null);
+  rowActionsImplRef.current = {
+    select: handleRowSelect,
+    setPinned: handleSetPinned,
+    deactivate: handleRowDeactivate,
+    kill: handleRowKill,
+    archive: (row) => {
+      void handleArchive(row);
+    },
+    swipeArchive: handleSwipeArchive,
+    moveToProject: (row, slug) => {
+      if (slug === null) unpinForProjectMoveRef.current(row);
+      handleRowMoveToProject(row, slug);
+    },
+    createProject: (row) => setCreateProjectForRow(row),
+  };
+  const rowActions = useMemo<RowActions>(
+    () => ({
+      select: (row) => rowActionsImplRef.current?.select(row),
+      setPinned: (row, want) => rowActionsImplRef.current?.setPinned(row, want),
+      deactivate: (row) => rowActionsImplRef.current?.deactivate(row),
+      kill: (row) => rowActionsImplRef.current?.kill(row),
+      archive: (row) => rowActionsImplRef.current?.archive(row),
+      swipeArchive: (row) => rowActionsImplRef.current?.swipeArchive(row),
+      moveToProject: (row, slug) =>
+        rowActionsImplRef.current?.moveToProject(row, slug),
+      createProject: (row) => rowActionsImplRef.current?.createProject(row),
+    }),
+    [],
+  );
+
+  // Identity projects live on the identity's host, so the modal is pinned
+  // there. Relay rooms carry no host — the modal keeps its host picker.
+  const createProjectLockedHostId = useMemo(() => {
+    const row = createProjectForRow;
+    if (row === null || (typeof row.roomId === "string" && row.roomId.length > 0)) {
+      return undefined;
+    }
+    const n = row.host ? parseInt(row.host.id, 10) : NaN;
+    return Number.isFinite(n) && n > 0 ? n : undefined;
+  }, [createProjectForRow]);
+
+  // ─── Nested projects: sub-project create, re-parent, drag ────────────────
+  // "New sub-project" opens the create modal pinned to the parent's host.
+  const [createSubProjectFor, setCreateSubProjectFor] = useState<
+    { slug: string; displayName: string; hostId: number } | null
+  >(null);
+  const handleNewSubProject = useCallback(
+    (slug: string, hostId?: string) => {
+      const proj = findProject(slug, hostId);
+      const n = proj ? parseInt(proj.hostId, 10) : NaN;
+      if (!proj || !(Number.isFinite(n) && n > 0)) {
+        console.warn({ operation: "new_sub_project_no_host", slug, hostId });
+        return;
+      }
+      setCreateSubProjectFor({ slug, displayName: proj.displayName, hostId: n });
+    },
+    [findProject],
+  );
+
+  // Resolved parent of every project section (tree from the store), used to
+  // tell a project's own subtree apart from legal new parents.
+  const sectionParentByKey = useMemo(() => {
+    const m = new Map<string, string | null>();
+    for (const s of projectSections) {
+      m.set(`${s.hostId ?? ""}::${s.slug}`, s.parentKey ?? null);
+    }
+    return m;
+  }, [projectSections]);
+  // Raw parent links (as written in each project file), keyed like
+  // sectionParentByKey. The backend refuses a move by following these, so a
+  // hand-edited loop — drawn at top level — must still not be offered.
+  const rawParentByKey = useMemo(() => {
+    const m = new Map<string, string | null>();
+    for (const p of projectsList) {
+      m.set(
+        `${p.hostId}::${p.slug}`,
+        typeof p.parent === "string" ? `${p.hostId}::${p.parent}` : null,
+      );
+    }
+    return m;
+  }, [projectsList]);
+  // True when `targetKey` is `rootKey` or anywhere beneath it, by the tree
+  // as drawn or by the raw parent links.
+  const isInSubtree = useCallback(
+    (targetKey: string, rootKey: string) => {
+      for (const links of [sectionParentByKey, rawParentByKey]) {
+        const seen = new Set<string>();
+        let cur: string | null = targetKey;
+        while (cur !== null && !seen.has(cur)) {
+          if (cur === rootKey) return true;
+          seen.add(cur);
+          cur = links.get(cur) ?? null;
+        }
+      }
+      return false;
+    },
+    [sectionParentByKey, rawParentByKey],
+  );
+
+  // Re-parent a project (null = top level). Optimistic: the host's project
+  // list is patched locally, then the write goes out; a failure restores
+  // the previous list and says why. The backend refuses loops and missing
+  // parents too — this side only avoids offering them.
+  const handleMoveProject = useCallback(
+    (slug: string, hostId: string, newParent: string | null) => {
+      const hostRows = getProjectsSnapshot().filter((p) => p.hostId === hostId);
+      const target = hostRows.find((p) => p.slug === slug);
+      const hostIdNum = parseInt(hostId, 10);
+      if (!target || !(Number.isFinite(hostIdNum) && hostIdNum > 0)) {
+        console.warn({ operation: "move_project_no_host", slug, hostId, newParent });
+        return;
+      }
+      if ((target.parent ?? null) === newParent) return;
+      if (newParent !== null && isInSubtree(`${hostId}::${newParent}`, `${hostId}::${slug}`)) {
+        console.warn({ operation: "move_project_refused_own_subtree", slug, hostId, newParent });
+        return;
+      }
+      console.info({
+        operation: "move_project",
+        slug,
+        hostId,
+        from: target.parent ?? null,
+        to: newParent,
+      });
+      mergeProjectsForHost(
+        hostId,
+        hostRows.map((p) => (p.slug === slug ? { ...p, parent: newParent } : p)),
+      );
+      setProjectParent(hostIdNum, slug, newParent).catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error({ operation: "move_project_failed", slug, hostId, newParent, errMessage: msg });
+        // Restore only if nothing newer replaced our optimistic row.
+        const now = getProjectsSnapshot().filter((p) => p.hostId === hostId);
+        if (now.find((p) => p.slug === slug)?.parent === newParent) {
+          mergeProjectsForHost(hostId, hostRows);
+        }
+        void kitAlert({ title: "Couldn't move this project", body: msg });
+      });
+    },
+    [isInSubtree],
+  );
+
+  // What a dragged project header may do over a given section.
+  const classifyProjectDropFor = useCallback(
+    (section: ProjectSection) =>
+      (dragged: DraggedProject): "accept" | "own-subtree" | "reject" => {
+        if (section.hostId !== undefined && section.hostId !== dragged.hostId) return "reject";
+        const targetKey = `${section.hostId ?? ""}::${section.slug}`;
+        if (isInSubtree(targetKey, `${dragged.hostId}::${dragged.slug}`)) return "own-subtree";
+        return "accept";
+      },
+    [isInSubtree],
+  );
+
+  // The project kebab's "Move to": Top level, then every project on the same
+  // host in tree order (indented), minus the project itself and its subtree.
+  // The checkmark and the no-op guard follow the parent the FILE names, not
+  // the drawn tree: a project in a loop (or whose parent is gone) is drawn at
+  // top level but still names a parent, and "Top level" must clear that —
+  // on a phone it's the only way out of a loop.
+  const projectMoveToItems = useCallback(
+    (section: ProjectSection): RowKebabSubmenuItem[] => {
+      const hostId = section.hostId;
+      if (hostId === undefined) return [];
+      const selfKey = `${hostId}::${section.slug}`;
+      const fileParent =
+        projectsList.find((p) => p.hostId === hostId && p.slug === section.slug)?.parent ?? null;
+      const items: RowKebabSubmenuItem[] = [
+        {
+          label: "Top level",
+          checked: fileParent === null,
+          onClick: () => {
+            if (fileParent !== null) handleMoveProject(section.slug, hostId, null);
+          },
+          testId: `pv-project-move-to-top-${section.slug}`,
+        },
+      ];
+      for (const s of projectSections) {
+        if (s.hostId !== hostId) continue;
+        const k = `${hostId}::${s.slug}`;
+        const isCurrent = s.slug === fileParent;
+        // The current parent always shows (ticked) — on a hand-edited loop
+        // it is also "beneath" this project by the raw links.
+        if (!isCurrent && isInSubtree(k, selfKey)) continue;
+        items.push({
+          label: s.displayName,
+          checked: isCurrent,
+          indent: s.depth ?? 0,
+          onClick: () => {
+            if (!isCurrent) handleMoveProject(section.slug, hostId, s.slug);
+          },
+          testId: `pv-project-move-to-${section.slug}-${s.slug}`,
+        });
+      }
+      return items;
+    },
+    [projectSections, projectsList, isInSubtree, handleMoveProject],
+  );
+
+  // Projects super-header as a drop target: a dragged project lands at top
+  // level.
+  const [projectsHeaderDragOver, setProjectsHeaderDragOver] = useState(false);
+  const onProjectsHeaderDragOver = useCallback((e: React.DragEvent<HTMLDivElement>) => {
+    if (!hasProjectMime(e.dataTransfer) || getDraggedProject() === null) return;
+    e.preventDefault();
+    e.stopPropagation();
+    e.dataTransfer.dropEffect = "move";
+    setProjectsHeaderDragOver(true);
+  }, []);
+  const onProjectsHeaderDragLeave = useCallback(() => {
+    setProjectsHeaderDragOver(false);
+  }, []);
+  const onProjectsHeaderDrop = useCallback(
+    (e: React.DragEvent<HTMLDivElement>) => {
+      setProjectsHeaderDragOver(false);
+      if (!hasProjectMime(e.dataTransfer)) return;
+      const dragged = getDraggedProject();
+      endProjectDrag();
+      if (dragged === null) return;
+      e.preventDefault();
+      e.stopPropagation();
+      handleMoveProject(dragged.slug, dragged.hostId, null);
+    },
+    [handleMoveProject],
+  );
+
+  // ─── Identity badges dropped on sidebar sections ──────────────────────────
+  // An open conversation's badge files the conversation exactly like its
+  // sidebar row would: the badge resolves to that row and the section
+  // handlers run on the row's payload. (Putting a badge AWAY — close /
+  // archive — lives on the BadgeDropLane, not the sidebar.) dragover can't
+  // read the payload, so acceptance resolves the badge captured at
+  // dragstart (badge-drag.ts); the drop itself resolves its own payload.
+  // dragover fires many times a second and every section asks, so the
+  // answer is remembered for the dragged badge (one object per drag).
+  const badgeDropCacheRef = useRef<{
+    badge: DraggedBadge;
+    sections: typeof projectSections;
+    payload: PrettyProjectDropPayload | null;
+  } | null>(null);
+  const resolveBadgeDrop = useCallback(
+    (badge: DraggedBadge | null): PrettyProjectDropPayload | null => {
+      if (badge === null) return null;
+      const cached = badgeDropCacheRef.current;
+      if (cached?.badge === badge && cached.sections === projectSections) return cached.payload;
+      const payload = badgeRowDropPayload(badge, [
+        ...rowsByIdRef.current.values(),
+        ...projectSections.flatMap((sec) => sec.rows),
+      ]);
+      badgeDropCacheRef.current = { badge, sections: projectSections, payload };
+      return payload;
+    },
+    [projectSections],
+  );
+
+  // Pinned / Conversations accept row drags and resolvable badge drags.
+  const acceptsSidebarDrag = useCallback(
+    (dt: DataTransfer | null | undefined): boolean =>
+      (!!dt && Array.from(dt.types).includes("application/x-skynet-row")) ||
+      (hasBadgeMime(dt) && resolveBadgeDrop(getDraggedBadge()) !== null),
+    [resolveBadgeDrop],
+  );
+
+  // The dropped payload: the row MIME, else the dropped badge's row.
+  const readSidebarDrop = useCallback(
+    (dt: DataTransfer | null | undefined): unknown => {
+      const raw = dt?.getData("application/x-skynet-row") ?? "";
+      if (raw === "") {
+        return hasBadgeMime(dt)
+          ? resolveBadgeDrop(parseBadgePayload(dt!.getData(BADGE_MIME)))
+          : null;
+      }
+      try {
+        return JSON.parse(raw);
+      } catch {
+        return null;
+      }
+    },
+    [resolveBadgeDrop],
+  );
+
+  const [isFlatMiddleDragOver, setIsFlatMiddleDragOver] = useState(false);
+
+  const { claim: claimFlatMiddlePreview, release: releaseFlatMiddlePreview } =
+    useDragPreviewClaim("convlist-flat-middle", () => setIsFlatMiddleDragOver(false));
+
+  const handleFlatMiddleDragOver = useCallback(
+    (e: React.DragEvent<HTMLDivElement>) => {
+      if (!acceptsSidebarDrag(e.dataTransfer)) return;
+      e.preventDefault();
+      setIsFlatMiddleDragOver(true);
+      claimFlatMiddlePreview();
+    },
+    [claimFlatMiddlePreview, acceptsSidebarDrag],
+  );
+
+  const handleFlatMiddleDragLeave = useCallback(
+    (e: React.DragEvent<HTMLDivElement>) => {
+      if (!acceptsSidebarDrag(e.dataTransfer)) return;
+      const rect = e.currentTarget.getBoundingClientRect();
+      const stillInside =
+        e.clientX >= rect.left &&
+        e.clientX <= rect.right &&
+        e.clientY >= rect.top &&
+        e.clientY <= rect.bottom;
+      if (stillInside) return;
+      setIsFlatMiddleDragOver(false);
+      releaseFlatMiddlePreview();
+    },
+    [releaseFlatMiddlePreview, acceptsSidebarDrag],
+  );
+
+  const handleFlatMiddleDrop = useCallback(
+    (e: React.DragEvent<HTMLDivElement>) => {
+      setIsFlatMiddleDragOver(false);
+      releaseFlatMiddlePreview();
+      const parsed = readSidebarDrop(e.dataTransfer);
+      if (parsed === null || typeof parsed !== "object") return;
+      const p = parsed as {
+        id?: string;
+        host?: { id: string } | null;
+        targetTmuxSession?: string | null;
+        matrixRoomId?: string | null;
+        rdpHostRow?: boolean;
+        identityKey?: string | null;
+      };
+      if (typeof p.id !== "string" || p.id.length === 0) return;
+      if (p.rdpHostRow === true) return; // D-08 defense
+      // Drop on Other = "neither pinned nor in a project". Two actions may
+      // fire; either is optional but at least one must apply or this is a
+      // no-op. Order: unpin first (pure store write, no async), then clear
+      // project (network round-trip).
+      const currentSlug = rowIdToProjectSlug.get(p.id);
+      const inProject = currentSlug !== undefined;
+      const shadowFleetId =
+        p.host && typeof p.host.id === "string" && p.targetTmuxSession
+          ? fleetRowId(parseInt(p.host.id, 10), p.targetTmuxSession)
+          : null;
+      const openTabPinned = pinnedIds.has(p.id);
+      const shadowPinned = shadowFleetId !== null && pinnedIds.has(shadowFleetId);
+      const isPinned = openTabPinned || shadowPinned;
+      if (!inProject && !isPinned) return; // no-op — nothing to change
+      e.preventDefault();
+      e.stopPropagation();
+      if (isPinned) {
+        console.info(`[pin-drop] unpin from Other id=${p.id} openTab=${openTabPinned} shadow=${shadowPinned}`);
+        if (openTabPinned) unpinConversation(p.id);
+        if (shadowPinned && shadowFleetId !== null) unpinConversation(shadowFleetId);
+      }
+      if (!inProject) return;
+      // Route the clear the same way handleProjectDrop routes an assign,
+      // but with slug=null.
+      if (typeof p.matrixRoomId === "string" && p.matrixRoomId.length > 0) {
+        if (!viewingUserMxid) {
+          console.warn(`[project-drop] skipping clear — viewing user mxid not yet resolved`);
+          return;
+        }
+        console.info(`[project-drop] clear kind=relay-room roomId=${p.matrixRoomId}`);
+        const rollbackClear = patchRoomProjectAssignment(p.matrixRoomId, null);
+        setRelayRoomProject(p.matrixRoomId, viewingUserMxid, null).catch(
+          (err: unknown) => {
+            rollbackClear();
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error(`[project-drop] setRelayRoomProject(null) failed: ${msg}`);
+          },
+        );
+        return;
+      }
+      if (!p.host || typeof p.host.id !== "string") return;
+      const hostIdNum = parseInt(p.host.id, 10);
+      if (!Number.isFinite(hostIdNum) || hostIdNum <= 0) return;
+      const identityKey =
+        p.identityKey ??
+        (p.targetTmuxSession
+          ? sessionMatchKey(p.targetTmuxSession) ?? p.targetTmuxSession
+          : null);
+      if (!identityKey) return;
+      console.info(`[project-drop] clear kind=identity hostId=${hostIdNum} key=${identityKey}`);
+      setSessionProject(hostIdNum, identityKey, null).catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[project-drop] setSessionProject(null) failed: ${msg}`);
+      });
+    },
+    [rowIdToProjectSlug, viewingUserMxid, pinnedIds, releaseFlatMiddlePreview, readSidebarDrop],
+  );
+
+  // Pinned-zone drop lane — mirror of the flat-middle machinery. Drop a row
+  // onto the Pinned wrapper to pin it (if not already pinned). Uses the same
+  // dual-shape write pattern as handleTogglePin: prefer the fleet-synthetic
+  // shadow id when host+targetTmuxSession are available so the pin survives
+  // openTab id churn across URL-restores.
+  const [isPinnedZoneDragOver, setIsPinnedZoneDragOver] = useState(false);
+
+  // project-scoped apps: dropping a project app's row on the Apps section
+  // moves it to the sidebar (desktop drag; the menu's Move to elsewhere).
+  const [isAppsZoneDragOver, setIsAppsZoneDragOver] = useState(false);
+  const { claim: claimAppsPreview, release: releaseAppsPreview } =
+    useDragPreviewClaim("convlist-apps", () => setIsAppsZoneDragOver(false));
+  const draggedProjectApp = (dt: DataTransfer | null | undefined) => {
+    if (!hasAppMime(dt)) return null;
+    const dragged = getDraggedApp();
+    return dragged !== null && dragged.owner === null && dragged.project !== null ? dragged : null;
+  };
+  const handleAppsZoneDragOver = useCallback(
+    (e: React.DragEvent<HTMLDivElement>) => {
+      if (draggedProjectApp(e.dataTransfer) === null) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "move";
+      setIsAppsZoneDragOver(true);
+      claimAppsPreview();
+    },
+    [claimAppsPreview],
+  );
+  const handleAppsZoneDragLeave = useCallback(
+    (e: React.DragEvent<HTMLDivElement>) => {
+      if (draggedProjectApp(e.dataTransfer) === null) return;
+      const rect = e.currentTarget.getBoundingClientRect();
+      if (e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom) return;
+      setIsAppsZoneDragOver(false);
+      releaseAppsPreview();
+    },
+    [releaseAppsPreview],
+  );
+  const handleAppsZoneDrop = useCallback(
+    (e: React.DragEvent<HTMLDivElement>) => {
+      setIsAppsZoneDragOver(false);
+      releaseAppsPreview();
+      if (draggedProjectApp(e.dataTransfer) === null) return;
+      const dragged = droppedApp(e.dataTransfer);
+      e.preventDefault();
+      endAppDrag();
+      if (dragged === null) return;
+      void moveApp(dragged, { to: "sidebar" });
+    },
+    [releaseAppsPreview],
+  );
+  // project-scoped apps: an app dropped on a project's section moves there.
+  const handleAppDropOnProject = useCallback((dragged: DraggedApp, projectSlug: string) => {
+    void moveApp(dragged, { to: "project", project: projectSlug });
+  }, []);
+
+  const { claim: claimPinnedPreview, release: releasePinnedPreview } =
+    useDragPreviewClaim("convlist-pinned", () => setIsPinnedZoneDragOver(false));
+
+  const handlePinnedZoneDragOver = useCallback(
+    (e: React.DragEvent<HTMLDivElement>) => {
+      if (!acceptsSidebarDrag(e.dataTransfer)) return;
+      e.preventDefault();
+      setIsPinnedZoneDragOver(true);
+      claimPinnedPreview();
+    },
+    [claimPinnedPreview, acceptsSidebarDrag],
+  );
+
+  const handlePinnedZoneDragLeave = useCallback(
+    (e: React.DragEvent<HTMLDivElement>) => {
+      if (!acceptsSidebarDrag(e.dataTransfer)) return;
+      const rect = e.currentTarget.getBoundingClientRect();
+      const stillInside =
+        e.clientX >= rect.left &&
+        e.clientX <= rect.right &&
+        e.clientY >= rect.top &&
+        e.clientY <= rect.bottom;
+      if (stillInside) return;
+      setIsPinnedZoneDragOver(false);
+      releasePinnedPreview();
+    },
+    [releasePinnedPreview, acceptsSidebarDrag],
+  );
+
+  const handlePinnedZoneDrop = useCallback(
+    (e: React.DragEvent<HTMLDivElement>) => {
+      setIsPinnedZoneDragOver(false);
+      releasePinnedPreview();
+      const parsed = readSidebarDrop(e.dataTransfer);
+      if (parsed === null || typeof parsed !== "object") return;
+      const p = parsed as {
+        id?: string;
+        host?: { id: string } | null;
+        targetTmuxSession?: string | null;
+        rdpHostRow?: boolean;
+      };
+      if (typeof p.id !== "string" || p.id.length === 0) return;
+      if (p.rdpHostRow === true) return; // D-08 defense
+      const shadowFleetId =
+        p.host && typeof p.host.id === "string" && p.targetTmuxSession
+          ? fleetRowId(parseInt(p.host.id, 10), p.targetTmuxSession)
+          : null;
+      const openTabPinned = pinnedIds.has(p.id);
+      const shadowPinned = shadowFleetId !== null && pinnedIds.has(shadowFleetId);
+      const inProject = rowIdToProjectSlug.has(p.id);
+      if ((openTabPinned || shadowPinned) && !inProject) return; // already pinned — no-op
+      if (!isIdentityRow(p)) return; // non-identity rows aren't pinnable
+      e.preventDefault();
+      e.stopPropagation();
+      if (openTabPinned || shadowPinned) {
+        // Stale pin on a project member (project outranks it in the sidebar):
+        // pinConversation would no-op, so take it out of the project directly.
+        const row = projectSections
+          .flatMap((sec) => sec.rows)
+          .find((r) => r.id === p.id);
+        console.info(`[pin-drop] stale pin on project member — clearing project rowId=${p.id}`);
+        if (row) handleRowMoveToProjectRef.current?.(row, null);
+        return;
+      }
+      const targetId = shadowFleetId ?? p.id;
+      console.info(`[pin-drop] pin id=${targetId} (from rowId=${p.id})`);
+      pinConversation(targetId);
+    },
+    [pinnedIds, releasePinnedPreview, rowIdToProjectSlug, projectSections, readSidebarDrop],
+  );
+
+  // Phase 117 M-F follow-up (2026-09-18): the section's SquarePen opens the
+  // NEW-AGENT dialog (NewSessionDialog) with a pending project slug. After
+  // the identity is born, the NewSessionDialog's onCreate wrapper below
+  // fires setSessionProject(host, identityKey, slug) as a fire-and-forget
+  // call so the newborn identity's frontmatter carries `project:` from the
+  // first sweep tick. Was: opened NewConversationModal (relay-room path) —
+  // that flow rejected by the user 2026-09-18 in favor of "new agent mode".
+  //
+  // Phase 117 M-I follow-up (2026-09-19): also stash the project's hostId
+  // so the dialog renders with a single-host tree (picker auto-hides).
+  const handleNewConversationInProject = useCallback(
+    (slug: string, hostId?: string) => {
+      setNewSessionPendingProjectSlug(slug);
+      // Resolve the project's home host (projects live per-host; the newborn
+      // agent must be born on the SAME host to appear under the section).
+      const proj = findProject(slug, hostId);
+      const projHostIdNum = proj ? parseInt(proj.hostId, 10) : NaN;
+      setNewSessionPendingProjectHostId(
+        Number.isFinite(projHostIdNum) && projHostIdNum > 0
+          ? projHostIdNum
+          : null,
+      );
+      setNewSessionDialogOpen(true);
+    },
+    [findProject],
+  );
+
+  // Phase 117 Plan 117-09 Task 2 (D-28, D-29, D-30 + Fix 3) — archive
+  // project cascade, extended to the whole subtree for nested projects.
+  // Sequence:
+  //   1. Collect the project and every sub-project beneath it (resolved tree
+  //      from the store) and all their member rows.
+  //   2. Confirm, naming the project and counting sub-projects, agents and
+  //      relay rooms.
+  //   3. Move each folder to ~/fleet/projects/archive/, deepest first, so a
+  //      failure part-way never leaves a sub-project whose parent survives
+  //      but is half-archived — anything left behind still shows (at top
+  //      level if its parent went). If the host can't be resolved or a move
+  //      fails, alert; members of projects that didn't move are left alone.
+  //   4. Run ONE Promise.allSettled batch that includes BOTH identity-
+  //      archive calls (archiveIdentity per identity member, after closing
+  //      its pane and optimistically removing its row) AND relay-room
+  //      tag-clear calls (setRelayRoomProject(null) per relay-room member).
+  //      One shared wait boundary per Fix 3.
+  //   5. Log partial failures via console.error and alert the user. The
+  //      archive itself is one-way (Phase 115 semantics); only a failed
+  //      member's optimistic sidebar removal is rolled back.
+  //
+  // RDP rows are defense-in-depth guarded (D-08) — the derived selector
+  // should never emit them into a project section, but the filter here is
+  // a safety net.
+  const handleArchiveProject = useCallback(
+    async (slug: string, hostId?: string) => {
+      // 1. The project's section plus every section beneath it, in tree
+      //    order (parent first).
+      //    Read from the latest snapshot: the kit confirm doesn't freeze the
+      //    page, so this runs again after it to pick up membership changes.
+      const collectSubtree = () => {
+        const sections = projectSectionsRef.current;
+        const root = sections.find(
+          (s) => s.slug === slug && (hostId === undefined || s.hostId === undefined || s.hostId === hostId),
+        );
+        const sectionKey = (s: { slug: string; hostId?: string }) => `${s.hostId ?? ""}::${s.slug}`;
+        const tree: typeof sections = [];
+        if (root) {
+          const inSubtree = new Set<string>([sectionKey(root)]);
+          for (const s of sections) {
+            if (s === root) {
+              tree.push(s);
+              continue;
+            }
+            const pk = s.parentKey ?? null;
+            if (pk !== null && inSubtree.has(pk)) {
+              inSubtree.add(sectionKey(s));
+              tree.push(s);
+            }
+          }
+        }
+        return { section: root, subtree: tree };
+      };
+      const { section, subtree } = collectSubtree();
+      const subProjects = subtree.slice(1);
+      const members = subtree.flatMap((s) => s.rows);
+      const isRoomRow = (r: (typeof members)[number]) =>
+        !!(r as { matrixRoomId?: string | null }).matrixRoomId ||
+        !!(r as { roomId?: string | null }).roomId;
+      const nonRdpMembers = members.filter((r) => r.rdpHostRow !== true);
+      const agentCount = nonRdpMembers.filter((r) => !isRoomRow(r)).length;
+      const roomCount = nonRdpMembers.filter(isRoomRow).length;
+      // 2. Resolve the host — hostId comes from the project's own row
+      //    (D-01; M7: never infer it); every sub-project lives on the same
+      //    host by construction.
+      const proj = findProject(slug, hostId);
+      const projHostIdNum = proj ? parseInt(proj.hostId, 10) : NaN;
+      if (!proj || !(Number.isFinite(projHostIdNum) && projHostIdNum > 0)) {
+        console.warn({
+          operation: "archive_project_folder_move_skipped_no_host",
+          slug,
+          reason: proj
+            ? "project host invalid"
+            : "project not found in projectsList",
+        });
+        void kitAlert({
+          title: "Couldn't archive this project",
+          body: "Its host couldn't be determined. Nothing was archived.",
+        });
+        return;
+      }
+      // The sidebar only knows the sub-projects this user can see; archiving
+      // must take the whole subtree, so ask the host first and refuse when
+      // some of it is hidden from them.
+      const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+      const name = section?.displayName ?? slug;
+      if (subtree.length > 0) {
+        let hiddenSubProjects = 0;
+        try {
+          ({ hiddenSubProjects } = await getArchivePreflight(projHostIdNum, slug));
+        } catch (err) {
+          console.error({
+            operation: "archive_project_preflight_failed",
+            slug,
+            hostId: projHostIdNum,
+            errMessage: err instanceof Error ? err.message : "unknown",
+          });
+          void kitAlert({
+            title: `Couldn't check "${name}"`,
+            body: "Couldn't check it before archiving. Nothing was archived.",
+          });
+          return;
+        }
+        if (hiddenSubProjects > 0) {
+          console.info({
+            operation: "archive_project_refused_hidden_sub_projects",
+            slug,
+            hostId: projHostIdNum,
+            hiddenSubProjects,
+          });
+          void kitAlert({
+            title: `Can't archive "${name}"`,
+            body: `${plural(hiddenSubProjects, "sub-project")} inside it ${hiddenSubProjects === 1 ? "is" : "are"} hidden from you. Nothing was archived.`,
+          });
+          return;
+        }
+      }
+      // 3. Confirm with counts. It opens at once; Archive waits for the
+      //    agents' wake-up checks, which add the agents whose wake-ups would
+      //    stop with them.
+      const agentTargets = nonRdpMembers
+        .filter((r) => !isRoomRow(r))
+        .map((r) => archiveTarget(r))
+        .filter((t): t is NonNullable<typeof t> => t !== null);
+      const confirmBody = (wakeupWarning: string) => {
+        const lines: string[] = [];
+        if (subProjects.length > 0) {
+          lines.push(
+            agentCount > 0
+              ? `This also archives its ${plural(subProjects.length, "sub-project")} and the ${plural(agentCount, "agent")} across them.`
+              : `This also archives its ${plural(subProjects.length, "sub-project")}.`,
+          );
+        } else if (agentCount > 0) {
+          lines.push(`This also archives the ${plural(agentCount, "agent")} in it.`);
+        }
+        if (roomCount > 0) {
+          lines.push(
+            `${plural(roomCount, "relay room")} will move back to Conversations.`,
+          );
+        }
+        if (wakeupWarning) lines.push(wakeupWarning);
+        lines.push("This can't be undone. Move conversations out first to keep them.");
+        return lines.join("\n\n");
+      };
+      console.info({
+        operation: "archive_project_confirm_shown",
+        slug,
+        hostId,
+        subProjectCount: subProjects.length,
+        agentCount,
+        roomCount,
+      });
+      const ready = checkActiveWakeupsForAgents(
+        agentTargets.map((t) => ({ hostId: t.hostIdNum, identityKey: t.identityKey, label: t.label })),
+      ).then((wakeupChecks) => {
+        console.info({
+          operation: "archive_project_wakeups_checked",
+          slug,
+          agentsWithWakeups: wakeupChecks.filter((r) => r.check.status === "checked" && r.check.active.length > 0).length,
+          agentsUnchecked: wakeupChecks.filter((r) => r.check.status === "unknown").length,
+        });
+        return {
+          body: confirmBody(
+            multiAgentWakeupWarning(wakeupChecks.map(({ agent, check }) => ({ label: agent.label, check }))),
+          ),
+        };
+      });
+      const proceed = await kitConfirm({
+        title: `Archive "${name}"?`,
+        body: confirmBody(""),
+        ready,
+        confirmLabel: "Archive",
+        destructive: true,
+      });
+      if (!proceed) return;
+      // 4. Folder moves FIRST, deepest first (host resolved above), over the
+      //    subtree as it is now.
+      const latestSubtree = collectSubtree().subtree;
+      const toMove: Array<{ slug: string; rows: typeof members }> =
+        latestSubtree.length > 0 ? latestSubtree : [{ slug, rows: [] }];
+      const moved: typeof toMove = [];
+      let moveError: unknown = null;
+      for (const s of [...toMove].reverse()) {
+        try {
+          await archiveProject(projHostIdNum, s.slug);
+          moved.push(s);
+        } catch (err) {
+          moveError = err;
+          console.error({
+            operation: "archive_project_folder_move_failed",
+            slug: s.slug,
+            rootSlug: slug,
+            hostId: projHostIdNum,
+            movedSoFar: moved.length,
+            errMessage: err instanceof Error ? err.message : "unknown",
+          });
+          break;
+        }
+      }
+      if (moveError !== null) {
+        const msg = moveError instanceof Error ? moveError.message : String(moveError);
+        void kitAlert(
+          moved.length === 0
+            ? { title: "Couldn't archive this project", body: `${msg}. Nothing was archived.` }
+            : {
+                title: "Couldn't finish archiving this project",
+                body: `${msg}. ${plural(moved.length, "project")} beneath it ${moved.length === 1 ? "was" : "were"} archived; the rest are still in the sidebar.`,
+              },
+        );
+        if (moved.length === 0) return;
+      }
+      console.info({
+        operation: "archive_project_folders_moved",
+        slug,
+        hostId: projHostIdNum,
+        movedSlugs: moved.map((s) => s.slug),
+      });
+      // Only members of projects that actually moved are archived/released.
+      const movedMembers = moved
+        .flatMap((s) => s.rows)
+        .filter((r) => r.rdpHostRow !== true);
+      // Agents are archived only if the confirm counted them — one moved in
+      // while it was up just falls back to the unassigned list. (Rooms only
+      // lose their tag, so every room inside is released.)
+      const countedIds = new Set(members.map((r) => r.id));
+      const identityMembers = movedMembers.filter((r) => !isRoomRow(r) && countedIds.has(r.id));
+      const relayRoomMembers = movedMembers.filter(isRoomRow);
+      // 5. Member ops in one Promise.allSettled batch. Identity members get
+      //    the same optimistic removal as a single-row archive (pending mark
+      //    + row drop), so they don't fall into the unassigned list for the
+      //    ~15s until the supervisor retires them. Relay-room members get a
+      //    tag clear (Fix 3 — the room itself survives).
+      const ops: Promise<unknown>[] = [];
+      const hostForRow = (
+        row: { host?: { id: string } | null; targetTmuxSession?: string | null },
+      ) => {
+        if (!row.host || typeof row.host.id !== "string") return null;
+        const n = parseInt(row.host.id, 10);
+        if (!Number.isFinite(n) || n <= 0) return null;
+        const key = row.targetTmuxSession
+          ? sessionMatchKey(row.targetTmuxSession) ?? row.targetTmuxSession
+          : null;
+        if (!key) return null;
+        return { hostId: n, identityKey: key, sessionName: row.targetTmuxSession as string };
+      };
+      for (const r of identityMembers) {
+        const parsed = hostForRow(r);
+        if (!parsed) continue;
+        // Close the member's pane if open, as handleArchive does.
+        if (activeSetRef.current.has(r.id)) {
+          handleRowDeactivateRef.current(r);
+        }
+        const undoRemove = optimisticArchiveRemove(parsed.hostId, parsed.sessionName, parsed.identityKey);
+        ops.push(
+          archiveIdentity(parsed.hostId, parsed.identityKey).catch((err: unknown) => {
+            undoRemove();
+            throw err;
+          }),
+        );
+      }
+      // relay-room tag-clear ops require the viewing user's mxid (D-05a).
+      if (relayRoomMembers.length > 0) {
+        if (!viewingUserMxid) {
+          console.warn({
+            operation: "archive_project_relay_members_skipped_no_mxid",
+            slug,
+            relayRoomMemberCount: relayRoomMembers.length,
+          });
+        } else {
+          for (const r of relayRoomMembers) {
+            const roomId =
+              (r as { matrixRoomId?: string | null }).matrixRoomId ??
+              (r as { roomId?: string | null }).roomId ??
+              null;
+            if (typeof roomId !== "string" || roomId.length === 0) continue;
+            // Fix 3 gate: setRelayRoomProject(roomId, mxid, null) is the
+            // canonical tag-clear call. The literal `null` third arg is
+            // asserted by the acceptance grep on this file.
+            const undoTag = patchRoomProjectAssignment(roomId, null);
+            ops.push(
+              setRelayRoomProject(roomId, viewingUserMxid, null).catch((err: unknown) => {
+                undoTag();
+                throw err;
+              }),
+            );
+          }
+        }
+      }
+      const results = await Promise.allSettled(ops);
+      const failures = results.filter((r) => r.status === "rejected");
+      if (failures.length > 0) {
+        console.error({
+          operation: "archive_project_partial_member_failures",
+          slug,
+          failureCount: failures.length,
+          totalOps: ops.length,
+          failures: failures.map((f) =>
+            f.status === "rejected"
+              ? f.reason instanceof Error
+                ? f.reason.message
+                : String(f.reason)
+              : "",
+          ),
+        });
+        void kitAlert({
+          title: "Some conversations weren't archived",
+          body: `The project was archived, but ${failures.length} of its ${ops.length} conversation${ops.length === 1 ? "" : "s"} couldn't be archived. They're back in the sidebar, outside any project.`,
+        });
+      }
+    },
+    [projectSections, findProject, viewingUserMxid],
+  );
+
+  // Phase 117 Plan 117-09 Task 2 (D-14) — handleSectionContextMenu RETIRED
+  // by shape-sidebar-header-affordances. The project header's RowKebabMenu
+  // calls handleOpenProject / handleRenameProject / handleArchiveProject
+  // directly; the coord-based projectContextMenu middleman is gone.
+
+  // "Edit project" menu item: resolve the project's host from projectsList
+  // (same lookup pattern as handleArchiveProject above — projects live under a
+  // specific host's ~/fleet/projects/ tree per D-01) and open the
+  // ProjectModal. If the slug isn't in projectsList (should never happen —
+  // the menu opens from a rendered section header), log a warning and no-op
+  // rather than silently opening against an ambiguous host.
+  const handleOpenProject = useCallback(
+    (slug: string, hostId?: string) => {
+      const proj = findProject(slug, hostId);
+      const projHostIdNum = proj ? parseInt(proj.hostId, 10) : NaN;
+      if (!proj || !(Number.isFinite(projHostIdNum) && projHostIdNum > 0)) {
+        // eslint-disable-next-line no-console
+        console.warn({
+          operation: "open_project_no_host",
+          slug,
+          reason: proj
+            ? "project host invalid"
+            : "project not found in projectsList",
+        });
+        return;
+      }
+      setProjectModal({
+        slug,
+        displayName: proj.displayName,
+        hostId: projHostIdNum,
+      });
+    },
+    [findProject],
+  );
+
+  // Rename via context menu: kit prompt + frontmatter swap. Keeps the
+  // change tiny — no dedicated backend endpoint — by round-tripping through the
+  // existing GET/PUT /projects/:slug/file pair. The PUT handler publishes
+  // publishProjectListChanged, which fans out to every connected client and
+  // repaints the sidebar section header without a manual refresh.
+  //
+  // Frontmatter mutation strategy: match the FIRST `displayName:` line inside
+  // the leading `---` fence and rewrite its value. If no frontmatter or no
+  // displayName key is present, prepend a minimal `--- displayName: <n> ---`
+  // block — a fresh project.md that has never been edited has exactly that
+  // shape (writeProjectFile's initial write per identity-artifact-reader.ts).
+  const handleRenameProject = useCallback(
+    (slug: string, currentDisplayName: string, hostId?: string) => {
+      const proj = findProject(slug, hostId);
+      const projHostIdNum = proj ? parseInt(proj.hostId, 10) : NaN;
+      if (!proj || !(Number.isFinite(projHostIdNum) && projHostIdNum > 0)) {
+        // eslint-disable-next-line no-console
+        console.warn({
+          operation: "rename_project_no_host",
+          slug,
+          reason: proj
+            ? "project host invalid"
+            : "project not found in projectsList",
+        });
+        return;
+      }
+
+      void (async () => {
+        const raw = await kitPrompt({
+          title: "Rename project",
+          defaultValue: currentDisplayName,
+          confirmLabel: "Rename",
+          validate: (v) =>
+            v.trim().length === 0
+              ? "Enter a name."
+              : v.trim().length > 80
+                ? "Name must be 80 characters or fewer."
+                : null,
+        });
+        if (raw === null) return; // Cancel
+        const next = raw.trim();
+        if (next.length === 0 || next.length > 80) return; // validate blocks > 80
+        if (next === currentDisplayName) return; // No-op
+        try {
+          const { markdown } = await getProjectFile(projHostIdNum, slug);
+          const rewritten = rewriteDisplayNameInFrontmatter(markdown, next);
+          await updateProjectFile(projHostIdNum, slug, rewritten);
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.warn({
+            operation: "rename_project_failed",
+            slug,
+            hostId: projHostIdNum,
+            errMessage: err instanceof Error ? err.message : "unknown",
+          });
+          void kitAlert({
+            title: "Couldn't rename the project",
+            body: err instanceof Error ? err.message : "unknown error",
+          });
+        }
+      })();
+    },
+    [findProject],
+  );
+
+  // Phase 22 (SRIC-04): label for the `+ New role` launcher button.
+  const newRoleLabel = t("nav.newRole", {
+    defaultValue: "New role",
+  });
+  const rdpSectionLabel = t("nav.conversations.rdpSection", {
+    defaultValue: "Remote desktop",
+  });
+  const loadingLabel = t("nav.conversations.loading", {
+    defaultValue: "Loading conversations…",
+  });
+
+  return (
+    // The sidebar's menus (rows, headings, app icons) take the windows' menu
+    // look — same as inside a window.
+    <KitScopeContext.Provider value={SIDEBAR_KIT_SCOPE}>
+    <div
+      className="relative flex flex-col flex-1 min-h-0 overflow-hidden pb-[env(safe-area-inset-bottom)]"
+      data-testid="pretty-conversations-panel"
+      data-variant={variant}
+    >
+      {/* Header: mock v4 `.pv-panel-header` treatment (14px 16px padding +
+          hairline border-bottom via --color-pv-border-quiet, 12px UPPERCASE
+          700-weight 0.1em-tracked title in --color-pv-fg, 32x32 transparent
+          pencil with 8px radius + --color-pv-fg-muted icon). Layout + all
+          typography + all button chrome come from the CSS class declared in
+          pretty-conversations.css. Retain `shrink-0` on the container to
+          defend against parent-flex shrinking; everything else (display:
+          flex, align-items: center, justify-content: space-between, padding,
+          border-bottom) comes from `.pv-panel-header`.
+
+          Layout branches on `variant`:
+            desktop → title (left) + pencil (right)
+            mobile  → empty left, pencil only (right)  */}
+      <div className="pv-panel-header shrink-0" data-sidebar-toggle-overlaps={sidebarToggleOverlaps ? "true" : "false"}>
+        {/* .pv-panel-header-row wraps the title + actions. Patch #142
+            data-sidebar-toggle-overlaps attribute stays on the outer
+            .pv-panel-header (unchanged). */}
+        <div className="pv-panel-header-row">
+          {/* Patch #144 Fix (f): title renders on BOTH mobile and desktop.
+              Prior handoff note "deliberately left off per Phase 10 design"
+              was wrong per user 2026-07-24. */}
+          <span
+            className="pv-title"
+            style={{ display: "inline-flex", alignItems: "center", gap: 8 }}
+          >
+            <a
+              href={`${getBasePath()}/`}
+              aria-label={`${brandingConfig.appName} home`}
+              data-testid="pv-header-home-link"
+              style={{ display: "inline-flex", alignItems: "center", gap: 8 }}
+            >
+              <img
+                src={brandingConfig.iconPath}
+                alt=""
+                aria-hidden="true"
+                className="pv-header-logo"
+              />
+            </a>
+          </span>
+          <div className="pv-header-actions">
+            {/* Header icon buttons — see each button's own inline note for
+                its individual rationale. The showPencilButton-gated cluster
+                (New conversation, Create project, Scheduled Agents, kebab)
+                appears/disappears together based on typeof onCreateSession
+                === "function". Send feedback lives inside the sidebar
+                footer (docked above the anchor+actions row) — see the
+                .pv-panel-footer render below. Search moved OUT of this
+                cluster to a dedicated sidebar-search input row below the
+                header (shape-sidebar-search-inline). No
+                numbered enumeration here because it goes stale every time
+                the shape shifts; walking the JSX in order is authoritative. */}
+            {showPencilButton && (
+                <button
+                  type="button"
+                  className="pv-pencil"
+                  aria-label="New conversation"
+                  title="New conversation"
+                  data-testid="pv-header-new-agent-button"
+                  onClick={() => {
+                    // A plain new conversation: no project or chain left over
+                    // from an earlier open that didn't close through the dialog.
+                    setNewSessionPendingProjectSlug(null);
+                    setNewSessionPendingProjectHostId(null);
+                    setChainPrefill(null);
+                    setNewSessionDialogOpen(true);
+                  }}
+                >
+                  <SquarePen size={18} />
+                </button>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* shape-sidebar-search-inline: sidebar-search input row. Sibling of
+          .pv-panel-header and .pv-panel-scroll — sits in the fixed top region
+          directly below the header icon-button row and never scrolls. Live
+          substring filter (case-insensitive) across every sidebar row against
+          the union of every candidate string that could render on either of
+          the row's two lines. The everywhere-link + Escape + filter apply
+          land in follow-up tasks; task 2 wires the input surface only. */}
+      <div className="pv-sidebar-search shrink-0" data-testid="pv-sidebar-search-container">
+        {/* /close code-review 2026-09-29: outer wrap changed from <label> to
+            <div> — HTML spec prohibits interactive content (the everywhere
+            <button>) inside <label>. Click-anywhere-to-focus-input behavior
+            is preserved via the explicit onClick on the wrap. */}
+        <div
+          className="pv-sidebar-search-wrap"
+          onClick={() => sidebarSearchInputRef.current?.focus()}
+        >
+          <Search size={14} className="pv-sidebar-search-icon" aria-hidden="true" />
+          <input
+            ref={sidebarSearchInputRef}
+            type="text"
+            value={sidebarSearchQuery}
+            onChange={(e) => setSidebarSearchQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                // /close code-review 2026-09-29: gate Enter-escalation on
+                // sidebarSearchActive — the everywhere affordance only
+                // materializes when the input has content, and Enter must
+                // follow the same "no content = no escalation" rule.
+                if (sidebarSearchActive) openSearchEverywhere();
+              } else if (e.key === "Escape") {
+                // shape-sidebar-search-inline task 6: Escape clears + blurs.
+                setSidebarSearchQuery("");
+                sidebarSearchInputRef.current?.blur();
+              }
+            }}
+            placeholder="Search"
+            className="pv-sidebar-search-input"
+            data-testid="pv-sidebar-search-input"
+            aria-label="Search sidebar"
+          />
+          {/* shape-sidebar-search-inline: "everywhere ↗" escalation link.
+              Hidden at rest; fades in when the input has content (see
+              .pv-sidebar-search-everywhere.visible in the CSS). Clicking
+              opens ConversationSearchModal pre-populated with the current
+              trimmed query via openSearchEverywhere. tabIndex flips with
+              visibility so keyboard focus doesn't land on an invisible link. */}
+          <button
+            type="button"
+            className={`pv-sidebar-search-everywhere${sidebarSearchActive ? " visible" : ""}`}
+            onClick={openSearchEverywhere}
+            data-testid="pv-sidebar-search-everywhere-link"
+            aria-label="Search everywhere"
+            tabIndex={sidebarSearchActive ? 0 : -1}
+          >
+            everywhere ↗
+          </button>
+          {/* Clear button — shown while there's text. Clearing keeps focus in
+              the input (mousedown is swallowed so the click doesn't blur it);
+              Escape is the clear-and-leave path. */}
+          {sidebarSearchQuery.length > 0 && (
+            <KitIconButton
+              label="Clear search"
+              size="sm"
+              className="pv-sidebar-search-clear"
+              data-testid="pv-sidebar-search-clear"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={(e) => {
+                e.stopPropagation();
+                setSidebarSearchQuery("");
+                sidebarSearchInputRef.current?.focus();
+              }}
+            >
+              <X />
+            </KitIconButton>
+          )}
+        </div>
+      </div>
+
+      {/* Scroll region: safe-area padding lives on outer container (patch #131)
+          so the panel bottom sits ABOVE the safe-area — settings row is not
+          covered when scroll is at rest. Search entry lives in a dedicated
+          input row directly above this scroll region (see
+          shape-sidebar-search-inline); ConversationSearchModal remains as
+          the "search everywhere" escalation target, opened from the
+          everywhere-link that materializes on-input in that search row. */}
+      <div ref={scrollRegionRef} className="pv-panel-scroll min-h-0">
+        {/* Load-in-flight affordance. Renders at the top of the scroll region
+            while the fleet enumeration is still in flight; disappears once
+            useFleetSessionsLoaded() flips true. RDP and openTab rows tend to
+            arrive first (host-tree endpoint), so consumers with RDP hosts
+            see the strip above already-rendered rows, while RDP-less
+            consumers see just the strip on an otherwise empty panel — both
+            get an explicit "more is coming" signal instead of a blank flash.
+            No separate empty-state card: the header chrome is affordance
+            enough when the list is genuinely empty post-load. */}
+        {!fleetSessionsLoaded && (
+          <div
+            role="status"
+            aria-busy="true"
+            aria-label={loadingLabel}
+            data-testid="pretty-conversations-loading"
+            className="pv-section-note flex items-center gap-2"
+          >
+            <Loader2
+              className="size-4 shrink-0 animate-spin"
+              aria-hidden="true"
+            />
+            <span>{loadingLabel}</span>
+          </div>
+        )}
+        {/* shape-sidebar-search-inline: all-empty fallback. Renders when the
+            sidebar-search filter is active AND every section has zero rows —
+            the sidebar would otherwise be blank. Presents the query back to
+            the user and offers escalation to the full search view (which
+            covers content + archives that the sidebar can't). Clicking the
+            CTA pre-populates the modal via openSearchEverywhere. */}
+        {sidebarSearchActive && !sidebarSearchHasAnyMatch && (
+          <div
+            className="pv-sidebar-search-empty"
+            data-testid="pv-sidebar-search-empty"
+          >
+            <div className="pv-sidebar-search-empty-text">
+              no matches for &ldquo;{trimmedSidebarSearchQuery}&rdquo;
+            </div>
+            <button
+              type="button"
+              className="pv-sidebar-search-empty-cta"
+              onClick={openSearchEverywhere}
+              data-testid="pv-sidebar-search-everywhere-cta"
+            >
+              search everywhere ↗
+            </button>
+          </div>
+        )}
+        {/* Phase 119 Plan 04 (D-01/D-02/D-03/D-04/D-05):
+            The sidebar Apps section — first content group under the search
+            input and above the search-vs-three-zone ternary below. Rendered
+            OUTSIDE the ternary (RESEARCH.md Pitfall 2) so the section stays
+            visible when the user is typing in the search box; putting this
+            block INSIDE either branch of the ternary would silently hide
+            the section during active search, violating the D-05 always-
+            present invariant that IS the campaign's discoverability point.
+
+            Chrome mirrors the Archived section at PrettyConversationsPanel
+            .tsx:1995-2033 verbatim (D-02): same button semantics, same
+            typography tokens, same rule-line gradient, same rotating
+            ChevronDown, same data-testid + aria-expanded + aria-controls
+            pattern. ONE difference vs Archived: the outer wrapper is NOT
+            gated on `appTiles.length > 0` (D-05 lock — the section header
+            renders unconditionally so a user with zero apps can still
+            discover the section).
+
+            Section body is lazy-rendered via `{appsExpanded && ...}`
+            (D-03) — the tile list and the D-04 empty-state prompt are
+            both inside that gate, so neither is in the DOM until the user
+            expands. When `appTiles.length === 0`, the D-04 empty-state
+            prompt renders as a single italic muted line (verbatim copy
+            per D-04, React-escaped text node — zero XSS surface). When
+            populated, one <AppTile
+            key={`${hostId}:${slug}`} app={app}/> per entry in the sort
+            order returned by useAppTiles() (D-15 sort applied at the
+            store level; the panel does not re-sort). */}
+        {/* shape-sidebar-search-inline: Apps section hides ENTIRELY when a
+            sidebar-search is active AND no app tiles match, per the shape's
+            "sections whose rows all filter away disappear" rule. When the
+            search IS active AND at least one app matches, the section is
+            force-expanded (appsExpanded || sidebarSearchActive) so matches
+            are visible without requiring the user to click through the
+            collapse toggle. */}
+        {!(sidebarSearchActive && searchedAppTiles.length === 0) && (
+        <div
+          className="pv-panel-group pv-apps-section relative"
+          onDragOver={handleAppsZoneDragOver}
+          onDragLeave={handleAppsZoneDragLeave}
+          onDrop={handleAppsZoneDrop}
+        >
+          {isAppsZoneDragOver && (
+            <div
+              data-testid="pv-apps-zone-drop-overlay"
+              className="absolute inset-0 pointer-events-none"
+              style={{
+                background: "rgba(255, 184, 150, 0.22)",
+                border: "2px solid rgba(255, 184, 150, 0.60)",
+                zIndex: 30,
+              }}
+            />
+          )}
+          {/* Outer <div role="button"> so the kebab can be a SIBLING button
+              (not nested — nested <button>s are invalid HTML). `group` enables
+              the kebab's hover-reveal via group-hover below. */}
+          <div
+            role="button"
+            tabIndex={0}
+            onClick={() => setAppsExpanded((v) => !v)}
+            onContextMenu={appsHeaderContextMenu.onContextMenu}
+            {...appsHeaderContextMenu.holdProps}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                setAppsExpanded((v) => !v);
+              }
+            }}
+            className="pv-section-head group w-full text-left cursor-pointer"
+            data-testid="pretty-conversations-apps-header"
+            aria-expanded={appsExpanded || sidebarSearchActive}
+            aria-controls="pv-apps-section-content"
+          >
+            <span className="pv-section-label">
+              Apps
+            </span>
+            <span aria-hidden="true" className="flex-1" />
+            {/* shape-sidebar-header-affordances: Apps header kebab.
+                Items today: Archived apps (opens ArchivedAppsModal).
+                Hover-reveal on desktop (opacity-0 → group-hover:opacity-100
+                at md+); always-visible on mobile (opacity-100 at <md).
+                Also revealed on group-focus-within so keyboard Tab-into-kebab
+                lights the trigger. RowKebabMenu's own portal-click-containment
+                prevents item-click leaks to the outer div's collapse toggle. */}
+            <div
+              className="pv-section-kebab-slot opacity-100 md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 transition-opacity shrink-0"
+              data-testid="pretty-conversations-apps-header-kebab-slot"
+            >
+              <RowKebabMenu
+                ariaLabel="Apps section menu"
+                testId="pretty-conversations-apps-header-kebab-trigger"
+                items={appsHeaderKebabItems}
+              />
+              {appsHeaderContextMenu.menu}
+            </div>
+            <ChevronDown
+              className="pv-section-chevron"
+              data-open={appsExpanded || sidebarSearchActive ? "true" : "false"}
+              aria-hidden="true"
+            />
+          </div>
+          {(appsExpanded || sidebarSearchActive) && (
+            <div id="pv-apps-section-content" className="pv-apps-grid">
+              {searchedAppTiles.length === 0 ? (
+                <div className="pv-apps-empty pv-section-note">
+                  Ask an agent to make an app for you.
+                </div>
+              ) : (
+                searchedAppTiles.map((app) => (
+                  <AppTile
+                    key={`${app.hostId}:${app.slug}`}
+                    app={app}
+                    onOpenApp={onOpenApp}
+                    onArchive={onArchiveApp}
+                    variant={variant}
+                  />
+                ))
+              )}
+            </div>
+          )}
+        </div>
+        )}
+        {/* Phase 122 Plan 04 (D-17 removal): the Phase 41 Plan 02
+            `searchMatches !== null` ternary that swapped between a flat
+            match list and the three-zone view is retired. The three-zone
+            view (pinned / middle / rdpGroup / activeSet) now renders
+            unconditionally — content-search is handled by
+            ConversationSearchModal (Phase 122 Plan 03). */}
+        <>
+            {/* Phase 42 UAT amendment 2026-08-17: active-set top zone retired
+                — active-set rows now flow through to pinned (if pinned) or
+                middle (by recency). Pinned tier still renders inside
+                `.pv-panel-group[data-pinned-group="true"]` with per-row
+                inActiveSet={activeSet.has(row.id)} wiring preserved to gate the
+                `.active-set` CSS deactivate-action hover-reveal.
+
+                UAT 2026-09-19: the "Pinned" header — retired 2026-08-17 —
+                is REINSTATED. Phase 119's Apps section landed above the flat
+                middle and created ambiguity that didn't exist under the
+                original 2026-08-17 layout (pinned rows sitting right after
+                the search box read unambiguously as pinned). With Apps in
+                place, pinned rows visually appear to belong to the Apps
+                section unless a header explicitly disambiguates. Header
+                chrome mirrors the Apps + Archived sections' typography
+                verbatim (Pin icon at size-3 + uppercase label + rule-line
+                gradient), MINUS the ChevronDown — Pinned is not
+                collapsible.
+
+                UAT 2026-09-23: header + drop lane are now ALWAYS rendered
+                (previously gated on `displayedPinned.length > 0`) so the
+                Pinned zone is a discoverable drag-drop target for the pin
+                gesture — parity with project sections and the flat-middle
+                unpin gesture. Empty state gets a "Drag a conversation here
+                to pin" italic muted line mirroring the empty-project
+                pattern. */}
+            {/* shape-sidebar-search-inline: hide the Pinned section entirely
+                when a sidebar-search is active AND no pinned rows match. When
+                search is inactive OR at least one pinned row matches, the
+                section renders (drop-lane preserved for the pin gesture). */}
+            {!(sidebarSearchActive && searchedPinned.length === 0) && (
+            <div
+              className="pv-panel-group relative"
+              data-pinned-group="true"
+              style={{ isolation: "isolate" }}
+              onDragOver={handlePinnedZoneDragOver}
+              onDragLeave={handlePinnedZoneDragLeave}
+              onDrop={handlePinnedZoneDrop}
+            >
+              {isPinnedZoneDragOver && (
+                <div
+                  data-testid="pv-pinned-zone-drop-overlay"
+                  className="absolute inset-0 pointer-events-none"
+                  style={{
+                    background: "rgba(255, 184, 150, 0.22)",
+                    border: "2px solid rgba(255, 184, 150, 0.60)",
+                    zIndex: 30,
+                  }}
+                />
+              )}
+              <div
+                className="pv-section-head"
+                data-testid="pretty-conversations-pinned-header"
+              >
+                <span className="pv-section-label">
+                  Pinned
+                </span>
+                <span aria-hidden="true" className="flex-1" />
+              </div>
+              {searchedPinned.length === 0 ? (
+                <div
+                  className="pv-pinned-empty pv-section-note"
+                  data-testid="pretty-conversations-pinned-empty"
+                >
+                  {isCoarsePointer()
+                    ? "Press and hold a conversation to pin it."
+                    : "Drag a conversation here to pin."}
+                </div>
+              ) : (
+                searchedPinned.map((row) => (
+                  <PrettyConversationRowLive
+                    key={row.id}
+                    row={row}
+                    selected={row.id === selectedId || visibleInSplitTree.has(row.id)}
+                    identity={resolveRowIdentity(row, identitiesByHostKey, identitiesByKey)}
+                    pinned={true}
+                    variant={variant}
+                    actions={rowActions}
+                    pinMode={pinModeFor(row)}
+                    archivable={true}
+                    projectActions={true}
+                    projects={submenuProjectsForRow(row)}
+                    currentProjectSlug={rowIdToProjectSlug.get(row.id) ?? null}
+                    inActiveSet={activeSet.has(row.id)}
+                    sessionKey={sessionWorkingKey(row)}
+                    subtitleMode="identityTitle"
+                  />
+                ))
+              )}
+            </div>
+            )}
+            {/* Phase 117 Plan 117-08 (D-09, D-11) — projects zone.
+                Inserted BETWEEN the pinned zone (above) and the flat middle
+                (below) per D-09's vertical order lock. A "Projects"
+                super-header (label + rule + "+" new-project button) wraps
+                every project section, indented beneath it; the "+" is the
+                sole new-project entry point (the header-strip folder button
+                is retired). The super-header always renders so a project can
+                be created from an empty list, except during an active sidebar
+                search with no project matches, when the whole zone hides.
+                Empty sections still render as header-only per D-11 (hidden
+                during a search). Each section wraps its rows in a coral drop
+                lane (D-22 gesture #1) via PrettyProjectSectionHeader. */}
+            {!(sidebarSearchActive && visibleProjectSections.length === 0) && (
+              <div className="pv-panel-group pv-projects-section" data-testid="pv-projects-super-section">
+                {/* Clickable header toggles the whole projects zone, same
+                    shape as the Apps header. Force-expanded during a sidebar
+                    search so matches stay visible; the persisted state
+                    reapplies when the search clears. */}
+                <div
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => {
+                    console.info(`[sidebar] projects-section toggle collapsed=${!projectsSectionCollapsed}`);
+                    toggleProjectsSection();
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.target !== e.currentTarget) return;
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      toggleProjectsSection();
+                    }
+                  }}
+                  // Nested projects: drop a dragged project header here to
+                  // return it to top level.
+                  onDragOver={onProjectsHeaderDragOver}
+                  onDragLeave={onProjectsHeaderDragLeave}
+                  onDrop={onProjectsHeaderDrop}
+                  style={
+                    projectsHeaderDragOver
+                      ? {
+                          background: "rgba(255, 184, 150, 0.22)",
+                          outline: "2px solid rgba(255, 184, 150, 0.60)",
+                        }
+                      : undefined
+                  }
+                  className="pv-section-head group w-full text-left cursor-pointer"
+                  data-testid="pv-projects-super-header"
+                  aria-expanded={!projectsSectionCollapsed || sidebarSearchActive}
+                  aria-controls="pv-projects-section-content"
+                >
+                  <span className="pv-section-label">
+                    Projects
+                  </span>
+                  {projectsSectionCollapsed && !sidebarSearchActive && anyProjectDm ? (
+                    <span
+                      className="pv-section-dm-mark"
+                      role="img"
+                      aria-label="An agent notified you"
+                      data-testid="pv-projects-super-header-dm"
+                    >
+                      <Mail aria-hidden="true" />
+                    </span>
+                  ) : projectsSectionCollapsed && !sidebarSearchActive && anyProjectUnread ? (
+                    <span
+                      className="pv-section-unread-dot"
+                      role="img"
+                      aria-label="Has unread conversations"
+                      data-testid="pv-projects-super-header-unread"
+                    />
+                  ) : null}
+                  <span aria-hidden="true" className="flex-1" />
+                  {showPencilButton && (
+                    <button
+                      type="button"
+                      aria-label="New project"
+                      title="New project"
+                      data-testid="pv-projects-new-project-button"
+                      className="pv-section-add"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setPendingProjectSlug(null);
+                        setCreateProjectModalOpen(true);
+                      }}
+                    >
+                      <Plus aria-hidden="true" />
+                    </button>
+                  )}
+                  <ChevronDown
+                    className="pv-section-chevron"
+                    data-open={!projectsSectionCollapsed || sidebarSearchActive ? "true" : "false"}
+                    aria-hidden="true"
+                  />
+                </div>
+                {(!projectsSectionCollapsed || sidebarSearchActive) && (
+                <div id="pv-projects-section-content">
+                  {(() => {
+                    // Nested projects: render the (already tree-ordered,
+                    // search-filtered) sections as a tree. A section whose
+                    // parent isn't shown renders at the root.
+                    const keyOf = (sec: ProjectSection) => `${sec.hostId ?? ""}::${sec.slug}`;
+                    const shownKeys = new Set(visibleProjectSections.map(keyOf));
+                    const childrenOf = new Map<string | null, ProjectSection[]>();
+                    for (const sec of visibleProjectSections) {
+                      const pk = sec.parentKey ?? null;
+                      const at = pk !== null && shownKeys.has(pk) ? pk : null;
+                      const list = childrenOf.get(at) ?? [];
+                      list.push(sec);
+                      childrenOf.set(at, list);
+                    }
+                    const renderSection = (section: ProjectSection): React.ReactNode => {
+                      const subSections = childrenOf.get(keyOf(section)) ?? [];
+                      // project-scoped apps: between sub-projects and conversations.
+                      const allSectionApps = projectAppsByKey.get(keyOf(section)) ?? [];
+                      const sectionApps =
+                        nameMatchedProjectKeys === null || nameMatchedProjectKeys.has(keyOf(section))
+                          ? allSectionApps
+                          : allSectionApps.filter((a) => appTileMatches(a.title, trimmedSidebarSearchQuery));
+                      return (
+                  <PrettyProjectSectionHeader
+                    key={keyOf(section)}
+                    slug={section.slug}
+                    displayName={section.displayName}
+                    // Force-expand during sidebar search so matches inside a
+                    // user-collapsed project are actually visible (mirrors the
+                    // Apps section's `appsExpanded || sidebarSearchActive`
+                    // pattern). Persisted collapse state is untouched — it
+                    // reapplies when the search clears. Collapsing a parent
+                    // hides its sub-projects with it (they render inside).
+                    collapsed={
+                      sidebarSearchActive
+                        ? false
+                        : collapsedProjectSlugs.has(keyOf(section)) || collapsedProjectSlugs.has(section.slug)
+                    }
+                    hasUnread={unreadSectionKeys.has(keyOf(section))}
+                    hasDm={dmSectionKeys.has(keyOf(section))}
+                    // Keyed by host + slug: same-named projects on different
+                    // hosts (or nested under different parents) are separate.
+                    // A bare slug is a pre-keying entry; it's expanded into the
+                    // keys of every project sharing that slug on first toggle.
+                    onToggleCollapse={() => {
+                      const key = keyOf(section);
+                      const legacy = collapsedProjectSlugs.has(section.slug)
+                        ? {
+                            legacy: section.slug,
+                            keys: projectSections.filter((p) => p.slug === section.slug).map(keyOf),
+                          }
+                        : undefined;
+                      console.info(`[sidebar] project toggle key=${key} collapsed=${!(collapsedProjectSlugs.has(key) || legacy)} migratedLegacy=${legacy !== undefined}`);
+                      toggleProjectCollapse(key, legacy);
+                    }}
+                    onNewConversationClick={(s) => handleNewConversationInProject(s, section.hostId)}
+                    onDropRow={handleProjectDrop}
+                    resolveBadgeDrop={resolveBadgeDrop}
+                    onRenameProject={(s, name) => handleRenameProject(s, name, section.hostId)}
+                    onOpenProject={(s) => handleOpenProject(s, section.hostId)}
+                    onArchiveProject={(s) => { void handleArchiveProject(s, section.hostId); }}
+                    onNewSubProject={(s) => handleNewSubProject(s, section.hostId)}
+                    moveToItems={projectMoveToItems(section)}
+                    hostId={section.hostId}
+                    // Phones have no drag; "Move to" is the way there.
+                    draggable={!isMobileVariant}
+                    classifyProjectDrop={classifyProjectDropFor(section)}
+                    onDropProject={(dragged) => handleMoveProject(dragged.slug, dragged.hostId, section.slug)}
+                    onDropApp={(dragged) => handleAppDropOnProject(dragged, section.slug)}
+                    rows={
+                      <>
+                        {/* Sub-projects sit above the project's own
+                            apps, then its conversations. */}
+                        {subSections.map(renderSection)}
+                        {sectionApps.map((app) => (
+                          <ProjectAppRow
+                            key={`${app.hostId}:${app.slug}`}
+                            app={app}
+                            onOpenApp={onOpenApp}
+                            variant={variant}
+                          />
+                        ))}
+                        {section.rows.length === 0 ? (
+                          subSections.length === 0 && sectionApps.length === 0 ? (
+                            // UAT 2026-09-19: empty-state message when a project has
+                            // zero conversations (and, with nesting, no
+                            // sub-projects) — mirrors the Apps section's D-04
+                            // empty-state pattern. The drop lane on
+                            // PrettyProjectSectionHeader is already active on the
+                            // whole section, so drag-and-drop works over this text.
+                            <div
+                              className="pv-project-empty pv-section-note"
+                              data-testid="pretty-conversations-project-empty"
+                            >
+                              {isCoarsePointer()
+                                ? "Create a new conversation, or move one here from its menu."
+                                : "Create a new conversation, or drag one here."}
+                            </div>
+                          ) : null
+                        ) : (
+                        section.rows.map((row) => (
+                          <PrettyConversationRowLive
+                            key={row.id}
+                            row={row}
+                            selected={row.id === selectedId || visibleInSplitTree.has(row.id)}
+                            identity={resolveRowIdentity(row, identitiesByHostKey, identitiesByKey)}
+                            pinned={false}
+                            variant={variant}
+                            actions={rowActions}
+                            pinMode={pinModeFor(row)}
+                            archivable={true}
+                            projectActions={true}
+                            projects={submenuProjectsForRow(row)}
+                            currentProjectSlug={rowIdToProjectSlug.get(row.id) ?? null}
+                            inActiveSet={activeSet.has(row.id)}
+                            sessionKey={sessionWorkingKey(row)}
+                            subtitleMode="identityTitle"
+                          />
+                        ))
+                        )}
+                      </>
+                    }
+                  />
+                      );
+                    };
+                    return (childrenOf.get(null) ?? []).map(renderSection);
+                  })()}
+                </div>
+                )}
+              </div>
+            )}
+            {/* Phase 41 Plan 01 (user 2026-08-14): FLAT middle zone.
+                No per-host divider chips (retired). Every non-pinned, non-
+                active-set, non-RDP row lands in `displayedMiddle` as a
+                single flat array from `snapshot.middle`, sorted by the
+                store's compareByRecencyDesc + insertion-order fallback.
+                Rendered inside ONE `.pv-panel-group` container without
+                per-host wrappers.
+
+                Phase 117 Plan 117-08 (D-22 gesture #2) — the flat-middle
+                container is also a drop target that CLEARS the project field
+                on a row currently assigned to a project. Type-gated on
+                application/x-skynet-row so the outer panel's badge-drag
+                machinery is not clobbered (badge MIME falls through to the
+                outer handler; row MIME is handled here). Wrapper always
+                renders now — the section is a permanent
+                sidebar fixture with header + empty-state, not gated on
+                content presence. */}
+            {/* shape-sidebar-search-inline: hide the Conversations section
+                entirely when a sidebar-search is active AND no middle rows
+                match. Otherwise the section renders as normal (header +
+                empty-state placeholder OR rows). */}
+            {!(sidebarSearchActive && searchedMiddle.length === 0) && (
+              <div
+                className="pv-panel-group relative"
+                data-middle-group="true"
+                data-testid="pv-panel-flat-middle"
+                style={{ isolation: "isolate" }}
+                onDragOver={handleFlatMiddleDragOver}
+                onDragLeave={handleFlatMiddleDragLeave}
+                onDrop={handleFlatMiddleDrop}
+              >
+                {isFlatMiddleDragOver && (
+                  <div
+                    data-testid="pv-flat-middle-drop-overlay"
+                    className="absolute inset-0 pointer-events-none"
+                    style={{
+                      background: "rgba(255, 184, 150, 0.22)",
+                      border: "2px solid rgba(255, 184, 150, 0.60)",
+                      zIndex: 30,
+                    }}
+                  />
+                )}
+                {/* Section header — the label alone. Always
+                    renders now; when the middle is empty a placeholder row
+                    follows so the section reads as a real fixture, not a
+                    stray label. */}
+                <div
+                  className="pv-section-head"
+                  data-testid="pv-flat-middle-section-header"
+                >
+                  <span className="pv-section-label">
+                    Conversations
+                  </span>
+                  <span aria-hidden="true" className="flex-1" />
+                </div>
+                {searchedMiddle.length === 0 && (
+                  <div
+                    className="pv-section-note"
+                    data-testid="pv-flat-middle-empty"
+                  >
+                    Start a conversation with the pencil at the top.
+                  </div>
+                )}
+                {searchedMiddle.map((row) => (
+                  <PrettyConversationRowLive
+                    key={row.id}
+                    row={row}
+                    selected={row.id === selectedId || visibleInSplitTree.has(row.id)}
+                    identity={resolveRowIdentity(row, identitiesByHostKey, identitiesByKey)}
+                    pinned={isRowPinned(row)}
+                    variant={variant}
+                    actions={rowActions}
+                    pinMode={pinModeFor(row)}
+                    archivable={true}
+                    projectActions={true}
+                    projects={submenuProjectsForRow(row)}
+                    currentProjectSlug={rowIdToProjectSlug.get(row.id) ?? null}
+                    inActiveSet={activeSet.has(row.id)}
+                    sessionKey={sessionWorkingKey(row)}
+                    subtitleMode="identityTitle"
+                  />
+                ))}
+              </div>
+            )}
+            {/* Phase 41 Plan 01: RDP zone renderer. When `searchedRdpGroup`
+                is null (zero RDP-eligible hosts), the entire section —
+                divider chip + rows — is suppressed (user lock #7).
+                When non-null, renders the "Remote desktop" divider chip +
+                Monitor-glyph rows.
+                shape-sidebar-search-inline: also hides entirely when a
+                sidebar-search is active AND no RDP rows match. */}
+            {searchedRdpGroup !== null && searchedRdpGroup.rows.length > 0 && (
+              <div
+                key={searchedRdpGroup.hostId}
+                className="pv-panel-group"
+                data-rdp-group="true"
+              >
+                {/* RDP section header — same section title as Apps / Pinned /
+                    Projects / Conversations. */}
+                <div
+                  className="pv-section-head"
+                  data-testid="rdp-divider"
+                >
+                  <span className="pv-section-label">
+                    {rdpSectionLabel}
+                  </span>
+                  <span aria-hidden="true" className="flex-1" />
+                </div>
+                {searchedRdpGroup.rows.map((row) => (
+                  <PrettyConversationRowLive
+                    key={row.id}
+                    row={row}
+                    selected={row.id === selectedId || visibleInSplitTree.has(row.id)}
+                    identity={resolveRowIdentity(row, identitiesByHostKey, identitiesByKey)}
+                    pinned={false}
+                    variant={variant}
+                    actions={rowActions}
+                    pinMode="noop"
+                    /* projectActions off: RDP rows never get Move-to /
+                       New-project (onMoveToProject / onCreateProject were
+                       never wired at this site). */
+                    projectActions={false}
+                    /* RDP rows are excluded from the archive affordance —
+                       canonicalArchiveIdForRow short-circuits rdpHostRow=true
+                       to null, so archivable is intentionally false here.
+                       Documented explicitly so a future refactor doesn't
+                       accidentally add it and re-open the affordance-
+                       narrowing gate 115-02 landed for the Hide slot.
+                       (D-01 affordance-narrowing: Archive is identity-only.) */
+                    archivable={false}
+                    inActiveSet={activeSet.has(row.id)}
+                    sessionKey={sessionWorkingKey(row)}
+                  />
+                ))}
+              </div>
+            )}
+            {/* (Phase 115 Plan 115-02: prior Hidden section render block
+                retired per D-21 alongside the Hide affordance.
+                Phase 115 Plan 115-06 Archived section retired in the
+                Phase 122 shape follow-up — archived identities are now
+                surfaced exclusively via the ConversationSearchModal.) */}
+        </>
+      </div>
+
+      {/* Sidebar footer — the "about me" zone. Sibling of .pv-panel-header
+          and .pv-panel-scroll in the panel's flex column. Column-oriented
+          so an optional full-width "Send feedback" CTA can dock on top
+          without the border-top reading as a divider under it. Row-1 (when
+          feedbackEnabled): the CTA. Row-2 (always): anchor block on the
+          left (avatar/initials + username) + actions on the right
+          (preferences gear + logout). When feedback is disabled the
+          footer has only Row-2, which visually matches the pre-CTA
+          layout since .pv-footer-row is a flex row w/ align-items:center
+          and gap:8px (same values the old direct-child layout used). */}
+      <div className="pv-panel-footer" data-testid="pv-panel-footer">
+        {feedbackEnabled && (
+          <KitButton
+            full
+            data-testid="pv-footer-send-feedback-button"
+            onClick={() => onOpenFeedback?.()}
+          >
+            <MessageSquare />
+            Send feedback
+          </KitButton>
+        )}
+        <div className="pv-footer-row">
+        <div className="pv-footer-anchor">
+          {(() => {
+            // Trim first so whitespace-only usernames collapse to no-anchor
+            // (they don't produce a visible circle with an empty glyph +
+            // a blank username line — the anchor slot silently omits).
+            // Spread-index the first character so astral/emoji-first
+            // usernames get a full code point in the circle, not a lone
+            // UTF-16 surrogate half.
+            const name = username?.trim();
+            if (!name) return null;
+            const initial = [...name][0]?.toUpperCase() ?? "";
+            return (
+              <>
+                {/* Phase 137 D-30: conditional avatar render. When avatarPath
+                    is set, show the uploaded avatar image; otherwise fall back
+                    to the initial-letter circle. Cache-bust via ?f={avatarPath}
+                    (backend mints a new random filename per upload — RESEARCH A3). */}
+                {avatarPath ? (
+                  <img
+                    className="pv-footer-initials"
+                    src={`/users/${encodeURIComponent(userId)}/avatar?f=${encodeURIComponent(avatarPath)}`}
+                    alt=""
+                    aria-hidden="true"
+                    data-testid="pv-footer-avatar-image"
+                  />
+                ) : (
+                  <span
+                    className="pv-footer-initials"
+                    aria-hidden="true"
+                    data-testid="pv-footer-initials"
+                  >
+                    {initial}
+                  </span>
+                )}
+                <span
+                  className="pv-footer-username"
+                  data-testid="pv-footer-username"
+                >
+                  {name}
+                </span>
+              </>
+            );
+          })()}
+        </div>
+        <div className="pv-footer-actions">
+          {/* Manage surfaces for standing things the user owns live here,
+              beside the gear; the header strip keeps only "new conversation". */}
+          {showPencilButton && (
+            <>
+              <button
+                type="button"
+                className="pv-footer-btn"
+                aria-label="Scheduled conversations"
+                title="Scheduled conversations"
+                data-testid="pv-footer-scheduled-agents-button"
+                onClick={() => {
+                  setScheduledAgentsFilter(null);
+                  setScheduledAgentsModalOpen(true);
+                }}
+              >
+                <Clock size={18} />
+              </button>
+              <button
+                type="button"
+                className="pv-footer-btn"
+                aria-label="Roles"
+                title="Roles"
+                data-testid="pv-footer-roles-button"
+                onClick={() => setRolesWindow({ open: true, start: { view: "library" }, hop: false })}
+              >
+                <Drama size={18} />
+              </button>
+              <button
+                type="button"
+                className="pv-footer-btn"
+                aria-label="Skills"
+                title="Skills"
+                data-testid="pv-footer-skills-button"
+                onClick={() => setSkillsEditorModalOpen(true)}
+              >
+                <Zap size={18} />
+              </button>
+            </>
+          )}
+          {/* Phase 137 D-08: gear button wired to open PreferencesModal.
+              Previously an inert <span>; now a real interactive <button>.
+              Phase 137 D-29: Globe button (global files) retired — preferences
+              modal is the single entry point for About-you / global-files editing.
+              Logout button relocated into PreferencesModal (bottom of left nav);
+              the modal is now the sole entry point for account-scoped actions. */}
+          {isAdmin && (
+            <button
+              type="button"
+              className="pv-footer-btn"
+              aria-label="Admin"
+              title="Admin"
+              data-testid="pv-footer-admin-button"
+              onClick={() => setAdminModalOpen(true)}
+            >
+              <Crown size={18} />
+            </button>
+          )}
+          <button
+            type="button"
+            className="pv-footer-btn"
+            aria-label="Preferences"
+            title="Preferences"
+            data-testid="pv-footer-preferences-button"
+            onClick={() => setPreferencesModalOpen(true)}
+          >
+            <Settings size={18} />
+          </button>
+        </div>
+        </div>
+      </div>
+
+      {/* NewSessionDialog VERBATIM from ConversationsPanel.tsx lines
+          358-368. Portal-mounted; DOM sibling position doesn't drive
+          layout. Only mounted when onCreateSession is wired — same gate
+          as the pencil button. */}
+      {/* Phase 117 M-F follow-up (2026-09-18): wrapper node with a data
+          attribute so tests can observe the pending project slug wired
+          through the panel (mirrors the pv-new-conv-modal-wrapper pattern
+          above). The slug is applied via setSessionProject inside onCreate
+          below, then cleared on close/create. */}
+      <div
+        data-testid="pv-new-session-dialog-wrapper"
+        data-pending-project-slug={newSessionPendingProjectSlug ?? ""}
+        hidden
+      />
+      {showPencilButton && (
+        <NewSessionDialog
+          open={newSessionDialogOpen}
+          project={newSessionPendingProjectSlug}
+          onClose={() => {
+            setNewSessionDialogOpen(false);
+            // Phase 22 SRIC-05: clear chainPrefill on close so a subsequent
+            // manual open (via pencil) does NOT inherit stale chain state.
+            setChainPrefill(null);
+            // Phase 117 M-F/M-I: clear pending project slug + hostId so a
+            // subsequent header-pencil open does NOT inherit stale project
+            // context.
+            setNewSessionPendingProjectSlug(null);
+            setNewSessionPendingProjectHostId(null);
+          }}
+          // Single-host tree when opened from a project — see newSessionHostTree.
+          hostTree={newSessionHostTree}
+          onCreate={(opts) => {
+            onCreateSession!(opts);
+            // Phase 117 M-F: if this dialog was opened via the per-project
+            // SquarePen, apply the pending project slug to the newborn
+            // identity via setSessionProject. identityMode:
+            // false is a plain tmux session — no identity to tag; skip.
+            //
+            // Phase 117 M-H (2026-09-19): chain refreshIdentities AFTER the
+            // write so the store observes the fresh `project:` field. The
+            // birth flow's built-in refresh runs BEFORE onCreate fires, so
+            // without this re-fetch the store carries project=null and the
+            // sidebar derivation never buckets the newborn under its
+            // section (visible symptom: agent opens as a tab but does NOT
+            // appear under the project section until the next full page
+            // reload).
+            const slug = newSessionPendingProjectSlug;
+            if (slug !== null) {
+              const identityKey =
+                opts.identityMode === true ? opts.name : null;
+              if (identityKey !== null) {
+                const hostIdNum = parseInt(opts.host.id, 10);
+                if (Number.isFinite(hostIdNum) && hostIdNum > 0) {
+                  setSessionProject(hostIdNum, identityKey, slug)
+                    .then(() =>
+                      refreshIdentities({ [identityKey]: hostIdNum }),
+                    )
+                    .catch((err: unknown) => {
+                      const msg =
+                        err instanceof Error ? err.message : String(err);
+                      // eslint-disable-next-line no-console
+                      console.error(
+                        `[project-new-session] setSessionProject failed hostId=${hostIdNum} key=${identityKey} slug=${slug}: ${msg}`,
+                      );
+                    });
+                }
+              }
+            }
+            setNewSessionDialogOpen(false);
+            // Also clear on successful submit path (matches close semantics).
+            setChainPrefill(null);
+            setNewSessionPendingProjectSlug(null);
+            setNewSessionPendingProjectHostId(null);
+          }}
+          // Phase 22 SRIC-05: chain pre-fill props. Null when chainPrefill
+          // has not been set (fresh manual pencil open); populated when
+          // the roles window's new-role hop created a role.
+          initialHost={chainPrefill?.host ?? null}
+          initialRole={chainPrefill?.role ?? null}
+          initialRoles={chainPrefill?.roles ?? null}
+          initialName={chainPrefill?.name ?? null}
+          initialBrief={chainPrefill?.description ?? null}
+          onNewRole={({ host, roles, name }) => {
+            newRoleHopRef.current = { host, roles, name };
+            setNewSessionDialogOpen(false);
+            setChainPrefill(null);
+            setCreateRoleInitialHost(host);
+            setRolesWindow({ open: true, start: { view: "new", host }, hop: true });
+          }}
+          // Phase 88: forward admin-gate to NewSessionDialog for Path field + shell checkbox visibility (see 88-CONTEXT.md §isAdmin prop plumbing).
+          isAdmin={isAdmin}
+        />
+      )}
+      {/* The roles window. On the new-conversation dialog's "New role…" hop
+          its back/cancel and create go back to that dialog. */}
+      <RolesWindow
+        open={rolesWindow.open}
+        onOpenChange={(o) => {
+          if (o) return;
+          setRolesWindow((w) => ({ ...w, open: false }));
+          // Closed out of a hop with the X: drop the remembered picks.
+          if (rolesWindow.hop) {
+            newRoleHopRef.current = null;
+            setCreateRoleInitialHost(null);
+            setNewSessionPendingProjectSlug(null);
+            setNewSessionPendingProjectHostId(null);
+          }
+        }}
+        start={rolesWindow.start}
+        // A per-project hop locks role creation to the project's host (the
+        // same single-host tree the new-agent dialog got) so the role — and
+        // the agent born with it — can't land on a host the project isn't on.
+        hostTree={rolesWindow.hop && createRoleInitialHost ? newSessionHostTree : (hostTree ?? null)}
+        newRoleHop={
+          rolesWindow.hop
+            ? {
+                onBack: () => {
+                  setRolesWindow((w) => ({ ...w, open: false }));
+                  setCreateRoleInitialHost(null);
+                  const hop = newRoleHopRef.current;
+                  newRoleHopRef.current = null;
+                  console.log(`[new-role-hop] cancelled — restoring new-agent dialog hostId=${hop?.host?.id ?? "-"}`);
+                  if (hop) setChainPrefill({ host: hop.host, roles: hop.roles, name: hop.name });
+                  setNewSessionDialogOpen(true);
+                },
+                onCreated: ({ role, host, description }) => {
+                  const hop = newRoleHopRef.current;
+                  newRoleHopRef.current = null;
+                  setRolesWindow((w) => ({ ...w, open: false }));
+                  setCreateRoleInitialHost(null);
+                  // Back from a hop on the same host: keep the earlier picks and add
+                  // the new role. A different host invalidates the earlier picks. A
+                  // hop with no host had no picks, so only its name carries over.
+                  const sameHost = hop !== null && (hop.host === null || hop.host.id === host.id);
+                  const roles = sameHost ? [...hop.roles.filter((r) => r !== role), role] : undefined;
+                  console.log(
+                    `[new-role-hop] role created role=${role} hostId=${host.id} fromHop=${hop !== null} roles=${roles?.join(",") ?? role}`,
+                  );
+                  setChainPrefill({ role, roles, name: sameHost ? hop.name : null, host, description });
+                  setNewSessionDialogOpen(true);
+                },
+              }
+            : null
+        }
+      />
+      {/* Phase 137 D-29: GlobalFilesModal retired — About-you pane in
+          PreferencesModal is the sole remaining entry for global-files editing. */}
+      {/* Phase 44 SKILLED-01: SkillsEditorModal — portal-mounted sibling of
+          GlobalFilesModal. Opened via the header menu's "Edit skills…" item.
+          defaultHostId={null} deliberate — the panel-header trigger has no
+          active-conversation context, so the modal falls through to its own
+          host picker. */}
+      <SkillsEditorModal
+        open={skillsEditorModalOpen}
+        onOpenChange={setSkillsEditorModalOpen}
+        hostTree={hostTree ?? null}
+        defaultHostId={null}
+      />
+      {/* Phase 137 D-08: PreferencesModal — portal-mounted sibling of other
+          modals. Opened via the sidebar footer gear button. userId/avatarPath/
+          onAvatarChanged/userPrefs threaded from AppShell for live-sync (D-30)
+          and Voice pane initial value (D-14). defaultHostId=null — footer gear
+          has no active-conversation context; modal falls through to its own
+          host picker. Globe button + kebab notification item are deferred to
+          Plans 04/05. */}
+      <PreferencesModal
+        open={preferencesModalOpen}
+        onOpenChange={setPreferencesModalOpen}
+        userId={userId}
+        avatarPath={avatarPath ?? null}
+        onAvatarChanged={onAvatarChanged ?? (() => {})}
+        userPrefs={userPrefs ?? {}}
+        onUserPrefsChanged={onUserPrefsChanged}
+        username={username}
+        isAdmin={isAdmin}
+        hostTree={hostTree ?? null}
+        defaultHostId={null}
+      />
+      {isAdmin && (
+        <AdminModal
+          open={adminModalOpen}
+          onOpenChange={setAdminModalOpen}
+          currentUserId={userId}
+        />
+      )}
+      {/* Phase 122 Plan 03 Task 3 — ConversationSearchModal: portal-mounted
+          sibling of NewConversationModal + GlobalFilesModal. Opened via the
+          magnifying-glass button in .pv-header-actions above (first child of
+          the cluster, gated by showPencilButton). D-04 jump-and-close on
+          active-result click; D-15 blunt window.alert on archived-result
+          click; the modal itself closes on the active-click path (via
+          onOpenChange false), so the parent only routes the
+          onOpenActiveConversation callback through to AppShell. */}
+      <ConversationSearchModal
+        open={searchModalOpen}
+        onOpenChange={setSearchModalOpen}
+        onOpenActiveConversation={(result) => {
+          onSearchResultOpenActive?.(result);
+        }}
+      />
+      {/* Phase 129 (shape 3, wake-ups-redesign) Plan 129-01 Task 4 —
+          ScheduledAgentsModal: portal-mounted sibling of ConversationSearchModal.
+          Opened via the Clock button in .pv-header-actions above
+          (position 6 in the guarded cluster — after Edit-global-files
+          Globe, before feedback + kebab). Owns its own list + form +
+          refetch lifecycle (D-03 no client cache, D-17 filter reset on
+          close); controlled open state only. hostTree threaded so the
+          filter-bar host dropdown + wave-2 host chip-picker can render
+          the same user-scoped host set every other modal in this cluster
+          uses. */}
+      <ScheduledAgentsModal
+        open={scheduledAgentsModalOpen}
+        onOpenChange={setScheduledAgentsModalOpen}
+        hostTree={hostTree ?? null}
+        initialFilter={scheduledAgentsFilter}
+      />
+      {/* Phase 143 D-09: ArchivedAppsModal — portal-mounted sibling of
+          RolesListModal. Opened via the archived-box icon-button on the Apps
+          section header. Re-fetches the archived-apps list on every open
+          (Risk-Summary authoritative recovery path). Modal stays open after
+          un-archive (D-19). */}
+      <ArchivedAppsModal
+        open={archivedAppsModalOpen}
+        onOpenChange={setArchivedAppsModalOpen}
+      />
+      {/* Phase 117 Plan 117-09 Task 1 — CreateProjectModal, wired to the
+          header "Create project" button (state landed in 117-08). Replaces
+          the 117-08 placeholder marker. Backend-authoritative slugify:
+          modal submits the raw displayName; the response body carries the
+          slug produced by the backend's normalizeToSlug (D-25, Pitfall 1). */}
+      <CreateProjectModal
+        open={createProjectModalOpen}
+        onOpenChange={(o) => {
+          setCreateProjectModalOpen(o);
+          if (!o) setPendingProjectSlug(null);
+        }}
+        onCreated={() => {
+          // Wire event (project-list-changed → useProjects) refreshes the
+          // sidebar; nothing else to do here. If pendingProjectSlug was set
+          // (i.e. this modal-open was triggered by a per-section new-conv
+          // click that 117-09's Task 2 hooked into NewConversationModal
+          // instead), it's cleared alongside the modal close.
+        }}
+        hostTree={hostTree ?? null}
+      />
+      {/* "Move to → New project…" from a row's menu: create, then move the
+          row into it. Same routing as picking an existing project. */}
+      <CreateProjectModal
+        open={createProjectForRow !== null}
+        onOpenChange={(o) => {
+          if (!o) setCreateProjectForRow(null);
+        }}
+        onCreated={({ slug }) => {
+          const row = createProjectForRow;
+          if (row === null) return;
+          console.info(
+            `[project-menu] created slug=${slug} from Move-to; moving rowId=${row.id}`,
+          );
+          handleRowMoveToProject(row, slug);
+        }}
+        hostTree={hostTree ?? null}
+        lockedHostId={createProjectLockedHostId}
+      />
+      {/* Project menu "New sub-project": create inside the parent, on the
+          parent's host. The wire update nests it in the sidebar. */}
+      <CreateProjectModal
+        open={createSubProjectFor !== null}
+        onOpenChange={(o) => {
+          if (!o) setCreateSubProjectFor(null);
+        }}
+        onCreated={({ slug }) => {
+          console.info(
+            `[project-menu] created sub-project slug=${slug} parent=${createSubProjectFor?.slug ?? "(none)"}`,
+          );
+        }}
+        hostTree={hostTree ?? null}
+        lockedHostId={createSubProjectFor?.hostId}
+        parent={
+          createSubProjectFor
+            ? { slug: createSubProjectFor.slug, displayName: createSubProjectFor.displayName }
+            : undefined
+        }
+      />
+      {/* 117-08 legacy placeholder marker — kept for tests written against
+          117-08's state contract that observe the marker rather than the
+          real modal. Rendered ALONGSIDE the real modal so both markers are
+          visible for the same open state. 117-09's tests observe the real
+          modal via role="dialog" / data-testid="create-project-modal". */}
+      {createProjectModalOpen && (
+        <div
+          data-testid="create-project-modal-placeholder"
+          data-pending-project-slug={pendingProjectSlug ?? ""}
+          hidden
+        />
+      )}
+      {/* ProjectModal wired to the section-header kebab's "Edit project"
+          item. State carries {slug, displayName, hostId} at open time
+          (resolved from projectsList in handleOpenProject). onOpenChange(false)
+          clears the state so a re-open starts fresh. */}
+      {projectModal !== null && (() => {
+        // Live from the sidebar's own sections, so a rename or a row moving in
+        // while the window is open shows at once — and the count matches
+        // exactly what this user's sidebar shows directly inside the project.
+        const key = `${projectModal.hostId}::${projectModal.slug}`;
+        const section = projectSections.find((s) => `${s.hostId ?? ""}::${s.slug}` === key);
+        return (
+          <ProjectModal
+            open={true}
+            onOpenChange={(o) => {
+              if (!o) setProjectModal(null);
+            }}
+            slug={projectModal.slug}
+            displayName={section?.displayName ?? projectModal.displayName}
+            hostId={projectModal.hostId}
+            contents={
+              section
+                ? {
+                    conversations: section.rows.length,
+                    subProjects: projectSections.filter((s) => s.parentKey === key).length,
+                  }
+                : undefined
+            }
+          />
+        );
+      })()}
+      {/* Phase 117 Plan 117-09 Task 2 (D-14) per-section context menu portal
+          RETIRED by shape-sidebar-header-affordances. The four section-scoped
+          actions now live in the project header's RowKebabMenu, which calls
+          the per-action handlers (handleOpenProject / handleRenameProject /
+          handleArchiveProject) directly without a portal-mounted context menu
+          middleman. */}
+    </div>
+    </KitScopeContext.Provider>
+  );
+}

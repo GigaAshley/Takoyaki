@@ -1,0 +1,909 @@
+/**
+ * Unit tests for webAudioStreamPlayer.ts — Web Audio API streaming player factory.
+ *
+ * Tests use a mocked AudioContext (via vi.stubGlobal) so they run in jsdom
+ * without any real audio hardware. The mock records calls to createBuffer,
+ * createBufferSource, source.start, source.stop, and exposes a way to
+ * synthetically fire source.onended.
+ *
+ * Reference: 19-CONTEXT.md § Frontend player, § Cross-bubble Stop, § Error handling.
+ * Phase 19, Plan 04 (patch #237).
+ */
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import {
+  createWebAudioStreamPlayer,
+  NEVER_STARTED_MS,
+  getTtsPlaybackRate,
+  setTtsPlaybackRate,
+} from "./webAudioStreamPlayer";
+
+// ─── Mock AudioContext infrastructure ────────────────────────────────────────
+
+interface MockSource {
+  buffer: unknown;
+  onended: (() => void) | null;
+  _started: boolean;
+  _startedAt: number;
+  _stopped: boolean;
+  connected: boolean;
+  playbackRate: { value: number };
+  start(when: number): void;
+  stop(): void;
+  connect(dest: unknown): void;
+}
+
+interface MockAudioBuffer {
+  channels: number;
+  frames: number;
+  sampleRate: number;
+  _channelData: Float32Array[];
+  getChannelData(ch: number): Float32Array;
+  duration: number;
+}
+
+interface MockContext {
+  currentTime: number;
+  state: "running" | "suspended" | "closed";
+  destination: object;
+  sources: MockSource[];
+  buffers: MockAudioBuffer[];
+  createBuffer(ch: number, fr: number, sr: number): MockAudioBuffer;
+  createBufferSource(): MockSource;
+  close(): Promise<void>;
+  suspend(): Promise<void>;
+  resume(): Promise<void>;
+  _closed: boolean;
+  _suspendCalls: number;
+  _resumeCalls: number;
+  _resumeRejects: boolean;
+}
+
+let mockCtx: MockContext;
+let ctxInstances: MockContext[] = [];
+
+function makeMockContext(): MockContext {
+  const ctx: MockContext = {
+    currentTime: 0,
+    state: "running",
+    destination: {},
+    sources: [],
+    buffers: [],
+    _closed: false,
+    _suspendCalls: 0,
+    _resumeCalls: 0,
+    _resumeRejects: false,
+
+    createBuffer(ch: number, fr: number, sr: number): MockAudioBuffer {
+      const channelData = Array.from({ length: ch }, () => new Float32Array(fr));
+      const buf: MockAudioBuffer = {
+        channels: ch,
+        frames: fr,
+        sampleRate: sr,
+        _channelData: channelData,
+        getChannelData(c: number) {
+          return channelData[c];
+        },
+        get duration() {
+          return sr > 0 ? fr / sr : 0;
+        },
+      };
+      ctx.buffers.push(buf);
+      return buf;
+    },
+
+    createBufferSource(): MockSource {
+      const source: MockSource = {
+        buffer: null,
+        onended: null,
+        _started: false,
+        _startedAt: 0,
+        _stopped: false,
+        connected: false,
+        playbackRate: { value: 1.0 },
+        start(when: number) {
+          this._started = true;
+          this._startedAt = when;
+        },
+        stop() {
+          if (this._stopped) throw new DOMException("already stopped", "InvalidStateError");
+          this._stopped = true;
+        },
+        connect(_dest: unknown) {
+          this.connected = true;
+        },
+      };
+      ctx.sources.push(source);
+      return source;
+    },
+
+    close(): Promise<void> {
+      ctx.state = "closed";
+      ctx._closed = true;
+      return Promise.resolve();
+    },
+
+    suspend(): Promise<void> {
+      ctx._suspendCalls += 1;
+      if (ctx.state === "running") ctx.state = "suspended";
+      return Promise.resolve();
+    },
+
+    resume(): Promise<void> {
+      ctx._resumeCalls += 1;
+      if (ctx._resumeRejects) return Promise.reject(new Error("resume failed"));
+      if (ctx.state === "suspended") ctx.state = "running";
+      return Promise.resolve();
+    },
+  };
+  return ctx;
+}
+
+beforeEach(() => {
+  ctxInstances = [];
+  vi.stubGlobal(
+    "AudioContext",
+    class {
+      constructor() {
+        mockCtx = makeMockContext();
+        ctxInstances.push(mockCtx);
+        return mockCtx;
+      }
+    },
+  );
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
+
+// ─── Helper: build a valid RIFF WAV chunk (44-byte header + pcmBytes) ────────
+
+function makeWavChunk(
+  pcmBytes: Uint8Array,
+  opts: { channels?: number; sampleRate?: number; bitDepth?: number } = {},
+): Uint8Array {
+  const { channels = 1, sampleRate = 24000, bitDepth = 16 } = opts;
+  const buf = new Uint8Array(44 + pcmBytes.byteLength);
+  const dv = new DataView(buf.buffer);
+  // "RIFF"
+  buf.set([0x52, 0x49, 0x46, 0x46], 0);
+  dv.setUint32(4, 0xffffffff, true); // streaming sentinel
+  // "WAVE"
+  buf.set([0x57, 0x41, 0x56, 0x45], 8);
+  // "fmt "
+  buf.set([0x66, 0x6d, 0x74, 0x20], 12);
+  dv.setUint32(16, 16, true); // fmt chunk size
+  dv.setUint16(20, 1, true); // PCM
+  dv.setUint16(22, channels, true);
+  dv.setUint32(24, sampleRate, true);
+  dv.setUint32(28, (sampleRate * channels * bitDepth) / 8, true);
+  dv.setUint16(32, (channels * bitDepth) / 8, true);
+  dv.setUint16(34, bitDepth, true);
+  // "data"
+  buf.set([0x64, 0x61, 0x74, 0x61], 36);
+  dv.setUint32(40, 0xffffffff, true); // streaming sentinel
+  buf.set(pcmBytes, 44);
+  return buf;
+}
+
+/** Build a mock Response with a ReadableStream containing the given chunks. */
+function makeMockResponse(chunks: Uint8Array[], ok = true, status = 200): Response {
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const c of chunks) controller.enqueue(c);
+      controller.close();
+    },
+  });
+  return new Response(stream, {
+    status,
+    headers: { "Content-Type": "audio/wav" },
+  });
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+describe("createWebAudioStreamPlayer", () => {
+  it("Test 1 — play() creates AudioBuffer + AudioBufferSourceNode for a single-chunk response", async () => {
+    // 4 PCM bytes = 2 mono frames at 16-bit
+    const pcm = new Uint8Array([0x00, 0x00, 0xff, 0x7f]);
+    const chunk = makeWavChunk(pcm, { channels: 1, sampleRate: 24000, bitDepth: 16 });
+    const player = createWebAudioStreamPlayer({});
+    const response = makeMockResponse([chunk]);
+
+    await player.play(response);
+
+    expect(ctxInstances).toHaveLength(1);
+    const ctx = ctxInstances[0];
+    expect(ctx.buffers).toHaveLength(1);
+    expect(ctx.buffers[0].channels).toBe(1);
+    expect(ctx.buffers[0].frames).toBe(2);
+    expect(ctx.buffers[0].sampleRate).toBe(24000);
+    expect(ctx.sources).toHaveLength(1);
+    expect(ctx.sources[0]._started).toBe(true);
+    expect(ctx.sources[0]._startedAt).toBeGreaterThanOrEqual(ctx.currentTime);
+  });
+
+  it("Test 2 — play() schedules multiple chunks with monotonically non-decreasing start times", async () => {
+    // 3 chunks: first has header + PCM, next two are pure PCM
+    const pcm = new Uint8Array([0x00, 0x00, 0xff, 0x7f]);
+    const firstChunk = makeWavChunk(pcm);
+    const secondChunk = new Uint8Array([0x00, 0x00, 0x00, 0x00]);
+    const thirdChunk = new Uint8Array([0x00, 0x00, 0x00, 0x00]);
+
+    const player = createWebAudioStreamPlayer({});
+    const response = makeMockResponse([firstChunk, secondChunk, thirdChunk]);
+
+    await player.play(response);
+
+    const ctx = ctxInstances[0];
+    expect(ctx.sources).toHaveLength(3);
+    // Start times must be monotonically non-decreasing
+    for (let i = 1; i < ctx.sources.length; i++) {
+      expect(ctx.sources[i]._startedAt).toBeGreaterThanOrEqual(ctx.sources[i - 1]._startedAt);
+    }
+  });
+
+  it("Test 3 — play() fires onEnded only after BOTH reader done AND all sources ended", async () => {
+    const onEnded = vi.fn();
+    const pcm = new Uint8Array([0x00, 0x00, 0xff, 0x7f]);
+    const chunk = makeWavChunk(pcm);
+
+    const player = createWebAudioStreamPlayer({ onEnded });
+    const response = makeMockResponse([chunk]);
+
+    // Reader is synchronous, so after play() returns, reader is done but
+    // the source's onended has not fired yet (it fires asynchronously via AudioContext).
+    await player.play(response);
+
+    // At this point: reader done = true, but source.onended has NOT fired.
+    // onEnded must NOT have been called yet.
+    expect(onEnded).not.toHaveBeenCalled();
+
+    // Now synthetically fire the source's onended callback.
+    const ctx = ctxInstances[0];
+    expect(ctx.sources).toHaveLength(1);
+    ctx.sources[0].onended?.();
+
+    // Now both conditions are met: onEnded should have fired exactly once.
+    expect(onEnded).toHaveBeenCalledTimes(1);
+  });
+
+  it("Test 3b — a stream that ends with no audio fires onError, not onEnded", async () => {
+    const onEnded = vi.fn();
+    const onError = vi.fn();
+    const player = createWebAudioStreamPlayer({ onEnded, onError });
+
+    // RIFF header only — the server ended the stream before any PCM.
+    await player.play(makeMockResponse([makeWavChunk(new Uint8Array(0))]));
+
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(String(onError.mock.calls[0][0])).toMatch(/no audio/);
+    expect(onEnded).not.toHaveBeenCalled();
+    expect(ctxInstances[0].sources).toHaveLength(0);
+  });
+
+  it("Test 3c — stop() while a read is pending (still waiting for audio) fires neither onError nor onEnded", async () => {
+    const onEnded = vi.fn();
+    const onError = vi.fn();
+    const player = createWebAudioStreamPlayer({ onEnded, onError });
+    // Header arrives, then the stream stays open with no audio.
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) { c.enqueue(makeWavChunk(new Uint8Array(0))); },
+    });
+    const playing = player.play(new Response(stream, { status: 200 }));
+    await new Promise((r) => setTimeout(r, 0));
+
+    player.stop();
+    await playing;
+
+    expect(onError).not.toHaveBeenCalled();
+    expect(onEnded).not.toHaveBeenCalled();
+  });
+
+  it("Test 4 — stop() stops all sources, closes AudioContext, and is idempotent", async () => {
+    const onEnded = vi.fn();
+    const pcm = new Uint8Array([0x00, 0x00, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00]);
+    const chunk = makeWavChunk(pcm);
+
+    const player = createWebAudioStreamPlayer({ onEnded });
+    const response = makeMockResponse([chunk]);
+
+    await player.play(response);
+
+    const ctx = ctxInstances[0];
+    expect(ctx.sources.length).toBeGreaterThan(0);
+
+    // Stop the player before onended fires.
+    player.stop();
+
+    // All sources must be stopped.
+    for (const source of ctx.sources) {
+      expect(source._stopped).toBe(true);
+    }
+    // AudioContext must be closed.
+    expect(ctx._closed).toBe(true);
+
+    // onEnded must NOT be called — stop() is an external teardown, not a natural end.
+    expect(onEnded).not.toHaveBeenCalled();
+
+    // Calling stop() again must be a no-op (idempotent — no throw, no double-close).
+    expect(() => player.stop()).not.toThrow();
+  });
+
+  it("Test 5 — non-ok response fires onError and does NOT create an AudioContext", async () => {
+    const onError = vi.fn();
+    const player = createWebAudioStreamPlayer({ onError });
+    const response = makeMockResponse([], false, 503);
+
+    await player.play(response);
+
+    // onError must have been called with an Error mentioning the status code.
+    expect(onError).toHaveBeenCalledTimes(1);
+    const err = onError.mock.calls[0][0] as Error;
+    expect(err.message).toMatch(/503/);
+
+    // No AudioContext was created (resource-leak prevention).
+    expect(ctxInstances).toHaveLength(0);
+  });
+
+  it("Test 6 — mid-stream reader error fires onError and stops all created sources", async () => {
+    const onError = vi.fn();
+    const pcm = new Uint8Array([0x00, 0x00, 0xff, 0x7f]);
+    const firstChunk = makeWavChunk(pcm);
+
+    // Simulate a mid-stream error by mocking the reader directly.
+    // This avoids the unhandled-rejection warning that ReadableStream controller.error()
+    // emits at the Node.js stream-internals level (a jsdom/Node.js quirk: the error
+    // propagates both via reader.read() rejection AND as a separate uncaught promise).
+    let readCount = 0;
+    const fakeReader = {
+      read(): Promise<{ done: boolean; value?: Uint8Array }> {
+        readCount++;
+        if (readCount === 1) {
+          return Promise.resolve({ done: false, value: firstChunk });
+        }
+        // Second read: reject to simulate a network blip mid-stream.
+        return Promise.reject(new Error("network blip"));
+      },
+      cancel(): Promise<void> {
+        return Promise.resolve();
+      },
+      releaseLock(): void {},
+    };
+
+    // Build a mock response with a body that returns our fake reader.
+    const fakeBody = {
+      getReader(): typeof fakeReader {
+        return fakeReader;
+      },
+    };
+    const response = {
+      ok: true,
+      status: 200,
+      body: fakeBody,
+    } as unknown as Response;
+
+    const player = createWebAudioStreamPlayer({ onError });
+    await player.play(response).catch(() => {});
+
+    // onError must have been called.
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect((onError.mock.calls[0][0] as Error).message).toMatch(/network blip/);
+
+    // All created sources must be stopped after teardown.
+    if (ctxInstances.length > 0) {
+      const ctx = ctxInstances[0];
+      for (const source of ctx.sources) {
+        expect(source._stopped).toBe(true);
+      }
+      // AudioContext must be closed.
+      expect(ctx._closed).toBe(true);
+    }
+  });
+
+  it("Test 7 — split header across chunks: player accumulates bytes before parsing", async () => {
+    // Split the 44-byte header: first chunk has 20 bytes, second has remaining 24 + 4 PCM bytes.
+    const fullChunk = makeWavChunk(new Uint8Array([0x00, 0x00, 0xff, 0x7f]));
+    const firstPart = fullChunk.slice(0, 20);
+    const secondPart = fullChunk.slice(20);
+
+    const player = createWebAudioStreamPlayer({});
+    const response = makeMockResponse([firstPart, secondPart]);
+
+    await player.play(response);
+
+    // Player must have correctly assembled the header and scheduled at least one source.
+    expect(ctxInstances).toHaveLength(1);
+    const ctx = ctxInstances[0];
+    expect(ctx.sources).toHaveLength(1);
+    expect(ctx.sources[0]._started).toBe(true);
+    // Sample rate must be 24000 (from the assembled header).
+    expect(ctx.buffers[0].sampleRate).toBe(24000);
+  });
+
+  it("Test 8 — chunks with odd PCM byte counts carry the trailing byte over (frame alignment regression, patch #238)", async () => {
+    // Regression test for the patch #237 ship-day bug: HTTP chunked-transfer
+    // chunks can arrive at arbitrary byte boundaries. When a chunk's PCM
+    // portion has an odd byte count (mono 16-bit = 2 bytes/frame), the naive
+    // decodePcmChunk floor-divides and drops the trailing byte. The next
+    // chunk then starts on a misaligned byte, and every subsequent Int16
+    // sample straddles two adjacent samples in the byte stream. Symptom:
+    // audio starts clean, drifts into gibberish English, then into static.
+    //
+    // Fix: pcmRemainder carry-over in play(). This test proves the fix.
+    //
+    // Setup: 4 mono 16-bit samples across two chunks, with the first PCM
+    // chunk containing an odd byte count (3 bytes). Values chosen to be
+    // asymmetric so any misalignment produces obviously-wrong Float32 output.
+    // Samples: 0x1122, 0x3344, 0x5566, 0x7788 (little-endian byte pairs:
+    // 22 11, 44 33, 66 55, 88 77).
+    const allPcm = new Uint8Array([0x22, 0x11, 0x44, 0x33, 0x66, 0x55, 0x88, 0x77]);
+    // First chunk carries header + 3 PCM bytes (1.5 frames — half a sample trails).
+    const first = makeWavChunk(allPcm.slice(0, 3));
+    // Second chunk is pure PCM: the remaining 5 bytes.
+    const second = allPcm.slice(3);
+
+    const player = createWebAudioStreamPlayer({});
+    const response = makeMockResponse([first, second]);
+
+    await player.play(response);
+
+    // Player must have decoded exactly 4 correctly-aligned Int16 samples.
+    // If the misalignment bug is present, the second chunk starts on byte
+    // 0x33 (the high byte of sample 0x3344), and the decoded Float32 values
+    // will be garbage.
+    expect(ctxInstances).toHaveLength(1);
+    const ctx = ctxInstances[0];
+    // Total frames scheduled must equal 4 (1 from first chunk + 3 from second).
+    const totalFrames = ctx.buffers.reduce((sum, b) => sum + b.frames, 0);
+    expect(totalFrames).toBe(4);
+    // Concatenate decoded samples across all buffers and verify each Int16
+    // was read at its correct byte offset. Expected values in Float32 = Int16 / 32768.
+    const decoded: number[] = [];
+    for (const buf of ctx.buffers) {
+      const ch0 = buf._channelData[0];
+      for (let i = 0; i < ch0.length; i++) decoded.push(ch0[i]);
+    }
+    // Little-endian Int16 reads: 0x1122 = 4386, 0x3344 = 13124, 0x5566 = 21862, 0x7788 = 30600.
+    const expected = [0x1122, 0x3344, 0x5566, 0x7788].map((v) => v / 32768);
+    for (let i = 0; i < 4; i++) {
+      expect(decoded[i]).toBeCloseTo(expected[i], 5);
+    }
+  });
+
+  // ─── pause() / resume() — pause-message-speaking bounty ────────────────────
+
+  it("Test 9 — pause() calls AudioContext.suspend() when running; resume() calls .resume() when suspended", async () => {
+    const pcm = new Uint8Array([0x00, 0x00, 0xff, 0x7f]);
+    const chunk = makeWavChunk(pcm);
+    const player = createWebAudioStreamPlayer({});
+    await player.play(makeMockResponse([chunk]));
+
+    const ctx = ctxInstances[0];
+    expect(ctx.state).toBe("running");
+
+    await player.pause();
+    expect(ctx._suspendCalls).toBe(1);
+    expect(ctx.state).toBe("suspended");
+
+    await player.resume();
+    expect(ctx._resumeCalls).toBe(1);
+    expect(ctx.state).toBe("running");
+  });
+
+  it("Test 10 — pause()/resume() before play() are no-ops (no context yet)", async () => {
+    const player = createWebAudioStreamPlayer({});
+    await player.pause();
+    await player.resume();
+    expect(ctxInstances).toHaveLength(0);
+  });
+
+  it("pause() before play() holds: the new context is suspended from the start and not nudged", async () => {
+    const player = createWebAudioStreamPlayer({});
+    await player.pause();
+    await player.play(makeMockResponse([makeWavChunk(new Uint8Array([0x00, 0x00, 0xff, 0x7f]))]));
+    const ctx = ctxInstances[0];
+    expect(ctx.state).toBe("suspended");
+    expect(ctx._resumeCalls).toBe(0);
+    await player.resume();
+    expect(ctx.state).toBe("running");
+  });
+
+  it("pause() while the context is still suspended (not yet woken) keeps it from being woken", async () => {
+    vi.stubGlobal(
+      "AudioContext",
+      class {
+        constructor() {
+          const ctx = makeMockContext();
+          ctx.state = "suspended";
+          ctxInstances.push(ctx);
+          return ctx;
+        }
+      },
+    );
+    const player = createWebAudioStreamPlayer({});
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    // A body that delivers its first chunk only after the pause.
+    const chunk = makeWavChunk(new Uint8Array([0x00, 0x00, 0xff, 0x7f]));
+    let sent = false;
+    const response = {
+      ok: true,
+      status: 200,
+      body: {
+        getReader: () => ({
+          read: async () => {
+            if (sent) return { done: true, value: undefined };
+            await gate;
+            sent = true;
+            return { done: false, value: chunk };
+          },
+          cancel: () => Promise.resolve(),
+        }),
+      },
+    } as unknown as Response;
+    const playing = player.play(response);
+    await player.pause();
+    release();
+    await playing;
+    const ctx = ctxInstances[0];
+    expect(ctx._resumeCalls).toBe(0);
+    expect(ctx.state).toBe("suspended");
+    await player.resume();
+    expect(ctx.state).toBe("running");
+  });
+
+  it("held while interrupted (a call), it goes back on hold if the phone brings the context back to running", async () => {
+    const player = createWebAudioStreamPlayer({});
+    await player.play(makeMockResponse([makeWavChunk(new Uint8Array([0x00, 0x00, 0xff, 0x7f]))]));
+    const ctx = ctxInstances[0] as ReturnType<typeof makeMockContext> & {
+      onstatechange?: (() => void) | null;
+    };
+    ctx.state = "interrupted" as AudioContextState;
+    await player.pause();
+    expect(ctx._suspendCalls).toBe(0); // nothing to suspend while interrupted
+    // The call ends; iOS resumes the context on its own.
+    ctx.state = "running";
+    ctx.onstatechange?.();
+    await Promise.resolve();
+    expect(ctx._suspendCalls).toBe(1);
+    expect(ctx.state).toBe("suspended");
+    // Resumed by the user: no re-hold.
+    await player.resume();
+    ctx.onstatechange?.();
+    expect(ctx._suspendCalls).toBe(1);
+    expect(ctx.state).toBe("running");
+  });
+
+  it("a resume() right after pause() waits for the suspend instead of being undone by it", async () => {
+    const player = createWebAudioStreamPlayer({});
+    await player.play(makeMockResponse([makeWavChunk(new Uint8Array([0x00, 0x00, 0xff, 0x7f]))]));
+    const ctx = ctxInstances[0];
+    let finishSuspend!: () => void;
+    ctx.suspend = () => {
+      ctx._suspendCalls += 1;
+      return new Promise<void>((r) => {
+        finishSuspend = () => {
+          ctx.state = "suspended";
+          r();
+        };
+      });
+    };
+    const pausing = player.pause();
+    const resuming = player.resume();
+    finishSuspend();
+    await pausing;
+    await resuming;
+    expect(ctx.state).toBe("running");
+    expect(ctx._resumeCalls).toBe(1);
+  });
+
+  it("Test 11 — pause() after stop() is a no-op", async () => {
+    const pcm = new Uint8Array([0x00, 0x00, 0xff, 0x7f]);
+    const chunk = makeWavChunk(pcm);
+    const player = createWebAudioStreamPlayer({});
+    await player.play(makeMockResponse([chunk]));
+
+    player.stop();
+    const ctx = ctxInstances[0];
+    expect(ctx._closed).toBe(true);
+    const suspendCallsAtStop = ctx._suspendCalls;
+
+    await player.pause();
+    expect(ctx._suspendCalls).toBe(suspendCallsAtStop);
+  });
+
+  it("Test 12 — pause() while already suspended is a no-op (idempotent)", async () => {
+    const pcm = new Uint8Array([0x00, 0x00, 0xff, 0x7f]);
+    const chunk = makeWavChunk(pcm);
+    const player = createWebAudioStreamPlayer({});
+    await player.play(makeMockResponse([chunk]));
+
+    await player.pause();
+    const ctx = ctxInstances[0];
+    expect(ctx._suspendCalls).toBe(1);
+
+    await player.pause();
+    expect(ctx._suspendCalls).toBe(1);
+  });
+
+  it("Test 13 — resume() on a closed context fires onError instead of throwing", async () => {
+    const onError = vi.fn();
+    const pcm = new Uint8Array([0x00, 0x00, 0xff, 0x7f]);
+    const chunk = makeWavChunk(pcm);
+    const player = createWebAudioStreamPlayer({ onError });
+    await player.play(makeMockResponse([chunk]));
+
+    // Simulate the browser having killed the AudioContext under us mid-pause
+    // (long tab background suspension). AudioContext.state transitions to
+    // "closed" and any resume() attempt should surface as onError.
+    const ctx = ctxInstances[0];
+    ctx.state = "closed";
+
+    await player.resume();
+
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect((onError.mock.calls[0][0] as Error).message).toMatch(/closed/i);
+  });
+
+  it("Test 14 — resume() surfacing an underlying rejection fires onError", async () => {
+    const onError = vi.fn();
+    const pcm = new Uint8Array([0x00, 0x00, 0xff, 0x7f]);
+    const chunk = makeWavChunk(pcm);
+    const player = createWebAudioStreamPlayer({ onError });
+    await player.play(makeMockResponse([chunk]));
+
+    // Put the context into suspended state, then rig resume() to reject —
+    // mirrors a browser refusing resume mid-transition for its own reasons.
+    await player.pause();
+    const ctx = ctxInstances[0];
+    ctx._resumeRejects = true;
+
+    await player.resume();
+
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect((onError.mock.calls[0][0] as Error).message).toMatch(/resume failed/i);
+  });
+
+  it("Test 15 — external stop() from a paused state still tears down (no onError)", async () => {
+    const onError = vi.fn();
+    const onEnded = vi.fn();
+    const pcm = new Uint8Array([0x00, 0x00, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00]);
+    const chunk = makeWavChunk(pcm);
+    const player = createWebAudioStreamPlayer({ onError, onEnded });
+    await player.play(makeMockResponse([chunk]));
+
+    await player.pause();
+    const ctx = ctxInstances[0];
+    expect(ctx.state).toBe("suspended");
+
+    player.stop();
+
+    expect(ctx._closed).toBe(true);
+    for (const source of ctx.sources) expect(source._stopped).toBe(true);
+    // Neither callback fires — external stop is not a natural end, and it's
+    // not an error either.
+    expect(onError).not.toHaveBeenCalled();
+    expect(onEnded).not.toHaveBeenCalled();
+  });
+
+  it("Test 16 — time-based horizon: reader parks after scheduling a fat buffer until playhead advances", async () => {
+    // Regression for the 2026-09-20 bug: the earlier count-based horizon
+    // (8 pending sources) let a single ~1MB reader.read() chunk decode into
+    // a 60s AudioBuffer, then the next 7 large buffers piled up 100+ seconds
+    // of scheduled audio ahead of the playhead — right back in Chrome's
+    // silent-drop zone. The time-based horizon must park the reader after
+    // scheduling ENOUGH sources to hit the horizon, then only unblock once
+    // the playhead catches up (nextStart - currentTime < horizon).
+    //
+    // Fat buffer: 20000 frames @ 1000Hz sample rate = 20s buffer duration.
+    // audible = 20 / TTS_PLAYBACK_RATE (default 1.0) = 20s. > horizon (15).
+    // Post-2026-09-23 sub-split (MAX_BUFFER_AUDIBLE_SECONDS = 10 at rate 1.0),
+    // the fat chunk splits into 2 sub-sources of 10s each: sub-1 schedules
+    // at [0.02, 10.02] (ahead=10 < horizon, continues), sub-2 schedules at
+    // [10.02, 20.02] (ahead=20 >= horizon, PARKS). Reader must not gulp any
+    // of the small chunks that follow until the playhead advances.
+    const frames = 20000;
+    const sampleRate = 1000;
+    const fatPcm = new Uint8Array(frames * 2); // mono 16-bit
+    const smallPcm = new Uint8Array([0x00, 0x00, 0xff, 0x7f]);
+    const fatChunk = makeWavChunk(fatPcm, { channels: 1, sampleRate, bitDepth: 16 });
+
+    const player = createWebAudioStreamPlayer({});
+    const response = makeMockResponse([fatChunk, smallPcm, smallPcm]);
+
+    // Kick off play WITHOUT awaiting — reader will park at the backpressure
+    // gate after scheduling both sub-splits of the fat buffer, so play()
+    // cannot resolve until we advance currentTime and fire onended.
+    const playPromise = player.play(response);
+
+    // Yield enough microtasks for the reader loop to consume the fat chunk,
+    // sub-split it, schedule both sub-sources, and hit the backpressure gate.
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+
+    const ctx = ctxInstances[0];
+    // Exactly two sub-sources scheduled — reader is parked, not gulping ahead.
+    expect(ctx.sources).toHaveLength(2);
+
+    // Advance the playhead past both sub-sources' audible end, THEN fire
+    // their onended callbacks in order. Order matters: the reader re-checks
+    // the horizon on wake, so if currentTime is still 0 it would just re-block.
+    ctx.currentTime = 20;
+    ctx.sources[0].onended?.();
+    ctx.sources[1].onended?.();
+
+    // Yield microtasks so the reader wakes, schedules the two remaining
+    // small chunks, and hits done.
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+
+    expect(ctx.sources).toHaveLength(4);
+    await playPromise;
+  });
+
+  it("Test 17 — sub-split: a single fat reader chunk decodes into multiple sources of ≤ MAX_BUFFER_AUDIBLE_SECONDS each", async () => {
+    // Regression for the 2026-09-23 bug: a single ~2MB reader.read() chunk
+    // decoded to one 65s AudioBuffer scheduled with a safe 5s start-lead,
+    // but its 52s audible tail extended into Chrome's silent-drop zone
+    // (~30-60s past playhead). Middle went silent; onended fired on schedule.
+    // The fix sub-splits oversized PCM chunks so no single source's audible
+    // playback overshoots the drop threshold.
+    //
+    // Fat buffer: 50000 frames @ 1000Hz = 50s audible at rate 1.0.
+    // Post-fix (MAX_BUFFER_AUDIBLE_SECONDS = 10), this must produce
+    // ceil(50 / 10) = 5 sub-sources, each ≤ 10s audible. Every source's
+    // buffer.duration must be ≤ MAX_BUFFER_AUDIBLE_SECONDS * TTS_PLAYBACK_RATE.
+    // A low sample rate keeps byte-count small while forcing the split.
+    const frames = 50000;
+    const sampleRate = 1000;
+    const fatPcm = new Uint8Array(frames * 2); // mono 16-bit
+    const fatChunk = makeWavChunk(fatPcm, { channels: 1, sampleRate, bitDepth: 16 });
+
+    const player = createWebAudioStreamPlayer({});
+    const response = makeMockResponse([fatChunk]);
+
+    const playPromise = player.play(response);
+
+    // Yield microtasks so the reader schedules the first two sub-sources
+    // then parks on the horizon (2 x 10s = 20s ahead ≥ 15s horizon).
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+
+    const ctx = ctxInstances[0];
+    expect(ctx.sources).toHaveLength(2);
+
+    // Drain the horizon three times: each iteration advances the playhead
+    // past one more sub-source, fires its onended, and lets the reader wake
+    // + schedule the next sub-source before re-parking.
+    for (let subIdx = 0; subIdx < 3; subIdx++) {
+      ctx.currentTime = (subIdx + 1) * 10;
+      ctx.sources[subIdx].onended?.();
+      for (let j = 0; j < 20; j++) await Promise.resolve();
+    }
+
+    // All 5 sub-sources scheduled (reader saw done() after subOffset reached
+    // the end of the fat pcm chunk on the last iteration).
+    expect(ctx.sources).toHaveLength(5);
+
+    // Every source's AudioBuffer must be capped so its audible playback
+    // stays inside the safe schedule window. buffer.duration is in ctx-time
+    // seconds; audible = buffer.duration / TTS_PLAYBACK_RATE. At the 1.0
+    // default they're equal, so buffer.duration ≤ MAX_BUFFER_AUDIBLE_SECONDS.
+    for (const buf of ctx.buffers) {
+      expect(buf.duration).toBeLessThanOrEqual(10.0001);
+    }
+
+    await playPromise;
+  });
+});
+
+describe("per-user playback rate", () => {
+  afterEach(() => setTtsPlaybackRate(null));
+
+  it("Rate 1 — defaults to 1.0 and resets to 1.0 on null / out-of-range / non-finite", () => {
+    expect(getTtsPlaybackRate()).toBe(1);
+    for (const bad of [null, undefined, 0, 0.2, 4.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      setTtsPlaybackRate(1.5);
+      setTtsPlaybackRate(bad);
+      expect(getTtsPlaybackRate()).toBe(1);
+    }
+    setTtsPlaybackRate(0.25);
+    expect(getTtsPlaybackRate()).toBe(0.25);
+    setTtsPlaybackRate(4);
+    expect(getTtsPlaybackRate()).toBe(4);
+  });
+
+  /** Seconds of audio scheduled on a context, summed over its sources. */
+  function scheduledSeconds(ctx: (typeof ctxInstances)[number]): number {
+    return ctx.buffers.reduce((n, b) => n + b.frames / b.sampleRate, 0);
+  }
+
+  it("Rate 2 — a player applies the rate set before it was created, shortening the audio without changing pitch", async () => {
+    setTtsPlaybackRate(2);
+    // 2 × 2000 frames @ 1000Hz = 4s of audio → 2s at 2×.
+    const chunk = makeWavChunk(new Uint8Array(2000 * 2), { channels: 1, sampleRate: 1000, bitDepth: 16 });
+    const player = createWebAudioStreamPlayer({});
+
+    await player.play(makeMockResponse([chunk, new Uint8Array(2000 * 2)]));
+
+    const ctx = ctxInstances[0];
+    expect(scheduledSeconds(ctx)).toBeCloseTo(2, 5);
+    // Speed lives in the samples; sources play at native rate (no pitch shift).
+    for (const src of ctx.sources) expect(src.playbackRate.value).toBe(1);
+    // Gapless: each source starts where the previous one ends.
+    for (let i = 1; i < ctx.sources.length; i++) {
+      const prev = ctx.buffers[i - 1];
+      expect(ctx.sources[i]._startedAt - ctx.sources[i - 1]._startedAt).toBeCloseTo(prev.frames / prev.sampleRate, 5);
+    }
+  });
+
+  it("Rate 3 — changing the rate mid-play doesn't affect a player already created", async () => {
+    setTtsPlaybackRate(1.25);
+    const player = createWebAudioStreamPlayer({});
+    setTtsPlaybackRate(3);
+    // 1000 frames @ 1000Hz = 1s → 0.8s at 1.25×.
+    await player.play(makeMockResponse([makeWavChunk(new Uint8Array(1000 * 2), { channels: 1, sampleRate: 1000, bitDepth: 16 })]));
+    expect(scheduledSeconds(ctxInstances[0])).toBeCloseTo(0.8, 5);
+  });
+});
+
+describe("createWebAudioStreamPlayer — never-started guard", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("gives up with onError when the context stays suspended", async () => {
+    vi.useFakeTimers();
+    const onError = vi.fn();
+    const onEnded = vi.fn();
+    // iOS: a context made outside a tap starts (and stays) suspended.
+    vi.stubGlobal(
+      "AudioContext",
+      class {
+        constructor() {
+          const ctx = makeMockContext();
+          ctx.state = "suspended";
+          ctx._resumeRejects = true;
+          ctxInstances.push(ctx);
+          return ctx;
+        }
+      },
+    );
+    const player = createWebAudioStreamPlayer({ onError, onEnded });
+    await player.play(makeMockResponse([makeWavChunk(new Uint8Array([0x00, 0x00, 0xff, 0x7f]))]));
+    const ctx = ctxInstances[0];
+    expect(ctx._resumeCalls).toBe(1); // nudged once
+    await vi.advanceTimersByTimeAsync(NEVER_STARTED_MS + 10);
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onEnded).not.toHaveBeenCalled();
+    expect(ctx.sources[0]._stopped).toBe(true);
+  });
+
+  it("does not give up while the audio is playing", async () => {
+    vi.useFakeTimers();
+    const onError = vi.fn();
+    const player = createWebAudioStreamPlayer({ onError });
+    await player.play(makeMockResponse([makeWavChunk(new Uint8Array([0x00, 0x00, 0xff, 0x7f]))]));
+    ctxInstances[0].currentTime = 1;
+    await vi.advanceTimersByTimeAsync(NEVER_STARTED_MS + 10);
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("does not give up while the user has it paused", async () => {
+    vi.useFakeTimers();
+    const onError = vi.fn();
+    const player = createWebAudioStreamPlayer({ onError });
+    await player.play(makeMockResponse([makeWavChunk(new Uint8Array([0x00, 0x00, 0xff, 0x7f]))]));
+    await player.pause();
+    await vi.advanceTimersByTimeAsync(NEVER_STARTED_MS + 10);
+    expect(onError).not.toHaveBeenCalled();
+  });
+});
+
+describe("createWebAudioStreamPlayer — output level", () => {
+  it("reads no level before anything plays, and none after stop()", () => {
+    const player = createWebAudioStreamPlayer();
+    expect(player.readLevel?.()).toBeNull();
+    player.stop();
+    expect(player.readLevel?.()).toBeNull();
+  });
+});

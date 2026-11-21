@@ -1,0 +1,295 @@
+# Phase 79 Plan 06 — canonical Skynet Docker Compose.
+#
+# Blocker B-5 (revision pass): host-varying paths (bind-mount sources,
+# env_file, Caddyfile) are parametrized via a SKYNET_HOST_DIR env-var
+# with a /opt/skynet default, so `docker compose -f docker/docker-compose.yml
+# config` works both in the repo (default resolves to the live /opt/skynet
+# layout) and on any host that sets SKYNET_HOST_DIR to a different root.
+#
+# Two-file reality: this file is the REPO canonical shape. On the live
+# deploy target this file lives in the repo and is invoked directly from
+# the repo checkout — no on-host mirror.  Runtime host-varying paths
+# (bind-mount sources, env_file) are parametrized via SKYNET_HOST_DIR
+# (default /opt/skynet) set by shell env or an .env file at the compose
+# location.  The `name:` below pins the compose project namespace to
+# `skynet` regardless of where compose is invoked from (repo checkout at
+# any path, etc.), so container names + docker-managed volumes stay
+# stable across identity trees and future path changes.
+
+name: skynet
+
+# Cap every container's json-file log (Docker's default is unbounded). Synapse
+# alone logged ~3 GB/day of access lines before this; the cap only applies to
+# containers created after the change, so it lands on the next recreate.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+
+services:
+  skynet:
+    image: skynet-patched:local
+    container_name: skynet
+    logging: *default-logging
+    restart: unless-stopped
+    # Share the host's PID namespace so the fleet-status sweep (invoked
+    # locally via acquireLocalChannel for the self-poll) can resolve
+    # ~/.claude/sessions/*.json PIDs via /proc/<pid>/environ. The bind-mounted
+    # HOME gets the sweep the session files; the host PID namespace gets it
+    # the /proc lookups needed to fold each PID into its identity. Without
+    # this, every self-hosted session's pid line is dropped and no WIP
+    # indicators light up for identities on the Skynet host itself. Matches
+    # the practical process-visibility the container already has when it
+    # SSHes as `ubuntu` to any other fleet host.
+    pid: host
+    # /proc/<pid>/environ is mode 0400, readable only by the process owner
+    # (or a process with CAP_SYS_PTRACE). The container runs as root inside
+    # but session PIDs are owned by the host's ubuntu user, so the read
+    # fails EPERM without this capability. Docker drops SYS_PTRACE by
+    # default; adding it here lets the sweep resolve each PID's identity
+    # via its tmux environment. Same practical power the container already
+    # has when it SSHes to any fleet host as ubuntu.
+    cap_add:
+      - SYS_PTRACE
+    # Docker's default AppArmor profile (docker-default) denies the ptrace
+    # syscall regardless of CAP_SYS_PTRACE — profile-level deny sits above
+    # capability grants. Unconfined disables that profile for THIS container
+    # only. Combined with pid: host + SYS_PTRACE this gives the container
+    # the same read visibility into host processes it would have if it
+    # SSHed in as ubuntu. No other containers on the daemon are affected.
+    security_opt:
+      - apparmor:unconfined
+    # Build block: `docker compose build` from a maintainer's worktree
+    # rebuilds skynet-patched:local. Context `..` resolves to the repo
+    # root from docker/docker-compose.yml.
+    #
+    # Build-id is fully automatic: `additional_contexts.git-repo` exposes
+    # the repo's `.git/` to a Dockerfile helper stage (`sha-computer`),
+    # which reads HEAD and bakes the SHA into the client bundle (via
+    # Vite) and into /app/.build-sha for the runtime entrypoint to export
+    # as VITE_BUILD_ID. Zero operator ceremony — no shell exports, no
+    # wrapper script. `.git/` never enters a layer (bind mount).
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      additional_contexts:
+        git-repo: ../.git
+    expose:
+      - "8080"
+    volumes:
+      - skynet-data:/app/data
+      - ${SKYNET_HOST_DIR:-/opt/skynet}/console-forward-logs:/var/log/skynet/console-forward
+      - ${SKYNET_HOST_DIR:-/opt/skynet}/stt-recordings:/app/stt-recordings
+      # Phase 70: branding config + assets — single directory bind-mount from
+      # host, read-only. The operator drops branding.json AND asset files
+      # into /opt/skynet/branding/ side-by-side (matching the bundled defaults
+      # layout at /app/branding-defaults/). One directory mount avoids the
+      # docker create_host_path file-vs-directory ambiguity (a missing file
+      # source would auto-create as an empty DIRECTORY, breaking the loader);
+      # a missing directory source auto-creates as an empty directory cleanly,
+      # and the loader's per-file ENOENT fallback then serves bundled defaults.
+      - type: bind
+        source: ${SKYNET_HOST_DIR:-/opt/skynet}/branding
+        target: /etc/skynet/branding
+        read_only: true
+        bind:
+          create_host_path: true
+      # LOCAL-branch bind mount for co-located deployments (opt-in). When a
+      # deployment's own box is registered as a Skynet host AND wants
+      # identity-artifact-reader / identity-birth / spawn-request-worker /
+      # distributor to skip SSH for that host, exposing the host's user-home
+      # dir here lets Skynet read AND write directly from disk.
+      #
+      # Widened 2026-09-18 (bug: distributor local-FS install landed
+      # ~/.local/bin/* and ~/.claude/skills/* at /home/ubuntu/fleet/.local/*
+      # instead of /home/ubuntu/.local/* because the mount only covered
+      # ~/fleet, not all of ~/). Fix: mount full user-home at /host-home so
+      # every catalog `~/*` install path resolves correctly. Blast surface
+      # widened accordingly — the container can now read/write anything
+      # under the mounted user-home (including ~/.ssh, ~/.aws, etc.). This
+      # is a conscious tradeoff for co-located deployments only.
+      #
+      # Opt-in shape: set SKYNET_HOME_MOUNT_SRC in shell env at compose
+      # invocation (typically via .env file at /opt/skynet/.env),
+      # AND set IDENTITIES_LOCAL_HOST_IDS + IDENTITIES_HOST_DIR +
+      # ROLES_HOST_DIR + HOME_HOST_DIR in skynet.env.
+      # Mounted RW: LOCAL-branch identity-birth writes <name>.md / avatar /
+      # relay.json under /host-home/fleet/, spawn-request worker writes
+      # response files under /host-home/fleet/, and the fleet-substrate
+      # distributor writes to /host-home/.claude/skills/ + /host-home/.local/bin/
+      # + /host-home/.config/systemd/user/. Read-only defeats all of them.
+      #
+      # HARD-FAIL if SKYNET_HOME_MOUNT_SRC is unset (2026-09-12 user):
+      # the prior `:-/tmp` fallback silently mounted /tmp into the bind when
+      # the env var didn't reach compose interpolation (sudo-env-strip
+      # issue with `--env-file`), producing invisible-scanner + lost
+      # spawn-requests. Fail-loud beats fail-quiet. If this errors on
+      # `docker compose build` OR `docker compose up`, pass
+      # `--env-file /opt/skynet/.env` (or your deployment's equivalent
+      # canonical env file) — required for BOTH steps because compose
+      # interpolates volume paths at config-parse time, not just at up.
+      - ${SKYNET_HOME_MOUNT_SRC:?SKYNET_HOME_MOUNT_SRC must be set — pass --env-file /opt/skynet/.env to docker compose (required for BOTH build and up; see docker/docker-compose.yml note above)}:/host-home
+      # tmux socket directory for the fleet-status sweep's pid→identity
+      # resolver. The sweep reads /proc/<pid>/environ (needs pid: host +
+      # SYS_PTRACE + apparmor:unconfined above) to get TMUX_PANE, then
+      # spawns `tmux display-message` to translate that pane id into the
+      # session name (which is the identity name on this fleet). Without
+      # the socket bind, tmux inside the container can't talk to the host's
+      # tmux server so every resolve returns None and every pid line is
+      # dropped. The socket + directory are owned by uid 1000 (ubuntu);
+      # container root can connect fine. Read-only is sufficient — the
+      # container never creates panes, only queries.
+      - /tmp/tmux-1000:/tmp/tmux-1000:ro
+    env_file:
+      - ${SKYNET_HOST_DIR:-/opt/skynet}/skynet.env
+    environment:
+      PORT: "8080"
+      SKYNET_CONSOLE_FORWARD_LOG_PATH: "/var/log/skynet/console-forward/console-forward.log"
+      # Host-side path of the bind mount at /host-home (LEFT side of the
+      # `${SKYNET_HOME_MOUNT_SRC}:/host-home` volume above). Propagated into
+      # the container runtime env so LOCAL-branch bootstrap can distinguish
+      # container-side write paths from host-side exec paths (the value
+      # written into ~/.claude/settings.json.statusLine.command is exec'd
+      # by Claude Code on the HOST, where /host-home does not exist —
+      # 2026-09-25). Same fail-loud guard as the bind above.
+      SKYNET_HOME_MOUNT_SRC: ${SKYNET_HOME_MOUNT_SRC:?SKYNET_HOME_MOUNT_SRC must be set — pass --env-file /opt/skynet/.env to docker compose}
+      # Document converter sidecar (below). Unset it to turn conversion off:
+      # legacy Office / OpenDocument files then get the binary download card.
+      SKYNET_CONVERTER_URL: "http://converter:3030"
+    depends_on:
+      - guacd
+    networks:
+      - skynet-net
+      - converter-net
+
+  # LibreOffice document converter: opens .doc/.odt in the Word editor,
+  # .xls/.ods in the Excel viewer, and .ppt/.pptx/.odp as PDFs (and converts
+  # edited .doc/.odt back on save). It parses untrusted documents, so it is
+  # locked down: only on an internal network with no route out (Skynet is
+  # its only peer), read-only filesystem with a tmpfs scratch area, no
+  # capabilities, no privilege escalation, and memory/CPU/process caps. Each
+  # conversion is a fresh LibreOffice process with macros disabled.
+  converter:
+    build:
+      context: ./converter
+    image: skynet-converter:local
+    container_name: skynet-converter
+    logging: *default-logging
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=1g
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1536m
+    cpus: 2
+    pids_limit: 256
+    expose:
+      - "3030"
+    networks:
+      - converter-net
+
+  guacd:
+    image: guacamole/guacd:1.6.0
+    container_name: guacd
+    logging: *default-logging
+    restart: unless-stopped
+    networks:
+      - skynet-net
+
+  # Matrix homeserver for deployments that co-locate their fleet's relay.
+  # SYNAPSE_SERVER_NAME must be set per-deployment (either at this env-var
+  # default or in /opt/skynet/skynet.env). On first startup with no
+  # homeserver.yaml in the volume, the image auto-generates config from the
+  # env vars. Skynet does NOT wire itself to this service — the relay
+  # account lives on whatever homeserver the deployment chose (external or
+  # co-located). The `matrix` network alias is load-bearing for Caddy's
+  # reverse_proxy → matrix:8008 route.
+  synapse:
+    image: ghcr.io/element-hq/synapse:latest
+    container_name: synapse
+    logging: *default-logging
+    restart: unless-stopped
+    environment:
+      - SYNAPSE_SERVER_NAME=${SYNAPSE_SERVER_NAME:-matrix.local}
+      - SYNAPSE_REPORT_STATS=${SYNAPSE_REPORT_STATS:-no}
+    # Tailnet-exposure gate. Default 127.0.0.1 = internal-only (Caddy reverse-
+    # proxies via the `matrix` network alias, external clients hit Caddy).
+    # Fleets that want peer boxes' relay receivers to reach Synapse directly
+    # over the tailnet set SYNAPSE_HOST_BIND to the tailnet IP in skynet.env.
+    ports:
+      - "${SYNAPSE_HOST_BIND:-127.0.0.1}:8008:8008"
+    volumes:
+      - synapse-data:/data
+    networks:
+      skynet-net:
+        aliases:
+          - matrix
+
+  # Custom Caddy build (adds route53 DNS-01 plugin for wildcard TLS on the
+  # deployment's wildcard subdomain). Uses cross-account AssumeRole against
+  # a Route 53 hosted zone via the `caddy` AWS profile. Per-deployment
+  # specifics (AWS account IDs, hosted zone ID, IAM role ARN) live in the
+  # host's ~/.aws/config (bind-mounted below), NOT this repo — different
+  # deployments plug in their own values.
+  caddy:
+    build:
+      context: ..
+      dockerfile: docker/Caddy.Dockerfile
+    image: skynet-caddy:local
+    container_name: caddy
+    logging: *default-logging
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      # Directory bind (not single-file bind) so atomic-replace edits to
+      # Caddyfile (Write/Edit tool, `sed -i`, editor "save-as-tmp+rename")
+      # don't orphan the container's inode reference — single-file bind
+      # mounts to a specific inode at mount time, and any atomic-replace
+      # creates a new inode the container never sees. Host directory
+      # ${SKYNET_HOST_DIR}/caddy-config/ must contain a Caddyfile; unlocks
+      # hot-reload workflows (docker exec caddy caddy reload) without
+      # container recreate.
+      - ${SKYNET_HOST_DIR:-/opt/skynet}/caddy-config/:/etc/caddy/:ro
+      - caddy-data:/data
+      # NOTE: this docker-managed `caddy-config` volume is separate from
+      # the host `caddy-config/` directory bound above — different names
+      # in different namespaces. This volume holds Caddy's runtime state
+      # at /config (auto-generated JSON config, TLS session state); the
+      # host bind at /etc/caddy/ holds the input Caddyfile.
+      - caddy-config:/config
+      # AWS SDK profile for cross-account Route 53 access.  Host
+      # ~/.aws/config must contain a [profile caddy] block with the
+      # appropriate role_arn / credential_source / region for the
+      # deployment's Route 53 zone.
+      - ${HOME}/.aws/config:/root/.aws/config:ro
+    environment:
+      # List form (KEY=VALUE) matches the plan's grep gate expectations and
+      # docker-compose accepts either list or map form for environment.
+      - AWS_PROFILE=caddy
+      - AWS_REGION=us-east-1
+    networks:
+      - skynet-net
+
+volumes:
+  skynet-data:
+    driver: local
+  caddy-data:
+    driver: local
+  caddy-config:
+    driver: local
+  synapse-data:
+    driver: local
+
+networks:
+  skynet-net:
+    driver: bridge
+  # No external connectivity: the converter can reach Skynet and nothing else.
+  converter-net:
+    driver: bridge
+    internal: true

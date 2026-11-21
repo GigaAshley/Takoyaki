@@ -1,0 +1,344 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+# shellcheck disable=SC2317
+# Test driver for snapshot_schedule_peek() — the dormant-wake check for
+# scheduled wake-ups. Regression coverage for the `.anchored`/`.last` split
+# (commit 9676e820): a recurring spec that has only been anchored (never
+# fired) must still wake a dormant identity when its first slot comes due.
+#
+# Covers:
+#   T-01  — daily, only .anchored, slot overdue → due
+#   T-02  — daily, .last after today's slot → not due
+#   T-03  — interval, only .anchored, anchor+every passed → due
+#   T-04  — interval, only .anchored, anchor+every in future → not due
+#   T-05  — weekly, only .anchored, this week's slot overdue → due
+#   T-06  — no .last and no .anchored (never seen by scheduler) → not due
+#   T-07  — .last wins over .anchored when both present
+#   T-08  — yearly, only .anchored, this year's slot overdue → due
+#   T-09  — yearly, .last after this year's slot → not due
+#   T-10  — interval in months, .last a month+ ago → due
+#   T-11  — interval in months, .last a day ago → not due
+#   T-12  — monthly day-of-month, anchored-only, today's slot overdue → due
+#   T-13  — count exhausted (.runs == count) → not due even though overdue
+#   T-14  — state keyed by the wake-up's folder name, like the scheduler
+#   T-15  — malformed schedule → not due (the scheduler refuses to fire it)
+#   T-16  — spec without `instruction` → not due (the scheduler never loads it)
+#   T-17  — sensor wake-up with a waiting fire → due
+#   T-18  — sensor wake-up with only a half-written fire → not due
+#   T-19  — disabled sensor wake-up with a waiting fire → not due
+#   T-20  — flat legacy wakeups/<slug>.json → not due (folders only)
+#   T-21  — one-time sensor that already handed its fire over → not due
+#   T-22  — one-time sensor with a waiting fire → due
+#   T-23  — sensor broken past the grace period, owner not yet told → due; told → not due
+#   T-24  — sensor whose only waiting fire is a duplicate it would drop → not due
+#   T-25  — tripped sensor (not switched back on) with a waiting fire → not due
+#   T-26  — grouped sensor whose window is still open → not due; closed → due
+#
+# Exits 0 on all-pass; 1 on any failure.
+#
+# Usage: bash substrate/scripts/tests/agent-supervisor-schedule-peek.test.sh
+#   Run from the repo root.
+
+export AGENT_SUPERVISOR_LIB_ONLY=1
+
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+SUPERVISOR="${SUPERVISOR:-$REPO_ROOT/substrate/scripts/agent-supervisor.sh}"
+# The peek loads the schedule engine from the scheduler — point it at this tree's copy.
+export AGENT_SUPERVISOR_WAKEUP_SCHEDULER="$REPO_ROOT/substrate/scripts/wakeup-scheduler.py"
+
+if [ ! -f "$SUPERVISOR" ]; then
+  printf 'FATAL: supervisor not found at %s\n' "$SUPERVISOR" >&2
+  exit 1
+fi
+
+PASS=0
+FAIL=0
+FAILURES=()
+CURRENT_TEST=""
+
+pass() { PASS=$((PASS+1)); printf 'PASS: %s\n' "$CURRENT_TEST"; }
+fail() {
+  FAIL=$((FAIL+1))
+  FAILURES+=("$CURRENT_TEST: $1")
+  printf 'FAIL: %s — %s\n' "$CURRENT_TEST" "$1" >&2
+}
+
+SCRATCH=""
+setup_scratch() {
+  SCRATCH=$(mktemp -d)
+  IDENTITIES_DIR="$SCRATCH"
+  METRICS_LOG="$SCRATCH/metrics.jsonl"
+  IDENTITIES=(alice)
+  mkdir -p "$SCRATCH/alice/wakeups/w/.state"
+}
+
+teardown_scratch() {
+  [ -n "$SCRATCH" ] && [ -d "$SCRATCH" ] && rm -rf "$SCRATCH"
+  SCRATCH=""
+}
+
+# shellcheck disable=SC1090
+source "$SUPERVISOR" 2>/dev/null || true
+
+if ! declare -F snapshot_schedule_peek >/dev/null 2>&1; then
+  printf 'FATAL: snapshot_schedule_peek not defined after sourcing supervisor\n' >&2
+  exit 1
+fi
+
+# Pin the window so the assertions don't depend on the box's conf.
+FALSE_KILL_MINUTES=5
+
+write_spec() { printf '%s\n' "$1" > "$SCRATCH/alice/wakeups/w/wakeup.json"; }
+write_state() { printf '%s' "$2" > "$SCRATCH/alice/wakeups/w/.state/w.$1"; }
+write_fire() { mkdir -p "$SCRATCH/alice/wakeups/w/fires"; printf 'found' > "$SCRATCH/alice/wakeups/w/fires/$1"; }
+
+expect_due() {
+  snapshot_schedule_peek
+  if schedule_peek alice; then pass; else fail "expected due, got not-due"; fi
+}
+expect_not_due() {
+  snapshot_schedule_peek
+  if schedule_peek alice; then fail "expected not-due, got due (${SCHEDULE_PEEK_SNAPSHOT[alice]:-})"; else pass; fi
+}
+
+run_case() {
+  local name="$1"; shift
+  CURRENT_TEST="$name"
+  setup_scratch
+  "$@"
+  teardown_scratch
+}
+
+NOW=$(date +%s)
+# A daily slot 10 minutes ago, box-local (no timezone key → box-local wall clock).
+SLOT_PAST=$(date -d "@$((NOW - 600))" +%H:%M)
+# Skip around midnight: a slot 10 min ago would land on yesterday's date.
+if [ "$(date -d "@$((NOW - 600))" +%F)" != "$(date +%F)" ]; then
+  printf 'SKIP: within 10 min of local midnight; rerun shortly\n'
+  exit 0
+fi
+
+t01() {
+  write_spec "{\"name\":\"w\",\"schedule\":{\"type\":\"daily\",\"at\":\"$SLOT_PAST\"},\"instruction\":\"x\"}"
+  write_state anchored "$((NOW - 86400))"
+  expect_due
+}
+
+t02() {
+  write_spec "{\"name\":\"w\",\"schedule\":{\"type\":\"daily\",\"at\":\"$SLOT_PAST\"},\"instruction\":\"x\"}"
+  write_state last "$((NOW - 60))"
+  expect_not_due
+}
+
+t03() {
+  write_spec '{"name":"w","schedule":{"type":"interval","every":"1h"},"instruction":"x"}'
+  write_state anchored "$((NOW - 7200))"
+  expect_due
+}
+
+t04() {
+  write_spec '{"name":"w","schedule":{"type":"interval","every":"1h"},"instruction":"x"}'
+  write_state anchored "$((NOW - 60))"
+  expect_not_due
+}
+
+t05() {
+  local day
+  day=$(date -d "@$((NOW - 600))" +%a | tr '[:upper:]' '[:lower:]')
+  write_spec "{\"name\":\"w\",\"schedule\":{\"type\":\"weekly\",\"day\":\"$day\",\"at\":\"$SLOT_PAST\"},\"instruction\":\"x\"}"
+  write_state anchored "$((NOW - 3 * 86400))"
+  expect_due
+}
+
+t06() {
+  write_spec "{\"name\":\"w\",\"schedule\":{\"type\":\"daily\",\"at\":\"$SLOT_PAST\"},\"instruction\":\"x\"}"
+  expect_not_due
+}
+
+t07() {
+  write_spec '{"name":"w","schedule":{"type":"interval","every":"1h"},"instruction":"x"}'
+  write_state anchored "$((NOW - 7200))"
+  write_state last "$((NOW - 60))"
+  expect_not_due
+}
+
+t08() {
+  local date
+  date=$(date -d "@$((NOW - 600))" +%m-%d)
+  write_spec "{\"name\":\"w\",\"schedule\":{\"type\":\"yearly\",\"date\":\"$date\",\"at\":\"$SLOT_PAST\"},\"instruction\":\"x\"}"
+  write_state anchored "$((NOW - 30 * 86400))"
+  expect_due
+}
+
+t09() {
+  local date
+  date=$(date -d "@$((NOW - 600))" +%m-%d)
+  write_spec "{\"name\":\"w\",\"schedule\":{\"type\":\"yearly\",\"date\":\"$date\",\"at\":\"$SLOT_PAST\"},\"instruction\":\"x\"}"
+  write_state last "$((NOW - 60))"
+  expect_not_due
+}
+
+t10() {
+  write_spec '{"name":"w","schedule":{"type":"interval","every":"1mo"},"instruction":"x"}'
+  write_state last "$((NOW - 32 * 86400))"
+  expect_due
+}
+
+t11() {
+  write_spec '{"name":"w","schedule":{"type":"interval","every":"1mo"},"instruction":"x"}'
+  write_state last "$((NOW - 86400))"
+  expect_not_due
+}
+
+t12() {
+  local dom
+  dom=$((10#$(date -d "@$((NOW - 600))" +%d)))
+  write_spec "{\"name\":\"w\",\"schedule\":{\"type\":\"monthly\",\"day\":$dom,\"at\":\"$SLOT_PAST\"},\"instruction\":\"x\"}"
+  write_state anchored "$((NOW - 40 * 86400))"
+  expect_due
+}
+
+t13() {
+  write_spec "{\"name\":\"w\",\"schedule\":{\"type\":\"daily\",\"at\":\"$SLOT_PAST\",\"count\":2},\"instruction\":\"x\"}"
+  write_state last "$((NOW - 86400))"
+  write_state runs 2
+  expect_not_due
+}
+
+t14() {
+  # State is keyed by the folder name, whatever the spec's display `name`.
+  write_spec "{\"name\":\"Renamed\",\"schedule\":{\"type\":\"daily\",\"at\":\"$SLOT_PAST\"},\"instruction\":\"x\"}"
+  write_state anchored "$((NOW - 86400))"
+  expect_due
+}
+
+t15() {
+  write_spec "{\"name\":\"w\",\"schedule\":{\"type\":\"daily\",\"at\":\"25:00\"},\"instruction\":\"x\"}"
+  write_state anchored "$((NOW - 86400))"
+  expect_not_due
+}
+
+t16() {
+  write_spec "{\"name\":\"w\",\"schedule\":{\"type\":\"daily\",\"at\":\"$SLOT_PAST\"}}"
+  write_state anchored "$((NOW - 86400))"
+  expect_not_due
+}
+
+t17() {
+  write_spec '{"name":"w","schedule":{"type":"sensor"},"instruction":"x"}'
+  write_fire 20261014T143012345-a1b2c3d4.fire
+  expect_due
+}
+
+t18() {
+  write_spec '{"name":"w","schedule":{"type":"sensor"},"instruction":"x"}'
+  write_fire 20261014T143012345-a1b2c3d4.fire.tmp
+  expect_not_due
+}
+
+t19() {
+  write_spec '{"name":"w","enabled":false,"schedule":{"type":"sensor"},"instruction":"x"}'
+  write_fire 20261014T143012345-a1b2c3d4.fire
+  expect_not_due
+}
+
+t21() {
+  # A one-time sensor that already handed its fire over is not due.
+  write_spec '{"name":"w","schedule":{"type":"sensor","once":true},"instruction":"x"}'
+  write_fire 20261014T143012345-a1b2c3d4.fire
+  touch -d '1 minute ago' "$SCRATCH/alice/wakeups/w/wakeup.json"
+  write_state fired 20261014T143000000-00000000.fire
+  expect_not_due
+}
+
+t22() {
+  # A one-time sensor that hasn't fired yet is due with a waiting fire.
+  write_spec '{"name":"w","schedule":{"type":"sensor","once":true},"instruction":"x"}'
+  write_fire 20261014T143012345-a1b2c3d4.fire
+  expect_due
+}
+
+t23() {
+  write_spec '{"name":"w","schedule":{"type":"sensor"},"instruction":"x"}'
+  local d="$SCRATCH/alice/wakeups/w/.state" since upd
+  since=$(date -u -d '-1 hour' +%Y-%m-%dT%H:%M:%SZ); upd=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  mkdir -p "$d"
+  printf '{"state":"failed","healthy":false,"unhealthySince":"%s","updatedAt":"%s"}' "$since" "$upd" > "$d/sensor-health.json"
+  expect_due
+  printf '{"since":"%s"}' "$since" > "$d/w.broken"
+  expect_not_due
+}
+
+t20() {
+  # A flat legacy spec is not a wake-up any more.
+  printf '%s\n' "{\"name\":\"flat\",\"schedule\":{\"type\":\"daily\",\"at\":\"$SLOT_PAST\"},\"instruction\":\"x\"}" > "$SCRATCH/alice/wakeups/flat.json"
+  mkdir -p "$SCRATCH/alice/wakeups/.state"
+  printf '%s' "$((NOW - 86400))" > "$SCRATCH/alice/wakeups/.state/flat.anchored"
+  expect_not_due
+}
+
+t24() {
+  write_spec '{"name":"w","schedule":{"type":"sensor"},"instruction":"x"}'
+  write_fire 20261014T143012345-a1b2c3d4.fire
+  printf 'k' > "$SCRATCH/alice/wakeups/w/fires/20261014T143012345-a1b2c3d4.fire.key"
+  printf '{"deliveries":[],"keys":{"k":%s}}' "$((NOW - 60))" > "$SCRATCH/alice/wakeups/w/.state/sensor-ledger.json"
+  expect_not_due
+}
+
+t25() {
+  write_spec '{"name":"w","schedule":{"type":"sensor"},"instruction":"x"}'
+  write_fire 20261014T143012345-a1b2c3d4.fire
+  printf '{"at":"2026-10-14T00:00:00Z","limit":10,"fires":3,"specMtimeNs":null}' > "$SCRATCH/alice/wakeups/w/.state/sensor-tripped.json"
+  expect_not_due
+}
+
+t26() {
+  write_spec '{"name":"w","schedule":{"type":"sensor"},"instruction":"x"}'
+  mkdir -p "$SCRATCH/alice/wakeups/w/sensor"
+  printf '{"run":"always","command":"x","groupWindow":"1h"}' > "$SCRATCH/alice/wakeups/w/sensor/sensor.json"
+  local name
+  name=$(python3 -c "import datetime as d,time; t=d.datetime.fromtimestamp(time.time()-60, d.timezone.utc); print(t.strftime('%Y%m%dT%H%M%S') + '000-00000001.fire')")
+  write_fire "$name"
+  expect_not_due
+  printf '{"run":"always","command":"x","groupWindow":"1m"}' > "$SCRATCH/alice/wakeups/w/sensor/sensor.json"
+  expect_due
+}
+
+run_case "T-01 daily anchored-only overdue → due" t01
+run_case "T-02 daily fired after slot → not due" t02
+run_case "T-03 interval anchored-only overdue → due" t03
+run_case "T-04 interval anchored-only future → not due" t04
+run_case "T-05 weekly anchored-only overdue → due" t05
+run_case "T-06 no state at all → not due" t06
+run_case "T-07 .last wins over .anchored" t07
+run_case "T-08 yearly anchored-only overdue → due" t08
+run_case "T-09 yearly fired after slot → not due" t09
+run_case "T-10 interval months elapsed → due" t10
+run_case "T-11 interval months not elapsed → not due" t11
+run_case "T-12 monthly anchored-only overdue → due" t12
+run_case "T-13 count exhausted → not due" t13
+run_case "T-14 state keyed by folder name" t14
+run_case "T-15 malformed schedule → not due" t15
+run_case "T-16 no instruction → not due" t16
+run_case "T-17 sensor with a waiting fire → due" t17
+run_case "T-18 sensor with only a half-written fire → not due" t18
+run_case "T-19 disabled sensor with a waiting fire → not due" t19
+run_case "T-21 one-time sensor already handed over → not due" t21
+run_case "T-22 one-time sensor with a waiting fire → due" t22
+run_case "T-23 broken sensor not yet told → due; told → not due" t23
+run_case "T-24 duplicate-only sensor fire → not due" t24
+run_case "T-25 tripped sensor → not due" t25
+run_case "T-26 grouped window open → not due; closed → due" t26
+run_case "T-20 flat legacy spec ignored → not due" t20
+
+printf '\n===============================\n'
+printf 'PASS: %d  FAIL: %d\n' "$PASS" "$FAIL"
+if [ "$FAIL" -gt 0 ]; then
+  printf 'Failures:\n'
+  for f in "${FAILURES[@]}"; do printf '  - %s\n' "$f"; done
+  exit 1
+fi
+exit 0

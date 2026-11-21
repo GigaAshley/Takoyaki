@@ -1,0 +1,328 @@
+/* eslint-disable react-refresh/only-export-components */
+import { prepareClientCacheVersion } from "@/lib/client-cache-version";
+import { StrictMode, Suspense, lazy, useState, useRef, useEffect } from "react";
+import { createRoot } from "react-dom/client";
+import "./ui/index.css";
+import "./ui/features/pretty-conversations/pretty-conversations.css";
+import { ThemeProvider } from "@/components/theme-provider";
+import "./ui/i18n/i18n";
+import { Toaster } from "@/components/sonner";
+import { SkewLockModal } from "@/features/skew-lock/SkewLockModal";
+import { Auth, getStoredAuth, clearStoredAuth } from "@/auth/Auth";
+import { validateReturnUrl, parseReturnFromSearch } from "@/auth/return-url";
+import {
+  reloadToSignIn,
+  readSignOutBroadcast,
+  type SignOutReason,
+} from "@/auth/reload-to-sign-in";
+import { getUserInfo, appReadyPromise } from "@/main-axios";
+import { applyAccentColor, applyFontSize } from "@/lib/theme";
+import type { FontSizeId } from "@/types/ui-types";
+import { useServiceWorker } from "@/hooks/use-service-worker";
+import { useTranslation } from "react-i18next";
+import { snapshotPendingTab } from "@/lib/tab-url";
+import { initConsoleForwarder } from "@/lib/console-forwarder";
+import { startDiagEmitter } from "@/lib/diag-emitter";
+import { startFreezeDiag } from "@/lib/freeze-diag";
+import { installDragDiag } from "@/lib/drag-diag";
+import { installScrollbarReveal } from "@/lib/scrollbar-reveal";
+import { fetchBrandingConfig } from "@/branding/branding-fetch";
+import { useBrandingFavicon } from "@/branding/apply-favicon";
+
+// Patch #146: install console-forwarder before anything else so all
+// subsequent console.log/warn/error calls are intercepted and batched
+// to /debug/console-log for server-side grep via docker exec.
+initConsoleForwarder();
+
+// Phase 31 D-02: PWA lifecycle structured logs at page level.
+// Distinct from console-forwarder.ts's visibilitychange handler (which only
+// calls flushBeacon) — different concerns. These emit [pwa] lines for
+// diagnosis of "app hangs on page-restore", "tabs discarded by iOS", etc.
+export function registerPwaLifecycleLogs(): void {
+  window.addEventListener("visibilitychange", () => {
+    console.info(`[pwa] visibility-change state=${document.visibilityState} hidden=${document.hidden}`);
+  });
+  window.addEventListener("pagehide", (e: PageTransitionEvent) => {
+    console.info(`[pwa] pagehide persisted=${e.persisted}`);
+  });
+  window.addEventListener("pageshow", (e: PageTransitionEvent) => {
+    console.info(`[pwa] pageshow persisted=${e.persisted}`);
+  });
+}
+registerPwaLifecycleLogs();
+
+// Phase 31 D-02: boot boundary log — surfaces whether the app init path
+// fired at all and from which URL. UA truncated to 80 chars (T-31-14: UA is
+// already public, sent on every HTTP request; no additional exposure).
+console.info(`[pwa] boot ts=${Date.now()} ua="${navigator.userAgent.slice(0, 80)}" pathname=${window.location.pathname}`);
+
+// Bounty pretty-view-per-pane-cost-diag: kick off the per-pane cost
+// diag emitter. Rides the console-forwarder above — every 30s it walks
+// the diag registry and console.logs one [DIAG-REPORT] envelope.
+// Removable in ~5 min when the mitigation shape is chosen.
+startDiagEmitter();
+
+// 2026-09-30 UAT: freeze-diag heartbeat. Ships a `[freeze-diag]` line every
+// 5s with WS count + heap MB + DOM node count + modal open counts so we can
+// grep the console-forward log for leading indicators before the user hits
+// the intermittent "page unresponsive" freezes. Remove once the cause is
+// identified. See src/ui/lib/freeze-diag.ts.
+startFreezeDiag();
+
+// `[dnd-diag]` lines per drag, plus `stalled` when a drag starts but the
+// browser never carries it (no image, no-symbol cursor). See
+// src/ui/lib/drag-diag.ts.
+installDragDiag();
+
+// Scrollbars hide when idle and show while scrolled or hovered.
+installScrollbarReveal();
+
+// Preserve ?tab=<spec> across the auth flow. Auth.tsx calls replaceState in
+// several branches that would otherwise strip the query string before
+// AppShell mounts.
+snapshotPendingTab();
+console.info(`[pwa] snapshot-tab-restore result=no-pending`);
+
+const AppShell = lazy(() =>
+  import("@/AppShell").then((m) => ({ default: m.AppShell })),
+);
+
+// Full-screen apps opened via query params (e.g. from external links)
+const TerminalApp = lazy(() =>
+  import("@/features/terminal/TerminalApp").then((m) => ({
+    default: m.default,
+  })),
+);
+const GuacamoleApp = lazy(() =>
+  import("@/features/guacamole/GuacamoleApp").then((m) => ({
+    default: m.default,
+  })),
+);
+
+type Phase =
+  | "verifying"
+  | "idle-auth"
+  | "fading-in"
+  | "idle-app"
+  | "fading-out";
+
+function FullscreenApp() {
+  const searchParams = new URLSearchParams(window.location.search);
+  const view = searchParams.get("view");
+  const hostId = searchParams.get("hostId");
+
+  switch (view) {
+    case "terminal":
+      return <TerminalApp hostId={hostId || undefined} />;
+    case "rdp":
+    case "vnc":
+    case "telnet":
+      return <GuacamoleApp hostId={hostId || undefined} />;
+    default:
+      return null;
+  }
+}
+
+function App() {
+  // bounty branding-favicon-coverage-gap: called here (not inside AppShell)
+  // so the operator's branding.faviconPath overrides <link rel="icon"> hrefs
+  // on BOTH the login (<Auth>) and post-login (<AppShell>) branches. Previously
+  // scoped to AppShell — AppShell only mounts post-login, so the login page
+  // always rendered the fork's hardcoded /favicon-32.png default and no
+  // operator branding-config override reached the browser tab pre-auth.
+  //
+  // NOT mounted in RootApp: that component short-circuits to <FullscreenApp>
+  // for ?view= popouts, which doesn't need favicon rewrites (out of scope for
+  // this bounty).
+  useBrandingFavicon();
+  const stored = getStoredAuth();
+  const [phase, setPhase] = useState<Phase>(
+    stored?.loggedIn ? "verifying" : "idle-auth",
+  );
+  const [authUsername, setAuthUsername] = useState(stored?.username ?? "");
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    const savedAccent = localStorage.getItem("skynet-accent");
+    if (savedAccent) applyAccentColor(savedAccent);
+    const savedSize = localStorage.getItem(
+      "skynet-font-size",
+    ) as FontSizeId | null;
+    applyFontSize(savedSize ?? "lg");
+    return () => {
+      if (timerRef.current) clearTimeout(timerRef.current);
+    };
+  }, []);
+
+  // Verify stored session against the server before rendering AppShell.
+  // Wait for API instances to be initialized first.
+  useEffect(() => {
+    if (phase !== "verifying") return;
+    appReadyPromise
+      .then(() => getUserInfo())
+      .then(() => {
+        setPhase("fading-in");
+        timerRef.current = setTimeout(() => setPhase("idle-app"), 450);
+      })
+      .catch(() => {
+        clearStoredAuth();
+        setPhase("idle-auth");
+      });
+  }, [phase]);
+
+  function handleLogin(u: string) {
+    setAuthUsername(u);
+    setPhase("fading-in");
+    timerRef.current = setTimeout(() => setPhase("idle-app"), 450);
+  }
+
+  function handleLogout(reason: SignOutReason) {
+    clearStoredAuth();
+    setPhase("fading-out");
+    timerRef.current = setTimeout(() => reloadToSignIn(reason), 450);
+  }
+
+  // A sign-out in another tab of this browser: reload this one too, or it
+  // would keep showing the old account while the shared cookie moves on to
+  // whoever signs in next.
+  useEffect(() => {
+    if (phase !== "idle-app" && phase !== "fading-in") return;
+    const onStorage = (e: StorageEvent) => {
+      const reason = readSignOutBroadcast(e);
+      if (reason) reloadToSignIn(reason, { broadcast: false });
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, [phase]);
+
+  const showApp =
+    phase === "idle-app" || phase === "fading-in" || phase === "fading-out";
+  const showAuth =
+    phase === "idle-auth" || phase === "fading-in" || phase === "fading-out";
+  const appOpacity = phase === "idle-app" ? 1 : 0;
+  const authOpacity = phase === "idle-auth" ? 1 : 0;
+
+  const { t } = useTranslation();
+  const isTransitioning = phase === "fading-in" || phase === "fading-out";
+
+  if (phase === "verifying") {
+    return (
+      <div className="fixed inset-0 flex items-center justify-center bg-background">
+        <div className="flex flex-col items-center gap-4">
+          <div className="w-5 h-5 border-2 border-primary border-t-transparent rounded-full animate-spin" />
+          <p className="text-sm text-muted-foreground">{t("common.loading")}</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      {isTransitioning && (
+        <div className="fixed inset-0 z-0 flex items-center justify-center bg-background">
+          <div className="flex flex-col items-center gap-4">
+            <div className="w-5 h-5 border-2 border-primary border-t-transparent rounded-full animate-spin" />
+            <p className="text-sm text-muted-foreground">
+              {t("common.loading")}
+            </p>
+          </div>
+        </div>
+      )}
+
+      {showApp && (
+        <div
+          className="fixed inset-0 z-10 transition-opacity duration-[450ms] ease-in-out"
+          style={{
+            opacity: appOpacity,
+            pointerEvents: phase === "idle-app" ? "auto" : "none",
+          }}
+        >
+          <Suspense fallback={null}>
+            <AppShell username={authUsername} onLogout={handleLogout} />
+          </Suspense>
+        </div>
+      )}
+
+      {showAuth && (
+        <div
+          className="fixed inset-0 z-20 transition-opacity duration-[450ms] ease-in-out"
+          style={{
+            opacity: authOpacity,
+            pointerEvents: phase === "idle-auth" ? "auto" : "none",
+          }}
+        >
+          <Auth onLogin={handleLogin} />
+        </div>
+      )}
+
+      <Toaster position="bottom-right" />
+      <SkewLockModal />
+    </>
+  );
+}
+
+function RootApp() {
+  useServiceWorker();
+
+  const searchParams = new URLSearchParams(window.location.search);
+  const isFullscreen = searchParams.has("view");
+
+  if (isFullscreen) {
+    return (
+      <Suspense fallback={null}>
+        <FullscreenApp />
+      </Suspense>
+    );
+  }
+
+  return <App />;
+}
+
+// Phase 70: hydrate the branding-store from /api/branding.
+// Fire-and-forget: the store's initial state is a bundled-default sentinel
+// (byte-for-byte match with docker/branding-defaults/branding.json), so
+// first-paint is defensible even if this fetch never resolves — matches
+// today's default "Skynet" behavior (Pitfall 5 mitigation, D-14). Runs in
+// parallel with prepareClientCacheVersion(); createRoot render is NOT
+// gated on the branding promise.
+void fetchBrandingConfig();
+
+// 260910-pf4 (GAP 4): Short-circuit render if user is already-authed AND a valid
+// same-parent-domain return URL is present. This handles the edge case where
+// main.tsx's App component would otherwise enter the "verifying" → getUserInfo()
+// loop before Auth.tsx even mounts. By redirecting here (before createRoot), we
+// skip both the SPA boot and the spinner — the browser navigates immediately.
+// The destination (a serve URL) will re-auth via JWT cookie and 302 back to /login
+// if the session is stale. Trust boundary is the subdomain-dispatch backend, not here.
+//
+// H-01 fix (code-review): returns TRUE when a redirect was fired so the caller can
+// suppress createRoot(). Bare IIFE `return` only exits the IIFE — the outer module
+// continued to createRoot, causing App to mount + getUserInfo() fetch + Auth's own
+// mount effect to fire a duplicate window.location.assign() before the navigation
+// completed. Gate createRoot on this return value now.
+function tryMainReturnUrlRedirect(): boolean {
+  const stored = getStoredAuth();
+  if (!stored?.loggedIn) return false;
+  const raw = parseReturnFromSearch(window.location.search);
+  const validated = validateReturnUrl(raw, window.location.hostname);
+  if (validated) {
+    window.location.assign(validated);
+    return true;
+  }
+  if (raw !== null && validated === null) {
+    console.warn("[auth] rejecting invalid return url", { returnParam: raw, parentDomain: window.location.hostname });
+  }
+  return false;
+}
+
+if (!tryMainReturnUrlRedirect()) {
+  prepareClientCacheVersion().finally(() => {
+    createRoot(document.getElementById("root")!).render(
+      <StrictMode>
+        <ThemeProvider defaultTheme="dark" storageKey="vite-ui-theme">
+          <RootApp />
+        </ThemeProvider>
+      </StrictMode>,
+    );
+  });
+}

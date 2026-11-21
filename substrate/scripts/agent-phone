@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# agent-phone — ring an app user's phone, speak a message, print their reply.
+#
+# Canonical copy lives in the app's source repo at substrate/scripts/agent-phone and
+# is distributed to every managed host by the fleet-substrate distributor (see
+# src/backend/distributor/catalog.ts). Installed per-box at
+# ~/.local/bin/agent-phone. Do NOT hand-edit the installed copy.
+#
+# Thin wrapper over fleet-service (the shared agent-services client); the
+# backend side is src/backend/agent-services/services/agent-phone/.
+#
+# Usage:
+#   agent-phone --to <username> --from "<caller name>" "<message>"
+#   agent-phone --to <username> --from "<caller name>" - < message.txt
+#
+# Env overrides:
+#   AGENT_PHONE_TIMEOUT_SEC   wait in seconds (default 780 = 13 min, over
+#                             the backend's ~12.3-min worst case; see
+#                             agent-phone/adapter.ts "Time budget"). Past
+#                             Claude Code's 10-min foreground Bash limit, so
+#                             agents run this in the background.
+#
+# Exit status:
+#   0  call delivered (outcome completed or no_response). Transcript on
+#      stdout; {outcome, transcript, call_length_seconds} JSON on stderr.
+#   1  anything else. {outcome, message?, ...} JSON on stderr, nothing on
+#      stdout.
+#   2  usage or local error.
+
+set -uo pipefail
+
+TIMEOUT_SEC="${AGENT_PHONE_TIMEOUT_SEC:-780}"
+FLEET_SERVICE="$(dirname -- "$(readlink -f -- "$0")")/fleet-service"
+[ -x "$FLEET_SERVICE" ] || FLEET_SERVICE="fleet-service"
+
+usage() {
+  cat >&2 <<'USAGE'
+usage: agent-phone --to <username> --from "<caller name>" "<message>"
+       agent-phone --to <username> --from "<caller name>" - < message.txt
+       agent-phone -h | --help
+
+Places a one-turn phone call to an app user via the fleet's phone service.
+
+  --to    <username>    App username of the recipient (required).
+  --from  "<name>"      TTS-friendly caller identifier (required).
+                        Compose from your identity displayName + your role
+                        (title-cased). Example: "Clipper the Box Maintainer".
+  <message>             What to say (required). Pass - to read it from stdin.
+
+On success (outcome=completed or no_response), transcript is printed on
+stdout and full response JSON on stderr. On failure, JSON with the outcome
+is printed on stderr and exit code is non-zero.
+
+See ~/.claude/skills/agent-phone/SKILL.md for outcome enum reference.
+USAGE
+}
+
+to_user=""
+caller_name=""
+message=""
+have_message=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --to)      to_user="${2:-}";      shift 2;;
+    --from)    caller_name="${2:-}";  shift 2;;
+    -h|--help) usage; exit 0;;
+    --) shift; break;;
+    -)
+      message=$(cat)
+      have_message=1
+      shift
+      ;;
+    -*)
+      printf 'agent-phone: unknown flag: %s\n' "$1" >&2
+      usage
+      exit 2
+      ;;
+    *)
+      if [ "$have_message" -eq 1 ]; then
+        printf 'agent-phone: unexpected positional arg after message: %s\n' "$1" >&2
+        usage
+        exit 2
+      fi
+      message="$1"
+      have_message=1
+      shift
+      ;;
+  esac
+done
+
+for req in "to_user:--to <username>" "caller_name:--from \"<caller name>\"" "message:<message>"; do
+  var="${req%%:*}"
+  if [ -z "${!var}" ]; then
+    printf 'agent-phone: %s is required\n' "${req#*:}" >&2
+    usage
+    exit 2
+  fi
+done
+
+command -v jq >/dev/null 2>&1 || {
+  printf 'agent-phone: jq is required but not installed (apt install jq)\n' >&2
+  exit 2
+}
+
+response=$(
+  jq -cn --arg c "$caller_name" --arg t "$to_user" --arg m "$message" \
+    '{caller_name: $c, to_user: $t, message: $m}' |
+    "$FLEET_SERVICE" call agent-phone --input - --timeout "$TIMEOUT_SEC"
+)
+status=$?
+[ "$status" -eq 2 ] && exit 2
+
+if [ "$status" -eq 0 ]; then
+  jq -c '.result' <<<"$response" >&2
+  transcript=$(jq -r '.result.transcript // ""' <<<"$response")
+  [ -n "$transcript" ] && printf '%s\n' "$transcript"
+  exit 0
+fi
+
+jq -c '.error | {outcome: .code} + del(.code)' <<<"$response" >&2
+exit 1

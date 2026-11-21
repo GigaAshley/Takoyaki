@@ -1,0 +1,1257 @@
+/**
+ * subscription-registry.ts
+ *
+ * In-memory registry of (hostId, tmuxSession) → SessionState plus a Set of
+ * frontend-connection subscribers with snapshot + fan-out semantics.
+ *
+ * Key convention: `${hostId}:${tmuxSession ?? ''}` — mirrors session-working-store.ts.
+ */
+import { systemLogger } from "../utils/logger.js";
+import type {
+  AppState,
+  FrontendOutboundFrameType,
+  SessionState,
+} from "./wire-protocol.js";
+import {
+  FRAME_SCHEMA_VERSION,
+  makeAppGoneFrame,
+  makeAppSnapshotFrame,
+  makeAppUpdateFrame,
+  makeGoneFrame,
+  makeProjectListChangedFrame,
+  makeSessionProjectChangedFrame,
+  makeSnapshotFrame,
+  makeUpdateFrame,
+} from "./wire-protocol.js";
+// Phase 90 Plan 00 (Wave 0, 2026-09-08 — D-10 delivery mechanism):
+// contextPct is PROMOTED from PrettyView-local useState to a per-session
+// field on fleet-status. Every SessionState published + every snapshot frame
+// carries the contextPct value read from the shared in-memory map, which is
+// dual-written by the two `context_pct` WS emission sites in
+// claude-session-server.ts (L3219 dormant + L7074 primary timer branch).
+// See contextpct-store.ts docblock for the D-10 correctness invariant.
+import { getContextPct } from "./contextpct-store.js";
+
+type SendFrame = (frame: FrontendOutboundFrameType) => void;
+
+// Phase 117 Plan 117-03 (D-37): shape of a project row on the
+// project-list-changed frame. Mirrors the zod schema in
+// wire-protocol.ts (FrontendProjectListChangedFrameSchema.projects).
+//
+// Phase 117 Plan 117-04: promoted to `export` so Wave 2 write routes
+// (project-list.ts, session-project-write.ts) can typecheck the entries
+// they build to hand to publishProjectListChanged. No runtime shape change.
+export type ProjectListEntry = {
+  slug: string;
+  displayName: string;
+  hostId: string;
+  hostname: string;
+  archived: boolean;
+  /**
+   * Phase 130: per-user visibility gate list from the project.md's
+   * `users:` frontmatter. Consumed by `isProjectVisibleToUser` inside
+   * `filterAppFrame`'s project-list-changed branch (see app-frame-filter.ts).
+   *
+   * D-3 fallback: `null` = "no gate on this project" (falls open — every
+   * caller with host access sees it). A non-empty array is the whitelist of
+   * Skynet usernames who see this project.
+   *
+   * Phase 130 HIGH-parity discipline (Phase 129 HIGH-1 mirror): the users
+   * field is GATE-ONLY. `makeProjectListChangedFrame` accepts it on the
+   * input type but the per-subscriber filter (app-frame-filter's
+   * project-list-changed branch) STRIPS it before the frame reaches the
+   * wire — never leaked to the frontend. The wire schema
+   * `FrontendProjectListChangedFrameSchema` in wire-protocol.ts deliberately
+   * has NO `users` field, so any accidental pass-through gets stripped by
+   * Zod pass-through-strip on the client-side parse anyway (defense in depth).
+   */
+  users?: string[] | null;
+  /**
+   * Nested projects: parent project slug on the same host, or null for top
+   * level. Unlike `users` this IS on the wire. Carried in the JSON.stringify
+   * deep-equal skip, so a move-only change still fans out.
+   */
+  parent?: string | null;
+};
+
+/**
+ * Phase 118 Plan 118-05 (D-15): async per-user host-visibility filter for
+ * app frames only. When present in `createSubscriptionRegistry` deps, every
+ * app-* fan-out call and the subscribe-path app-snapshot emit routes
+ * through this filter per-subscriber. Filter returns the frame verbatim,
+ * a projected copy (for app-snapshot), or null to drop.
+ *
+ * Session + archived-identity fan-out is UNAFFECTED — D-15 scopes the
+ * filter to app frames only; identity frames pass through the sync fanOut
+ * unchanged (D-15's "or will be" language explicitly defers identity
+ * filtering to a follow-up).
+ *
+ * The registry does NOT own the filter's cache or dependencies — it holds
+ * an opaque async function reference and calls it per subscriber. The
+ * production wiring builds this via `createAppFrameFilter({
+ * resolveHostOwnerById })` in fleet-status-server.ts.
+ */
+export type AppFrameFilter = (
+  frame: FrontendOutboundFrameType,
+  userId?: string,
+) => Promise<FrontendOutboundFrameType | null>;
+
+/**
+ * Phase 118 Plan 118-05: widened subscriber shape carrying the JWT-verified
+ * userId alongside the send callback. The async fanOutApp helper reads
+ * `entry.userId` to invoke the filter per-subscriber. Bare
+ * `subscribe(sendFrame)` (no ctx) yields `entry.userId === undefined` —
+ * the filter's own guard passes those frames through unchanged
+ * (backward-compat with existing session-only tests + any auth-skipping
+ * harness).
+ *
+ * Phase 118 code-review HIGH-4 (fix pass 2026-09-18): `pendingFrames`
+ * holds app-frame deliveries that arrive between the moment subscribe()
+ * adds the entry to the Set and the moment the fire-and-forget
+ * app-snapshot resolves + sends. Snapshot MUST arrive before any
+ * subsequent update to prevent the picture-has-lied race: stale snapshot
+ * overwriting a fresher update in the client store.
+ *
+ *   null       — deliver normally (steady-state).
+ *   []         — queue is empty; snapshot has not yet flushed; incoming
+ *                app frames get pushed onto this array in fanOutApp
+ *                instead of sent immediately.
+ *   [frame…]   — queue has entries; drained (in order) right after the
+ *                subscribe-path snapshot succeeds, then set to null.
+ *
+ * Only app-* frames queue (session + archived-identity snapshots are
+ * delivered SYNCHRONOUSLY inside subscribe BEFORE the async app-snapshot
+ * block, so those are always ordered correctly). fanOut (sync) ignores
+ * this field; only fanOutApp checks it.
+ */
+interface SubscriberEntry {
+  send: SendFrame;
+  userId?: string;
+  pendingFrames: FrontendOutboundFrameType[] | null;
+}
+
+/**
+ * Phase 118 Plan 118-05: optional dependency bag for the factory.
+ * `appFrameFilter` — when present, the registry routes app-* fan-outs and
+ * the subscribe-path app-snapshot through it per-subscriber. Absent →
+ * registry uses the sync fanOut path unchanged (backward-compat with
+ * 118-03 tests + starter.ts that hasn't wired the filter yet, which is
+ * the state at plan land-time; starter wiring is a deploy-motion concern
+ * flagged in the SUMMARY per fleet directive #10).
+ */
+export interface SubscriptionRegistryDeps {
+  appFrameFilter?: AppFrameFilter;
+}
+
+export interface SubscriptionRegistry {
+  /**
+   * Add a subscriber that will receive fleet-status frames.
+   * Immediately sends a snapshot of current state.
+   * Returns a disposer that removes the subscriber.
+   *
+   * @param sendFrame - Callback invoked with each outbound frame.
+   * @param ctx - Optional { userId } context. When present AND the subscriber
+   *   count transitions 0 → 1, every callback registered via
+   *   onFirstSubscriber is fired with the ctx. Required by Phase 39
+   *   Path C — the SSH-poll orchestrator uses ctx.userId as the subject
+   *   for `resolveHostById(hostId, userId)` decrypt. Backward-compatible:
+   *   existing callers may still call `subscribe(sendFrame)` with no ctx.
+   */
+  subscribe(sendFrame: SendFrame, ctx?: { userId: string }): () => void;
+
+  /**
+   * Publish a new or updated SessionState for (hostId, state.tmuxSession).
+   * Fans out an `update` frame to all subscribers.
+   */
+  publishSessionState(hostId: string, state: SessionState): void;
+
+  /**
+   * Re-publish the cached SessionState for (hostId, tmuxSession) when the
+   * contextpct-store value differs from the contextPct last stamped on it.
+   * Without this, a contextPct change only reaches clients on the next frame
+   * published for some other reason (status flip etc.), so the meter freezes
+   * for the length of a busy turn — e.g. pinned at the pre-condense value.
+   * No-op when no state is cached, the value is unchanged, or the stored
+   * value is null, so callers can invoke it on every context-pct tick.
+   */
+  republishContextPct(hostId: string, tmuxSession: string): void;
+
+  /**
+   * Phase 117 Plan 117-03 (D-37): publish a project-list-changed frame
+   * carrying the projects array FOR ONE HOST (scoped by hostId). Client
+   * merges by dropping existing entries with matching hostId and splicing
+   * in the incoming rows.
+   *
+   * Snapshot-on-subscribe: reconnecting clients get one project-list-changed
+   * frame per host that has been published to (iterates the per-host cache).
+   *
+   * Idempotent: byte-identical array replay for the SAME hostId is a no-op
+   * via JSON.stringify compare against that host's cache entry. Cache-miss
+   * for that hostId → entry replaced and the frame fans out.
+   *
+   * Empty projects[] is a valid state for a hostId ("this host has zero
+   * projects now" — e.g. last project archived) and IS a delta if the
+   * previous cache for that hostId was non-empty.
+   */
+  publishProjectListChanged(
+    hostId: string,
+    projects: ProjectListEntry[],
+  ): void;
+
+  /**
+   * Publish a `session-project-changed` frame carrying the delta from a
+   * single-identity `project:` frontmatter write (e.g. sidebar drag-drop
+   * onto a project, or explicit clear). Distinct from
+   * publishProjectListChanged: the projects[] array itself doesn't change
+   * when an identity moves between projects — only which identity belongs
+   * where — so this fanout carries just { identityKey, hostId, project }.
+   *
+   * No idempotent-skip cache: every call fans out. The frame is a delta;
+   * a reconnecting client learns about current membership via the
+   * `/identities` REST fetch (which reads the frontmatter directly), not
+   * via replay of this channel.
+   *
+   * `project` is nullable: string = assigned to that slug; null = cleared.
+   */
+  publishSessionProjectChanged(
+    identityKey: string,
+    hostId: number,
+    project: string | null,
+  ): void;
+
+  /**
+   * Mark a session as gone. If the key exists in the map AND the cached entry
+   * still belongs to the process that died:
+   *   - Removes it from the map
+   *   - Fans out a `gone` frame to all subscribers
+   *   - Returns true
+   * If the key does NOT exist, this is a no-op (prevents false-negative churn
+   * from watcher restart cycles).
+   *
+   * Superseded guard: the cache is keyed by (host, tmuxSession), and a
+   * relaunch (crash recovery, supervisor restart) brings claude back in the
+   * SAME tmux session. The stale-PID reap can land after the fresh claude (or
+   * a pid-less source-B frame) has already
+   * published into that key — deleting then would wipe the NEW session's
+   * row. So when `opts.pid` is given, only an entry carrying that exact PID
+   * is deleted; without a pid (host-watcher frame), only an entry whose
+   * sessionId matches. A superseded gone returns false and fans out nothing.
+   */
+  publishSessionGone(
+    hostId: string,
+    tmuxSession: string | null,
+    sessionId: string,
+    opts?: { pid?: number },
+  ): boolean;
+
+  /**
+   * Phase 115 hotfix (2026-09-18): identity-scoped "gone" for the per-host
+   * sweep reconciliation. Looks up the cached SessionState at makeKey(hostId,
+   * identityName) — source-B (dormant) publishes use tmuxSession = identity
+   * name (see ssh-poll-orchestrator.ts) so the key composes identically.
+   * Extracts the entry's own sessionId for the gone-frame fanout so the
+   * frontend can correlate with the row it needs to drop. No-op if the key
+   * doesn't exist (prevents churn on repeated reconciliation ticks after
+   * an identity is already dropped).
+   *
+   * Distinct from publishSessionGone in that the caller doesn't need to
+   * know the sessionId — the registry reads it from its own cache entry.
+   * The reconciliation loop in ssh-poll-orchestrator knows the identity
+   * name (from the previous tick's live-tree set), not the sessionId, so
+   * this shape is the ergonomic fit for that call site.
+   */
+  publishIdentityGoneByName(hostId: string, identityName: string): void;
+
+  /**
+   * Phase 118 Plan 118-03 (D-09, D-13, D-14): publish an add/mutate for one
+   * source-C app. The apps map is indexed by `${hostId}:${slug}` (a separate
+   * key helper `makeAppKey` — NOT reused with makeKey because slug and
+   * tmuxSession could collide in a shared map; here they live in different
+   * maps but the helper carries the discipline).
+   *
+   * NO byte-equality idempotence guard — D-13 requires that a health-flip
+   * (same slug, isHealthy changed) always emits an app-update. Every publish
+   * call fans out.
+   *
+   * Called from ssh-poll-orchestrator.ts (Plan 118-04) inside the per-host
+   * successful-sweep loop.
+   */
+  publishAppUpdate(hostId: string, app: AppState): void;
+
+  /**
+   * Phase 118 Plan 118-03 (D-11, D-14): remove one source-C app from the map
+   * and fan out an app-gone frame. No-op when the key is absent (prevents
+   * churn on repeated reconciliation ticks after an app is already dropped).
+   * Called from ssh-poll-orchestrator.ts (Plan 118-04) per-host reconciliation.
+   */
+  publishAppGoneByHostSlug(hostId: string, slug: string): void;
+
+  /**
+   * Return all current AppState values as an array (order not guaranteed).
+   * Symmetric with getSnapshot() for sessions.
+   */
+  getAppSnapshot(): AppState[];
+
+  /**
+   * Return all current SessionState values as an array (order not guaranteed).
+   */
+  getSnapshot(): SessionState[];
+
+  /**
+   * Send a frame to every subscriber connected as `userId` (all of that
+   * user's tabs and devices) and nobody else. Used for per-user state such
+   * as read-state-changed. No filter runs: the frame is the user's own.
+   */
+  publishToUser(userId: string, frame: FrontendOutboundFrameType): void;
+
+  /**
+   * Register a callback fired ONCE on the 0 → 1 subscribers transition
+   * (i.e. exactly when the registry becomes non-empty via `subscribe`).
+   * The callback receives the ctx passed to that subscribe() call.
+   *
+   * Returns a disposer that unregisters the callback.
+   *
+   * Semantics:
+   *   - Fires only when ctx was provided to subscribe(). A no-ctx
+   *     subscribe does NOT fire onFirstSubscriber (Phase 39 backward-compat).
+   *   - Re-fires on subsequent 0 → 1 cycles (subscribe → dispose → subscribe).
+   *   - Callback exceptions are caught + logged; they never bubble to subscribe().
+   *
+   * Phase 39 D-01 (GATE2-01): wired by starter.ts to start the SSH-poll orchestrator.
+   */
+  onFirstSubscriber(cb: (ctx: { userId: string }) => void): () => void;
+
+  /**
+   * Register a callback fired ONCE on the 1 → 0 subscribers transition
+   * (i.e. when the last subscriber's disposer runs).
+   *
+   * Returns a disposer that unregisters the callback.
+   *
+   * Semantics:
+   *   - Fires when subscribers.size transitions to 0 via disposer invocation.
+   *   - Re-fires on subsequent 1 → 0 cycles.
+   *   - Callback exceptions are caught + logged; they never bubble to disposer().
+   *
+   * Phase 39 D-02 (GATE2-02): wired by starter.ts to stop the SSH-poll orchestrator.
+   */
+  onLastUnsubscriber(cb: () => void): () => void;
+
+  /**
+   * Register a callback fired on the PER-USER 0 → 1 subscribers transition
+   * (i.e. the first subscribe() from that userId — the same user's
+   * subsequent tabs do NOT re-fire until they've all disposed and a fresh
+   * subscribe() comes in).
+   *
+   * Returns a disposer that unregisters the callback.
+   *
+   * Semantics:
+   *   - Fires only when ctx.userId is provided to subscribe(); bare
+   *     subscribes without a userId are ignored (matches the global
+   *     onFirstSubscriber behavior).
+   *   - Independent of the GLOBAL onFirstSubscriber — both fire on the very
+   *     first subscribe of a fresh registry, and per-user fires on each
+   *     subsequent NEW userId's first subscribe even when the global count
+   *     is already non-zero.
+   *   - Re-fires on subsequent 0 → 1 cycles for the SAME userId
+   *     (subscribe → dispose → subscribe by that user).
+   *   - Callback exceptions are caught + logged; they never bubble to
+   *     subscribe().
+   *
+   * Multi-tenant fleet-status orchestrator shape (2026-09-23): wired by
+   * starter.ts to spawn a per-user watcher instance for every user that
+   * has an active subscription.
+   */
+  onFirstUserSubscriber(cb: (ctx: { userId: string }) => void): () => void;
+
+  /**
+   * Register a callback fired on the PER-USER 1 → 0 subscribers transition
+   * (i.e. that user's last remaining tab closed — they now have zero active
+   * subscriptions).
+   *
+   * Returns a disposer that unregisters the callback.
+   *
+   * Semantics:
+   *   - Fires only for users that were tracked (had at least one subscribe()
+   *     with ctx.userId provided).
+   *   - Independent of the GLOBAL onLastUnsubscriber — per-user fires on
+   *     each user's exit even while other users remain subscribed; global
+   *     fires only when the last subscriber overall leaves.
+   *   - Re-fires on subsequent 1 → 0 cycles for the SAME userId.
+   *   - Callback exceptions are caught + logged; they never bubble to
+   *     the disposer.
+   *
+   * Multi-tenant fleet-status orchestrator shape (2026-09-23): wired by
+   * starter.ts to tear down that user's watcher when they disconnect.
+   */
+  onLastUserUnsubscriber(cb: (ctx: { userId: string }) => void): () => void;
+}
+
+function makeKey(hostId: string, tmuxSession: string | null): string {
+  return `${hostId}:${tmuxSession ?? ""}`;
+}
+
+/**
+ * Phase 118 Plan 118-03 (D-09, T-118-03-KC): compose the key for the sibling
+ * apps map. Kept DISTINCT from makeKey — the two callers live in different
+ * maps (the apps map vs. the session state map), so byte-level string
+ * collisions between a slug and a tmuxSession are structurally impossible
+ * here; the named helper mirrors the makeKey precedent for readability and
+ * keeps the discipline that slugs and tmuxSessions are NEVER interchangeable.
+ */
+function makeAppKey(hostId: string, slug: string): string {
+  return `${hostId}:${slug}`;
+}
+
+function fanOut(
+  subscribers: Set<SubscriberEntry>,
+  frame: FrontendOutboundFrameType,
+): void {
+  for (const entry of subscribers) {
+    try {
+      entry.send(frame);
+    } catch (err) {
+      systemLogger.warn("Fleet-status fan-out failed for one subscriber", {
+        operation: "fleet_status_fanout_failed",
+        error: err instanceof Error ? err.message : "unknown",
+      });
+    }
+  }
+}
+
+/**
+ * Phase 118 Plan 118-05 (D-15): async fan-out for app frames only.
+ * Per-subscriber: run the filter (with entry.userId), then send the
+ * projected frame (or drop on null). Uses Promise.allSettled so a slow /
+ * failing filter for one subscriber does not block delivery to others
+ * (RESEARCH § Q4 — the async unavoidability + per-subscriber isolation
+ * discipline). Fire-and-forget from the callers (publishAppUpdate /
+ * publishAppGoneByHostSlug) — the async work completes on its own; no
+ * caller awaits.
+ *
+ * Rejections in the settled results are logged (structured warn — fleet
+ * directive #11) but do NOT throw or propagate. Send-throws INSIDE the
+ * per-subscriber closure are caught and logged with the fanout-failed
+ * shape (same op tag the sync fanOut uses) so log-side observability is
+ * uniform across sync and async paths.
+ */
+async function fanOutApp(
+  subscribers: Set<SubscriberEntry>,
+  frame: FrontendOutboundFrameType,
+  filter: AppFrameFilter,
+): Promise<void> {
+  const results = await Promise.allSettled(
+    Array.from(subscribers).map(async (entry) => {
+      const projected = await filter(frame, entry.userId);
+      if (projected === null) return;
+      // Phase 118 code-review HIGH-4 (fix pass 2026-09-18): if the
+      // subscribe-path app-snapshot has not yet flushed for this
+      // subscriber, queue the projected frame instead of delivering it
+      // immediately. The subscribe() closure drains this queue in order
+      // after the snapshot lands. This prevents the picture-has-lied
+      // race where a sweep-tick update overtakes the initial snapshot.
+      //
+      // Between reading the array and pushing to it we don't need a
+      // lock — Node runs one microtask at a time; the subscribe()
+      // drain-and-null happens in its own microtask; the queue is only
+      // ever mutated from single-turn callbacks.
+      //
+      // Post-await disposal guard: an entry can be dropped from
+      // `subscribers` while its filter promise is in flight (the
+      // subscriber disconnected). Check membership BEFORE the send —
+      // and BEFORE queueing — so a stale filter resolution cannot
+      // deliver frames to a disposed subscriber (HIGH-4-4 test seat).
+      if (!subscribers.has(entry)) {
+        return;
+      }
+      if (entry.pendingFrames !== null) {
+        entry.pendingFrames.push(projected);
+        return;
+      }
+      try {
+        entry.send(projected);
+      } catch (err) {
+        systemLogger.warn("Fleet-status fan-out failed for one subscriber", {
+          operation: "fleet_status_fanout_failed",
+          error: err instanceof Error ? err.message : "unknown",
+        });
+      }
+    }),
+  );
+  for (const r of results) {
+    if (r.status === "rejected") {
+      systemLogger.warn(
+        "Fleet-status app-frame filter failed for one subscriber",
+        {
+          operation: "app_frame_filter_failed",
+          error:
+            r.reason instanceof Error ? r.reason.message : String(r.reason),
+        },
+      );
+    }
+  }
+}
+
+/**
+ * Factory — creates a new isolated SubscriptionRegistry instance.
+ *
+ * Phase 118 Plan 118-05: accepts an optional `deps` bag. `deps.appFrameFilter`
+ * — when present — wraps the app-* fan-out path and the subscribe-path
+ * app-snapshot emit. Absent → registry runs unfiltered (backward-compat with
+ * 118-03 tests + any pre-118-05 caller). Session + archived-identity
+ * fan-out is UNAFFECTED regardless.
+ */
+export function createSubscriptionRegistry(
+  deps?: SubscriptionRegistryDeps,
+): SubscriptionRegistry {
+  const state = new Map<string, SessionState>();
+  const subscribers = new Set<SubscriberEntry>();
+  const appFrameFilter = deps?.appFrameFilter;
+  // Phase 39 — presence signals for Path C (D-01 / D-02)
+  const firstSubCallbacks = new Set<(ctx: { userId: string }) => void>();
+  const lastUnsubCallbacks = new Set<() => void>();
+
+  // Multi-tenant fleet-status orchestrator shape (2026-09-23) — per-user
+  // presence signals. `subscriberCountByUser` is the source of truth for
+  // per-user 0→1 and 1→0 transitions; keys are userIds and values are the
+  // count of that user's active subscriptions. Bare subscribes (no
+  // ctx.userId) are NOT tracked here — they don't fire per-user callbacks.
+  // Keys are deleted when the count reaches zero so the Map stays bounded
+  // to currently-active users.
+  const subscriberCountByUser = new Map<string, number>();
+  const firstUserSubCallbacks = new Set<(ctx: { userId: string }) => void>();
+  const lastUserUnsubCallbacks = new Set<(ctx: { userId: string }) => void>();
+  // (Phase 115 Plan 115-06 archivedIdentities cache retired in the Phase 122
+  //  shape follow-up alongside publishIdentityArchived + wire frame.)
+
+  // Phase 117 Plan 117-03 (D-37): per-host cache for the projects pool.
+  // Each hostId → the projects[] published for that host. Map absence
+  // means "no publish has occurred yet for that hostId" — snapshot-on-
+  // subscribe iterates the map and emits ONE project-list-changed frame
+  // per hostId that has been published to. Idempotent-skip in
+  // publishProjectListChanged compares JSON.stringify(projects) against
+  // JSON.stringify of the cache entry for that hostId to drop no-op
+  // republishes at cache-hit.
+  const projectListCache = new Map<string, ProjectListEntry[]>();
+  // Phase 118 Plan 118-03 (D-09): sibling map for source-C apps, indexed by
+  // `${hostId}:${slug}` via makeAppKey. Populated by publishAppUpdate, drained
+  // by publishAppGoneByHostSlug, and re-emitted to every new subscriber via
+  // subscribe() as an app-snapshot frame. In-memory only per D-10 — no DB
+  // persistence, restart wipes it, next successful sweep tick rebuilds it
+  // from disk-on-boxes.
+  const apps = new Map<string, AppState>();
+
+  return {
+    subscribe(sendFrame: SendFrame, ctx?: { userId: string }): () => void {
+      // Phase 118 code-review HIGH-2 (fix pass 2026-09-18): refuse a
+      // bare subscribe (no ctx.userId) against a filtered registry.
+      // The app-frame filter's backward-compat guard passes
+      // userId === undefined frames THROUGH unchanged — which means
+      // a bare subscriber to a filtered registry gets EVERY app frame
+      // regardless of host access. That is the same info-disclosure
+      // leak T-118-05-IL fought. Belt-and-suspenders on top of
+      // HIGH-1a/1b: production callers pass { userId } via the WS
+      // handler; tests that intentionally want the unfiltered shape
+      // should use `createSubscriptionRegistry()` without deps.
+      if (appFrameFilter !== undefined && ctx?.userId === undefined) {
+        throw new Error(
+          "subscription-registry: userId ctx required when app-frame filter is attached",
+        );
+      }
+
+      // Capture emptiness BEFORE adding so we fire the 0 → 1 edge exactly once
+      const wasEmpty = subscribers.size === 0;
+
+      // Phase 118 Plan 118-05: idempotency is now per-callback-identity.
+      // A duplicate `sendFrame` reference produces a NEW SubscriberEntry
+      // (Set idempotence is by reference on the entry object, not the
+      // callback). This is a behavior change from pre-118-05 but the
+      // idempotency-on-same-sendFrame test (Test 7) is still satisfied
+      // because the pre-existing test asserts that the DUPLICATE subscribe
+      // call produces the same fan-out shape — with per-subscriber entries
+      // both entries call the same sendFrame, so it fires twice per
+      // publish. UPDATE: pre-existing Test 7 does assert exactly-1 update
+      // per publish for a duplicate subscribe → we preserve that by
+      // dedup'ing at entry-add time on the sendFrame identity.
+      let entry: SubscriberEntry | undefined;
+      for (const existing of subscribers) {
+        if (existing.send === sendFrame) {
+          entry = existing;
+          break;
+        }
+      }
+      if (entry === undefined) {
+        // Phase 118 code-review HIGH-4 (fix pass 2026-09-18): initialize
+        // pendingFrames = null (deliver normally) by default. Set to
+        // [] BELOW right before the fire-and-forget app-snapshot block
+        // when the filter is wired AND we have a userId — the ONLY
+        // scenario that produces a subscribe → snapshot race window.
+        entry = {
+          send: sendFrame,
+          userId: ctx?.userId,
+          pendingFrames: null,
+        };
+        subscribers.add(entry);
+      }
+      // Capture into a const the async closure below can safely close over.
+      const subscriberEntry = entry;
+
+      // Send the session snapshot immediately for unfiltered subscribers.
+      // The filtered path builds+filters this same snapshot inside the
+      // fire-and-forget block below so the queue-window covers it (matches
+      // archived + app-snapshot ordering discipline).
+      //
+      // re-stamp contextPct at snapshot-delivery time so a late-arriving
+      // subscriber sees the CURRENT value from contextpct-store.
+      if (appFrameFilter === undefined || ctx?.userId === undefined) {
+        const snapshot = makeSnapshotFrame(
+          Array.from(state.values()).map((s) => ({
+            ...s,
+            contextPct: getContextPct(s.hostId, s.tmuxSession ?? "") ?? null,
+          })),
+        );
+        try {
+          sendFrame(snapshot);
+        } catch (err) {
+          systemLogger.warn("Fleet-status initial snapshot delivery failed", {
+            operation: "fleet_status_snapshot_failed",
+            error: err instanceof Error ? err.message : "unknown",
+          });
+        }
+      }
+
+      // (Phase 115 Plan 115-06 archived-identity re-emit retired in the Phase 122
+      //  shape follow-up alongside the wire frame + registry cache.)
+
+      // Replay the cached project list on subscribe (unfiltered path only).
+      // Filtered subscribers get the projected version inside the fire-and-
+      // forget block below. One frame emitted per hostId in the per-host
+      // cache. An empty map means no publish has occurred yet — no frames
+      // fan out (the frontend must not learn "no projects" from a registry
+      // that has never been told what the projects ARE); once the first
+      // publish for a hostId lands, subsequent subscribes replay it.
+      if (appFrameFilter === undefined || ctx?.userId === undefined) {
+        for (const [cachedHostId, cachedProjects] of projectListCache) {
+          try {
+            sendFrame(
+              makeProjectListChangedFrame(cachedHostId, cachedProjects),
+            );
+          } catch (err) {
+            systemLogger.warn(
+              "Fleet-status project-list snapshot delivery failed",
+              {
+                operation: "fleet_status_project_list_snapshot_failed",
+                scopeHostId: cachedHostId,
+                error: err instanceof Error ? err.message : "unknown",
+              },
+            );
+          }
+        }
+      }
+
+      // Phase 118 Plan 118-03 (D-14, D-16): re-emit the current apps map as
+      // one app-snapshot frame so a reconnecting client sees the current app
+      // picture without waiting for the next 2s sweep tick. Emit is
+      // UNCONDITIONAL — an empty apps map still produces an app-snapshot with
+      // apps: [] (a valid state — proves the emit happens alongside the
+      // session + archived snapshots).
+      //
+      // Phase 118 Plan 118-05 (D-15, D-16, RESEARCH § Pitfall 2): when the
+      // filter is wired AND ctx.userId is present, project the snapshot
+      // through the filter so the subscriber only sees apps on hosts they
+      // can access. The subscribe() outer signature stays SYNCHRONOUS
+      // (existing tests + callers depend on the sync disposer return);
+      // the filtered emit runs fire-and-forget as a promise settled soon
+      // after subscribe returns (well under the 100ms UX budget — the
+      // filter is one PermissionManager hit per unique hostId plus an
+      // in-memory cache). Empty apps map short-circuits — no filter call.
+      const rawSnapshot = makeAppSnapshotFrame(Array.from(apps.values()));
+      if (appFrameFilter !== undefined && ctx?.userId !== undefined) {
+        const userIdForFilter = ctx.userId;
+        // Phase 118 code-review HIGH-4 (fix pass 2026-09-18): open the
+        // queue-window BEFORE spawning the async snapshot. Any
+        // publishAppUpdate / publishAppGoneByHostSlug fired between now
+        // and when the snapshot's sendFrame call completes will land in
+        // subscriberEntry.pendingFrames instead of racing past the
+        // snapshot. The drain-and-null below flushes the queue in FIFO
+        // order right after the snapshot lands, then re-opens
+        // steady-state delivery. On disposer-during-window (see below)
+        // the entry is removed from `subscribers` so future drains have
+        // no observers to hit anyway.
+        subscriberEntry.pendingFrames = [];
+        // Fire-and-forget — disposer must return synchronously.
+        void (async () => {
+          try {
+            // Build + filter the session snapshot. contextPct restamp
+            // happens here so the client gets the freshest value from
+            // contextpct-store at emit time.
+            const sessionSnapshot = makeSnapshotFrame(
+              Array.from(state.values()).map((s) => ({
+                ...s,
+                contextPct:
+                  getContextPct(s.hostId, s.tmuxSession ?? "") ?? null,
+              })),
+            );
+            try {
+              const projectedSession = await appFrameFilter(
+                sessionSnapshot,
+                userIdForFilter,
+              );
+              if (projectedSession !== null) {
+                sendFrame(projectedSession);
+              }
+            } catch (err) {
+              systemLogger.warn(
+                "Fleet-status initial snapshot delivery failed",
+                {
+                  operation: "fleet_status_snapshot_failed",
+                  error: err instanceof Error ? err.message : "unknown",
+                },
+              );
+            }
+
+            // (Phase 115 archived-identity re-emit retired in Phase 122 follow-up.)
+
+            // Replay the cached project list, projected per subscriber.
+            // One frame per hostId in the per-host cache (empty map =
+            // nothing to replay; same guarantee as the sync path).
+            for (const [cachedHostId, cachedProjects] of projectListCache) {
+              const projectListFrame = makeProjectListChangedFrame(
+                cachedHostId,
+                cachedProjects,
+              );
+              try {
+                const projectedProjects = await appFrameFilter(
+                  projectListFrame,
+                  userIdForFilter,
+                );
+                if (projectedProjects !== null) {
+                  sendFrame(projectedProjects);
+                }
+              } catch (err) {
+                systemLogger.warn(
+                  "Fleet-status project-list snapshot delivery failed",
+                  {
+                    operation: "fleet_status_project_list_snapshot_failed",
+                    scopeHostId: cachedHostId,
+                    error: err instanceof Error ? err.message : "unknown",
+                  },
+                );
+              }
+            }
+
+            const projected = await appFrameFilter(rawSnapshot, userIdForFilter);
+            if (projected !== null) {
+              sendFrame(projected);
+            }
+          } catch (err) {
+            systemLogger.warn(
+              "Fleet-status app-snapshot filter/delivery failed",
+              {
+                operation: "fleet_status_app_snapshot_failed",
+                error: err instanceof Error ? err.message : "unknown",
+              },
+            );
+          } finally {
+            // Drain-and-null runs in BOTH success and failure branches.
+            // If snapshot fails, the client either resubscribes or the
+            // next sweep tick re-populates state — either way, blocking
+            // subsequent frames forever is the wrong choice. On failure
+            // the drain still flushes any queued frames so the client
+            // is not starved of updates that arrived during the window.
+            const pending = subscriberEntry.pendingFrames;
+            subscriberEntry.pendingFrames = null;
+            if (pending !== null && subscribers.has(subscriberEntry)) {
+              for (const f of pending) {
+                try {
+                  sendFrame(f);
+                } catch (err) {
+                  systemLogger.warn(
+                    "Fleet-status app-frame queue drain delivery failed",
+                    {
+                      operation: "fleet_status_fanout_failed",
+                      error: err instanceof Error ? err.message : "unknown",
+                    },
+                  );
+                }
+              }
+            }
+          }
+        })();
+      } else {
+        try {
+          sendFrame(rawSnapshot);
+        } catch (err) {
+          systemLogger.warn("Fleet-status app-snapshot delivery failed", {
+            operation: "fleet_status_app_snapshot_failed",
+            error: err instanceof Error ? err.message : "unknown",
+          });
+        }
+      }
+
+      // Phase 39 — fire onFirstSubscriber callbacks on 0 → 1 transition when ctx is provided.
+      // Callbacks isolated by try/catch so consumer bugs cannot break subscribe().
+      if (wasEmpty && ctx) {
+        for (const cb of firstSubCallbacks) {
+          try {
+            cb(ctx);
+          } catch (err) {
+            systemLogger.warn(
+              "Fleet-status onFirstSubscriber callback threw",
+              {
+                operation: "fleet_status_lifecycle_cb_failed",
+                error: err instanceof Error ? err.message : "unknown",
+              },
+            );
+          }
+        }
+      }
+
+      // Multi-tenant fleet-status orchestrator shape (2026-09-23): fire
+      // PER-USER onFirstUserSubscriber callbacks on the per-user 0 → 1
+      // transition. Bare subscribes (no ctx.userId) are not tracked.
+      // Independent of the global firstSubCallbacks above — both may fire
+      // on the same subscribe when a fresh registry gets its very first
+      // subscriber; per-user fires on each subsequent NEW userId's first
+      // subscribe even while global count is already non-zero. Same
+      // try/catch isolation as the global path.
+      if (ctx) {
+        const prev = subscriberCountByUser.get(ctx.userId) ?? 0;
+        subscriberCountByUser.set(ctx.userId, prev + 1);
+        if (prev === 0) {
+          for (const cb of firstUserSubCallbacks) {
+            try {
+              cb(ctx);
+            } catch (err) {
+              systemLogger.warn(
+                "Fleet-status onFirstUserSubscriber callback threw",
+                {
+                  operation: "fleet_status_lifecycle_cb_failed",
+                  userId: ctx.userId,
+                  error: err instanceof Error ? err.message : "unknown",
+                },
+              );
+            }
+          }
+        }
+      }
+
+      // Return disposer
+      return () => {
+        subscribers.delete(subscriberEntry);
+        // Phase 118 code-review HIGH-4 (fix pass 2026-09-18): also drop
+        // any queued app frames so if the snapshot promise settles
+        // AFTER disposal, the drain sees an empty queue and (via the
+        // `subscribers.has` guard) also skips delivery. Belt-and-braces.
+        subscriberEntry.pendingFrames = null;
+
+        // Multi-tenant fleet-status orchestrator shape (2026-09-23): fire
+        // PER-USER onLastUserUnsubscriber callbacks on the per-user 1 → 0
+        // transition. Only fires for entries whose subscribe() provided a
+        // userId. Delete the Map key at 0 to keep the Map bounded to
+        // currently-active users. Runs BEFORE the global 1→0 path so
+        // per-user teardown observers can act while the global registry is
+        // still considered active from another user's perspective (though
+        // in practice the global path only fires when ALL users have left).
+        const disposedUserId = subscriberEntry.userId;
+        if (disposedUserId !== undefined) {
+          const prev = subscriberCountByUser.get(disposedUserId) ?? 0;
+          if (prev > 1) {
+            subscriberCountByUser.set(disposedUserId, prev - 1);
+          } else {
+            subscriberCountByUser.delete(disposedUserId);
+            for (const cb of lastUserUnsubCallbacks) {
+              try {
+                cb({ userId: disposedUserId });
+              } catch (err) {
+                systemLogger.warn(
+                  "Fleet-status onLastUserUnsubscriber callback threw",
+                  {
+                    operation: "fleet_status_lifecycle_cb_failed",
+                    userId: disposedUserId,
+                    error: err instanceof Error ? err.message : "unknown",
+                  },
+                );
+              }
+            }
+          }
+        }
+
+        // Phase 39 — fire onLastUnsubscriber callbacks on 1 → 0 transition.
+        // Same try/catch isolation pattern as onFirstSubscriber.
+        if (subscribers.size === 0) {
+          for (const cb of lastUnsubCallbacks) {
+            try {
+              cb();
+            } catch (err) {
+              systemLogger.warn(
+                "Fleet-status onLastUnsubscriber callback threw",
+                {
+                  operation: "fleet_status_lifecycle_cb_failed",
+                  error: err instanceof Error ? err.message : "unknown",
+                },
+              );
+            }
+          }
+        }
+      };
+    },
+
+    publishSessionState(hostId: string, sessionState: SessionState): void {
+      const key = makeKey(hostId, sessionState.tmuxSession);
+      // Phase 90 Plan 00 (Wave 0, D-10 delivery mechanism): stamp contextPct
+      // from the shared in-memory store at publish time. `null` when the
+      // store has no entry OR when the latest stored value is null (dormant
+      // sentinel / cold session). tmuxSession is nullable on the wire; when
+      // null the store lookup uses the empty-string key convention shared
+      // with session-working-store.ts. The stamp is UNCONDITIONAL — every
+      // frame carries the current value, so subscribers see the freshest
+      // contextPct on the very next fleet-status frame after a store write.
+      // The condensing axis is stamped only by source B (per-identity sweep);
+      // source A's live frames leave it out. A frame that leaves it out keeps
+      // the last stamped value, so a live status change mid-condense doesn't
+      // clear "Condensing…" early — source B's own false frame clears it.
+      const prior = state.get(key);
+      const carried =
+        sessionState.condensing === undefined && prior?.condensing !== undefined
+          ? { condensing: prior.condensing }
+          : {};
+      const stampedState: SessionState = {
+        ...sessionState,
+        ...carried,
+        contextPct: getContextPct(hostId, sessionState.tmuxSession ?? "") ?? null,
+      };
+      state.set(key, stampedState);
+      const frame = makeUpdateFrame(stampedState);
+      if (appFrameFilter !== undefined) {
+        void fanOutApp(subscribers, frame, appFrameFilter);
+      } else {
+        fanOut(subscribers, frame);
+      }
+    },
+
+    republishContextPct(hostId: string, tmuxSession: string): void {
+      const key = makeKey(hostId, tmuxSession);
+      const cached = state.get(key);
+      if (cached === undefined) return;
+      const pct = getContextPct(hostId, tmuxSession) ?? null;
+      // A null is usually a transient read failure, not a real value —
+      // republishing it would blink the meter to its loading placeholder.
+      // Nulls still ride the next status-driven frame, as before.
+      if (pct === null) return;
+      if (cached.contextPct === pct) return;
+      const stampedState: SessionState = { ...cached, contextPct: pct };
+      state.set(key, stampedState);
+      systemLogger.info("Fleet-status: contextPct change republished", {
+        operation: "fleet_status_context_pct_republished",
+        fleetHostId: hostId,
+        tmuxSession,
+        previousPct: cached.contextPct ?? null,
+        pct,
+      });
+      const frame = makeUpdateFrame(stampedState);
+      if (appFrameFilter !== undefined) {
+        void fanOutApp(subscribers, frame, appFrameFilter);
+      } else {
+        fanOut(subscribers, frame);
+      }
+    },
+
+    publishProjectListChanged(
+      hostId: string,
+      projects: ProjectListEntry[],
+    ): void {
+      // Deep-equal skip via JSON.stringify canonicalization, scoped to the
+      // per-host cache entry. Field types are small strings + booleans;
+      // stringify cost is O(N × avg field size) which for realistic N
+      // (< 20 projects/host) is negligible per RESEARCH § Pitfall 4. A
+      // first publish for a hostId has no entry and always fans out.
+      const nextSerialized = JSON.stringify(projects);
+      const prev = projectListCache.get(hostId);
+      const prevSerialized = prev === undefined ? null : JSON.stringify(prev);
+      if (prevSerialized === nextSerialized) {
+        return;
+      }
+      // Defensive copy so a caller mutating the array post-publish cannot
+      // silently corrupt the cache (and thus poison future idempotent-skip
+      // comparisons and snapshot-on-subscribe replays).
+      projectListCache.set(hostId, projects.slice());
+      const frame = makeProjectListChangedFrame(hostId, projects);
+      if (appFrameFilter !== undefined) {
+        void fanOutApp(subscribers, frame, appFrameFilter);
+      } else {
+        fanOut(subscribers, frame);
+      }
+    },
+
+    publishSessionProjectChanged(
+      identityKey: string,
+      hostId: number,
+      project: string | null,
+    ): void {
+      const frame = makeSessionProjectChangedFrame(identityKey, hostId, project);
+      if (appFrameFilter !== undefined) {
+        void fanOutApp(subscribers, frame, appFrameFilter);
+      } else {
+        fanOut(subscribers, frame);
+      }
+    },
+
+    publishSessionGone(
+      hostId: string,
+      tmuxSession: string | null,
+      sessionId: string,
+      opts?: { pid?: number },
+    ): boolean {
+      const key = makeKey(hostId, tmuxSession);
+
+      // No-op if key doesn't exist — prevents false churn on watcher restarts
+      const existing = state.get(key);
+      if (existing === undefined) {
+        return false;
+      }
+
+      // Superseded guard (see interface docblock): the key now holds a newer
+      // publication than the process this gone is about.
+      const pid = opts?.pid;
+      const superseded =
+        pid !== undefined
+          ? existing.pid !== pid
+          : sessionId !== "" && existing.sessionId !== "" && existing.sessionId !== sessionId;
+      if (superseded) {
+        systemLogger.info("Fleet-status: gone superseded by newer session — skipped", {
+          operation: "fleet_status_gone_superseded",
+          fleetHostId: hostId,
+          tmuxSession,
+          goneSessionId: sessionId,
+          gonePid: pid ?? null,
+          currentSessionId: existing.sessionId,
+          currentPid: existing.pid,
+        });
+        return false;
+      }
+
+      state.delete(key);
+      // `pid_stale`: the claude PID died but the tmux session may persist
+      // (relaunch, kill-inside-tmux). Frontend keeps open tabs open — a fresh
+      // claude typically re-attaches in seconds.
+      const frame = makeGoneFrame(hostId, tmuxSession, sessionId, "pid_stale");
+      if (appFrameFilter !== undefined) {
+        void fanOutApp(subscribers, frame, appFrameFilter);
+      } else {
+        fanOut(subscribers, frame);
+      }
+      return true;
+    },
+
+    publishIdentityGoneByName(hostId: string, identityName: string): void {
+      // Source-B publishes with tmuxSession = identityName, so the cache key
+      // for a dormant identity composes as makeKey(hostId, identityName).
+      // Look up the entry to extract its sessionId for the gone-frame fanout.
+      //
+      // `identity_gone` MUST fan out even when the state entry is already
+      // absent: the ssh-poll-orchestrator's 30-second stale-sweep can win the
+      // race against the reconcile tick that fires this method — when it does,
+      // its publishSessionGone(pid_stale) has already deleted the state entry.
+      // Early-returning here would silently swallow the only signal that
+      // closes the frontend's open pane (pid_stale keeps the tab open by
+      // design, for the relaunch case). Fall back to identityName as
+      // tmuxSession (source-A + source-B both key identity sessions that way)
+      // and "" as sessionId (frontend's tab-close matcher reads hostId +
+      // tmuxSession + reason only — sessionId is a display field on this
+      // path).
+      const key = makeKey(hostId, identityName);
+      const existing = state.get(key);
+      state.delete(key);
+      const frame = makeGoneFrame(
+        hostId,
+        existing?.tmuxSession ?? identityName,
+        existing?.sessionId ?? "",
+        "identity_gone",
+      );
+      if (appFrameFilter !== undefined) {
+        void fanOutApp(subscribers, frame, appFrameFilter);
+      } else {
+        fanOut(subscribers, frame);
+      }
+    },
+
+    publishAppUpdate(hostId: string, app: AppState): void {
+      // Phase 118 Plan 118-03 (D-09, D-13, D-14): insert-or-replace at
+      // `${hostId}:${slug}` and fan out an app-update frame. NO byte-equality
+      // guard — a health-flip (same slug, isHealthy changed) MUST always
+      // emit. Every publish call fans out.
+      //
+      // Phase 118 Plan 118-05 (D-15): route through the async fanOutApp when
+      // a filter is wired — per-subscriber visibility check bounds who sees
+      // the update. Fall back to the sync fanOut when no filter dep (existing
+      // 118-03/118-04 tests + starter.ts unwired-state).
+      const key = makeAppKey(hostId, app.slug);
+      apps.set(key, app);
+      const frame = makeAppUpdateFrame(app);
+      if (appFrameFilter !== undefined) {
+        void fanOutApp(subscribers, frame, appFrameFilter);
+      } else {
+        fanOut(subscribers, frame);
+      }
+    },
+
+    publishAppGoneByHostSlug(hostId: string, slug: string): void {
+      // Phase 118 Plan 118-03 (D-11, D-14): remove from the apps map and fan
+      // out an app-gone frame. No-op if the key is absent (prevents churn on
+      // repeated reconciliation ticks after an app is already dropped —
+      // mirrors publishSessionGone / publishIdentityGoneByName).
+      //
+      // Phase 118 Plan 118-05 (D-15): route through the async fanOutApp
+      // when a filter is wired.
+      const key = makeAppKey(hostId, slug);
+      if (!apps.has(key)) {
+        return;
+      }
+      apps.delete(key);
+      const frame = makeAppGoneFrame(hostId, slug);
+      if (appFrameFilter !== undefined) {
+        void fanOutApp(subscribers, frame, appFrameFilter);
+      } else {
+        fanOut(subscribers, frame);
+      }
+    },
+
+    getAppSnapshot(): AppState[] {
+      // Phase 118 Plan 118-03 — symmetric with getSnapshot() for sessions.
+      // Order is Map insertion order; callers must not depend on it.
+      return Array.from(apps.values());
+    },
+
+    publishToUser(userId: string, frame: FrontendOutboundFrameType): void {
+      let delivered = 0;
+      for (const entry of subscribers) {
+        if (entry.userId !== userId) continue;
+        // Same ordering guard as fanOutApp: hold the frame until this
+        // subscriber's initial snapshot has flushed.
+        if (entry.pendingFrames !== null) {
+          entry.pendingFrames.push(frame);
+          delivered++;
+          continue;
+        }
+        try {
+          entry.send(frame);
+          delivered++;
+        } catch (err) {
+          systemLogger.warn("Fleet-status per-user publish failed for one subscriber", {
+            operation: "fleet_status_publish_to_user_failed",
+            userId,
+            frameType: frame.type,
+            error: err instanceof Error ? err.message : "unknown",
+          });
+        }
+      }
+      systemLogger.debug("Fleet-status per-user frame published", {
+        operation: "fleet_status_publish_to_user",
+        userId,
+        frameType: frame.type,
+        delivered,
+      });
+    },
+
+    getSnapshot(): SessionState[] {
+      // Phase 90 Plan 00 (Wave 0) — re-stamp contextPct from the shared
+      // store at read time so callers always see the CURRENT value, matching
+      // the fanout semantics of publishSessionState + subscribe's snapshot.
+      return Array.from(state.values()).map((s) => ({
+        ...s,
+        contextPct: getContextPct(s.hostId, s.tmuxSession ?? "") ?? null,
+      }));
+    },
+
+    onFirstSubscriber(cb: (ctx: { userId: string }) => void): () => void {
+      firstSubCallbacks.add(cb);
+      return () => {
+        firstSubCallbacks.delete(cb);
+      };
+    },
+
+    onLastUnsubscriber(cb: () => void): () => void {
+      lastUnsubCallbacks.add(cb);
+      return () => {
+        lastUnsubCallbacks.delete(cb);
+      };
+    },
+
+    onFirstUserSubscriber(
+      cb: (ctx: { userId: string }) => void,
+    ): () => void {
+      firstUserSubCallbacks.add(cb);
+      return () => {
+        firstUserSubCallbacks.delete(cb);
+      };
+    },
+
+    onLastUserUnsubscriber(
+      cb: (ctx: { userId: string }) => void,
+    ): () => void {
+      lastUserUnsubCallbacks.add(cb);
+      return () => {
+        lastUserUnsubCallbacks.delete(cb);
+      };
+    },
+  };
+}
+
+// Re-export the FRAME_SCHEMA_VERSION for consumers that need it
+export { FRAME_SCHEMA_VERSION };
+
+// ---------------------------------------------------------------------------
+// Phase 117 Plan 117-04: module-level singleton accessor.
+//
+// The registry is created in `starter.ts` and dep-injected into
+// fleet-status-server + ssh-poll-orchestrator. Database routes (like
+// `project-list.ts` and `session-project-write.ts`) mount inside
+// `database.ts` before starter.ts creates the registry — so they cannot
+// receive it via a constructor argument.
+//
+// Rather than plumbing the registry down through the Express app locals
+// or a request middleware, the router calls `getSubscriptionRegistry()`
+// at REQUEST time (not module-import time). By the time an HTTP request
+// hits the route, starter.ts has already run and called
+// `setSubscriptionRegistry(registry)` — so the accessor returns the same
+// instance the WS server is fanning out through.
+//
+// If the accessor is called before starter.ts has populated the cell
+// (e.g. in a test that only mounts the router without a registry), it
+// returns `null` — the route's fanout call becomes a no-op rather than
+// crashing.
+// ---------------------------------------------------------------------------
+
+let sharedRegistry: SubscriptionRegistry | null = null;
+
+/**
+ * Set the process-wide singleton registry. Called exactly once by
+ * `starter.ts` after `createSubscriptionRegistry()` — same instance that
+ * is dep-injected into the WS server and the SSH-poll orchestrator, so
+ * every publish path fans out through the SAME subscriber set.
+ */
+export function setSubscriptionRegistry(
+  registry: SubscriptionRegistry,
+): void {
+  sharedRegistry = registry;
+}
+
+/**
+ * Access the process-wide singleton registry. Returns `null` if the
+ * registry has not been set yet — callers MUST tolerate null (typically
+ * by skipping the fanout with a warn log). Do NOT throw on null; the
+ * absence of a registry means the WS layer is not initialized, not that
+ * the caller is misusing the API.
+ */
+export function getSubscriptionRegistry(): SubscriptionRegistry | null {
+  return sharedRegistry;
+}
+
+/**
+ * Test-only reset for the module-level cell. Vitest suites that create
+ * their own registry should call this in `afterEach` to prevent leakage
+ * across test files.
+ */
+export function __resetSubscriptionRegistryForTests(): void {
+  sharedRegistry = null;
+}

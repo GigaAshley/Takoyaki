@@ -1,0 +1,1153 @@
+// ─── AppShell.persistence.test.tsx ───────────────────────────────────────────
+// Phase 6 Plan 06-02 Task 2 — persistence-contract smoke test.
+//
+// The load-bearing correctness contract of Plan 06-02 (and the whole of Phase
+// 6): switching from conversation A → B → A must NOT unmount either pane;
+// the DOM node for each conversation's mount is created ONCE per tab lifetime
+// and re-parented / visibility-toggled between showings via the patch #35
+// `tabNodesRef` + `normalViewRef` DOM-move mechanism preserved in AppShell.
+//
+// This is the T-06-02-01 (tampering — mount lifecycle regression) programmatic
+// defense. If a future refactor accidentally re-mounts on switch, THIS test
+// fails loudly rather than waiting for a UAT walk to catch the WebSocket-drop
+// / terminal-buffer-loss / pretty-view-scroll-reset regression.
+//
+// ─── Test scope / fallback path (plan Task 2 <action> + NOTE-08) ─────────────
+// The plan gives an explicit fallback: if mocking AppShell's ~30 imports is
+// too fragile (i18n provider, theme provider, backend axios calls,
+// dbHealthMonitor, terminal/guacamole feature panels, all sidebar panels),
+// extract the ONE new mechanism this plan wires (selected-id-drives-visibility
+// via tabNodesRef DOM-move) into a minimal MountManager scaffold and test THAT
+// in isolation.
+//
+// This test takes the fallback path: it reproduces the exact tabNodesRef +
+// normalViewRef DOM-move mechanism + createPortal loop from AppShell.tsx
+// lines 285-297, 1195-1237, 1595-1620 in a minimal ~60-line MountManager
+// component, and asserts:
+//
+//   Test 1 (DOM node identity across switches): reference-equality of the
+//     per-tab DOM node across A → B → A.  If a switch remounts, the ref
+//     changes and this test fails.  This is the load-bearing correctness
+//     assertion — it directly tests the "no unmount on switch" contract.
+//
+//   Test 2 (mount-count invariant): the mock content component tracks
+//     mount/unmount counts.  After A → B → A, both A's and B's counts are
+//     mount=1 / unmount=0.  Proves NO remount, complementing Test 1 from
+//     the React-side.
+//
+//   Test 3 (visibility toggle applied on switch): after selecting A, A's
+//     node has `visibility: visible` and B's has `visibility: hidden`.
+//     Selecting B flips them.  Proves the DOM-move effect's visibility
+//     toggle is wired correctly.
+//
+// Tests 4 (activeTabId mirror), 5 (stale-id no-op), 6 (URL-sync fragment
+// update) from the plan spec are DEFERRED to UAT in Plan 06-05 per NOTE-08.
+// They exercise integration behavior (document.title effect, URL-sync effect,
+// selectConversation guard as it flows into AppShell's mirror effect) that
+// only meaningfully runs in a real AppShell. Their observable outcomes are
+// covered by:
+//   - Test 5 (stale-id no-op): already covered by conversation-store.test.ts
+//     Test 6 (T-06-01-01 stale-selection defense) — selectConversation with
+//     an unknown id is a silent no-op at the store level, so no downstream
+//     mirror effect fires.
+//   - Test 6 (URL-sync fragment update): the URL-sync effect at AppShell.tsx
+//     line 420 fires on `activeTabId` change; because Plan 06-02 mirrors
+//     store's selectedId → activeTabId (Step C), the URL-sync effect fires
+//     the same way it did before.  UAT walk in Plan 06-05 confirms the wire
+//     behavior end-to-end (patch #25 URL fragment survives Chrome window-
+//     restore).
+//   - Test 4 (document.title): analogous — the title effect at AppShell.tsx
+//     line 407 fires on activeTabId; the mirror keeps it firing.
+//
+// This split preserves the load-bearing correctness guard (Tests 1-3) as a
+// programmatic test that runs on every CI while shifting the integration
+// pathway to a manual walk that catches the same class of regression.
+
+import { render, act } from "@testing-library/react";
+import { describe, it, expect, beforeEach } from "vitest";
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { createPortal } from "react-dom";
+
+import {
+  __getSnapshotForTest,
+  __resetFleetSessionsForTest,
+  __subscribeForTest,
+  selectConversation,
+  updateHostTree,
+  updateOpenTabs,
+  updateFleetSessions,
+  updateHostsFlat,
+} from "./state/conversation-store.js";
+import type { Tab, Host } from "@/types/ui-types";
+
+// ─── Test fixtures ────────────────────────────────────────────────────────────
+
+function makeHost(id: string, name: string): Host {
+  return { id, name } as unknown as Host;
+}
+
+function makeTerminalTab(id: string, host: Host, label: string): Tab {
+  return {
+    id,
+    instanceId: id,
+    type: "terminal",
+    label,
+    host,
+    openedAt: 0,
+    targetTmuxSession: null,
+  };
+}
+
+// Reset module-scoped store between tests (mirrors the pattern in
+// conversation-store.test.ts beforeEach).
+beforeEach(() => {
+  updateOpenTabs([]);
+  selectConversation(null);
+  updateHostTree(null);
+  // Plan 07-01: reset the new fleet-native inputs so Test 4's store-contract
+  // assertion starts from an empty fleet + empty hostsFlat. Tests 1-3 do
+  // not consume these inputs, so their behavior is unchanged.
+  //
+  // Phase 111 hotfix: use the explicit reset primitive because
+  // `updateFleetSessions([])` is no longer a bulk-empty — it now preserves
+  // pulse-populated rows (failing-re-ask must not wipe). See case 13 in
+  // conversation-store.test.ts for the invariant.
+  __resetFleetSessionsForTest();
+  updateHostsFlat(new Map());
+  const snap = __getSnapshotForTest();
+  expect(snap.pinned.length).toBe(0);
+  // Phase 41 Plan 01: `grouped: HostGroup[]` retired; `middle` + `rdpGroup`.
+  expect(snap.middle.length).toBe(0);
+  expect(snap.rdpGroup).toBeNull();
+  expect(snap.selectedId).toBeNull();
+  // Reset mount counters between tests
+  mountCounts.clear();
+  unmountCounts.clear();
+});
+
+// ─── MountManager scaffold ───────────────────────────────────────────────────
+// Reproduces the load-bearing patch #35 mechanism from AppShell.tsx byte-for-
+// byte-comparable form, driven by the conversation-store's selectedId. Any
+// regression to the AppShell code that changes this mechanism's shape will
+// diverge from this scaffold; the tests still pass on the scaffold but the
+// UAT walk catches the AppShell-side drift. This is intentional — the
+// scaffold is a WHITEBOX test of "the mechanism, done correctly, gives the
+// contract"; the UAT is the BLACKBOX test of "AppShell uses the mechanism
+// correctly."
+
+const mountCounts = new Map<string, number>();
+const unmountCounts = new Map<string, number>();
+
+function MockTabContent({ tabId, isVisible }: { tabId: string; isVisible: boolean }) {
+  useEffect(() => {
+    mountCounts.set(tabId, (mountCounts.get(tabId) ?? 0) + 1);
+    return () => {
+      unmountCounts.set(tabId, (unmountCounts.get(tabId) ?? 0) + 1);
+    };
+  }, [tabId]);
+  return (
+    <div
+      data-testid={`content-${tabId}`}
+      data-visible={isVisible ? "true" : "false"}
+    >
+      {tabId}
+    </div>
+  );
+}
+
+function MountManager({
+  tabs,
+  effectiveSelectedTabId,
+  tabNodesRef,
+}: {
+  tabs: Tab[];
+  effectiveSelectedTabId: string | null;
+  tabNodesRef: React.MutableRefObject<Map<string, HTMLDivElement>>;
+}) {
+  const normalViewRef = useRef<HTMLDivElement>(null);
+
+  const getTabNode = useCallback(
+    (tabId: string) => {
+      if (!tabNodesRef.current.has(tabId)) {
+        const el = document.createElement("div");
+        el.style.position = "absolute";
+        el.style.inset = "0";
+        el.style.overflow = "hidden";
+        tabNodesRef.current.set(tabId, el);
+      }
+      return tabNodesRef.current.get(tabId)!;
+    },
+    [tabNodesRef],
+  );
+
+  // Mirror of AppShell.tsx lines 1195-1237 DOM-placement effect. The `if
+  // (isTerminal)` branch is a full match; the singleton non-terminal branch
+  // uses `display: none` instead of `visibility: hidden`. We test the
+  // terminal branch (visibility toggle) which is what all conversation
+  // tabs use.
+  useEffect(() => {
+    const normalView = normalViewRef.current;
+    if (!normalView) return;
+
+    const tabIds = new Set(tabs.map((t) => t.id));
+    for (const [id, node] of tabNodesRef.current) {
+      if (!tabIds.has(id)) {
+        node.remove();
+        tabNodesRef.current.delete(id);
+      }
+    }
+
+    for (const tab of tabs) {
+      const node = getTabNode(tab.id);
+      const activeInline = tab.id === effectiveSelectedTabId;
+      if (node.parentElement !== normalView) normalView.appendChild(node);
+      node.style.display = "";
+      node.style.visibility = activeInline ? "visible" : "hidden";
+      node.style.pointerEvents = activeInline ? "auto" : "none";
+      node.style.zIndex = activeInline ? "1" : "0";
+    }
+  });
+
+  return (
+    <div ref={normalViewRef} data-testid="normal-view">
+      {tabs.map((tab) => {
+        const tabNode = getTabNode(tab.id);
+        const isVisible = tab.id === effectiveSelectedTabId;
+        return createPortal(
+          <MockTabContent tabId={tab.id} isVisible={isVisible} />,
+          tabNode,
+          tab.id,
+        );
+      })}
+    </div>
+  );
+}
+
+// Driver component: renders MountManager and derives effectiveSelectedTabId
+// the same way AppShell does (via a selectedConversationId hook — here we
+// read the store directly and force re-renders via useSyncExternalStore).
+function TestHarness({ tabs }: { tabs: Tab[] }) {
+  // We drive selection via the real conversation-store so the test exercises
+  // the actual store's selectConversation guards + the effectiveSelectedTabId
+  // derivation semantics AppShell uses. This is more realistic than a plain
+  // useState.
+  const tabNodesRef = useRef<Map<string, HTMLDivElement>>(new Map());
+  const [tick, setTick] = useState(0);
+
+  useEffect(() => {
+    // Push tabs into the store on every render so store's selection guard
+    // can accept the id when a test calls selectConversation.
+    updateOpenTabs(tabs);
+  }, [tabs]);
+
+  useEffect(() => {
+    // Subscribe to store changes to trigger re-renders when selection changes.
+    // We drive re-renders manually because the harness's effectiveSelectedTabId
+    // reads state.selectedId via __getSnapshotForTest (not a React hook), so
+    // there's nothing to auto-invalidate without an explicit setState.
+    const unsub = __subscribeForTest(() => setTick((n) => n + 1));
+    return unsub;
+    // tick intentionally NOT in deps — the effect is a permanent subscription
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const snap = __getSnapshotForTest();
+  const selectedId = snap.selectedId;
+
+  const effectiveSelectedTabId = useMemo(() => {
+    if (selectedId && tabs.some((t) => t.id === selectedId)) return selectedId;
+    return tabs[0]?.id ?? null;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedId, tabs, tick]);
+
+  return (
+    <MountManager
+      tabs={tabs}
+      effectiveSelectedTabId={effectiveSelectedTabId}
+      tabNodesRef={tabNodesRef}
+    />
+  );
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+describe("AppShell persistence contract — patch #35 tabNodesRef DOM-move (T-06-02-01)", () => {
+  const hostA = makeHost("host-A", "hostA");
+  const hostB = makeHost("host-B", "hostB");
+  const tabT1 = makeTerminalTab("t1", hostA, "session-1");
+  const tabT2 = makeTerminalTab("t2", hostB, "session-2");
+  const tabs = [tabT1, tabT2];
+
+  it("Test 1: DOM node identity persists across A → B → A switches (load-bearing)", () => {
+    const { rerender: _rerender } = render(<TestHarness tabs={tabs} />);
+
+    // Select t1 first
+    act(() => selectConversation("t1"));
+    // Note: the harness uses a subscribeToStore hook so the effect fires;
+    // React needs another render cycle to pick up the tick — we force it
+    // via act() calls below.
+
+    // Grab the DOM nodes from the tabNodesRef map — accessed via the
+    // MountManager's internal ref, so we test via the actual DOM tree.
+    // The mock content renders inside a per-tab DOM node the mechanism
+    // created; that node is a child of the normalView container.
+    const normalViewBefore = document.querySelector('[data-testid="normal-view"]');
+    expect(normalViewBefore).not.toBeNull();
+    const t1ContentBefore = document.querySelector('[data-testid="content-t1"]');
+    const t2ContentBefore = document.querySelector('[data-testid="content-t2"]');
+    expect(t1ContentBefore).not.toBeNull();
+    expect(t2ContentBefore).not.toBeNull();
+    // The IMMEDIATE parent element of the content is the per-tab DOM node
+    // the mechanism created (created via document.createElement inside
+    // getTabNode).
+    const t1NodeBefore = t1ContentBefore!.parentElement;
+    const t2NodeBefore = t2ContentBefore!.parentElement;
+    expect(t1NodeBefore).not.toBeNull();
+    expect(t2NodeBefore).not.toBeNull();
+
+    // Switch to t2
+    act(() => selectConversation("t2"));
+
+    const t1ContentMid = document.querySelector('[data-testid="content-t1"]');
+    const t2ContentMid = document.querySelector('[data-testid="content-t2"]');
+    expect(t1ContentMid).not.toBeNull(); // still mounted (hidden, not unmounted)
+    expect(t2ContentMid).not.toBeNull();
+    const t1NodeMid = t1ContentMid!.parentElement;
+    const t2NodeMid = t2ContentMid!.parentElement;
+
+    // Same DOM node references — patch #35 mechanism preserved DOM identity
+    expect(t1NodeMid).toBe(t1NodeBefore);
+    expect(t2NodeMid).toBe(t2NodeBefore);
+
+    // Switch back to t1
+    act(() => selectConversation("t1"));
+
+    const t1ContentAfter = document.querySelector('[data-testid="content-t1"]');
+    const t2ContentAfter = document.querySelector('[data-testid="content-t2"]');
+    expect(t1ContentAfter).not.toBeNull();
+    expect(t2ContentAfter).not.toBeNull();
+    const t1NodeAfter = t1ContentAfter!.parentElement;
+    const t2NodeAfter = t2ContentAfter!.parentElement;
+
+    // ADR: reference equality is the load-bearing assertion
+    expect(t1NodeAfter).toBe(t1NodeBefore);
+    expect(t2NodeAfter).toBe(t2NodeBefore);
+  });
+
+  it("Test 2: mount-count invariant — no remount on switch", () => {
+    render(<TestHarness tabs={tabs} />);
+
+    // Initial mount: both t1 and t2 mount once each (createPortal loop
+    // renders every tab into its own persistent DOM node from the first
+    // render). The initial selection defaults to tabs[0] = t1 in the
+    // harness (no explicit select).
+    expect(mountCounts.get("t1")).toBe(1);
+    expect(mountCounts.get("t2")).toBe(1);
+    expect(unmountCounts.get("t1") ?? 0).toBe(0);
+    expect(unmountCounts.get("t2") ?? 0).toBe(0);
+
+    // Switch to t2
+    act(() => selectConversation("t2"));
+
+    // No mount count changes — visibility toggled, component NOT remounted
+    expect(mountCounts.get("t1")).toBe(1);
+    expect(mountCounts.get("t2")).toBe(1);
+    expect(unmountCounts.get("t1") ?? 0).toBe(0);
+    expect(unmountCounts.get("t2") ?? 0).toBe(0);
+
+    // Switch back to t1
+    act(() => selectConversation("t1"));
+
+    expect(mountCounts.get("t1")).toBe(1);
+    expect(mountCounts.get("t2")).toBe(1);
+    expect(unmountCounts.get("t1") ?? 0).toBe(0);
+    expect(unmountCounts.get("t2") ?? 0).toBe(0);
+  });
+
+  it("Test 3: visibility toggle applied on switch", () => {
+    render(<TestHarness tabs={tabs} />);
+
+    // Select t1 explicitly
+    act(() => selectConversation("t1"));
+
+    const t1Content = document.querySelector('[data-testid="content-t1"]');
+    const t2Content = document.querySelector('[data-testid="content-t2"]');
+    const t1Node = t1Content!.parentElement!;
+    const t2Node = t2Content!.parentElement!;
+
+    // t1 visible, t2 hidden
+    expect(t1Node.style.visibility).toBe("visible");
+    expect(t2Node.style.visibility).toBe("hidden");
+    expect(t1Node.style.pointerEvents).toBe("auto");
+    expect(t2Node.style.pointerEvents).toBe("none");
+
+    // Switch to t2 — flips
+    act(() => selectConversation("t2"));
+
+    expect(t1Node.style.visibility).toBe("hidden");
+    expect(t2Node.style.visibility).toBe("visible");
+    expect(t1Node.style.pointerEvents).toBe("none");
+    expect(t2Node.style.pointerEvents).toBe("auto");
+  });
+
+  // ─── Plan 07-01: fleet-derived row-shape contract (Test 4) ─────────────────
+  // Store-level assertion that the Plan 07-01 Task 2 detached-row-click
+  // handler's INPUTS are produced correctly. AppShell's onDetachedRowClick
+  // (see AppShell.tsx §Plan 07-01) reads row.host + row.targetTmuxSession
+  // from a fleet-only row and calls openTab. Test 4 asserts that after
+  // AppShell would have called updateHostsFlat + updateFleetSessions, the
+  // store's snapshot contains a fleet-derived row with the fields the
+  // handler needs — host resolved via hostsFlat, targetTmuxSession set,
+  // deterministic id, and the internal fleetOnly=true routing marker.
+  //
+  // This is NOT an openTab integration test — the openTab call itself is
+  // an AppShell concern and is walked in Plan 07-03 UAT. Test 4 is a
+  // regression guard for the store contract that the handler depends on;
+  // if a future refactor breaks the resolution chain (e.g., host stops
+  // being populated via hostsFlat, or fleetOnly stops being set) this
+  // test fails BEFORE user clicks a detached row and gets a silent
+  // no-op.
+  //
+  // Tests 1-3 above (T-06-02-01 MountManager scaffold) are UNCHANGED —
+  // this test does not render the MountManager, does not touch tabNodesRef,
+  // does not extend the createPortal loop.
+  it("Test 4: fleet-derived row shape — hostsFlat resolves host + fleetOnly:true + id `fleet::N::name`", () => {
+    const mockHostA = makeHost("1", "hostA");
+
+    // Simulate what AppShell's mount effects do in production:
+    //   1. hostsById memo populates from realHostTree → updateHostsFlat
+    //   2. getSessionList() resolves → updateFleetSessions
+    // Order isn't semantically load-bearing (both are pure inputs), but we
+    // match the AppShell effect ordering for realism.
+    act(() => {
+      updateHostsFlat(new Map<number, Host>([[1, mockHostA]]));
+      updateFleetSessions([
+        { hostId: 1, hostName: "hostA", sessionName: "work", created: 100 },
+      ]);
+    });
+
+    const snap = __getSnapshotForTest();
+    // Phase 41 Plan 01: fleet-derived row lands in flat middle (no host bucket).
+    expect(snap.middle.length).toBe(1);
+    const row = snap.middle[0];
+
+    // Handler's required inputs:
+    //   - row.host (resolved via hostsFlat — passed to openTab)
+    //   - row.targetTmuxSession (passed to openTab options)
+    //   - row.fleetOnly === true (routes ConversationsPanel through
+    //     onDetachedRowClick vs selectConversation)
+    //   - row.id in deterministic `fleet::${hostId}::${sessionName}` shape
+    //     so future assertions / diagnostics can reason about identity
+    expect(row.host).toBe(mockHostA);
+    expect(row.targetTmuxSession).toBe("work");
+    expect((row as unknown as { fleetOnly?: boolean }).fleetOnly).toBe(true);
+    expect(row.id).toBe("fleet::1::work");
+  });
+
+  // ─── quick-260821-m36: flag-flip on getSessionList() failure ─────────────
+  //
+  // Failing /sessions/list previously left cold-cache clients stuck at
+  // "Loading agents…" — the AppShell useEffect's silent catch (~L646-651)
+  // never touched the store on the failure path, so `fleetSessionsLoaded`
+  // stayed false and PrettyConversationsPanel kept rendering its spinner.
+  // The fix adds ONE guarded call inside the catch:
+  //
+  //   if (!cancelled) updateFleetSessions([]);
+  //
+  // Under the quick-260727-kbw contract (conversation-store.ts:962-998),
+  // the first call to updateFleetSessions — even with an empty array —
+  // unconditionally flips `fleetSessionsLoaded` false → true, which drives
+  // PrettyConversationsPanel out of its Loading state.
+  //
+  // This test takes the scaffold-fallback path the file header block
+  // explicitly authorizes (Tests 1-3 rationale): mocking AppShell's ~30
+  // imports (i18n provider, theme provider, dbHealthMonitor, feature
+  // panels, and every /api/sessions-api boundary) to render the real
+  // AppShell would be strictly more fragile than extracting the useEffect
+  // shape into a minimal <FleetFetcher /> component and testing THAT.
+  // This is the same "extract the mechanism, test it in isolation"
+  // pattern the MountManager scaffold above uses for the DOM-move
+  // mechanism.
+  it("Test 5 (quick-260821-m36): getSessionList rejects → updateFleetSessions([]) flips fleetSessionsLoaded false→true", async () => {
+    // Establish a clean false starting point — beforeEach called
+    // updateFleetSessions([]) on line 115 which (per quick-260727-kbw)
+    // ALREADY flipped the flag to true. __resetFleetSessionsForTest wipes
+    // both the fleetSessions array AND the flag back to their initial
+    // module-scope values so we can observe the false→true transition
+    // this test cares about.
+    __resetFleetSessionsForTest();
+    expect(__getSnapshotForTest().fleetSessionsLoaded).toBe(false);
+
+    // Cache-write spy — proves the try-branch's writeFleetSessionsCache is
+    // NEVER called on the failure path (invariant: "the last known-good
+    // snapshot survives the network hiccup"). We inline a no-op cache-
+    // write shim rather than spying on the real module boundary because
+    // the scaffold reproduces the useEffect body in isolation.
+    let cacheWriteCallCount = 0;
+    const writeFleetSessionsCacheShim = (): void => {
+      cacheWriteCallCount++;
+    };
+
+    // Reproduce the AppShell.tsx L596-657 useEffect shape in a minimal
+    // scaffold component. The try-branch is kept as a compiled-in dead
+    // path (Promise.reject fires immediately) so the assertion focuses
+    // on the catch-branch behavior — the whole point of the fix.
+    //
+    // The scaffold's catch mirrors AppShell.tsx's post-quick-260821-m36
+    // silent catch — `if (!cancelled) updateFleetSessions([])`. Any
+    // future refactor that drops the line from EITHER site diverges +
+    // fails one of the two guards (this test OR the UAT cold-cache
+    // walk). This is the whitebox mirror-lock pattern the file header
+    // authorizes.
+    function FleetFetcher(): null {
+      useEffect(() => {
+        let cancelled = false;
+        void (async () => {
+          try {
+            // Simulate getSessionList() failure — matches how axios
+            // rejects on network error / 500 / timeout in production.
+            await Promise.reject(new Error("boom: /sessions/list failed"));
+            if (cancelled) return;
+            // (unreachable dead path — kept for shape symmetry with the
+            //  real useEffect body; writeFleetSessionsCacheShim would
+            //  be called here if the promise resolved).
+            writeFleetSessionsCacheShim();
+          } catch {
+            // quick-260821-m36 fix — mirror of AppShell.tsx L656.
+            if (!cancelled) updateFleetSessions([]);
+          }
+        })();
+        return () => {
+          cancelled = true;
+        };
+      }, []);
+      return null;
+    }
+
+    // flushPromises: yield to the microtask + macrotask queue so the
+    // (async () => {})() IIFE completes and the store notification lands
+    // before the assertion runs. setTimeout(res, 0) drains BOTH queues.
+    const flushPromises = (): Promise<void> =>
+      new Promise((res) => setTimeout(res, 0));
+
+    await act(async () => {
+      render(<FleetFetcher />);
+      await flushPromises();
+    });
+
+    const snap = __getSnapshotForTest();
+    expect(snap.fleetSessionsLoaded).toBe(true);
+    expect(snap.fleetSessions.length).toBe(0);
+
+    // Cache-untouched invariant — the try-branch's writeFleetSessionsCache
+    // (the shim) was never called because Promise.reject short-circuited
+    // to the catch.
+    expect(cacheWriteCallCount).toBe(0);
+  });
+});
+
+// ─── Phase 111 Plan 06: fetchAndApplyFleetSessions re-ask contract ────────────
+//
+// Tests the D-07 amendment: GET /sessions/list fires on mount AND on becoming
+// visible again (via a shared fetchAndApplyFleetSessions path). Scaffold
+// pattern mirrors the one the main describe block uses — a minimal component
+// that reproduces AppShell's mount effect + visibility effect shape, tested
+// in isolation with controlled promises.
+//
+// Critical T-111-35 invariant: the re-ask (isColdStart: false) path MUST NOT
+// call updateFleetSessions([]) on failure. Only the cold-start path may do so.
+//
+// Helpers shared across the 8 cases:
+//   setVisibility() — mutates document.visibilityState + fires visibilitychange
+//   flushPromises() — drains microtask + macrotask queue so async effects settle
+
+function setVisibilityDoc(state: "visible" | "hidden"): void {
+  Object.defineProperty(document, "visibilityState", {
+    value: state,
+    configurable: true,
+  });
+  document.dispatchEvent(new Event("visibilitychange"));
+}
+
+const flushP = (): Promise<void> => new Promise((res) => setTimeout(res, 0));
+
+describe("Phase 111 Plan 06: fetchAndApplyFleetSessions re-ask (D-07 / T-111-35)", () => {
+  beforeEach(() => {
+    // Restore document.visibilityState to "visible" so cases start clean.
+    Object.defineProperty(document, "visibilityState", {
+      value: "visible",
+      configurable: true,
+    });
+    // Reset fleet store
+    __resetFleetSessionsForTest();
+  });
+
+  // ─── Case 1: mount fires exactly one getSessionList ──────────────────────
+  it("Case 1: mount fires exactly one getSessionList call (no more, no less)", async () => {
+    let fetchCount = 0;
+    const getSessionListShim = (): Promise<unknown[]> => {
+      fetchCount++;
+      return Promise.resolve([]);
+    };
+
+    function FetchHarness(): null {
+      const fetchInflightRef = useRef<boolean>(false);
+      const mountedRef = useRef<boolean>(false);
+
+      const fetchAndApply = useCallback(
+        async (opts: { isColdStart: boolean }) => {
+          if (fetchInflightRef.current) return;
+          fetchInflightRef.current = true;
+          try {
+            const sessions = await getSessionListShim();
+            if (opts.isColdStart && !mountedRef.current) return;
+            const fresh = Array.isArray(sessions) ? sessions : [];
+            updateFleetSessions(fresh);
+          } catch {
+            if (opts.isColdStart && mountedRef.current) updateFleetSessions([]);
+          } finally {
+            fetchInflightRef.current = false;
+          }
+        },
+        [],
+      ); // eslint-disable-line react-hooks/exhaustive-deps
+
+      useEffect(() => {
+        mountedRef.current = true;
+        void fetchAndApply({ isColdStart: true });
+        return () => {
+          mountedRef.current = false;
+        };
+      }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+      useEffect(() => {
+        const handler = () => {
+          if (document.visibilityState !== "visible") return;
+          void fetchAndApply({ isColdStart: false });
+        };
+        document.addEventListener("visibilitychange", handler);
+        return () => document.removeEventListener("visibilitychange", handler);
+      }, [fetchAndApply]);
+
+      return null;
+    }
+
+    await act(async () => {
+      render(<FetchHarness />);
+      await flushP();
+    });
+
+    expect(fetchCount).toBe(1);
+  });
+
+  // ─── Case 2: becoming visible fires a second getSessionList ──────────────
+  it("Case 2: becoming visible after mount fires a second getSessionList", async () => {
+    let fetchCount = 0;
+    const getSessionListShim = (): Promise<unknown[]> => {
+      fetchCount++;
+      return Promise.resolve([]);
+    };
+
+    function FetchHarness(): null {
+      const fetchInflightRef = useRef<boolean>(false);
+      const mountedRef = useRef<boolean>(false);
+
+      const fetchAndApply = useCallback(
+        async (opts: { isColdStart: boolean }) => {
+          if (fetchInflightRef.current) return;
+          fetchInflightRef.current = true;
+          try {
+            const sessions = await getSessionListShim();
+            if (opts.isColdStart && !mountedRef.current) return;
+            const fresh = Array.isArray(sessions) ? sessions : [];
+            updateFleetSessions(fresh);
+          } catch {
+            if (opts.isColdStart && mountedRef.current) updateFleetSessions([]);
+          } finally {
+            fetchInflightRef.current = false;
+          }
+        },
+        [],
+      ); // eslint-disable-line react-hooks/exhaustive-deps
+
+      useEffect(() => {
+        mountedRef.current = true;
+        void fetchAndApply({ isColdStart: true });
+        return () => {
+          mountedRef.current = false;
+        };
+      }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+      useEffect(() => {
+        const handler = () => {
+          if (document.visibilityState !== "visible") return;
+          void fetchAndApply({ isColdStart: false });
+        };
+        document.addEventListener("visibilitychange", handler);
+        return () => document.removeEventListener("visibilitychange", handler);
+      }, [fetchAndApply]);
+
+      return null;
+    }
+
+    await act(async () => {
+      render(<FetchHarness />);
+      await flushP();
+    });
+
+    expect(fetchCount).toBe(1);
+
+    // Simulate tab becoming visible (e.g. after Alt-Tab back)
+    await act(async () => {
+      setVisibilityDoc("hidden");
+      setVisibilityDoc("visible");
+      await flushP();
+    });
+
+    expect(fetchCount).toBe(2);
+  });
+
+  // ─── Case 3: re-ask does NOT touch readFleetSessionsCache ────────────────
+  it("Case 3: readFleetSessionsCache is mount-only — re-ask does not call it", async () => {
+    let cacheReadCount = 0;
+    const readCacheShim = (): unknown[] => {
+      cacheReadCount++;
+      return [];
+    };
+
+    function FetchHarness(): null {
+      const fetchInflightRef = useRef<boolean>(false);
+      const mountedRef = useRef<boolean>(false);
+
+      const fetchAndApply = useCallback(
+        async (_opts: { isColdStart: boolean }) => {
+          if (fetchInflightRef.current) return;
+          fetchInflightRef.current = true;
+          try {
+            await Promise.resolve([]);
+          } catch {
+            // no-op
+          } finally {
+            fetchInflightRef.current = false;
+          }
+        },
+        [],
+      ); // eslint-disable-line react-hooks/exhaustive-deps
+
+      useEffect(() => {
+        mountedRef.current = true;
+        // Cache read is MOUNT-ONLY — inside this effect, not in fetchAndApply
+        readCacheShim();
+        void fetchAndApply({ isColdStart: true });
+        return () => {
+          mountedRef.current = false;
+        };
+      }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+      useEffect(() => {
+        const handler = () => {
+          if (document.visibilityState !== "visible") return;
+          // Re-ask path — fetchAndApply is called but readCacheShim is NOT
+          void fetchAndApply({ isColdStart: false });
+        };
+        document.addEventListener("visibilitychange", handler);
+        return () => document.removeEventListener("visibilitychange", handler);
+      }, [fetchAndApply]);
+
+      return null;
+    }
+
+    await act(async () => {
+      render(<FetchHarness />);
+      await flushP();
+    });
+
+    expect(cacheReadCount).toBe(1); // mount only
+
+    await act(async () => {
+      setVisibilityDoc("hidden");
+      setVisibilityDoc("visible");
+      await flushP();
+    });
+
+    // Still 1 — re-ask did not call readCacheShim
+    expect(cacheReadCount).toBe(1);
+  });
+
+  // ─── Case 4: failing re-ask does NOT call updateFleetSessions([]) (T-111-35, load-bearing) ──
+  //
+  // If the re-ask catch branch unconditionally calls updateFleetSessions([]),
+  // every transient network blip wipes the conversation list. The
+  // opts.isColdStart guard ensures only the cold-start path calls it.
+  // This test tracks the call count of a shim to prove the guard is active.
+  //
+  // Load-bearing proof: making catch unconditional causes this test to fail.
+  it("Case 4: failing re-ask does NOT call updateFleetSessions([]) — T-111-35", async () => {
+    // Use a shim to count how many times the "empty wipe" path fires
+    let emptyUpdateCallCount = 0;
+    const emptyUpdateShim = (): void => {
+      emptyUpdateCallCount++;
+    };
+
+    let fetchCallCount = 0;
+    const getSessionListShim = (): Promise<unknown[]> => {
+      fetchCallCount++;
+      return Promise.reject(new Error("network blip"));
+    };
+
+    function FetchHarness(): null {
+      const fetchInflightRef = useRef<boolean>(false);
+      const mountedRef = useRef<boolean>(false);
+
+      const fetchAndApply = useCallback(
+        async (opts: { isColdStart: boolean }) => {
+          if (fetchInflightRef.current) return;
+          fetchInflightRef.current = true;
+          try {
+            await getSessionListShim();
+          } catch {
+            // T-111-35: ONLY cold-start path calls the empty-update shim.
+            // Re-ask path must NOT call it.
+            if (opts.isColdStart && mountedRef.current) emptyUpdateShim();
+          } finally {
+            fetchInflightRef.current = false;
+          }
+        },
+        [],
+      ); // eslint-disable-line react-hooks/exhaustive-deps
+
+      useEffect(() => {
+        mountedRef.current = true;
+        void fetchAndApply({ isColdStart: true });
+        return () => {
+          mountedRef.current = false;
+        };
+      }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+      useEffect(() => {
+        const handler = () => {
+          if (document.visibilityState !== "visible") return;
+          void fetchAndApply({ isColdStart: false });
+        };
+        document.addEventListener("visibilitychange", handler);
+        return () => document.removeEventListener("visibilitychange", handler);
+      }, [fetchAndApply]);
+
+      return null;
+    }
+
+    // Mount — cold-start fetch fails
+    await act(async () => {
+      render(<FetchHarness />);
+      await flushP();
+    });
+
+    expect(fetchCallCount).toBe(1);
+    // Cold-start failure fires the shim (isColdStart: true)
+    expect(emptyUpdateCallCount).toBe(1);
+
+    // Re-ask (visibility-triggered) — also fails
+    await act(async () => {
+      setVisibilityDoc("hidden");
+      setVisibilityDoc("visible");
+      await flushP();
+    });
+
+    expect(fetchCallCount).toBe(2);
+    // T-111-35: re-ask failure must NOT fire the empty-update shim
+    expect(emptyUpdateCallCount).toBe(1); // still 1, not 2
+  });
+
+  // ─── Case 5: failing cold-start still flips fleetSessionsLoaded ──────────
+  //
+  // quick-260821-m36 behaviour must survive the D-07 refactor. A cold-start
+  // failure must still flip fleetSessionsLoaded false→true so clients don't
+  // stay stuck at "Loading agents…".
+  it("Case 5: failing cold-start calls updateFleetSessions([]) — flips fleetSessionsLoaded (quick-260821-m36 survives D-07)", async () => {
+    __resetFleetSessionsForTest();
+    expect(__getSnapshotForTest().fleetSessionsLoaded).toBe(false);
+
+    function FetchHarness(): null {
+      const fetchInflightRef = useRef<boolean>(false);
+      const mountedRef = useRef<boolean>(false);
+
+      const fetchAndApply = useCallback(
+        async (opts: { isColdStart: boolean }) => {
+          if (fetchInflightRef.current) return;
+          fetchInflightRef.current = true;
+          try {
+            await Promise.reject(new Error("timeout"));
+          } catch {
+            if (opts.isColdStart && mountedRef.current) updateFleetSessions([]);
+          } finally {
+            fetchInflightRef.current = false;
+          }
+        },
+        [],
+      ); // eslint-disable-line react-hooks/exhaustive-deps
+
+      useEffect(() => {
+        mountedRef.current = true;
+        void fetchAndApply({ isColdStart: true });
+        return () => {
+          mountedRef.current = false;
+        };
+      }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+      useEffect(() => {
+        const handler = () => {
+          if (document.visibilityState !== "visible") return;
+          void fetchAndApply({ isColdStart: false });
+        };
+        document.addEventListener("visibilitychange", handler);
+        return () => document.removeEventListener("visibilitychange", handler);
+      }, [fetchAndApply]);
+
+      return null;
+    }
+
+    await act(async () => {
+      render(<FetchHarness />);
+      await flushP();
+    });
+
+    expect(__getSnapshotForTest().fleetSessionsLoaded).toBe(true);
+  });
+
+  // ─── Case 6: rapid hidden/visible cycling produces at most one in-flight ──
+  //
+  // fetchInflightRef.current guard coalesces concurrent visibility events so
+  // rapid cycling (e.g. mobile backgrounding) does not stack concurrent
+  // network requests. The guard is NOT a success-latch — it clears in finally.
+  it("Case 6: rapid hidden/visible cycling fires at most one concurrent fetch (in-flight coalescing)", async () => {
+    let fetchCount = 0;
+
+    // Slow fetch — does not resolve until we control it
+    let resolveFetch!: (v: unknown[]) => void;
+    const pendingFetch = new Promise<unknown[]>((res) => {
+      resolveFetch = res;
+    });
+
+    const getSessionListShim = (): Promise<unknown[]> => {
+      fetchCount++;
+      return pendingFetch;
+    };
+
+    function FetchHarness(): null {
+      const fetchInflightRef = useRef<boolean>(false);
+      const mountedRef = useRef<boolean>(false);
+
+      const fetchAndApply = useCallback(
+        async (opts: { isColdStart: boolean }) => {
+          if (fetchInflightRef.current) return; // coalescing guard
+          fetchInflightRef.current = true;
+          try {
+            const sessions = await getSessionListShim();
+            if (opts.isColdStart && !mountedRef.current) return;
+            updateFleetSessions(Array.isArray(sessions) ? sessions : []);
+          } catch {
+            if (opts.isColdStart && mountedRef.current) updateFleetSessions([]);
+          } finally {
+            fetchInflightRef.current = false;
+          }
+        },
+        [],
+      ); // eslint-disable-line react-hooks/exhaustive-deps
+
+      useEffect(() => {
+        mountedRef.current = true;
+        void fetchAndApply({ isColdStart: true });
+        return () => {
+          mountedRef.current = false;
+        };
+      }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+      useEffect(() => {
+        const handler = () => {
+          if (document.visibilityState !== "visible") return;
+          void fetchAndApply({ isColdStart: false });
+        };
+        document.addEventListener("visibilitychange", handler);
+        return () => document.removeEventListener("visibilitychange", handler);
+      }, [fetchAndApply]);
+
+      return null;
+    }
+
+    // Mount — cold-start fetch starts (fetchInflightRef = true), stays pending
+    await act(async () => {
+      render(<FetchHarness />);
+      await flushP();
+    });
+
+    expect(fetchCount).toBe(1); // cold-start fired
+
+    // Rapid visible cycles while cold-start is still in-flight
+    await act(async () => {
+      setVisibilityDoc("hidden");
+      setVisibilityDoc("visible");
+      setVisibilityDoc("hidden");
+      setVisibilityDoc("visible");
+      setVisibilityDoc("hidden");
+      setVisibilityDoc("visible");
+      await flushP();
+    });
+
+    // Still 1 — coalescing guard blocked all re-asks while cold-start in-flight
+    expect(fetchCount).toBe(1);
+
+    // Resolve the cold-start fetch — fetchInflightRef clears in finally
+    await act(async () => {
+      resolveFetch([]);
+      await flushP();
+    });
+
+    // Now a new visibility event triggers a fresh fetch (guard is clear)
+    await act(async () => {
+      setVisibilityDoc("hidden");
+      setVisibilityDoc("visible");
+      await flushP();
+    });
+
+    // pendingFetch already resolved, so this second fetch also resolves immediately
+    expect(fetchCount).toBe(2);
+  });
+
+  // ─── Case 7: successful re-ask calls writeFleetSessionsCache ─────────────
+  it("Case 7: successful re-ask calls writeFleetSessionsCache", async () => {
+    let cacheWriteCount = 0;
+    const writeCacheShim = (): void => {
+      cacheWriteCount++;
+    };
+
+    function FetchHarness(): null {
+      const fetchInflightRef = useRef<boolean>(false);
+      const mountedRef = useRef<boolean>(false);
+
+      const fetchAndApply = useCallback(
+        async (opts: { isColdStart: boolean }) => {
+          if (fetchInflightRef.current) return;
+          fetchInflightRef.current = true;
+          try {
+            const sessions = await Promise.resolve([]);
+            if (opts.isColdStart && !mountedRef.current) return;
+            updateFleetSessions(Array.isArray(sessions) ? sessions : []);
+            writeCacheShim();
+          } catch {
+            if (opts.isColdStart && mountedRef.current) updateFleetSessions([]);
+          } finally {
+            fetchInflightRef.current = false;
+          }
+        },
+        [],
+      ); // eslint-disable-line react-hooks/exhaustive-deps
+
+      useEffect(() => {
+        mountedRef.current = true;
+        void fetchAndApply({ isColdStart: true });
+        return () => {
+          mountedRef.current = false;
+        };
+      }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+      useEffect(() => {
+        const handler = () => {
+          if (document.visibilityState !== "visible") return;
+          void fetchAndApply({ isColdStart: false });
+        };
+        document.addEventListener("visibilitychange", handler);
+        return () => document.removeEventListener("visibilitychange", handler);
+      }, [fetchAndApply]);
+
+      return null;
+    }
+
+    await act(async () => {
+      render(<FetchHarness />);
+      await flushP();
+    });
+
+    expect(cacheWriteCount).toBe(1); // cold-start wrote cache
+
+    await act(async () => {
+      setVisibilityDoc("hidden");
+      setVisibilityDoc("visible");
+      await flushP();
+    });
+
+    expect(cacheWriteCount).toBe(2); // re-ask also writes cache on success
+  });
+
+  // ─── Case 8: visibility listener removed on unmount ──────────────────────
+  it("Case 8: visibilitychange listener is removed when component unmounts", async () => {
+    let fetchCount = 0;
+    const getSessionListShim = (): Promise<unknown[]> => {
+      fetchCount++;
+      return Promise.resolve([]);
+    };
+
+    function FetchHarness(): null {
+      const fetchInflightRef = useRef<boolean>(false);
+      const mountedRef = useRef<boolean>(false);
+
+      const fetchAndApply = useCallback(
+        async (opts: { isColdStart: boolean }) => {
+          if (fetchInflightRef.current) return;
+          fetchInflightRef.current = true;
+          try {
+            const sessions = await getSessionListShim();
+            if (opts.isColdStart && !mountedRef.current) return;
+            updateFleetSessions(Array.isArray(sessions) ? sessions : []);
+          } catch {
+            if (opts.isColdStart && mountedRef.current) updateFleetSessions([]);
+          } finally {
+            fetchInflightRef.current = false;
+          }
+        },
+        [],
+      ); // eslint-disable-line react-hooks/exhaustive-deps
+
+      useEffect(() => {
+        mountedRef.current = true;
+        void fetchAndApply({ isColdStart: true });
+        return () => {
+          mountedRef.current = false;
+        };
+      }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+      useEffect(() => {
+        const handler = () => {
+          if (document.visibilityState !== "visible") return;
+          void fetchAndApply({ isColdStart: false });
+        };
+        document.addEventListener("visibilitychange", handler);
+        return () => document.removeEventListener("visibilitychange", handler);
+      }, [fetchAndApply]);
+
+      return null;
+    }
+
+    const { unmount } = render(<FetchHarness />);
+    await act(async () => { await flushP(); });
+
+    expect(fetchCount).toBe(1); // cold-start
+
+    // Unmount — cleanup runs, listener removed
+    unmount();
+
+    // Visibility event after unmount — must NOT trigger another fetch
+    await act(async () => {
+      setVisibilityDoc("hidden");
+      setVisibilityDoc("visible");
+      await flushP();
+    });
+
+    expect(fetchCount).toBe(1); // unchanged — listener was removed
+  });
+});

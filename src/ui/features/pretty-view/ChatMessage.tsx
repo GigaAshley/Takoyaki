@@ -1,0 +1,736 @@
+import React, { useRef, useState, useMemo } from "react";
+import ReactMarkdown, { type Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
+import remarkBreaks from "remark-breaks";
+import { ThumbsUp, ThumbsDown, Volume2, Loader2, Pause, Play } from "lucide-react";
+import { cn } from "@/lib/utils";
+// Phase 124 Plan 01 (D-39): leaf-level subscription to the feedback-enabled
+// signal per Pattern S-01. Gates BOTH the layout swap (in-bubble speak button
+// → strip below the bubble) AND the thumbs affordance render — they travel
+// together per D-01. useSyncExternalStore-based; O(1) subscribe.
+import { useFeedbackEnabled } from "@/feedback/feedback-store";
+import { preprocessCommandTriplets, splitMarkers } from "./commandTags";
+import { parseInjectedUserTurn } from "@/api/pretty-view-upload-protocol";
+import { userBubbleContent } from "./bubble-text";
+import { AttachmentChipStrip } from "./AttachmentChipStrip";
+import { CopyableBlock } from "./CopyableBlock";
+import { ChatDiffBlock, chatDiffFromPre } from "./ChatDiffBlock";
+import { useSpeakPlayback } from "./useSpeakPlayback";
+import { readSpeakableText } from "./speakable-text";
+import { handleCleanCopy } from "./clean-copy";
+import { FileChip } from "./FileChip";
+import { AppChip } from "./AppChip";
+import { parseSkynetAppUrl } from "../apps/app-link";
+import { AskMarker, AnswerBubbleBody } from "./ask/AskBubbleParts";
+import { lastAskBody } from "./ask/ask-format";
+import { parseAnswerMessage, stripTrayNotices } from "./ask/answer-format";
+import { buildSkynetFileUrl, encodeFileLinkSpaces, isSkynetFileUrl } from "./file-url";
+import { RICH_COMPONENTS, RICH_REMARK_PLUGINS, richPre } from "./rich/rich-markdown";
+import { QUOTE_NAME_ATTR, QUOTE_SOURCE_ATTR } from "./quote-selection";
+
+// Presentational chat bubble for one conversational message.
+//
+// Content is rendered as markdown (GFM) via react-markdown so **bold**,
+// backticks, bullet lists, tables, etc. render as formatted output
+// rather than literal characters — Claude Code's assistant output is
+// mostly markdown, and user writes markdown-flavored prose too. Raw
+// HTML in the source is NOT interpreted (react-markdown default) so
+// there is no XSS surface even for untrusted content.
+//
+// Prose styling comes from @tailwindcss/typography via `prose prose-sm`.
+// The `max-w-none` override lets the bubble's own width cap the block;
+// the first/last-child margin resets keep the tight bubble aesthetic
+// (typography defaults would leave a stripe of whitespace at top/bottom
+// of every message). User bubbles use `prose-invert` unconditionally
+// (primary bg is dark in every theme); assistant bubbles use
+// `dark:prose-invert` so headings/code/strong/em get light-mode prose
+// colors on the light theme card and dark-mode prose colors (light
+// grays) on the dark theme card. Without the assistant-side invert,
+// Skynet's dark card renders headings/inline-code in default light-mode
+// prose colors — dark grays that read as "faint/unreadable" against
+// the dark card background.
+//
+// Font: inherits the app-wide Inter default (index.css). Inline `code`
+// bubbles opt into mono via the prose-code override in index.css so
+// command names and paths still read as code.
+const NO_VOICES: readonly string[] = [];
+
+// Module-scope plugin list: a fresh array literal per render would make
+// ReactMarkdown treat every render as a new pipeline (perf, iPhone scroll jank).
+const REMARK_PLUGINS = [remarkGfm, remarkBreaks];
+
+type HastLike = { type?: string; tagName?: string; value?: string; properties?: { className?: unknown }; children?: HastLike[] };
+function hastText(n: HastLike | undefined): string {
+  if (!n) return "";
+  if (n.type === "text") return n.value ?? "";
+  return (n.children ?? []).map(hastText).join("");
+}
+/** The body of a ```ask fenced block, or null for any other <pre>. */
+function askBodyFromPre(pre: unknown): string | null {
+  const code = (pre as HastLike | undefined)?.children?.find((c) => c.type === "element" && c.tagName === "code");
+  const cls = code?.properties?.className;
+  if (!code || !Array.isArray(cls) || !cls.some((c) => String(c) === "language-ask")) return null;
+  return hastText(code);
+}
+
+// Memoized: the bubble list re-renders on every new message / PrettyView state
+// change; an unchanged bubble must skip markdown re-parse entirely. Props from
+// PrettyView are stable (memoized values + ref-backed handlers).
+export const ChatMessage = React.memo(function ChatMessage({
+  role,
+  content: rawContent,
+  speakVoices = NO_VOICES,
+  ts,
+  eventId,
+  onThumbsUp,
+  onThumbsDown,
+  onOpenEditor,
+  fileDragOrigin,
+  pendingState = null,
+  attachments,
+  hostName,
+  askTray = true,
+  quoteName = null,
+}: {
+  role: "user" | "assistant";
+  content: string;
+  /** Voice candidates in preference order (voice-candidates.ts); [] = provider default. */
+  speakVoices?: readonly string[];
+  ts?: number;
+  eventId?: string;
+  // Phase 124 Plan 01 D-38: leaf-level callbacks the assistant-bubble strip
+  // fires on thumbs-up / thumbs-down tap. Payload is the message's eventId
+  // (used as `messageRef` per D-32). Both optional — a ChatMessage without
+  // handlers still renders the strip when feedbackEnabled (Plan 02 wires the
+  // handlers at PrettyView; ChatMessage-scope tests exercise the callback
+  // dispatch without a real postFeedback fire). Note: the modal-open logic
+  // for thumbs-down (D-23) lives in Plan 02's PrettyView handler; this
+  // callback runs BEFORE any modal opens (D-26 — pressed state applies
+  // immediately on tap).
+  onThumbsUp?: (eventId: string) => void;
+  onThumbsDown?: (eventId: string) => void;
+  // Phase 40 D-03/D-06: opens the EditableFileModal for a specific tailnet
+  // URL. Optional so callers that don't provide it (tests, historical mount
+  // sites) safely skip the affordance render.
+  onOpenEditor?: (input: {
+    messageEventId: string;
+    url: string;
+    filename: string;
+  }) => void;
+  // Encoded tab spec of the conversation this bubble sits in; file chips
+  // carry it on their drag so a file pane knows where its file came from.
+  fileDragOrigin?: string | null;
+  // Phase 50 D-01/D-03/D-06/D-19: optimistic-send bubble state. Only
+  // meaningful for user bubbles (assistant bubbles ignore it — pending
+  // state is a send-path concept). 'sending' renders identically to a
+  // settled bubble (truly optimistic — the WipBubble carries the in-flight
+  // feedback); 'failed' applies the whole-bubble red treatment via
+  // data-pv-bubble-failed. null | undefined = no rendering change
+  // (back-compat with every existing mount site).
+  pendingState?: "sending" | "failed" | null;
+  // Shape (2026-09-28): string hostname of the target host, used to build
+  // Skynet /file/<host>/<abs-path> URLs for the injected user-turn's file
+  // entries. Threaded from IdentitySessionPane → PrettyView → here. When
+  // present, injected-turn file entries render as interactive FileChips
+  // (same click contract as assistant-side chips); when absent, they fall
+  // back to the static read-only AttachmentChipStrip render.
+  hostName?: string;
+  // shape-interactive-responses: false where no tray exists (relay rooms) —
+  // an ask block then shows as plain text so it can be answered in words.
+  askTray?: boolean;
+  // shape-quote-reply: who a quote from this bubble is attributed to —
+  // set in relay rooms only; null quotes without a name.
+  quoteName?: string | null;
+  // Phase 80 D-15: attachments carried on a pending-with-attachments seed
+  // (PendingSend.attachments — populated by Plan 02's onUploadReadyToInject
+  // wiring). When present + non-empty AND the existing `injected` branch
+  // condition is false, the new pending-with-attachments render branch
+  // fires: caption above AttachmentChipStrip in readOnly mode (mirrors the
+  // settled `injected` bubble shape but sources data from this prop rather
+  // than parseInjectedUserTurn(content)). Absent for text-only pending
+  // bubbles and for settled bubbles (backward-compat with every existing
+  // mount site).
+  attachments?: Array<{
+    filename: string;
+    size: number;
+    mimetype: string;
+  }>;
+}) {
+  const isUser = role === "user";
+  // Voice-mode sends carry a trailing label for the agent, and messages sent
+  // while a question was open carry [tray] notices for it; never show either.
+  const content = isUser ? userBubbleContent(rawContent) : rawContent;
+  // A tray answer renders as an answer bubble (shape-interactive-responses).
+  const answer = useMemo(() => (isUser ? parseAnswerMessage(content) : null), [isUser, content]);
+  // The one ask block of this message the tray can hold (its last top-level
+  // one). Any other ask-looking block reads as plain text, so a marker never
+  // points at a question the tray doesn't have.
+  const trayAskBody = useMemo(() => (isUser || !askTray ? null : lastAskBody(content)), [isUser, askTray, content]);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  // Phase 124 Plan 01 (D-39): leaf-level feedback-enabled subscription. When
+  // true AND !isUser, the in-bubble speak button is not rendered (D-03), the
+  // bubble's right-side padding pocket collapses from pr-[42px] to pr-[12px]
+  // (D-03), and an action strip renders below the bubble carrying speak +
+  // thumbs-up + thumbs-down as three peers (D-04/D-05). When false, the
+  // bubble renders byte-identically to today (D-02 lock).
+  const feedbackEnabled = useFeedbackEnabled();
+
+  // Phase 124 Plan 01 (D-40 option (a) + D-30): thumbs pressed-state, scoped
+  // to this ChatMessage instance so it resets on unmount (conversation
+  // switch, hydration flush, page reload). Independent per direction — both
+  // thumbs may be pressed on the same message (D-29). Second-tap-no-op is
+  // enforced in the onClick handlers (D-22/D-28).
+  const [thumbsUpPressed, setThumbsUpPressed] = useState<boolean>(false);
+  const [thumbsDownPressed, setThumbsDownPressed] = useState<boolean>(false);
+
+  // Speak apparatus (state, pause/resume, cross-bubble preempt) — shared
+  // with RelayInboundBubble and the file viewer. Reads the rendered text at
+  // click time, skipping in-bubble controls (copy button, diff toggle).
+  // 2026-09-28 cutoff investigation: speak-start logs innerText vs the raw
+  // prop, so a DOM hiding text from the speak path shows in logs.
+  const speakLensRef = useRef("");
+  const { speakState, onSpeakClick } = useSpeakPlayback({
+    ownerName: "speak-bubble",
+    voices: speakVoices,
+    getText: () => {
+      const innerText = containerRef.current ? readSpeakableText(containerRef.current) : undefined;
+      speakLensRef.current = `contentLen=${content?.length ?? 0} innerTextLen=${innerText?.length ?? -1}`;
+      return innerText ?? content;
+    },
+    logFields: () => speakLensRef.current,
+    // An agent reply played here counts toward voice mode's heard note.
+    heardSource: () => (role === "assistant" ? { eventId, text: rawContent } : null),
+  });
+
+  // Phase 05 Plan 03: sender-side chip render for injected user turns.
+  // When a user-role message's content matches the exact format produced
+  // by formatInjectedUserTurn (caption + \n\n + INJECTED_DELIMITER + \n +
+  // per-file `N. name (size, mime) → path` + `   uploaded ts` pairs), the
+  // bubble renders as caption text + inline chip strip in the SAME wrapper
+  // instead of the normal markdown render. Non-matching content falls
+  // through to the normal path — the parser returns null quickly for the
+  // vast majority of messages (early indexOf bail on the delimiter
+  // substring), so there is no perf concern for non-injected messages.
+  // Assistant messages never trigger the parser (role gate — defense in
+  // depth against an assistant reply that coincidentally quotes the
+  // delimiter substring in prose).
+  const injected = useMemo(
+    () => (isUser ? parseInjectedUserTurn(content) : null),
+    [isUser, content],
+  );
+  // A tray answer sent with files: the caption is the answer.
+  const captionAnswer = useMemo(
+    () => (injected ? parseAnswerMessage(stripTrayNotices(injected.caption)) : null),
+    [injected],
+  );
+  // Quick-reply as-a-thumbs-up: a user message whose text is exactly the
+  // quick-reply payload "thumbs up" (case-insensitive, ignoring surrounding
+  // whitespace) renders as a ThumbsUp glyph inside the normal user bubble.
+  // Mirrors the ComposeBox quick-send button that produces this message, so
+  // what she sent visually matches what she clicked. Client-render-only —
+  // session file stays faithful. Single equality check: legacy alt-matches
+  // for 'yes'/'works for me'/'good to go'/'go ahead'/'let's go' render as
+  // plain text.
+  const isQuickReply =
+    isUser && !injected && content.trim().toLowerCase() === "thumbs up";
+  // Prettify slash-command triplets before markdown parsing. Runs of
+  // <command-message>/<command-name>/<command-args> tags become ⟨cmd:...⟩
+  // sentinel markers, then the `p` component override below splits those
+  // markers out into <CommandChip> pills. Backend session-file-parser stays
+  // faithful to the wire format — this transform is client-render-only.
+  // File links with spaces in the path are repaired first (see
+  // encodeFileLinkSpaces) so they parse as links instead of half-autolinking.
+  const processedContent = useMemo(
+    () => preprocessCommandTriplets(encodeFileLinkSpaces(content)),
+    [content],
+  );
+  // BUG C1 fix: memoize the ReactMarkdown `components` object. Passing a fresh
+  // inline object literal every render forces ReactMarkdown to remount its
+  // child overrides on every parent re-render. Deps are exactly the values
+  // the `a` override closes over: eventId, onOpenEditor, fileDragOrigin.
+  // The p/pre/blockquote overrides only close over module-scope imports
+  // (splitMarkers, CopyableBlock, ChatDiffBlock) — stable, not deps.
+  const markdownComponents = useMemo<Components>(() => ({
+    // URL dispatch inside the assistant's rendered markdown:
+    //   file URL       → FileChip on its own line (shape 2026-09-28).
+    //   app pane URL   → AppChip on its own line (convo-scoped apps).
+    //   anything else  → plain anchor with target=_blank.
+    a: ({ node: _node, ...rest }) => {
+      const props = rest as React.AnchorHTMLAttributes<HTMLAnchorElement>;
+      const href = props.href;
+
+      // File URL → render as FileChip on its own line inside the bubble.
+      // The chip replaces the inline hyperlink entirely; the wrapping span
+      // with `display: block` breaks the surrounding paragraph flow so the
+      // chip always sits on its own line, even when the URL was originally
+      // embedded mid-sentence.
+      //
+      // `isSkynetFileUrl` guards to same-origin only — an untrusted markdown
+      // link like `https://attacker.tld/file/x/tracker.png` must never
+      // become a chip whose media source fires a cookie-bearing request off
+      // to a third-party origin.
+      if (href && isSkynetFileUrl(href) && eventId && onOpenEditor) {
+        let filename = "";
+        try {
+          // Pitfall 8: URL.pathname strips ?query before we split.
+          const parsed = new URL(href);
+          const segments = parsed.pathname.split("/").filter(Boolean);
+          filename = segments.length > 0
+            ? decodeURIComponent(segments[segments.length - 1])
+            : "";
+        } catch {
+          // Malformed URL — bail to plain anchor rather than a chip
+          // titled with an empty filename.
+        }
+        // Fallback: if filename extraction produced nothing (URL ends in
+        // `/` or something similarly odd) but the URL shape matched, still
+        // render a chip so the shape's "every file MUST show up somewhere"
+        // invariant holds — better a chip labeled "file" than a silently-
+        // dropped URL.
+        const displayName = filename || "file";
+        return (
+          <span className="block my-1.5">
+            <FileChip
+              dragOrigin={fileDragOrigin}
+              url={href}
+              filename={displayName}
+              onOpen={() =>
+                onOpenEditor({
+                  messageEventId: eventId,
+                  url: href,
+                  filename: displayName,
+                })
+              }
+            />
+          </span>
+        );
+      }
+
+      // convo-scoped apps: an app pane link (`<origin>/apps/<hostId>/<slug>/pane/`)
+      // renders as an app chip on its own line — click opens the app, drag
+      // splits it beside the conversation. Same-origin only (parseSkynetAppUrl).
+      const appAddress = parseSkynetAppUrl(href);
+      if (href && appAddress) {
+        return (
+          <span className="block my-1.5">
+            <AppChip url={href} address={appAddress} />
+          </span>
+        );
+      }
+
+      // Not a file URL or app link — plain anchor.
+      // Tailnet URLs (legacy) fall here too; per shape they render as
+      // plain text-shaped links, not chips.
+      return (
+        <a
+          {...props}
+          target="_blank"
+          rel="noopener noreferrer"
+        />
+      );
+    },
+    p: ({ node, children, ...props }) => (
+      <p {...props}>{splitMarkers(children)}</p>
+    ),
+    pre: ({ node, children, ...props }) => {
+      // An agent's ask block: a quiet marker here; the question itself is in
+      // the tray above the compose box.
+      const askBody = askBodyFromPre(node);
+      if (askBody !== null) {
+        const inTray = trayAskBody !== null && askBody.trimEnd() === trayAskBody.trimEnd();
+        return <AskMarker body={askBody} trayShown={inTray} />;
+      }
+      // Wealthy text: charts, diagrams and display formulas in agent replies.
+      const rich = isUser ? null : richPre(node);
+      if (rich) return rich;
+      const diff = chatDiffFromPre(node);
+      if (diff) return <ChatDiffBlock text={diff.text} patch={diff.patch} />;
+      return <CopyableBlock as="pre" {...props}>{children}</CopyableBlock>;
+    },
+    blockquote: ({ node, children, ...props }) => (
+      <CopyableBlock as="blockquote" {...props}>{children}</CopyableBlock>
+    ),
+    // Wealthy text: workable tables and inline formulas, agent replies only.
+    ...(isUser ? {} : RICH_COMPONENTS),
+  }), [eventId, onOpenEditor, fileDragOrigin, trayAskBody, isUser]);
+  const titleText = useMemo(
+    () => (ts !== undefined ? new Date(ts).toLocaleString() : undefined),
+    [ts],
+  );
+  // Phase 50 Plan 03 Task 1 (D-01/D-03/D-06/D-19): user-only pending-state
+  // gate. Assistant bubbles ignore the prop; only 'failed' changes the
+  // render ('sending' is visually identical to settled).
+  //
+  // Phase 76 Plan 02 — D-06 semantic upgrade (user 2026-09-06 verbatim:
+  // "hopefully after we do this work a failed bubble will be a truly failed
+  // bubble and that is worth being that loud about"). Post-Phase-76, a failed
+  // bubble means the backend spent its FULL 210s give-up ceiling and actually
+  // gave up — it is a rare, truly-failed event. The visual must carry that
+  // weight: whole-bubble red fill, not just a red border + faint tint.
+  //
+  // CSS approach: use the `background` SHORTHAND (not `backgroundColor`) in
+  // the inline style. `background` overrides `background-image` (which is what
+  // the Tailwind `bg-[linear-gradient(...)]` utility class at line 451 sets),
+  // while `backgroundColor` alone would lose to the gradient in the cascade.
+  // Inline-style specificity beats any className utility, so the saturated-red
+  // `background` replaces the base blue-gray gradient entirely.
+  const showFailedBubble = isUser && pendingState === "failed";
+  const bubbleInlineStyle: React.CSSProperties = showFailedBubble
+    ? {
+        position: "relative",
+        background: "hsla(0, 60%, 35%, 0.90)",
+        borderColor: "hsla(0, 70%, 50%, 0.85)",
+      }
+    : { position: "relative" };
+  // Phase 124 Plan 01 (D-04/D-07 + Pattern S-07 option c): when the strip is
+  // present (assistant + feedbackEnabled), the outer flex wrapper also carries
+  // `flex-col items-start group` so the strip lives directly below the bubble
+  // left-edge-aligned, and Tailwind `group-hover:` on the strip picks up hover
+  // over either the bubble OR the strip itself. On feedback-OFF / user cases,
+  // the wrapper is byte-identical to today (`flex justify-*`) — no group, no
+  // flex-col — so the render path is untouched (D-02 lock).
+  return (
+    <div
+      // Copy without the dark-theme backgrounds/colors (see clean-copy.ts).
+      onCopy={handleCleanCopy}
+      className={cn(
+        "flex",
+        isUser ? "justify-end" : "justify-start",
+        !isUser && feedbackEnabled && "flex-col items-start group",
+      )}
+    >
+      <div
+        ref={containerRef}
+        // shape-quote-reply: selected words here can be quoted into a reply.
+        {...{ [QUOTE_SOURCE_ATTR]: "" }}
+        {...(quoteName ? { [QUOTE_NAME_ATTR]: quoteName } : {})}
+        title={titleText}
+        style={bubbleInlineStyle}
+        {...(showFailedBubble ? { "data-pv-bubble-failed": "true" } : {})}
+        // pv-bubble: hover-target class for any descendant that opts into
+        // a `.pv-bubble:hover_&` Tailwind selector. Historically read by
+        // the pencil-edit affordance; kept for future hover-descendants
+        // and for OutboundBubble which references the same idiom.
+        className={cn(
+          "pv-bubble",
+          // shape-conversation-view: the agent speaks in a solid bubble in its
+          // own colour (pv-hue-surface keeps the multi-role gold / roleless
+          // grey looks, index.css); you in a neutral bubble on the right.
+          // Look, padding and spacing: conversation.css.
+          isUser ? "pv-bubble-user" : "pv-bubble-agent pv-hue-surface",
+          "[overflow-wrap:anywhere]",
+          // Prose scaffolding (typography plugin): lists, headings, tables.
+          "prose prose-invert max-w-none",
+          "prose-pre:font-[JetBrains_Mono_Variable,ui-monospace,monospace]",
+          "prose-code:font-[JetBrains_Mono_Variable,ui-monospace,monospace]",
+          // Tables: the bubble's overflow-wrap:anywhere shrinks every column's
+          // min-content to one character, so on a phone auto layout crushes
+          // columns into one-letter-per-line stacks. Undo it inside tables and
+          // let a too-wide table scroll sideways within the bubble instead.
+          "prose-table:block prose-table:max-w-full prose-table:overflow-x-auto",
+          "prose-table:[overflow-wrap:normal] prose-table:[word-break:normal]",
+          "prose-th:[overflow-wrap:normal] prose-td:[overflow-wrap:normal]",
+          "prose-th:min-w-[4.5em] prose-td:min-w-[4.5em] prose-th:whitespace-nowrap",
+        )}
+      >
+        {isQuickReply ? (
+          <ThumbsUp className="size-6" aria-label="quick reply" />
+        ) : answer && !injected && !(attachments && attachments.length > 0) ? (
+          <AnswerBubbleBody answer={answer} />
+        ) : injected ? (
+          // Sender-side render of an injected user turn. Caption text sits
+          // above the file chips inside the SAME bubble.
+          //
+          // Shape (2026-09-28): if hostName + eventId + onOpenEditor are all
+          // available, render each file entry as an interactive FileChip
+          // pointing at the file's landing URL on the host — same click
+          // contract, media preview, and download control as assistant-side
+          // chips. Falls back to the original static AttachmentChipStrip
+          // render when any of those are missing (e.g. relay-source mount,
+          // no host context, older messages without eventId hooks).
+          <>
+            {captionAnswer ? (
+              <div className="mb-2"><AnswerBubbleBody answer={captionAnswer} /></div>
+            ) : injected.caption.length > 0 && (
+              <div className="pv-injected-caption whitespace-pre-wrap mb-2">
+                {injected.caption}
+              </div>
+            )}
+            {hostName &&
+            eventId &&
+            onOpenEditor &&
+            injected.files.every((f) => f.landingPath.length > 0) ? (
+              injected.files.map((f) => {
+                // Build the Skynet file URL from the browser origin, the
+                // target hostname, and the file's absolute landing path.
+                // encodeURIComponent per path segment escapes spaces, `?`,
+                // `#`, and unicode without swallowing the `/` separator,
+                // so a landingPath like `/foo?bar` or `/dir/with space/x`
+                // survives correctly and can't inject query / fragment
+                // syntax into the URL.
+                const chipUrl = buildSkynetFileUrl(hostName, f.landingPath);
+                return (
+                  <div key={f.landingPath} className="my-1.5">
+                    <FileChip
+                      dragOrigin={fileDragOrigin}
+                      url={chipUrl}
+                      filename={f.filename}
+                      size={f.size}
+                      onOpen={() =>
+                        onOpenEditor({
+                          messageEventId: eventId,
+                          url: chipUrl,
+                          filename: f.filename,
+                        })
+                      }
+                    />
+                  </div>
+                );
+              })
+            ) : (
+              <AttachmentChipStrip
+                attachments={injected.files.map((f, i) => ({
+                  // tempId is unique per-file inside this bubble; landingPath
+                  // is guaranteed unique by the backend's collision-suffix loop
+                  // (Plan 01 orchestrator) so it doubles as a stable key.
+                  tempId: f.landingPath || `${i}-${f.filename}`,
+                  file: { name: f.filename, size: f.size, type: f.mimetype },
+                  status: "complete",
+                  bytesUploaded: f.size,
+                  error: null,
+                }))}
+                onRemove={() => {
+                  /* readOnly — never fires */
+                }}
+                readOnly={true}
+              />
+            )}
+          </>
+        ) : attachments && attachments.length > 0 ? (
+          // Phase 80 D-15: pending-with-attachments render. Fires when the
+          // pending seed carried attachments (from PrettyView's
+          // onUploadReadyToInject closure, Plan 02). Sources from the
+          // `attachments` prop directly — no parseInjectedUserTurn call
+          // because the pending record's `content` field carries only the
+          // caption. See RESEARCH.md § Pattern 3 for shape rationale.
+          //
+          // Placed AFTER the `injected` branch so a settled attachment
+          // bubble whose content parses cleanly always wins ordering
+          // (defense-in-depth against the pending record hanging around
+          // once the harness echoes and the FIFO head-match cleanup fires
+          // — the settled render should take over).
+          //
+          // Whole-bubble red on failure (Phase 76 D-06) is inherited for
+          // free via bubbleInlineStyle at the outer bubble div (L420) —
+          // no additional style work needed for pendingState === "failed".
+          //
+          // Duplicated inline (not extracted to a helper) per RESEARCH.md
+          // § "Share vs Duplicate": different caption source (content vs
+          // injected.caption), different tempId source (synthetic vs
+          // landingPath), different file-shape mapping (PendingSend
+          // triple vs ParsedInjectedTurn files), 8 lines of JSX total.
+          <>
+            {answer ? (
+              <div className="mb-2"><AnswerBubbleBody answer={answer} /></div>
+            ) : content.length > 0 && (
+              <div className="pv-injected-caption whitespace-pre-wrap mb-2">
+                {content}
+              </div>
+            )}
+            <AttachmentChipStrip
+              attachments={attachments.map((f, idx) => ({
+                // Synthetic tempId — pending records have no landingPath;
+                // used only as React key inside the short-lived pending
+                // bubble. Index-based (not filename+size) so two identically-
+                // named identically-sized files in the same batch keep unique
+                // React keys (code-review M1, 2026-09-07).
+                tempId: `pending-${idx}`,
+                file: { name: f.filename, size: f.size, type: f.mimetype },
+                status: "complete",
+                bytesUploaded: f.size,
+                error: null,
+              }))}
+              onRemove={() => {
+                /* readOnly — never fires */
+              }}
+              readOnly={true}
+            />
+          </>
+        ) : (
+          <ReactMarkdown
+            remarkPlugins={isUser ? REMARK_PLUGINS : RICH_REMARK_PLUGINS}
+            components={markdownComponents}
+          >
+            {processedContent}
+          </ReactMarkdown>
+        )}
+        {!isUser && !feedbackEnabled && (
+          // Phase 124 Plan 01 (D-02/D-03): in-bubble speak button — ONLY
+          // renders on feedback-OFF deployments. When feedbackEnabled is
+          // true, this DOM node is ABSENT and speak lives in the strip
+          // below (see the strip render below the bubble div). Every visual
+          // + interaction state (Loader2/Pause/Play/Volume2 glyphs,
+          // hover-lift, touch baseline) is preserved verbatim in the strip
+          // copy per D-15/D-16/D-17.
+          <button
+            type="button"
+            onClick={(e) => { void onSpeakClick(e); }}
+            aria-label={
+              speakState === "playing"
+                ? "Pause speaking"
+                : speakState === "paused"
+                  ? "Resume speaking"
+                  : "Speak message"
+            }
+            data-active={speakState === "playing" || speakState === "paused" ? "true" : undefined}
+            className="pv-speak-btn"
+          >
+            {speakState === "loading" ? (
+              <Loader2 size={16} className="animate-spin" />
+            ) : speakState === "playing" ? (
+              <Pause size={16} />
+            ) : speakState === "paused" ? (
+              <Play size={16} />
+            ) : (
+              <Volume2 size={16} />
+            )}
+          </button>
+        )}
+      </div>
+      {!isUser && feedbackEnabled && (
+        // Phase 124 Plan 01 (D-04/D-05): action strip anchored below the
+        // assistant bubble, left-edge aligned via the flex-col wrapper (see
+        // the outer return below where !isUser && feedbackEnabled wraps
+        // bubble+strip in `flex flex-col items-start group`). Three peers
+        // in left-to-right order: speak · thumbs-up · thumbs-down (D-05).
+        // Resting opacity 0.62 (D-07); hovering anywhere in the group lifts
+        // to 100% via Tailwind group-hover (Pattern S-07 option (c)); touch
+        // devices sit at 0.72 always-visible baseline (D-08). The strip
+        // buttons all share the .pv-strip-btn CSS class hook so shell
+        // sizing matches the existing speak button (Pattern S-05).
+        <div
+          data-testid="pv-chat-message-action-strip"
+          className="mt-[4px] pl-[4px] flex items-center gap-[6px] opacity-[0.62] group-hover:opacity-100 [@media(hover:none)]:opacity-[0.72] transition-opacity"
+        >
+          {/* Strip speak button — duplicates the in-bubble button's handlers
+              + glyph state machine verbatim (D-15/D-16/D-17). Position
+              stripped: strip is normal flow, not absolute-positioned. */}
+          <button
+            data-testid="pv-chat-message-speak"
+            type="button"
+            onClick={(e) => { void onSpeakClick(e); }}
+            aria-label={
+              speakState === "playing"
+                ? "Pause speaking"
+                : speakState === "paused"
+                  ? "Resume speaking"
+                  : "Speak message"
+            }
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              background: "transparent",
+              borderWidth: 1,
+              borderStyle: "solid",
+              borderColor: "var(--k-hair)",
+              color: "var(--k-t2)",
+              cursor: "pointer",
+              transition: "opacity 120ms, background 120ms, transform 80ms",
+            }}
+            className={`pv-strip-btn hover:!opacity-100 hover:!bg-[var(--k-s2)] focus-visible:!opacity-100 active:scale-[0.92] [@media(hover:none)]:!opacity-[0.72]`}
+          >
+            {speakState === "loading" ? (
+              <Loader2 size={16} className="animate-spin" />
+            ) : speakState === "playing" ? (
+              <Pause size={16} />
+            ) : speakState === "paused" ? (
+              <Play size={16} />
+            ) : (
+              <Volume2 size={16} />
+            )}
+          </button>
+          {/* Thumbs-up — D-18/D-20/D-22. Second-tap-no-op enforced by the
+              early return (`if (thumbsUpPressed) return;`) BEFORE any
+              callback fires. eventId is required (D-32 makes eventId the
+              messageRef); an eventId-less bubble is a defensive no-op. */}
+          <button
+            data-testid="pv-chat-message-thumbs-up"
+            type="button"
+            aria-label={
+              thumbsUpPressed
+                ? "Feedback recorded (thumbs up)"
+                : "Send thumbs up feedback"
+            }
+            onClick={() => {
+              if (thumbsUpPressed) return;
+              if (!eventId) return;
+              setThumbsUpPressed(true);
+              onThumbsUp?.(eventId);
+            }}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              background: thumbsUpPressed
+                ? "hsla(var(--pv-id-hue),65%,55%,0.36)"
+                : "transparent",
+              borderWidth: 1,
+              borderStyle: "solid",
+              borderColor: thumbsUpPressed
+                ? "hsla(var(--pv-id-hue),70%,70%,0.45)"
+                : "var(--k-hair)",
+              color: "var(--k-t2)",
+              opacity: thumbsUpPressed ? 1 : undefined,
+              cursor: "pointer",
+              transition: "opacity 120ms, background 120ms, transform 80ms",
+            }}
+            className={`pv-strip-btn hover:!opacity-100 hover:!bg-[var(--k-s2)] focus-visible:!opacity-100 active:scale-[0.92] [@media(hover:none)]:!opacity-[0.72]`}
+          >
+            <ThumbsUp size={16} />
+          </button>
+          {/* Thumbs-down — D-23/D-26/D-28. Pressed state applies immediately
+              on tap (D-26 — before any modal opens); the modal-open logic
+              is owned by PrettyView in Plan 02 and consumes the eventId
+              from this callback. Second-tap-no-op mirrors thumbs-up. */}
+          <button
+            data-testid="pv-chat-message-thumbs-down"
+            type="button"
+            aria-label={
+              thumbsDownPressed
+                ? "Feedback recorded (thumbs down)"
+                : "Send thumbs down feedback"
+            }
+            onClick={() => {
+              if (thumbsDownPressed) return;
+              if (!eventId) return;
+              setThumbsDownPressed(true);
+              onThumbsDown?.(eventId);
+            }}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              background: thumbsDownPressed
+                ? "hsla(var(--pv-id-hue),65%,55%,0.36)"
+                : "transparent",
+              borderWidth: 1,
+              borderStyle: "solid",
+              borderColor: thumbsDownPressed
+                ? "hsla(var(--pv-id-hue),70%,70%,0.45)"
+                : "var(--k-hair)",
+              color: "var(--k-t2)",
+              opacity: thumbsDownPressed ? 1 : undefined,
+              cursor: "pointer",
+              transition: "opacity 120ms, background 120ms, transform 80ms",
+            }}
+            className={`pv-strip-btn hover:!opacity-100 hover:!bg-[var(--k-s2)] focus-visible:!opacity-100 active:scale-[0.92] [@media(hover:none)]:!opacity-[0.72]`}
+          >
+            <ThumbsDown size={16} />
+          </button>
+        </div>
+      )}
+    </div>
+  );
+});

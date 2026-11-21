@@ -1,0 +1,540 @@
+/**
+ * catalog.test.ts — Structural assertions on the fleet-substrate catalog.
+ *
+ * These tests verify the shape and invariants of FLEET_SUBSTRATE_CATALOG. They
+ * are pure structural checks (no SSH, no orchestrator wiring, no DB) — the
+ * catalog is a hand-maintained data module and the tests enforce that the
+ * hand-maintenance stays honest.
+ *
+ * See .planning/phases/72-feature-02-slice-2-reconcile-loop/72-CONTEXT.md for
+ * the shape source of truth these assertions derive from.
+ */
+import { describe, it, expect } from "vitest";
+import { existsSync, statSync } from "node:fs";
+import { resolve } from "node:path";
+import {
+  FLEET_SUBSTRATE_CATALOG,
+  type CatalogEntry,
+} from "./catalog.js";
+import {
+  RETIRED_SUBSTRATE_FILES,
+  RETIRED_SUBSTRATE_DIRS,
+} from "./run-bootstrap.js";
+
+// Repo root for Test 7 (executable-bit sanity check). The test file lives at
+// src/backend/distributor/catalog.test.ts; four levels up is the repo root.
+const REPO_ROOT = resolve(__dirname, "..", "..", "..");
+
+/**
+ * Convert a bundled container path (e.g. "/app/fleet-substrate/scripts/foo.sh")
+ * to the corresponding on-disk repo path ("<repoRoot>/substrate/scripts/foo.sh").
+ * Used only by Test 7 to read the mode bits from the checked-in bundled file.
+ */
+function bundledPathToRepoPath(bundledPath: string): string {
+  const rel = bundledPath.replace(/^\/app\/fleet-substrate\//, "substrate/");
+  return resolve(REPO_ROOT, rel);
+}
+
+describe("FLEET_SUBSTRATE_CATALOG", () => {
+  it("Test 1: contains exactly 75 entries (17 conceptual items + agent-supervisor.service unit + file-watch fourth ambient monitor + fleet-status-sweep Phase 92 + pv-context-pct-sweep Phase 95 + ambient-monitor mega-monitor phase + instance-policy-claude-md Phase 114 twinkie + image-gen-skill + image-gen-helper Phase 116 + 24 app-development shape-1 rows (26 originally; favicon.svg row retired 2026-09-28 when the scaffold switched to a static/icon.webp symlink; restore-app.sh row retired 2026-09-30 by the un-archiving campaign, host-side shape) + task-field-check hook + inbox-watcher (fifth ambient-monitor child, shape-agent-supervisor-inbox 2026-10-02) + 4 agent-desktop rows (desktop skill + agent-desktop + desktop-mcp + agent-desktop@.service) + fleet-service agent-services client + pending-context-drain hook + machine-people hook)", () => {
+    // 17 = 6 single-file skills + agent-relay (SKILL.md + recv.sh counted as
+    // one item) + id (SKILL.md + 3 companions counted as one item) + 8 helper
+    // scripts + 1 mega-monitor launcher (ambient-monitor) + 1 Phase 114 twinkie
+    // (instance-policy-claude-md). Per-FILE row layout is required by the
+    // byte-compare mechanism in Plan 03, so the array has 12 skill-side rows
+    // + 10 scripts-side rows + 1 user-onboarding row (agent-supervisor.service)
+    // + 1 Phase 114 twinkie row + 24 app-development rows.
+    // file-watch is the 7th helper script (an ambient monitor alongside
+    // wakeup-scheduler; context-watch since retired). fleet-status-sweep is the 8th helper
+    // script (Phase 92 batch sweep for the fleet-status poller).
+    // pv-context-pct-sweep is the 9th helper script (Phase 95 batch sweep for the
+    // PrettyView context-pct poller). ambient-monitor is the 10th — the single
+    // on-wake launcher that spawns the four ambient watchers under one Monitor
+    // instead of four (mega-monitor phase).
+    // instance-policy-claude-md is a runtime-sourced Phase 114 twinkie row —
+    // bytes come from readInstanceFileBytes() at sweep time, not from
+    // /app/fleet-substrate/ — AND the first system-root-installed row
+    // (writes to /etc/claude-code/CLAUDE.md as root:root 0644, gated on
+    // hosts.username === "root" per Plan 05 D-13).
+    // Phase 116 (image-gen) adds 2 rows: SKILL.md + a helper script.
+    // The first-class-apps campaign (shape 1, 2026-09-17) adds a new skill
+    // folder with SKILL.md + 4 helper scripts (bootstrap/create/archive/
+    // backup) + a 19-file starter template (16 source files + 3
+    // files for the pre-generated initial Drizzle migration: the SQL, a
+    // journal, and a snapshot) for the Bun + SvelteKit + Tailwind + Drizzle
+    // + SQLite stack — 24 rows all landing under
+    // ~/.claude/skills/app-development/ on managed boxes. (Originally 26;
+    // favicon.svg row retired 2026-09-28 when the scaffold switched to a
+    // static/icon.webp symlink to the app's own icon.webp; restore-app.sh
+    // row retired 2026-09-30 by the un-archiving campaign, host-side shape
+    // — its logic now lives in the agent-supervisor's app-unarchive
+    // scanner, gated on ~/fleet/apps-archive/<slug>/.unarchive-requested.)
+    // task-field-check adds 1 helper script (UserPromptSubmit hook for
+    // the id-skill task: field nag).
+    // +5 rows 2026-09-25 for the pane-safe starter files (Ivory's scaffold
+    // packaged): src/lib/pane.ts, src/hooks.ts, src/hooks.server.ts,
+    // server.js, src/routes/about/+page.svelte — grew app-development from
+    // 26 to 31 rows.
+    // agent-phone adds 2 rows: SKILL.md + agent-phone helper script.
+    // allow-all-tools adds 1 helper script (PreToolUse hook — fleet-wide
+    // auto-allow for every tool call, completes the "no prompts, ever"
+    // posture by covering residual circuit-breaker prompts that
+    // --dangerously-skip-permissions doesn't).
+    // self-edit-baseline-sync adds 1 helper script (PostToolUse hook for
+    // file-watch self-edit suppression, 2026-09-27 — see
+    // .planning/shapes/shape-stop-self-edit-events.md).
+    // +3 rows for interactive-messages-gc (Phase 140: seven-day backstop):
+    // interactive-messages-gc .py script + .service unit + .timer unit.
+    // +69 rows for the interactive-messages skill payload (backfilled
+    // 2026-09-28, extended 2026-09-30): SKILL.md + create-widget.sh +
+    // teardown-widget.sh + iterate-widget.sh + 65 template files (13
+    // template folders × 5 files each: args.sh, im-SLUG.service.template,
+    // metadata.json.template, server.py, widget.html). Skill lands at
+    // ~/.claude/skills/interactive-messages/ on every managed host; GC's
+    // teardown shell-out depends on it. The 13th template folder
+    // (draft-terminal-on-submit) + iterate-widget.sh landed 2026-09-30
+    // alongside the draft-template ship.
+    // +1 for scheduled-agents-scheduler.service (systemd unit that owns
+    // the box-level scheduled-agents scheduler, so wakeup-scheduler.py
+    // byte-changes actually cause a scheduler restart) — 126 → 127.
+    // -1 for app-development-restore-app row retired 2026-09-30 by the
+    // un-archiving campaign (host-side shape); logic now lives in the
+    // agent-supervisor's scan_app_unarchive_requested_sentinels() — 127 → 126.
+    // +1 for inbox-watcher (shape-agent-supervisor-inbox 2026-10-02, fifth
+    // ambient-monitor child; delivery substrate for files dropped into any
+    // identity's inbox folder, enabling the eventual composebox cutover in
+    // shape-composebox-cutover) — 126 → 127.
+    // +4 for the agent desktop (desktop SKILL.md + agent-desktop helper +
+    // desktop-mcp helper + agent-desktop@.service template unit) — 127 → 131.
+    // +1 for fleet-service (shared agent-services file-drop client that the
+    // image-gen and agent-phone wrappers call) — 131 → 132.
+    // +2 for stt (SKILL.md + stt helper, speech-to-text agent service) —
+    // 132 → 134.
+    // -3 for usage-reporter + usage-report + claude-usage-collector, retired
+    // 2026-10-09 with the usage meter — 134 → 131.
+    // -1 for the role skill, retired 2026-10-09 with the role-history
+    // retirement — 131 → 130.
+    // +1 for resume-gap-notice (UserPromptSubmit hook — tells a session how
+    // long it has been since its last activity) — 130 → 131.
+    // +1 pending-context-drain (hook that delivers queued file-watch notices).
+    // +4 for sensors (sensor-development SKILL.md + sensor-fire +
+    // sensor-runner + sensor-runner.service) — 132 → 136.
+    // +2 for relay-mcp (host-wide relay MCP server + relay-mcp.service) —
+    // 136 → 138.
+    // +1 for desktop-mcp.service (box-level desktop MCP server) — 138 → 139.
+    // +1 for id-load-context (UserPromptSubmit hook — hands an `/id` load
+    // its context) — 139 → 140.
+    // +1 for app-development make-icon.sh (house-style app icons) — 140 → 141.
+    // +6 for convo-scoped apps: app-units.sh + promote-app.sh, and the one app
+    // unit template replaced by five under templates/units/ — 141 → 147.
+    // -71 for the interactive-messages widget system, retired 2026-10-25:
+    // the GC trio (script + .service + .timer) and 68 skill companions
+    // (create/teardown/iterate-widget.sh + 65 template files); SKILL.md
+    // stays — 147 → 76.
+    // -1 for the interactive-messages SKILL.md, folded into the id skill
+    // (shape-wealthy-text) — 76 → 75.
+    // +1 for precompact-reground (PreCompact hook — re-ground after
+    // compaction) — 75 → 76.
+    // -1 for context-watch, retired with reset (Condense) — 76 → 75.
+    // +2 for the notify-me and call-me skills (done-bell) — 75 → 77.
+    // +1 machine-people (SessionStart hook — people on this machine) — 77 → 78.
+    // +1 borrowable-roles-context (the roles a loading agent may borrow) — 78 → 79.
+    // +1 person-files (SessionStart hook — About you files of an agent's people) — 79 → 80.
+    // +1 move-app.sh (project-scoped apps: Move to) — 80 → 81.
+    // +6 for the app starter's JSON API (api helpers, todo logic, routes,
+    // openapi.json) — 81 → 87.
+    expect(FLEET_SUBSTRATE_CATALOG.length).toBe(87);
+  });
+
+  it("Test 2: every bundled row's bundledPath starts with /app/fleet-substrate/skills/, /app/fleet-substrate/scripts/, or /app/fleet-substrate/user-onboarding/", () => {
+    // Post Phase 114 D-12: only BundledCatalogEntry carries `bundledPath`;
+    // runtime rows (sourceKind: "runtime") resolve their bytes at sweep time
+    // via a resolverKey lookup and don't have this field. Narrow first.
+    const bundled = FLEET_SUBSTRATE_CATALOG.filter(
+      (e) => e.sourceKind === "bundled",
+    );
+    for (const entry of bundled) {
+      const ok =
+        entry.bundledPath.startsWith("/app/fleet-substrate/skills/") ||
+        entry.bundledPath.startsWith("/app/fleet-substrate/scripts/") ||
+        entry.bundledPath.startsWith("/app/fleet-substrate/user-onboarding/");
+      expect(ok, `bad bundledPath: ${entry.bundledPath}`).toBe(true);
+    }
+  });
+
+  it("Test 3: installPath prefix invariant split by installMode (Phase 114 D-14)", () => {
+    // Prior to Phase 114 every row had a `~/`-relative installPath. Phase 114
+    // introduces the `installMode: "system-root"` axis: rows so-marked write
+    // to absolute paths under /etc/ instead. Split the invariant accordingly:
+    //   - user-home rows (default) → installPath must start with ~/.claude/skills/,
+    //     ~/.local/bin/, or ~/.config/systemd/user/ (existing invariant).
+    //   - system-root rows → installPath must start with /etc/ AND match the
+    //     exact D-14 value /etc/claude-code/CLAUDE.md. There is exactly one
+    //     such row today; if a future contributor adds a second system-root
+    //     row without updating this test, the exact-match assertion fires as
+    //     a regression guard.
+    for (const entry of FLEET_SUBSTRATE_CATALOG) {
+      const installMode =
+        "installMode" in entry ? entry.installMode : undefined;
+      if (installMode === "system-root") {
+        expect(
+          entry.installPath.startsWith("/etc/"),
+          `system-root installPath must start with /etc/: ${entry.installPath}`,
+        ).toBe(true);
+        expect(
+          entry.installPath,
+          `system-root installPath must match D-14 exact value`,
+        ).toBe("/etc/claude-code/CLAUDE.md");
+      } else {
+        const ok =
+          entry.installPath.startsWith("~/.claude/skills/") ||
+          entry.installPath.startsWith("~/.local/bin/") ||
+          entry.installPath.startsWith("~/.config/systemd/user/");
+        expect(ok, `bad installPath: ${entry.installPath}`).toBe(true);
+      }
+    }
+  });
+
+  it("Test 4: catalog entries with non-null restartHooks — one row per long-lived process that needs bouncing on byte-change", () => {
+    const withRestart = FLEET_SUBSTRATE_CATALOG.filter(
+      (e: CatalogEntry) => e.restartHook !== null,
+    );
+    // Seven slugs participate. Rationale for each pairing:
+    //   agent-supervisor + agent-supervisor-service-unit → both changes
+    //     bounce the SAME unit (agent-supervisor.service) because the
+    //     binary AND its unit-file both belong to that daemon.
+    //   wakeup-scheduler + scheduled-agents-scheduler-service-unit → both
+    //     bounce scheduled-agents-scheduler.service (box-level scheduler;
+    //     per-identity wakeup-scheduler instances stay harness-bound and
+    //     accept staleness).
+    //   sensor-runner + sensor-runner-service-unit → both bounce
+    //     sensor-runner.service (box-level sensor runner).
+    //   relay-mcp + relay-mcp-service-unit → both bounce relay-mcp.service
+    //     (box-level relay MCP server).
+    //   desktop-mcp-helper + desktop-mcp-service-unit → both bounce
+    //     desktop-mcp.service (box-level desktop MCP server).
+    const expected: Record<string, string> = {
+      "agent-supervisor": "agent-supervisor.service",
+      "agent-supervisor-service-unit": "agent-supervisor.service",
+      "wakeup-scheduler": "scheduled-agents-scheduler.service",
+      "scheduled-agents-scheduler-service-unit":
+        "scheduled-agents-scheduler.service",
+      "sensor-runner": "sensor-runner.service",
+      "sensor-runner-service-unit": "sensor-runner.service",
+      "relay-mcp": "relay-mcp.service",
+      "relay-mcp-service-unit": "relay-mcp.service",
+      "desktop-mcp-helper": "desktop-mcp.service",
+      "desktop-mcp-service-unit": "desktop-mcp.service",
+    };
+    expect(withRestart.length).toBe(Object.keys(expected).length);
+    for (const entry of withRestart) {
+      expect(
+        expected[entry.slug],
+        `unexpected slug in withRestart: ${entry.slug}`,
+      ).toBeDefined();
+      expect(entry.restartHook).toBe(expected[entry.slug]);
+    }
+  });
+
+  it("Test 5: every slug is unique", () => {
+    const slugs = FLEET_SUBSTRATE_CATALOG.map((e) => e.slug);
+    const uniq = new Set(slugs);
+    expect(uniq.size).toBe(slugs.length);
+  });
+
+  it("Test 6: skill-side + scripts-side + user-onboarding partitioning matches the shape doc enumeration", () => {
+    // Post Phase 114 D-12: partition by bundledPath applies only to
+    // BundledCatalogEntry rows; the twinkie row (sourceKind: "runtime")
+    // has no bundledPath and is enumerated separately by Test T-07.
+    const bundledOnly = FLEET_SUBSTRATE_CATALOG.filter(
+      (e) => e.sourceKind === "bundled",
+    );
+    const skillRows = bundledOnly.filter((e) =>
+      e.bundledPath.startsWith("/app/fleet-substrate/skills/"),
+    );
+    const scriptRows = bundledOnly.filter((e) =>
+      e.bundledPath.startsWith("/app/fleet-substrate/scripts/"),
+    );
+    const userOnboardingRows = bundledOnly.filter((e) =>
+      e.bundledPath.startsWith("/app/fleet-substrate/user-onboarding/"),
+    );
+
+    // 32 skill-side files: 1 under id/ (companions retired 2026-09-20 with
+    // coord-as-mode retirement) + 2 under agent-relay/ + 2 single-file
+    // skills (queue, role [role retired 2026-10-09 — see below];
+    // backlog/bounty/next-bounty retired 2026-09-20,
+    // promote-to-coordinator retired 2026-09-20) + 1 image-gen (Phase 116) +
+    // 24 under app-development/ (SKILL.md + 4 helpers + 19 template files
+    // including the 3-file pre-generated initial Drizzle migration,
+    // first-class-apps shape 1; originally 26 with a favicon.svg template,
+    // retired 2026-09-28 for a static/icon.webp symlink to the app's own
+    // icon.webp so the browser tab favicon matches the sidebar tile;
+    // restore-app.sh helper row retired 2026-09-30 by the un-archiving
+    // campaign, host-side shape — logic folded into the agent-supervisor's
+    // app-unarchive scanner)
+    // +5 for pane-safe starter files (see Test 1 comment) — 30 → 35.
+    // +1 for agent-phone (SKILL.md) — 35 → 36.
+    // +69 for the interactive-messages skill payload (SKILL.md +
+    // create-widget.sh + teardown-widget.sh + iterate-widget.sh + 65
+    // template files across 13 folders — backfilled 2026-09-28; draft
+    // template + iterate-widget added 2026-09-30) — 36 → 105.
+    // +1 for the desktop skill (SKILL.md) — 105 → 106.
+    // +1 for the stt skill (SKILL.md) — 106 → 107.
+    // -1 for the role skill, retired 2026-10-09 — 107 → 106.
+    // +1 for the sensor-development skill (SKILL.md) — 106 → 107.
+    // +1 for app-development make-icon.sh — 107 → 108.
+    // +6 for convo-scoped apps (app-units.sh, promote-app.sh, 1 → 5 unit templates) — 108 → 114.
+    // -68 for the interactive-messages widget companions, retired
+    // 2026-10-25 (SKILL.md stays) — 114 → 46.
+    // -1 for its SKILL.md, folded into the id skill — 46 → 45.
+    // +2 for notify-me and call-me (done-bell) — 45 → 47.
+    // +1 for move-app.sh (project-scoped apps) — 47 → 48.
+    // +6 for the app starter's JSON API — 48 → 54.
+    expect(skillRows.length).toBe(54);
+    // 18 helper scripts: agent-supervisor + wakeup-scheduler +
+    // file-watch (4th ambient monitor) + fleet-status-sweep (Phase 92
+    // batch sweep) + (usage-reporter / usage-report / claude-usage-collector
+    // retired 2026-10-09 with the usage meter — 21 → 18) +
+    // pv-context-pct-sweep (Phase 95 PrettyView context-pct batch sweep) +
+    // ambient-monitor (mega-monitor phase, single on-wake launcher) +
+    // image-gen (Phase 116 file-drop broker helper) +
+    // task-field-check (UserPromptSubmit hook for id skill task: field nag) +
+    // agent-phone (file-drop broker helper for phone-call capability) +
+    // allow-all-tools (PreToolUse hook — fleet-wide auto-allow, eliminates
+    // residual permission prompts that --dangerously-skip-permissions doesn't) +
+    // self-edit-baseline-sync (PostToolUse hook for file-watch self-edit
+    // suppression, 2026-09-27) +
+    // inbox-watcher (shape-agent-supervisor-inbox 2026-10-02, fifth
+    // ambient-monitor child; watches each identity's inbox folder for
+    // dropped message files, surfaces paths up to ambient-monitor via the
+    // RAW-PASTE-FILE: stdout protocol — delivery substrate for the eventual
+    // composebox cutover) +
+    // agent-desktop + desktop-mcp (per-identity virtual desktop: lifecycle
+    // CLI + MCP server for screenshot/click/type tools) +
+    // fleet-service (shared agent-services file-drop client) +
+    // stt (speech-to-text agent-services wrapper) +
+    // resume-gap-notice (UserPromptSubmit hook — time-since-last-activity note)
+    // +1 pending-context-drain +
+    // sensor-fire + sensor-runner (sensors: fire command + box-level runner)
+    // + relay-mcp (host-wide relay MCP server)
+    // + id-load-context (UserPromptSubmit hook — `/id` load context)
+    // (interactive-messages-gc retired 2026-10-25 — 24 → 23)
+    // + precompact-reground (PreCompact hook — re-ground after compaction)
+    // - context-watch (retired with reset, Condense campaign)
+    // + machine-people (SessionStart hook — people on this machine)
+    // + borrowable-roles-context (the roles a loading agent may borrow)
+    // + person-files (SessionStart hook — the About you files of an agent's people)
+    expect(scriptRows.length).toBe(26);
+    // user-onboarding files: agent-supervisor.service
+    // + scheduled-agents-scheduler.service (this ship: move
+    // scheduled-agents scheduler from in-process agent-supervisor child
+    // to a systemd user unit so byte-changes actually take effect)
+    // + agent-desktop@.service (per-identity desktop template unit)
+    // + sensor-runner.service (box-level sensor runner)
+    // + relay-mcp.service (box-level relay MCP server)
+    // + desktop-mcp.service (box-level desktop MCP server).
+    // (interactive-messages-gc .service + .timer retired 2026-10-25 — 8 → 6)
+    expect(userOnboardingRows.length).toBe(6);
+
+    // id has 4 entries (SKILL.md + 3 companions)
+    const idRows = skillRows.filter((e) =>
+      e.bundledPath.startsWith("/app/fleet-substrate/skills/id/"),
+    );
+    expect(idRows.length).toBe(1);
+
+    // agent-relay has 2 entries (SKILL.md + recv.sh)
+    const agentRelayRows = skillRows.filter((e) =>
+      e.bundledPath.startsWith("/app/fleet-substrate/skills/agent-relay/"),
+    );
+    expect(agentRelayRows.length).toBe(2);
+
+    // Single-file skills each contribute one entry (backlog, bounty,
+    // next-bounty, promote-to-coordinator all retired 2026-09-20; role
+    // retired 2026-10-09).
+    const singleFileSkillSlugs = ["queue", "notify-me", "call-me"];
+    for (const slug of singleFileSkillSlugs) {
+      const rows = skillRows.filter((e) =>
+        e.bundledPath.startsWith(`/app/fleet-substrate/skills/${slug}/`),
+      );
+      expect(rows.length, `expected 1 row for skill ${slug}`).toBe(1);
+      expect(rows[0].bundledPath).toBe(
+        `/app/fleet-substrate/skills/${slug}/SKILL.md`,
+      );
+    }
+
+    // All 10 scripts land under ~/.local/bin/
+    for (const row of scriptRows) {
+      expect(row.installPath.startsWith("~/.local/bin/")).toBe(true);
+    }
+
+    // The 1 user-onboarding file lands under ~/.config/systemd/user/
+    for (const row of userOnboardingRows) {
+      expect(row.installPath.startsWith("~/.config/systemd/user/")).toBe(true);
+    }
+  });
+
+  it("Test 8: agent-supervisor-service-unit entry has correct bundledPath and installPath", () => {
+    const entry = FLEET_SUBSTRATE_CATALOG.find(
+      (e) => e.slug === "agent-supervisor-service-unit",
+    );
+    expect(
+      entry,
+      "agent-supervisor-service-unit entry not found in catalog",
+    ).toBeDefined();
+    expect(entry!.bundledPath).toBe(
+      "/app/fleet-substrate/user-onboarding/agent-supervisor.service",
+    );
+    expect(entry!.installPath).toBe(
+      "~/.config/systemd/user/agent-supervisor.service",
+    );
+    expect(entry!.restartHook).toBe("agent-supervisor.service");
+  });
+
+  // Test 7 is a sanity check against the developer's on-disk substrate/ tree.
+  // It confirms that every ~/.local/bin/ item's bundled sibling is chmod +x
+  // (any exec bit set — owner, group, or other). Skipped automatically if
+  // substrate/ is not present (which is the case in the container image where
+  // the source tree isn't shipped alongside the compiled JS).
+  const substrateRootAvailable = existsSync(
+    resolve(REPO_ROOT, "substrate", "scripts"),
+  );
+  const runOrSkip = substrateRootAvailable ? it : it.skip;
+  runOrSkip(
+    "Test 7: every ~/.local/bin/ entry's bundled file has the executable bit set on disk",
+    () => {
+      const scriptEntries = FLEET_SUBSTRATE_CATALOG.filter((e) =>
+        e.installPath.startsWith("~/.local/bin/"),
+      );
+      expect(scriptEntries.length).toBeGreaterThan(0);
+      for (const entry of scriptEntries) {
+        const repoPath = bundledPathToRepoPath(entry.bundledPath);
+        const st = statSync(repoPath);
+        // Any exec bit: owner (0o100), group (0o010), or other (0o001).
+        const hasExec = (st.mode & 0o111) !== 0;
+        expect(
+          hasExec,
+          `${repoPath} (mode 0o${st.mode.toString(8)}) is missing exec bit`,
+        ).toBe(true);
+      }
+    },
+  );
+
+  it("Test 9: interactive-messages skill (retired 2026-10-25, how-to folded into the id skill) ships nothing", () => {
+    const imRows = FLEET_SUBSTRATE_CATALOG.filter(
+      (e) =>
+        e.slug.startsWith("interactive-messages") ||
+        e.slug.startsWith("im-tpl-") ||
+        e.installPath.includes("interactive-messages"),
+    );
+    expect(imRows).toEqual([]);
+  });
+
+  it("Test T-07: sourceKind discriminant — bundled + runtime row split (Phase 114 D-22 + Phase 116 additions + task-field-check + allow-all-tools + agent-phone + pane-safe starter + 24 app-development rows + self-edit-baseline-sync)", () => {
+    // Regression guard for Phase 114 D-12 + D-14: the catalog is a
+    // discriminated union on sourceKind. Phase 116 added 2 bundled rows
+    // (image-gen-skill + image-gen-helper); task-field-check adds one more
+    // bundled row (UserPromptSubmit hook); allow-all-tools adds one more
+    // bundled row (PreToolUse hook — fleet-wide auto-allow); first-class-apps
+    // shape 1 adds 24 bundled rows (app-development skill + helpers +
+    // starter template — originally 26; favicon.svg row retired 2026-09-28
+    // for the static/icon.webp symlink; restore-app.sh row retired
+    // 2026-09-30 by the un-archiving campaign, host-side shape);
+    // self-edit-baseline-sync adds one bundled row (PostToolUse hook —
+    // file-watch self-edit suppression).
+    // Runtime row (twinkie) unchanged at 1.
+    const bundled = FLEET_SUBSTRATE_CATALOG.filter(
+      (e) => e.sourceKind === "bundled",
+    );
+    const runtime = FLEET_SUBSTRATE_CATALOG.filter(
+      (e) => e.sourceKind === "runtime",
+    );
+    // +5 for pane-safe starter files (see Test 1 comment) — 45 → 50.
+    // +2 for agent-phone (skill + helper) — 50 → 52.
+    // +1 for allow-all-tools helper — 52 → 53.
+    // +1 for self-edit-baseline-sync helper — 53 → 54.
+    // +3 for interactive-messages-gc (Phase 140: script + .service + .timer) — 54 → 57.
+    // +69 for the interactive-messages skill payload (SKILL.md + 3 top-level
+    // scripts + 65 template files) — backfilled 2026-09-28, extended
+    // 2026-09-30 (draft template + iterate-widget.sh) — 57 → 126.
+    // -1 for the favicon.svg row retired 2026-09-28 — 126 → 125.
+    // +1 for scheduled-agents-scheduler.service (systemd unit that owns
+    // the box-level scheduled-agents scheduler, so wakeup-scheduler.py
+    // byte-changes actually cause a scheduler restart) — 125 → 126.
+    // -1 for app-development-restore-app row retired 2026-09-30 by the
+    // un-archiving campaign (host-side shape) — 126 → 125.
+    // +1 for inbox-watcher (shape-agent-supervisor-inbox 2026-10-02, fifth
+    // ambient-monitor child) — 125 → 126.
+    // +4 for the agent desktop (skill + 2 helpers + template unit) — 126 → 130.
+    // +1 for fleet-service (agent-services client) — 130 → 131.
+    // +2 for stt (skill + helper) — 131 → 133.
+    // -3 for the retired usage-reporter trio — 133 → 130.
+    // -1 for the retired role skill — 130 → 129.
+    // +1 for resume-gap-notice helper — 129 → 130.
+    // +1 pending-context-drain.
+    // +4 for sensors (skill + sensor-fire + sensor-runner + unit) — 131 → 135.
+    // +2 for relay-mcp (server + unit) — 135 → 137.
+    // +1 for desktop-mcp.service — 137 → 138.
+    // +1 for id-load-context — 138 → 139.
+    // +1 for app-development make-icon.sh — 139 → 140.
+    // +6 for convo-scoped apps (app-units.sh, promote-app.sh, 1 → 5 unit templates) — 140 → 146.
+    // -71 for the retired interactive-messages widget system — 146 → 75.
+    // -1 for the interactive-messages SKILL.md — 75 → 74.
+    // +1 for precompact-reground — 74 → 75.
+    // -1 for context-watch, retired with reset — 75 → 74.
+    // +1 for machine-people — 76 → 77.
+    // +1 for borrowable-roles-context — 77 → 78.
+    // +1 for person-files — 78 → 79.
+    // +1 for move-app.sh (project-scoped apps) — 79 → 80.
+    // +6 for the app starter's JSON API — 80 → 86.
+    expect(bundled.length).toBe(86);
+    expect(runtime.length).toBe(1);
+
+    // Every bundled row retains bundledPath under /app/fleet-substrate/
+    // (byte-identity of the pre-Phase-112 shape).
+    for (const e of bundled) {
+      expect(typeof e.bundledPath).toBe("string");
+      expect(e.bundledPath.startsWith("/app/fleet-substrate/")).toBe(true);
+    }
+
+    // The single runtime row is exactly the twinkie per D-14. The cast
+    // to a resolverKey-carrying shape is safe: sourceKind === "runtime"
+    // narrows RuntimeCatalogEntry which has this field, but we spell out
+    // the shape for readers not tracking the discriminated-union type.
+    expect(runtime[0].slug).toBe("instance-policy-claude-md");
+    expect(runtime[0].installPath).toBe("/etc/claude-code/CLAUDE.md");
+    expect(runtime[0].installMode).toBe("system-root");
+    expect(
+      (runtime[0] as { resolverKey: string }).resolverKey,
+    ).toBe("instance-policy");
+    expect(runtime[0].restartHook).toBeNull();
+  });
+});
+
+describe("retired substrate paths", () => {
+  it("no catalog row installs a path the bootstrap deletes as retired", () => {
+    // run-bootstrap.ts Step 3 rm -f's every RETIRED_SUBSTRATE_FILES path on
+    // every sweep. A catalog row installing the same path would be written
+    // and deleted on every tick — re-adding a retired file means removing it
+    // from the retired list first.
+    const installed = new Set(
+      FLEET_SUBSTRATE_CATALOG.map((e) => e.installPath.replace(/^~\//, "")),
+    );
+    for (const rel of RETIRED_SUBSTRATE_FILES) {
+      expect(installed.has(rel), `${rel} is both installed and retired`).toBe(false);
+    }
+    // ...and no catalog row installs INTO a retired dir.
+    for (const dir of RETIRED_SUBSTRATE_DIRS) {
+      for (const p of installed) {
+        expect(p.startsWith(`${dir}/`), `${p} installs into retired dir ${dir}`).toBe(false);
+      }
+    }
+  });
+
+  it("the /role skill is retired: no catalog row, and its install path is on the retired list", () => {
+    expect(
+      FLEET_SUBSTRATE_CATALOG.some((e) => e.installPath.startsWith("~/.claude/skills/role/")),
+    ).toBe(false);
+    expect(RETIRED_SUBSTRATE_FILES).toContain(".claude/skills/role/SKILL.md");
+    expect(RETIRED_SUBSTRATE_DIRS).toContain(".claude/skills/role");
+  });
+});

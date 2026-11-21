@@ -1,0 +1,328 @@
+/**
+ * Phase 75 amendment — POST /matrix-admin/creds ingestion endpoint.
+ *
+ * The Phase 75 plans (75-01..05) shipped setMatrixAdminCreds() as an in-process
+ * store function but did not include an HTTP surface for calling it. This
+ * endpoint closes that gap: an admin-gated route that accepts the @skynet-admin
+ * relay credentials in the request body and writes them into the encrypted
+ * matrix_admin_creds table via setMatrixAdminCreds(). Same endpoint handles
+ * the one-shot initial bootstrap AND future admin-cred rotation (returns
+ * `rotation: true` when overwriting an existing row).
+ *
+ * Mount point: app.use("/matrix-admin", matrixAdminRoutes)
+ */
+import express from "express";
+import type { Request, Response } from "express";
+import { AuthManager } from "../utils/auth-manager.js";
+import { authLogger } from "../utils/logger.js";
+import type { AuthenticatedRequest } from "../../types/index.js";
+import {
+  setMatrixAdminCreds,
+  getMatrixAdminCreds,
+  setMatrixAdminServerName,
+  setMatrixAdminHostSideBase,
+} from "./matrix-admin-creds-store.js";
+
+const MXID_RE = /^@[a-z0-9._=/+-]{1,255}:[a-z0-9.-]{1,255}$/;
+
+const router = express.Router();
+const authManager = AuthManager.getInstance();
+const requireAdmin = authManager.createAdminMiddleware();
+
+router.post(
+  "/creds",
+  express.json(),
+  requireAdmin,
+  async (req: Request, res: Response): Promise<void> => {
+    const adminUserId = (req as AuthenticatedRequest).userId;
+    const {
+      homeserverBase,
+      userId: mxid,
+      password,
+      accessToken,
+    } = (req.body ?? {}) as Record<string, unknown>;
+
+    if (
+      typeof homeserverBase !== "string" ||
+      !/^https?:\/\/[^\s]+$/.test(homeserverBase)
+    ) {
+      res.status(400).json({ error: "homeserverBase must be an http(s) URL" });
+      return;
+    }
+    if (typeof mxid !== "string" || !MXID_RE.test(mxid)) {
+      res.status(400).json({ error: "userId must match @localpart:server_name" });
+      return;
+    }
+    if (typeof password !== "string" || password.length === 0) {
+      res.status(400).json({ error: "password required" });
+      return;
+    }
+    if (typeof accessToken !== "string" || accessToken.length === 0) {
+      res.status(400).json({ error: "accessToken required" });
+      return;
+    }
+
+    try {
+      const existing = await getMatrixAdminCreds();
+      const isRotation = existing !== null;
+
+      await setMatrixAdminCreds({
+        homeserverBase,
+        userId: mxid,
+        password,
+        accessToken,
+      });
+
+      try {
+        const { saveMemoryDatabaseToFile } = await import(
+          "../database/db/index.js"
+        );
+        await saveMemoryDatabaseToFile();
+      } catch (saveError) {
+        authLogger.error(
+          "Failed to persist matrix-admin creds to disk",
+          saveError,
+          { operation: "matrix_admin_creds_save_failed" },
+        );
+      }
+
+      authLogger.info("matrix-admin creds ingested", {
+        operation: isRotation
+          ? "matrix_admin_creds_rotate"
+          : "matrix_admin_creds_ingest",
+        adminId: adminUserId,
+        mxid,
+        homeserverBase,
+      });
+
+      res.json({ ok: true, mxid, rotation: isRotation });
+    } catch (err) {
+      authLogger.error("Failed to ingest matrix-admin creds", err);
+      res.status(500).json({ error: "Failed to ingest matrix-admin creds" });
+    }
+  },
+);
+
+router.get(
+  "/creds",
+  requireAdmin,
+  async (_req: Request, res: Response): Promise<void> => {
+    try {
+      const creds = await getMatrixAdminCreds();
+      if (!creds) {
+        res.json({ present: false });
+        return;
+      }
+      res.json({
+        present: true,
+        mxid: creds.userId,
+        homeserverBase: creds.homeserverBase,
+        serverName: creds.serverName,
+        hostSideBase: creds.hostSideBase,
+      });
+    } catch (err) {
+      authLogger.error("Failed to read matrix-admin creds metadata", err);
+      res.status(500).json({ error: "Failed to read matrix-admin creds metadata" });
+    }
+  },
+);
+
+// PATCH the server_name override on the singleton matrix_admin_creds row
+// without touching the encrypted accessToken/password columns. Exists so
+// the operator can decouple the mxid domain from the homeserverBase URL
+// host — needed when the URL must stay as a raw IP (container DNS can't
+// resolve the tailnet FQDN) but Synapse's real server_name is a hostname.
+//
+// Body: `{ serverName: string | null }`. A null (or explicit null) clears
+// the override; consumers then fall back to URL-host derivation.
+// Non-string / non-null / empty-string values return 400. The Matrix mxid
+// domain-part alphabet is `[a-z0-9.-]{1,255}` (per MXID_RE above);
+// enforced here so a bad value can't sneak through to mint calls.
+router.patch(
+  "/creds/server-name",
+  express.json(),
+  requireAdmin,
+  async (req: Request, res: Response): Promise<void> => {
+    const adminUserId = (req as AuthenticatedRequest).userId;
+    const { serverName } = (req.body ?? {}) as Record<string, unknown>;
+
+    if (serverName !== null && typeof serverName !== "string") {
+      res
+        .status(400)
+        .json({ error: "serverName must be a string or null" });
+      return;
+    }
+    if (typeof serverName === "string") {
+      if (serverName.length === 0 || serverName.length > 255) {
+        res
+          .status(400)
+          .json({ error: "serverName must be 1-255 chars (or null to clear)" });
+        return;
+      }
+      if (!/^[a-z0-9.-]+$/.test(serverName)) {
+        res
+          .status(400)
+          .json({ error: "serverName must match [a-z0-9.-]+" });
+        return;
+      }
+    }
+
+    try {
+      const applied = await setMatrixAdminServerName(
+        serverName as string | null,
+      );
+      if (!applied) {
+        res.status(409).json({
+          error:
+            "matrix_admin_creds not yet ingested — POST /matrix-admin/creds first",
+        });
+        return;
+      }
+
+      authLogger.info("matrix-admin server_name patched", {
+        operation: "matrix_admin_creds_server_name_patch",
+        adminId: adminUserId,
+        serverName,
+      });
+
+      res.json({ ok: true, serverName });
+    } catch (err) {
+      authLogger.error("Failed to patch matrix-admin server_name", err);
+      res
+        .status(500)
+        .json({ error: "Failed to patch matrix-admin server_name" });
+    }
+  },
+);
+
+// 2026-09-11: PATCH the host_side_base override on the singleton
+// matrix_admin_creds row without touching the encrypted accessToken/password
+// columns. Decouples the URL Skynet uses to reach synapse (homeserverBase —
+// possibly `http://synapse:8008` from inside its container) from the URL
+// written into per-identity relay.json's `base` field, which is consumed by
+// recv.sh on the identity's HOST and must be reachable from there.
+//
+// Body: `{ hostSideBase: string | null }`. A null (or explicit null) clears
+// the override; consumers then fall back to homeserverBase. Non-string /
+// non-null values return 400. String values must match `^https?://[^\s]+$`
+// (same regex used by POST /creds's homeserverBase validation at line ~49).
+// URL is not a secret — safe to log in the info line below.
+router.patch(
+  "/creds/host-side-base",
+  express.json(),
+  requireAdmin,
+  async (req: Request, res: Response): Promise<void> => {
+    const adminUserId = (req as AuthenticatedRequest).userId;
+    const { hostSideBase } = (req.body ?? {}) as Record<string, unknown>;
+
+    if (hostSideBase !== null && typeof hostSideBase !== "string") {
+      res
+        .status(400)
+        .json({ error: "hostSideBase must be a string or null" });
+      return;
+    }
+    if (typeof hostSideBase === "string") {
+      if (!/^https?:\/\/[^\s]+$/.test(hostSideBase)) {
+        res
+          .status(400)
+          .json({ error: "hostSideBase must be an http(s) URL or null" });
+        return;
+      }
+    }
+
+    try {
+      const applied = await setMatrixAdminHostSideBase(
+        hostSideBase as string | null,
+      );
+      if (!applied) {
+        res.status(409).json({
+          error:
+            "matrix_admin_creds not yet ingested — POST /matrix-admin/creds first",
+        });
+        return;
+      }
+
+      authLogger.info("matrix-admin host_side_base patched", {
+        operation: "matrix_admin_creds_host_side_base_patch",
+        adminId: adminUserId,
+        hostSideBase,
+      });
+
+      res.json({ ok: true, hostSideBase });
+    } catch (err) {
+      authLogger.error("Failed to patch matrix-admin host_side_base", err);
+      res
+        .status(500)
+        .json({ error: "Failed to patch matrix-admin host_side_base" });
+    }
+  },
+);
+
+// One-shot admin-gated reset for the two registry-room settings rows.
+// Existing `ensureRegistryRoomsExist` runs at boot only, and takes a
+// fast-path when both `agents_registry_room_id` + `humans_registry_room_id`
+// settings are present — pointing at rooms that may not exist on a
+// newly-swapped homeserver (e.g. after a relay-server migration). This
+// endpoint deletes both settings rows, forceSaves, then invokes
+// ensureRegistryRoomsExist inline so fresh rooms are created on the
+// current (already-swapped) homeserver in the same request — no container
+// restart needed. Idempotent: re-running against a homeserver where the
+// rows have already been recreated just recreates them again.
+router.post(
+  "/reset-registry-rooms",
+  requireAdmin,
+  async (req: Request, res: Response): Promise<void> => {
+    const adminUserId = (req as AuthenticatedRequest).userId;
+    try {
+      // Dynamic imports mirror the other handlers in this file (see /creds
+      // above) — matrix-admin-routes is imported from server.ts very early
+      // and pulling db/schema/registry-rooms at top-level tangles the
+      // initialization graph.
+      const { db, saveMemoryDatabaseToFile } = await import(
+        "../database/db/index.js"
+      );
+      const {
+        SETTINGS_KEY_AGENTS_REGISTRY,
+        SETTINGS_KEY_HUMANS_REGISTRY,
+        ensureRegistryRoomsExist,
+      } = await import("../relay-sessions/registry-rooms.js");
+
+      db.$client
+        .prepare("DELETE FROM settings WHERE key IN (?, ?)")
+        .run(SETTINGS_KEY_AGENTS_REGISTRY, SETTINGS_KEY_HUMANS_REGISTRY);
+
+      await saveMemoryDatabaseToFile();
+
+      const ensured = await ensureRegistryRoomsExist();
+
+      authLogger.info("matrix-admin reset-registry-rooms completed", {
+        operation: "matrix_admin_reset_registry_rooms",
+        adminId: adminUserId,
+        ok: ensured.ok,
+      });
+
+      // === false narrowing (not `!ensured.ok`) — strict tsc doesn't
+      // narrow discriminated unions on the truthy `.ok` branch here, same
+      // pattern as identity-birth-orchestrator.ts fix pinpointed at commit
+      // 967ab598.
+      if (ensured.ok === false) {
+        res.status(503).json({
+          error: "reset_registry_rooms_failed",
+          reason: ensured.reason,
+        });
+        return;
+      }
+
+      res.json({
+        ok: true,
+        agentsRoomId: ensured.agentsRoomId,
+        humansRoomId: ensured.humansRoomId,
+      });
+    } catch (err) {
+      authLogger.error("Failed to reset registry rooms", err);
+      res.status(500).json({ error: "Failed to reset registry rooms" });
+    }
+  },
+);
+
+export default router;

@@ -1,0 +1,1128 @@
+/**
+ * catalog.ts — Hand-maintained catalog of the fleet-substrate items that the
+ * per-host sweep in Plan 03 will iterate over.
+ *
+ * SHAPE SOURCE OF TRUTH:
+ *   .planning/phases/72-feature-02-slice-2-reconcile-loop/72-CONTEXT.md
+ *   (and, via that CONTEXT.md, the locked feature-02 design doc under
+ *    ~/fleet/roles/box-maintainer/bounties/ai-plus-mvp-project/
+ *    feature-02-skynet-distributor.md and the closed slice-1 shape doc.)
+ *
+ * PURE-LIB DISCIPLINE:
+ *   This module contains NO filesystem access, NO SSH, NO child process
+ *   execution, NO logger — it is data + type declaration only. Zero runtime
+ *   imports. Every downstream consumer (byte-compare, push mechanism, restart
+ *   hook fire) injects the transport it needs and reads the shape it wants
+ *   off these entries.
+ *
+ * MODE IS NOT DECLARED PER ENTRY:
+ *   The push helpers in Plan 03 read each bundled file's mode from disk at
+ *   push time and mirror it onto the installed side. Git IS the mode source
+ *   of truth per the shape doc's mode-preservation invariant — declaring it
+ *   here would just create a second, drift-prone source.
+ *
+ * RESTART HOOK CONTRACT:
+ *   `restartHook` is passed verbatim to `systemctl --user restart <hook>` on
+ *   the managed host. This module does no interpretation. Two entries carry
+ *   non-null hooks: agent-supervisor.sh (the binary) and
+ *   agent-supervisor.service (the unit file). The service entry's restart
+ *   works correctly because runBootstrapForHost unconditionally runs
+ *   `systemctl --user daemon-reload` at the start of every sweep, so systemd
+ *   has already re-read the unit before the restart hook fires.
+ *
+ * ROW-COUNT RECONCILIATION (19 items vs. 52 rows):
+ *   The shape doc counts "15 items" — that was 7 single-file skills + 1 skill
+ *   with 1 companion (agent-relay: SKILL.md + recv.sh) + 1 skill with 3
+ *   companions (id: SKILL.md + actor-status-prompt + clone-picker-prompt +
+ *   coordinator-instructions) + 6 helper scripts. claude-code-harness-auth
+ *   was subsequently removed, bringing the single-file skill count to 6.
+ *   Phase 92 appends fleet-status-sweep and Phase 95 appends
+ *   pv-context-pct-sweep, bringing the conceptual helper-script count to 8.
+ *   The mega-monitor phase adds a ninth helper script — `ambient-monitor` —
+ *   bringing the conceptual count to 16. (As of 2026-09-14 the
+ *   agent-supervisor, not the agent, launches ambient-monitor; that changed
+ *   the caller, not the row count.)
+ *   The byte-compare mechanism in Plan 03 pushes files, not "items",
+ *   so this catalog has one row per file. The bootstrap bounty adds 1 more
+ *   row (agent-supervisor.service):
+ *     - 1 row for id/           (SKILL.md; 3 companions retired 2026-09-20
+ *       with coord-as-mode retirement — coordinator became its own role)
+ *     - 2 rows for agent-relay/ (SKILL.md + recv.sh)
+ *     - 3 rows for the single-file skills (queue, notify-me, call-me) — backlog, bounty,
+ *       and next-bounty retired 2026-09-20 with the bounty-concept
+ *       retirement; promote-to-coordinator retired 2026-09-20 with the
+ *       coord-as-mode retirement; role retired 2026-10-09 with the
+ *       role-history retirement (host copies removed via
+ *       RETIRED_SUBSTRATE_FILES in run-bootstrap.ts)
+ *     - 1 row for image-gen skill (Phase 116 file-drop broker SKILL.md)
+ *     - 38 rows for app-development/ (SKILL.md + 8 helper scripts +
+ *       25 starter-template files including a pre-generated initial
+ *       Drizzle migration; first-class-apps campaign shape 1, 2026-09-17;
+ *       favicon.svg row retired 2026-09-28 when the scaffold switched to
+ *       a static/icon.webp symlink to the app's own icon.webp)
+ *     - 12 rows for helper scripts under scripts/
+ *       (file-watch is one of the five ambient-monitor children, all five
+ *       spawned as children of ambient-monitor rather than launched
+ *       individually per identity; inbox-watcher is the fifth child, added
+ *       by shape-agent-supervisor-inbox for the composebox-via-agent-supervisor
+ *       campaign;
+ *       fleet-status-sweep is the Phase 92 batch sweep for the fleet-status
+ *       poller; pv-context-pct-sweep is the Phase 95 batch sweep for the
+ *       PV context-pct poller;
+ *       image-gen is the Phase 116 file-drop broker helper, now a wrapper
+ *       over the shared fleet-service agent-services client)
+ *     - 1 row for user-onboarding/agent-supervisor.service
+ *     - 1 row for instance-policy-claude-md (Phase 114 twinkie — runtime-sourced,
+ *       system-root-installed)
+ *   Total = 77 rows as of the done-bell skills (the breakdown above is
+ *   historical — catalog.test.ts keeps the exact count). Earlier: 47 (45 pre-agent-phone + 2 for the agent-phone-skill and
+ *   agent-phone-helper rows added alongside the image-gen equivalents;
+ *   was 52 before 2026-09-20 retirements — 3 bounty-adjacent skills,
+ *   3 id/ coord companions, and promote-to-coordinator).
+ *
+ * TWO NEW AXES (Phase 114 D-12 + RESEARCH.md § Pattern 1):
+ *   Phase 114 introduces two orthogonal axes to CatalogEntry:
+ *
+ *   1. `sourceKind` (values: bundled | runtime) — DISCRIMINATED UNION on this
+ *      axis because it fundamentally changes which source-side fields are present:
+ *        - BundledCatalogEntry (51 of the 52 rows) carries `bundledPath`
+ *          (bytes live at /app/fleet-substrate/… inside the image, static).
+ *        - RuntimeCatalogEntry (the Phase 114 twinkie row) carries `resolverKey`
+ *          (bytes resolved at sweep time by looking up the key in the
+ *          composer's `deps.resolvedRuntimeBytes` map). The catalog stays
+ *          runtime-free per PURE-LIB DISCIPLINE — the resolver key is a
+ *          lookup string, not a function.
+ *      The discriminated-union shape gives the type-checker the strongest
+ *      guarantee that the 51 bundled rows can never accidentally be treated
+ *      as runtime rows (no resolverKey field) and vice-versa (no
+ *      bundledPath access on runtime rows without narrowing).
+ *
+ *   2. `installMode: "user-home" | "system-root"` — OPTIONAL FIELD with
+ *      default "user-home" because it only affects post-write behavior
+ *      (path quoting + ownership + directory creation), not source shape.
+ *      The 51 bundled rows omit the field and inherit the "user-home" default,
+ *      keeping the diff minimal. The twinkie row sets it explicitly to
+ *      "system-root" (writes to /etc/claude-code/CLAUDE.md root:root 0644,
+ *      gated on hosts.username === "root" per Plan 05).
+ */
+
+/**
+ * A single reconciled fleet-substrate item, bundled-source variant: the
+ * bundled bytes inside the container image, the target install path on a
+ * managed host (relative to the ubuntu user's HOME by default), and — if the
+ * item needs re-execution to take effect after its bytes change — the systemd
+ * --user unit to restart.
+ */
+export interface BundledCatalogEntry {
+  /**
+   * Unique kebab-case identifier, used only in log lines and test assertions.
+   * Not written to disk on the managed host.
+   */
+  slug: string;
+
+  /**
+   * Discriminant: bundled rows carry `bundledPath`; the source bytes live
+   * statically inside the container image at that path.
+   */
+  sourceKind: "bundled";
+
+  /**
+   * Absolute path inside the container image where the canonical bytes live.
+   * Always under /app/fleet-substrate/ (established by slice 1).
+   */
+  bundledPath: string;
+
+  /**
+   * Target path on the managed host. For `installMode: "user-home"` (default),
+   * expressed with a leading "~/" that the remote shell will expand against
+   * the ubuntu user's HOME. Skill entries land under ~/.claude/skills/<slug>/…
+   * and helper scripts under ~/.local/bin/<name>.
+   */
+  installPath: string;
+
+  /**
+   * Where the file is installed on the managed host. Optional; defaults to
+   * "user-home" (path prefixed `~/`, ubuntu-user-owned, no root elevation
+   * needed). Existing bundled rows omit this field. Future bundled rows MAY
+   * opt into "system-root" if they need an absolute path under /etc/ or
+   * similar — the discriminant here is orthogonal to sourceKind.
+   */
+  installMode?: "user-home" | "system-root";
+
+  /**
+   * Systemd --user unit name to restart after the file's bytes change on the
+   * managed host. Passed verbatim to `systemctl --user restart <hook>`. Null
+   * for items with no restart requirement (they pick up new bytes on the
+   * next natural read — identity reload for skills, next invocation for
+   * on-demand scripts).
+   */
+  restartHook: string | null;
+}
+
+/**
+ * A single reconciled fleet-substrate item, runtime-source variant: the
+ * source bytes are NOT static in the container image. Instead, the sweep
+ * composer looks up `resolverKey` in a pre-resolved runtime-bytes map
+ * (`deps.resolvedRuntimeBytes`) that a caller populates ONCE per sweep at
+ * orchestrator scope. Keeps this data module free of runtime imports per
+ * PURE-LIB DISCIPLINE: the resolver is a STRING KEY, not a function.
+ */
+export interface RuntimeCatalogEntry {
+  /**
+   * Unique kebab-case identifier, used only in log lines and test assertions.
+   * Not written to disk on the managed host.
+   */
+  slug: string;
+
+  /**
+   * Discriminant: runtime rows carry `resolverKey` instead of `bundledPath`.
+   * The sweep composer maps the key to a resolver dep at orchestrator wire
+   * time; the catalog module stays a pure data + type module.
+   */
+  sourceKind: "runtime";
+
+  /**
+   * Lookup key the composer resolves to source bytes at sweep time. Extend
+   * this string-literal union when new runtime rows land (e.g. adding a
+   * second runtime resolver later would be `"instance-policy" | "other-key"`).
+   */
+  resolverKey: "instance-policy";
+
+  /**
+   * Absolute path on the managed host where the file is installed. For
+   * `installMode: "system-root"` rows this is an absolute path under /etc/
+   * (or similar); the remote shell MUST NOT tilde-expand it.
+   */
+  installPath: string;
+
+  /**
+   * Where the file is installed on the managed host. Runtime rows MUST
+   * declare this explicitly (no default) because the whole point of adding
+   * the runtime source axis was to accommodate a system-root twinkie.
+   */
+  installMode: "user-home" | "system-root";
+
+  /**
+   * Systemd --user unit name to restart after the file's bytes change on the
+   * managed host. Null for items with no restart requirement — e.g. the
+   * instance-policy CLAUDE.md is discovered natively by Claude Code at every
+   * new session start (per Phase 114 D-14 + D-20), so no daemon restart is
+   * needed on byte change.
+   */
+  restartHook: string | null;
+}
+
+/**
+ * Discriminated union on `sourceKind`. Bundled rows (51 of the 52) narrow
+ * to `BundledCatalogEntry` (bundledPath accessible); the runtime row narrows
+ * to `RuntimeCatalogEntry` (resolverKey accessible, no bundledPath).
+ *
+ * See file-level docstring "TWO NEW AXES" for the type-theory rationale.
+ */
+export type CatalogEntry = BundledCatalogEntry | RuntimeCatalogEntry;
+
+/**
+ * The 75-row hand-maintained catalog. Ordered skills-side first (id,
+ * agent-relay, single-file skills, then app-development), then scripts-side,
+ * then user-onboarding/ files, then Phase 92 additions (fleet-status-sweep),
+ * then Phase 95 additions (pv-context-pct-sweep), then the
+ * mega-monitor ambient-monitor launcher, then the
+ * Phase 114 twinkie (instance-policy-claude-md — the first runtime-sourced
+ * row and the first system-root-installed row).
+ * Within skills, multi-file skills (id, agent-relay) appear before single-file
+ * skills for reviewability. app-development is a multi-file skill with a
+ * bundled starter template — the 26 rows for it are grouped and commented as
+ * a single block after the single-file skills to keep the diff clean.
+ */
+export const FLEET_SUBSTRATE_CATALOG: readonly CatalogEntry[] = [
+  // --- id skill (1 row: SKILL.md — companions retired 2026-09-20 with
+  //     the coord-as-mode retirement; coordinator became its own role) ---
+  {
+    slug: "id-skill",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/id/SKILL.md",
+    installPath: "~/.claude/skills/id/SKILL.md",
+    restartHook: null,
+  },
+
+  // --- agent-relay skill (2 rows: SKILL.md + recv.sh receiver) ---
+  {
+    slug: "agent-relay-skill",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/agent-relay/SKILL.md",
+    installPath: "~/.claude/skills/agent-relay/SKILL.md",
+    restartHook: null,
+  },
+  {
+    slug: "agent-relay-recv",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/agent-relay/recv.sh",
+    installPath: "~/.claude/skills/agent-relay/recv.sh",
+    restartHook: null,
+  },
+
+  // --- single-file skills (1 row, one SKILL.md each; promote-to-coordinator
+  //     retired 2026-09-20 with the coord-as-mode retirement; role retired
+  //     2026-10-09 with the role-history retirement — installed copies are
+  //     removed by run-bootstrap.ts RETIRED_SUBSTRATE_FILES) ---
+  {
+    slug: "queue-skill",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/queue/SKILL.md",
+    installPath: "~/.claude/skills/queue/SKILL.md",
+    restartHook: null,
+  },
+  // done-bell (campaign notify-when-done): the two skills the composer's bell
+  // sends while an agent works — the agent reaches the user when it's done or
+  // needs them. Person-started only (disable-model-invocation).
+  {
+    slug: "notify-me-skill",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/notify-me/SKILL.md",
+    installPath: "~/.claude/skills/notify-me/SKILL.md",
+    restartHook: null,
+  },
+  {
+    slug: "call-me-skill",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/call-me/SKILL.md",
+    installPath: "~/.claude/skills/call-me/SKILL.md",
+    restartHook: null,
+  },
+  // Phase 116: file-drop broker skill body — carries the D-17 PHI directive
+  // at top primacy plus the D-18 recency echo inline in the invocation
+  // section. No restart hook — on-demand-loaded skill file (Claude Code
+  // re-reads on next skill invocation).
+  {
+    slug: "image-gen-skill",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/image-gen/SKILL.md",
+    installPath: "~/.claude/skills/image-gen/SKILL.md",
+    restartHook: null,
+  },
+  // agent-phone: file-drop broker skill body for the phone-call capability.
+  // Same shape as image-gen-skill above — on-demand-loaded, no restart hook.
+  {
+    slug: "agent-phone-skill",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/agent-phone/SKILL.md",
+    installPath: "~/.claude/skills/agent-phone/SKILL.md",
+    restartHook: null,
+  },
+  // stt: agent-services skill for speech to text. Same shape as
+  // image-gen-skill above — on-demand-loaded, no restart hook.
+  {
+    slug: "stt-skill",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/stt/SKILL.md",
+    installPath: "~/.claude/skills/stt/SKILL.md",
+    restartHook: null,
+  },
+  // sensor-development: teaches agents to build a sensor (logic that fires a
+  // wake-up or scheduled task). On-demand-loaded skill file — no restart hook.
+  {
+    slug: "sensor-development-skill",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/sensor-development/SKILL.md",
+    installPath: "~/.claude/skills/sensor-development/SKILL.md",
+    restartHook: null,
+  },
+  // desktop: tells the agent when + how to use its per-identity virtual
+  // desktop (agent-desktop CLI + desktop-mcp tools). On-demand-loaded skill
+  // file — no restart hook.
+  {
+    slug: "desktop-skill",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/desktop/SKILL.md",
+    installPath: "~/.claude/skills/desktop/SKILL.md",
+    restartHook: null,
+  },
+
+  // --- helper scripts (8 rows prior to Phase 95 addition, 9 total — all under ~/.local/bin/) ---
+  // agent-supervisor is the sole entry with a restart hook: bytes must be
+  // re-executed for the daemon to run the new version, and its unit is
+  // KillMode=process so `systemctl --user restart agent-supervisor` does not
+  // reap its supervised tmux sessions.
+  {
+    slug: "agent-supervisor",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/scripts/agent-supervisor.sh",
+    installPath: "~/.local/bin/agent-supervisor",
+    restartHook: "agent-supervisor.service",
+  },
+  // wakeup-scheduler serves TWO fleet concepts from the same Python file
+  // (see substrate/scripts/wakeup-scheduler.py docstring):
+  //   (1) per-identity wake-up dispatch — one process per live identity,
+  //       spawned as a child of agent-supervisor. Intentionally
+  //       harness-bound; a restart here would kill the child mid-drift.
+  //       These continue to run stale bytes until the identity's harness
+  //       naturally cycles. Accepted trade-off.
+  //   (2) --mode scheduled-agents — one box-level process, owned by
+  //       scheduled-agents-scheduler.service (systemd user unit). NOT
+  //       tied to any harness. Stale bytes here manifest as newly-spawned
+  //       identities that never received scheduler-side updates (e.g.
+  //       pre-authorized-prompt wrapping, task-field clock prefix).
+  //
+  // The restart hook targets the scheduled-agents systemd unit only —
+  // per-identity children under agent-supervisor stay untouched.
+  {
+    slug: "wakeup-scheduler",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/scripts/wakeup-scheduler.py",
+    installPath: "~/.local/bin/wakeup-scheduler",
+    restartHook: "scheduled-agents-scheduler.service",
+  },
+  {
+    slug: "file-watch",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/scripts/file-watch.py",
+    installPath: "~/.local/bin/file-watch",
+    restartHook: null,
+  },
+  // inbox-watcher — fifth ambient-watcher child (shape-agent-supervisor-inbox).
+  // Watches ~/fleet/identities/<name>/inbox/ for message files dropped by any
+  // process on the box, surfaces their paths up to ambient-monitor's parent via
+  // the RAW-PASTE-FILE: stdout protocol. Harness-bound like the other
+  // ambient-watcher children — a bytes change here waits for the next natural
+  // harness relaunch to apply. Accepted trade-off; mirrors the file-watch
+  // distribution shape.
+  {
+    slug: "inbox-watcher",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/scripts/inbox-watcher.py",
+    installPath: "~/.local/bin/inbox-watcher",
+    restartHook: null,
+  },
+  // Agent services: fleet-service is the shared file-drop client every
+  // service wrapper calls (request envelope into ~/fleet/service-requests/,
+  // wait for the response, collect output files). See
+  // src/backend/agent-services/README.md. On-demand executables, no restart
+  // hooks.
+  {
+    slug: "fleet-service-helper",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/scripts/fleet-service",
+    installPath: "~/.local/bin/fleet-service",
+    restartHook: null,
+  },
+  // image-gen wrapper: `image-gen "..."` → prints image paths on stdout.
+  {
+    slug: "image-gen-helper",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/scripts/image-gen",
+    installPath: "~/.local/bin/image-gen",
+    restartHook: null,
+  },
+  // agent-phone wrapper: `agent-phone --to <user> --from "<name>" "<msg>"`
+  // → prints the call transcript on stdout.
+  {
+    slug: "agent-phone-helper",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/scripts/agent-phone",
+    installPath: "~/.local/bin/agent-phone",
+    restartHook: null,
+  },
+  // stt wrapper: `stt <audio-file>` → prints the transcript on stdout.
+  {
+    slug: "stt-helper",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/scripts/stt",
+    installPath: "~/.local/bin/stt",
+    restartHook: null,
+  },
+  // sensor-fire: the one command a sensor runs to fire its trigger (drops a
+  // fire file the wake-up scheduler delivers). On-demand, no restart hook.
+  {
+    slug: "sensor-fire",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/scripts/sensor-fire",
+    installPath: "~/.local/bin/sensor-fire",
+    restartHook: null,
+  },
+  // sensor-runner: the box-level process behind sensors (services follow
+  // sensor folders, cadence clock, health). Owned by sensor-runner.service;
+  // it reloads the wakeup-scheduler schedule engine itself when that changes.
+  {
+    slug: "sensor-runner",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/scripts/sensor-runner",
+    installPath: "~/.local/bin/sensor-runner",
+    restartHook: "sensor-runner.service",
+  },
+
+  // agent-desktop: per-identity virtual desktop (Xvnc + openbox) — allocates
+  // a stable display number, starts/stops it via the agent-desktop@ unit
+  // below. On-demand executable, no restart hook; running desktops keep
+  // their old `serve` bytes until next restart (accepted — serve is tiny).
+  {
+    slug: "agent-desktop-helper",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/scripts/agent-desktop",
+    installPath: "~/.local/bin/agent-desktop",
+    restartHook: null,
+  },
+  // desktop-mcp: ONE MCP server per host (HTTP on 127.0.0.1:7794) exposing
+  // screenshot/click/type/key/browser_* on each identity's own desktop;
+  // sessions connect to it instead of each spawning a copy. agent-supervisor
+  // passes ~/.claude/desktop-mcp.json on every launch once the server
+  // answers. Owned by desktop-mcp.service; the server is stateless and the
+  // browsers run outside it, so the restart keeps every session and browser
+  // (only a call in flight at that moment fails).
+  {
+    slug: "desktop-mcp-helper",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/scripts/desktop-mcp.py",
+    installPath: "~/.local/bin/desktop-mcp",
+    restartHook: "desktop-mcp.service",
+  },
+  // relay-mcp: ONE MCP server per host (HTTP on 127.0.0.1:7793) that sends
+  // relay messages for every identity; sessions connect to it instead of each
+  // spawning a copy. agent-supervisor passes ~/.claude/relay-mcp.json on every
+  // launch once the server answers. Owned by relay-mcp.service; the server is
+  // stateless, so the restart is invisible to connected sessions.
+  {
+    slug: "relay-mcp",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/scripts/relay-mcp.py",
+    installPath: "~/.local/bin/relay-mcp",
+    restartHook: "relay-mcp.service",
+  },
+
+  // task-field-check: UserPromptSubmit hook that nudges the agent when its
+  // identity file's `task:` frontmatter is still "Untitled conversation".
+  // Reads $FLEET_IDENTITY (exported by agent-supervisor.sh into every
+  // claude launch env) to locate the identity file; silent no-op if the
+  // env var is absent (unsupervised claude sessions) or the field is
+  // already filled. Wired via the run-bootstrap.ts settings.json patch —
+  // hook execution is driven by ~/.claude/settings.json .hooks.UserPromptSubmit,
+  // not by any restart. No restart hook — new bytes picked up on next fire.
+  {
+    slug: "task-field-check",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/scripts/task-field-check.sh",
+    installPath: "~/.local/bin/task-field-check",
+    restartHook: null,
+  },
+
+  // resume-gap-notice: UserPromptSubmit hook that tells a session how long
+  // it has been since its last activity (last assistant turn in the
+  // transcript) when that gap is 30 minutes or more — so a dormancy wake, a
+  // crash-recovery resume, or an always-on identity idle for days knows how
+  // long it was out. No FLEET_IDENTITY gate: fires in every session on the
+  // box. Wired via the run-bootstrap.ts settings.json patch. No restart
+  // hook — new bytes picked up on next fire.
+  {
+    slug: "resume-gap-notice",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/scripts/resume-gap-notice.sh",
+    installPath: "~/.local/bin/resume-gap-notice",
+    restartHook: null,
+  },
+
+  // id-load-context: UserPromptSubmit hook that, on an `/id <name>` load
+  // (and PostToolUse(Skill) hook for the agent invoking the id skill itself),
+  // hands the agent its identity file, role files, role skills, the
+  // scheduled tasks that run with its roles, its own wake-ups and its
+  // project chain — so the load needs no lookup tool calls. Whole files go
+  // in while they fit under Claude Code's 10K additionalContext cap; the
+  // rest are named for the agent to Read. Wired via the run-bootstrap.ts
+  // settings.json patch. No restart hook — new bytes picked up on next fire.
+  {
+    slug: "id-load-context",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/scripts/id-load-context.py",
+    installPath: "~/.local/bin/id-load-context",
+    restartHook: null,
+  },
+
+  // borrowable-roles-context: UserPromptSubmit + PostToolUse(Skill) hook on
+  // the same identity loads id-load-context answers. Runs id-load-context in
+  // its --borrowable mode: lists the roles on the host marked `borrowable:
+  // true` that the agent doesn't hold, so it can borrow one for a task (id
+  // skill § Borrowing a role). Its own hook so the list gets its own 10K
+  // additionalContext allowance. Wired via the run-bootstrap.ts settings.json
+  // patch. No restart hook — new bytes picked up on next fire.
+  {
+    slug: "borrowable-roles-context",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/scripts/borrowable-roles-context.sh",
+    installPath: "~/.local/bin/borrowable-roles-context",
+    restartHook: null,
+  },
+
+  // precompact-reground: PreCompact hook (every trigger) for an identity's
+  // main session. Tells the summarizer to leave out what the agent's
+  // directive files hold and to end the summary with the agent's own note to
+  // re-load itself (invoke the id skill for its name) before anything else.
+  // The re-load's identity/role/project context comes from id-load-context's
+  // PostToolUse(Skill) registration. Wired via the run-bootstrap.ts
+  // settings.json patch. No restart hook — new bytes picked up on next fire.
+  {
+    slug: "precompact-reground",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/scripts/precompact-reground.py",
+    installPath: "~/.local/bin/precompact-reground",
+    restartHook: null,
+  },
+
+  // allow-all-tools: PreToolUse hook that unconditionally emits
+  // permissionDecision:"allow" for every tool call. Completes fleet-wide
+  // "no prompts, ever": --dangerously-skip-permissions covers most tool
+  // approvals but not the harness's hard-coded circuit-breaker patterns
+  // (rm -rf $HOME / rm -rf / and similar), which still surface as an
+  // "approve Bash" modal in the raw terminal + a presence-only
+  // WaitingBubble in Skynet's chat view. A PreToolUse hook returning
+  // "allow" is authoritative over the permission gate — including the
+  // circuit-breaker — so this hook eliminates the residual prompts at
+  // the harness's own designated seam. Wired via the run-bootstrap.ts
+  // settings.json patch — hook execution is driven by
+  // ~/.claude/settings.json .hooks.PreToolUse with NO matcher (fires
+  // for every tool). No restart hook — new bytes picked up on next fire.
+  {
+    slug: "allow-all-tools",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/scripts/allow-all-tools.sh",
+    installPath: "~/.local/bin/allow-all-tools",
+    restartHook: null,
+  },
+
+  // self-edit-baseline-sync: PostToolUse hook that suppresses file-watch
+  // events on the agent's own edits. After every Write/Edit/MultiEdit/
+  // NotebookEdit/Bash tool call, refreshes any drifted baselines under
+  // ~/fleet/identities/$FLEET_IDENTITY/file-watch/ and writes a sha256
+  // marker so the watcher's hash-guard (file-watch.py:_is_self_edit)
+  // can confirm the agent's own edit and stay silent. Wired via the
+  // run-bootstrap.ts settings.json patch. No restart hook — new bytes picked
+  // up on next hook fire. Shape rationale:
+  //   .planning/shapes/shape-stop-self-edit-events.md
+  {
+    slug: "self-edit-baseline-sync",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/scripts/self-edit-baseline-sync.sh",
+    installPath: "~/.local/bin/self-edit-baseline-sync",
+    restartHook: null,
+  },
+
+  // pending-context-drain: UserPromptSubmit + PostToolUse + SessionStart hook
+  // that delivers the file-watch notices queued in
+  // ~/fleet/identities/$FLEET_IDENTITY/pending-context/ as additionalContext
+  // at the agent's next turn or tool call — so a file edit never spends a
+  // turn of its own on an idle agent. SessionStart (startup/clear) discards
+  // the queue. Wired via the run-bootstrap.ts settings.json patch. No
+  // restart hook — new bytes picked up on next hook fire.
+  {
+    slug: "pending-context-drain",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/scripts/pending-context-drain.sh",
+    installPath: "~/.local/bin/pending-context-drain",
+    restartHook: null,
+  },
+
+  // machine-people: SessionStart hook that hands every session the people
+  // file (~/fleet/host/people.md, written by bootstrap Step 5c) — everyone
+  // with access to this machine and their relay IDs. Wired via the
+  // run-bootstrap.ts settings.json patch. No restart hook — new bytes picked
+  // up on next hook fire.
+  {
+    slug: "machine-people",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/scripts/machine-people.sh",
+    installPath: "~/.local/bin/machine-people",
+    restartHook: null,
+  },
+
+  // person-files: SessionStart hook that hands an agent the About you files
+  // (~/fleet/people/<user>.md) of the people it is shared with. Also loaded
+  // as a module by file-watch (installed beside it) so the two agree on who
+  // that is. Wired via the run-bootstrap.ts settings.json patch. No restart
+  // hook — new bytes picked up on next hook fire.
+  {
+    slug: "person-files",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/scripts/person-files.py",
+    installPath: "~/.local/bin/person-files",
+    restartHook: null,
+  },
+
+  // --- user-onboarding/ (1 row: agent-supervisor.service) ---
+  // The .service unit file must land in ~/.config/systemd/user/ on every
+  // managed host. runBootstrapForHost runs `systemctl --user daemon-reload`
+  // unconditionally at the start of each sweep, so when bytes here change
+  // systemd has already re-read the unit before the restart hook fires.
+  {
+    slug: "agent-supervisor-service-unit",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/user-onboarding/agent-supervisor.service",
+    installPath: "~/.config/systemd/user/agent-supervisor.service",
+    restartHook: "agent-supervisor.service",
+  },
+
+  // scheduled-agents-scheduler.service — systemd user unit that owns the
+  // box-level scheduled-agents scheduler (a Python process running
+  // wakeup-scheduler in --mode scheduled-agents against the fleet-level
+  // schedule folder). run-bootstrap.ts enables + starts this on every
+  // host (mirrors agent-supervisor.service bootstrap pattern). Restart
+  // hook targets self: daemon-reload picks up the fresh unit definition
+  // before the restart fires (daemon-reload runs unconditionally at the
+  // start of every sweep).
+  {
+    slug: "scheduled-agents-scheduler-service-unit",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/user-onboarding/scheduled-agents-scheduler.service",
+    installPath: "~/.config/systemd/user/scheduled-agents-scheduler.service",
+    restartHook: "scheduled-agents-scheduler.service",
+  },
+
+  // sensor-runner.service — systemd user unit that owns sensor-runner.
+  // run-bootstrap.ts enables + starts it on every host (same pattern as
+  // scheduled-agents-scheduler.service). Restart hook targets self.
+  {
+    slug: "sensor-runner-service-unit",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/user-onboarding/sensor-runner.service",
+    installPath: "~/.config/systemd/user/sensor-runner.service",
+    restartHook: "sensor-runner.service",
+  },
+
+  // relay-mcp.service — box-level user unit running relay-mcp. run-bootstrap.ts
+  // enables + starts it on every host (same pattern as sensor-runner.service).
+  // Restart hook targets self.
+  {
+    slug: "relay-mcp-service-unit",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/user-onboarding/relay-mcp.service",
+    installPath: "~/.config/systemd/user/relay-mcp.service",
+    restartHook: "relay-mcp.service",
+  },
+
+  // desktop-mcp.service — box-level user unit running `desktop-mcp serve`.
+  // Not enabled at bootstrap; started by the first sweep's restart hook (a
+  // restart starts a stopped unit) and by agent-supervisor before any launch
+  // that finds it down. Restart hook targets self: idle sessions don't
+  // notice, a call in flight at that moment fails.
+  {
+    slug: "desktop-mcp-service-unit",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/user-onboarding/desktop-mcp.service",
+    installPath: "~/.config/systemd/user/desktop-mcp.service",
+    restartHook: "desktop-mcp.service",
+  },
+
+  // agent-desktop@.service — TEMPLATE unit, one instance per identity with a
+  // running desktop (instance = systemd-escaped identity name). Started and
+  // stopped on demand by agent-desktop up/down; never enabled at bootstrap.
+  // No restart hook: a template has no single instance to bounce, and the
+  // per-sweep daemon-reload already picks up new unit bytes for the next
+  // start.
+  {
+    slug: "agent-desktop-service-unit",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/user-onboarding/agent-desktop@.service",
+    installPath: "~/.config/systemd/user/agent-desktop@.service",
+    restartHook: null,
+  },
+
+  // --- fleet-status-sweep (1 row: python batch sweep for fleet-status poller — Phase 92) ---
+  // On-demand batch sweep invoked by the fleet-status poller (one exec per host,
+  // not one per agent). No restart hook — the sweep is a short-lived script the
+  // caller runs on demand, so new bytes are picked up on the next invocation.
+  {
+    slug: "fleet-status-sweep",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/scripts/fleet-status-sweep.py",
+    installPath: "~/.local/bin/fleet-status-sweep",
+    restartHook: null,
+  },
+
+  // --- pv-context-pct-sweep (1 row: python batch sweep for PrettyView context-pct — Phase 95) ---
+  // On-demand batch sweep invoked by claude-session-server.ts contextPctTimer per WS per 3s tick.
+  // Collapses up to 4 tail -c execs per identity per tick down to 1 exec per WS per tick.
+  // No restart hook — short-lived on-demand script; new bytes are picked up on next invocation.
+  {
+    slug: "pv-context-pct-sweep",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/scripts/pv-context-pct-sweep.py",
+    installPath: "~/.local/bin/pv-context-pct-sweep",
+    restartHook: null,
+  },
+
+  // --- app-development skill (38 rows: SKILL.md + 8 helper scripts + 24 starter template files + 5 unit templates) ---
+  // First-class-apps campaign, shape 1 (2026-09-17). Ships the canonical
+  // app-development skill that teaches fleet agents to build user-facing apps
+  // under ~/fleet/apps/<slug>/. The skill folder on managed boxes lands at
+  // ~/.claude/skills/app-development/. No restart hook — skills are read at
+  // /id load time; new bytes land on the identity's next relaunch.
+  // The 20 template files include a pre-generated initial Drizzle migration
+  // (SQL + meta journal + meta snapshot) alongside the 17 source files.
+  {
+    slug: "app-development-skill",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/SKILL.md",
+    installPath: "~/.claude/skills/app-development/SKILL.md",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-bootstrap",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/bootstrap.sh",
+    installPath: "~/.claude/skills/app-development/bootstrap.sh",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-create-app",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/create-app.sh",
+    installPath: "~/.claude/skills/app-development/create-app.sh",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-archive-app",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/archive-app.sh",
+    installPath: "~/.claude/skills/app-development/archive-app.sh",
+    restartHook: null,
+  },
+  // app-development-restore-app was removed by the un-archiving campaign
+  // (host-side shape) — restore-app.sh's logic now lives inside the
+  // agent-supervisor's scan_app_unarchive_requested_sentinels() scanner.
+  // Agents un-archive apps by dropping .unarchive-requested inside
+  // ~/fleet/apps-archive/<slug>/, same disk-gesture pattern as archive.
+  {
+    slug: "app-development-backup-app",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/backup-app.sh",
+    installPath: "~/.claude/skills/app-development/backup-app.sh",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-make-icon",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/make-icon.sh",
+    installPath: "~/.claude/skills/app-development/make-icon.sh",
+    restartHook: null,
+  },
+  // convo-scoped apps: app-units.sh owns how an app runs under systemd (the
+  // agent-supervisor calls it on identity retire / un-archive and app
+  // un-archive); move-app.sh moves an app between the sidebar, a project and
+  // out of a conversation (promote-app.sh is its old name, kept as a wrapper).
+  {
+    slug: "app-development-app-units",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/app-units.sh",
+    installPath: "~/.claude/skills/app-development/app-units.sh",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-move-app",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/move-app.sh",
+    installPath: "~/.claude/skills/app-development/move-app.sh",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-promote-app",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/promote-app.sh",
+    installPath: "~/.claude/skills/app-development/promote-app.sh",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-template-gitignore",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/app-starter/.gitignore",
+    installPath: "~/.claude/skills/app-development/templates/app-starter/.gitignore",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-template-readme",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/app-starter/README.md",
+    installPath: "~/.claude/skills/app-development/templates/app-starter/README.md",
+    restartHook: null,
+  },
+  // convo-scoped apps: the single app unit template became five unit templates
+  // under templates/units/, rendered by app-units.sh (socket + relay + app +
+  // sleep-marker watch + boot check).
+  {
+    slug: "app-development-template-unit-service",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/units/app-SLUG.service.template",
+    installPath: "~/.claude/skills/app-development/templates/units/app-SLUG.service.template",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-template-unit-socket",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/units/app-SLUG.socket.template",
+    installPath: "~/.claude/skills/app-development/templates/units/app-SLUG.socket.template",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-template-unit-relay",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/units/app-SLUG-relay.service.template",
+    installPath: "~/.claude/skills/app-development/templates/units/app-SLUG-relay.service.template",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-template-unit-marker",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/units/app-SLUG-marker.path.template",
+    installPath: "~/.claude/skills/app-development/templates/units/app-SLUG-marker.path.template",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-template-unit-boot",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/units/app-SLUG-boot.service.template",
+    installPath: "~/.claude/skills/app-development/templates/units/app-SLUG-boot.service.template",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-template-app-json",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/app-starter/app.json",
+    installPath: "~/.claude/skills/app-development/templates/app-starter/app.json",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-template-drizzle-config",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/app-starter/drizzle.config.ts",
+    installPath: "~/.claude/skills/app-development/templates/app-starter/drizzle.config.ts",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-template-package-json",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/app-starter/package.json",
+    installPath: "~/.claude/skills/app-development/templates/app-starter/package.json",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-template-app-css",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/app-starter/src/app.css",
+    installPath: "~/.claude/skills/app-development/templates/app-starter/src/app.css",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-template-app-html",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/app-starter/src/app.html",
+    installPath: "~/.claude/skills/app-development/templates/app-starter/src/app.html",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-template-db-index",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/app-starter/src/lib/server/db/index.ts",
+    installPath: "~/.claude/skills/app-development/templates/app-starter/src/lib/server/db/index.ts",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-template-db-schema",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/app-starter/src/lib/server/db/schema.ts",
+    installPath: "~/.claude/skills/app-development/templates/app-starter/src/lib/server/db/schema.ts",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-template-layout",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/app-starter/src/routes/+layout.svelte",
+    installPath: "~/.claude/skills/app-development/templates/app-starter/src/routes/+layout.svelte",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-template-page-server",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/app-starter/src/routes/+page.server.ts",
+    installPath: "~/.claude/skills/app-development/templates/app-starter/src/routes/+page.server.ts",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-template-page-svelte",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/app-starter/src/routes/+page.svelte",
+    installPath: "~/.claude/skills/app-development/templates/app-starter/src/routes/+page.svelte",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-template-svelte-config",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/app-starter/svelte.config.js",
+    installPath: "~/.claude/skills/app-development/templates/app-starter/svelte.config.js",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-template-tsconfig",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/app-starter/tsconfig.json",
+    installPath: "~/.claude/skills/app-development/templates/app-starter/tsconfig.json",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-template-vite-config",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/app-starter/vite.config.ts",
+    installPath: "~/.claude/skills/app-development/templates/app-starter/vite.config.ts",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-template-migration-sql",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/app-starter/drizzle/0000_panoramic_micromax.sql",
+    installPath: "~/.claude/skills/app-development/templates/app-starter/drizzle/0000_panoramic_micromax.sql",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-template-migration-journal",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/app-starter/drizzle/meta/_journal.json",
+    installPath: "~/.claude/skills/app-development/templates/app-starter/drizzle/meta/_journal.json",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-template-migration-snapshot",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/app-starter/drizzle/meta/0000_snapshot.json",
+    installPath: "~/.claude/skills/app-development/templates/app-starter/drizzle/meta/0000_snapshot.json",
+    restartHook: null,
+  },
+
+  // Pane-safe starter files (2026-09-25) — Ivory's proven pattern packaged
+  // into the scaffold so a first-try agent gets pane-safety without knowing
+  // the mechanism. pane.ts + server.js carry `__HOSTID__` / `__SLUG__`
+  // markers that create-app.sh substitutes at scaffold time; the other
+  // files reference PANE_BASE symbolically. See substrate/skills/
+  // app-development/SKILL.md § How the pane mounts your app.
+  {
+    slug: "app-development-template-lib-pane",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/app-starter/src/lib/pane.ts",
+    installPath: "~/.claude/skills/app-development/templates/app-starter/src/lib/pane.ts",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-template-hooks",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/app-starter/src/hooks.ts",
+    installPath: "~/.claude/skills/app-development/templates/app-starter/src/hooks.ts",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-template-hooks-server",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/app-starter/src/hooks.server.ts",
+    installPath: "~/.claude/skills/app-development/templates/app-starter/src/hooks.server.ts",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-template-server-js",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/app-starter/server.js",
+    installPath: "~/.claude/skills/app-development/templates/app-starter/server.js",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-template-about-page",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/app-starter/src/routes/about/+page.svelte",
+    installPath: "~/.claude/skills/app-development/templates/app-starter/src/routes/about/+page.svelte",
+    restartHook: null,
+  },
+  // The starter's JSON API: endpoint() helper, the to-do logic, its routes,
+  // the generated /api/openapi.json, and the browser-side api() caller.
+  // See SKILL.md § The API.
+  {
+    slug: "app-development-template-lib-api",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/app-starter/src/lib/api.ts",
+    installPath: "~/.claude/skills/app-development/templates/app-starter/src/lib/api.ts",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-template-lib-server-api",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/app-starter/src/lib/server/api.ts",
+    installPath: "~/.claude/skills/app-development/templates/app-starter/src/lib/server/api.ts",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-template-lib-server-todos",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/app-starter/src/lib/server/todos.ts",
+    installPath: "~/.claude/skills/app-development/templates/app-starter/src/lib/server/todos.ts",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-template-api-todos",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/app-starter/src/routes/api/todos/+server.ts",
+    installPath: "~/.claude/skills/app-development/templates/app-starter/src/routes/api/todos/+server.ts",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-template-api-todos-id",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/app-starter/src/routes/api/todos/[id]/+server.ts",
+    installPath: "~/.claude/skills/app-development/templates/app-starter/src/routes/api/todos/[id]/+server.ts",
+    restartHook: null,
+  },
+  {
+    slug: "app-development-template-api-openapi",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/skills/app-development/templates/app-starter/src/routes/api/openapi.json/+server.ts",
+    installPath: "~/.claude/skills/app-development/templates/app-starter/src/routes/api/openapi.json/+server.ts",
+    restartHook: null,
+  },
+
+  // --- ambient-monitor (1 row: the single launcher that spawns the ambient watchers) ---
+  // Replaces what were once separate Monitor invocations (relay receiver, wake-up scheduler,
+  // file-watch, and the since-retired context watch) with a single launch. The watchers stay as their own
+  // canonical entries above (still distributed, still on-disk at their existing paths);
+  // ambient-monitor invokes them via those entry points.
+  //
+  // 2026-09-14: the AGENT-SUPERVISOR now starts this, not the agent — one launcher per harness it
+  // brings up (fresh / recover / dormant-wake), passing --inject-to <session> --harness-pid <pid>.
+  // In that mode the launcher delivers each wake line INTO the session as a <task-notification>
+  // envelope rather than writing to stdout, because with no harness-owned Monitor there is nothing
+  // to raise events through. Motivating constraint: one Skynet instance is barred from having the
+  // Monitor tool present in harnesses at all, so its identities cannot receive real monitor events.
+  //
+  // No restart hook, and it deliberately needs none: the supervisor starts a fresh launcher on every
+  // harness launch and each launcher dies with the harness it watches, so new bytes land on an
+  // identity's next relaunch. A restart hook here would be actively WRONG — it would have to kill
+  // live launchers, orphaning their identities mid-session.
+  {
+    slug: "ambient-monitor",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/scripts/ambient-monitor.py",
+    installPath: "~/.local/bin/ambient-monitor",
+    restartHook: null,
+  },
+
+  // --- instance-policy-claude-md (1 row: Phase 114 twinkie — runtime-sourced, system-root-installed) ---
+  // FIRST runtime-sourced row: bytes come from readInstanceFileBytes() (instance-file/store.ts) at sweep time
+  // (via deps.resolvedRuntimeBytes.get("instance-policy")), NOT from /app/fleet-substrate/…
+  // in the container image. See RuntimeCatalogEntry docstring above.
+  //
+  // FIRST system-root-installed row: writes to /etc/claude-code/CLAUDE.md as root:root 0644.
+  // Gated on hosts.username === "root" per Plan 05's D-13 gate — non-root SSH hosts are
+  // skipped with a structured sshLogger.info log line and no push is attempted. Non-root
+  // hosts will receive the twinkie automatically on their next sweep once they migrate to
+  // root-SSH (via the box-maintainer org-migration bounty).
+  //
+  // restartHook: null because Claude Code discovers managed-policy at every new session start
+  // natively (per Phase 114 D-14 + D-20 + code.claude.com/docs/en/memory) — no daemon to
+  // restart. Running sessions do NOT reload mid-session; that's expected behavior.
+  {
+    slug: "instance-policy-claude-md",
+    sourceKind: "runtime",
+    resolverKey: "instance-policy",
+    installPath: "/etc/claude-code/CLAUDE.md",
+    installMode: "system-root",
+    restartHook: null,
+  },
+] as const;

@@ -1,0 +1,8272 @@
+import { WebSocketServer, WebSocket, type RawData } from "ws";
+import { createHash, randomBytes } from "node:crypto";
+import { checkInstanceWideRoleWrite, afterAdminWrite, INSTANCE_WIDE_ROLE_REFUSAL } from "../instance-wide/role-guard.js";
+import { basename } from "node:path";
+import type { Client as SSHClientType } from "ssh2";
+import { AuthManager } from "../utils/auth-manager.js";
+import { UserCrypto } from "../utils/user-crypto.js";
+import { sshLogger, databaseLogger } from "../utils/logger.js";
+// Phase 111 SKEW-07: WS handshake gate — shared helper + server build-id
+// getter (module-load capture per D-16). SERVER_BUILD_ID is read once at
+// module load below; the gate runs before any JWT auth work.
+import { extractSkewTag } from "../utils/skew-tag.js";
+import { getServerBuildId } from "../config/server-build-id.js";
+import { resolveHostById } from "../ssh/host-resolver.js";
+import { connectOneShot } from "../ssh/ssh-one-shot.js";
+import { enableHostd } from "../ssh/hostd-channel.js";
+import { discoverClaudeSession, discoverClaudeSessionBatched } from "./session-file-discovery.js";
+import { readSessionFileCache } from "../fleet-status/session-file-cache.js";
+import { discoverIdentitySessionFile } from "./discover-identity-session-file.js";
+import {
+  parseSessionLine,
+  normalizePastedHarnessEnvelopes,
+  extractText,
+} from "./session-file-parser.js";
+import { tailSessionFile, type TailHandle } from "./session-file-tail.js";
+import { tailSessionFileWindowed, searchBackgroundWorkHistory, type RunExec } from "./session-file-window.js";
+import { isRepeatComposeMqid } from "./seen-input-mqids.js";
+import {
+  InterruptCancelTracker,
+  isPromptStart,
+  type InterruptVerdict,
+} from "./interrupt-cancel-tracker.js";
+// Phase 50 Plan 02 — signal-driven send-path watchdog. Replaces the OLD
+// PTY-activity-proxy watchdog formerly at src/backend/ssh/ (patch quick
+// 260803-1xw, deleted in Phase 50 Plan 02 Task 3). See pv-send-watchdog.ts file header for the
+// three-stage timing chain + hash-derivation contract.
+import {
+  armPvSendWatchdog,
+  clearPvSendWatchdog,
+  clearPvSendWatchdogsForSession,
+  notifyMatched as notifyPvSendMatched,
+} from "./pv-send-watchdog.js";
+// Phase 47 Plan 03: bounded JSONL slice reader for the load-more button
+// (Plan 01 output). Used by handleFetchOlderRange below AND by
+// startActiveSessionFlow's Hunk B totalLines probe.
+import { readSessionFileRange } from "./session-file-range-reader.js";
+import { __applyQueueDedupForTests } from "./queue-dedup.js";
+import {
+  performDormantWakeGate,
+  MARKER_FALLBACK_MS,
+} from "./dormant-wake-gate.js";
+import {
+  createPaneStateEmitter,
+  type PaneStateEmitter,
+} from "./pane-state-emitter.js";
+import { readContextPctFromJsonl } from "./context-pct-from-jsonl.js";
+import { parseSweepJsonl } from "./pv-sweep-schema.js";
+// Phase 90 Plan 00 (Wave 0, 2026-09-08 — D-10 delivery mechanism, user 2026-09-08
+// D-03 waiver): dual-write every `context_pct` emission into the fleet-status
+// shared map so PrettyView (post D-03 mechanical waiver swap) and the future
+// Plan 06 relay-pane badge appendage both read contextPct from the SAME
+// source of truth (fleet-status), via the same session key format. WS
+// emissions BELOW are PRESERVED unchanged for backwards compat during
+// transition — nothing else consumes them after Task 2, but the safety
+// net stays until the transition is fully validated.
+import { setContextPct } from "../fleet-status/contextpct-store.js";
+import { getSubscriptionRegistry } from "../fleet-status/subscription-registry.js";
+import { execCommand } from "../ssh/tmux-helper.js";
+import { workNarrationHub } from "./work-narration.js";
+import {
+  handleUploadStart,
+  handleUploadChunk,
+  handleUploadAbort,
+  cleanupBatchesForConnection,
+} from "../ssh/pretty-view-upload.js";
+import type {
+  UploadStartPayload,
+  UploadChunkPayload,
+  UploadAbortPayload,
+} from "../../ui/api/pretty-view-upload-protocol.js";
+import {
+  probeIdentityFolderState,
+  type IdentityFolderState,
+  type ArchivedApp,
+  buildArchivedAppsScript,
+  parseArchivedAppsStdout,
+  readArchivedAppsLocal,
+  readArchivedIdentityLook,
+  type ArchivedIdentityLook,
+} from "./archived-identity.js";
+import {
+  isLocalHostId,
+  getLocalIdentitiesArchiveRoot,
+  getLocalIdentitiesRoot,
+  IDENTITY_KEY_RE,
+  IDENTITY_SLUG_RE,
+  humanizeWakeupSchedule,
+  readIdentityFile,
+  readIdentityWakeups,
+  readIdentityHandoff,
+  readIdentityTrappedWork,
+  readRoleFile,
+  readRoleFileByName,
+  writeIdentityWakeupUpdate,
+  writeIdentityWakeupCreate,
+  writeIdentityWakeupDelete,
+  writeIdentityFile,
+  writeIdentityHandoff,
+  writeRoleFile,
+  writeRoleFileByName,
+  resolveRoleForIdentity,
+  type WakeupSpec,
+} from "./identity-artifact-reader.js";
+import { ROLE_NAME_PATTERN } from "../database/routes/identity-birth-orchestrator.js";
+import { getHostSemaphore } from "../ssh/host-semaphore-registry.js";
+import { settleWithConcurrency } from "../utils/settle-with-concurrency.js";
+import { blockedCommandIn } from "../../types/blocked-commands.js";
+import { buildSendKeysCommands } from "./send-keys-chunks.js";
+import {
+  isCutOffPermissionPrompt,
+  parsePermissionPromptScreen,
+  type PermissionPromptScreen,
+} from "./permission-prompt-screen.js";
+
+/**
+ * Live Claude-session WebSocket server on port 30011.
+ *
+ * Wire protocol (V1 hard-lock, RENDER-01 — IMAGES EXCEPTED per patch #86):
+ *
+ *   client -> server:
+ *     { type: "connectToPane", hostId: number, tmuxSession: string }
+ *     { type: "identity:probe-trapped-work", targets: Array<{ identityKey: string; hostId: number | null }> } // Phase 104 Plan 01: batched per-identity trapped-work probe (~/fleet/identities/<key>/workspace/ walk) for the trapped-work indicator
+ *     // patch #17g/#92: identity artifact fetches (one-shot; no pane needed):
+ *     { type: "identity:get-identity-file", identityKey: string, hostId: number } // patch #17g/#92: fetch <key>.md
+ *     { type: "identity:get-role-file", identityKey: string, hostId: number }     // Phase 22 SRIC-06: fetch ~/fleet/roles/<role>/<role>.md via backend two-step (identity file → role: frontmatter → role artifact)
+ *     { type: "identity:list-wakeups", identityKey: string, hostId: number }      // patch #17g/#92: list wakeups/<slug>/wakeup.json folders
+ *     { type: "identity:get-handoff", identityKey: string, hostId: number }       // patch #17g/#92: fetch handoff.md
+ *     // patch #154: first WRITE paths on identity artifacts. Same hostId routing.
+ *     { type: "identity:update-wakeup", identityKey: string, hostId: number, wakeupSlug: string, updates: { enabled?: boolean, schedule?: object } } // patch #154: patch wakeups/<slug>/wakeup.json
+ *     { type: "identity:create-wakeup", identityKey: string, hostId: number, spec: { name, enabled, schedule, instruction } } // Phase 72 Plan 01: identity-scope create — full CRUD on ~/fleet/identities/<key>/wakeups/<slug>/wakeup.json. Slug derived from spec.name (kebab-case). Throws "A scheduled wake-up with this name already exists — pick a different name." when the <slug>/ folder exists.
+ *     { type: "identity:delete-wakeup", identityKey: string, hostId: number, wakeupSlug: string } // Phase 72 Plan 01: identity-scope delete (removes the whole wakeups/<slug>/ folder; idempotent).
+ *     // Phase 136 retired identity:update-bounty-priority / update-bounty-status /
+ *     // update-bounty-pinned / update-bounty-fields / archive-bounty /
+ *     // delete-bounty wire types alongside the bounty concept retirement.
+ *     // Phase 18 / IDMEDIT-06: markdown write surfaces (full-overwrite, tmp+rename atomic):
+ *     { type: "identity:update-identity-file", identityKey: string, hostId: number, contents: string } // Phase 18: full-overwrite <key>/<key>.md via SFTP tmp+rename (REMOTE) or fs tmp+rename (LOCAL)
+ *     { type: "identity:update-role-file", identityKey: string, hostId: number, contents: string }     // Phase 22 SRIC-06: full-overwrite ~/fleet/roles/<role>/<role>.md via backend two-step
+ *     { type: "role:update-file", roleName: string, hostId: number, contents: string }                 // Phase 90 Plan 90-03: role-name-keyed companion of identity:update-role-file — full-overwrite ~/fleet/roles/<roleName>/<roleName>.md without the identity two-step. Consumed by the RoleModal (Plan 90-04) which has no identity context.
+ *     // Phase 90 Plan 90-07: role-name-keyed READ variants (D-08.3). Byte-shape mirrors of identity-keyed handlers MINUS identity two-step. RoleModal has role-name context, not identity. Phase 134 Plan 134-02: role-scope wakeup CRUD variants retired.
+ *     { type: "role:get-file", roleName: string, hostId: number }                                          // Phase 90 Plan 90-07: role-name-keyed companion of identity:get-role-file — read ~/fleet/roles/<roleName>/<roleName>.md directly.
+ *     // Phase 134 Plan 134-02 retired role:list-wakeups / create-wakeup /
+ *     // update-wakeup / delete-wakeup. Phase 136 retired role:list-bounties.
+ *     { type: "identity:update-handoff", identityKey: string, hostId: number, contents: string }       // Phase 18: full-overwrite <key>/handoff.md
+ *     // hostId routing (patch #92): when omitted OR when the hostId is in IDENTITIES_LOCAL_HOST_IDS,
+ *     // reads from the local bind-mount (IDENTITIES_HOST_DIR); otherwise SSHes to the pane's host.
+ *     // Response shapes UNCHANGED — only request payloads gain the optional hostId field.
+ *
+ *   server -> client:
+ *     { type: "session", pid, sessionFile }                      // metadata
+ *     { type: "message", role, content, eventId, ts }            // per parsed JSONL line
+ *     { type: "image", role, images, text, eventId, ts }         // per parsed JSONL turn carrying base64 image content (patch #86, WS-inline b64)
+ *     { type: "wip", active }                                    // work-in-progress state (emitted on transitions + once as initial state)
+ *     { type: "context_pct", pct }                               // 0-100, live scrape of Claude Code status-line "context) NN%"
+ *     { type: "harness_tasks", tasks }                           // Claude Code /queue + TaskCreate items — read from ~/.claude/tasks/<sid>/*.json
+ *     { type: "backgrounded_agents", agents }                    // currently-running Agent{run_in_background:true} subagents — derived from JSONL tool_use/tool_result correlation (patch #61)
+ *     { type: "backgrounded_shells", shells }                    // currently-running Bash{run_in_background:true} shells — derived from JSONL tool_use / task-notification correlation (patch #68)
+ *     // Phase 56 (2026-08-23) — invisible dormancy. The wake WS message
+ *     // (client -> server) and its wake_result response are DELETED. The
+ *     // dormant frame stays on the wire for internal state tracking
+ *     // (paneState machine, WIP-indicator gating, live-frame auto-dismiss)
+ *     // but no user-facing UI consumes it — DormancyOverlay + Wake button
+ *     // were removed in Plan 56-03. wakingSince field was removed in Plan
+ *     // 56-01. Sends into a dormant pane trigger invisible wake at the
+ *     // send-path (Plan 56-01) with widened watchdog (Plan 56-02).
+ *     { type: "dormant", dormant: boolean }                      // server -> client: emit-only-on-change; identity pane's .dormant sentinel state
+ *     { type: "pane_state", state: "active"|"holding"|"dormant"|"inactive"|"error", reason?: string } // Phase 30 PS30-01: authoritative pane-entry state verdict; emitted alongside every existing dormant/session_holding/session_holding_cleared/session_changed/inactive transition + on connectToPane attach. Legacy frames remain on the wire this phase for backward compat (deprecation deferred per 30-CONTEXT.md § Deferred).
+ *     { type: "inactive", reason }                               // FALLBACK-01: send once, then silent
+ *     { type: "tail_error", message }                            // recoverable: client may render a banner
+ *     { type: "error", message, code? }                          // fatal for this pane
+ *     { type: "identity:trapped-work", results: Array<{ identityKey, hostId, hasTrappedWork, error? }> } // Phase 104 Plan 01: response to identity:probe-trapped-work (one-shot; WS closed by client after receipt)
+ *     // patch #17g: identity artifact responses (one-shot; WS closed by client after receipt):
+ *     { type: "identity:identity-file", markdown: string, error?: string } // patch #17g: response to identity:get-identity-file
+ *     { type: "identity:role-file", markdown: string, error?: string }      // Phase 22 SRIC-06: response to identity:get-role-file
+ *     { type: "identity:wakeups", wakeups: Wakeup[], error?: string }       // patch #17g: response to identity:list-wakeups
+ *     { type: "identity:handoff", markdown: string, error?: string }        // patch #17g: response to identity:get-handoff
+ *     // patch #154: post-write responses carry the FRESH list so the client can atomically re-render without a follow-up read.
+ *     { type: "identity:wakeup-updated", wakeups: Wakeup[], error?: string }  // patch #154: response to identity:update-wakeup (includes refreshed list)
+ *     { type: "identity:wakeup-created", wakeups: Wakeup[], error?: string } // Phase 72 Plan 01: response to identity:create-wakeup (fresh identity-scope list)
+ *     { type: "identity:wakeup-deleted", wakeups: Wakeup[], error?: string } // Phase 72 Plan 01: response to identity:delete-wakeup (fresh identity-scope list)
+ *     // Phase 18 / IDMEDIT-06: post-write echoes — server re-reads after write so client rehydrates from server-side truth:
+ *     { type: "identity:identity-file-updated", markdown: string, error?: string } // Phase 18: response to identity:update-identity-file (confirmed markdown post-write)
+ *     { type: "identity:role-file-updated", markdown: string, error?: string }      // Phase 22 SRIC-06: response to identity:update-role-file (confirmed markdown post-write, re-read via two-step)
+ *     { type: "role:file-updated", markdown: string, error?: string }                // Phase 90 Plan 90-03: response to role:update-file (confirmed markdown post-write, re-read via readRoleFileByName)
+ *     // Phase 90 Plan 90-07: response envelopes for the role-name-keyed READ variants (D-08.3). Phase 134 Plan 134-02: role-scope wakeup CRUD retired.
+ *     { type: "role:file-loaded", markdown: string, error?: string }                                        // Phase 90 Plan 90-07: response to role:get-file
+ *     // Phase 134 Plan 134-02 retired role:wakeups-loaded / wakeup-created /
+ *     // wakeup-updated / wakeup-deleted. Phase 136 retired role:bounties-loaded.
+ *     { type: "identity:handoff-updated", markdown: string, error?: string }        // Phase 18: response to identity:update-handoff (confirmed markdown post-write)
+ *
+ * Image frames carry inline base64 payloads: each `images[]` element is
+ * `{ data: string, mediaType: string, toolUseId?: string }` where `data`
+ * is raw base64 with no `data:` URI prefix (the frontend adds one at
+ * render time). A typical PNG Read is ~150KB on the wire — acceptable
+ * for the read-only sessions pretty-view targets, and there is no HTTP
+ * fallback endpoint to bolt onto (pretty-view is WS-only architecture).
+ *
+ * Auth model mirrors `src/backend/ssh/terminal.ts` exactly: cookie `jwt=`
+ * then `Authorization: Bearer <token>` then `?token=` query fallback. JWT
+ * verified by AuthManager singleton; UserCrypto data-key must be resolved
+ * (otherwise close 1008 with DATA_LOCKED per the terminal WS posture).
+ *
+ * Keep-alive follows patch #10's convention: `ws.ping()` every 30 s and
+ * terminate on a double-miss of `pong`. This survives Chrome's
+ * intensive-throttling on backgrounded tabs because ping/pong frames are
+ * dispatched by the browser's networking layer, not the JS event loop.
+ *
+ * FALLBACK-01 enforcement (never reach back to a prior session file):
+ * when discovery returns `inactive`, the server emits a single
+ * `{type:"inactive",reason}` frame and STOPS. It does not open a tail; it
+ * does not look at any other file. Any future scope creep here should
+ * touch this comment first.
+ */
+
+const authManager = AuthManager.getInstance();
+const userCrypto = UserCrypto.getInstance();
+
+// Patch #92: humanizeWakeupSchedule moved to identity-artifact-reader.ts to avoid
+// circular dependency (reader imports from server → server imports from reader would cycle).
+// Imported above and re-exported so callers outside this module can still use it if needed.
+export { humanizeWakeupSchedule };
+
+// pv-malformed-line-dedup-across-tail-restarts (2026-08-10): stable eventId
+// derived from the raw malformed line so appendDedup can collapse replays.
+// tailSessionFile runs `tail -F -n +1`, which re-reads from line 1 on every
+// (re)start (WS reconnect / session_changed / patch #344 visibility resume);
+// without a content-derived id, each replay of the same malformed line got a
+// fresh random id and stacked as a new bubble. 12 hex chars = 48 bits, ample
+// for line-uniqueness within one session file.
+function malformedEventId(rawLine: string): string {
+  return (
+    "malformed-" +
+    createHash("sha1").update(rawLine).digest("hex").slice(0, 12)
+  );
+}
+export const __malformedEventIdForTests = malformedEventId;
+
+// ─── Phase 47 Plan 03 Hunk A: shared reshape helper ─────────────────────────
+//
+// `reshapeParsedLineToWireFrame` was extracted from the streaming-tail
+// dispatch switch (was inline at ~L2416-2522). It is the SINGLE source of
+// truth for turning a `ParsedLine` (from parseSessionLine) into a wire
+// frame — used by both:
+//   (a) the streaming-tail onLine callback (real-time playback of new lines
+//       written to the JSONL as the conversation progresses); and
+//   (b) `handleFetchOlderRange` (Plan 47-03 Hunk C — the load-more button's
+//       WS request handler, reads a bounded slice of older lines).
+//
+// Wire-shape parity between the two paths is structurally guaranteed by
+// their SHARED call to this helper. Without the extraction, streaming-tail
+// and range-fetch would drift on frame shape (parser produces {kind:"..."},
+// wire expects {type:"..."} with role/content/eventId/ts fields — the
+// reshape is 100+ lines of case handling; duplicating would guarantee bugs).
+//
+// Signature:
+//   parsed:  the discriminated-union output of parseSessionLine
+//   rawLine: the original raw JSONL line (needed by the malformed branch for
+//            malformedEventId(rawLine))
+//   line:    the 1-indexed JSONL line-number that produced `parsed` — Plan
+//            01 widened every per-turn wire type with an optional `line?:
+//            number` field so the client can track `oldestLoadedLine` and
+//            derive the next `beforeLine` cursor value.
+// Returns:
+//   The wire-frame object (a member of the `StreamEvent` union below),
+//   OR null when `parsed.kind === "skip"` (silent-drop policy inherited
+//   from the streaming-tail's original switch — RENDER-01 hard-lock).
+//
+// The `StreamEvent` local type alias mirrors Plan 01's
+// `FetchOlderRangeBatchEvent.messages[]` union in claude-session-api.ts —
+// the same 5 per-turn types the streaming tail emits. Local alias (rather
+// than an import) keeps this backend file free of a cross-boundary type
+// coupling for what is effectively a purely-local emit shape.
+type StreamEvent =
+  | {
+      type: "message";
+      role: "user" | "assistant";
+      content: string;
+      eventId: string;
+      ts: number;
+      line: number;
+      interrupted?: true;
+      turnEnd?: true;
+    }
+  | {
+      type: "image";
+      role: "user" | "assistant" | "tool_result";
+      images: import("./session-file-parser.js").ImageBlock[];
+      text: string;
+      eventId: string;
+      ts: number;
+      line: number;
+    }
+  | {
+      type: "relay_outbound";
+      room: string | null;
+      rawCommand: string;
+      body: string | null;
+      to: string | null;
+      toolUseId: string | null;
+      eventId: string;
+      ts: number;
+      line: number;
+    }
+  | {
+      type: "relay_send_result";
+      toolUseId: string;
+      ok: boolean;
+      roomId: string | null;
+      error: string | null;
+      eventId: string;
+      ts: number;
+      line: number;
+    }
+  | {
+      type: "relay_inbound";
+      room: string;
+      sender: string;
+      matrixEventId: string;
+      body: string;
+      raw: string;
+      eventId: string;
+      ts: number;
+      line: number;
+    }
+  | {
+      type: "malformed_line";
+      bytes: number;
+      eventId: string;
+      ts: number;
+      line: number;
+    }
+  | {
+      type: "compaction";
+      summary: string;
+      eventId: string;
+      ts: number;
+      line: number;
+    }
+  | {
+      type: "compaction_guidance";
+      guidance: string;
+      eventId: string;
+      ts: number;
+      line: number;
+    };
+
+export function reshapeParsedLineToWireFrame(
+  parsed: import("./session-file-parser.js").ParsedLine,
+  rawLine: string,
+  line: number,
+): StreamEvent | null {
+  switch (parsed.kind) {
+    case "message":
+      return {
+        type: "message",
+        role: parsed.role,
+        content: parsed.content,
+        eventId: parsed.eventId,
+        ts: parsed.ts,
+        line,
+        ...(parsed.interrupted ? { interrupted: true as const } : {}),
+        ...(parsed.turnEnd ? { turnEnd: true as const } : {}),
+      };
+    case "image":
+      return {
+        type: "image",
+        role: parsed.role,
+        images: parsed.images,
+        text: parsed.text,
+        eventId: parsed.eventId,
+        ts: parsed.ts,
+        line,
+      };
+    case "relay_outbound":
+      // Diagnostic drop pretty-view-outgoing-relay-render: body ?? null so JSON.stringify
+      // emits an explicit null; the frontend's `body !== null` check would take
+      // the pretty branch on undefined and produce an invisible bubble.
+      return {
+        type: "relay_outbound",
+        room: parsed.room,
+        rawCommand: parsed.rawCommand,
+        body: parsed.body ?? null,
+        to: parsed.to ?? null,
+        toolUseId: parsed.toolUseId ?? null,
+        eventId: parsed.eventId,
+        ts: parsed.ts,
+        line,
+      };
+    case "relay_send_result":
+      return {
+        type: "relay_send_result",
+        toolUseId: parsed.toolUseId,
+        ok: parsed.ok,
+        roomId: parsed.roomId,
+        error: parsed.error,
+        eventId: parsed.eventId,
+        ts: parsed.ts,
+        line,
+      };
+    case "relay_inbound":
+      return {
+        type: "relay_inbound",
+        room: parsed.room,
+        sender: parsed.sender,
+        matrixEventId: parsed.matrixEventId,
+        body: parsed.body,
+        raw: parsed.raw,
+        eventId: parsed.eventId,
+        ts: parsed.ts,
+        line,
+      };
+    case "malformed":
+      // pv-malformed-jsonl-placeholder-bubble: eventId is a content-hash of
+      // the raw line so tail-restart replays dedupe via appendDedup instead
+      // of stacking a fresh placeholder each restart.
+      return {
+        type: "malformed_line",
+        bytes: parsed.bytes,
+        eventId: malformedEventId(rawLine),
+        ts: Date.now(),
+        line,
+      };
+    case "compaction":
+      return {
+        type: "compaction",
+        summary: parsed.summary,
+        eventId: parsed.eventId,
+        ts: parsed.ts,
+        line,
+      };
+    case "compaction_guidance":
+      return {
+        type: "compaction_guidance",
+        guidance: parsed.guidance,
+        eventId: parsed.eventId,
+        ts: parsed.ts,
+        line,
+      };
+    case "skip":
+      // RENDER-01 hard-lock: kind:"skip" (meta / empty_content /
+      // harness_wrapper / no_message / unknown-type) is silently dropped.
+      // Caller filters nulls before pushing to the messages array.
+      return null;
+    default: {
+      // Exhaustive-check guard — TS narrows `parsed` to `never` here if
+      // every case is covered. If parseSessionLine gains a new kind and
+      // this switch isn't updated, the assignment fails compilation.
+      const _exhaustive: never = parsed;
+      void _exhaustive;
+      return null;
+    }
+  }
+}
+export const __reshapeParsedLineToWireFrameForTests = reshapeParsedLineToWireFrame;
+
+// ─── quick-260821-shn: slash-command wrapper → raw-body reconstruction ───────
+//
+// Bug shape (verbatim from quick-260821-shn):
+//   • Frontend PrettyView composer arms pv-send-watchdog with
+//     `sha256("/id tabitha").slice(0,32)` — hashes the RAW body the user typed.
+//   • Claude Code writes the user turn to session-file JSONL as a WRAPPER:
+//     `<command-message>id</command-message><command-name>/id</command-name><command-args>tabitha</command-args>`.
+//   • Backend tail-side onLine callback (this file, below) previously hashed
+//     the WRAPPER string, so the two hashes never matched → pending watchdog
+//     never cleared → T+2500ms retry Enter + T+5500ms full re-send fired,
+//     double-submitting the slash-command into the harness.
+//
+// Fix (dual-hash notify — additive, backend-only):
+//   • On every kind:"message" role:"user" tail signal, notify with the
+//     wrapper-hash (unchanged pre-fix behavior).
+//   • If the content matches the slash-command wrapper shape, reconstruct the
+//     raw `/NAME[ ARGS]` body the frontend hashed and notify a SECOND time
+//     with `sha256(rawBody).slice(0,32)`. Non-slash user turns fall through
+//     unchanged (helper returns null → single notify).
+//
+// Regex idioms (load-bearing):
+//   • `[\s\S]*?` for args capture — dotall-equivalent so multi-line args land
+//     verbatim (a slash-command args body may contain real newlines; `.*?`
+//     would be newline-sensitive and would fail multi-line test 4).
+//   • `[^<]+` for name capture — bounded by the closing tag; non-empty name
+//     required (empty name after the slash is treated as malformed).
+
+const CMD_NAME_RE = /<command-name>\/([^<]+)<\/command-name>/;
+const CMD_NAME_ANY_RE = /<command-name>([\s\S]*?)<\/command-name>/;
+const CMD_ARGS_RE = /<command-args>([\s\S]*?)<\/command-args>/;
+const CMD_SIBLING_RE = /<command-message>|<command-args>/;
+
+/**
+ * Pure helper: reconstruct the raw `/NAME[ ARGS]` body the frontend hashed
+ * from the Claude-Code JSONL wrapper. Returns null when the content is not
+ * a slash-command wrapper OR when the wrapper is malformed.
+ *
+ * Detection (must-hold, both):
+ *   (i)  `<command-name>/NAME</command-name>` present, with NAME non-empty
+ *        (`name.trim().length > 0`).
+ *   (ii) At least ONE sibling wrapper tag (`<command-message>` or
+ *        `<command-args>`) present anywhere in the content.
+ *
+ * Extraction:
+ *   • NAME captured via `[^<]+` (bounded, non-empty).
+ *   • ARGS captured via `[\s\S]*?` (dotall-safe; multi-line verbatim).
+ *   • If `<command-args>` missing OR captured args trims to empty →
+ *     reconstruct as `/NAME` (no trailing space).
+ *   • Otherwise reconstruct as `/NAME ARGS` (single space; args verbatim).
+ *
+ * Malformed handling (returns null + logs at INFO on sshLogger):
+ *   • `<command-name>` present but inner text does NOT start with `/`.
+ *   • `<command-name></command-name>` empty or whitespace-only inner text.
+ *   • `<command-name>/</command-name>` (slash alone, no name).
+ *   • `<command-name>` present but NO sibling wrapper tag (`<command-message>`
+ *     or `<command-args>`) — treated as malformed, per plan § A detection
+ *     contract (ii).
+ *
+ * The "no `<command-name>` at all" case is the hot path (non-slash user
+ * turns) — returns null with NO log to keep per-message logging cheap
+ * (role directive "logging is cheap and batched" — batched here means
+ * not-per-message on the common path).
+ */
+export function reconstructRawSlashCommand(content: string): string | null {
+  // Fast path: bail immediately if no <command-name> tag anywhere. This is
+  // the common (non-slash user turn) case — must NOT log to keep per-message
+  // logging batched off the hot path.
+  const anyNameMatch = CMD_NAME_ANY_RE.exec(content);
+  if (anyNameMatch === null) return null;
+
+  const innerName = anyNameMatch[1] ?? "";
+  // Detected the wrapper tag but the inner text is missing a leading slash,
+  // is empty, or is `/` alone → malformed. Log at INFO so we can spot this
+  // failure mode in structured logs (occurrences here indicate a Claude Code
+  // wire-shape change or a wrapper produced by a code path we haven't seen).
+  const nameSlashMatch = CMD_NAME_RE.exec(content);
+  if (nameSlashMatch === null || (nameSlashMatch[1] ?? "").trim().length === 0) {
+    sshLogger.info(
+      `[pv-send-watchdog] reconstructRawSlashCommand: malformed slash-command wrapper skipped contentLen=${content.length}`,
+      {
+        operation: "pv_send_watchdog_malformed_wrapper",
+        innerNameLen: innerName.length,
+      },
+    );
+    return null;
+  }
+
+  // <command-name> alone (no sibling wrapper tag) → malformed. Log at INFO.
+  if (!CMD_SIBLING_RE.test(content)) {
+    sshLogger.info(
+      `[pv-send-watchdog] reconstructRawSlashCommand: malformed slash-command wrapper skipped contentLen=${content.length}`,
+      {
+        operation: "pv_send_watchdog_malformed_wrapper",
+        reason: "no_sibling_tag",
+      },
+    );
+    return null;
+  }
+
+  const name = nameSlashMatch[1] as string; // narrowed by the trim check above
+  const argsMatch = CMD_ARGS_RE.exec(content);
+  const args = argsMatch !== null ? (argsMatch[1] ?? "") : "";
+  return args.trim().length > 0 ? `/${name} ${args}` : `/${name}`;
+}
+
+/**
+ * Test seam extracted from the tail-side onLine notify block below (~L3498).
+ * The seam owns:
+ *   1. The guard (frame is message/user + non-empty string content + non-empty
+ *      sessionIdFromFile).
+ *   2. The single order-based notifyMatched(sessionId) call — clears the OLDEST
+ *      pending pv-send arm on that session (FIFO head-pop, matching frontend
+ *      order-based semantic at PrettyView.tsx:1961-1979, quick-260908-bqx).
+ *
+ * Injectable deps (all required):
+ *   • `frame` — the reshaped wire frame from `reshapeParsedLineToWireFrame`.
+ *   • `sessionIdFromFile` — session id extracted from the JSONL filepath, or
+ *      null when the tail hasn't attached to a real session yet.
+ *   • `notifyMatched` — bound to `notifyPvSendMatched` in production; tests
+ *      inject a spy to assert the exact call count and sessionId argument.
+ */
+export function __applyOnLineNotifyForTests(deps: {
+  frame: { type?: string; role?: string; content?: unknown; text?: unknown };
+  sessionIdFromFile: string | null;
+  notifyMatched: (sessionId: string) => void;
+}): void {
+  const { frame, sessionIdFromFile, notifyMatched } = deps;
+
+  // A user turn arrives as a message frame, or as an image frame when
+  // Claude Code turned image paths in the sent text into inline images —
+  // both are the echo of a pending send.
+  const content =
+    frame.type === "message"
+      ? frame.content
+      : frame.type === "image"
+        ? frame.text
+        : undefined;
+  if (
+    frame.role !== "user" ||
+    typeof content !== "string" ||
+    content.length === 0 ||
+    !sessionIdFromFile
+  ) {
+    return;
+  }
+
+  notifyMatched(sessionIdFromFile);
+}
+
+// ─── Phase 51 Plan 01: backgrounded-agents correlator (extracted test seam) ──
+//
+// State type for the extracted correlator. Mirrors the closure-local Map value
+// shapes at ~L2143 (backgroundedAgents), ~L2162 (backgroundedShells), and the
+// new pendingAgentAdmission scratch map introduced in Task 2 of Phase 51 Plan
+// 01 (see 51-RESEARCH.md § "Fix Shape (recommended)"). Kept as an inline type
+// bag rather than a shared interface because the per-connection closure owns
+// the concrete Maps — the helper only mutates them in place.
+export type __BackgroundedAgentsCorrelatorStateForTests = {
+  backgroundedAgents: Map<
+    string,
+    {
+      toolUseId: string;
+      subagentType: string;
+      description: string;
+      startedAt: number;
+    }
+  >;
+  pendingAgentAdmission: Map<
+    string,
+    {
+      toolUseId: string;
+      subagentType: string;
+      description: string;
+      startedAt: number;
+    }
+  >;
+  backgroundedShells: Map<
+    string,
+    {
+      toolUseId: string;
+      description: string;
+      command: string;
+      ts: number;
+    }
+  >;
+  // Harness task id (Bash `backgroundTaskId` / Agent `agentId`, read off the
+  // launch-ack tool_result) → tool_use id. Newer harnesses write completion
+  // notifications carrying only <task-id>, and TaskStop/KillShell name the
+  // task id, so removal must resolve through this index.
+  taskIdToToolUseId: Map<string, string>;
+  // TaskStop / KillShell tool_use id → the task id it names. The row is
+  // removed only when that stop call's tool_result comes back without error
+  // (a denied or failed stop leaves the task running).
+  pendingStops: Map<string, string>;
+};
+
+// Phase 51 Plan 01 refactor-extract: the raw-line scan for backgrounded
+// Agent / Bash tool_use → tool_result correlation used to live inline inside
+// the wss.on("connection") closure (~L2527-2620 pre-refactor). Extracting
+// into a module-scope helper makes the correlator unit-testable without
+// spinning up a full WS server + SSH pair. The in-closure call site invokes
+// this SAME helper against its own state Maps, so what tests exercise is
+// what production runs.
+//
+// Phase 51 Plan 01 Task 2 extends the Agent branch to admit modern-shape
+// (v2.1.150+) invocations via a two-step scratch-and-promote path:
+//   (a) At tool_use time, Agents WITHOUT `input.run_in_background` (modern
+//       shape) stash into `state.pendingAgentAdmission`. Agents WITH the
+//       legacy flag admit directly to `state.backgroundedAgents` (backward
+//       compat — older Claude Code or any future harness that reintroduces
+//       the flag).
+//   (b) At tool_result time, if `toolUseResult.isAsync === true` (the async-
+//       launch-ack), any pending scratch entry with matching tool_use_id is
+//       promoted into `state.backgroundedAgents`. If NOT isAsync (a real
+//       sync completion), any lingering scratch entry is dropped alongside
+//       the existing `backgroundedAgents.delete` — this is the "sync Agent
+//       silently dropped" behavior.
+// The Bash branch is UNTOUCHED — Claude Code v2.1.150+ still writes Bash
+// {run_in_background:true} in the legacy shape per RESEARCH.md § "Bash
+// shape on v2.1.150" empirical finding.
+//
+// Malformed / non-JSON lines are silently ignored — same posture as the
+// parser (see the surrounding try/catch at ~L2527).
+export function __admitBackgroundedAgentsLineForTests(
+  line: string,
+  state: __BackgroundedAgentsCorrelatorStateForTests,
+): void {
+  const {
+    backgroundedAgents,
+    pendingAgentAdmission,
+    backgroundedShells,
+    taskIdToToolUseId,
+    pendingStops,
+  } = state;
+  try {
+    const obj = JSON.parse(line) as {
+      type?: string;
+      timestamp?: string;
+      message?: { content?: unknown };
+    };
+    const content = obj?.message?.content;
+    if (obj?.type === "assistant" && Array.isArray(content)) {
+      for (const block of content as unknown[]) {
+        const b = block as {
+          type?: string;
+          name?: string;
+          id?: string;
+          input?: {
+            run_in_background?: boolean;
+            subagent_type?: unknown;
+            description?: unknown;
+            command?: unknown;
+          };
+        };
+        if (
+          b?.type === "tool_use" &&
+          b?.name === "Agent" &&
+          typeof b?.id === "string"
+        ) {
+          const startedAt =
+            typeof obj.timestamp === "string"
+              ? Date.parse(obj.timestamp) || Date.now()
+              : Date.now();
+          const info = {
+            toolUseId: b.id,
+            subagentType:
+              typeof b.input?.subagent_type === "string"
+                ? b.input.subagent_type
+                : "",
+            description:
+              typeof b.input?.description === "string"
+                ? b.input.description
+                : "",
+            startedAt,
+          };
+          if (b?.input?.run_in_background === true) {
+            // Legacy shape (older Claude Code, or any harness that
+            // reintroduces the field): admit directly — backward compat.
+            backgroundedAgents.set(b.id, info);
+          } else {
+            // Modern shape (Claude Code v2.1.150+): stash for late admission
+            // on the async-launch-ack (toolUseResult.isAsync === true). A
+            // synchronous Agent will never receive the ack — its scratch
+            // entry is silently dropped in the non-async completion branch
+            // below (never enters backgroundedAgents, never emitted).
+            pendingAgentAdmission.set(b.id, info);
+          }
+        }
+        if (
+          b?.type === "tool_use" &&
+          b?.name === "Bash" &&
+          b?.input?.run_in_background === true &&
+          typeof b?.id === "string"
+        ) {
+          const ts =
+            typeof obj.timestamp === "string"
+              ? Date.parse(obj.timestamp) || Date.now()
+              : Date.now();
+          const rawCommand =
+            typeof b.input.command === "string" ? b.input.command : "";
+          backgroundedShells.set(b.id, {
+            toolUseId: b.id,
+            description:
+              typeof b.input.description === "string"
+                ? b.input.description
+                : "",
+            command: rawCommand.slice(0, 120),
+            ts,
+          });
+        }
+        // Agent-initiated stop of a background task. No task-notification
+        // is written for these, so without this the row sticks forever.
+        if (
+          b?.type === "tool_use" &&
+          (b?.name === "TaskStop" || b?.name === "KillShell")
+        ) {
+          const stopInput = b.input as
+            | { task_id?: unknown; shell_id?: unknown }
+            | undefined;
+          const taskId =
+            typeof stopInput?.task_id === "string"
+              ? stopInput.task_id
+              : typeof stopInput?.shell_id === "string"
+                ? stopInput.shell_id
+                : null;
+          if (taskId !== null && typeof b.id === "string") {
+            pendingStops.set(b.id, taskId);
+          }
+        }
+      }
+    } else if (obj?.type === "user" && Array.isArray(content)) {
+      // Index the harness task id from the launch-ack so later removals that
+      // only name the task id (TaskStop, <task-id>-only notifications) can
+      // resolve back to the tool_use id the panels are keyed on.
+      const launchResult = (
+        obj as {
+          toolUseResult?: {
+            backgroundTaskId?: unknown;
+            agentId?: unknown;
+            isAsync?: unknown;
+          };
+        }
+      )?.toolUseResult;
+      const launchTaskId =
+        typeof launchResult?.backgroundTaskId === "string"
+          ? launchResult.backgroundTaskId
+          : launchResult?.isAsync === true &&
+              typeof launchResult?.agentId === "string"
+            ? launchResult.agentId
+            : null;
+      // Only index launches the panels actually track — foreground Agent
+      // results carry agentId too and would otherwise grow the map forever.
+      // A turn carrying more than one tool_result is ambiguous; skip it.
+      const resultBlocks = (content as unknown[]).filter(
+        (block): block is { type: string; tool_use_id: string } =>
+          (block as { type?: unknown })?.type === "tool_result" &&
+          typeof (block as { tool_use_id?: unknown })?.tool_use_id ===
+            "string",
+      );
+      if (launchTaskId !== null && resultBlocks.length === 1) {
+        const launchedId = resultBlocks[0].tool_use_id;
+        if (
+          backgroundedShells.has(launchedId) ||
+          backgroundedAgents.has(launchedId) ||
+          pendingAgentAdmission.has(launchedId)
+        ) {
+          taskIdToToolUseId.set(launchTaskId, launchedId);
+        }
+      }
+      for (const block of content as unknown[]) {
+        const b = block as {
+          type?: string;
+          tool_use_id?: string;
+          is_error?: boolean;
+        };
+        if (b?.type !== "tool_result" || typeof b?.tool_use_id !== "string") {
+          continue;
+        }
+        const stoppedTaskId = pendingStops.get(b.tool_use_id);
+        if (stoppedTaskId !== undefined) {
+          pendingStops.delete(b.tool_use_id);
+          if (b.is_error !== true) removeBackgroundedTask(state, stoppedTaskId);
+        }
+      }
+      // Async launch acks (patch #66 fix): for run_in_background:true Agent
+      // invocations, Claude Code writes a tool_result within ~100ms of the
+      // tool_use as a LAUNCH ACKNOWLEDGEMENT ("Async agent launched
+      // successfully...") — NOT completion. The turn carries
+      // toolUseResult.isAsync === true and status: "async_launched". Real
+      // completion arrives ~seconds-to-minutes later as a task-notification
+      // attachment turn (see the new branch below). Skip removal for the
+      // ack so the panel stays mounted; the attachment branch clears it
+      // on the actual completion event.
+      //
+      // Phase 51 Plan 01 Task 2: additionally use the ack as an ADMIT signal
+      // for modern-shape (v2.1.150+) Agent invocations — the tool_use for
+      // these lacked `run_in_background:true`, so they stashed to
+      // `pendingAgentAdmission` instead of admitting immediately. Promote
+      // any matching scratch entry into `backgroundedAgents` here.
+      const isAsyncAck =
+        (obj as { toolUseResult?: { isAsync?: boolean } })?.toolUseResult
+          ?.isAsync === true;
+      if (isAsyncAck) {
+        for (const block of content as unknown[]) {
+          const b = block as {
+            type?: string;
+            tool_use_id?: string;
+          };
+          if (
+            b?.type === "tool_result" &&
+            typeof b?.tool_use_id === "string"
+          ) {
+            const info = pendingAgentAdmission.get(b.tool_use_id);
+            if (info) {
+              backgroundedAgents.set(b.tool_use_id, info);
+              pendingAgentAdmission.delete(b.tool_use_id);
+            }
+          }
+        }
+      } else {
+        for (const block of content as unknown[]) {
+          const b = block as {
+            type?: string;
+            tool_use_id?: string;
+          };
+          if (
+            b?.type === "tool_result" &&
+            typeof b?.tool_use_id === "string"
+          ) {
+            backgroundedAgents.delete(b.tool_use_id);
+            // Phase 51 Plan 01 Task 2: sync-Agent scratch-drop. If a modern-
+            // shape Agent invocation was synchronous (no async-launch-ack
+            // ever arrived — first tool_result is a real completion), the
+            // scratch entry lingers from tool_use time. Drop it here so it
+            // never leaks into backgroundedAgents on a later replay and
+            // never grows unbounded. Delete-on-absent is a no-op, so this
+            // is safe for tool_use_ids that never had a scratch entry.
+            pendingAgentAdmission.delete(b.tool_use_id);
+          }
+        }
+      }
+    }
+  } catch {
+    /* malformed line — silently ignore, same posture as parser */
+  }
+}
+
+// Drop a background task from both panels by harness task id or tool_use id.
+function removeBackgroundedTask(
+  state: __BackgroundedAgentsCorrelatorStateForTests,
+  id: string,
+): void {
+  const toolUseId = state.taskIdToToolUseId.get(id) ?? id;
+  state.taskIdToToolUseId.delete(id);
+  state.backgroundedAgents.delete(toolUseId);
+  state.backgroundedShells.delete(toolUseId);
+  state.pendingAgentAdmission.delete(toolUseId);
+}
+
+// Terminal statuses observed in task-notification payloads. "killed" is what
+// the harness writes when a background shell is stopped (e.g. via TaskStop or
+// session teardown); it was missing before and left shell rows stuck.
+const TASK_NOTIFICATION_TERMINAL_STATUS_RE =
+  /<status>(completed|failed|stopped|cancelled|error|killed)<\/status>/;
+
+// Applies a <task-notification> payload to the correlator state. Matches on
+// <tool-use-id> when present, else on <task-id> (newer harnesses omit the
+// tool-use id for background Agents).
+export function __applyTaskNotificationForTests(
+  payload: string,
+  state: __BackgroundedAgentsCorrelatorStateForTests,
+): void {
+  // Header fields precede the free-text <summary>/<result> bodies, which may
+  // quote other tasks' ids — match only within the header.
+  const bodyStart = payload.search(/<summary>|<result>/);
+  const header = bodyStart === -1 ? payload : payload.slice(0, bodyStart);
+  if (!TASK_NOTIFICATION_TERMINAL_STATUS_RE.test(header)) return;
+  const toolUseIdMatch = header.match(
+    /<tool-use-id>(toolu_[^<]+)<\/tool-use-id>/,
+  );
+  const taskIdMatch = header.match(/<task-id>([^<]+)<\/task-id>/);
+  if (toolUseIdMatch) removeBackgroundedTask(state, toolUseIdMatch[1]);
+  if (taskIdMatch) removeBackgroundedTask(state, taskIdMatch[1]);
+}
+
+// Patch #66 completion signal for backgrounded Agents. Claude Code /
+// its harness lands the task-notification payload in the JSONL in
+// AT LEAST three observed shapes across versions and states:
+//   (1) type:"attachment" with attachment.commandMode:"task-
+//       notification" and attachment.prompt carrying the XML.
+//   (2) type:"queue-operation" with a top-level `content` string
+//       carrying the XML (harness enqueue bookkeeping).
+//   (3) type:"user" with message.content being a raw STRING that
+//       starts with "<task-notification>" (the user-turn form
+//       observed on this box's Claude Code v2.1.143).
+// Detect any of the three by picking whichever field carries the
+// payload; require the STRING to START with "<task-notification>"
+// (not merely contain it) so a normal user message or tool_result
+// that happens to quote the phrase does NOT false-positive — same
+// discipline as patch #65's anchored /exit scan.
+function taskNotificationPayload(
+  obj: { type?: string; message?: { content?: unknown } },
+): string | null {
+  const content = obj?.message?.content;
+  // Shape 1: type:"attachment" + attachment.prompt
+  const attachmentAny = obj as {
+    type?: string;
+    attachment?: { commandMode?: string; prompt?: unknown };
+  };
+  if (
+    attachmentAny?.type === "attachment" &&
+    attachmentAny?.attachment?.commandMode === "task-notification" &&
+    typeof attachmentAny?.attachment?.prompt === "string" &&
+    attachmentAny.attachment.prompt.startsWith("<task-notification>")
+  ) {
+    return attachmentAny.attachment.prompt;
+  }
+  // Shape 2: type:"queue-operation" + top-level content string
+  const qopAny = obj as { type?: string; content?: unknown };
+  if (
+    qopAny?.type === "queue-operation" &&
+    typeof qopAny?.content === "string" &&
+    qopAny.content.startsWith("<task-notification>")
+  ) {
+    return qopAny.content;
+  }
+  // Shape 3: type:"user" + message.content as raw XML string
+  if (
+    obj?.type === "user" &&
+    typeof content === "string" &&
+    content.startsWith("<task-notification>")
+  ) {
+    return content;
+  }
+  return null;
+}
+
+/**
+ * Feed one raw JSONL line to the background-work correlator: admission of
+ * backgrounded Agents / shells, stops, and task-notification completions.
+ * Shared by the live tail and the windowed open's whole-history search.
+ */
+function applyBackgroundWorkLine(
+  line: string,
+  state: __BackgroundedAgentsCorrelatorStateForTests,
+): void {
+  let obj: { type?: string; timestamp?: string; message?: { content?: unknown } };
+  try {
+    obj = JSON.parse(line);
+  } catch {
+    return; /* malformed line — silently ignore, same posture as parser */
+  }
+  if (!obj || typeof obj !== "object") return;
+  // New-harness pasted_content envelopes → legacy bare-wrapper shape
+  // before the patch #66 startsWith("<task-notification>") checks.
+  normalizePastedHarnessEnvelopes(obj as Record<string, unknown>);
+  __admitBackgroundedAgentsLineForTests(line, state);
+  const notifPayload = taskNotificationPayload(obj);
+  if (notifPayload) __applyTaskNotificationForTests(notifPayload, state);
+}
+
+/** Tool-use ids the history search must look up results for: still-open background work and pending stops. */
+function openBackgroundWorkIds(lines: string[]): string[] {
+  const state: __BackgroundedAgentsCorrelatorStateForTests = {
+    backgroundedAgents: new Map(),
+    pendingAgentAdmission: new Map(),
+    backgroundedShells: new Map(),
+    taskIdToToolUseId: new Map(),
+    pendingStops: new Map(),
+  };
+  for (const l of lines) applyBackgroundWorkLine(l, state);
+  // Pending admissions too: their result decides whether they were
+  // backgrounded, and without it they'd sit in the pending map for good.
+  return [
+    ...state.backgroundedAgents.keys(),
+    ...state.pendingAgentAdmission.keys(),
+    ...state.backgroundedShells.keys(),
+    ...state.pendingStops.keys(),
+  ];
+}
+export const __openBackgroundWorkIdsForTests = openBackgroundWorkIds;
+
+// Phase 3 session-changeover tuning constants. Holding timeout: 200 * 3s = 600s (10min).
+// Per D-31 and CONTEXT.md § holding timeout — Nelly's original timing note said "new .jsonl
+// appears within ~5s; fully-loaded identity ~30-70s later" but a relaunch under load
+// can take multiple minutes (user 2026-08-09: original 45s tripped the red "refresh to
+// check" overlay ~60s into a relaunch that later completed fine; then teardownPane
+// meant even after success nothing cleared the overlay).
+// 10min matches the client-side belt-and-suspenders watchdog at
+// src/ui/features/pretty-view/PrettyView.tsx (was 5min, bumped in the same change) so
+// the two agree; the client watchdog covers the WS-drop case where the backend can't
+// deliver the frame. Keep the two constants in lockstep on any future retune.
+const HOLDING_TIMEOUT_TICKS = 200;
+// Items replayed on open: the client's twenty-item window plus a margin for
+// lines the client collapses as duplicates.
+const OPEN_WINDOW_ITEMS = 25;
+const DISCOVERY_REPOLL_INTERVAL_MS = 3000;
+// Harness-tasks poller tuning — moved to module scope from the pre-refactor
+// inline block so the setupHarnessTasksPoller helper (per BLOCKER fix from
+// plan-checker 2026-07-18) can reference them without re-allocating per call.
+const HARNESS_TASKS_INTERVAL_MS = 3000;
+// MARKER_FALLBACK_MS is now the canonical export from dormant-wake-gate.ts
+// (imported at top of file). Still referenced below for the dormant-poll's
+// own freshness gate + the deep-dormant timing chain — see
+// __applyDormantPollWithRediscoveryForTests.
+const UUID_RE =
+  /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
+
+// Phase 14 (plain-language-translation-asides) Wave 1 — module-scope primitives.
+//
+// The aside subsystem injects a fixed `/btw` prompt into an identity's tmux
+// pane, extracts the BTW-overlay answer, and dismisses the overlay via
+// Escape. All three operations reuse the pane's existing sshConn + the
+// existing execCommand primitive (per PATTERNS.md L438-440 and CONTEXT.md
+// § canonical_refs: no new SSH subsystem, no new port).
+//
+// Per ASIDE-10 (no aside store): these helpers carry NO module-scope state —
+// they are pure request/response over the passed-in SSH connection. Wave 2
+// (14-02) composes them into the frontend-arm-driven poller + WS event
+// surface.
+//
+// BTW_PROMPT is the EXACT literal text from CONTEXT.md § Injection (per
+// ASIDE-03 no-paraphrase rule). The em-dash MUST be a real U+2014 character.
+export const BTW_PROMPT =
+  "/btw Re-explain concisely whatever's currently going on to me since my last message without using code symbols, in a conceptual model style. Not a metaphor — explain the actual thing, don't recast it as an extended analogy.";
+
+// ASIDE_END_MARKER is the literal end-of-answer substring from the BTW
+// overlay's footer line (full marker: `↑/↓ to scroll · f to fork · Esc to
+// close`). Stable across BTW invocations in Claude Code 2.1.150 per the
+// kumquat-test verification (CONTEXT.md § Mechanism).
+export const ASIDE_END_MARKER = "Esc to close";
+
+// BTW_CLEAR_HISTORY_KEY — key sent into the tmux pane before Escape to
+// clear Claude Code's in-overlay /btw history before dismissing the
+// overlay. Rationale: /btw history within a Claude Code session poisons
+// subsequent aside answers (the model self-references prior "please
+// explain" turns from earlier asides). Sending this key first gives every
+// new aside a clean slate. Lowercase `x` per the overlay's clear-history
+// keybinding (user 2026-07-27). If UAT reveals a different key (e.g.
+// `c`, `Ctrl+L`), change this constant only — the two-keystroke shape
+// stays the same.
+export const BTW_CLEAR_HISTORY_KEY = "x";
+
+// Largest compose/voice message the send path accepts (UTF-16 code units, as
+// the WS frame's string length). Long bodies are typed in chunks.
+export const MAX_INPUT_BYTES = 256 * 1024;
+
+// Local shellQuote — byte-identical to src/backend/ssh/terminal.ts L123.
+// Kept local (not cross-module import) to preserve terminal.ts's
+// "no new deps, no new modules" comment above L122. If a future refactor
+// promotes shellQuote to a shared module, update both call sites in lock-step.
+const shellQuote = (s: string): string =>
+  `'${s.replace(/'/g, `'\\''`)}'`;
+
+// Test-only re-export of the local shellQuote helper. NOT for production
+// callers — the underscore prefix marks it as an internal test seam. Lets
+// claude-session-server.aside.test.ts verify byte-parity with terminal.ts L123
+// without duplicating the 2-line body in the test file.
+export const __asideShellQuoteForTests = shellQuote;
+
+/**
+ * injectBtw — send the fixed /btw prompt into the identity's tmux pane via
+ * the pane's existing SSH connection. Wraps the send-keys payload and target
+ * in shellQuote (house-style parity with terminal.ts L574 + L760). Failures
+ * are logged and swallowed — a failed injection is not fatal; Wave 2's
+ * poll-timeout logic handles the "no answer arrived" case.
+ */
+async function injectBtw(
+  conn: SSHClientType,
+  tmuxSession: string,
+): Promise<void> {
+  try {
+    // Patch #152 (2026-07-26): Send BTW_PROMPT text and the Enter keystroke
+    // as TWO separate tmux send-keys invocations with a 200ms gap. In one
+    // call, Claude Code v2.1.150's Ink-based REPL treats the ~300-char
+    // BTW_PROMPT burst as a paste and absorbs the trailing Enter into the
+    // paste buffer — /btw overlay never opens. Two calls + delay lets the
+    // paste buffer flush before Enter arrives as a distinct keystroke.
+    // See historical diagnostic drop aside-btw-enter-not-submitting for the
+    // live reproduction + fix verification against v2.1.150.
+    await execCommand(
+      conn,
+      `tmux send-keys -t ${shellQuote(tmuxSession)} ${shellQuote(BTW_PROMPT)}`,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    await execCommand(
+      conn,
+      `tmux send-keys -t ${shellQuote(tmuxSession)} Enter`,
+    );
+  } catch (err) {
+    sshLogger.info("aside injectBtw failed", {
+      operation: "aside_inject",
+      tmuxSession,
+      err,
+    });
+  }
+}
+
+// Test-only re-export of injectBtw. Same underscore-prefix convention as
+// __asideShellQuoteForTests — internal seam so the vitest suite can assert
+// the two-call shape locked by Patch #152. NOT for production callers.
+export const __injectBtwForTests = injectBtw;
+
+/**
+ * dismissBtw — close the /btw overlay via a TWO-keystroke sequence into the
+ * identity's tmux pane. Replaces the previous single-Escape dismiss so that
+ * the /btw overlay's in-session history is cleared BEFORE the overlay
+ * closes; without this, prior aside answers within the same Claude Code
+ * session poison subsequent asides (the model self-references earlier
+ * "please explain" turns from the same overlay history buffer).
+ *
+ * Sequence:
+ *   1. tmux send-keys BTW_CLEAR_HISTORY_KEY (`x`) — clear /btw history.
+ *   2. Wait 100ms (see gap rationale below).
+ *   3. tmux send-keys Escape — close the /btw overlay.
+ *
+ * The 100ms gap mirrors the SHAPE of patch #152's injectBtw two-call
+ * workaround but uses a shorter delay: dismiss is a pair of single-key
+ * presses, not the ~300-char BTW_PROMPT paste that needs Ink's paste
+ * buffer to flush. 100ms is enough for tmux to deliver the first keystroke
+ * to the overlay before the second is queued.
+ *
+ * The WS frame shape (`{type:'aside_dismissed', hostId, tmuxSession}`) and
+ * the frontend dismiss handler are UNCHANGED — only the backend tmux
+ * keystroke sequence differs from the prior single-Escape dispatch. Both
+ * send-keys calls are wrapped in a single try/catch (log-and-swallow) so a
+ * failed dismiss is not fatal; the pane's Escape recovery is best-effort.
+ *
+ * Both send-keys payloads use shellQuote for the tmux target (house-style
+ * parity with terminal.ts L574 + L760). Escape is an unquoted tmux
+ * send-keys key name — same shape as `Enter` / `C-c` in terminal.ts.
+ */
+async function dismissBtw(
+  conn: SSHClientType,
+  tmuxSession: string,
+): Promise<void> {
+  try {
+    // Step 1: clear /btw history via BTW_CLEAR_HISTORY_KEY before Escape.
+    await execCommand(
+      conn,
+      `tmux send-keys -t ${shellQuote(tmuxSession)} ${shellQuote(BTW_CLEAR_HISTORY_KEY)}`,
+    );
+    // Step 2: 100ms gap so tmux delivers the clear-history key to the
+    // overlay before Escape is queued. Shorter than injectBtw's 200ms —
+    // no paste-buffer flush needed for a single-key press.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    // Step 3: send Escape to close the (now history-cleared) /btw overlay.
+    await execCommand(
+      conn,
+      `tmux send-keys -t ${shellQuote(tmuxSession)} Escape`,
+    );
+  } catch (err) {
+    sshLogger.info("aside dismissBtw failed", {
+      operation: "aside_dismiss",
+      tmuxSession,
+      err,
+    });
+  }
+}
+
+// Test-only re-export of dismissBtw. Same underscore-prefix convention as
+// __injectBtwForTests — internal seam so the vitest suite can assert the
+// two-call shape locked by the quick 260727-lbr change. NOT for production
+// callers.
+export const __dismissBtwForTests = dismissBtw;
+
+/**
+ * extractBtwAnswer — pure string function that extracts the /btw answer
+ * text from a raw tmux capture-pane output snapshot.
+ *
+ * Input:
+ *   paneOutput: raw multi-line output from `tmux capture-pane -p -S -200`
+ *   marker:     the end-of-answer substring (typically ASIDE_END_MARKER,
+ *               i.e. "Esc to close")
+ *
+ * Behavior contract (validated by claude-session-server.aside.test.ts
+ * cases A-E; per 14-01-PLAN.md Task 2 <behavior>):
+ *
+ *   A. marker absent            → null   (answer still streaming)
+ *   B. single-line answer       → the trimmed text between /btw echo + marker
+ *   C. multi-line with scrollback → last-occurrence anchors on BOTH the marker
+ *      AND the /btw echo pick the CURRENT invocation, not any prior BTW echo
+ *      still visible in scrollback (ASIDE-04 scrollback-recovery requirement)
+ *   D. marker present but no /btw echo → null (malformed; do not emit garbage
+ *      to the frontend — Wave 3 renders this string into React and we do not
+ *      want a false-positive aside from parsing noise)
+ *   E. marker + /btw echo + zero lines between → "" (degenerate valid case;
+ *      Wave 2's poll-stability guard filters these — the extractor itself
+ *      does not judge)
+ *
+ * The `/^\s*(>\s*)?\/btw\b/` regex allows for tmux prompt prefixes like
+ * `> ` that Claude Code renders before the echoed slash-command. The `\b`
+ * word-boundary prevents matching random lines that happen to contain
+ * `/btw` as a substring (e.g. a URL or a file path).
+ */
+export function extractBtwAnswer(
+  paneOutput: string,
+  marker: string,
+): string | null {
+  const lines = paneOutput.split("\n");
+
+  // (2) Find the LAST index containing the marker substring.
+  let endIdx = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].includes(marker)) {
+      endIdx = i;
+      break;
+    }
+  }
+  if (endIdx === -1) return null; // CASE A
+
+  // (3) Find the LAST index BEFORE endIdx that matches the /btw echo pattern.
+  //     Allow optional tmux prompt prefix (e.g. `> `).
+  const btwEchoRe = /^\s*(>\s*)?\/btw\b/;
+  let startIdx = -1;
+  for (let i = endIdx - 1; i >= 0; i--) {
+    if (btwEchoRe.test(lines[i])) {
+      startIdx = i;
+      break;
+    }
+  }
+  if (startIdx === -1) return null; // CASE D
+
+  // (5) Slice between the two anchors (exclusive of both), join, trim.
+  //     May return "" for CASE E (valid degenerate).
+  return lines.slice(startIdx + 1, endIdx).join("\n").trim();
+}
+
+// Phase 14 Wave 2 (14-02) — Aside subsystem module-scope state + helpers.
+//
+// Non-negotiable architecture (per CONTEXT.md § Trigger + § Backend per-
+// connection state locks, 2026-07-26):
+//
+//   * asideState MUST live at MODULE SCOPE, not inside wss.on("connection").
+//     Cross-tab dismiss coherence (ASIDE-11) requires broadcastAsideDismissed
+//     to flip peer WSes' `displayed` flags — closure-scoped `let` variables
+//     would leave stale gates on peer connections and silently break the v1
+//     overlap policy (ASIDE-08) across tabs.
+//
+//   * The SOLE trigger source is the client's `aside_arm` WS message. The
+//     backend does NOT observe the terminal WSS idle-signal frame
+//     (that runs on port 30002 in terminal.ts, a separate closure with no
+//     shared state). Identity gating happens frontend-side.
+//
+//   * No aside store beyond these two ephemeral Maps — the tmux BTW overlay
+//     is source of truth (ASIDE-10). Both Maps are keyed by live WS
+//     connections / session identity and are dropped on disconnect.
+//
+// `asideState` — per-WS overlap-ignore gate flags.
+//   `armed`: /btw has been injected on this WS, poller should scrape.
+//   `displayed`: an aside is currently rendered on this WS (own render OR
+//                broadcast render from another tab's arm on the same session).
+//
+// Phase 14 Plan 05 Task 1: `export` added so Wave 5's integration test
+// suite can inspect the source-of-truth Map directly (`import { asideState }`)
+// to assert cross-tab peer-state-flip coherence — the atomic BOTH-STEPS
+// rule from CONTEXT.md § Backend per-connection state LOCK. This is a
+// legitimate observation seam, NOT a test-only export: the Map IS the
+// source of truth per the CONTEXT lock, and observing it is the same
+// posture as any other exported module constant. The pre-existing
+// `__asideStateForTests` alias (below) is preserved for backward
+// compatibility with Wave 2's structural tests.
+export const asideState = new Map<
+  import("ws").WebSocket,
+  { armed: boolean; displayed: boolean }
+>();
+
+// `activeViewers` — fan-out registry keyed by `${hostId}::${tmuxSession}`.
+// Set on connectToPane discovery success; peer entry removed on ws.close.
+const activeViewers = new Map<string, Set<import("ws").WebSocket>>();
+
+// ASIDE_POLL_INTERVAL_MS — extraction poll cadence (per CONTEXT.md
+// § Extraction: ~200-400ms; picked 300ms as the mid-point, matching the
+// house-style grouping with other polling-interval constants like
+// HARNESS_TASKS_INTERVAL_MS.
+const ASIDE_POLL_INTERVAL_MS = 300;
+
+/**
+ * Long-lived slot for `tailSessionFile` — released on stop() or onError.
+ * session-file-tail.ts itself has no hostId, so we hold the slot here at
+ * the caller site (Phase 101 D-06-adjacent).
+ *
+ * Shape: fire-and-forget `getHostSemaphore(hostId).run(...)` whose inner
+ * Promise resolves only when `release()` is called. The semaphore counts
+ * this as one active slot for the full tail lifetime.
+ *
+ * IDEMPOTENT RELEASE: calling `release()` from both `stop()` and `onError`
+ * is safe — resolving an already-resolved Promise is a no-op (the Promise
+ * state IS the idempotency guard; no manual boolean needed).
+ */
+function acquireTailSlot(hostId: number | string): { release: () => void } {
+  let releaser: () => void = () => {};
+  void getHostSemaphore(hostId).run(
+    () => new Promise<void>((resolve) => { releaser = resolve; }),
+  );
+  return { release: () => releaser() };
+}
+
+// sessionKey — build the `${hostId}::${tmuxSession}` composite key used
+// as the activeViewers Map's index. Delimiter `::` avoids collision with
+// tmux-safe session names (frontend restricts to alphanumeric + dash +
+// underscore, so `::` never appears inside the session name half).
+function sessionKey(hostId: number, tmuxSession: string): string {
+  return `${hostId}::${tmuxSession}`;
+}
+
+// INTERRUPT_THROTTLE_MS — the minimum gap between two Ctrl-C keystrokes
+// dispatched to the SAME tmux pane before the second is dropped.
+//
+// Empirical basis (measured 2026-09-16, Claude Code v2.1.150):
+//   Claude Code's exit-confirm window is ~0.8s. Two Ctrl-C presses at gaps
+//   of 0.3 / 0.4 / 0.6 / 0.7 / 0.75s KILLED the harness across repeated
+//   trials; 0.8s / 0.85s / 1.0s survived. 2500ms is ~3× the measured window,
+//   chosen for margin against execCommand's unbounded latency.
+//
+// This number is harness-version-specific. Re-measure after any Claude Code
+// upgrade — the exit-confirm window is owned by Claude Code and can change.
+const INTERRUPT_THROTTLE_MS = 2500;
+
+// interruptThrottleByPane — AUTHORITATIVE per-pane interrupt guard.
+//
+// Maps sessionKey(hostId, tmuxSession) → last-fire epoch ms. A second
+// interrupt arriving within INTERRUPT_THROTTLE_MS of the last is dropped
+// silently server-side, regardless of which client sent it.
+//
+// Why the client-side ref in ComposeBox cannot be the guarantee:
+//   1. It is per-view: two open views (phone + desktop) each hold an
+//      independent ref and can individually respect the window while still
+//      landing two Ctrl-Cs ~200ms apart at the same pane.
+//   2. It times the click, not the arrival: execCommand has no timeout and
+//      unbounded latency, so jitter can compress a compliant pair below 0.8s
+//      in flight.
+//   3. A stale bundle enforces whatever constant it shipped with.
+// Only this server-side Map — keyed by the connection-scoped pane identity
+// the interrupt handler already trusts — can hold the real guarantee.
+const interruptThrottleByPane = new Map<string, number>();
+
+// cancelTrackerByWs — each open pretty-view connection's interrupt tracker
+// (getter, because the connection swaps in a fresh tracker on a session-file
+// transition). Lets a cancel verdict reach every view of the same pane.
+const cancelTrackerByWs = new Map<import("ws").WebSocket, () => InterruptCancelTracker>();
+// Prompt uuids cancelled live by this server process, shared by every tracker
+// (see InterruptCancelTracker's constructor). Memory only; bounded by the tracker.
+const cancelledLivePrompts = new Set<string>();
+const newCancelTracker = (): InterruptCancelTracker => new InterruptCancelTracker(cancelledLivePrompts);
+
+// broadcastPromptCancelled — fan out a live cancel verdict to every OPEN view
+// of the pane: each peer's tracker records it (so a later revive is noticed)
+// and each client hides the bubble. Only the pressing view gets the words
+// back — that is the separate interrupt_result frame.
+function broadcastPromptCancelled(key: string, eventId: string): void {
+  const peers = activeViewers.get(key);
+  if (!peers) return;
+  const frame = JSON.stringify({ type: "messages_hidden", eventIds: [eventId], reason: "cancelled" });
+  let delivered = 0;
+  for (const peer of peers) {
+    if (peer.readyState !== WebSocket.OPEN) continue;
+    cancelTrackerByWs.get(peer)?.().markCancelledLive(eventId);
+    try {
+      peer.send(frame);
+      delivered += 1;
+    } catch {
+      /* peer may be mid-close */
+    }
+  }
+  sshLogger.info(`[interrupt] broadcast-hidden key=${key} eventId=${eventId} peers=${peers.size} delivered=${delivered}`, {
+    operation: "interrupt_broadcast_hidden",
+    key,
+    eventId,
+    peers: peers.size,
+    delivered,
+  });
+}
+
+// broadcastAsideDismissed — atomic fan-out for the dismiss signal.
+// LOAD-BEARING per CONTEXT.md § Backend per-connection state (2026-07-26 lock):
+// MUST perform BOTH steps for every OPEN peer in activeViewers.get(key):
+//   (a) send `{type:"aside_dismissed"}` frame to peer's client
+//   (b) flip `asideState.get(peer).displayed = false` — resets the peer's
+//       overlap-ignore gate so it can arm on the next isIdle transition.
+// Missing step (b) silently breaks the v1 overlap policy (ASIDE-08) across
+// tabs — the peer stays stuck on `displayed:true` forever.
+function broadcastAsideDismissed(key: string): void {
+  const peers = activeViewers.get(key);
+  if (!peers) return;
+  const frame = JSON.stringify({ type: "aside_dismissed" });
+  for (const peer of peers) {
+    // WebSocket.OPEN = 1 (from the "ws" package). Use the numeric sentinel
+    // rather than the class constant to avoid coupling this helper to a
+    // direct WebSocketServer import here (the class is imported at file top).
+    if (peer.readyState !== WebSocket.OPEN) continue;
+    // (a) Send the dismiss frame to the peer's client.
+    try {
+      peer.send(frame);
+    } catch {
+      /* peer may be mid-close — swallow, matching the sibling send-guards
+         throughout this file */
+    }
+    // (b) MANDATORY per CONTEXT.md § Backend per-connection state:
+    // flip the peer's `displayed` flag so its overlap-ignore gate resets
+    // and the peer can arm on next turn's isIdle transition.
+    const peerState = asideState.get(peer);
+    if (peerState) peerState.displayed = false;
+  }
+}
+
+// Test-only re-exports — internal test seams. Underscore prefix marks them
+// as private; NO production caller should reference these. Enables the
+// vitest suite to assert the module-scope Map identities + the atomic
+// BOTH-STEPS rule of broadcastAsideDismissed without spinning up a full
+// WebSocketServer.
+export const __asideStateForTests = asideState;
+export const __activeViewersForTests = activeViewers;
+
+// Phase 95 Part C — per-WS pv-context-pct-sweep seam registry.
+// Maps each WebSocket to the closure-scoped helper object exposed by
+// startActiveSessionFlow for the regression test suite. Tests retrieve
+// the seam from this registry, drive tick logic via the helpers, and
+// inspect sweepScriptPresent / sweepSchemaMismatch via the get/set accessors.
+// Automatically keyed by WebSocket identity — cleared when the WS closes.
+export interface __PvSweepSeamForTests {
+  computeContextPctLegacy: (
+    connSnapshot: SSHClientType,
+    sessionFileSnapshot: string | null,
+  ) => Promise<number | null>;
+  computeContextPctBatch: (
+    connSnapshot: SSHClientType,
+    tmuxSessionSnapshot: string,
+  ) => Promise<
+    | { ok: true; pct: number | null }
+    | { ok: false; reason: "null-exec" | "schema-mismatch" | "identity-missing" }
+  >;
+  getSweepScriptPresent: () => boolean | null;
+  setSweepScriptPresent: (v: boolean | null) => void;
+  getSweepSchemaMismatch: () => boolean;
+  setSweepSchemaMismatch: (v: boolean) => void;
+}
+export const __pvSweepSeamRegistry = new Map<
+  import("ws").WebSocket,
+  __PvSweepSeamForTests
+>();
+export const __sessionKeyForTests = sessionKey;
+export const __interruptThrottleForTests = interruptThrottleByPane;
+export const __broadcastAsideDismissedForTests = broadcastAsideDismissed;
+
+
+// ─── hostId gate shared by the identity/role file + wakeup WS handlers ────────
+//
+// Every one of these handlers MUST name the host it targets. A missing or
+// invalid hostId used to mean "the co-located box" (bind-mount write); that
+// fallback is gone — it let a hostless request skip per-host routing and the
+// instance-wide role guard. The request is rejected with the handler's own
+// error envelope instead.
+
+const HOST_ID_REQUIRED_ERROR = "hostId is required";
+
+function isValidHostId(raw: unknown): raw is number {
+  return typeof raw === "number" && Number.isInteger(raw) && raw > 0;
+}
+
+function describeRawHostId(raw: unknown): string {
+  if (raw === undefined) return "undefined";
+  try { return JSON.stringify(raw) ?? String(raw); } catch { return String(raw); }
+}
+
+/** Returns the validated hostId, or null after replying `{...envelope, error}`. */
+function requireHostId(
+  ws: WebSocket,
+  rawHostId: unknown,
+  messageType: string,
+  envelope: Record<string, unknown>,
+  userId: string | undefined,
+): number | null {
+  if (isValidHostId(rawHostId)) return rawHostId;
+  sshLogger.warn("ws request rejected: missing or invalid hostId", {
+    operation: "ws_missing_host_id",
+    messageType,
+    hostIdRaw: describeRawHostId(rawHostId),
+    userId,
+  });
+  try {
+    ws.send(JSON.stringify({ ...envelope, error: HOST_ID_REQUIRED_ERROR }));
+  } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=${String(envelope.type)} err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 104 Plan 01: identity:probe-trapped-work handler + test seam
+// ---------------------------------------------------------------------------
+//
+// Batched fan-out shape:
+//   - Response type tag: "identity:trapped-work"
+//   - Results field name: "results"
+//   - Per-result shape: {hasTrappedWork:boolean}
+//   - Delegates to readIdentityTrappedWork (workspace-scoped, D-09 no role lookup)
+//
+// Wire shape:
+//   in:  { type: "identity:probe-trapped-work", targets: [{identityKey, hostId}, ...] }
+//   out: { type: "identity:trapped-work", results:  [{identityKey, hostId, hasTrappedWork, error?}, ...] }
+//
+// Same batching semantics as the retired per-host list-counts probe:
+//   - hostId in IDENTITIES_LOCAL_HOST_IDS → local (bind-mount) branch.
+//   - hostId missing/invalid → per-target {error:"hostId is required"} (no
+//     fallback to the co-located box).
+//   - Otherwise: group by hostId, connectOneShot ONCE per hostId group,
+//     run every identity in the group through that single conn, close in
+//     try/finally.
+//   - Per-target allSettled (at most TRAPPED_WORK_PER_CONN_CONCURRENCY execs in
+//     flight per connection) so one dead SSH host doesn't block the batch.
+//   - Rejected reads → {hasTrappedWork:false, error:string}. Zero-with-error
+//     keeps the wire shape uniform for the frontend consumer (Plan 02).
+
+type TrappedWorkTarget = { identityKey: string; hostId: number | null };
+
+/** Max concurrent exec channels per one-shot connection in the trapped-work
+ *  probe — under OpenSSH's default MaxSessions=10 with headroom. */
+export const TRAPPED_WORK_PER_CONN_CONCURRENCY = 8;
+type TrappedWorkResult = {
+  identityKey: string;
+  hostId: number | null;
+  hasTrappedWork: boolean;
+  error?: string;
+};
+
+async function readOneTrappedWorkTarget(
+  conn: SSHClientType | null,
+  identityKey: string,
+): Promise<{ hasTrappedWork: boolean }> {
+  // The reader itself validates identityKey; forwarding invalid keys is fine
+  // — the rejection lands in the per-target error field via allSettled.
+  return readIdentityTrappedWork(conn, identityKey);
+}
+
+export async function handleIdentityProbeTrappedWork(
+  ws: WebSocket,
+  msg: unknown,
+  userId: string | undefined,
+): Promise<void> {
+  const rawTargets = (msg as { targets?: unknown }).targets;
+  const targets: TrappedWorkTarget[] = Array.isArray(rawTargets)
+    ? rawTargets
+        .filter((t): t is Record<string, unknown> => typeof t === "object" && t !== null)
+        .map((t) => {
+          const key = typeof t.identityKey === "string" ? t.identityKey : "";
+          const hostIdRaw = t.hostId;
+          if (!isValidHostId(hostIdRaw)) {
+            sshLogger.warn("ws request rejected: missing or invalid hostId", {
+              operation: "ws_missing_host_id",
+              messageType: "identity:probe-trapped-work",
+              hostIdRaw: describeRawHostId(hostIdRaw),
+              userId,
+              identityKey: key,
+            });
+          }
+          return { identityKey: key, hostId: isValidHostId(hostIdRaw) ? hostIdRaw : null };
+        })
+    : [];
+
+  if (targets.length === 0) {
+    try {
+      ws.send(JSON.stringify({ type: "identity:trapped-work", results: [] }));
+    } catch (err) {
+      databaseLogger.warn(`[ws-server] send-failed msgType=identity:trapped-work err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" });
+    }
+    return;
+  }
+
+  // Group targets by "routing key": hostId=null / local hosts → "local";
+  // otherwise the numeric hostId. Each group opens one conn (or zero for
+  // the local group) and reads all its identities through the same conn.
+  const groups = new Map<string | number, TrappedWorkTarget[]>();
+  // Targets without a valid hostId are answered with a per-target error —
+  // never routed to the co-located box.
+  const missingHostResults: TrappedWorkResult[] = [];
+  for (const t of targets) {
+    if (t.hostId === null) {
+      missingHostResults.push({ identityKey: t.identityKey, hostId: null, hasTrappedWork: false, error: HOST_ID_REQUIRED_ERROR });
+      continue;
+    }
+    const useLocal = isLocalHostId(t.hostId);
+    const groupKey: string | number = useLocal ? "local" : t.hostId;
+    const bucket = groups.get(groupKey);
+    if (bucket) bucket.push(t);
+    else groups.set(groupKey, [t]);
+  }
+
+  const groupPromises: Array<Promise<TrappedWorkResult[]>> = [];
+  for (const [groupKey, bucket] of groups) {
+    if (groupKey === "local") {
+      groupPromises.push(
+        (async () => {
+          const settled = await Promise.allSettled(
+            bucket.map((t) => readOneTrappedWorkTarget(null, t.identityKey)),
+          );
+          return settled.map((s, i) => {
+            const t = bucket[i];
+            if (s.status === "fulfilled") {
+              return {
+                identityKey: t.identityKey,
+                hostId: t.hostId,
+                hasTrappedWork: s.value.hasTrappedWork,
+              };
+            }
+            return {
+              identityKey: t.identityKey,
+              hostId: t.hostId,
+              hasTrappedWork: false,
+              error: String((s.reason as Error)?.message ?? s.reason),
+            };
+          });
+        })(),
+      );
+    } else {
+      const hostIdNum = groupKey as number;
+      // Semaphore wrap (Phase 104 /close follow-up, diagnostic drop
+      // outbound-ssh-exec-semaphore-coverage-gaps): every SSH exec against a
+      // managed host must go through getHostSemaphore(hostId).run(...) so
+      // concurrent probes cannot push the target's ssh2 connection past
+      // MaxSessions=10. Improves on the retired handleIdentityCountArtifacts
+      // pattern, which did NOT acquire the semaphore.
+      groupPromises.push(
+        getHostSemaphore(hostIdNum).run(async () => {
+          let conn: SSHClientType | null = null;
+          try {
+            const resolved = await resolveHostById(hostIdNum, userId!);
+            if (!resolved) {
+              return bucket.map((t) => ({
+                identityKey: t.identityKey,
+                hostId: t.hostId,
+                hasTrappedWork: false,
+                error: "host not found",
+              }));
+            }
+            conn = await connectOneShot(
+              resolved as unknown as Parameters<typeof connectOneShot>[0],
+              5000,
+            );
+            // One probe runs a read per identity (49 on a big host, every
+            // minute per open tab): send them all through one skynet-hostd
+            // channel instead of a login each.
+            enableHostd(conn);
+            // Every read is its own exec channel on this ONE connection;
+            // bound them so a ~30-identity host never exceeds sshd's
+            // per-connection MaxSessions (OpenSSH default 10).
+            if (bucket.length > TRAPPED_WORK_PER_CONN_CONCURRENCY) {
+              sshLogger.info("identity:probe-trapped-work: bounding per-connection exec concurrency", {
+                operation: "trapped_work_probe_concurrency_bounded",
+                hostId: hostIdNum,
+                targets: bucket.length,
+                limit: TRAPPED_WORK_PER_CONN_CONCURRENCY,
+              });
+            }
+            const settled = await settleWithConcurrency(
+              bucket,
+              TRAPPED_WORK_PER_CONN_CONCURRENCY,
+              (t) => readOneTrappedWorkTarget(conn, t.identityKey),
+            );
+            return settled.map((s, i) => {
+              const t = bucket[i];
+              if (s.status === "fulfilled") {
+                return {
+                  identityKey: t.identityKey,
+                  hostId: t.hostId,
+                  hasTrappedWork: s.value.hasTrappedWork,
+                };
+              }
+              return {
+                identityKey: t.identityKey,
+                hostId: t.hostId,
+                hasTrappedWork: false,
+                error: String((s.reason as Error)?.message ?? s.reason),
+              };
+            });
+          } catch (err) {
+            const msgStr = err instanceof Error ? err.message : String(err);
+            return bucket.map((t) => ({
+              identityKey: t.identityKey,
+              hostId: t.hostId,
+              hasTrappedWork: false,
+              error: msgStr,
+            }));
+          } finally {
+            if (conn) {
+              try {
+                conn.end();
+              } catch (err) {
+                databaseLogger.warn(`[ws-server] conn-end-failed err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_conn_end_failed" });
+              }
+            }
+          }
+        }),
+      );
+    }
+  }
+
+  const groupResults = await Promise.all(groupPromises);
+  const results: TrappedWorkResult[] = [...missingHostResults, ...groupResults.flat()];
+
+  try {
+    ws.send(JSON.stringify({ type: "identity:trapped-work", results }));
+  } catch {
+    /* ws may be mid-close */
+  }
+}
+
+// Test seam — Phase 104 Plan 01. Vitest drives the handler directly rather
+// than spinning up a WebSocketServer + ssh2 pair. Alias mirrors L1347.
+export const __handleIdentityProbeTrappedWorkForTests = handleIdentityProbeTrappedWork;
+
+// ─── Phase 22 SRIC-06 / Plan 22-06: identity:get-role-file WS handler ──────────
+//
+// Byte-shape mirror of the identity:get-identity-file handler at L1928+ (which
+// remains inline; extracting it would break the "byte-shape mirror" audit
+// principle established in this plan). The new handlers are extracted to give
+// them the same test seam as __handleIdentityProbeTrappedWorkForTests above — vitest can
+// drive them directly with mocked readRoleFile / resolveHostById / connectOneShot
+// without a full WSS bring-up.
+//
+// Wire shape (mirrors identity:get-identity-file exactly):
+//   request:  { type: "identity:get-role-file", identityKey: string, hostId: number }
+//   response: { type: "identity:role-file", markdown: string, error?: string }
+//
+// Backend does the two-step (identity file → role: frontmatter → role artifact)
+// inside readRoleFile — the WS handler is a mechanical mirror of the
+// identity-file version and does NOT parse frontmatter itself. An identity
+// with zero (or several) roles has no single role file and surfaces as
+// {error: "..."}.
+
+export async function handleIdentityGetRoleFile(
+  ws: WebSocket,
+  msg: unknown,
+  userId: string | undefined,
+): Promise<void> {
+  const m = (msg ?? {}) as { identityKey?: unknown; hostId?: unknown };
+  const rawKey = m.identityKey;
+  if (typeof rawKey !== "string" || !IDENTITY_KEY_RE.test(rawKey)) {
+    try {
+      ws.send(JSON.stringify({ type: "identity:role-file", markdown: "", error: "invalid identityKey" }));
+    } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:role-file err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+    return;
+  }
+  const identityKey = rawKey;
+  const rawHostId = m.hostId;
+  const hostIdNum = requireHostId(ws, rawHostId, "identity:get-role-file", { type: "identity:role-file", markdown: "" }, userId);
+  if (hostIdNum === null) return;
+  const useLocal = isLocalHostId(hostIdNum);
+
+  try {
+    let markdown: string;
+    if (useLocal) {
+      ({ markdown } = await readRoleFile(null, identityKey));
+      sshLogger.info("identity:get-role-file", {
+        operation: "identity_get_role_file",
+        userId, identityKey, hostId: hostIdNum, useLocal: true, payloadSize: markdown.length,
+      });
+    } else {
+      const resolved = await resolveHostById(hostIdNum, userId!);
+      if (!resolved) {
+        try { ws.send(JSON.stringify({ type: "identity:role-file", markdown: "", error: "host not found" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:role-file err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+        return;
+      }
+      await getHostSemaphore(hostIdNum).run(async () => {
+        const conn = await connectOneShot(resolved as unknown as Parameters<typeof connectOneShot>[0], 5000);
+        try {
+          ({ markdown } = await readRoleFile(conn, identityKey));
+          sshLogger.info("identity:get-role-file", {
+            operation: "identity_get_role_file",
+            userId, identityKey, hostId: hostIdNum, useLocal: false, payloadSize: markdown.length,
+          });
+        } finally {
+          try { conn.end(); } catch (err) { databaseLogger.warn(`[ws-server] conn-end-failed err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_conn_end_failed" }); }
+        }
+      });
+    }
+    try { ws.send(JSON.stringify({ type: "identity:role-file", markdown })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:role-file err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+  } catch (err: unknown) {
+    sshLogger.error(
+      "identity:get-role-file error",
+      err instanceof Error ? err : new Error(String(err)),
+      { operation: "identity_get_role_file_error", userId, identityKey, hostId: hostIdNum },
+    );
+    try {
+      ws.send(JSON.stringify({ type: "identity:role-file", markdown: "", error: err instanceof Error ? err.message : String(err) }));
+    } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:role-file err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+  }
+}
+
+// ─── Phase 22 SRIC-06 / Plan 22-06: identity:update-role-file WS handler ───────
+//
+// Byte-shape mirror of the identity:update-identity-file handler at L2213+.
+// After write, re-reads via readRoleFile so the client rehydrates from
+// server-side truth (T-22-06-05 mitigation — no client-side draft trust,
+// server echo is authoritative). writeRoleFile handles the two-step, byte
+// cap, and IDENTITY_KEY_RE guards internally.
+
+
+export async function handleIdentityUpdateRoleFile(
+  ws: WebSocket,
+  msg: unknown,
+  userId: string | undefined,
+): Promise<void> {
+  const m = (msg ?? {}) as { identityKey?: unknown; hostId?: unknown; contents?: unknown };
+  const rawKey = m.identityKey;
+  const rawContents = m.contents;
+  if (typeof rawKey !== "string" || !IDENTITY_KEY_RE.test(rawKey)) {
+    try { ws.send(JSON.stringify({ type: "identity:role-file-updated", markdown: "", error: "invalid identityKey" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:role-file-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+    return;
+  }
+  if (typeof rawContents !== "string") {
+    try { ws.send(JSON.stringify({ type: "identity:role-file-updated", markdown: "", error: "contents must be a string" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:role-file-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+    return;
+  }
+  const identityKey = rawKey;
+  const contents = rawContents;
+  const rawHostId = m.hostId;
+  const hostIdNum = requireHostId(ws, rawHostId, "identity:update-role-file", { type: "identity:role-file-updated", markdown: "" }, userId);
+  if (hostIdNum === null) return;
+  // Instance-wide roles: resolve the identity's role first and apply the same
+  // admin-only rule as role:update-file.
+  let instanceWideMachineId: string | null = null;
+  if (userId) {
+    let resolvedRole: string | null = null;
+    try {
+      if (isLocalHostId(hostIdNum)) {
+        resolvedRole = await resolveRoleForIdentity(null, identityKey);
+      } else {
+        const resolvedHost = await resolveHostById(hostIdNum, userId);
+        if (resolvedHost) {
+          await getHostSemaphore(hostIdNum).run(async () => {
+            const probeConn = await connectOneShot(resolvedHost as unknown as Parameters<typeof connectOneShot>[0], 5000);
+            try {
+              resolvedRole = await resolveRoleForIdentity(probeConn, identityKey);
+            } finally {
+              try { probeConn.end(); } catch { /* best-effort */ }
+            }
+          });
+        }
+      }
+    } catch {
+      resolvedRole = null; // the write below surfaces the real error
+    }
+    if (resolvedRole) {
+      const check = await checkInstanceWideRoleWrite(userId, hostIdNum, resolvedRole);
+      if (check.verdict === "refuse") {
+        try { ws.send(JSON.stringify({ type: "identity:role-file-updated", markdown: "", error: INSTANCE_WIDE_ROLE_REFUSAL })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:role-file-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+        return;
+      }
+      if (check.verdict === "admin") instanceWideMachineId = check.machineId;
+    }
+  }
+  const useLocal = isLocalHostId(hostIdNum);
+  try {
+    let markdown: string;
+    if (useLocal) {
+      await writeRoleFile(null, identityKey, contents);
+      ({ markdown } = await readRoleFile(null, identityKey));
+      sshLogger.info("identity:update-role-file", {
+        operation: "identity_update_role_file",
+        userId, identityKey, hostId: hostIdNum, useLocal: true,
+        bytes: Buffer.byteLength(contents, "utf-8"),
+      });
+    } else {
+      const resolved = await resolveHostById(hostIdNum, userId!);
+      if (!resolved) {
+        try { ws.send(JSON.stringify({ type: "identity:role-file-updated", markdown: "", error: "host not found" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:role-file-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+        return;
+      }
+      await getHostSemaphore(hostIdNum).run(async () => {
+        const conn = await connectOneShot(resolved as unknown as Parameters<typeof connectOneShot>[0], 5000);
+        try {
+          await writeRoleFile(conn, identityKey, contents);
+          ({ markdown } = await readRoleFile(conn, identityKey));
+          sshLogger.info("identity:update-role-file", {
+            operation: "identity_update_role_file",
+            userId, identityKey, hostId: hostIdNum, useLocal: false,
+            bytes: Buffer.byteLength(contents, "utf-8"),
+          });
+        } finally {
+          try { conn.end(); } catch (err) { databaseLogger.warn(`[ws-server] conn-end-failed err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_conn_end_failed" }); }
+        }
+      });
+    }
+    if (instanceWideMachineId) afterAdminWrite(instanceWideMachineId);
+    try { ws.send(JSON.stringify({ type: "identity:role-file-updated", markdown })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:role-file-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+  } catch (err) {
+    sshLogger.error(
+      "identity:update-role-file unexpected error",
+      err instanceof Error ? err : new Error(String(err)),
+      { operation: "identity_update_role_file_error", userId, identityKey, hostId: hostIdNum },
+    );
+    try {
+      ws.send(JSON.stringify({ type: "identity:role-file-updated", markdown: "", error: err instanceof Error ? err.message : String(err) }));
+    } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:role-file-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+  }
+}
+
+// Test seams — Plan 22-06. Same pattern as __handleIdentityProbeTrappedWorkForTests
+// above. Vitest drives the handlers directly with mocked reader/writer helpers.
+export const __handleIdentityGetRoleFileForTests = handleIdentityGetRoleFile;
+export const __handleIdentityUpdateRoleFileForTests = handleIdentityUpdateRoleFile;
+
+// ─── Phase 90 Plan 90-03: role:update-file WS handler ─────────────────────────
+//
+// Byte-shape mirror of handleIdentityUpdateRoleFile above, keyed directly on
+// roleName (no identity two-step). Companion wire type for the RoleModal
+// (Phase 90 Plan 90-04) save path — the role modal has no identity context,
+// so the identity-keyed handler is awkward. D-08.3 planner-pick: added a
+// companion wire type rather than having the frontend synthesize an
+// identityKey from the host's identity list (which breaks if the roles-list
+// host has no local identities).
+//
+// After write, re-reads via readRoleFileByName so the client rehydrates from
+// server-side truth (no client-side draft trust). writeRoleFileByName handles
+// the ROLE_NAME_PATTERN gate + byte cap internally, so the outer catch
+// propagates helper errors verbatim on the response envelope.
+
+export async function handleRoleUpdateFile(
+  ws: WebSocket,
+  msg: unknown,
+  userId: string | undefined,
+): Promise<void> {
+  const m = (msg ?? {}) as { roleName?: unknown; hostId?: unknown; contents?: unknown };
+  const rawRoleName = m.roleName;
+  const rawContents = m.contents;
+  if (typeof rawRoleName !== "string" || !ROLE_NAME_PATTERN.test(rawRoleName)) {
+    try { ws.send(JSON.stringify({ type: "role:file-updated", markdown: "", error: "invalid roleName" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=role:file-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+    return;
+  }
+  if (typeof rawContents !== "string") {
+    try { ws.send(JSON.stringify({ type: "role:file-updated", markdown: "", error: "contents must be a string" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=role:file-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+    return;
+  }
+  const roleName = rawRoleName;
+  const contents = rawContents;
+  const rawHostId = m.hostId;
+  const hostIdNum = requireHostId(ws, rawHostId, "role:update-file", { type: "role:file-updated", markdown: "" }, userId);
+  if (hostIdNum === null) return;
+  // Instance-wide roles: non-admins are refused; an admin's write is followed
+  // by a sync that carries it from this host to every machine.
+  let instanceWideMachineId: string | null = null;
+  if (userId) {
+    const check = await checkInstanceWideRoleWrite(userId, hostIdNum, roleName);
+    if (check.verdict === "refuse") {
+      try { ws.send(JSON.stringify({ type: "role:file-updated", markdown: "", error: INSTANCE_WIDE_ROLE_REFUSAL })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=role:file-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+      return;
+    }
+    if (check.verdict === "admin") instanceWideMachineId = check.machineId;
+  }
+  const useLocal = isLocalHostId(hostIdNum);
+  try {
+    let markdown: string;
+    if (useLocal) {
+      await writeRoleFileByName(null, roleName, contents);
+      ({ markdown } = await readRoleFileByName(null, roleName));
+      sshLogger.info("role:update-file", {
+        operation: "role_update_file",
+        userId, roleName, hostId: hostIdNum, useLocal: true,
+        bytes: Buffer.byteLength(contents, "utf-8"),
+      });
+    } else {
+      const resolved = await resolveHostById(hostIdNum, userId!);
+      if (!resolved) {
+        try { ws.send(JSON.stringify({ type: "role:file-updated", markdown: "", error: "host not found" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=role:file-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+        return;
+      }
+      await getHostSemaphore(hostIdNum).run(async () => {
+        const conn = await connectOneShot(resolved as unknown as Parameters<typeof connectOneShot>[0], 5000);
+        try {
+          await writeRoleFileByName(conn, roleName, contents);
+          ({ markdown } = await readRoleFileByName(conn, roleName));
+          sshLogger.info("role:update-file", {
+            operation: "role_update_file",
+            userId, roleName, hostId: hostIdNum, useLocal: false,
+            bytes: Buffer.byteLength(contents, "utf-8"),
+          });
+        } finally {
+          try { conn.end(); } catch (err) { databaseLogger.warn(`[ws-server] conn-end-failed err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_conn_end_failed" }); }
+        }
+      });
+    }
+    if (instanceWideMachineId) afterAdminWrite(instanceWideMachineId);
+    try { ws.send(JSON.stringify({ type: "role:file-updated", markdown })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=role:file-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+  } catch (err) {
+    sshLogger.error(
+      "role:update-file unexpected error",
+      err instanceof Error ? err : new Error(String(err)),
+      { operation: "role_update_file_error", userId, roleName, hostId: hostIdNum },
+    );
+    try {
+      ws.send(JSON.stringify({ type: "role:file-updated", markdown: "", error: err instanceof Error ? err.message : String(err) }));
+    } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=role:file-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+  }
+}
+
+// Test seam — Phase 90 Plan 90-03. Same pattern as __handleIdentityUpdateRoleFileForTests.
+export const __handleRoleUpdateFileForTests = handleRoleUpdateFile;
+
+// ─── Phase 90 Plan 90-07: role-name-keyed READ WS handlers ────────────────────
+//
+// Closes the D-08.3 divergence between the identity-keyed handlers (which
+// require identity two-step) and the RoleModal's role-name context.
+// Byte-shape mirror of identity:get-role-file MINUS the identity two-step —
+// dispatches to a role-name-keyed reader from identity-artifact-reader.ts
+// (readRoleFileByName).
+//
+// Wire shape:
+//   role:get-file        {roleName, hostId}                       -> role:file-loaded     {markdown, error?}
+//
+// Phase 134 Plan 134-02 retired the role-scope wakeup CRUD handlers
+// (role:list-wakeups / role:create-wakeup / role:update-wakeup /
+// role:delete-wakeup); Phase 136 retired the role-scope bounty handler
+// (role:list-bounties). Only role:get-file remains.
+//
+// Guards: roleName via ROLE_NAME_PATTERN before any SSH work. hostId via
+// resolveHostById.
+
+export async function handleRoleGetFile(
+  ws: WebSocket,
+  msg: unknown,
+  userId: string | undefined,
+): Promise<void> {
+  const m = (msg ?? {}) as { roleName?: unknown; hostId?: unknown };
+  const rawRoleName = m.roleName;
+  if (typeof rawRoleName !== "string" || !ROLE_NAME_PATTERN.test(rawRoleName)) {
+    try { ws.send(JSON.stringify({ type: "role:file-loaded", markdown: "", error: "invalid roleName" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=role:file-loaded err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+    return;
+  }
+  const roleName = rawRoleName;
+  const rawHostId = m.hostId;
+  const hostIdNum = requireHostId(ws, rawHostId, "role:get-file", { type: "role:file-loaded", markdown: "" }, userId);
+  if (hostIdNum === null) return;
+  const useLocal = isLocalHostId(hostIdNum);
+
+  try {
+    let markdown: string;
+    if (useLocal) {
+      ({ markdown } = await readRoleFileByName(null, roleName));
+      sshLogger.info("role:get-file", {
+        operation: "role_get_file",
+        userId, roleName, hostId: hostIdNum, useLocal: true, payloadSize: markdown.length,
+      });
+    } else {
+      const resolved = await resolveHostById(hostIdNum, userId!);
+      if (!resolved) {
+        try { ws.send(JSON.stringify({ type: "role:file-loaded", markdown: "", error: "host not found" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=role:file-loaded err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+        return;
+      }
+      await getHostSemaphore(hostIdNum).run(async () => {
+        const conn = await connectOneShot(resolved as unknown as Parameters<typeof connectOneShot>[0], 5000);
+        try {
+          ({ markdown } = await readRoleFileByName(conn, roleName));
+          sshLogger.info("role:get-file", {
+            operation: "role_get_file",
+            userId, roleName, hostId: hostIdNum, useLocal: false, payloadSize: markdown.length,
+          });
+        } finally {
+          try { conn.end(); } catch (err) { databaseLogger.warn(`[ws-server] conn-end-failed err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_conn_end_failed" }); }
+        }
+      });
+    }
+    try { ws.send(JSON.stringify({ type: "role:file-loaded", markdown })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=role:file-loaded err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+  } catch (err) {
+    sshLogger.error(
+      "role:get-file unexpected error",
+      err instanceof Error ? err : new Error(String(err)),
+      { operation: "role_get_file_error", userId, roleName, hostId: hostIdNum },
+    );
+    try {
+      ws.send(JSON.stringify({ type: "role:file-loaded", markdown: "", error: err instanceof Error ? err.message : String(err) }));
+    } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=role:file-loaded err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+  }
+}
+
+
+// Test seams — Phase 90 Plan 90-07. Same convention as __handleRoleUpdateFileForTests.
+export const __handleRoleGetFileForTests = handleRoleGetFile;
+
+// ─── Phase 72 Plan 01: identity-scope wakeup create/delete parity-gap closure ─
+//
+// Two extracted WS handlers mirror the byte-shape of identity:list-wakeups and
+// identity:update-wakeup, extracted as top-level functions so vitest can drive
+// them directly with mocked reader/writer helpers — same test-seam convention
+// as handleIdentityGetRoleFile above.
+//
+// Wire shapes:
+//   identity:create-wakeup       {identityKey, hostId, spec: WakeupSpec}            -> identity:wakeup-created       {wakeups, error?}
+//   identity:delete-wakeup       {identityKey, hostId, wakeupSlug}                  -> identity:wakeup-deleted       {wakeups, error?}
+//
+// Create accepts a `spec` payload (WakeupSpec: name/enabled/schedule/
+// instruction). The writer does the slug-normalization + clobber-check +
+// validation; the handler only surfaces the writer's throws as {error} strings.
+// After a successful write the writer re-lists internally and returns fresh
+// {wakeups}, which the handler passes through so the client can atomically
+// re-render without a follow-up read.
+//
+// Delete uses IDENTITY_SLUG_RE double-belt (belt + suspenders — the writer
+// also checks; the handler check short-circuits without opening SSH for a bad
+// slug).
+//
+// Phase 134 Plan 134-02: the four role-scope handlers that once lived here
+// (identity:list-role-wakeups, identity:update-role-wakeup,
+// identity:create-role-wakeup, identity:delete-role-wakeup) were retired
+// top-to-bottom.
+
+/** Validate a WakeupSpec-shaped payload from an untrusted `msg.spec` field.
+ *  Returns the typed spec on success, or throws an Error with a specific
+ *  per-field message. Consumed by handleIdentityCreateWakeup below. */
+function extractWakeupSpec(rawSpec: unknown): WakeupSpec {
+  if (typeof rawSpec !== "object" || rawSpec === null) {
+    throw new Error("spec must be an object");
+  }
+  const s = rawSpec as Record<string, unknown>;
+  if (typeof s.name !== "string" || s.name.length === 0) {
+    throw new Error("spec.name must be a non-empty string");
+  }
+  if (typeof s.enabled !== "boolean") {
+    throw new Error("spec.enabled must be a boolean");
+  }
+  if (typeof s.instruction !== "string") {
+    throw new Error("spec.instruction must be a string");
+  }
+  if (typeof s.schedule !== "object" || s.schedule === null) {
+    throw new Error("spec.schedule must be an object");
+  }
+  const t = (s.schedule as Record<string, unknown>).type;
+  if (typeof t !== "string" || t.length === 0) {
+    throw new Error("spec.schedule.type must be a non-empty string");
+  }
+  return {
+    name: s.name,
+    enabled: s.enabled,
+    schedule: s.schedule as Record<string, unknown>,
+    instruction: s.instruction,
+  };
+}
+
+export async function handleIdentityCreateWakeup(
+  ws: WebSocket,
+  msg: unknown,
+  userId: string | undefined,
+): Promise<void> {
+  const raw = (msg ?? {}) as { identityKey?: unknown; hostId?: unknown; spec?: unknown };
+  const rawKey = raw.identityKey;
+  if (typeof rawKey !== "string" || !IDENTITY_KEY_RE.test(rawKey)) {
+    try { ws.send(JSON.stringify({ type: "identity:wakeup-created", wakeups: [], error: "invalid identityKey" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:wakeup-created err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+    return;
+  }
+  let spec: WakeupSpec;
+  try {
+    spec = extractWakeupSpec(raw.spec);
+  } catch (err) {
+    try { ws.send(JSON.stringify({ type: "identity:wakeup-created", wakeups: [], error: err instanceof Error ? err.message : String(err) })); } catch (err2) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:wakeup-created err="${err2 instanceof Error ? err2.message : String(err2)}"`, { operation: "ws_send_failed" }); }
+    return;
+  }
+  const identityKey = rawKey;
+  const rawHostId = raw.hostId;
+  const hostIdNum = requireHostId(ws, rawHostId, "identity:create-wakeup", { type: "identity:wakeup-created", wakeups: [] }, userId);
+  if (hostIdNum === null) return;
+  const useLocal = isLocalHostId(hostIdNum);
+  try {
+    let wakeups: Awaited<ReturnType<typeof readIdentityWakeups>>["wakeups"];
+    if (useLocal) {
+      ({ wakeups } = await writeIdentityWakeupCreate(null, identityKey, spec));
+      sshLogger.info("identity:create-wakeup", {
+        operation: "identity_create_wakeup",
+        userId, identityKey, hostId: hostIdNum, useLocal: true,
+        name: spec.name,
+      });
+    } else {
+      const resolved = await resolveHostById(hostIdNum, userId!);
+      if (!resolved) {
+        try { ws.send(JSON.stringify({ type: "identity:wakeup-created", wakeups: [], error: "host not found" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:wakeup-created err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+        return;
+      }
+      await getHostSemaphore(hostIdNum).run(async () => {
+        const conn = await connectOneShot(resolved as unknown as Parameters<typeof connectOneShot>[0], 5000);
+        try {
+          ({ wakeups } = await writeIdentityWakeupCreate(conn, identityKey, spec));
+          sshLogger.info("identity:create-wakeup", {
+            operation: "identity_create_wakeup",
+            userId, identityKey, hostId: hostIdNum, useLocal: false,
+            name: spec.name,
+          });
+        } finally {
+          try { conn.end(); } catch (err) { databaseLogger.warn(`[ws-server] conn-end-failed err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_conn_end_failed" }); }
+        }
+      });
+    }
+    try { ws.send(JSON.stringify({ type: "identity:wakeup-created", wakeups })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:wakeup-created err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+  } catch (err) {
+    sshLogger.error(
+      "identity:create-wakeup unexpected error",
+      err instanceof Error ? err : new Error(String(err)),
+      { operation: "identity_create_wakeup_error", userId, identityKey, hostId: hostIdNum },
+    );
+    try {
+      ws.send(JSON.stringify({ type: "identity:wakeup-created", wakeups: [], error: err instanceof Error ? err.message : String(err) }));
+    } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:wakeup-created err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+  }
+}
+
+export async function handleIdentityDeleteWakeup(
+  ws: WebSocket,
+  msg: unknown,
+  userId: string | undefined,
+): Promise<void> {
+  const raw = (msg ?? {}) as { identityKey?: unknown; hostId?: unknown; wakeupSlug?: unknown };
+  const rawKey = raw.identityKey;
+  const rawSlug = raw.wakeupSlug;
+  if (typeof rawKey !== "string" || !IDENTITY_KEY_RE.test(rawKey)) {
+    try { ws.send(JSON.stringify({ type: "identity:wakeup-deleted", wakeups: [], error: "invalid identityKey" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:wakeup-deleted err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+    return;
+  }
+  if (typeof rawSlug !== "string" || !IDENTITY_SLUG_RE.test(rawSlug)) {
+    try { ws.send(JSON.stringify({ type: "identity:wakeup-deleted", wakeups: [], error: "Invalid scheduled wake-up" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:wakeup-deleted err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+    return;
+  }
+  const identityKey = rawKey;
+  const wakeupSlug = rawSlug;
+  const rawHostId = raw.hostId;
+  const hostIdNum = requireHostId(ws, rawHostId, "identity:delete-wakeup", { type: "identity:wakeup-deleted", wakeups: [] }, userId);
+  if (hostIdNum === null) return;
+  const useLocal = isLocalHostId(hostIdNum);
+  try {
+    let wakeups: Awaited<ReturnType<typeof readIdentityWakeups>>["wakeups"];
+    if (useLocal) {
+      ({ wakeups } = await writeIdentityWakeupDelete(null, identityKey, wakeupSlug));
+      sshLogger.info("identity:delete-wakeup", {
+        operation: "identity_delete_wakeup",
+        userId, identityKey, wakeupSlug, hostId: hostIdNum, useLocal: true,
+      });
+    } else {
+      const resolved = await resolveHostById(hostIdNum, userId!);
+      if (!resolved) {
+        try { ws.send(JSON.stringify({ type: "identity:wakeup-deleted", wakeups: [], error: "host not found" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:wakeup-deleted err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+        return;
+      }
+      await getHostSemaphore(hostIdNum).run(async () => {
+        const conn = await connectOneShot(resolved as unknown as Parameters<typeof connectOneShot>[0], 5000);
+        try {
+          ({ wakeups } = await writeIdentityWakeupDelete(conn, identityKey, wakeupSlug));
+          sshLogger.info("identity:delete-wakeup", {
+            operation: "identity_delete_wakeup",
+            userId, identityKey, wakeupSlug, hostId: hostIdNum, useLocal: false,
+          });
+        } finally {
+          try { conn.end(); } catch (err) { databaseLogger.warn(`[ws-server] conn-end-failed err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_conn_end_failed" }); }
+        }
+      });
+    }
+    try { ws.send(JSON.stringify({ type: "identity:wakeup-deleted", wakeups })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:wakeup-deleted err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+  } catch (err) {
+    sshLogger.error(
+      "identity:delete-wakeup unexpected error",
+      err instanceof Error ? err : new Error(String(err)),
+      { operation: "identity_delete_wakeup_error", userId, identityKey, wakeupSlug, hostId: hostIdNum },
+    );
+    try {
+      ws.send(JSON.stringify({ type: "identity:wakeup-deleted", wakeups: [], error: err instanceof Error ? err.message : String(err) }));
+    } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:wakeup-deleted err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+  }
+}
+
+// Test seams — Phase 72 Plan 01. Mirrors the __handleIdentityGetRoleFileForTests
+// convention. Vitest drives the handlers directly with mocked reader/writer
+// helpers and mocked connectOneShot/resolveHostById.
+export const __handleIdentityCreateWakeupForTests = handleIdentityCreateWakeup;
+export const __handleIdentityDeleteWakeupForTests = handleIdentityDeleteWakeup;
+
+// ─── Phase 47 Plan 03 Hunk C: handleFetchOlderRange WS handler ────────────────
+//
+// Client → server request: `{ type: "fetch_older_range", beforeLine, count }`
+// (see FetchOlderRangePayload in src/ui/api/claude-session-api.ts). Server
+// reads lines `[max(1, beforeLine - count), beforeLine - 1]` inclusive via
+// the Plan 01 range reader, parses+reshapes each via the shared
+// `reshapeParsedLineToWireFrame` helper (also used by the streaming-tail
+// dispatch — this shared helper is what makes streaming and range-fetched
+// frames byte-identical on the wire, including the additive `line: number`
+// field Plan 01 widened onto every per-turn wire type), filters skip nulls,
+// and emits a `fetch_older_range_batch` response.
+//
+// Trust boundary (T-47-09, mirror of raw_keystrokes' T-14-02-01 at L4349):
+// `currentSessionFile` is read from `deps` (the dispatch branch captures it
+// from connection scope at L1845). Never accepted from the client payload.
+//
+// Skip-frame policy (v2, quick-260822-7no): skip frames drop out and the
+// handler refills from older slices until it holds `count` frames or
+// reaches line 1 — see the refill loop below.
+//
+// Reject-not-clamp (LOCKED via Test 4): count > 20 or < 1 emits an error
+// frame; matches Plan 01's reader-side 200-cap defense-in-depth and
+// prevents silent client/server drift (asked for 1e9, got 20 without notice).
+//
+// Error frame (LOCKED via Test 2): missing sshConn or currentSessionFile
+// emits `{ ..., messages: [], oldestLine: 0, hasMore: false, error: "no
+// active session" }`, NOT silent return — the client's in-flight state
+// needs to be dismissible without hanging forever, and Plan 04's button
+// error-state variant is what shows the user "the click did something".
+//
+// Cursor semantic: LINE-cursor, not eventId-cursor. Plan 01's revision
+// (see 47-01-SUMMARY.md § key-decisions) eliminated any need to scan
+// the JSONL to resolve an eventId to a line — handler does ONE bounded
+// `readSessionFileRange` call per request. No scan, no search step of
+// any kind (this is what allows the 200-line reader cap to be
+// architecturally sufficient rather than a fragile invariant).
+
+export async function handleFetchOlderRange(
+  ws: WebSocket,
+  msg: unknown,
+  deps: {
+    sshConn: SSHClientType | null;
+    currentSessionFile: string | null;
+    currentHostId: number | null;
+    // Phase 50 Plan 01 Task 2: thread the JSONL session UUID so the
+    // parser's queue-operation branch produces the same deterministic
+    // eventId shape that the streaming-tail dispatch produces (the
+    // frontend's per-eventId dedup Set is keyed line-scoped by eventId).
+    // Optional — legacy callers/tests can omit; parser falls back to
+    // fallbackEventId() for the queue-op branch only.
+    sessionIdFromFile?: string | null;
+  },
+): Promise<void> {
+  // Inline helper: DRY the error-emit sites. Every error path emits the
+  // same shape — `messages:[], oldestLine:0, hasMore:false, error:<msg>` —
+  // and the client's gate is the presence of `error`.
+  const emitErrorFrame = (errMsg: string): void => {
+    try {
+      ws.send(
+        JSON.stringify({
+          type: "fetch_older_range_batch",
+          messages: [],
+          oldestLine: 0,
+          hasMore: false,
+          error: errMsg,
+        }),
+      );
+    } catch (err) {
+      databaseLogger.warn(
+        `[ws-server] send-failed msgType=fetch_older_range_batch err="${err instanceof Error ? err.message : String(err)}"`,
+        { operation: "ws_send_failed" },
+      );
+    }
+  };
+
+  // ─ Input-validation gate — BEFORE any I/O. Same discipline as
+  //   handleIdentityGetRoleFile L744-750 (validate shape+bounds first,
+  //   trust-boundary second, work third).
+  const m = (msg ?? {}) as {
+    type?: unknown;
+    beforeLine?: unknown;
+    count?: unknown;
+  };
+  if (m.type !== "fetch_older_range") {
+    emitErrorFrame("invalid type");
+    return;
+  }
+  if (!Number.isInteger(m.beforeLine) || (m.beforeLine as number) < 1) {
+    emitErrorFrame("invalid beforeLine");
+    return;
+  }
+  const beforeLine = m.beforeLine as number;
+  if (
+    !Number.isInteger(m.count) ||
+    (m.count as number) < 1 ||
+    (m.count as number) > 20
+  ) {
+    // Reject-not-clamp: matches Plan 01's reader-side throw on count > 200
+    // (defense-in-depth) and CONTEXT.md § scope-edges batch-size lock of 20
+    // (client always passes 20). Silent clamping would drift semantics.
+    emitErrorFrame("invalid count");
+    return;
+  }
+  const count = m.count as number;
+
+  // ─ Trust-boundary gate (T-47-09): both `sshConn` and `currentSessionFile`
+  //   MUST originate from connection scope. Missing = pane not yet
+  //   discovered (client sent fetch_older_range before connectToPane
+  //   completed, or after teardownPane cleared them). Not silent return —
+  //   the client needs the error frame to dismiss in-flight state.
+  if (!deps.sshConn || !deps.currentSessionFile) {
+    emitErrorFrame("no active session");
+    return;
+  }
+
+  // ─ quick-260822-7no: structured entry log for the full click → WS →
+  //   response path. Fires exactly ONCE per request, AFTER validation
+  //   and trust-boundary gates but BEFORE any I/O (including the
+  //   rangeCount<=0 fast-path emit). Paired with per-iteration `slice`
+  //   logs and a single `emit` log so a grep of `[fetch-older-range]`
+  //   over the backend log shows the entire lifecycle of every click.
+  databaseLogger.info(
+    `[fetch-older-range] req beforeLine=${beforeLine} count=${count}`,
+    { operation: "fetch_older_range_req" },
+  );
+
+  // ─ Clamp the LINE range so we never ask the reader for lines <1 or an
+  //   empty range. `beforeLine=1` means client is already at the top.
+  const startLine = Math.max(1, beforeLine - count);
+  const rangeCount = Math.min(count, beforeLine - 1);
+  if (rangeCount <= 0) {
+    // Nothing to read — client's beforeLine=1 (or lower after gate). Emit
+    // an empty success (not error) so the client updates hasMore=false
+    // and unmounts the button gracefully.
+    try {
+      ws.send(
+        JSON.stringify({
+          type: "fetch_older_range_batch",
+          messages: [],
+          oldestLine: 1,
+          hasMore: false,
+        }),
+      );
+    } catch (err) {
+      databaseLogger.warn(
+        `[ws-server] send-failed msgType=fetch_older_range_batch err="${err instanceof Error ? err.message : String(err)}"`,
+        { operation: "ws_send_failed" },
+      );
+    }
+    return;
+  }
+
+  // ─ Read the range. try/catch surfaces reader errors as an error frame
+  //   without crashing the WS.
+  let readResult: { lines: string[]; totalLines: number };
+  try {
+    readResult = await readSessionFileRange(
+      deps.sshConn,
+      deps.currentSessionFile,
+      startLine,
+      rangeCount,
+    );
+  } catch (err) {
+    emitErrorFrame(err instanceof Error ? err.message : String(err));
+    return;
+  }
+
+  // ─ v2 refill policy (quick-260822-7no): parse + reshape each line via
+  //   the SHARED helper (Hunk A output), then KEEP READING older slices
+  //   (REFILL_SLICE_LINES wide) until either the accumulator holds ≥20 non-skip wire frames
+  //   OR the read cursor reaches startLine=1. Under v1 a single click on
+  //   a skip-heavy JSONL (Sally's session was 88% skip) could return 0–4
+  //   messages even though 20 non-skip messages existed further back —
+  //   symptom was "button flashes → nothing appears (sometimes)". Skip
+  //   frames reshape to null; malformed lines reshape to a placeholder
+  //   frame (NOT null) and count toward the 20-non-skip accumulator.
+  //
+  //   Chronological-order invariant: reader returns oldest-first; each
+  //   successive iteration reads OLDER lines; `accumulator.unshift(...)`
+  //   prepends survivors so the accumulator stays oldest-first — matches
+  //   Test 1's line-number monotonicity assertion.
+  const reshapeLines = (lines: string[], startingLine: number): StreamEvent[] => {
+    const out: StreamEvent[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      const lineNumber = startingLine + i;
+      const rawLine = lines[i];
+      // Phase 50 Plan 01 Task 2: sessionId threaded from connection scope
+      // so the parser's queue-operation branch (Task 1) derives a
+      // deterministic eventId matching the streaming-tail dispatch's shape.
+      // Note: dedup is NOT applied here — the range-fetch path emits older
+      // history whose enqueue → dequeue pairs already surfaced live; the
+      // frontend's per-eventId dedup Set handles collapse on the client.
+      const parsed = parseSessionLine(rawLine, deps.sessionIdFromFile ?? undefined);
+      const frame = reshapeParsedLineToWireFrame(parsed, rawLine, lineNumber);
+      if (frame !== null) {
+        out.push(frame);
+      }
+    }
+    return out;
+  };
+
+  const accumulator: StreamEvent[] = [];
+  let currentBefore = beforeLine;
+  let lastStartLine = startLine;
+  let refillIterations = 0;
+
+  // Iteration 1: reuse the FIRST read (already in readResult from L1583).
+  {
+    const survivors = reshapeLines(readResult.lines, lastStartLine);
+    accumulator.push(...survivors);
+    refillIterations = 1;
+    databaseLogger.info(
+      `[fetch-older-range] slice startLine=${lastStartLine} rawLines=${readResult.lines.length} nonSkip=${survivors.length} total=${accumulator.length}`,
+      { operation: "fetch_older_range_slice" },
+    );
+    currentBefore = lastStartLine;
+  }
+
+  // Refill loop: keep reading older slices until quota hit or top. Refill
+  // slices are REFILL_SLICE_LINES wide (the reader's 200-line cap) — most
+  // JSONL lines are skip frames, so 20-line slices meant a dozen serial SSH
+  // round-trips (2-4s) per click on a typical session.
+  const REFILL_SLICE_LINES = 200;
+  while (accumulator.length < 20 && currentBefore > 1) {
+    const nextStartLine = Math.max(1, currentBefore - REFILL_SLICE_LINES);
+    const nextRangeCount = Math.min(REFILL_SLICE_LINES, currentBefore - 1);
+    try {
+      readResult = await readSessionFileRange(
+        deps.sshConn,
+        deps.currentSessionFile,
+        nextStartLine,
+        nextRangeCount,
+      );
+    } catch (err) {
+      // Mid-loop reader failure — surface as an error frame, same
+      // discipline as the FIRST read failure above.
+      emitErrorFrame(err instanceof Error ? err.message : String(err));
+      return;
+    }
+    const survivors = reshapeLines(readResult.lines, nextStartLine);
+    accumulator.unshift(...survivors);
+    lastStartLine = nextStartLine;
+    currentBefore = nextStartLine;
+    refillIterations++;
+    databaseLogger.info(
+      `[fetch-older-range] slice startLine=${nextStartLine} rawLines=${readResult.lines.length} nonSkip=${survivors.length} total=${accumulator.length}`,
+      { operation: "fetch_older_range_slice" },
+    );
+  }
+
+  // Cap at the NEWEST 20 wire frames. The accumulator is chronological
+  // oldest-first after each prepend, so slice(-20) keeps the frames closest
+  // to the client's cursor — the client's `[...batch, ...prev]` prepend is
+  // then contiguous with what it already has.
+  const messages = accumulator.slice(-20);
+  // Prefer the actual first surviving frame's line number so
+  // `oldestLoadedLine` on the client seeks to a REAL message on the next
+  // click, not a skip line the reader would re-scan. Fall back to
+  // `lastStartLine` when the accumulator is empty (all-skip file, Test 9).
+  const oldestLine =
+    messages.length > 0 && typeof messages[0].line === "number"
+      ? messages[0].line
+      : lastStartLine;
+  // More exists only if the scan stopped short of line 1, or frames older
+  // than `messages` were trimmed off by the slice above. NOT `oldestLine >
+  // 1` — a scan that reached line 1 with the oldest message on, say, line 23
+  // would claim more, and the next click would read lines 1-22 and get
+  // nothing back.
+  const hasMore = lastStartLine > 1 || accumulator.length > messages.length;
+
+  databaseLogger.info(
+    `[fetch-older-range] emit oldestLine=${oldestLine} messagesLen=${messages.length} hasMore=${hasMore} refillIterations=${refillIterations}`,
+    { operation: "fetch_older_range_emit" },
+  );
+
+  try {
+    ws.send(
+      JSON.stringify({
+        type: "fetch_older_range_batch",
+        messages,
+        oldestLine,
+        hasMore,
+      }),
+    );
+  } catch (err) {
+    databaseLogger.warn(
+      `[ws-server] send-failed msgType=fetch_older_range_batch err="${err instanceof Error ? err.message : String(err)}"`,
+      { operation: "ws_send_failed" },
+    );
+  }
+}
+
+// Test seam — mirrors __handleIdentityGetRoleFileForTests convention above.
+// Vitest drives the handler directly (with a mocked readSessionFileRange)
+// via this alias, without needing a real WebSocketServer + ssh2 pair.
+export const __handleFetchOlderRangeForTests = handleFetchOlderRange;
+
+// ─── Test seam: discovery-repoll tick logic (Fix A + Fix B, quick 260730-sjf) ──
+//
+// The discoveryRepollTimer .then() callback is a per-connection closure over
+// ~8 mutable state variables and 4 helper functions. Spinning up the full
+// WS server + SSH pair just to observe repoll branch behavior is impractical
+// (requires 7+ dependency mocks to reach the connectToPane path). Instead,
+// extract the core decision logic into a module-scope function with injectable
+// deps so vitest can cover the five branch cases without I/O.
+//
+// Production code calls this via the per-connection discoveryRepollTimer
+// .then() body by delegating to it with the closure-bound state refs.
+// Tests instantiate a plain state box + helper stubs and call it directly.
+//
+// This is the same "function seam" pattern as __handleIdentityProbeTrappedWorkForTests
+// (which also extracted per-connection handler logic so vitest can drive it
+// without a real WebSocketServer).
+
+/** Mutable state box shared between the per-connection closure and the test seam. */
+export type __RepollStateForTests = {
+  changeoverState: "active" | "holding" | "dead";
+  currentSessionFile: string | null;
+  holdingTicks: number;
+};
+
+/** Helpers injected into the repoll tick logic. */
+export type __RepollHelpersForTests = {
+  transitionToHolding: (reason: "discovery_diff") => void;
+  transitionToActiveNew: (newSessionFile: string) => void;
+  transitionFromHoldingToActiveSameFile: () => void;
+  transitionToDead: (reason: string) => void;
+};
+
+/**
+ * Apply one repoll tick's decision logic for a given discovery result.
+ * Mutates `state` in-place (changeoverState, holdingTicks) and calls into
+ * helpers (transitionToHolding / transitionToActiveNew / etc.) as needed.
+ * Mirrors the .then() callback body in discoveryRepollTimer exactly.
+ *
+ * Returns immediately if changeoverState is already "dead" (idempotent guard).
+ *
+ * @param result  - discovery result for this tick
+ * @param state   - mutable per-connection state box (mutated in-place)
+ * @param helpers - injectable transition helpers (stubs in tests, real fns in prod)
+ */
+export function __applyRepollResultForTests(
+  result: import("./session-file-discovery.js").ClaudeSessionDiscoveryResult,
+  state: __RepollStateForTests,
+  helpers: __RepollHelpersForTests,
+): void {
+  if (state.changeoverState === "dead") return;
+
+  const isExecErrorTick =
+    result.status === "inactive" && result.reason === "exec_error";
+
+  if (result.status === "active") {
+    if (result.sessionFile !== state.currentSessionFile) {
+      if (state.changeoverState === "active") {
+        helpers.transitionToHolding("discovery_diff");
+      }
+      helpers.transitionToActiveNew(result.sessionFile);
+    } else if (state.changeoverState === "holding") {
+      helpers.transitionFromHoldingToActiveSameFile();
+    }
+  } else if (!isExecErrorTick) {
+    if (state.changeoverState === "active") {
+      helpers.transitionToHolding("discovery_diff");
+    }
+  }
+
+  if (state.changeoverState === "holding" && !isExecErrorTick) {
+    state.holdingTicks++;
+    if (state.holdingTicks >= HOLDING_TIMEOUT_TICKS) {
+      helpers.transitionToDead("holding_timeout");
+    }
+  }
+}
+
+// Which attach-time inactive reasons can be a sleeping agent: no claude on
+// the pane (`not_claude`), or no pane at all yet (`no_tmux_session`) — a
+// sleeping agent's conversation is read from its own history folder, so it
+// doesn't need a terminal session. The supervisor creates a sleeping agent's
+// session a moment after it lands (e.g. just after an un-archive); a tab that
+// connects in that gap still opens on the conversation.
+export function isDormancyCandidateReason(reason: string): boolean {
+  return reason === "not_claude" || reason === "no_tmux_session";
+}
+
+// ─── Test seam: attach-path inactive classifier (quick 260813-0qx) ───────────
+//
+// The initial-attach `if (result.status === "inactive") { ... }` block has to
+// decide, between the dormant-identity branch and FALLBACK-01, whether the
+// discovery result signals a launch window on THIS pane (claude starting up
+// after a crash-relaunch, fresh spawn, or dormant wake)
+// — in which case we enter holding + start the discovery-repoll timer instead
+// of tearing down. exec_error falls through unchanged to FALLBACK-01;
+// not_claude / no_tmux_session on a non-identity pane (bare shell, no such
+// agent) also falls through.
+//
+// This pure classifier is the SINGLE SOURCE OF TRUTH for the "launch_window vs
+// fallback_01" decision — the production branch calls it directly (so the
+// reducer and the test-observed classifier are the same code), and the tests
+// exercise the same function via this seam. That guarantees drift between
+// "what tests assert" and "what production does" cannot arise here.
+//
+// Launch-window reasons (map to "launch_window"):
+//   • no_pid_session_file
+//   • no_open_session_file
+//   • not_claude AND isIdentityShapedCached === true
+//   • no_tmux_session AND isIdentityShapedCached === true (agent folder,
+//     no session yet)
+//
+// Terminal reasons (map to "fallback_01"):
+//   • exec_error
+//   • not_claude / no_tmux_session AND isIdentityShapedCached !== true (bare
+//     shell, no such agent, OR probe never ran / threw → conservative fallback)
+//   • defensive: status === "active" (attach path only calls this on inactive)
+export function __classifyAttachInactiveForTests(
+  result: import("./session-file-discovery.js").ClaudeSessionDiscoveryResult,
+  isIdentityShapedCached: boolean | null,
+): "launch_window" | "fallback_01" {
+  if (result.status === "active") return "fallback_01";
+  const reason = result.reason;
+  if (reason === "no_pid_session_file" || reason === "no_open_session_file") {
+    return "launch_window";
+  }
+  // An agent's pane with no claude yet — or no pane yet (an always-on agent
+  // just un-archived, or one whose wake removed `.dormant` before the
+  // supervisor created its session) — is starting up, not gone.
+  if ((reason === "not_claude" || reason === "no_tmux_session") && isIdentityShapedCached === true) {
+    return "launch_window";
+  }
+  return "fallback_01";
+}
+
+// ─── Test seam: dormant poll tick logic (quick 260808-cd6) ───────────────────
+//
+// The dormant stat check lives inside the contextPctTimer IIFE alongside a
+// closure over 4 mutable state variables. Spinning up the full WS server + SSH
+// pair to test it is impractical. Instead we export the core logic as a
+// module-scope function with injectable deps (same pattern as
+// __applyRepollResultForTests above). Tests instantiate a plain state box +
+// mock execCommand + mock ws.send and call __applyDormantPollTickForTests directly.
+
+/** Mutable dormant-state box shared between the per-connection closure and the test seam. */
+export type __DormantStateForTests = {
+  isIdentityShapedCached: boolean | null;
+  identityShapeProbeInFlight: boolean;
+  dormantLastEmitted: boolean | null;
+  // Phase 56 Plan 01: wakeTriggerTs getter removed — the {type:"dormant"}
+  // frame no longer carries a timestamp field. Backend still owns
+  // wakeTriggerTs internally in the connection closure (~L3026) for the
+  // marker-freshness gate at __applyDormantPollWithRediscoveryForTests
+  // L2604-2626, but nothing emits it any more — the frontend no longer
+  // needs to reconstruct waking state (DormancyOverlay deleted in Plan 03).
+};
+
+/**
+ * Apply one dormant-poll tick for the given connection state.
+ * Mutates `state` in-place and calls `wsSend` if the dormant state changed.
+ * `execCommand` is injectable so tests can control its output.
+ *
+ * @param deps.connSnapshot  - SSH connection (typed as any in the seam; tests pass a stub)
+ * @param deps.escapedName   - tmux session name (already validated to safe subset)
+ * @param deps.execCommand   - injectable SSH exec helper
+ * @param deps.wsSend        - injectable ws.send stub
+ * @param state              - mutable per-connection dormant state box
+ */
+export async function __applyDormantPollTickForTests(
+  deps: {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    connSnapshot: any;
+    escapedName: string;
+    execCommand: (conn: unknown, cmd: string) => Promise<string>;
+    wsSend: (data: string) => void;
+  },
+  state: __DormantStateForTests,
+): Promise<void> {
+  const { connSnapshot, escapedName, execCommand: exec, wsSend } = deps;
+  if (state.isIdentityShapedCached === null && !state.identityShapeProbeInFlight) {
+    state.identityShapeProbeInFlight = true;
+    try {
+      const probeOut = await exec(
+        connSnapshot,
+        `test -d ~/fleet/identities/'${escapedName}' && echo yes || echo no`,
+      );
+      state.isIdentityShapedCached = probeOut.trim() === "yes";
+    } catch {
+      state.isIdentityShapedCached = false;
+    } finally {
+      state.identityShapeProbeInFlight = false;
+    }
+  } else if (state.isIdentityShapedCached === true) {
+    try {
+      const statOut = await exec(
+        connSnapshot,
+        `stat ~/fleet/identities/'${escapedName}'/.dormant 2>/dev/null >/dev/null && echo yes || echo no`,
+      );
+      const isDormant = statOut.trim() === "yes";
+      if (isDormant !== state.dormantLastEmitted) {
+        state.dormantLastEmitted = isDormant;
+        // Phase 56 Plan 01: wakingSince no longer emitted — the frontend no
+        // longer needs to reconstruct waking state (DormancyOverlay deleted
+        // in Plan 03). Backend keeps wakeTriggerTs internally only for the
+        // marker-freshness gate at __applyDormantPollWithRediscoveryForTests
+        // L2604-2626 (unchanged).
+        wsSend(JSON.stringify({ type: "dormant", dormant: isDormant }));
+      }
+    } catch {
+      /* SSH error — skip this tick silently */
+    }
+  }
+  // isIdentityShapedCached === false → skip entirely (never re-probe on this connection)
+}
+
+/**
+ * Fix #2 (post-Phase-50 code review): shared cleanup helper for the
+ * session-file-change path (transitionToActiveNew). Called from the closure
+ * transitionToActiveNew AND directly from optimistic-bubbles.integration.test.ts
+ * scenario (h) via the __applyTransitionToActiveNewCleanupForTests export.
+ *
+ * Clears three per-connection state slots that previously survived a
+ * session-file change and could leak OLD-session behavior into the NEW session:
+ *
+ *   1. queueEnqueueDedup Map — stale content-hash entries could suppress
+ *      fresh-session type:"user" frames on content collision.
+ *   2. pv-send-watchdog module `pending` (via clearPvSendWatchdogsForSession)
+ *      — a mid-arm watchdog for the OLD sessionId whose full-resend timer
+ *      fires post-change would retype OLD body into NEW composebox,
+ *      violating the shape invariant "retry never submits unintended
+ *      message" and leaking OLD-session content into the NEW transcript.
+ *   3. pendingMqidsForThisConnection Set — stale mqid bookkeeping so the
+ *      ws.on("close") cleanup does not attempt to clear already-cancelled
+ *      watchdogs and stays in sync with the pending Map.
+ *
+ * The cleared-mqid list from clearPvSendWatchdogsForSession is used to
+ * scrub matching entries from pendingMqidsForThisConnection.
+ */
+function applyTransitionToActiveNewCleanup(args: {
+  oldSessionId: string;
+  queueEnqueueDedup: Map<string, number>;
+  pendingMqidsForThisConnection: Set<string>;
+}): void {
+  const {
+    oldSessionId,
+    queueEnqueueDedup,
+    pendingMqidsForThisConnection,
+  } = args;
+  // (1) queueEnqueueDedup is per-connection scope (declared in the ws-server
+  //     closure at L~2419) — not sessionId-keyed at the top level. A new
+  //     session file is a session boundary; every stale hash was scoped to the OLD
+  //     session's content flow, so blanket .clear() is correct.
+  queueEnqueueDedup.clear();
+  // (2) Watchdog module state — clear every pending entry matching the OLD
+  //     sessionId. Returns cleared mqids so we can prune the per-connection
+  //     Set below.
+  const clearedMqids = clearPvSendWatchdogsForSession(oldSessionId);
+  // (3) Remove cleared mqids from pendingMqidsForThisConnection so
+  //     ws.on("close") does not attempt double-clears on already-cancelled
+  //     watchdogs (harmless but noise). Any mqids for OTHER sessions on
+  //     this connection stay — a WS connection could in principle hold
+  //     watchdogs for different session UUIDs during a rapid session-file change,
+  //     though the common case is a 1:1 connection:session mapping.
+  for (const mqid of clearedMqids) {
+    pendingMqidsForThisConnection.delete(mqid);
+  }
+}
+
+/**
+ * Test-only re-export of the applyTransitionToActiveNewCleanup helper.
+ * Consumed by optimistic-bubbles.integration.test.ts scenario (h) so
+ * the session-file-change cleanup contract is exercised without needing to spin up
+ * a full WS server + SSH connection + tail restart.
+ */
+export const __applyTransitionToActiveNewCleanupForTests =
+  applyTransitionToActiveNewCleanup;
+
+/** Result of the send-time pane check (see probePaneForSend). */
+export interface PaneSendProbe {
+  /** The session is a fleet identity (has ~/fleet/identities/<name>/<name>.md). */
+  isIdentity: boolean;
+  /** The identity's `.dormant` sentinel is present. */
+  dormantSentinel: boolean;
+  /** A claude/node process is on the session's pane tty. */
+  claudeRunning: boolean;
+}
+
+/**
+ * One SSH exec: is this identity's session actually able to take typed input?
+ * The claude-running test mirrors the supervisor's claude_running (claude/node
+ * on the pane tty). Returns null if the exec fails or prints something
+ * unparseable, so a flaky check never blocks a send.
+ */
+export async function probePaneForSend(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  conn: any,
+  name: string,
+  exec: (conn: unknown, cmd: string) => Promise<string>,
+): Promise<PaneSendProbe | null> {
+  const dir = `~/fleet/identities/${shellQuote(name)}`;
+  const cmd =
+    `i=0; [ -f ${dir}/${shellQuote(name + ".md")} ] && i=1; ` +
+    `d=0; [ -e ${dir}/.dormant ] && d=1; ` +
+    `t=$(tmux list-panes -t ${shellQuote("=" + name + ":")} -F '#{pane_tty}' 2>/dev/null | head -1); ` +
+    `c=0; [ -n "$t" ] && ps -t "\${t#/dev/}" -o comm= 2>/dev/null | grep -qiE 'claude|node' && c=1; ` +
+    `echo "probe $i $d $c"`;
+  try {
+    const out = (await exec(conn, cmd)).trim();
+    const m = /^probe ([01]) ([01]) ([01])$/.exec(out.split("\n").pop() ?? "");
+    if (!m) return null;
+    return { isIdentity: m[1] === "1", dormantSentinel: m[2] === "1", claudeRunning: m[3] === "1" };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Apply the input message handler logic for tests.
+ * Phase 35 — pretty-view compose-send migrated onto claude-session WS.
+ * Mirrors the input-handler seam shape (Tests D/E/F from dormant-poll.test.ts)
+ * — the sibling wake-message test seam was DELETED in Phase 56 Plan 03.
+ *
+ * Handles both the split-send case (mqid non-empty + data ends in \r →
+ * body write, 250ms delay, Enter write) and the non-split case (one send-keys call).
+ *
+ * @param deps.sshConn              - SSH connection (null if not connected)
+ * @param deps.currentTmuxSession   - current pane tmux session name (null if none)
+ * @param deps.currentHostId        - connection-scoped host ID (for logging)
+ * @param deps.execCommand          - injectable SSH exec helper
+ * @param deps.data                 - the input data string (may contain trailing \r for split-send)
+ * @param deps.messageQueueItemId   - optional mqid; non-empty triggers split-send gate
+ * @param deps.textArea             - the send came out of the compose box's text area;
+ *                                    refused if it starts with a blocked command
+ */
+export async function __applyInputMessageForTests(deps: {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  sshConn: any | null;
+  currentTmuxSession: string | null;
+  currentHostId: number | null;
+  execCommand: (conn: unknown, cmd: string) => Promise<string>;
+  data: string;
+  messageQueueItemId?: string;
+  textArea?: boolean;
+  // Phase 50 Plan 02 Task 2 — optional wire-up for the signal-driven send
+  // watchdog. All four are optional to preserve backward compat with the
+  // pre-Phase-50 test call sites (they omit these and get the log-and-swallow-
+  // only path unchanged).
+  sessionId?: string;
+  wsSend?: (frame: object) => void;
+  armWatchdog?: typeof armPvSendWatchdog;
+  trackMqid?: (mqid: string) => void;
+  // Phase 56 Plan 01 — send-while-dormant path (invisible wake trigger).
+  // When all four are wired AND dormantLastEmitted() returns true at entry,
+  // the send-path drops the .dormant sentinel, records wakeTriggerTs so the
+  // existing dormant-poll marker-freshness gate holds this pane's dormant
+  // frame in place, polls .resume-complete until it's newer than send-time
+  // (or MARKER_FALLBACK_MS elapses), then falls through to the normal
+  // split-send. Same freshness contract as __applyDormantPollWithRediscovery
+  // ForTests (L2515-2648). All four optional to preserve backward compat
+  // with pre-Phase-56 test call sites (they omit these and get the pre-Phase-
+  // 56 non-dormant-branch path unchanged).
+  dormantLastEmitted?: () => boolean | null;
+  setWakeTriggerTs?: (ts: number) => void;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  markerCommand?: (conn: any, name: string) => Promise<string | null>;
+  now?: () => number;
+  // Fresh host-side check run right before typing, for when the connection's
+  // dormant view lags the host: the supervisor writes `.dormant` before it
+  // sends /exit, and the poll that flips dormantLastEmitted runs seconds later,
+  // so a send in that window would be typed into the shell claude just left.
+  // Returns null when the check itself fails (the send then goes ahead as
+  // before) — see probePaneForSend.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  paneProbe?: (conn: any, name: string) => Promise<PaneSendProbe | null>;
+}): Promise<void> {
+  const { sshConn, currentTmuxSession, currentHostId, execCommand: exec } = deps;
+  // Diagnostic drop: pv-claude-session-ws-zombie-after-tmux-teardown — forensic drop log
+  // for the class of failure diagnosed 2026-09-07 (WS OPEN, currentTmuxSession
+  // nulled server-side by tmux teardown, every subsequent input frame silently
+  // returning here with no log/no ack). Symmetric outbound broadcaster does NOT
+  // need its own log: activeViewers (L1058) is keyed by ${hostId}::${tmuxSession}
+  // and membership is torn down inside teardownPane (L4001-4006), so the fan-out
+  // iterates a valid registry and never touches orphan connections. Log-shape
+  // mirrors :2615 (sentinel drop failed) and :2704 (payload too large) — same
+  // (msg, { operation, ...ctx }) form.
+  if (!sshConn || !currentTmuxSession) {
+    sshLogger.warn("[pv-input] drop_no_session", {
+      operation: "pv_input_drop_no_session",
+      mqid: String(deps.messageQueueItemId ?? "none"),
+      hostId: currentHostId,
+      hasSshConn: !!sshConn,
+      hasTmuxSession: !!currentTmuxSession,
+      dataLen: (deps.data ?? "").length,
+    });
+    return;
+  }
+  const data = String(deps.data ?? "");
+  if (data.length === 0) return;
+  // The compose box's text area carries only Skynet's own commands. A marked
+  // send that starts with a blocked one is refused before anything else —
+  // no wake, nothing typed. Unmarked sends (buttons) are never checked.
+  if (deps.textArea === true) {
+    const blocked = blockedCommandIn(data.replace(/\r$/, ""));
+    if (blocked !== null) {
+      const mqid = String(deps.messageQueueItemId ?? "");
+      sshLogger.info(`[pv-input] command_refused command=${blocked} mqid=${mqid || "none"} hostId=${currentHostId} tmuxSession=${currentTmuxSession}`, {
+        operation: "pv_input_command_refused",
+        command: blocked,
+        mqid: mqid || "none",
+        hostId: currentHostId,
+        tmuxSession: currentTmuxSession,
+      });
+      if (mqid !== "") deps.wsSend?.({ type: "command_refused", mqid });
+      return;
+    }
+  }
+  // Cap payload size. Voice mode produces long messages (a 17.8 KB dictation
+  // was dropped at the old 16 KB cap), and long bodies are typed in chunks
+  // (send-keys-chunks.ts), so the cap only guards against absurd input.
+  // Checked before the dormant wake so a refusal tells the client at once —
+  // the bubble fails with a reason instead of waiting out the wake and its
+  // own 90s timeout — and nobody is woken for a message that can't be sent.
+  const mqid = String(deps.messageQueueItemId ?? "");
+  if (data.length > MAX_INPUT_BYTES) {
+    sshLogger.warn("input rejected: payload too large", {
+      operation: "input_reject_size",
+      hostId: currentHostId,
+      tmuxSession: currentTmuxSession,
+      mqid: mqid || "none",
+      dataLength: data.length,
+      maxBytes: MAX_INPUT_BYTES,
+    });
+    if (deps.wsSend) {
+      try {
+        deps.wsSend({
+          type: "send_keys_error",
+          mqid: mqid.length > 0 ? mqid : null,
+          reason: "too_large",
+          message: `Too long to send (${Math.ceil(data.length / 1024)} KB; the limit is ${MAX_INPUT_BYTES / 1024} KB).`,
+        });
+      } catch (wsErr) {
+        sshLogger.warn("send_keys_error frame emit failed", {
+          operation: "input_send_error_ws_emit_failed",
+          error: wsErr instanceof Error ? wsErr.message : String(wsErr),
+        });
+      }
+    }
+    return;
+  }
+  // Phase 56 Plan 01 — send-while-dormant branch. Read dormantLastEmitted
+  // after the MAX_INPUT_BYTES cap. When dormant AND all four Phase-56 deps are wired, delegate
+  // to performDormantWakeGate (shared helper).
+  // The gate drops the sentinel, polls .resume-complete until fresh or
+  // MARKER_FALLBACK_MS, then returns. Then fall through to the normal send
+  // code (split-send delivery).
+  // See T-56-01-01/02/03/04/05 in the plan's threat model for trust-boundary
+  // rationale (currentTmuxSession is connection-scoped from connectToPane
+  // discovery; client-supplied hostId/tmuxSession are IGNORED at the helper).
+  let wasDormant = deps.dormantLastEmitted?.() === true;
+  if (!wasDormant && deps.paneProbe && data.replace(/\r$/, "").length > 0) {
+    const probe = await deps.paneProbe(sshConn, currentTmuxSession);
+    if (probe && probe.isIdentity && (probe.dormantSentinel || !probe.claudeRunning)) {
+      sshLogger.info(
+        `[pv-input] send-time recheck: no live claude to type into (dormantSentinel=${probe.dormantSentinel} claudeRunning=${probe.claudeRunning}) — waking instead of typing into the shell`,
+        {
+          operation: "pv_input_send_recheck_wake",
+          hostId: currentHostId,
+          tmuxSession: currentTmuxSession,
+          mqid: String(deps.messageQueueItemId ?? "none"),
+          dormantSentinel: probe.dormantSentinel,
+          claudeRunning: probe.claudeRunning,
+        },
+      );
+      wasDormant = true;
+    }
+  }
+  if (
+    wasDormant &&
+    deps.setWakeTriggerTs &&
+    deps.markerCommand &&
+    deps.now
+  ) {
+    await performDormantWakeGate({
+      sshConn,
+      tmuxSession: currentTmuxSession,
+      hostId: currentHostId,
+      exec,
+      markerCommand: deps.markerCommand,
+      setWakeTriggerTs: deps.setWakeTriggerTs,
+      now: deps.now,
+      logOpPrefix: "pv_input",
+      mqid: String(deps.messageQueueItemId ?? ""),
+    });
+  }
+  // Split-send gate (mirrors terminal.ts:499 split-send semantics):
+  // mqid non-empty + data ends in \r → pretty-view compose-send shape (patch #110).
+  // Body write first, then SPLIT_SEND_DELAY_MS (bumped from 250ms → 1000ms
+  // 2026-08-21 by tina after diagnosing stuck sends; 250ms was sometimes
+  // inside the bracketed-paste-drain window on this pane. Patch #111 lore
+  // said "don't go BELOW 250" — going higher is more conservative, not less),
+  // then Enter.
+  const isSplitSend = mqid.length > 0 && data.endsWith("\r");
+  // Instrumentation (2026-08-21, tina): log every input frame at rx with all
+  // signals needed to diagnose "message stuck in composer" reports. Compare
+  // against `[compose] submit-*` on the frontend side to see where mqid gets
+  // dropped in the chain. Cheap + batched to console; rules per user
+  // 2026-08-11 (logging-first diagnosis).
+  sshLogger.info(
+    `[pv-input] rx hostId=${currentHostId} tmuxSession=${currentTmuxSession} dataLen=${data.length} hasMqid=${mqid.length > 0} mqid=${mqid.length > 0 ? mqid : "none"} endsWithCR=${data.endsWith("\r")} isSplitSend=${isSplitSend}`,
+    {
+      operation: "pv_input_rx",
+      hostId: currentHostId,
+      tmuxSession: currentTmuxSession,
+      dataLen: data.length,
+      hasMqid: mqid.length > 0,
+      endsWithCR: data.endsWith("\r"),
+      isSplitSend,
+    },
+  );
+  // Phase 50 Plan 02 Task 2 — track which exec call threw so the send_keys_error
+  // frame (D-21) can carry a precise reason. Body throw short-circuits Enter.
+  let bodyExecFailed = false;
+  let enterExecFailed = false;
+  const body = isSplitSend ? data.slice(0, -1) : "";
+  try {
+    if (isSplitSend) {
+      if (body.length > 0) {
+        try {
+          for (const cmd of buildSendKeysCommands(currentTmuxSession, body)) {
+            await exec(sshConn, cmd);
+          }
+        } catch (bodyErr) {
+          bodyExecFailed = true;
+          throw bodyErr;
+        }
+      }
+      // 1000ms — bumped from 250ms 2026-08-21 by tina. Patch #111 lore said
+      // "don't go BELOW 250" (user UAT confirmed 50ms caused paste-detection-
+      // still-active symptom). Diagnostic on 2026-08-21 found sends still
+      // occasionally getting stuck at 250ms; raising to 1000ms adds more
+      // headroom for bracketed-paste-drain / tmux-write-coalesce edges. Cost:
+      // every compose send is ~750ms slower.
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      try {
+        await exec(sshConn, `tmux send-keys -t ${shellQuote(currentTmuxSession)} Enter`);
+      } catch (enterErr) {
+        enterExecFailed = true;
+        throw enterErr;
+      }
+    } else {
+      for (const cmd of buildSendKeysCommands(currentTmuxSession, data)) {
+        await exec(sshConn, cmd);
+      }
+    }
+
+    // Phase 50 Plan 02 Task 2 — arm the signal-driven watchdog on successful
+    // split-send. contentHash derivation MUST match the arm-time key derivation
+    // in the onLine notifyMatched call site AND Plan 50-01 Task 2's dedup Map
+    // key (sha256(content).slice(0,32) — content-only). If any of the three
+    // drift, watchdogs never notify and every real send escalates unnecessarily.
+    // See 50-01-PLAN.md § objective "Hash-derivation contract".
+    //
+    // Fix #1 (post-Phase-50 code review): bare-Enter split-sends (data="\r"
+    // with an mqid — the second half of MessageQueueDrawer's split-write
+    // shape) have body="" after slicing the trailing \r. Arming a watchdog
+    // against sha256("").slice(0,32) is a dead arm: the parser never emits
+    // an empty-content message frame, so notifyMatched never fires → the
+    // full 2.5s→5.5s→20s escalation runs on every queue-drawer send. The
+    // body write already happened in the prior WS input event (queue-drawer
+    // step (a) — body without \r without mqid). Gate the arm on
+    // body.length > 0 so the bare Enter alone stays silent.
+    if (
+      isSplitSend &&
+      body.length > 0 &&
+      mqid.length > 0 &&
+      deps.sessionId &&
+      deps.wsSend &&
+      deps.armWatchdog
+    ) {
+      deps.armWatchdog({
+        sessionId: deps.sessionId,
+        mqid,
+        body,
+        // Bind sshConn into the exec signature the watchdog expects.
+        execCommand: (cmd: string) => exec(sshConn, cmd),
+        tmuxTarget: currentTmuxSession,
+        wsSend: deps.wsSend,
+        logger: sshLogger,
+        // Phase 56 Plan 02 — widened watchdog window for dormant-triggered
+        // sends. `wasDormant` was captured at L2064 (top of function body,
+        // Plan 01) BEFORE the sentinel-drop + marker-wait side-effects, so it
+        // reflects the pane's state at input-handler entry. Backend-derived
+        // — never from a WS payload field (T-56-02-01). When true, the
+        // watchdog uses GIVE_UP_MS_DORMANT (120_000ms) instead of
+        // GIVE_UP_MS (20_000ms) so a healthy ~90s wake doesn't trip
+        // paste_send_failed.
+        dormantSend: wasDormant,
+      });
+      deps.trackMqid?.(mqid);
+      sshLogger.info("[pv-input] armed split-send watchdog", {
+        operation: "pv_input_arm_split",
+        mqid,
+        sessionId: deps.sessionId,
+        bodyBytes: body.length,
+        dormantSend: wasDormant,
+      });
+      sshLogger.info(`[diag-dormant-send] backend watchdog-arm mqid=${mqid} sessionId=${deps.sessionId} bodyBytes=${body.length} dormantSend=${wasDormant} matched_by=fifo`);
+    }
+
+    // Non-split safety net (2026-08-21, tina). When the frontend loses mqid
+    // somewhere in the chain, we take the non-split path — body written with
+    // `send-keys -l <data>` where data ends in \r. Under bracketed paste the
+    // trailing \r lands as a newline in the composer, NOT a submit, and the
+    // message sits forever with no auto-recovery. Arm a retry-Enter-only
+    // watchdog so T+2500ms fires a bare Enter (safe by D-16: Claude ignores
+    // empty-input Enter). Full-resend + give-up are SKIPPED here — see
+    // pv-send-watchdog.ts ArmPvSendWatchdogArgs.retryEnterOnly comment for
+    // the double-submit reasoning. Gate on data.length > 1 so a bare "\r"
+    // frame doesn't arm.
+    if (
+      !isSplitSend &&
+      data.length > 1 &&
+      data.endsWith("\r") &&
+      deps.sessionId &&
+      deps.wsSend &&
+      deps.armWatchdog
+    ) {
+      const nonSplitBody = data.slice(0, -1);
+      const synthMqid = `backend-synth-${Date.now()}-${Math.random().toString(36).slice(2, 10).padEnd(8, "0")}`;
+      deps.armWatchdog({
+        sessionId: deps.sessionId,
+        mqid: synthMqid,
+        body: nonSplitBody,
+        execCommand: (cmd: string) => exec(sshConn, cmd),
+        tmuxTarget: currentTmuxSession,
+        wsSend: deps.wsSend,
+        logger: sshLogger,
+        retryEnterOnly: true,
+        // Phase 56 Plan 02 — even when we're on the mqid-loss safety net,
+        // dormant sends need the widened cadence: the single retry-Enter
+        // must fire AFTER the marker-wait window (T+92500ms), not during
+        // it (T+2500ms — useless because the wake-supervisor's shell →
+        // claude bootstrap could still be running and tmux isn't ready to
+        // receive the Enter as a submit). Orthogonal to retryEnterOnly:
+        // still only stage 1 fires, but at the widened cadence.
+        dormantSend: wasDormant,
+      });
+      deps.trackMqid?.(synthMqid);
+      sshLogger.warn(
+        "[pv-input] armed non-split retry-Enter-only watchdog (mqid lost somewhere in frontend chain?)",
+        {
+          operation: "pv_input_arm_non_split",
+          synthMqid,
+          sessionId: deps.sessionId,
+          bodyBytes: nonSplitBody.length,
+          dormantSend: wasDormant,
+        },
+      );
+      sshLogger.warn(`[diag-dormant-send] backend watchdog-arm-retryonly mqid=${synthMqid} sessionId=${deps.sessionId} bodyBytes=${nonSplitBody.length} dormantSend=${wasDormant} synth=true`);
+    }
+  } catch (err) {
+    // Phase 50 Plan 02 D-21 — surface execCommand throws as a new
+    // send_keys_error WS frame instead of the pre-Phase-50 log-and-swallow.
+    // The log stays (extended, not removed) for backend audit continuity.
+    sshLogger.warn("input send failed", {
+      operation: "input_send_error",
+      hostId: currentHostId,
+      tmuxSession: currentTmuxSession,
+      dataLength: data.length,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    if (deps.wsSend) {
+      const reason = isSplitSend
+        ? bodyExecFailed
+          ? "exec_throw_body"
+          : enterExecFailed
+            ? "exec_throw_enter"
+            : "exec_throw"
+        : "exec_throw";
+      try {
+        deps.wsSend({
+          type: "send_keys_error",
+          mqid: mqid.length > 0 ? mqid : null,
+          reason,
+          message: err instanceof Error ? err.message : String(err),
+        });
+      } catch (wsErr) {
+        sshLogger.warn("send_keys_error frame emit failed", {
+          operation: "input_send_error_ws_emit_failed",
+          error: wsErr instanceof Error ? wsErr.message : String(wsErr),
+        });
+      }
+    }
+  }
+}
+
+// ─── Phase 50 Plan 01 Task 2 — per-session queue-enqueue dedup ────────────────
+//
+// A queued user message appears in the JSONL TWICE: first as a
+// `type:"queue-operation", operation:"enqueue"` entry at enqueue time
+// (~T+0, ~111ms post-send), and again as a regular `type:"user"` turn at
+// dequeue time (up to ~2 MINUTES later per 50-CONTEXT.md § Empirical
+// evidence). Task 1's parser change means the first entry now emits as
+// kind:"message"; without dedup, the second would also emit and the
+// bubble would render twice.
+//
+// Dedup strategy (D-11 revised, see 50-01-PLAN.md § objective
+// "Hash-derivation contract"):
+//   • Key = contentHash = sha256(content).slice(0, 32) — content-only,
+//     NO sessionId, NO timestamp. Content-only because the enqueue and
+//     dequeue timestamps differ by minutes; any timestamp-inclusive key
+//     would fail to match across the enqueue → dequeue span. Per-session
+//     scope comes from the Map living on the per-connection tail-watcher
+//     closure — NOT from the key.
+//   • Value = wall-clock ms epoch of insertion; used for lazy TTL
+//     eviction (10 minutes per D-11 Discretion) and for the "unexpired"
+//     lookup check.
+//   • Capacity capped at 100 entries; on insert, oldest-first eviction
+//     (Map preserves insertion order in JS).
+//   • Single-shot: a successful suppress DELETES the matched entry so
+//     it can't accidentally suppress a genuine third occurrence of the
+//     same body later.
+//   • Task-notification enqueues skip upstream at the parser (Task 1
+//     guard) and thus never reach this seam; even if they did, the
+//     rawObj.type === "queue-operation" gate here plus a defense-in-depth
+//     check on the parsed content would prevent them from populating the
+//     Map. Patch #66's separate task-notification handler in onLine
+//     stays entirely intact.
+//
+// The seam is a pure function so tests can drive it without spinning up
+// the tail watcher or a WS server. Production onLine calls it BEFORE
+// `ws.send(JSON.stringify(frame))` for kind:"message" frames on user
+// role; when `suppress: true` the frame is dropped silently.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export {
+  __QUEUE_DEDUP_TTL_MS,
+  __QUEUE_DEDUP_CAP,
+  __applyQueueDedupForTests,
+} from "./queue-dedup.js";
+
+// How long the interrupt handler waits, after sending Escape, for the harness
+// to write its "[Request interrupted by user]" marker. Measured: the marker is
+// written within milliseconds of the stop, including mid-stream replies; a
+// rewind (cancel) writes nothing at all.
+export const INTERRUPT_MARKER_WAIT_MS = 1500;
+const INTERRUPT_MARKER_POLL_MS = 100;
+
+/**
+ * Pretty-view interrupt button (shape-interrupt-button). Transcript-only:
+ *
+ *   1. Per-pane throttle (unchanged — see interruptThrottleByPane).
+ *   2. Send Escape. Escape stops a working agent and, when the agent has not
+ *      produced anything yet, rewinds the prompt into the harness input box.
+ *      Unlike Ctrl-C it never arms Claude Code's "press again to exit".
+ *   3. Wait up to INTERRUPT_MARKER_WAIT_MS for the interrupt marker in the
+ *      transcript (via the connection's cancel tracker).
+ *   4. Verdict:
+ *        stopped   — the marker landed: the agent was working; nothing more.
+ *        cancelled — no marker and nothing from the agent after the latest
+ *                    prompt: the harness rewound it. Send ONE Ctrl-C to clear
+ *                    the rewound words from the harness input box (safe: the
+ *                    next press is >= INTERRUPT_THROTTLE_MS away and sends
+ *                    Escape, not Ctrl-C).
+ *        none      — the agent had already answered, or the prompt was
+ *                    already cancelled: nothing more is sent.
+ *
+ * Never reads the harness screen. Returns the verdict (null when the press was
+ * refused or throttled) so the caller can tell the views.
+ */
+export async function __applyInterruptMessageForTests(deps: {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  sshConn: any | null;
+  currentTmuxSession: string | null;
+  currentHostId: number | null;
+  execCommand: (conn: unknown, cmd: string) => Promise<string>;
+  tracker: () => InterruptCancelTracker;
+  /** Harness session id (transcript basename) — names the work-indicator markers. */
+  sessionIdFromFile?: string | null;
+  now?: () => number;
+  wait?: (ms: number) => Promise<void>;
+}): Promise<InterruptVerdict | null> {
+  const {
+    sshConn,
+    currentTmuxSession,
+    currentHostId,
+    execCommand: exec,
+    tracker,
+    sessionIdFromFile = null,
+    now = Date.now,
+    wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms)),
+  } = deps;
+  // Fail-closed: without a full pane identity there is no throttle key.
+  // In production this branch is unreachable: currentHostId is nulled in
+  // teardownPane in lockstep with currentTmuxSession.
+  if (!sshConn || !currentTmuxSession || currentHostId == null) return null;
+
+  const key = sessionKey(currentHostId, currentTmuxSession);
+  const nowMs = now();
+
+  const last = interruptThrottleByPane.get(key);
+  if (last !== undefined && nowMs - last < INTERRUPT_THROTTLE_MS) {
+    sshLogger.warn("interrupt throttled — press inside the per-pane window", {
+      operation: "interrupt_throttled",
+      hostId: currentHostId,
+      tmuxSession: currentTmuxSession,
+      elapsedMs: nowMs - last,
+      windowMs: INTERRUPT_THROTTLE_MS,
+    });
+    return { verdict: "none", reason: "throttled" };
+  }
+
+  // Prune stale entries before recording the fresh one (T-9o3-03).
+  for (const [k, ts] of interruptThrottleByPane) {
+    if (nowMs - ts >= INTERRUPT_THROTTLE_MS) {
+      interruptThrottleByPane.delete(k);
+    }
+  }
+  // Record BEFORE awaiting exec — two concurrent in-flight presses must not
+  // both pass the gate.
+  interruptThrottleByPane.set(key, nowMs);
+
+  const target = shellQuote(currentTmuxSession);
+  const snap = tracker().snapshot();
+  sshLogger.info(`[interrupt] press hostId=${currentHostId} tmuxSession=${currentTmuxSession} latestPrompt=${snap.latestUuid ?? "none"} markers=${snap.markerCount}`, {
+    operation: "interrupt_press",
+    hostId: currentHostId,
+    tmuxSession: currentTmuxSession,
+    latestPrompt: snap.latestUuid,
+  });
+  try {
+    // Escape is a tmux key name from our own source — no -l, no quoting.
+    await exec(sshConn, `tmux send-keys -t ${target} Escape`);
+  } catch (err) {
+    sshLogger.warn("interrupt send failed", {
+      operation: "interrupt_send_error",
+      hostId: currentHostId,
+      tmuxSession: currentTmuxSession,
+      key: "Escape",
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+
+  const t0 = now();
+  let waited = 0;
+  while (!tracker().markerSince(snap) && waited < INTERRUPT_MARKER_WAIT_MS) {
+    await wait(INTERRUPT_MARKER_POLL_MS);
+    waited = now() - t0;
+  }
+
+  const verdict = tracker().decide(snap);
+  const detail =
+    verdict.verdict === "cancelled"
+      ? `eventId=${verdict.prompt.uuid} restorable=${verdict.prompt.visibleText !== null}`
+      : verdict.verdict === "none"
+        ? `reason=${verdict.reason}`
+        : "marker=seen";
+  sshLogger.info(`[interrupt] verdict=${verdict.verdict} ${detail} waitedMs=${waited} hostId=${currentHostId} tmuxSession=${currentTmuxSession}`, {
+    operation: "interrupt_verdict",
+    hostId: currentHostId,
+    tmuxSession: currentTmuxSession,
+    verdict: verdict.verdict,
+    waitedMs: waited,
+  });
+
+  if (verdict.verdict === "cancelled") {
+    tracker().markCancelledLive(verdict.prompt.uuid);
+    try {
+      // The rewound words are now in the harness input box; one Ctrl-C clears
+      // every line of them (Ctrl-U clears only one line).
+      await exec(sshConn, `tmux send-keys -t ${target} C-c`);
+      sshLogger.info(`[interrupt] cleared-harness-input eventId=${verdict.prompt.uuid}`, {
+        operation: "interrupt_clear_input",
+        hostId: currentHostId,
+        tmuxSession: currentTmuxSession,
+      });
+    } catch (err) {
+      sshLogger.warn("interrupt clear failed", {
+        operation: "interrupt_send_error",
+        hostId: currentHostId,
+        tmuxSession: currentTmuxSession,
+        key: "C-c",
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  // A stop or cancel never runs the harness's Stop hook, so the work
+  // indicator (activity-marker mtime > stopped-marker mtime) would stay lit.
+  // Touch the stopped marker the Stop hook would have touched.
+  if (
+    (verdict.verdict === "stopped" || verdict.verdict === "cancelled") &&
+    sessionIdFromFile !== null &&
+    UUID_RE.test(sessionIdFromFile)
+  ) {
+    const dir = `"$HOME/.claude/fleet-status/hooks/${sessionIdFromFile}"`;
+    try {
+      await exec(sshConn, `mkdir -p ${dir} && touch ${dir}/stopped`);
+      sshLogger.info(`[interrupt] stopped-marker-touched sessionId=${sessionIdFromFile} verdict=${verdict.verdict}`, {
+        operation: "interrupt_stopped_marker",
+        hostId: currentHostId,
+        tmuxSession: currentTmuxSession,
+        sessionId: sessionIdFromFile,
+      });
+    } catch (err) {
+      sshLogger.warn("interrupt stopped-marker touch failed", {
+        operation: "interrupt_stopped_marker_error",
+        hostId: currentHostId,
+        tmuxSession: currentTmuxSession,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  return verdict;
+}
+
+// ─── Permission prompt read + answer (WaitingBubble Allow / Deny) ────────────
+//
+// When fleet-status reports the pane as waiting, pretty-view polls
+// `permission_probe` to learn what the prompt says, and sends
+// `permission_answer` when the user clicks Allow or Deny. Both re-read the
+// pane: an answer is only typed when the SAME prompt (by fingerprint) is still
+// on screen, so a late click can never leak a stray digit into the compose
+// line. Target pane comes from the connection-scoped tmux session only.
+
+export type PermissionPromptStateFrame = {
+  type: "permission_prompt_state";
+  prompt: PermissionPromptScreen | null;
+};
+
+export type PermissionAnswerResultFrame = {
+  type: "permission_answer_result";
+  choice: "allow" | "deny";
+  fingerprint: string;
+  status: "sent" | "gone" | "error";
+};
+
+// Rows to grow a detached pane to when a prompt is taller than it.
+export const PERMISSION_PROMPT_TALL_ROWS = 200;
+
+async function capturePermissionPrompt(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  sshConn: any,
+  tmuxSession: string,
+  exec: (conn: unknown, cmd: string) => Promise<string>,
+): Promise<PermissionPromptScreen | null> {
+  const target = shellQuote(tmuxSession);
+  const capture = () => exec(sshConn, `tmux capture-pane -p -t ${target}`);
+  const screen = await capture();
+  const parsed = parsePermissionPromptScreen(screen);
+  if (parsed || !isCutOffPermissionPrompt(screen)) return parsed;
+
+  // The prompt is taller than the pane, so its top isn't anywhere in tmux
+  // (Claude Code redraws without scrollback). A session nobody is attached
+  // to sits at tmux's default 80x24, so grow it and let Claude Code redraw.
+  // Only when no client is attached — an attached terminal view owns the
+  // size. Unsetting window-size afterwards hands sizing back to the next
+  // client that attaches.
+  const rows = PERMISSION_PROMPT_TALL_ROWS;
+  const out = await exec(
+    sshConn,
+    `if [ "$(tmux display-message -p -t ${target} '#{session_attached}')" = "0" ] && [ "$(tmux display-message -p -t ${target} '#{window_height}')" -lt ${rows} ]; then tmux resize-window -t ${target} -y ${rows} && tmux set-option -wu -t ${target} window-size && sleep 0.5 && echo resized; else echo skipped; fi`,
+  );
+  const resized = out.trim() === "resized";
+  sshLogger.info("permission prompt cut off at the top", {
+    operation: "permission_prompt_cut_off",
+    tmuxSession,
+    resized,
+    rows,
+    output: resized ? undefined : out.trim().slice(0, 200),
+  });
+  if (!resized) return null;
+  return parsePermissionPromptScreen(await capture());
+}
+
+export async function applyPermissionProbe(deps: {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  sshConn: any | null;
+  currentTmuxSession: string | null;
+  currentHostId: number | null;
+  execCommand: (conn: unknown, cmd: string) => Promise<string>;
+}): Promise<PermissionPromptStateFrame> {
+  const { sshConn, currentTmuxSession, currentHostId, execCommand: exec } = deps;
+  if (!sshConn || !currentTmuxSession) {
+    return { type: "permission_prompt_state", prompt: null };
+  }
+  try {
+    const prompt = await capturePermissionPrompt(sshConn, currentTmuxSession, exec);
+    return { type: "permission_prompt_state", prompt };
+  } catch (err) {
+    sshLogger.warn("permission probe capture failed", {
+      operation: "permission_probe_error",
+      hostId: currentHostId,
+      tmuxSession: currentTmuxSession,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return { type: "permission_prompt_state", prompt: null };
+  }
+}
+
+// Answers are serialized per pane (two tabs, or a tab plus the terminal, can
+// click at once) and a fingerprint answered moments ago is refused, so the
+// second click can't land its digit on whatever comes after the prompt.
+const permissionAnswerChains = new Map<string, Promise<unknown>>();
+const recentPermissionAnswers = new Map<string, { fingerprint: string; at: number }>();
+const PERMISSION_ANSWER_DEDUP_MS = 3000;
+
+/** Test-only: clear the per-pane answer state between tests. */
+export function __resetPermissionAnswerStateForTests(): void {
+  permissionAnswerChains.clear();
+  recentPermissionAnswers.clear();
+}
+
+export async function applyPermissionAnswer(deps: {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  sshConn: any | null;
+  currentTmuxSession: string | null;
+  currentHostId: number | null;
+  execCommand: (conn: unknown, cmd: string) => Promise<string>;
+  choice: unknown;
+  fingerprint: unknown;
+}): Promise<PermissionAnswerResultFrame | null> {
+  const { sshConn, currentTmuxSession, currentHostId, execCommand: exec } = deps;
+  if (deps.choice !== "allow" && deps.choice !== "deny") return null;
+  if (typeof deps.fingerprint !== "string" || deps.fingerprint.length === 0) {
+    return null;
+  }
+  const choice = deps.choice;
+  const fingerprint = deps.fingerprint;
+  const result = (status: PermissionAnswerResultFrame["status"]) =>
+    ({ type: "permission_answer_result", choice, fingerprint, status }) as const;
+  if (!sshConn || !currentTmuxSession) return result("gone");
+  const tmuxSession = currentTmuxSession;
+  const paneKey = `${currentHostId ?? "?"}:${tmuxSession}`;
+  const prev = permissionAnswerChains.get(paneKey) ?? Promise.resolve();
+  const run = prev.then(() => answerOnce());
+  const tail = run.catch(() => undefined);
+  permissionAnswerChains.set(paneKey, tail);
+  void tail.then(() => {
+    if (permissionAnswerChains.get(paneKey) === tail) {
+      permissionAnswerChains.delete(paneKey);
+    }
+  });
+  return run;
+
+  async function answerOnce(): Promise<PermissionAnswerResultFrame> {
+    const recent = recentPermissionAnswers.get(paneKey);
+    if (
+      recent &&
+      recent.fingerprint === fingerprint &&
+      Date.now() - recent.at < PERMISSION_ANSWER_DEDUP_MS
+    ) {
+      sshLogger.info("permission answer dropped — already answered", {
+        operation: "permission_answer_duplicate",
+        hostId: currentHostId,
+        tmuxSession,
+        choice,
+        fingerprint,
+      });
+      return result("gone");
+    }
+    try {
+      const prompt = await capturePermissionPrompt(sshConn, tmuxSession, exec);
+      if (!prompt || prompt.fingerprint !== fingerprint) {
+        sshLogger.info("permission answer dropped — prompt no longer on screen", {
+          operation: "permission_answer_gone",
+          hostId: currentHostId,
+          tmuxSession: currentTmuxSession,
+          choice,
+          fingerprint,
+          onScreenFingerprint: prompt?.fingerprint ?? null,
+        });
+        return result("gone");
+      }
+      const key = choice === "allow" ? prompt.yesKey : prompt.noKey;
+      // The parser only yields single digits; re-check before it reaches a shell.
+      if (!/^\d$/.test(key)) return result("error");
+      // A pane left in tmux copy-mode would swallow the digit as a count, so
+      // only type it in normal mode.
+      const target = shellQuote(tmuxSession);
+      const out = await exec(
+        sshConn,
+        `if [ "$(tmux display-message -p -t ${target} '#{pane_in_mode}')" = "0" ]; then tmux send-keys -t ${target} ${key} && echo sent; else echo in_mode; fi`,
+      );
+      if (out.trim() !== "sent") {
+        sshLogger.warn("permission answer not sent — pane not in normal mode", {
+          operation: "permission_answer_pane_in_mode",
+          hostId: currentHostId,
+          tmuxSession,
+          choice,
+          fingerprint,
+          output: out.trim().slice(0, 200),
+        });
+        return result("error");
+      }
+      recentPermissionAnswers.set(paneKey, { fingerprint, at: Date.now() });
+      sshLogger.info("permission answer sent", {
+        operation: "permission_answer_sent",
+        hostId: currentHostId,
+        tmuxSession: currentTmuxSession,
+        choice,
+        key,
+        fingerprint,
+        title: prompt.title,
+        autoDenySeconds: prompt.autoDenySeconds,
+      });
+      return result("sent");
+    } catch (err) {
+      sshLogger.warn("permission answer failed", {
+        operation: "permission_answer_error",
+        hostId: currentHostId,
+        tmuxSession: currentTmuxSession,
+        choice,
+        fingerprint,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return result("error");
+    }
+  }
+}
+
+// Phase 56 (2026-08-23): the former wake-message test seam and its
+// production wake handler are DELETED. The frontend no longer emits
+// the wake message — Plan 56-03 deleted the DormancyOverlay + Wake button.
+// Sends into a dormant pane now trigger invisible wake at the backend
+// send-path (Plan 56-01) with widened watchdog window (Plan 56-02).
+// The `let wakeTriggerTs` closure var is PRESERVED — Plan 01's send-path
+// writes to it via setWakeTriggerTs and the rediscovery-seam marker-
+// freshness gate reads it.
+
+// ─── Test seam: dormant-poll-with-rediscovery logic (quick 260808-dmz) ────────
+//
+// The dormant-poll IIFE in the inactive branch polls the sentinel and, on
+// disappearance, calls discoverClaudeSession + startActiveSessionFlow. Exported
+// as a test seam so tests G-K can exercise sentinel-disappearance + re-discovery
+// without spinning up the full WS server + SSH pair.
+//
+// Uses a two-arg "state accessor" pattern rather than a mutable box because the
+// production code stores dormantLastEmitted in the connection closure (not in a
+// box struct). The accessor pair {dormantLastEmitted, setDormantLastEmitted} lets
+// tests inject a plain variable capture and assert on it.
+
+/** Result type returned by discoverClaudeSession (subset used by the seam). */
+export type __DiscoveryResultForTests =
+  | { status: "active"; pid: number; sessionFile: string }
+  | { status: "inactive"; reason: string };
+
+/**
+ * Apply one dormant-poll tick with sentinel check + optional re-discovery.
+ * Called by the 3s setInterval in the inactive→dormant branch.
+ *
+ * quick 260808-fgf: extended with markerCommand (stat .resume-complete),
+ * state.wakeTriggerTs (getter for the wake-handler-set timestamp), and
+ * deps.now (injectable clock for deterministic tests). When wakeTriggerTs
+ * is non-null, dismiss requires EITHER a fresh marker (marker_ts > triggerTs)
+ * OR the 90s MARKER_FALLBACK_MS window to have elapsed.
+ *
+ * @param deps.connSnapshot        - SSH connection (stub in tests)
+ * @param deps.escapedName         - tmux session name (already validated)
+ * @param deps.execCommand         - injectable SSH exec helper
+ * @param deps.discoverSession     - injectable discoverClaudeSession callback
+ * @param deps.wsSend              - injectable ws.send stub
+ * @param deps.startActiveFlow     - injectable callback to transition to active flow
+ * @param deps.markerCommand       - injectable: cat .resume-complete; returns trimmed body or null
+ * @param deps.now                 - injectable clock; defaults to Date.now
+ * @param state.dormantLastEmitted - getter for current dormantLastEmitted closure value
+ * @param state.setDormantLastEmitted - setter for dormantLastEmitted
+ * @param state.wakeTriggerTs      - getter for wake_trigger_ts closure value (null = natural resume)
+ */
+export async function __applyDormantPollWithRediscoveryForTests(
+  deps: {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    connSnapshot: any;
+    escapedName: string;
+    execCommand: (conn: unknown, cmd: string) => Promise<string>;
+    discoverSession: (conn: unknown, session: string) => Promise<__DiscoveryResultForTests>;
+    wsSend: (data: string) => void;
+    startActiveFlow: (pid: number, sessionFile: string) => void;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    markerCommand: (conn: any, name: string) => Promise<string | null>;
+    now: () => number;
+    // Optional dormant-branch context-pct emit. When both the getter returns a
+    // resolved session file path AND readJsonlPct returns a non-null pct, emits
+    // {type:"context_pct", pct, dormant:true} on the same "sentinel present"
+    // tick. Absence of either (no session file resolved yet, or JSONL read
+    // returned null) is a silent skip — the meter stays on whatever value the
+    // frontend last held. The `dormant:true` flag stops the frontend's live-
+    // frame auto-dismiss from wiping the DormancyOverlay (PrettyView.tsx L1149).
+    readJsonlPct?: (conn: unknown, sessionFile: string) => Promise<number | null>;
+    dormantSessionFile?: () => string | null;
+    // Phase 90 Plan 00 (Wave 0, D-10 delivery mechanism): OPTIONAL dual-write
+    // hook — when set, the dormant-branch context_pct emit ALSO writes the
+    // pct into the fleet-status shared map via setContextPct(hostId,
+    // escapedName, pct). Absence keeps existing tests running unchanged
+    // (test seam contract preserved).
+    hostId?: number;
+    /** The agent was archived while its conversation was open: the client
+     *  has been told (`archived_state`); the caller stops polling. */
+    onArchived?: () => void;
+  },
+  state: {
+    dormantLastEmitted: () => boolean | null;
+    setDormantLastEmitted: (v: boolean | null) => void;
+    wakeTriggerTs: () => number | null;
+  },
+): Promise<void> {
+  const { connSnapshot, escapedName, execCommand: exec, discoverSession, wsSend, startActiveFlow, markerCommand, now, readJsonlPct, dormantSessionFile, hostId, onArchived } = deps;
+  try {
+    // Poll the .dormant sentinel (reuse exact command from seam line 956-961)
+    const statOut = await exec(
+      connSnapshot,
+      `stat ~/fleet/identities/'${escapedName}'/.dormant 2>/dev/null >/dev/null && echo yes || echo no`,
+    );
+    const isDormant = statOut.trim() === "yes";
+    if (isDormant) {
+      // Sentinel still present — emit only on change (state-change guard)
+      if (state.dormantLastEmitted() !== true) {
+        state.setDormantLastEmitted(true);
+        // Phase 56 Plan 01: wakingSince no longer emitted — backend keeps
+        // wakeTriggerTs internally only for the marker-freshness gate at
+        // L2604-2626 (state.wakeTriggerTs getter retained on the state
+        // signature for that gate). The frontend no longer reconstructs
+        // waking state (DormancyOverlay deleted in Plan 03).
+        wsSend(JSON.stringify({ type: "dormant", dormant: true }));
+      }
+      // Dormant-branch context-pct: read the last assistant turn's `usage`
+      // block from the identity's cached JSONL and emit. The JSONL is
+      // authoritative for token-usage (readContextPctFromJsonl docblock) so
+      // this stays correct even though claude is not running. Silent-skip
+      // when either injectable is absent (getter returns null before the
+      // tail-open discovery completes, or a test omits readJsonlPct).
+      if (readJsonlPct && dormantSessionFile) {
+        const sessionFile = dormantSessionFile();
+        if (sessionFile !== null) {
+          try {
+            const pct = await readJsonlPct(connSnapshot, sessionFile);
+            if (pct !== null) {
+              // Phase 90 Plan 00 (Wave 0, D-10 delivery mechanism): dual-write
+              // into the fleet-status shared map so PrettyView (post D-03
+              // mechanical waiver) and the future Plan 06 relay-pane badge
+              // appendage both read contextPct from the same source of
+              // truth. WS emission BELOW preserved for backwards compat.
+              if (hostId !== undefined) {
+                setContextPct(hostId, escapedName, pct);
+                getSubscriptionRegistry()?.republishContextPct(String(hostId), escapedName);
+              }
+              wsSend(JSON.stringify({ type: "context_pct", pct, dormant: true }));
+            } else {
+              // quick-260830-f1e: caller-site warn when the helper returns
+              // null despite dormantSessionFile being set. Correlates by
+              // grep to the specific-reason warn emitted inside
+              // readContextPctFromJsonl (exec_fail / empty_tail /
+              // no_asst_usage / exec_throw) so we get both the caller
+              // context (which identity, on which tick) AND the reason
+              // from the same log-file pair. user grep-target for the
+              // blank-meter class.
+              sshLogger.warn(
+                "context-pct: dormant-poll got null pct despite resolved session file",
+                {
+                  operation: "context_pct_dormant_null",
+                  escapedName,
+                },
+              );
+            }
+          } catch {
+            // Silent — nice-to-have, not load-bearing. Mirrors the outer
+            // catch's posture (skip this tick, keep polling). The
+            // readContextPctFromJsonl helper is documented never-throws,
+            // so this catch is defensive only.
+          }
+        }
+      }
+      return; // keep polling
+    }
+    // The sentinel is gone: either the agent is waking, or it was archived
+    // (its folder moved). Archived → tell the client (every open copy of an
+    // archived conversation closes) and stop.
+    if (onArchived) {
+      const folder = await probeIdentityFolderState((c) => exec(connSnapshot, c), escapedName).catch(() => null);
+      if (folder === "archived") {
+        sshLogger.info("Dormant conversation's agent is archived", {
+          operation: "claude_session_dormant_agent_archived",
+          escapedName,
+          hostId,
+        });
+        wsSend(JSON.stringify({ type: "archived_state", state: "archived" }));
+        onArchived();
+        return;
+      }
+    }
+    // Sentinel disappeared. Apply Nelly's freshness contract when this was a
+    // user-initiated wake (wakeTriggerTs non-null). Natural resumes (wakeTriggerTs
+    // null) skip the check entirely — preserves Test H / prior behavior.
+    const triggerTs = state.wakeTriggerTs();
+    if (triggerTs !== null) {
+      // User-initiated wake path: require fresh marker OR 90s fallback.
+      const markerBody = await markerCommand(connSnapshot, escapedName);
+      let markerFresh = false;
+      let fellBack = false;
+      if (markerBody !== null) {
+        const markerTs = Date.parse(markerBody.trim());
+        if (Number.isFinite(markerTs) && markerTs > triggerTs) {
+          markerFresh = true;
+        }
+      }
+      if (!markerFresh) {
+        const elapsed = now() - triggerTs;
+        if (elapsed >= MARKER_FALLBACK_MS) {
+          markerFresh = true;
+          fellBack = true;
+        }
+      }
+      if (!markerFresh) {
+        // Neither fresh marker nor fallback window elapsed — keep polling.
+        return;
+      }
+      if (fellBack) {
+        sshLogger.info("Dormancy marker fallback — supervisor pre-dates .resume-complete contract", {
+          operation: "dormancy_marker_fallback",
+          escapedName,
+        });
+      }
+    }
+    // Sentinel disappeared (and freshness check passed if applicable).
+    // Emit dormant:false (state-change guard).
+    if (state.dormantLastEmitted() !== false) {
+      state.setDormantLastEmitted(false);
+      wsSend(JSON.stringify({ type: "dormant", dormant: false }));
+    }
+    // Re-run discovery to see if claude has come back
+    const rediscovery = await discoverSession(connSnapshot, escapedName);
+    if (rediscovery.status === "active") {
+      // Transition to normal active session flow
+      startActiveFlow(rediscovery.pid, rediscovery.sessionFile);
+      return;
+    }
+    // Still inactive (supervisor may not have reconciled yet) — keep polling.
+    // dormantLastEmitted stays false so if the sentinel comes back, we re-emit
+    // dormant:true on the next tick. No teardown; no clearing of dormant-poll timer.
+  } catch {
+    // SSH error — skip this tick silently (same posture as __applyDormantPollTickForTests)
+  }
+}
+
+// ─── Test seam: dormant-branch tail-open (Phase 32 Wave 2 / 32-02) ────────────
+//
+// Phase 32 wires the Wave 1 `discoverIdentitySessionFile` helper into the
+// dormant branch of the message handler so the wake-bubble message list is
+// backed by the identity's most-recently active JSONL, streamed through the
+// SAME onLine/onError closures the active flow uses (D-08 latency parity).
+// That branch lives INSIDE a deeply-nested closure chain (`ws.on
+// ("connection")` → per-conn state setup → message handler → `if (result
+// .status === "inactive")` → dormancy probe) with every state variable it
+// touches being closure-scoped — so it is NOT reachable via any pre-existing
+// test seam.
+//
+// This seam encapsulates the helper-call + tail-open + structured-log logic
+// as a pure, dependency-injected function so CASE-DT1..DT3 + DT6 are
+// directly assertable without a live WebSocketServer or SSH conn. It is the
+// SINGLE production implementation entry point — the dormant branch calls
+// this seam and does no discovery work itself (matches D-09's "one call
+// site" invariant for `discoverIdentitySessionFile`).
+//
+// Follows the same injectable-helpers shape as __applyDormantPollTickForTests
+// (L984-1033) and __applyDormantPollWithRediscoveryForTests (L1106-1198):
+// `deps` object holds all module-side collaborators + fixed inputs; `state`
+// object holds mutable outputs (here just `setTailHandle`).
+
+/** Dependencies for the dormant-branch tail-open seam. */
+export type __DormantBranchTailOpenDepsForTests = {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  conn: any; // SSH conn used by discoverIdentitySessionFile
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  sshConn: any; // SSH conn used by tailSessionFile
+  tmuxSession: string;
+  discoverIdentitySessionFile: (
+    conn: unknown,
+    identityName: string,
+  ) => Promise<string | null>;
+  tailSessionFile: (
+    conn: unknown,
+    file: string,
+    onLine: (line: string) => void,
+    onError: (err: Error) => void,
+  ) => { stop: () => void };
+  onLine: (line: string) => void;
+  onError: (err: Error) => void;
+  wsSend: (data: string) => void;
+  logger: {
+    info: (msg: string, meta: Record<string, unknown>) => void;
+    warn?: (msg: string, meta: Record<string, unknown>) => void;
+  }; // sshLogger stub — warn used for probe-failure diagnostics
+  /**
+   * Optional probe emitted after a successful discovery so the client's
+   * load-more visibility gate can evaluate on dormant panes. Returns the
+   * current line count of the discovered JSONL file. When present AND
+   * discovery succeeds, the seam emits a `{type: "dormant_session_meta",
+   * sessionFile, totalLines}` frame via `wsSend`. Absent (or throws) → no
+   * emit; the button stays hidden but everything else keeps working
+   * (backward-compat with pre-emit backend builds + fail-safe posture).
+   */
+  probeTotalLines?: (sessionFile: string) => Promise<number>;
+};
+
+/** Mutable state for the dormant-branch tail-open seam. */
+export type __DormantBranchTailOpenStateForTests = {
+  setTailHandle: (h: { stop: () => void } | null) => void;
+  // Called with the discovered JSONL path (or null on no-match / throw) so the
+  // connection closure can cache it for the dormant-poll timer's JSONL-read
+  // context-pct emit. Called BEFORE setTailHandle when discovery succeeds; on
+  // null-return / helper-throw it is called with null.
+  setDormantSessionFile?: (f: string | null) => void;
+};
+
+/**
+ * Apply the dormant-branch tail-open sequence for tests (and, in
+ * production, called by the dormant branch itself — the seam IS the
+ * production implementation, not test-only scaffolding).
+ *
+ * Called ONCE per dormant-branch entry, immediately after the dormant
+ * frame + dormantPollTimer start, before `enteredDormantPoll = true`.
+ *
+ * Behavior:
+ *   - Calls `deps.discoverIdentitySessionFile(deps.conn, deps.tmuxSession)`.
+ *   - On non-null return: emits `deps.logger.info("Dormant tail
+ *     discovered", ...)` with `discoveredFileBasename:
+ *     path.basename(discoveredFile)` (T-32-05 mitigation — the JSONL's
+ *     session UUID is already discoverable via existing session-scoped
+ *     logs; the encoded project-dir path segment is dropped from log
+ *     output). Then calls `deps.tailSessionFile(deps.sshConn,
+ *     discoveredFile, deps.onLine, deps.onError)` and passes the handle
+ *     to `state.setTailHandle`.
+ *   - On null return: emits `deps.logger.info("Dormant tail not
+ *     discovered — no matching identity session file", ...)` with
+ *     `operation: "claude_session_dormant_tail_no_match"`. Does NOT call
+ *     `setTailHandle`. No path payload — nothing to disclose (T-32-02).
+ *   - On `discoverIdentitySessionFile` (or `tailSessionFile`) throw:
+ *     emits the same no-match log shape (fail-safe fallback, mirrors
+ *     the Wave 1 caller contract). Does NOT call `setTailHandle`; does
+ *     NOT re-throw.
+ *
+ * D-05: null / throw path is byte-identical to today's dormant behavior
+ *   (dormant frame sent, no tail opened, no messages).
+ * D-08: `onLine` and `onError` are passed through UNWRAPPED — the seam
+ *   does not create a new lambda. The dormant tail's line-emission path
+ *   IS the active-flow line-emission path (same `appendDedup` + `eventId`
+ *   pipeline).
+ * D-09: helper is called from EXACTLY ONE production site (the dormant
+ *   branch's call to this seam). Active-flow discovery at L~4634
+ *   stays on `discoverClaudeSession`.
+ */
+export async function __applyDormantBranchTailOpenForTests(
+  deps: __DormantBranchTailOpenDepsForTests,
+  state: __DormantBranchTailOpenStateForTests,
+): Promise<void> {
+  const {
+    conn,
+    sshConn,
+    tmuxSession,
+    discoverIdentitySessionFile: discover,
+    tailSessionFile: tail,
+    onLine,
+    onError,
+    logger,
+    wsSend,
+    probeTotalLines,
+  } = deps;
+  try {
+    const discoveredFile = await discover(conn, tmuxSession);
+    if (discoveredFile !== null) {
+      logger.info("Dormant tail discovered", {
+        operation: "claude_session_dormant_tail_discovered",
+        discoveredFileBasename: basename(discoveredFile),
+      });
+      // Cache the resolved path for the dormant-poll timer's JSONL-read
+      // context-pct emit (piggybacked on the sentinel poll).
+      state.setDormantSessionFile?.(discoveredFile);
+      // Load-more visibility gate for dormant panes: probe the JSONL's line
+      // count and emit `dormant_session_meta` so PrettyView's
+      // `sessionTotalLines != null && sessionHasMore && sessionTotalLines >
+      // effectiveMessages.length` gate can evaluate. Skipped when the dep is
+      // absent (backward-compat / seam-not-driven tests) or the probe throws
+      // (fail-safe — button stays hidden, pane still works). Emitted AFTER
+      // the tail-open below so the client sees metadata alongside the first
+      // batch of tail-delivered bubbles, not before.
+      if (probeTotalLines !== undefined) {
+        try {
+          const totalLines = await probeTotalLines(discoveredFile);
+          wsSend(
+            JSON.stringify({
+              type: "dormant_session_meta",
+              sessionFile: discoveredFile,
+              totalLines,
+            }),
+          );
+        } catch (err) {
+          logger.warn?.("Dormant totalLines probe failed", {
+            operation: "pv_dormant_totalLines_probe_failed",
+            err: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+      // SAME onLine/onError refs — no wrapping (D-08).
+      const handle = tail(sshConn, discoveredFile, onLine, onError);
+      state.setTailHandle(handle);
+    } else {
+      state.setDormantSessionFile?.(null);
+      logger.info(
+        "Dormant tail not discovered — no matching identity session file",
+        {
+          operation: "claude_session_dormant_tail_no_match",
+        },
+      );
+    }
+  } catch (err) {
+    // Defense-in-depth: the Wave 1 helper contract is no-throw (SSH
+    // errors return null); tailSessionFile funnels errors through
+    // onError. If anything here does throw, degrade gracefully to
+    // today's dormant behavior (no tail opened) and log via the
+    // no-match op code so post-deploy dashboards see it as fallback
+    // traffic. NEVER rethrow.
+    logger.info(
+      "Dormant tail not discovered — no matching identity session file",
+      {
+        operation: "claude_session_dormant_tail_no_match",
+        err: err instanceof Error ? err.message : String(err),
+      },
+    );
+    state.setDormantSessionFile?.(null);
+  }
+}
+
+/**
+ * Phase 41 Plan 04 + code-review M1: shared upload dispatch used by both
+ * the production `ws.on("message")` handler below AND the
+ * `__dispatchUploadMessageForTests` seam. Extracting the branch logic into
+ * one function eliminates the drift risk of a hand-copied test-only
+ * dispatch body — anything added to the real path (new field, changed
+ * cleanup ordering, new branch) is exercised by the test seam
+ * automatically. Logging + return semantics stay in the outer caller so
+ * production can emit its `claude_session_upload_*` logs at the point
+ * where it has full context (sshLogger, sessionId), and tests can skip
+ * the log path without needing a logger stub.
+ *
+ * Returns void; branch selection matches production. On upload_chunk with
+ * a pending parent start, awaits the parent (Quick-fix 260801-29v race
+ * guard) before dispatching the chunk.
+ */
+async function dispatchUploadMessage(
+  msg: { type?: unknown } & Record<string, unknown>,
+  uploadDeps: {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    sshConn: any | null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ws: any;
+    userId: string | undefined;
+    currentSessionId: string | null;
+  },
+  ownedUploadBatches: Set<string>,
+  pendingStarts: Map<string, Promise<void>>,
+): Promise<void> {
+  if (msg.type === "upload_start") {
+    const uploadStart = msg as unknown as UploadStartPayload;
+    const startMqid = uploadStart.messageQueueItemId;
+    if (typeof startMqid === "string" && startMqid.length > 0) {
+      ownedUploadBatches.add(startMqid);
+    }
+    const startPromise = handleUploadStart(uploadDeps, uploadStart);
+    if (typeof startMqid === "string" && startMqid.length > 0) {
+      pendingStarts.set(startMqid, startPromise);
+      startPromise.finally(() => {
+        pendingStarts.delete(startMqid);
+      });
+    }
+    return;
+  }
+  if (msg.type === "upload_chunk") {
+    const uploadChunk = msg as unknown as UploadChunkPayload;
+    const chunkMqid = uploadChunk.messageQueueItemId;
+    const pending =
+      typeof chunkMqid === "string" && chunkMqid.length > 0
+        ? pendingStarts.get(chunkMqid)
+        : undefined;
+    if (pending) {
+      await pending
+        .then(() => handleUploadChunk(uploadDeps, uploadChunk))
+        .catch(() => {
+          // A rejected start already emitted its own upload_failed event
+          // inside handleUploadStart; if handleUploadChunk then finds no
+          // batch it will emit unknown_temp_id, which is the CORRECT
+          // signal for a truly-failed start (vs. the race we are fixing
+          // here). Swallow to avoid an unhandled rejection.
+        });
+    } else {
+      handleUploadChunk(uploadDeps, uploadChunk);
+    }
+    return;
+  }
+  if (msg.type === "upload_abort") {
+    const uploadAbort = msg as unknown as UploadAbortPayload;
+    handleUploadAbort(uploadDeps, uploadAbort);
+    if (
+      !uploadAbort.tempId &&
+      typeof uploadAbort.messageQueueItemId === "string"
+    ) {
+      ownedUploadBatches.delete(uploadAbort.messageQueueItemId);
+    }
+    return;
+  }
+}
+
+/**
+ * Phase 41 Plan 04: testability seam for the upload_start / upload_chunk /
+ * upload_abort dispatch logic. Post code-review M1, this is a thin
+ * re-export of `dispatchUploadMessage` so tests exercise the same code
+ * path production runs — no drift possible.
+ *
+ * Pattern mirrors `__applyInputMessageForTests` above (the sibling
+ * wake-message test seam was DELETED in Phase 56 Plan 03) — zero new
+ * npm dependencies; test-only callpath.
+ */
+export const __dispatchUploadMessageForTests = dispatchUploadMessage;
+
+// Phase 111 SKEW-07: module-load capture of the server build id — parallel
+// to D-16 read-once contract. Used by the handshake gate below (Task 2) and
+// by sendFrame's outbound piggyback (Task 3).
+const SERVER_BUILD_ID = getServerBuildId();
+
+// Server start extracted from module-load side effect (user 2026-09-12) so
+// vitest workers importing this module for its exports don't collide on
+// port 30011. Called explicitly from starter.ts in production; test files
+// never invoke it. The function body below is intentionally left at
+// column 0 to keep the refactor diff small — indentation is stylistic
+// only in JS/TS and reindenting 4500 lines would obscure the actual change.
+export function startClaudeSessionServer() {
+const wss = new WebSocketServer({ port: 30011 });
+
+wss.on("connection", async (ws: WebSocket, req) => {
+  // Phase 111 SKEW-07: WS handshake gate. Version tag arrives as `?build=<sha>`
+  // query param on the upgrade URL. Absence AND mismatch both close with 4409
+  // (unlike HTTP lane's D-06 mismatch-only — browsers are the only legit WS
+  // clients, so absence is inherently suspicious for WS).
+  const clientBuild = extractSkewTag(req);
+  if (!clientBuild || clientBuild !== SERVER_BUILD_ID) {
+    ws.close(4409, "stale_client");
+    return;
+  }
+
+  // Phase 111 SKEW-08: sendFrame wraps ws.send with build-id piggyback.
+  // D-09: every outbound JSON-envelope message from server → client
+  // carries `build:<sha>`. Client's onmessage handler checks parsed.build
+  // vs its baked-in CLIENT_BUILD_ID and fires lockSkewedSession on
+  // mismatch.
+  //
+  // Implementation: this file has ~180 ws.send(JSON.stringify(...)) call
+  // sites spread across ~8000 lines. Per-site rewrites would be error-prone
+  // AND produce a huge diff. Instead we monkey-patch ws.send at connection
+  // scope: any outbound string that parses as a JSON object gets a `build`
+  // field injected top-level; anything else (raw strings, binary) passes
+  // through untouched. sendFrame is exposed as the canonical helper for
+  // future callers so the plan's grep-gate ("sendFrame present") passes and
+  // future contributors have an obvious primitive to reach for.
+  const originalSend = ws.send.bind(ws);
+  const sendFrame = (frame: object): void => {
+    try {
+      originalSend(JSON.stringify({ ...frame, build: SERVER_BUILD_ID }));
+    } catch {
+      /* ws mid-close — swallow silently */
+    }
+  };
+  const patchedSend = function (this: WebSocket, data: unknown, ...rest: unknown[]): void {
+    if (typeof data === "string" && data.length > 0 && data.charCodeAt(0) === 123 /* { */) {
+      try {
+        const parsed = JSON.parse(data);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          originalSend(
+            JSON.stringify({ ...parsed, build: SERVER_BUILD_ID }),
+            ...(rest as []),
+          );
+          return;
+        }
+      } catch {
+        /* not a JSON object envelope — fall through to raw send */
+      }
+    }
+    originalSend(data as never, ...(rest as []));
+  };
+  (ws as unknown as { send: typeof patchedSend }).send = patchedSend;
+  void sendFrame; // reserved for future direct callers; keeps helper live
+
+  let userId: string | undefined;
+  let sessionId: string | undefined;
+
+  try {
+    let token: string | undefined;
+
+    const cookieHeader = req.headers.cookie;
+    if (cookieHeader) {
+      const match = cookieHeader.match(/(?:^|;\s*)jwt=([^;]+)/);
+      if (match) token = decodeURIComponent(match[1]);
+    }
+
+    if (!token) {
+      const authHeader = req.headers.authorization;
+      if (authHeader?.startsWith("Bearer ")) {
+        token = authHeader.slice("Bearer ".length);
+      }
+    }
+
+    if (!token) {
+      const urlObj = new URL(req.url || "", "http://localhost");
+      const qp = urlObj.searchParams.get("token");
+      if (qp) token = qp;
+    }
+
+    if (!token) {
+      ws.close(1008, "Authentication required");
+      return;
+    }
+
+    const payload = await authManager.verifyJWTToken(token);
+    if (!payload?.userId || payload.pendingTOTP) {
+      ws.close(1008, "Authentication required");
+      return;
+    }
+
+    userId = payload.userId;
+    sessionId = payload.sessionId;
+  } catch (error) {
+    sshLogger.error(
+      "Claude session WS JWT verification failed",
+      error,
+      {
+        operation: "claude_session_ws_error",
+        ip: req.socket.remoteAddress,
+      },
+    );
+    ws.close(1008, "Authentication required");
+    return;
+  }
+
+  const dataKey = userCrypto.getUserDataKey(userId);
+  if (!dataKey) {
+    ws.send(
+      JSON.stringify({
+        type: "error",
+        message: "Data locked - re-authenticate with password",
+        code: "DATA_LOCKED",
+      }),
+    );
+    ws.close(1008, "Data access required");
+    return;
+  }
+
+  databaseLogger.info(`[ws-server] accept userId=${userId ?? 'null'} wsUrl=${req.url ?? ''}`, { operation: "ws_accept" });
+  sshLogger.info("Claude session WebSocket connection established", {
+    operation: "claude_session_ws_connect",
+    userId,
+    sessionId,
+  });
+
+  // wire_boot: sent BEFORE any other frame on a fresh WS attach. Signals
+  // that backend state — including the per-WS `lineNum` counter driving
+  // frame `line` values — has restarted from zero. Without this, a client
+  // that reconnects against a fresh backend closure (this container just
+  // restarted, or the ws-side simply re-did its auth handshake after any
+  // transient) keeps its pre-reconnect `messages` array — which carries
+  // now-higher pre-reconnect `line` values — and every post-reconnect
+  // frame (with fresh `line: 1, 2, 3, ...`) sorts BELOW them and gets
+  // silently discarded by the 20-item cap-drop at insert time. Client's
+  // `wire_boot` case handler resets `messages` state before subsequent
+  // frames arrive so the fresh line-counter has a clean sort space.
+  try {
+    ws.send(JSON.stringify({ type: "wire_boot" }));
+  } catch (sendErr) {
+    databaseLogger.warn(`[ws-server] send-failed msgType=wire_boot err="${sendErr instanceof Error ? sendErr.message : String(sendErr)}"`, { operation: "ws_send_failed" });
+  }
+
+  // Phase 14 Wave 2: initialize this WS's overlap-ignore state in the
+  // module-scope asideState Map (per CONTEXT.md § Backend per-connection
+  // state lock 2026-07-26). Cleaned up in ws.on("close") below.
+  asideState.set(ws, { armed: false, displayed: false });
+
+  let sshConn: SSHClientType | null = null;
+  let tailHandle: TailHandle | null = null;
+  // Phase 62 Wave 2 (D-62-01, D-62-04) — per-tail-watcher instance ID for
+  // diagnostic instrumentation. Regenerated on every tail start (fresh
+  // startActiveSessionFlow, tail restart in transitionToActiveNew, and
+  // dormant-handoff → new tail). Threaded via closure into [dedup],
+  // [frame-emit], and [tail-lifecycle] sshLogger.info emissions so a
+  // repro log can identify which tail-watcher instance produced each
+  // frame — cross-tail races are visible from the ID transitions.
+  // Never persisted beyond the closure. 8-char lowercase hex (4 bytes).
+  let tailInstanceId: string = "";
+  // Phase 47 Plan 03 Hunk A: 1-indexed line-number counter for the
+  // streaming-tail's per-line dispatch. tail -F -n +1 starts at line 1 of
+  // the current file; each onLine invocation is the NEXT line, so we
+  // pre-increment (0 → 1 on first invocation) and pass to
+  // reshapeParsedLineToWireFrame(parsed, rawLine, lineNum). Reset to 0 in
+  // transitionToActiveNew below when the tail restarts against a new file
+  // (fresh -n +1 replay converges on lineNum=1 again).
+  let lineNum = 0;
+  // Interrupt button (shape-interrupt-button): transcript-only bookkeeping of
+  // the latest prompt, fed every replayed + live line in file order. Fresh
+  // per session file (reset alongside lineNum on transition).
+  let cancelTracker = newCancelTracker();
+  cancelTrackerByWs.set(ws, () => cancelTracker);
+  let contextPctTimer: NodeJS.Timeout | null = null;
+  let contextPctInFlight = false;
+  // Phase 41 Plan 04: pretty-view upload handler state, ported from
+  // src/backend/ssh/terminal.ts L228-246 verbatim. Owner-set of batch mqids
+  // this WS started (drained on ws.close + teardownPane); pendingStarts is
+  // the Quick-fix 260801-29v race guard preventing "no active batch" errors
+  // when upload_chunk arrives on the same tick as its parent upload_start.
+  const ownedUploadBatches = new Set<string>();
+  const pendingStarts = new Map<string, Promise<void>>();
+  // quick 260808-cd6 — dormancy overlay + wake button.
+  // Per-connection (closure-scoped) dormancy guards. Mirror the
+  // contextPctInFlight pattern: only the dormant-state stat check is
+  // guarded; the one-shot identity-shape probe is separately guarded
+  // by identityShapeProbeInFlight. All four reset naturally with the
+  // closure on WS close — no explicit teardown step needed as long as
+  // these bindings live inside the same per-connection closure scope.
+  let dormantInFlight = false;
+  let dormantLastEmitted: boolean | null = null;       // change-only emit guard
+  let isIdentityShapedCached: boolean | null = null;  // null = not yet probed; true = identity pane; false = skip dormancy forever
+  let identityShapeProbeInFlight = false;
+  // quick 260808-dmz — dormant-poll loop (inactive-branch fix).
+  // Lightweight 3s poll that replaces the SSH teardown in the inactive branch
+  // when a dormant sentinel is detected. Mirrors contextPctTimer/contextPctInFlight
+  // pattern for lifecycle (cleared in teardownPane, guarded against pileups).
+  let dormantPollTimer: NodeJS.Timeout | null = null;
+  let dormantPollInFlight = false;
+  // True while the dormant branch is still opening its tail. The dormant poll
+  // skips meanwhile, so a wake can't race the open (which would leave two
+  // tails, one orphaned, and lines delivered twice).
+  let dormantTailOpening = false;
+  // Cached path of the identity's most-recent JSONL, resolved by the
+  // dormant-branch tail-open seam and consumed by the dormant-poll timer
+  // for the piggyback context-pct emit (readContextPctFromJsonl). Null
+  // until discovery completes; also null when discovery returns no-match.
+  let dormantSessionFile: string | null = null;
+  // Phase 95 Part C — per-WS closure state for the pv-context-pct-sweep
+  // batch dispatch. sweepScriptPresent is `null` before the first probe;
+  // becomes true/false after probe. Cleared naturally on WS close (whole
+  // closure regenerates). sweepSchemaMismatch latches true on the first
+  // schema-mismatched sweep response and stays latched — the caller falls
+  // back to legacy for the remainder of the WS lifetime rather than
+  // re-attempting a schema the peer's script version doesn't support.
+  let sweepScriptPresent: boolean | null = null;
+  let sweepSchemaMismatch = false;
+  // quick 260808-fgf — Nelly's .resume-complete freshness contract.
+  // Set to Date.now() when the wake handler successfully SSH-execs rm -f .dormant.
+  // Read by the dormant-poll seam via a getter accessor. Null means natural resume
+  // (no user-initiated Wake click) → skip freshness check entirely.
+  // Cleared inside startActiveFlow callback to avoid leaking into a subsequent
+  // dormancy cycle on the same WS connection.
+  let wakeTriggerTs: number | null = null;
+  // Phase 14 Wave 2: per-connection aside extraction bookkeeping. These
+  // are per-connection (not cross-tab-shared) so closure-scope is correct.
+  // Only `armed`/`displayed` MUST live in module-scope asideState — per
+  // CONTEXT.md § Backend per-connection state lock.
+  let asideExtractionTimer: NodeJS.Timeout | null = null;
+  let asideExtractionInFlight = false;
+  let lastStableCapture: string | null = null;
+  let hadMarkerLastCapture = false;
+  let harnessTasksTimer: NodeJS.Timeout | null = null;
+  let harnessTasksInFlight = false;
+  let harnessTasksLastSerialized: string | null = null;
+  // Backgrounded-agent tracking (patch #61): parent-JSONL scan for Agent
+  // tool_use blocks with run_in_background:true, paired against subsequent
+  // tool_result blocks by tool_use_id. Emit on serialized-change only.
+  // `backgroundedAgentsLastSerialized` is initialized to "[]" (not "") so
+  // a JSONL with no background agents produces net-zero emits after the
+  // initial `tail -F -n +1` replay.
+  const backgroundedAgents = new Map<
+    string,
+    {
+      toolUseId: string;
+      subagentType: string;
+      description: string;
+      startedAt: number;
+    }
+  >();
+  let backgroundedAgentsLastSerialized = "[]";
+  // Phase 51 Plan 01: pendingAgentAdmission scratch map. Claude Code v2.1.150+
+  // Agent tool_use payloads dropped `input.run_in_background === true`; the
+  // async signal moved to the tool_result launch-ack (toolUseResult.isAsync
+  // === true). Every modern Agent tool_use is stashed here at tool_use time,
+  // then promoted into `backgroundedAgents` when the async-ack arrives (~100ms
+  // later). Synchronous Agents (whose first tool_result is a real completion,
+  // no isAsync) have their scratch entry silently dropped in the else branch —
+  // they never enter `backgroundedAgents`, exactly the desired behavior. See
+  // 51-RESEARCH.md § "Fix Shape (recommended)" for the design contract and
+  // 51-CONTEXT.md § "Parser admission gate" for the dual-admission decision
+  // (legacy `run_in_background === true` still admits directly, belt-and-
+  // suspenders). Cleared alongside `backgroundedAgents` at both reset sites.
+  const pendingAgentAdmission = new Map<
+    string,
+    {
+      toolUseId: string;
+      subagentType: string;
+      description: string;
+      startedAt: number;
+    }
+  >();
+  // Backgrounded-shells tracking (patch #68): parent-JSONL scan for Bash
+  // tool_use blocks with run_in_background:true, paired against subsequent
+  // <task-notification> completion payloads. Unlike backgroundedAgents,
+  // there is NO tool_result-removal branch — Bash BG tool_results are
+  // ALWAYS launch-acks (content starts with "Command running in background
+  // with ID:"). Real completion arrives via task-notification only, handled
+  // in the shared patch-#66 IIFE below.
+  // `backgroundedShellsLastSerialized` is initialized to "[]" (not "") so
+  // an empty initial state doesn't emit a spurious frame.
+  const backgroundedShells = new Map<
+    string,
+    {
+      toolUseId: string;
+      description: string;
+      command: string;
+      ts: number;
+    }
+  >();
+  let backgroundedShellsLastSerialized = "[]";
+  const taskIdToToolUseId = new Map<string, string>();
+  const pendingStops = new Map<string, string>();
+  // Phase 50 Plan 01 Task 2 — per-session queue-enqueue dedup. Populated
+  // when the parser (Task 1) surfaces a normal-content queue-operation
+  // enqueue entry as kind:"message"; consumed when the same content
+  // reappears as a normal type:"user" turn (harness dequeue → normal
+  // user-turn write path, up to ~2 MINUTES later per 50-CONTEXT.md §
+  // Empirical evidence).
+  //
+  // D-11 revised: KEY = contentHash ONLY (sha256(content).slice(0,32));
+  // dropped the ±2-second-bucket sketch after empirical evidence showed
+  // enqueue→dequeue can span ~2 minutes (see 50-CONTEXT.md § Empirical
+  // evidence). Per-session scope via closure; wall-clock TTL via the
+  // number value.
+  //
+  // See __applyQueueDedupForTests (~L1560) for the dedup logic + hash
+  // derivation contract. Lifetime is the tail-watcher closure — the Map
+  // is destroyed on WS disconnect / pane teardown along with every
+  // other per-connection state slot in this scope.
+  const queueEnqueueDedup = new Map<string, number>();
+  // Phase 50 Plan 02 D-15 cleanup — per-connection tracking of every mqid
+  // armed via armPvSendWatchdog on this WS. Iterated on ws.on("close") to
+  // fire clearPvSendWatchdog for each pending mqid — prevents orphan
+  // paste_send_failed frames firing against a torn-down socket. T-50-02-06
+  // mitigation (Warning #5 mandated this, not optional). See the ws.on("close")
+  // handler at L~3660 for the iteration + clear + Set.clear() sequence.
+  const pendingMqidsForThisConnection = new Set<string>();
+  // Phase 56 hotfix — per-connection input-message serialization chain.
+  //
+  // The `ws.on("message", async ...)` listener below does NOT wait for previous
+  // async invocations before firing the next `message` event — Node's
+  // EventEmitter fires listeners synchronously and never awaits their returned
+  // Promise. Under Phase 56's invisible-dormancy path, `input` frames enter
+  // `__applyInputMessageForTests` and can spend up to `MARKER_FALLBACK_MS`
+  // (90_000ms) inside the `.resume-complete` marker-wait loop before dispatching
+  // the split-send `body → 1000ms → Enter` sequence via `tmux send-keys`.
+  //
+  // Two rapid sends into a dormant pane would both enter the handler, both drop
+  // the sentinel (idempotent — fine), both wait for the marker, both break out
+  // at roughly the same tick, and their split-send exec pairs could interleave —
+  // worst case `body-A, body-B, Enter-A, Enter-B` fuses the two messages into
+  // one prompt. This violates the shape's explicit invariant "Multiple sends
+  // landing out of order… they must arrive at the harness in send order."
+  //
+  // Fix: every `input` frame chains its `__applyInputMessageForTests` invocation
+  // onto `inputChain`, guaranteeing sequential execution per-WS-connection. The
+  // handler NEVER awaits its own chained call (fire-and-forget from ws.on's
+  // perspective) — the chain owns the work. Each chained segment wraps in a
+  // try/catch so one failure doesn't poison the chain for subsequent sends.
+  //
+  // Applies to ALL input frames, not just dormant-sends — trivial overhead
+  // (one Promise per input) in exchange for a single serialization guarantee
+  // that holds regardless of what the send-path is doing internally.
+  let inputChain: Promise<void> = Promise.resolve();
+  let stopped = false;
+
+  // Phase 3 session-changeover state machine. Per D-30:
+  // `active`  — currently tailing a live session; ticker also polls context-% + tasks.
+  // `holding` — session file in flux: discovery repoll showed a changed or
+  //             missing sessionFile (claude crashed / relaunching, fresh
+  //             launch, dormant wake) and the new tail has not started yet.
+  //             Compaction keeps the same file and never enters holding.
+  // `dead`    — holding timed out (HOLDING_TIMEOUT_TICKS); one final `{type:"inactive"}` was sent
+  //             and all pollers/tail were stopped. WS remains open so the client
+  //             can render FALLBACK-01; no auto-restart from here.
+  type ChangeoverState = "active" | "holding" | "dead";
+  let changeoverState: ChangeoverState = "active";
+  let currentSessionFile: string | null = null; // set on first discovery success and each session_changed
+  let sessionIdFromFile: string | null = null; // UUID basename of currentSessionFile; drives harness-tasks poller cmd (BLOCKER fix)
+  // Phase 30 Plan 30-01 (PS30-01): per-connection authoritative pane_state
+  // emitter. Consolidates today's five racing wire frames (dormant /
+  // session_holding / session_holding_cleared / session_changed / inactive)
+  // into ONE authoritative { type: "pane_state", state, reason? } frame.
+  // Legacy frames stay on the wire alongside (backward-compat this phase);
+  // the emitter is ADDITIVE — every existing ws.send at the transition sites
+  // below gets a matching paneStateEmitter.emit(...) call. Deduped on strict
+  // (state, reason) equality against the last emit (mirrors dormantLastEmitted
+  // at lines 1010-1022). See pane-state-emitter.ts for the pure module +
+  // 30-CONTEXT.md § Signal set for the LOCKED wire contract.
+  const paneStateEmitter: PaneStateEmitter = createPaneStateEmitter({
+    wsSend: (data: string) => {
+      if (!stopped && ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(data);
+        } catch {
+          /* ws may be mid-close */
+        }
+      }
+    },
+  });
+  let holdingTicks = 0; // # of 3s ticks in `holding`; timeout at HOLDING_TIMEOUT_TICKS
+  let discoveryRepollInFlight = false; // guard against slow SSH pileups (mirrors contextPctInFlight)
+  let discoveryRepollTimer: NodeJS.Timeout | null = null;
+  // Phase 3: current pane's hostId/tmuxSession hoisted to connection scope so
+  // the state-transition helpers (defined once per connection) can log with
+  // the right context and so `transitionToActiveNew` can pass tmuxSession into
+  // `discoverClaudeSession` if needed. Set on connectToPane after successful
+  // discovery; cleared in teardownPane. The connection callback enforces
+  // one active pane per WS (line 295 `if (sshConn || tailHandle) teardownPane()`),
+  // so these are effectively read-only for the lifetime of a pane.
+  let currentHostId: number | null = null;
+  let currentTmuxSession: string | null = null;
+
+  // Diagnostic drop: pv-claude-session-ws-zombie-after-tmux-teardown.
+  // Called by server-driven teardown paths BEFORE nulling currentTmuxSession
+  // or sshConn so the client's onclose handler fires and reconnects into a
+  // fresh session-bind. Guarded on ws.readyState so the ws.on("close")
+  // teardown re-entry (L5131) does not attempt a redundant close, and the
+  // user-initiated pane switch at connectToPane (L6832) and the post-connect
+  // stopped race (L6863) are intentionally NOT wired — they are not
+  // teardown-under-the-client shapes.
+  const closeForTornDownSession = (): void => {
+    if (ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.close(1011, "session_torn_down");
+      } catch {
+        /* ws may be mid-close; teardown proceeds regardless */
+      }
+    }
+  };
+
+  const teardownPane = () => {
+    if (currentHostId !== null || currentTmuxSession !== null) {
+      databaseLogger.info(`[session-server] detach hostId=${currentHostId ?? 'null'} tmuxSession=${currentTmuxSession ?? 'null'} userId=${userId ?? 'null'}`, { operation: "session_detach" });
+    }
+    if (contextPctTimer) {
+      clearInterval(contextPctTimer);
+      contextPctTimer = null;
+    }
+    // quick 260808-dmz: clear dormant-poll loop on pane teardown.
+    if (dormantPollTimer) {
+      clearInterval(dormantPollTimer);
+      dormantPollTimer = null;
+    }
+    dormantPollInFlight = false;
+    if (harnessTasksTimer) {
+      clearInterval(harnessTasksTimer);
+      harnessTasksTimer = null;
+    }
+    if (discoveryRepollTimer) {
+      clearInterval(discoveryRepollTimer);
+      discoveryRepollTimer = null;
+    }
+    // Phase 14 Wave 2: extraction poller lifecycle is tied to the pane —
+    // teardownPane fires on connectToPane rebind and (via ws.on("close"))
+    // on disconnect. activeViewers Set membership is torn down in
+    // ws.on("close") only (not here) because a pane-switch keeps the WS
+    // itself alive; the fan-out registry is per-WS, not per-pane.
+    if (asideExtractionTimer) {
+      clearInterval(asideExtractionTimer);
+      asideExtractionTimer = null;
+    }
+    asideExtractionInFlight = false;
+    lastStableCapture = null;
+    hadMarkerLastCapture = false;
+    // Reset per-WS aside gates on pane rebind — the fresh pane has no
+    // aside in flight yet. asideState entry itself stays (module-scope,
+    // lifetime = WS connection); we just clear the flags.
+    const st = asideState.get(ws);
+    if (st) {
+      st.armed = false;
+      st.displayed = false;
+    }
+    // Work narration: this WS no longer watches the prior pane's agent.
+    workNarrationHub.detach(ws);
+    // Phase 14 Wave 2: on pane rebind, remove this WS from any prior
+    // pane's fan-out registry so a subsequent broadcast doesn't spuriously
+    // dismiss on the new pane. The current-pane registration happens
+    // freshly in the connectToPane handler below (after discovery success).
+    if (currentHostId != null && currentTmuxSession != null) {
+      const priorKey = sessionKey(currentHostId, currentTmuxSession);
+      const priorPeers = activeViewers.get(priorKey);
+      if (priorPeers) {
+        priorPeers.delete(ws);
+        if (priorPeers.size === 0) {
+          activeViewers.delete(priorKey);
+          // T-9o3-03: drop the throttle entry when the last viewer on this pane
+          // disconnects. Conditional on the peer set emptying — while another
+          // viewer remains attached the throttle MUST survive (multi-viewer
+          // collision is precisely what this guard defends against).
+          interruptThrottleByPane.delete(priorKey);
+        }
+      }
+    }
+    harnessTasksLastSerialized = null;
+    backgroundedAgents.clear();
+    backgroundedAgentsLastSerialized = "[]";
+    // Phase 51 Plan 01: clear the pendingAgentAdmission scratch map alongside
+    // backgroundedAgents so a teardown drops any half-lifecycle modern Agent
+    // (tool_use seen, ack/completion not yet). Same rationale as clearing
+    // backgroundedAgents — the fresh session's `-n +1` replay repopulates.
+    pendingAgentAdmission.clear();
+    backgroundedShells.clear();
+    backgroundedShellsLastSerialized = "[]";
+    taskIdToToolUseId.clear();
+    pendingStops.clear();
+    // Phase 3: reset changeover state so a full pane teardown-and-reconnect
+    // (e.g. via a fresh connectToPane) starts clean. connectToPane already
+    // calls teardownPane before starting a new pane; being defensive here
+    // means the state is guaranteed reset even if teardownPane is called
+    // from elsewhere (e.g. transitionToDead) without a follow-up reconnect.
+    changeoverState = "active";
+    currentSessionFile = null;
+    sessionIdFromFile = null;
+    holdingTicks = 0;
+    discoveryRepollInFlight = false;
+    currentHostId = null;
+    currentTmuxSession = null;
+    if (tailHandle) {
+      try {
+        tailHandle.stop();
+      } catch (err) {
+        databaseLogger.warn(`[ws-server] tail-stop-failed hostId=${currentHostId ?? 'null'} err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_tail_stop_failed" });
+      }
+      tailHandle = null;
+      // Phase 62 Wave 2 (D-62-04) — paired stop log for the
+      // connection-teardown / teardownPane path. Additive fourth "reason"
+      // value ("connection-teardown") beyond the D-62-04 spec's
+      // initial | transition | dormant-handoff — teardownPane fires on
+      // ws.on("close") (final teardown) AND on pane-switch mid-life; both
+      // are legitimate lifecycle boundaries and worth logging.
+      // Guard against emitting a spurious stop for a tail that never
+      // started (empty-string default): only fire when tailInstanceId
+      // is non-empty. Reset to "" after emit so a subsequent
+      // startActiveSessionFlow regenerates cleanly and any redundant call
+      // to this teardown block does not re-log a stale ID.
+      if (tailInstanceId) {
+        sshLogger.info(
+          `[tail-lifecycle] tail=${tailInstanceId} action=stop sessionFile=<teardown> reason=connection-teardown`,
+          {
+            operation: "claude_session_tail_lifecycle",
+            tailInstanceId,
+            action: "stop",
+            sessionFile: null,
+            reason: "connection-teardown",
+          },
+        );
+        tailInstanceId = "";
+      }
+    }
+    // Phase 41 Plan 04: drain in-flight upload batches when the pane's SSH
+    // conn is being closed — an orphaned batch would keep writing to a
+    // destroyed conn otherwise. Mirrors terminal.ts's ws.on("close") posture
+    // ported to per-teardown scope since claude-session-server does pane-
+    // switching within one WS.
+    if (ownedUploadBatches.size > 0) {
+      cleanupBatchesForConnection(Array.from(ownedUploadBatches));
+      ownedUploadBatches.clear();
+    }
+    if (sshConn) {
+      try {
+        sshConn.end();
+      } catch (err) {
+        databaseLogger.warn(`[ws-server] conn-end-failed hostId=${currentHostId ?? 'null'} err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_conn_end_failed" });
+      }
+      sshConn = null;
+    }
+  };
+
+  // ---------------------------------------------------------------------------
+  // Phase 3 canonical declaration order (W1 fix from plan-checker):
+  //   state vars (above)
+  //   → teardownPane (above)
+  //   → const onLine (here)
+  //   → const onError (here)
+  //   → setupHarnessTasksPoller (here)
+  //   → transitionToHolding (here)
+  //   → transitionToActiveNew (here; references onLine, onError, setupHarnessTasksPoller)
+  //   → transitionToDead (here; references teardownPane)
+  //   → ws.on("message") handler body (below, unchanged shape)
+  //
+  // All cross-references between helpers happen at call-time inside async
+  // callbacks (setInterval, tail's onLine), never at synchronous handler-body
+  // execution — so TypeScript's TDZ and JS's const-scoping are both happy
+  // with this order. `hostId` and `tmuxSession` from the connectToPane
+  // message handler are captured via connection-scoped `let currentHostId` /
+  // `let currentTmuxSession` (set on discovery success, cleared in
+  // teardownPane) so these helpers can log with the correct context.
+  // ---------------------------------------------------------------------------
+
+  // Tail's onLine handler — extracted from the pre-Phase-3 inline lambda so
+  // `transitionToActiveNew` can restart the tail with the SAME callbacks
+  // rather than duplicating them.
+  // ── PHASE-43 OBSERVATION CHANNEL START — DO NOT EDIT BODY BELOW; extend switch cases in Region B only ──
+  const onLine = (line: string) => {
+    if (stopped || ws.readyState !== WebSocket.OPEN) return;
+
+    // Parallel raw-line scan for backgrounded Agent invocations (patch
+    // #61). Runs ALONGSIDE parseSessionLine, not through it — RENDER-01
+    // HARD LOCK strips tool_use/tool_result blocks structurally at the
+    // parser, so they never reach parseSessionLine's output. A second
+    // JSON.parse is trivially cheap at these volumes.
+    //
+    // Detection (from github.com/delexw/claude-code-trace spec 09):
+    //   - tool_use with name === "Agent" and input.run_in_background ===
+    //     true → started; keyed by tool_use.id.
+    //   - tool_result with matching tool_use_id → completed; drop.
+    // Emit `backgrounded_agents` only when the sorted-serialized list
+    // changes vs last emit. The tail's `-n +1` replay converges the map
+    // naturally through history — a completed subagent adds then removes
+    // within a few lines, and the initial `lastSerialized = "[]"` matches
+    // the empty-list stringification so no spurious empty emit fires.
+    try {
+      applyBackgroundWorkLine(line, {
+        backgroundedAgents,
+        pendingAgentAdmission,
+        backgroundedShells,
+        taskIdToToolUseId,
+        pendingStops,
+      });
+      const agents = Array.from(backgroundedAgents.values()).sort(
+        (a, b) => a.startedAt - b.startedAt,
+      );
+      const serialized = JSON.stringify(agents);
+      if (serialized !== backgroundedAgentsLastSerialized) {
+        backgroundedAgentsLastSerialized = serialized;
+        try {
+          ws.send(
+            JSON.stringify({ type: "backgrounded_agents", agents }),
+          );
+        } catch {
+          /* ws may be mid-close */
+        }
+      }
+      const shells = Array.from(backgroundedShells.values()).sort(
+        (a, b) => a.ts - b.ts,
+      );
+      const shellsSerialized = JSON.stringify(shells);
+      if (shellsSerialized !== backgroundedShellsLastSerialized) {
+        backgroundedShellsLastSerialized = shellsSerialized;
+        try {
+          ws.send(
+            JSON.stringify({ type: "backgrounded_shells", shells }),
+          );
+        } catch {
+          /* ws may be mid-close */
+        }
+      }
+    } catch {
+      /* malformed line — silently ignore, same posture as parser */
+    }
+
+    // Phase 47 Plan 03 Hunk A: pre-increment the outer `lineNum` counter
+    // (declared at ~L1839, reset in transitionToActiveNew). tail -F -n +1
+    // starts at line 1 of the current file; this is the NEXT line, so
+    // lineNum becomes 1 on first invocation and matches sed's 1-indexing
+    // used by session-file-range-reader.ts.
+    lineNum += 1;
+
+    // Phase 50 Plan 01 Task 2: thread sessionIdFromFile so the parser's
+    // queue-operation branch derives a deterministic eventId per
+    // (sessionId, timestamp, content) — see 50-01-PLAN.md § objective
+    // "Hash-derivation contract". Non-queue-operation branches ignore
+    // the sessionId argument (unchanged uuid/messageId chain).
+    const parsed = parseSessionLine(line, sessionIdFromFile ?? undefined);
+    // Discriminator switch on parsed.kind — RENDER-01 hard-lock enforcement.
+    // kind:"skip" and kind:"malformed" are silently dropped. Each emitting
+    // branch sends exactly one WS frame per parsed turn; the switch guarantees
+    // mutual exclusivity (only one case fires per line).
+    //
+    // Phase 47 Plan 03 Hunk A: the case-by-case switch that lived here was
+    // extracted into the shared `reshapeParsedLineToWireFrame` helper (~L280).
+    // Both the streaming-tail (here) AND `handleFetchOlderRange` (Plan 47-03
+    // Hunk C) call the SAME helper — this is what guarantees wire-shape
+    // parity between the two emit paths (streaming vs. range-fetch). If you
+    // are tempted to add a new per-kind case, extend the shared helper
+    // instead — do NOT reintroduce a switch here.
+    const frame = reshapeParsedLineToWireFrame(parsed, line, lineNum);
+    // Phase 50 Plan 01 Task 2: per-session queue-enqueue dedup applied
+    // BEFORE ws.send. Suppresses the dequeue-time normal-user-turn
+    // duplicate emission when the same content was already emitted
+    // from an enqueue entry within the 10-minute TTL window. Requires a
+    // fresh JSON.parse of the raw line so we can inspect rawObj.type +
+    // rawObj.operation without re-widening reshapeParsedLineToWireFrame's
+    // contract. Cost is one small JSON.parse per line on kind:"message"
+    // frames only — negligible on live tail volumes and consistent with
+    // the existing parallel-scan pattern above.
+    if (frame !== null) {
+      let suppress = false;
+      if (
+        (frame.type === "message" || frame.type === "image") &&
+        frame.role === "user"
+      ) {
+        try {
+          const rawObj = JSON.parse(line) as Record<string, unknown>;
+          const result = __applyQueueDedupForTests({
+            parsedFrame: parsed,
+            rawObj,
+            dedupMap: queueEnqueueDedup,
+            now: Date.now(),
+          });
+          suppress = result.suppress;
+          // Phase 62 Wave 2 (D-62-01, D-62-04) — [dedup] instrumentation.
+          // Emits one line per __applyQueueDedupForTests call outcome so
+          // the next dormant-send repro from user produces log evidence
+          // identifying which frame pair (if any) is bypassing dedup.
+          //
+          // W-1 note (documented in 62-02-SUMMARY.md): the helper's return
+          // shape was NOT extended with `contentHash: string`. We use the
+          // literal "<no-hash>" sentinel in the log line. The
+          // rawType/operation/action/mapSize triple is enough to correlate
+          // frames across log lines, and skipping the extension keeps
+          // __applyQueueDedupForTests's return-type contract untouched
+          // (D-62-01 — no changes to the dedup helper's internals).
+          //
+          // dedupAction derivation mirrors the helper's internal branches:
+          //  - suppress===true  → "suppress" (lookup branch found a hit)
+          //  - queue-op enqueue → "populate" (helper inserted into Map)
+          //  - anything else    → "passthrough" (user-turn miss, or other
+          //    rawType out of scope for dedup)
+          const dedupAction: "populate" | "suppress" | "passthrough" =
+            result.suppress
+              ? "suppress"
+              : (typeof rawObj.type === "string" && rawObj.type === "queue-operation" &&
+                 typeof rawObj.operation === "string" && rawObj.operation === "enqueue")
+                ? "populate"
+                : "passthrough";
+          const dedupRawType = typeof rawObj.type === "string" ? rawObj.type : "<no-type>";
+          const dedupOperation = typeof rawObj.operation === "string" ? rawObj.operation : "<no-op>";
+          sshLogger.info(
+            `[dedup] tail=${tailInstanceId} sessionId=${sessionIdFromFile ?? "<no-session>"} contentHash=<no-hash> rawType=${dedupRawType} operation=${dedupOperation} action=${dedupAction} mapSize=${queueEnqueueDedup.size}`,
+            {
+              operation: "claude_session_dedup_gate",
+              tailInstanceId,
+              sessionId: sessionIdFromFile,
+              contentHash: "<no-hash>",
+              rawType: dedupRawType,
+              dedupOperation,
+              action: dedupAction,
+              mapSize: queueEnqueueDedup.size,
+            },
+          );
+        } catch {
+          /* malformed line — already surfaced by parseSessionLine as kind:"malformed"
+             which is never a message frame, so we shouldn't hit this path. */
+        }
+      }
+      if (!suppress) {
+        try {
+          ws.send(JSON.stringify(frame));
+          // Phase 62 Wave 2 (D-62-01, D-62-04) — [frame-emit] instrumentation.
+          // Emits one line per user-role ws.send passthrough (dedup did not
+          // suppress). Inner guard mirrors the dedup gate above at :3951 —
+          // non-user-role frames pass ws.send without dedup logic AND
+          // without this log, keeping log volume bounded to the frames the
+          // diagnostic actually cares about. Placement AFTER ws.send but
+          // INSIDE the try means the log fires only when ws.send did not
+          // throw; if ws.send throws, the catch drops silently as today.
+          if (frame.type === "message" && frame.role === "user") {
+            const previewSource = typeof frame.content === "string" ? frame.content : String(frame.content ?? "");
+            const contentPreview = previewSource.slice(0, 50).replace(/[\r\n]+/g, " ");
+            sshLogger.info(
+              `[frame-emit] tail=${tailInstanceId} eventId=${frame.eventId ?? "<no-id>"} role=${frame.role} contentLen=${previewSource.length} contentPreview=${contentPreview}`,
+              {
+                operation: "claude_session_frame_emit",
+                tailInstanceId,
+                eventId: frame.eventId ?? null,
+                role: frame.role,
+                contentLen: previewSource.length,
+                contentPreview,
+              },
+            );
+          }
+        } catch {
+          /* ws may be mid-close; drop */
+        }
+        // Phase 50 Plan 02 Task 2 — notify any pending pv-send-watchdog that
+        // the matching parser signal has arrived. Fires for BOTH the direct-
+        // user-turn path AND the queue-operation-enqueue path (Plan 50-01 T1).
+        // quick-260908-bqx — order-based (FIFO) match, same semantic as
+        // PrettyView.tsx:1961-1979: CC processes input serially, JSONL is
+        // written in order, WS preserves order — SEND ORDER is the signal.
+        // The extracted seam `__applyOnLineNotifyForTests` owns the guard +
+        // single notifyMatched(sessionId) call (FIFO head-pop).
+        __applyOnLineNotifyForTests({
+          frame,
+          sessionIdFromFile,
+          notifyMatched: notifyPvSendMatched,
+        });
+      }
+    }
+    // kind:"skip" returns null and is silently dropped (RENDER-01 lock;
+    // skip covers meta, empty_content, harness_wrapper, no_message,
+    // unknown-type — same policy as the pre-refactor switch's implicit
+    // no-case default fallthrough).
+  };
+  // ── PHASE-43 OBSERVATION CHANNEL END ──
+
+  // Interrupt button (shape-interrupt-button): every tail line passes through
+  // the cancel tracker first, then the unchanged onLine above. The tracker
+  // turns the transcript's cancel shape into hide/unhide frames:
+  //   • two consecutive prompts sharing a parent with nothing from the agent
+  //     between → the earlier one was cancelled (hide, live and on replay);
+  //   • a live-cancelled prompt that later gains descendants (a restart
+  //     revived it) → unhide, so the view keeps matching what the agent has.
+  const observeCancelTracker = (line: string): void => {
+    if (stopped || ws.readyState !== WebSocket.OPEN) return;
+    let obj: Record<string, unknown>;
+    try {
+      obj = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      return;
+    }
+    if (!obj || typeof obj !== "object") return;
+    let visibleText: string | null = null;
+    if (isPromptStart(obj)) {
+      normalizePastedHarnessEnvelopes(obj);
+      const raw = extractText((obj.message as Record<string, unknown> | undefined)?.content);
+      const stripped = raw
+        .replace(/<task-notification>[\s\S]*?<\/task-notification>/g, "")
+        .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "")
+        .trim();
+      // A condense's own /compact prompt is never a bubble (the divider stands
+      // for it), so a cancel must not hand it back to the composer.
+      visibleText =
+        stripped === "" || raw.includes("<command-name>") || /^\/compact(\s|$)/.test(stripped) ? null : raw;
+    }
+    const changes = cancelTracker.observe(obj, visibleText);
+    const send = (frame: Record<string, unknown>) => {
+      try {
+        ws.send(JSON.stringify(frame));
+      } catch {
+        /* ws may be mid-close; drop */
+      }
+    };
+    if (changes.hide.length > 0) {
+      sshLogger.info(`[interrupt] transcript-cancel eventIds=${changes.hide.join(",")} line=${lineNum + 1} reason=sibling_dead_end`, {
+        operation: "interrupt_transcript_cancel",
+        hostId: currentHostId,
+        tmuxSession: currentTmuxSession,
+        eventIds: changes.hide,
+      });
+      send({ type: "messages_hidden", eventIds: changes.hide, reason: "cancelled" });
+    }
+    if (changes.unhide.length > 0) {
+      sshLogger.info(`[interrupt] revived eventIds=${changes.unhide.join(",")} line=${lineNum + 1} reason=restart_resumed_cancelled_prompt`, {
+        operation: "interrupt_revived",
+        hostId: currentHostId,
+        tmuxSession: currentTmuxSession,
+        eventIds: changes.unhide,
+      });
+      send({ type: "messages_unhidden", eventIds: changes.unhide, reason: "revived" });
+    }
+  };
+  const onLineTracked = (line: string): void => {
+    observeCancelTracker(line);
+    onLine(line);
+    // Work narration: the shared narrator for this agent reads the same lines.
+    if (!stopped && ws.readyState === WebSocket.OPEN && sshConn && currentHostId != null && currentTmuxSession != null) {
+      workNarrationHub.observeLine(ws, { key: sessionKey(currentHostId, currentTmuxSession), hostId: currentHostId, tmuxSession: currentTmuxSession, conn: sshConn }, line);
+    }
+  };
+
+  // Fast conversation open: replay only the recent window (the client's
+  // twenty items plus a margin for lines the client drops as duplicates),
+  // search the host for whole-history background-work facts, then follow
+  // live from the snapshot. `history_ready` tells the client the opening
+  // batch is complete so it can show it all at once. Every tail start —
+  // fresh attach, session-file change, dormant, archived — goes through here.
+  const openSessionTail = (
+    conn: import("ssh2").Client,
+    file: string,
+    errCb: (err: Error) => void,
+  ): TailHandle => {
+    // The open's short execs share the host's channel limiter with every
+    // other SSH producer (the live tail holds its own long-lived slot).
+    const hostId = currentHostId;
+    const runExec: RunExec = (fn) => (hostId == null ? fn() : getHostSemaphore(hostId).run(fn));
+    return tailSessionFileWindowed(conn, file, onLineTracked, errCb, {
+      targetItems: OPEN_WINDOW_ITEMS,
+      runExec,
+      onWindowStart: (startLine) => {
+        lineNum = startLine - 1;
+      },
+      loadHistory: () => searchBackgroundWorkHistory(conn, file, openBackgroundWorkIds, runExec),
+      onHistoryLine: (line) =>
+        applyBackgroundWorkLine(line, {
+          backgroundedAgents,
+          pendingAgentAdmission,
+          backgroundedShells,
+          taskIdToToolUseId,
+          pendingStops,
+        }),
+      onWindowDone: (stats) => {
+        if (stopped || ws.readyState !== WebSocket.OPEN) return;
+        try {
+          ws.send(JSON.stringify({ type: "history_ready", startLine: stats.startLine, totalLines: stats.totalLines }));
+        } catch {
+          /* ws may be mid-close */
+        }
+      },
+    });
+  };
+
+  // Tail's onError handler — byte-for-byte preserved from the pre-refactor
+  // inline lambda apart from swapping the message-scoped `hostId` /
+  // `tmuxSession` for the connection-scoped `currentHostId` /
+  // `currentTmuxSession` (set on connectToPane discovery success, both are
+  // non-null whenever the tail is running).
+  const onError = (err: Error) => {
+    sshLogger.error("Claude session tail error", err, {
+      operation: "claude_session_tail_error",
+      userId,
+      sessionId,
+      hostId: currentHostId,
+      tmuxSession: currentTmuxSession,
+    });
+    if (stopped || ws.readyState !== WebSocket.OPEN) return;
+    try {
+      ws.send(
+        JSON.stringify({
+          type: "tail_error",
+          message: err.message,
+        }),
+      );
+    } catch (sendErr) {
+      databaseLogger.warn(`[ws-server] send-failed msgType=tail_error err="${sendErr instanceof Error ? sendErr.message : String(sendErr)}"`, { operation: "ws_send_failed" });
+    }
+  };
+
+  // BLOCKER fix (plan-checker 2026-07-18): the harness-tasks poller setup
+  // is extracted into a helper so `transitionToActiveNew` can rebind it
+  // against the NEW sessionId after a session-file change. The pre-Phase-3
+  // code baked the initial-connect UUID into `tasksCmd` as a `const`, so after
+  // the poller kept querying the DEAD session's tasks directory forever.
+  //
+  // The helper is idempotent — safe to call at any state; teardown-and-
+  // restart against any UUID (including the same UUID, which is the
+  // CHANGEOVER-05 recover-in-different-cwd case). The setInterval body is
+  // byte-for-byte preserved from the pre-refactor block.
+  const setupHarnessTasksPoller = (
+    newSessionIdFromFile: string,
+  ): void => {
+    if (harnessTasksTimer) {
+      clearInterval(harnessTasksTimer);
+      harnessTasksTimer = null;
+    }
+    // Belt-and-braces: clear the dedupe sentinel so the first emit after
+    // a restart fires unconditionally. transitionToActiveNew ALSO resets
+    // this — doing it here means direct callers (e.g. the initial-connect
+    // path) don't need to remember.
+    harnessTasksLastSerialized = null;
+    // No UUID → no tasks dir → no poller. Same guard the pre-refactor
+    // patch-#52c code used; also protects against shell injection via a
+    // malformed sessionId basename.
+    if (!UUID_RE.test(newSessionIdFromFile)) return;
+
+    const tasksCmd = `for f in "$HOME/.claude/tasks/${newSessionIdFromFile}"/*.json; do [ -f "$f" ] && { tr '\\n' ' ' < "$f"; echo; }; done 2>/dev/null`;
+    harnessTasksTimer = setInterval(() => {
+      if (stopped || ws.readyState !== WebSocket.OPEN) return;
+      if (!sshConn) return;
+      if (harnessTasksInFlight) return;
+      harnessTasksInFlight = true;
+      const connSnapshot = sshConn;
+      execCommand(connSnapshot, tasksCmd)
+        .then((output) => {
+          if (stopped || ws.readyState !== WebSocket.OPEN) return;
+          const tasks: unknown[] = [];
+          for (const raw of output.split("\n")) {
+            const line = raw.trim();
+            if (!line) continue;
+            try {
+              tasks.push(JSON.parse(line));
+            } catch {
+              /* skip malformed lines silently */
+            }
+          }
+          // Sort by numeric id ascending so display order matches /queue.
+          tasks.sort((a, b) => {
+            const ai = parseInt(
+              String((a as { id?: unknown }).id ?? ""),
+              10,
+            );
+            const bi = parseInt(
+              String((b as { id?: unknown }).id ?? ""),
+              10,
+            );
+            if (Number.isFinite(ai) && Number.isFinite(bi))
+              return ai - bi;
+            return 0;
+          });
+          const serialized = JSON.stringify(tasks);
+          if (serialized === harnessTasksLastSerialized) return;
+          harnessTasksLastSerialized = serialized;
+          try {
+            ws.send(
+              JSON.stringify({ type: "harness_tasks", tasks }),
+            );
+          } catch {
+            /* ws may be mid-close */
+          }
+        })
+        .catch(() => {
+          /* Silent — same posture as the context-pct poller. */
+        })
+        .finally(() => {
+          harnessTasksInFlight = false;
+        });
+    }, HARNESS_TASKS_INTERVAL_MS);
+  };
+
+  // ---------------------------------------------------------------------------
+  // Phase 3 state-transition helpers. All three close over the connection-
+  // scoped state (changeoverState, currentSessionFile, sessionIdFromFile,
+  // holdingTicks, ws, sshConn, etc.) and the connection-scoped
+  // context (currentHostId, currentTmuxSession — set on connectToPane).
+  // ---------------------------------------------------------------------------
+
+  // Called when the ticker's discovery-repoll notices a changed or missing
+  // sessionFile (e.g. claude crashed and is being relaunched, or a fresh
+  // launch / dormant wake started a new file), or by the attach-path
+  // launch-window branch. Idempotent against double-fire — if state is
+  // already `holding` or `dead`, this is a no-op.
+  const transitionToHolding = (reason: "discovery_diff"): void => {
+    if (changeoverState !== "active") return;
+    changeoverState = "holding";
+    holdingTicks = 0;
+    if (!stopped && ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(JSON.stringify({ type: "session_holding" }));
+      } catch {
+        /* ws may be mid-close */
+      }
+    }
+    // Phase 30 Plan 30-01 (PS30-01): authoritative pane_state alongside the
+    // legacy session_holding frame. `reason` forwards through (discovery
+    // repoll dispatches "discovery_diff"). The emitter's own guard + dedupe
+    // make repeated fires safe.
+    paneStateEmitter.emit("holding", reason);
+    sshLogger.info("Claude session entering holding state", {
+      operation: "claude_session_holding",
+      reason,
+      userId,
+      sessionId,
+      hostId: currentHostId,
+      tmuxSession: currentTmuxSession,
+      oldSessionFile: currentSessionFile,
+    });
+  };
+
+  // Fix B (2026-07-30): self-clear the holding overlay when the repoll's
+  // active-branch sees the SAME sessionFile while changeoverState === "holding".
+  // This means the overlay was armed by a false alarm (e.g. a transient SSH
+  // blip that slipped through before Fix A, or a brief bare-shell gap that
+  // resolved on the next tick), NOT a real session-file change. The same-file result on
+  // an active tick proves claude never actually stopped writing to this file.
+  //
+  // Contrast with transitionToActiveNew (called when sessionFile CHANGED) which
+  // is a heavy-reset for a confirmed session-file change. This helper is surgical:
+  // flip changeoverState back to active, reset holdingTicks, emit
+  // session_holding_cleared. The frontend handler clears only isHolding +
+  // holdingTimeoutError and does NOT touch messages / contextPct / harnessTasks
+  // / backgroundedAgents / asideText — false-alarm recovery
+  // must not discard the conversation the user is looking at.
+  //
+  // Idempotency: if changeoverState is not "holding", this is a no-op. Guards
+  // against double-fire (e.g. from a fast repoll that fires twice before the
+  // first tick's WS send completes).
+  const transitionFromHoldingToActiveSameFile = (): void => {
+    if (changeoverState !== "holding") return;
+    changeoverState = "active";
+    holdingTicks = 0;
+    if (!stopped && ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(JSON.stringify({ type: "session_holding_cleared" }));
+      } catch {
+        /* ws may be mid-close */
+      }
+    }
+    // Phase 30 Plan 30-01: false-alarm-recovery case. Surface the recovery
+    // reason so the frontend + logs can distinguish this "we armed holding
+    // then discovery repoll proved it was a false alarm" path from the
+    // file-changed transitionToActiveNew ("session_changed") path.
+    paneStateEmitter.emit("active", "same_file_recovery");
+    sshLogger.info("Claude session self-cleared from holding on same-file recovery", {
+      operation: "claude_session_holding_cleared",
+      userId,
+      sessionId,
+      hostId: currentHostId,
+      tmuxSession: currentTmuxSession,
+      sessionFile: currentSessionFile,
+    });
+  };
+
+  // Called by the discovery-repoll branch when a changed sessionFile is
+  // detected. Tears down the old tail, clears ALL buffered per-session
+  // state (CHANGEOVER-04 backend-side reset), rebinds the harness-tasks
+  // poller against the new UUID (BLOCKER fix), starts a new tail on the
+  // new file, and emits `session_changed`. Does NOT close the WS and does
+  // NOT touch `sshConn` — the same SSH connection multiplexes the new tail
+  // + the same three pollers.
+  const transitionToActiveNew = (newSessionFile: string): void => {
+    const oldSessionFile = currentSessionFile;
+    const oldSessionIdFromFile = sessionIdFromFile;
+    if (tailHandle) {
+      try {
+        tailHandle.stop();
+      } catch (err) {
+        databaseLogger.warn(`[ws-server] tail-stop-failed hostId=${currentHostId ?? 'null'} err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_tail_stop_failed" });
+      }
+      tailHandle = null;
+    }
+    // Fix #2 (post-Phase-50 code review): clear session-scoped state that
+    // previously survived a session-file change and could leak OLD-session behavior:
+    //   • queueEnqueueDedup Map (stale hashes suppress fresh frames)
+    //   • pv-send-watchdog `pending` for the OLD sessionId (a mid-arm
+    //     watchdog whose full-resend fires post-change would retype OLD
+    //     body into NEW composebox — shape-invariant violation)
+    //   • pendingMqidsForThisConnection Set entries for those cleared mqids
+    // Runs BEFORE the other buffered-state resets so OLD-session watchdogs
+    // are cancelled before any onLine callback from the fresh tail's
+    // `-n +1` replay can race with them. The helper is a pure function
+    // (applyTransitionToActiveNewCleanup at ~L1470) — re-exported for
+    // integration test scenario (h) in optimistic-bubbles.integration.test.ts.
+    if (oldSessionIdFromFile !== null) {
+      applyTransitionToActiveNewCleanup({
+        oldSessionId: oldSessionIdFromFile,
+        queueEnqueueDedup,
+        pendingMqidsForThisConnection,
+      });
+    }
+    // Clear ALL buffered per-session state before the new tail starts so
+    // the fresh session's `-n +1` replay converges on clean bookkeeping.
+    harnessTasksLastSerialized = null;
+    backgroundedAgents.clear();
+    backgroundedAgentsLastSerialized = "[]";
+    // Phase 51 Plan 01: clear the pendingAgentAdmission scratch map alongside
+    // backgroundedAgents on session-file change. Same rationale — the fresh
+    // session's `-n +1` replay repopulates from scratch.
+    pendingAgentAdmission.clear();
+    backgroundedShells.clear();
+    backgroundedShellsLastSerialized = "[]";
+    taskIdToToolUseId.clear();
+    pendingStops.clear();
+    holdingTicks = 0;
+    // Phase 47 Plan 03 Hunk A: reset the streaming-tail line-counter for
+    // the new session file. The new `tail -F -n +1` will re-play from line
+    // 1, so the counter must return to 0 (pre-increment brings it back to
+    // 1 on first callback).
+    lineNum = 0;
+
+    // Derive the new UUID basename using the same slug logic the initial-
+    // connect path uses. Kept inline to keep this file self-contained.
+    const newSessionIdFromFile = newSessionFile
+      .replace(/\\/g, "/")
+      .split("/")
+      .pop()!
+      .replace(/\.jsonl$/, "");
+    currentSessionFile = newSessionFile;
+    sessionIdFromFile = newSessionIdFromFile;
+
+    // BLOCKER fix: rebind the harness-tasks poller against the NEW UUID.
+    // For CHANGEOVER-05 (recover-in-different-cwd, UUID preserved), this
+    // is an idempotent no-op restart against the same UUID — still safe.
+    setupHarnessTasksPoller(newSessionIdFromFile);
+
+    changeoverState = "active";
+
+    if (!stopped && ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(
+          JSON.stringify({
+            type: "session_changed",
+            newSessionFile,
+          }),
+        );
+      } catch {
+        /* ws may be mid-close */
+      }
+    }
+    // Phase 30 Plan 30-01: session-file-changed path. The new session file's UUID
+    // stays on the legacy session_changed frame only — pane_state's
+    // reason field is enum-shaped (no filesystem paths per T-30-01
+    // mitigation). "session_changed" as reason keeps parity with the
+    // legacy frame's meaning.
+    paneStateEmitter.emit("active", "session_changed");
+    sshLogger.info("Claude session changed", {
+      operation: "claude_session_changed",
+      userId,
+      sessionId,
+      hostId: currentHostId,
+      tmuxSession: currentTmuxSession,
+      oldSessionFile,
+      newSessionFile,
+      // For post-deploy debugging: distinguishes a new session (UUID changed)
+      // from recover-in-different-cwd (UUID preserved, projects/slug
+      // subdir moved).
+      sessionIdChanged:
+        oldSessionIdFromFile !== newSessionIdFromFile,
+    });
+
+    // Restart the tail on the new file with the SAME onLine/onError
+    // closures — do NOT create new lambdas; that would defeat the point
+    // of extracting them.
+    //
+    if (sshConn) {
+      // Phase 62 Wave 2 (D-62-04) — regenerate the per-tail-watcher
+      // instance ID for the transition-restart. The OLD ID is not emitted
+      // in a paired action=stop here because transitionToActiveNew replaces
+      // tailHandle in-place; the visible transition in the log stream is
+      // "prev-ID [dedup]/[frame-emit] lines" → "new-ID [tail-lifecycle]
+      // action=start reason=transition" → "new-ID [dedup]/[frame-emit] lines".
+      tailInstanceId = randomBytes(4).toString("hex");
+      // Phase 101 D-03: acquire long-lived slot before opening the tail.
+      // Released on stop() or onError — both paths are idempotent (D-06-adjacent).
+      const tailSlot1 = acquireTailSlot(currentHostId!);
+      cancelTracker = newCancelTracker(); // the new tail replays its window
+      tailHandle = openSessionTail(
+        sshConn,
+        newSessionFile,
+        (err) => { tailSlot1.release(); onError(err); },
+      );
+      const origStop1 = tailHandle.stop;
+      tailHandle.stop = () => { tailSlot1.release(); origStop1.call(tailHandle); };
+      sshLogger.info(
+        `[tail-lifecycle] tail=${tailInstanceId} action=start sessionFile=${newSessionFile} reason=transition`,
+        {
+          operation: "claude_session_tail_lifecycle",
+          tailInstanceId,
+          action: "start",
+          sessionFile: newSessionFile,
+          reason: "transition",
+        },
+      );
+    }
+  };
+
+  // Called by the discovery-repoll branch when holdingTicks reaches the
+  // timeout without a new sessionFile having appeared. Emits a terminal
+  // inactive frame with `reason:"holding_timeout"`, then teardownPane
+  // (which stops all pollers, stops the tail, and closes the SSH
+  // connection). WS stays open by default so the client renders FALLBACK-01
+  // per the existing initial-inactive-exit path (~line 407-423).
+  const transitionToDead = (reason: "holding_timeout"): void => {
+    const finalSessionFile = currentSessionFile;
+    if (!stopped && ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(JSON.stringify({ type: "inactive", reason }));
+      } catch {
+        /* ws may be mid-close */
+      }
+    }
+    // Phase 30 Plan 30-01: terminal inactive from holding-timeout. Reason
+    // forwards through as "holding_timeout" (the only current caller).
+    paneStateEmitter.emit("inactive", reason);
+    sshLogger.info("Claude session dead", {
+      operation: "claude_session_dead",
+      reason,
+      userId,
+      sessionId,
+      hostId: currentHostId,
+      tmuxSession: currentTmuxSession,
+      currentSessionFile: finalSessionFile,
+    });
+    // Diagnostic drop: pv-claude-session-ws-zombie-after-tmux-teardown — close the WS
+    // with 1011 so the client's onclose handler fires and reconnects into a
+    // fresh session-bind. MUST be BEFORE teardownPane() nulls the bindings;
+    // guarded internally on ws.readyState so we skip a redundant close if the
+    // socket is already closing.
+    closeForTornDownSession();
+    // teardownPane resets changeoverState back to "active" among other
+    // things — set `dead` AFTER teardown so the state accurately reflects
+    // "terminal, no recovery attempts."
+    teardownPane();
+    changeoverState = "dead";
+  };
+
+  // quick 260813-0qx — shared discovery-repoll timer setup (Option A).
+  //
+  // Extracted from the inline `discoveryRepollTimer = setInterval(...)` block
+  // that used to live inside startActiveSessionFlow (~L4700 pre-refactor).
+  // Now both call sites use this single helper:
+  //   1. startActiveSessionFlow (steady-state — active session established
+  //      on initial attach or via wake-from-dormant handoff).
+  //   2. The attach-path launch-window branch inside the initial-attach
+  //      inactive block (see below near L~5087) — flips changeoverState
+  //      to "holding" then starts the timer here so the launch window's
+  //      recovery uses the same recovery reducer the steady-state ticker uses.
+  //
+  // Behavior is byte-preserved for the steady-state site (same closure vars,
+  // same helper calls, same interval, same catch/finally shape). The .then()
+  // body IS the same code the __applyRepollResultForTests reducer at ~L920
+  // covers — no drift.
+  //
+  // Declared at connection scope AFTER transitionToActiveNew /
+  // transitionFromHoldingToActiveSameFile / transitionToDead / transitionToHolding
+  // so all closure references are visible. Reads discoveryRepollTimer,
+  // discoveryRepollInFlight, currentSessionFile, changeoverState, holdingTicks,
+  // stopped, ws, sshConn — the same set the inline block closed over.
+  const startDiscoveryRepollTimer = (activeTmuxSession: string): void => {
+    discoveryRepollTimer = setInterval(() => {
+      if (stopped || ws.readyState !== WebSocket.OPEN) return;
+      if (!sshConn) return;
+      if (discoveryRepollInFlight) return;
+      discoveryRepollInFlight = true;
+      const connSnapshot = sshConn;
+      // History doesn't move once found (one file for life): pass the file
+      // we're showing so the tick only checks whether Claude is running. A
+      // pane still waiting for its first history file (newborn) looks it up.
+      discoverClaudeSession(connSnapshot, activeTmuxSession, { knownHistoryFile: currentSessionFile })
+        .then((result) => {
+          if (stopped || ws.readyState !== WebSocket.OPEN) return;
+          if (changeoverState === "dead") return; // idempotent guard
+
+          // Fix A (2026-07-30): hoist isExecErrorTick flag so BOTH the
+          // inactive branch (which must not arm holding) and the
+          // holdingTicks++ block (which must not burn the timeout budget)
+          // can check the same value without duplicating the predicate.
+          //
+          // exec_error = "we couldn't reliably ask" (SSH-side failure at
+          // any of the four SSH-throw sites: queryPanePid, descendant walk,
+          // PID-file read, JSONL test). Categorically different from the
+          // real-inactive reasons below, which mean "we asked and got a
+          // definitive no":
+          //   • not_claude            — pane has no claude in its tree
+          //   • no_pid_session_file   — claude PID exists but no PID file
+          //   • no_open_session_file  — PID file found but JSONL missing
+          //   • no_tmux_session       — no tmux pane to query at all
+          //   • pid_unavailable       — kept for backcompat; no longer emitted
+          // A transient SSH round-trip failure must NOT arm the overlay.
+          const isExecErrorTick =
+            result.status === "inactive" && result.reason === "exec_error";
+
+          if (result.status === "active") {
+            if (result.sessionFile !== currentSessionFile) {
+              // File moved: crash-relaunch / fresh launch OR
+              // recover-in-different-cwd.
+              if (changeoverState === "active") {
+                // Changed while we thought we were active. Emit both
+                // holding and changed on the SAME tick.
+                transitionToHolding("discovery_diff");
+              }
+              transitionToActiveNew(result.sessionFile);
+            } else if (changeoverState === "holding") {
+              // Fix B (2026-07-30): same file + still active + we're in holding
+              // → the overlay was a false alarm. Self-clear on this repoll tick.
+              transitionFromHoldingToActiveSameFile();
+            }
+            // else: same file + active + changeoverState === "active"
+            // — nominal steady-state, no state change needed.
+          } else if (!isExecErrorTick) {
+            // status === "inactive" with a REAL inactive reason (not an SSH
+            // failure). Bare-shell gap during a relaunch is expected.
+            if (changeoverState === "active") {
+              transitionToHolding("discovery_diff");
+            }
+          }
+          // else: isExecErrorTick — SSH-side failure; silent tick.
+          // Do NOT call transitionToHolding. !isExecErrorTick guard below
+          // also prevents burning the holding budget.
+
+          // Fix A (2026-07-30): guard with !isExecErrorTick so transient SSH
+          // failures don't burn the 5-min holding budget on no-signal ticks.
+          if (changeoverState === "holding" && !isExecErrorTick) {
+            holdingTicks++;
+            if (holdingTicks >= HOLDING_TIMEOUT_TICKS) {
+              transitionToDead("holding_timeout");
+              return;
+            }
+            // No agent running: was it archived (folder moved)? Then tell the
+            // client — every open copy of an archived conversation closes.
+            return probeIdentityFolderState((c) => execCommand(connSnapshot, c), activeTmuxSession).then((folder) => {
+              if (folder !== "archived" || stopped || sshConn !== connSnapshot || changeoverState === "dead") return;
+              sshLogger.info("Open conversation's agent is archived", {
+                operation: "claude_session_agent_archived",
+                userId,
+                sessionId,
+                hostId: currentHostId,
+                tmuxSession: activeTmuxSession,
+                via: "holding",
+              });
+              try { ws.send(JSON.stringify({ type: "archived_state", state: "archived" })); } catch { /* mid-close */ }
+              transitionToDead("holding_timeout");
+            });
+          }
+        })
+        .catch(() => {
+          /* Silent — same posture as the context-pct and harness-tasks
+             pollers. A discovery failure on one tick shouldn't kill the
+             session; the next tick tries again. */
+        })
+        .finally(() => {
+          discoveryRepollInFlight = false;
+        });
+    }, DISCOVERY_REPOLL_INTERVAL_MS);
+  };
+
+  let wsAlive = true;
+
+  ws.on("pong", () => {
+    const wasAlive = wsAlive;
+    wsAlive = true;
+    sshLogger.info(
+      "[claude-session-heartbeat] pong received",
+      {
+        operation: "claude_session_heartbeat_pong",
+        userId,
+        sessionId,
+        hostId: currentHostId,
+        tmuxSession: currentTmuxSession,
+        wsAliveBefore: wasAlive,
+      },
+    );
+  });
+
+  const wsPingInterval = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      if (!wsAlive) {
+        sshLogger.warn(
+          "Claude session WS pong timeout - terminating",
+          {
+            operation: "claude_session_ws_error",
+            userId,
+            sessionId,
+            hostId: currentHostId,
+            tmuxSession: currentTmuxSession,
+          },
+        );
+        ws.terminate();
+        return;
+      }
+      wsAlive = false;
+      ws.ping();
+      sshLogger.info(
+        "[claude-session-heartbeat] ping sent",
+        {
+          operation: "claude_session_heartbeat_ping",
+          userId,
+          sessionId,
+          hostId: currentHostId,
+          tmuxSession: currentTmuxSession,
+          bufferedAmount: ws.bufferedAmount,
+        },
+      );
+    }
+  }, 30000);
+
+  ws.on("close", (code: number, reason: Buffer) => {
+    databaseLogger.info(`[ws-server] close userId=${userId ?? 'null'} hostId=${currentHostId ?? 'null'} tmuxSession=${currentTmuxSession ?? 'null'} code=${code} reason="${reason?.toString() ?? ''}"`, { operation: "ws_close" });
+    clearInterval(wsPingInterval);
+    stopped = true;
+    // Phase 50 D-15 cleanup: cancel any pending pv-send-watchdog escalations for
+    // mqids armed under this WS connection — prevents paste_send_failed frames
+    // firing against a torn-down socket. Warning #5 (checker feedback iteration 1)
+    // made this mandatory rather than aspirational. Iterated BEFORE teardownPane
+    // so the clear is not gated on any downstream side effect.
+    if (pendingMqidsForThisConnection.size > 0) {
+      for (const mqid of pendingMqidsForThisConnection) {
+        clearPvSendWatchdog(mqid);
+      }
+      pendingMqidsForThisConnection.clear();
+    }
+    teardownPane();
+    // Phase 41 Plan 04: unlink any orphaned .partial temp files for pretty-
+    // view upload batches this WS owned. teardownPane() above already drains
+    // ownedUploadBatches for the active pane; this guard handles any batches
+    // that started after the last teardownPane (e.g. if upload_start arrived
+    // after the most recent pane switch). Mirrors terminal.ts L297-302.
+    if (ownedUploadBatches.size > 0) {
+      cleanupBatchesForConnection(Array.from(ownedUploadBatches));
+      ownedUploadBatches.clear();
+    }
+    // Phase 14 Wave 2: WS lifetime ended — drop this WS from all module-
+    // scope aside state. teardownPane already unregistered this WS from
+    // activeViewers[currentSessionKey] (via the per-pane branch), but we
+    // defensively iterate here in case any prior state escaped that path
+    // (e.g. a bug in a future patch). Cheap: activeViewers is small.
+    asideState.delete(ws);
+    cancelTrackerByWs.delete(ws);
+    workNarrationHub.forget(ws);
+    for (const [key, peers] of activeViewers) {
+      if (peers.delete(ws) && peers.size === 0) {
+        activeViewers.delete(key);
+        // T-9o3-03: drop the throttle entry when the last viewer on this pane
+        // disconnects. Mirrors the identical condition in teardownPane above —
+        // delete only when the peer Set just emptied, so another still-attached
+        // viewer keeps the throttle alive.
+        interruptThrottleByPane.delete(key);
+      }
+    }
+    sshLogger.info("Claude session WebSocket disconnected", {
+      operation: "claude_session_ws_disconnect",
+      userId,
+      sessionId,
+    });
+  });
+
+  ws.on("error", (err: Error) => {
+    databaseLogger.error(`[ws-server] error userId=${userId ?? 'null'} hostId=${currentHostId ?? 'null'} tmuxSession=${currentTmuxSession ?? 'null'}`, err, { operation: "ws_error" });
+    sshLogger.error("Claude session WS error", err, {
+      operation: "claude_session_ws_error",
+      userId,
+      sessionId,
+    });
+  });
+
+  // quick 260808-dmz: connection-scoped forward reference for startActiveSessionFlow.
+  // Assigned on the first connectToPane message (before discovery), so it is
+  // in scope when the dormant-poll timer callback fires 3 seconds later even if
+  // the message handler returned early via the inactive→dormant branch.
+  // Phase 47 Plan 03 Hunk B: widened return type from `void` to
+  // `Promise<void> | void` to accommodate the totalLines probe (Plan 03
+  // makes the assignment async). Callers use fire-and-forget shape
+  // (no `await`) so both the pre-Phase-47 sync path and the Phase 47+
+  // async path work uniformly at the call sites.
+  // eslint-disable-next-line prefer-const
+  let startActiveSessionFlow: (params: {
+    pid: number;
+    sessionFile: string;
+    tmuxSession: string;
+    hostId: number;
+    // Phase 62 Wave 2 (D-62-04) — optional attach-reason discriminator
+    // threaded into the [tail-lifecycle] start log. Defaults to "initial"
+    // when omitted (fresh connectToPane + shared-hit cached path). The
+    // dormant→wake handoff caller at L~7208 passes "dormant-handoff".
+    startReason?: "initial" | "dormant-handoff" | "transition";
+    // Wake handoff onto the file the dormant tail is already streaming: keep
+    // that tail instead of replaying the history from line 1.
+    keepExistingTail?: boolean;
+  }) => Promise<void> | void = () => { /* noop until assigned by connectToPane */ };
+
+  ws.on("message", async (raw: RawData) => {
+    // Idempotency guard: once stopped, refuse all traffic.
+    if (stopped) {
+      try {
+        ws.send(
+          JSON.stringify({
+            type: "error",
+            message: "Connection closing",
+          }),
+        );
+      } catch (err) {
+        databaseLogger.warn(`[ws-server] send-failed msgType=error err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" });
+      }
+      return;
+    }
+
+    let msg: { type?: unknown; hostId?: unknown; tmuxSession?: unknown };
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      ws.send(
+        JSON.stringify({ type: "error", message: "Malformed message" }),
+      );
+      return;
+    }
+
+    // Phase 104 Plan 01: identity:probe-trapped-work — batched fan-out of
+    // per-identity binary "hasTrappedWork" probes. See handleIdentityProbeTrappedWork
+    // JSDoc for wire shape + batching semantics.
+    if (msg.type === "identity:probe-trapped-work") {
+      await handleIdentityProbeTrappedWork(ws, msg, userId);
+      return;
+    }
+
+    // Patch #17g/#92: identity:get-identity-file — read <identityKey>/<identityKey>.md as markdown.
+    // Patch #92: routes via helper; local branch for local hosts, SSH branch for remote hosts.
+    if (msg.type === "identity:get-identity-file") {
+      const rawKey = (msg as { type: unknown; identityKey?: unknown }).identityKey;
+      if (typeof rawKey !== "string" || !IDENTITY_KEY_RE.test(rawKey)) {
+        try {
+          ws.send(JSON.stringify({ type: "identity:identity-file", markdown: "", error: "invalid identityKey" }));
+        } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:identity-file err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+        return;
+      }
+      const identityKey = rawKey;
+      const rawHostId = (msg as { type: unknown; hostId?: unknown }).hostId;
+      const hostIdNum = requireHostId(ws, rawHostId, "identity:get-identity-file", { type: "identity:identity-file", markdown: "" }, userId);
+      if (hostIdNum === null) return;
+      // View-only window for an archived agent: read its archived folder.
+      const archived = (msg as { archived?: unknown }).archived === true;
+      const useLocal = isLocalHostId(hostIdNum);
+
+      try {
+        let markdown: string;
+        if (useLocal) {
+          ({ markdown } = await readIdentityFile(null, identityKey, { archived }));
+          sshLogger.info("identity:get-identity-file", {
+            operation: "identity_get_identity_file",
+            userId, identityKey, hostId: hostIdNum, useLocal: true, payloadSize: markdown.length,
+          });
+        } else {
+          const resolved = await resolveHostById(hostIdNum, userId!);
+          if (!resolved) {
+            try { ws.send(JSON.stringify({ type: "identity:identity-file", markdown: "", error: "host not found" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:identity-file err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+            return;
+          }
+          await getHostSemaphore(hostIdNum).run(async () => {
+            const conn = await connectOneShot(resolved as unknown as Parameters<typeof connectOneShot>[0], 5000);
+            try {
+              ({ markdown } = await readIdentityFile(conn, identityKey, { archived }));
+              sshLogger.info("identity:get-identity-file", {
+                operation: "identity_get_identity_file",
+                userId, identityKey, hostId: hostIdNum, useLocal: false, payloadSize: markdown.length,
+              });
+            } finally {
+              try { conn.end(); } catch (err) { databaseLogger.warn(`[ws-server] conn-end-failed err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_conn_end_failed" }); }
+            }
+          });
+        }
+        try { ws.send(JSON.stringify({ type: "identity:identity-file", markdown })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:identity-file err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+      } catch (err: unknown) {
+        sshLogger.error(
+          "identity:get-identity-file error",
+          err instanceof Error ? err : new Error(String(err)),
+          { operation: "identity_get_identity_file_error", userId, identityKey, hostId: hostIdNum },
+        );
+        try {
+          ws.send(JSON.stringify({ type: "identity:identity-file", markdown: "", error: err instanceof Error ? err.message : String(err) }));
+        } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:identity-file err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+      }
+      return;
+    }
+
+    // Phase 22 SRIC-06 / Plan 22-06: identity:get-role-file — byte-shape mirror
+    // of identity:get-identity-file above. Delegates to handleIdentityGetRoleFile
+    // (exported for tests) so the entire byte-shape mirror body is a single
+    // audit surface. See handler prologue at the module-scope function below.
+    if (msg.type === "identity:get-role-file") {
+      await handleIdentityGetRoleFile(ws, msg, userId);
+      return;
+    }
+
+    // Patch #17g/#92: identity:list-wakeups — enumerate wakeups/<slug>/wakeup.json and humanize each schedule.
+    // Patch #92: routes via helper; local branch for local hosts, SSH branch for remote hosts.
+    if (msg.type === "identity:list-wakeups") {
+      const rawKey = (msg as { type: unknown; identityKey?: unknown }).identityKey;
+      if (typeof rawKey !== "string" || !IDENTITY_KEY_RE.test(rawKey)) {
+        try {
+          ws.send(JSON.stringify({ type: "identity:wakeups", wakeups: [], error: "invalid identityKey" }));
+        } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:wakeups err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+        return;
+      }
+      const identityKey = rawKey;
+      const rawHostId = (msg as { type: unknown; hostId?: unknown }).hostId;
+      const hostIdNum = requireHostId(ws, rawHostId, "identity:list-wakeups", { type: "identity:wakeups", wakeups: [] }, userId);
+      if (hostIdNum === null) return;
+      const archived = (msg as { archived?: unknown }).archived === true;
+      // The archive check asks for a strict read so a failed one reaches the
+      // catch below (and its `error`) instead of reading as "no wake-ups".
+      const strict = (msg as { strict?: unknown }).strict === true;
+      const useLocal = isLocalHostId(hostIdNum);
+
+      try {
+        let wakeups: { name: string; enabled: boolean; scheduleHuman: string; instruction: string }[];
+        if (useLocal) {
+          ({ wakeups } = await readIdentityWakeups(null, identityKey, { archived, strict }));
+          sshLogger.info("identity:list-wakeups", {
+            operation: "identity_list_wakeups",
+            userId, identityKey, hostId: hostIdNum, useLocal: true, payloadSize: wakeups.length,
+          });
+        } else {
+          const resolved = await resolveHostById(hostIdNum, userId!);
+          if (!resolved) {
+            try { ws.send(JSON.stringify({ type: "identity:wakeups", wakeups: [], error: "host not found" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:wakeups err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+            return;
+          }
+          await getHostSemaphore(hostIdNum).run(async () => {
+            const conn = await connectOneShot(resolved as unknown as Parameters<typeof connectOneShot>[0], 5000);
+            try {
+              ({ wakeups } = await readIdentityWakeups(conn, identityKey, { archived, strict }));
+              sshLogger.info("identity:list-wakeups", {
+                operation: "identity_list_wakeups",
+                userId, identityKey, hostId: hostIdNum, useLocal: false, payloadSize: wakeups.length,
+              });
+            } finally {
+              try { conn.end(); } catch (err) { databaseLogger.warn(`[ws-server] conn-end-failed err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_conn_end_failed" }); }
+            }
+          });
+        }
+        try { ws.send(JSON.stringify({ type: "identity:wakeups", wakeups })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:wakeups err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+      } catch (err) {
+        sshLogger.error(
+          "identity:list-wakeups unexpected error",
+          err instanceof Error ? err : new Error(String(err)),
+          { operation: "identity_list_wakeups_error", userId, identityKey, hostId: hostIdNum },
+        );
+        try {
+          ws.send(JSON.stringify({ type: "identity:wakeups", wakeups: [], error: err instanceof Error ? err.message : String(err) }));
+        } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:wakeups err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+      }
+      return;
+    }
+
+    // identity:list-archived-apps — an archived agent's conversation apps, for
+    // its view-only window (title, description, picture; never served).
+    if (msg.type === "identity:list-archived-apps") {
+      const rawKey = (msg as { identityKey?: unknown }).identityKey;
+      const reply = (apps: ArchivedApp[], error?: string) => {
+        try { ws.send(JSON.stringify({ type: "identity:archived-apps", apps, ...(error ? { error } : {}) })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:archived-apps err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+      };
+      if (typeof rawKey !== "string" || !IDENTITY_KEY_RE.test(rawKey)) { reply([], "invalid identityKey"); return; }
+      const identityKey = rawKey;
+      const hostIdNum = requireHostId(ws, (msg as { hostId?: unknown }).hostId, "identity:list-archived-apps", { type: "identity:archived-apps", apps: [] }, userId);
+      if (hostIdNum === null) return;
+      try {
+        let apps: ArchivedApp[] = [];
+        if (isLocalHostId(hostIdNum)) {
+          apps = await readArchivedAppsLocal(getLocalIdentitiesArchiveRoot(), identityKey, getLocalIdentitiesRoot());
+        } else {
+          const resolved = await resolveHostById(hostIdNum, userId!);
+          if (!resolved) { reply([], "host not found"); return; }
+          await getHostSemaphore(hostIdNum).run(async () => {
+            const conn = await connectOneShot(resolved as unknown as Parameters<typeof connectOneShot>[0], 5000);
+            try {
+              apps = parseArchivedAppsStdout(await execCommand(conn, buildArchivedAppsScript(identityKey)));
+            } finally {
+              try { conn.end(); } catch { /* already closed */ }
+            }
+          });
+        }
+        sshLogger.info("identity:list-archived-apps", {
+          operation: "identity_list_archived_apps",
+          userId, identityKey, hostId: hostIdNum, count: apps.length,
+        });
+        reply(apps);
+      } catch (err) {
+        sshLogger.error("identity:list-archived-apps error", err instanceof Error ? err : new Error(String(err)), {
+          operation: "identity_list_archived_apps_error", userId, identityKey, hostId: hostIdNum,
+        });
+        reply([], err instanceof Error ? err.message : String(err));
+      }
+      return;
+    }
+
+    // Patch #154: identity:update-wakeup — patch a single wakeups/<slug>/wakeup.json
+    // (enabled and/or schedule) and return the fresh list so the modal can
+    // atomically re-render. Same local/SSH routing as list-wakeups.
+    //
+    // Quick 260731-2pa: `updates` widened to also accept `name` (non-empty
+    // string) and `instruction` (string). Backs the form-based editor in
+    // WakeupsTab.tsx which writes the full spec on Save. Filter, validate,
+    // and thread each field into `filtered` the same way enabled/schedule
+    // already do; the `no updates` guard now considers all four.
+    if (msg.type === "identity:update-wakeup") {
+      const raw = msg as { identityKey?: unknown; hostId?: unknown; wakeupSlug?: unknown; updates?: unknown };
+      const rawKey = raw.identityKey;
+      const rawSlug = raw.wakeupSlug;
+      const rawUpdates = raw.updates;
+      if (typeof rawKey !== "string" || !IDENTITY_KEY_RE.test(rawKey)) {
+        try { ws.send(JSON.stringify({ type: "identity:wakeup-updated", wakeups: [], error: "invalid identityKey" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:wakeup-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+        return;
+      }
+      if (typeof rawSlug !== "string" || !IDENTITY_SLUG_RE.test(rawSlug)) {
+        try { ws.send(JSON.stringify({ type: "identity:wakeup-updated", wakeups: [], error: "Invalid scheduled wake-up" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:wakeup-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+        return;
+      }
+      if (typeof rawUpdates !== "object" || rawUpdates === null) {
+        try { ws.send(JSON.stringify({ type: "identity:wakeup-updated", wakeups: [], error: "invalid updates" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:wakeup-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+        return;
+      }
+      const identityKey = rawKey;
+      const wakeupSlug = rawSlug;
+      const updates = rawUpdates as { enabled?: unknown; schedule?: unknown; name?: unknown; instruction?: unknown };
+      const filtered: { enabled?: boolean; schedule?: unknown; name?: string; instruction?: string } = {};
+      if (updates.enabled !== undefined) {
+        if (typeof updates.enabled !== "boolean") {
+          try { ws.send(JSON.stringify({ type: "identity:wakeup-updated", wakeups: [], error: "enabled must be boolean" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:wakeup-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+          return;
+        }
+        filtered.enabled = updates.enabled;
+      }
+      if (updates.schedule !== undefined) {
+        filtered.schedule = updates.schedule;
+      }
+      if (updates.name !== undefined) {
+        if (typeof updates.name !== "string" || updates.name.length === 0) {
+          try { ws.send(JSON.stringify({ type: "identity:wakeup-updated", wakeups: [], error: "name must be a non-empty string" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:wakeup-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+          return;
+        }
+        filtered.name = updates.name;
+      }
+      if (updates.instruction !== undefined) {
+        if (typeof updates.instruction !== "string") {
+          try { ws.send(JSON.stringify({ type: "identity:wakeup-updated", wakeups: [], error: "instruction must be a string" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:wakeup-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+          return;
+        }
+        filtered.instruction = updates.instruction;
+      }
+      if (filtered.enabled === undefined && filtered.schedule === undefined && filtered.name === undefined && filtered.instruction === undefined) {
+        try { ws.send(JSON.stringify({ type: "identity:wakeup-updated", wakeups: [], error: "no updates" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:wakeup-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+        return;
+      }
+      const rawHostId = raw.hostId;
+      const hostIdNum = requireHostId(ws, rawHostId, "identity:update-wakeup", { type: "identity:wakeup-updated", wakeups: [] }, userId);
+      if (hostIdNum === null) return;
+      const useLocal = isLocalHostId(hostIdNum);
+      try {
+        let wakeups: Awaited<ReturnType<typeof readIdentityWakeups>>["wakeups"];
+        if (useLocal) {
+          await writeIdentityWakeupUpdate(null, identityKey, wakeupSlug, filtered);
+          ({ wakeups } = await readIdentityWakeups(null, identityKey));
+          sshLogger.info("identity:update-wakeup", {
+            operation: "identity_update_wakeup",
+            userId, identityKey, wakeupSlug, hostId: hostIdNum, useLocal: true,
+            fields: Object.keys(filtered).join(","),
+          });
+        } else {
+          const resolved = await resolveHostById(hostIdNum, userId!);
+          if (!resolved) {
+            try { ws.send(JSON.stringify({ type: "identity:wakeup-updated", wakeups: [], error: "host not found" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:wakeup-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+            return;
+          }
+          await getHostSemaphore(hostIdNum).run(async () => {
+            const conn = await connectOneShot(resolved as unknown as Parameters<typeof connectOneShot>[0], 5000);
+            try {
+              await writeIdentityWakeupUpdate(conn, identityKey, wakeupSlug, filtered);
+              ({ wakeups } = await readIdentityWakeups(conn, identityKey));
+              sshLogger.info("identity:update-wakeup", {
+                operation: "identity_update_wakeup",
+                userId, identityKey, wakeupSlug, hostId: hostIdNum, useLocal: false,
+                fields: Object.keys(filtered).join(","),
+              });
+            } finally {
+              try { conn.end(); } catch (err) { databaseLogger.warn(`[ws-server] conn-end-failed err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_conn_end_failed" }); }
+            }
+          });
+        }
+        try { ws.send(JSON.stringify({ type: "identity:wakeup-updated", wakeups })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:wakeup-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+      } catch (err) {
+        sshLogger.error(
+          "identity:update-wakeup unexpected error",
+          err instanceof Error ? err : new Error(String(err)),
+          { operation: "identity_update_wakeup_error", userId, identityKey, wakeupSlug, hostId: hostIdNum },
+        );
+        try {
+          ws.send(JSON.stringify({ type: "identity:wakeup-updated", wakeups: [], error: err instanceof Error ? err.message : String(err) }));
+        } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:wakeup-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+      }
+      return;
+    }
+
+    // Phase 72 Plan 01: identity-scope wakeup create/delete parity-gap closure.
+    // Extracted at L1450+ for the test seams; here we dispatch by msg.type.
+    // Handler functions are byte-shape mirrors of identity:list-wakeups /
+    // identity:update-wakeup above — see handler prologue for details.
+    // Phase 134 Plan 134-02: the four role-scope dispatchers (identity:list-,
+    // create-, update-, delete-role-wakeup) were retired here.
+    if (msg.type === "identity:create-wakeup") {
+      await handleIdentityCreateWakeup(ws, msg, userId);
+      return;
+    }
+    if (msg.type === "identity:delete-wakeup") {
+      await handleIdentityDeleteWakeup(ws, msg, userId);
+      return;
+    }
+
+    // Phase 18 / IDMEDIT-06: identity:update-identity-file — full-overwrite
+    // <key>/<key>.md via SFTP tmp+rename (REMOTE) or fs tmp+rename (LOCAL).
+    // After write, re-reads the file via readIdentityFile so the client
+    // rehydrates from server-side truth. Mirror of identity:update-wakeup.
+    if (msg.type === "identity:update-identity-file") {
+      const raw = msg as { identityKey?: unknown; hostId?: unknown; contents?: unknown };
+      const rawKey = raw.identityKey;
+      const rawContents = raw.contents;
+      if (typeof rawKey !== "string" || !IDENTITY_KEY_RE.test(rawKey)) {
+        try { ws.send(JSON.stringify({ type: "identity:identity-file-updated", markdown: "", error: "invalid identityKey" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:identity-file-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+        return;
+      }
+      if (typeof rawContents !== "string") {
+        try { ws.send(JSON.stringify({ type: "identity:identity-file-updated", markdown: "", error: "contents must be a string" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:identity-file-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+        return;
+      }
+      const identityKey = rawKey;
+      const contents = rawContents;
+      const rawHostId = raw.hostId;
+      const hostIdNum = requireHostId(ws, rawHostId, "identity:update-identity-file", { type: "identity:identity-file-updated", markdown: "" }, userId);
+      if (hostIdNum === null) return;
+      const useLocal = isLocalHostId(hostIdNum);
+      try {
+        let markdown: string;
+        if (useLocal) {
+          await writeIdentityFile(null, identityKey, contents);
+          ({ markdown } = await readIdentityFile(null, identityKey));
+          sshLogger.info("identity:update-identity-file", {
+            operation: "identity_update_identity_file",
+            userId, identityKey, hostId: hostIdNum, useLocal: true,
+            bytes: Buffer.byteLength(contents, "utf-8"),
+          });
+        } else {
+          const resolved = await resolveHostById(hostIdNum, userId!);
+          if (!resolved) {
+            try { ws.send(JSON.stringify({ type: "identity:identity-file-updated", markdown: "", error: "host not found" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:identity-file-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+            return;
+          }
+          await getHostSemaphore(hostIdNum).run(async () => {
+            const conn = await connectOneShot(resolved as unknown as Parameters<typeof connectOneShot>[0], 5000);
+            try {
+              await writeIdentityFile(conn, identityKey, contents);
+              ({ markdown } = await readIdentityFile(conn, identityKey));
+              sshLogger.info("identity:update-identity-file", {
+                operation: "identity_update_identity_file",
+                userId, identityKey, hostId: hostIdNum, useLocal: false,
+                bytes: Buffer.byteLength(contents, "utf-8"),
+              });
+            } finally {
+              try { conn.end(); } catch (err) { databaseLogger.warn(`[ws-server] conn-end-failed err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_conn_end_failed" }); }
+            }
+          });
+        }
+        try { ws.send(JSON.stringify({ type: "identity:identity-file-updated", markdown })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:identity-file-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+      } catch (err) {
+        sshLogger.error(
+          "identity:update-identity-file unexpected error",
+          err instanceof Error ? err : new Error(String(err)),
+          { operation: "identity_update_identity_file_error", userId, identityKey, hostId: hostIdNum },
+        );
+        try {
+          ws.send(JSON.stringify({ type: "identity:identity-file-updated", markdown: "", error: err instanceof Error ? err.message : String(err) }));
+        } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:identity-file-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+      }
+      return;
+    }
+
+    // Phase 22 SRIC-06 / Plan 22-06: identity:update-role-file — byte-shape
+    // mirror of identity:update-identity-file above. Delegates to
+    // handleIdentityUpdateRoleFile (exported for tests). See handler prologue
+    // at the module-scope function below.
+    if (msg.type === "identity:update-role-file") {
+      await handleIdentityUpdateRoleFile(ws, msg, userId);
+      return;
+    }
+
+    // Phase 90 Plan 90-03: role:update-file — role-name-keyed companion of
+    // identity:update-role-file. Delegates to handleRoleUpdateFile (exported
+    // for tests). D-08.3 planner-pick — RoleModal (Plan 90-04) has no
+    // identity context so it uses this handler.
+    if (msg.type === "role:update-file") {
+      await handleRoleUpdateFile(ws, msg, userId);
+      return;
+    }
+
+    // Phase 90 Plan 90-07: role-name-keyed READ + wakeup CRUD variants.
+    // Close the D-08.3 divergence — the RoleModal has role-name context
+    // (not identity), so these six handlers dispatch to role-name-keyed
+    // helpers in identity-artifact-reader.ts. Byte-shape mirrors of the
+    // corresponding identity-keyed handlers MINUS the identity two-step.
+    // See handler prologues at L1516+ for details.
+    if (msg.type === "role:get-file") {
+      await handleRoleGetFile(ws, msg, userId);
+      return;
+    }
+    // Phase 134 Plan 134-02 retired the role-name-keyed wakeup dispatchers
+    // (role:list-wakeups / role:create-wakeup / role:update-wakeup /
+    // role:delete-wakeup). Phase 136 retired the role:list-bounties
+    // dispatcher.
+
+    // Phase 18 / IDMEDIT-06: identity:update-handoff — full-overwrite
+    // <key>/handoff.md. After write, re-reads via readIdentityHandoff so the
+    // client rehydrates from server-side truth.
+    if (msg.type === "identity:update-handoff") {
+      const raw = msg as { identityKey?: unknown; hostId?: unknown; contents?: unknown };
+      const rawKey = raw.identityKey;
+      const rawContents = raw.contents;
+      if (typeof rawKey !== "string" || !IDENTITY_KEY_RE.test(rawKey)) {
+        try { ws.send(JSON.stringify({ type: "identity:handoff-updated", markdown: "", error: "invalid identityKey" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:handoff-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+        return;
+      }
+      if (typeof rawContents !== "string") {
+        try { ws.send(JSON.stringify({ type: "identity:handoff-updated", markdown: "", error: "contents must be a string" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:handoff-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+        return;
+      }
+      const identityKey = rawKey;
+      const contents = rawContents;
+      const rawHostId = raw.hostId;
+      const hostIdNum = requireHostId(ws, rawHostId, "identity:update-handoff", { type: "identity:handoff-updated", markdown: "" }, userId);
+      if (hostIdNum === null) return;
+      const useLocal = isLocalHostId(hostIdNum);
+      try {
+        let markdown: string;
+        if (useLocal) {
+          await writeIdentityHandoff(null, identityKey, contents);
+          ({ markdown } = await readIdentityHandoff(null, identityKey));
+          sshLogger.info("identity:update-handoff", {
+            operation: "identity_update_handoff",
+            userId, identityKey, hostId: hostIdNum, useLocal: true,
+            bytes: Buffer.byteLength(contents, "utf-8"),
+          });
+        } else {
+          const resolved = await resolveHostById(hostIdNum, userId!);
+          if (!resolved) {
+            try { ws.send(JSON.stringify({ type: "identity:handoff-updated", markdown: "", error: "host not found" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:handoff-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+            return;
+          }
+          await getHostSemaphore(hostIdNum).run(async () => {
+            const conn = await connectOneShot(resolved as unknown as Parameters<typeof connectOneShot>[0], 5000);
+            try {
+              await writeIdentityHandoff(conn, identityKey, contents);
+              ({ markdown } = await readIdentityHandoff(conn, identityKey));
+              sshLogger.info("identity:update-handoff", {
+                operation: "identity_update_handoff",
+                userId, identityKey, hostId: hostIdNum, useLocal: false,
+                bytes: Buffer.byteLength(contents, "utf-8"),
+              });
+            } finally {
+              try { conn.end(); } catch (err) { databaseLogger.warn(`[ws-server] conn-end-failed err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_conn_end_failed" }); }
+            }
+          });
+        }
+        try { ws.send(JSON.stringify({ type: "identity:handoff-updated", markdown })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:handoff-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+      } catch (err) {
+        sshLogger.error(
+          "identity:update-handoff unexpected error",
+          err instanceof Error ? err : new Error(String(err)),
+          { operation: "identity_update_handoff_error", userId, identityKey, hostId: hostIdNum },
+        );
+        try {
+          ws.send(JSON.stringify({ type: "identity:handoff-updated", markdown: "", error: err instanceof Error ? err.message : String(err) }));
+        } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:handoff-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+      }
+      return;
+    }
+
+    // Patch #17g/#92: identity:get-handoff — read handoff.md as markdown.
+    // Patch #92: routes via helper; local branch for local hosts, SSH branch for remote hosts.
+    if (msg.type === "identity:get-handoff") {
+      const rawKey = (msg as { type: unknown; identityKey?: unknown }).identityKey;
+      if (typeof rawKey !== "string" || !IDENTITY_KEY_RE.test(rawKey)) {
+        try {
+          ws.send(JSON.stringify({ type: "identity:handoff", markdown: "", error: "invalid identityKey" }));
+        } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:handoff err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+        return;
+      }
+      const identityKey = rawKey;
+      const rawHostId = (msg as { type: unknown; hostId?: unknown }).hostId;
+      const hostIdNum = requireHostId(ws, rawHostId, "identity:get-handoff", { type: "identity:handoff", markdown: "" }, userId);
+      if (hostIdNum === null) return;
+      const useLocal = isLocalHostId(hostIdNum);
+
+      try {
+        let markdown: string;
+        if (useLocal) {
+          ({ markdown } = await readIdentityHandoff(null, identityKey));
+          sshLogger.info("identity:get-handoff", {
+            operation: "identity_get_handoff",
+            userId, identityKey, hostId: hostIdNum, useLocal: true, payloadSize: markdown.length,
+          });
+        } else {
+          const resolved = await resolveHostById(hostIdNum, userId!);
+          if (!resolved) {
+            try { ws.send(JSON.stringify({ type: "identity:handoff", markdown: "", error: "host not found" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:handoff err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+            return;
+          }
+          await getHostSemaphore(hostIdNum).run(async () => {
+            const conn = await connectOneShot(resolved as unknown as Parameters<typeof connectOneShot>[0], 5000);
+            try {
+              ({ markdown } = await readIdentityHandoff(conn, identityKey));
+              sshLogger.info("identity:get-handoff", {
+                operation: "identity_get_handoff",
+                userId, identityKey, hostId: hostIdNum, useLocal: false, payloadSize: markdown.length,
+              });
+            } finally {
+              try { conn.end(); } catch (err) { databaseLogger.warn(`[ws-server] conn-end-failed err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_conn_end_failed" }); }
+            }
+          });
+        }
+        try { ws.send(JSON.stringify({ type: "identity:handoff", markdown })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:handoff err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+      } catch (err: unknown) {
+        sshLogger.error(
+          "identity:get-handoff error",
+          err instanceof Error ? err : new Error(String(err)),
+          { operation: "identity_get_handoff_error", userId, identityKey, hostId: hostIdNum },
+        );
+        try {
+          ws.send(JSON.stringify({ type: "identity:handoff", markdown: "", error: err instanceof Error ? err.message : String(err) }));
+        } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:handoff err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+      }
+      return;
+    }
+
+    // Phase 14 Wave 2: aside_arm — the SOLE trigger source per CONTEXT.md
+    // § Trigger lock (2026-07-26). Frontend PrettyView WS-sends this on
+    // the `isIdle:false -> true` transition when `pvIdentity !== null`.
+    // The backend does NOT gate identity (delegated to the frontend) and
+    // does NOT observe the terminal WSS's idle-signal frame (that runs
+    // on port 30002 in a separate closure with no shared state). If a WS
+    // sends aside_arm, backend arms — trust boundary is frontend-owned.
+    //
+    // v1 overlap policy (ASIDE-08): if this WS's state has `armed` OR
+    // `displayed` set, the incoming aside_arm is a no-op — no re-inject
+    // of /btw while an aside is armed OR displayed. Bounds the tmux
+    // send-keys rate to ONE /btw per aside-cycle-completion per WS.
+    // Work narration: the tab reports whether it is showing the work
+    // indicator. Narration calls only run while some tab says yes.
+    if (msg.type === "narration_watch") {
+      workNarrationHub.setWatching(ws, (msg as { active?: unknown }).active === true);
+      return;
+    }
+    if (msg.type === "aside_arm") {
+      const state = asideState.get(ws);
+      if (!state) return; // defensive — asideState.set(ws) fires at connect init
+      if (state.armed || state.displayed) return; // overlap-ignore gate
+      if (!sshConn || !currentTmuxSession) return; // no pane bound yet
+      state.armed = true;
+      lastStableCapture = null;
+      hadMarkerLastCapture = false;
+      sshLogger.info("aside poll diag: armed", {
+        hostId: currentHostId,
+        tmuxSession: currentTmuxSession,
+      });
+      // injectBtw log-and-swallows internally; do NOT roll back state.armed
+      // on failure — the poller's disarm-on-emit path handles the "no
+      // answer arrived" case, and a stuck armed flag clears on next
+      // dismiss cycle. Keeps the dispatch simple.
+      await injectBtw(sshConn, currentTmuxSession);
+      return;
+    }
+
+    // Phase 14 Wave 2: aside_dismissed — client clicked the X (Resume)
+    // affordance on ComposeBox. Send Escape into the pane's tmux to close
+    // the BTW overlay, then broadcast the dismiss to all peer WSes on the
+    // same session so cross-tab tabs also clear their aside display.
+    //
+    // Per T-14-02-01 mitigation: we IGNORE msg.hostId / msg.tmuxSession
+    // for send-keys routing. The connection's own captured
+    // currentHostId / currentTmuxSession is the trusted source (set at
+    // connectToPane discovery success). Client-supplied fields cannot
+    // spoof a dismiss for a session the client doesn't own.
+    //
+    // Do NOT set asideState.get(ws).armed = false here — the poller's
+    // marker-disappearance path (or the extract-and-emit path) owns that.
+    // broadcastAsideDismissed flips this ws's `displayed=false` (since
+    // this ws IS in its own activeViewers set) and all peers' atomically.
+    if (msg.type === "aside_dismissed") {
+      if (sshConn && currentTmuxSession) {
+        await dismissBtw(sshConn, currentTmuxSession);
+      }
+      if (currentHostId != null && currentTmuxSession != null) {
+        broadcastAsideDismissed(sessionKey(currentHostId, currentTmuxSession));
+      }
+      return;
+    }
+
+    // Phase 47 Plan 03 Hunk D: load-more button — client asks for a
+    // bounded slice of older JSONL lines. Placed here (alongside
+    // raw_keystrokes) because both are pane-scoped WS requests that
+    // require connection-scoped SSH + session state. The handler
+    // (handleFetchOlderRange ~L900) validates payload shape+bounds,
+    // enforces the T-47-09 trust boundary (reads currentSessionFile
+    // from closure scope, never from msg), and emits a single
+    // `fetch_older_range_batch` response frame.
+    if (msg.type === "fetch_older_range") {
+      // Dormant-pane fallback: startActiveSessionFlow is the only site that
+      // populates `currentSessionFile`, so on a dormant pane it stays null
+      // even after the dormant-branch tail-open seam has discovered the
+      // identity's most-recent JSONL into `dormantSessionFile` (companion
+      // to the Bug #2 dormant_session_meta emit — that made the button
+      // APPEAR; this makes the click WORK). The dormant tail already runs
+      // `tail -F` against this exact path over the same sshConn, so
+      // handing it to readSessionFileRange is semantically identical to
+      // handing it currentSessionFile on an active pane. Coalesce at the
+      // call site rather than inside the handler so the handler's
+      // trust-boundary contract (single "sessionFile from connection
+      // scope") stays clean.
+      await handleFetchOlderRange(ws, msg, {
+        sshConn,
+        currentSessionFile: currentSessionFile ?? dormantSessionFile,
+        currentHostId,
+        // Phase 50 Plan 01 Task 2 — thread the JSONL session UUID so
+        // the parser's queue-operation branch derives the same
+        // deterministic eventId shape as the streaming-tail dispatch.
+        sessionIdFromFile,
+      });
+      return;
+    }
+
+    // Phase 35 — pretty-view compose-send owns its own WebSocket instead of
+    // borrowing the terminal SSH WS (see diagnostic drop terminal-ws-silent-death-on-session-return).
+    //
+    // `input` handler: accepts the same payload shape as terminal.ts:499's split-send gate
+    // ({ type: "input", data: string, messageQueueItemId?: string }) and replicates the
+    // split-send semantics via tmux send-keys:
+    //   - Split-send (mqid non-empty + data ends in \r): body write → 250ms → Enter write.
+    //   - Non-split (no mqid OR no trailing \r): one send-keys -l call.
+    // Citation: 250ms delay from src/backend/ssh/terminal.ts:842, patch #111.
+    //
+    // Trust boundary (mirrors aside_dismissed T-14-02-01): the send target
+    // is derived from the connection's captured currentTmuxSession (set on
+    // connectToPane discovery success). We IGNORE any client-supplied
+    // hostId/tmuxSession in the payload — a client cannot spoof an input
+    // frame into a pane it doesn't own.
+    if (msg.type === "input") {
+      // Phase 50 Plan 02 Task 2 — wire the signal-driven send watchdog into
+      // the production input handler. sessionId comes from the connection-
+      // scoped sessionIdFromFile (set on connectToPane discovery success);
+      // wsSend is a WS-OPEN-guarded JSON.stringify shim; armWatchdog is the
+      // real module export; trackMqid records into the per-connection
+      // pendingMqidsForThisConnection Set (iterated on ws.on("close") for
+      // orphan-frame prevention — T-50-02-06 mitigation).
+      //
+      // Phase 56 hotfix — capture the payload fields NOW (at message-arrival
+      // time), then enqueue onto `inputChain` for serialized execution. The
+      // handler MUST NOT await its own chained work — see the `inputChain`
+      // declaration above for the full rationale. Two rapid sends during a
+      // dormant-wake window would otherwise race through the split-send and
+      // fuse into one prompt.
+      const capturedData = String((msg as { data?: unknown }).data ?? "");
+      const capturedMqid = String((msg as { messageQueueItemId?: unknown }).messageQueueItemId ?? "") || undefined;
+      // A compose send resent after a WS drop that had in fact got through
+      // already — typing it again would duplicate the message.
+      if (isRepeatComposeMqid(capturedMqid)) {
+        sshLogger.info(`[pv-input] drop_repeat_mqid mqid=${capturedMqid} hostId=${currentHostId} tmuxSession=${currentTmuxSession} dataLen=${capturedData.length}`, {
+          operation: "pv_input_drop_repeat_mqid",
+          mqid: capturedMqid,
+          hostId: currentHostId,
+          tmuxSession: currentTmuxSession,
+        });
+        return;
+      }
+      inputChain = inputChain.then(async () => {
+        try {
+          await __applyInputMessageForTests({
+            sshConn,
+            currentTmuxSession,
+            currentHostId,
+            execCommand,
+            data: capturedData,
+            messageQueueItemId: capturedMqid,
+            textArea: (msg as { textArea?: unknown }).textArea === true,
+            sessionId: sessionIdFromFile ?? undefined,
+            wsSend: (frame: object) => {
+              if (ws.readyState === WebSocket.OPEN) {
+                try {
+                  ws.send(JSON.stringify(frame));
+                } catch {
+                  /* ws may be mid-close; drop */
+                }
+              }
+            },
+            armWatchdog: armPvSendWatchdog,
+            trackMqid: (mqid: string) => {
+              pendingMqidsForThisConnection.add(mqid);
+            },
+            // Phase 56 Plan 01 — send-while-dormant wire-up. Reads the connection-
+            // scoped `dormantLastEmitted` (declared ~L3001), writes the connection-
+            // scoped `wakeTriggerTs` (declared ~L3026) so the existing dormant-
+            // poll's marker-freshness gate holds this pane's dormant frame in
+            // place while the wake completes. markerCommand mirrors the rediscovery-
+            // seam wire-up at L7013-below (both share the same `.resume-complete`
+            // read contract — if these two ever drift, extract into a module-scope
+            // helper).
+            dormantLastEmitted: () => dormantLastEmitted,
+            setWakeTriggerTs: (ts: number) => {
+              wakeTriggerTs = ts;
+            },
+            markerCommand: async (
+              conn: unknown,
+              name: string,
+            ): Promise<string | null> => {
+              try {
+                const out = await execCommand(
+                  conn as import("ssh2").Client,
+                  `cat ~/fleet/identities/'${name}'/.resume-complete 2>/dev/null || echo`,
+                );
+                const trimmed = out.trim();
+                return trimmed.length > 0 ? trimmed : null;
+              } catch {
+                return null;
+              }
+            },
+            now: () => Date.now(),
+            paneProbe: (conn: unknown, name: string) =>
+              probePaneForSend(conn, name, execCommand as (c: unknown, cmd: string) => Promise<string>),
+          });
+        } catch (err) {
+          // Catch inside the chain so one failed handler doesn't reject the
+          // chain and skip every subsequent input segment. The applyInput
+          // seam itself already log-and-swallows internal errors; anything
+          // reaching here is a genuine unexpected failure worth surfacing
+          // once in the forensic trail.
+          sshLogger.warn(
+            `[pv-input] chain segment error: ${err instanceof Error ? err.message : String(err)}`,
+            {
+              operation: "pv_input_chain_error",
+              hostId: currentHostId,
+              tmuxSession: currentTmuxSession,
+              mqid: capturedMqid ?? "none",
+            },
+          );
+        }
+      });
+      return;
+    }
+
+    // Phase 35 — pretty-view owns its own safety-valve Ctrl-C after migrating off the
+    // borrowed terminal WS. Original Ctrl-C was patch #120 on terminal WS (Terminal.tsx:3300-3311).
+    //
+    // Trust boundary (mirrors T-14-02-01): target pane derived exclusively from
+    // connection-scoped currentTmuxSession. Client-supplied hostId/tmuxSession IGNORED.
+    // Ancestor: Terminal.tsx:3300-3311 (patch #120).
+    if (msg.type === "interrupt") {
+      const pressHostId = currentHostId;
+      const pressTmuxSession = currentTmuxSession;
+      const verdict = await __applyInterruptMessageForTests({
+        sshConn,
+        currentTmuxSession,
+        currentHostId,
+        execCommand,
+        tracker: () => cancelTracker,
+        sessionIdFromFile,
+      });
+      if (verdict === null) {
+        // The press never reached the harness — say so at once rather than
+        // leaving the button on "Stopping" until the client gives up.
+        if (ws.readyState === WebSocket.OPEN) {
+          try {
+            ws.send(JSON.stringify({ type: "interrupt_result", verdict: "failed" }));
+          } catch {
+            /* ws may be mid-close; drop */
+          }
+        }
+        return;
+      }
+      if (verdict.verdict === "cancelled" && pressHostId != null && pressTmuxSession) {
+        // Every view of the pane hides the bubble (this one included)…
+        const key = sessionKey(pressHostId, pressTmuxSession);
+        broadcastPromptCancelled(key, verdict.prompt.uuid);
+        if (!activeViewers.get(key)?.has(ws) && ws.readyState === WebSocket.OPEN) {
+          try {
+            ws.send(JSON.stringify({ type: "messages_hidden", eventIds: [verdict.prompt.uuid], reason: "cancelled" }));
+          } catch {
+            /* ws may be mid-close; drop */
+          }
+        }
+      }
+      // …and only the pressing view learns the verdict, with the words to
+      // give back on a cancel.
+      if (ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(
+            JSON.stringify({
+              type: "interrupt_result",
+              verdict: verdict.verdict,
+              ...(verdict.verdict === "cancelled"
+                ? { eventId: verdict.prompt.uuid, content: verdict.prompt.visibleText }
+                : {}),
+              ...(verdict.verdict === "none" ? { reason: verdict.reason } : {}),
+            }),
+          );
+        } catch {
+          /* ws may be mid-close; drop */
+        }
+      }
+      return;
+    }
+
+    // WaitingBubble: read the on-screen permission prompt / answer it.
+    if (msg.type === "permission_probe" || msg.type === "permission_answer") {
+      const deps = { sshConn, currentTmuxSession, currentHostId, execCommand };
+      const answer = msg as { choice?: unknown; fingerprint?: unknown };
+      const frame =
+        msg.type === "permission_probe"
+          ? await applyPermissionProbe(deps)
+          : await applyPermissionAnswer({
+              ...deps,
+              choice: answer.choice,
+              fingerprint: answer.fingerprint,
+            });
+      if (frame && ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(JSON.stringify(frame));
+        } catch (err) {
+          sshLogger.warn("permission frame send failed", {
+            operation: "permission_frame_send_error",
+            hostId: currentHostId,
+            tmuxSession: currentTmuxSession,
+            frameType: frame.type,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+      return;
+    }
+
+    // Phase 56 (2026-08-23): the {type:"wake"} handler is DELETED. The
+    // frontend no longer emits this message — the DormancyOverlay + Wake
+    // button were removed in Plan 56-03. Sends into a dormant pane trigger
+    // invisible wake at the backend send-path (Plan 56-01) with widened
+    // watchdog (Plan 56-02). Stale bundles that still send {type:"wake"}
+    // fall through to the outer switch's default (log-and-drop) — no side
+    // effect. The `let wakeTriggerTs` closure var above stays live; Plan 01
+    // writes to it via setWakeTriggerTs on send-while-dormant entry and the
+    // rediscovery seam reads it for marker-freshness gating.
+
+    // Phase 41 Plan 04: pretty-view upload dispatch — ported verbatim from
+    // src/backend/ssh/terminal.ts's upload_start/upload_chunk/upload_abort cases
+    // (removed from terminal.ts as part of this plan). The receiving WebSocket
+    // is now PrettyView's own claude-session WS (port 30011) rather than the
+    // Terminal SSH WS (port 30002). The reusable handler module (pretty-view-upload.ts)
+    // is unchanged — it takes UploadDeps { sshConn, ws, userId, currentSessionId }
+    // and emits the same server-to-client events. Wire protocol is byte-identical.
+    //
+    // Trust boundary: this WS is already JWT-authenticated (JWT verified at L1528,
+    // userId + sessionId extracted before ANY message dispatch). The T-05-07 guard
+    // inside pretty-view-upload.ts silently no-ops if sshConn is null (upload_*
+    // received before connectToPane completed).
+    // Phase 41 code-review M1: upload dispatch extracted to
+    // `dispatchUploadMessage` (module-scope) so the test seam
+    // `__dispatchUploadMessageForTests` exercises the same code path
+    // production runs. Logging stays inline here because the dispatcher
+    // is intentionally logger-free — production emits per-branch
+    // diagnostics with full sshLogger/sessionId context; tests skip logs.
+    if (
+      msg.type === "upload_start" ||
+      msg.type === "upload_chunk" ||
+      msg.type === "upload_abort"
+    ) {
+      const uploadDeps = {
+        sshConn,
+        ws,
+        userId,
+        currentSessionId: sessionId ?? null,
+      };
+      if (msg.type === "upload_start") {
+        const uploadStart = msg as unknown as UploadStartPayload;
+        sshLogger.info("claude-session upload_start", {
+          operation: "claude_session_upload_start",
+          userId,
+          sessionId,
+          messageQueueItemId: uploadStart.messageQueueItemId,
+          hasSshConn: !!sshConn,
+        });
+      } else if (msg.type === "upload_chunk") {
+        const uploadChunk = msg as unknown as UploadChunkPayload;
+        // Snapshot pending presence BEFORE dispatch — dispatchUploadMessage
+        // may await the pending promise, and we want the diagnostic to
+        // reflect the state at the dispatch instant.
+        const chunkMqid = uploadChunk.messageQueueItemId;
+        const hasPending =
+          typeof chunkMqid === "string" &&
+          chunkMqid.length > 0 &&
+          pendingStarts.has(chunkMqid);
+        sshLogger.debug?.("claude-session upload_chunk", {
+          operation: "claude_session_upload_chunk",
+          userId,
+          sessionId,
+          messageQueueItemId: chunkMqid,
+          offset: uploadChunk.offset,
+          hasPending,
+        });
+      } else {
+        const uploadAbort = msg as unknown as UploadAbortPayload;
+        sshLogger.info("claude-session upload_abort", {
+          operation: "claude_session_upload_abort",
+          userId,
+          sessionId,
+          messageQueueItemId: uploadAbort.messageQueueItemId,
+          tempId: uploadAbort.tempId ?? null,
+        });
+      }
+      // Dispatch — the same function the __dispatchUploadMessageForTests
+      // seam calls. Await so upload_chunk's pending-parent race guard
+      // completes before we return control to the WS message loop (the
+      // dispatcher awaits internally for chunk).
+      await dispatchUploadMessage(
+        msg,
+        uploadDeps,
+        ownedUploadBatches,
+        pendingStarts,
+      );
+      return;
+    }
+
+    if (msg.type !== "connectToPane") {
+      ws.send(
+        JSON.stringify({
+          type: "error",
+          message: "Unknown message type: " + String(msg.type),
+        }),
+      );
+      return;
+    }
+
+    const hostId = msg.hostId;
+    const tmuxSession = msg.tmuxSession;
+    if (
+      typeof hostId !== "number" ||
+      !Number.isFinite(hostId) ||
+      hostId <= 0 ||
+      typeof tmuxSession !== "string" ||
+      tmuxSession.length === 0
+    ) {
+      ws.send(
+        JSON.stringify({
+          type: "error",
+          message: "connectToPane requires hostId and tmuxSession",
+        }),
+      );
+      return;
+    }
+
+    databaseLogger.info(`[session-server] attach hostId=${hostId} tmuxSession=${tmuxSession} userId=${userId ?? 'null'}`, { operation: "session_attach" });
+    // Enforce one active pane per WS: any prior tail/conn is torn down first.
+    if (sshConn || tailHandle) {
+      sshLogger.info("Claude session pane switch", {
+        operation: "claude_session_pane_switch",
+        userId,
+        sessionId,
+        hostId,
+        tmuxSession,
+      });
+      teardownPane();
+    }
+
+    const resolved = await resolveHostById(hostId, userId!);
+    if (!resolved) {
+      ws.send(
+        JSON.stringify({ type: "error", message: "Host not found" }),
+      );
+      return;
+    }
+
+    let conn: SSHClientType;
+    try {
+      conn = await connectOneShot(
+        resolved as unknown as Parameters<typeof connectOneShot>[0],
+        5000,
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      ws.send(
+        JSON.stringify({
+          type: "error",
+          message: "SSH connect failed: " + message,
+        }),
+      );
+      return;
+    }
+
+    // Store immediately so a WS close during discovery still tears down.
+    sshConn = conn;
+    // Long-lived for the pane's lifetime: route its pollers' commands through
+    // one skynet-hostd channel instead of a login per command.
+    enableHostd(conn);
+    // The connection dying under a live pane (network drop, host sshd
+    // restart) would otherwise leave the pane bound to a dead conn: the tail
+    // is gone and every send fails "Not connected". Close the WS with the
+    // reconnect code so the client re-attaches on a fresh connection. Our own
+    // teardowns null sshConn before the close event lands, so they skip this.
+    conn.once("close", () => {
+      if (stopped || sshConn !== conn) return;
+      sshLogger.warn("Claude session SSH connection lost", {
+        operation: "claude_session_ssh_conn_lost",
+        userId,
+        sessionId,
+        hostId: currentHostId ?? hostId,
+        tmuxSession: currentTmuxSession ?? tmuxSession,
+      });
+      closeForTornDownSession();
+      teardownPane();
+    });
+    if (stopped) {
+      teardownPane();
+      return;
+    }
+
+    // quick 260808-dmz: closure-scoped helper — extracted active-flow start.
+    // Called from (a) the initial active discovery path below, and (b) the
+    // dormant-poll wake path above when sentinel disappears + re-discovery
+    // finds an active session. Extracts SESSION-METADATA-EMIT + TAIL-START +
+    // CONTEXT-PCT-TIMER-START (lines originally ~3503-3841). The aside
+    // subsystem block is NOT extracted — it stays inline in the initial-active
+    // path and is re-invoked separately in the dormant-poll wake path.
+    //
+    // Captures closure state: ws, sshConn, sshLogger, userId, sessionId,
+    // tailHandle, contextPctTimer, contextPctInFlight, dormantInFlight,
+    // dormantLastEmitted, isIdentityShapedCached, identityShapeProbeInFlight,
+    // backgroundedAgents, backgroundedAgentsLastSerialized, backgroundedShells,
+    // backgroundedShellsLastSerialized, changeoverState, currentSessionFile,
+    // sessionIdFromFile, holdingTicks, discoveryRepollInFlight,
+    // currentHostId, currentTmuxSession, stopped.
+    startActiveSessionFlow = async ({ pid, sessionFile, tmuxSession: activeTmuxSession, hostId: activeHostId, startReason, keepExistingTail }: {
+      pid: number;
+      sessionFile: string;
+      tmuxSession: string;
+      hostId: number;
+      keepExistingTail?: boolean;
+      // Phase 62 Wave 2 (D-62-04) — see forward-decl above.
+      startReason?: "initial" | "dormant-handoff" | "transition";
+    }) => {
+    // Phase 47 Plan 03 Hunk B: probe totalLines once so the connect-time
+    // session metadata frame can carry it. The client (PrettyView.tsx,
+    // Plan 47-04) gates the load-more button's initial visibility on
+    // `totalLines > messages.length` — without this field the button
+    // can't decide whether to mount. `readSessionFileRange(count=1)` is
+    // the cheapest possible probe: on the REMOTE branch it still runs
+    // the sentinel-split sed+wc pipeline in ONE round-trip; on the LOCAL
+    // branch it reads the whole file and returns just totalLines. We
+    // discard the returned line (only totalLines matters here).
+    //
+    // On probe failure emit `totalLines: 0` so the client hides the
+    // button gracefully (0 <= any messages count, gate fails, button
+    // stays unmounted). Structured log for post-deploy dashboards. This
+    // is non-fatal: the streaming tail delivers lines as they arrive and
+    // the pane still functions in full — the user just can't load history.
+    //
+    // Session frame is emitted BEFORE tail start (unchanged ordering);
+    // the probe runs on the same SSH connection so ssh2's channel
+    // multiplexing keeps this from blocking anything downstream.
+    let totalLinesProbe = 0;
+    if (sshConn) {
+      try {
+        const probeResult = await readSessionFileRange(sshConn, sessionFile, 1, 1);
+        totalLinesProbe = probeResult.totalLines;
+      } catch (err) {
+        sshLogger.warn("pv_totalLines_probe_failed", {
+          operation: "pv_totalLines_probe_failed",
+          hostId: activeHostId,
+          tmuxSession: activeTmuxSession,
+          sessionFile,
+          err: err instanceof Error ? err.message : String(err),
+        });
+        // totalLinesProbe stays 0 — client-side gate is `totalLines > messages.length`;
+        // 0 fails the gate and the button hides gracefully.
+      }
+    }
+
+    // Active path: metadata frame first, then start the tail.
+    ws.send(
+      JSON.stringify({
+        type: "session",
+        pid,
+        sessionFile,
+        totalLines: totalLinesProbe,
+      }),
+    );
+    // Phase 30 Plan 30-01 (PS30-07): attach-time pane_state establishment.
+    // Fires right after the session metadata so a fresh client that has
+    // never received a pane_state before immediately learns "this pane is
+    // active" — no wait for the first transition tick. Same call site is
+    // reused by the dormant-poll → wake path (startActiveFlow callback)
+    // which routes through startActiveSessionFlow, so both attach flows
+    // (fresh connectToPane AND wake-from-dormant) establish pane_state
+    // uniformly through this one line. No reason (bare "active") — reasons
+    // decorate transitions, not the initial establishment.
+    paneStateEmitter.emit("active");
+
+    // Phase 62 Wave 2 (D-62-04) — regenerate per-tail-watcher instance ID
+    // BEFORE the lifecycle log so both the existing "Starting Claude session
+    // tail" line AND the new "[tail-lifecycle] action=start" line carry the
+    // fresh ID. tailInstanceId is closure-scoped; the previous value (if
+    // any) has already been emitted in the paired action=stop log at either
+    // the dormant-handoff site (~L7193) or the connection-teardown site
+    // (~L3518-3525). Fresh 8-char lowercase hex (4 random bytes).
+    // A wake handoff that keeps the dormant tail starts no new tail, so it
+    // keeps the id and logs action=keep at the tail-open site instead.
+    const keepingTail = keepExistingTail === true && tailHandle !== null;
+    if (!keepingTail) {
+    tailInstanceId = randomBytes(4).toString("hex");
+    sshLogger.info("Starting Claude session tail", {
+      operation: "claude_session_tail_start",
+      userId,
+      sessionId,
+      hostId: activeHostId,
+      tmuxSession: activeTmuxSession,
+      pid,
+      sessionFile,
+      tailInstanceId,
+    });
+    sshLogger.info(
+      `[tail-lifecycle] tail=${tailInstanceId} action=start sessionFile=${sessionFile} reason=${startReason ?? "initial"}`,
+      {
+        operation: "claude_session_tail_lifecycle",
+        tailInstanceId,
+        action: "start",
+        sessionFile,
+        reason: startReason ?? "initial",
+        sessionId,
+        hostId: activeHostId,
+        tmuxSession: activeTmuxSession,
+      },
+    );
+    }
+
+    // Phase 3: pin the connection-scoped context so the state-transition
+    // helpers can log with the right hostId/tmuxSession without needing to
+    // re-thread them through every callsite. Also gives the discovery-repoll
+    // ticker its baseline to compare `sessionFile` against — without
+    // seeding `currentSessionFile` here, the first ticker comparison would
+    // treat the current file as "changed" and immediately fire
+    // transitionToActiveNew on itself.
+    currentHostId = activeHostId;
+    currentTmuxSession = activeTmuxSession;
+    currentSessionFile = sessionFile;
+    sessionIdFromFile = sessionFile
+      .replace(/\\/g, "/")
+      .split("/")
+      .pop()!
+      .replace(/\.jsonl$/, "");
+
+    // Phase 95 Part C — batch-first context_pct helpers.
+    //
+    // computeContextPctLegacy: extracted from the pre-Phase-95-Part-C inline
+    // readContextPctFromJsonl callsite. Preserved verbatim as the fallback path
+    // for boxes mid-rollout (pv-context-pct-sweep not yet distributed) and for
+    // the schema-mismatch latch. Test seam: __applyPvContextPctBatchTickForTests
+    // exposes this so regression tests can exercise the fallback without a live
+    // SSH connection.
+    async function computeContextPctLegacy(
+      connSnapshot: SSHClientType,
+      sessionFileSnapshot: string | null,
+    ): Promise<number | null> {
+      if (!sessionFileSnapshot) return null;
+      return readContextPctFromJsonl(connSnapshot, sessionFileSnapshot);
+    }
+
+    // computeContextPctBatch: dispatch the pv-context-pct-sweep script on the
+    // managed box and parse the JSONL result.
+    //
+    // Returns:
+    //   { ok: true; pct }                   — sweep succeeded, pct is the result.
+    //   { ok: false; reason: "null-exec" }  — exec returned null (SSH transient);
+    //                                         caller should re-probe next tick.
+    //   { ok: false; reason: "schema-mismatch" } — JSONL had schema_version !== 1;
+    //                                         caller should latch and stop trying.
+    //   { ok: false; reason: "identity-missing" } — safe-char guard failed or
+    //                                         identity not in sweep output.
+    async function computeContextPctBatch(
+      connSnapshot: SSHClientType,
+      tmuxSessionSnapshot: string,
+    ): Promise<
+      | { ok: true; pct: number | null }
+      | { ok: false; reason: "null-exec" | "schema-mismatch" | "identity-missing" }
+    > {
+      // G6 belt-and-suspenders safe-char guard — mirrors pv-context-pct-sweep.py's
+      // server-side SAFE_NAME_RE and the plan's belt-and-suspenders note.
+      if (!/^[a-zA-Z0-9_-]+$/.test(tmuxSessionSnapshot)) {
+        return { ok: false, reason: "identity-missing" };
+      }
+      const sweepCmd = `~/.local/bin/pv-context-pct-sweep --identities ${tmuxSessionSnapshot} 2>/dev/null`;
+      const raw = await execCommand(connSnapshot, sweepCmd);
+      if (raw === null || raw === undefined) return { ok: false, reason: "null-exec" };
+      const parsed = parseSweepJsonl(raw);
+      if (parsed.schemaMismatch) return { ok: false, reason: "schema-mismatch" };
+      const line = parsed.lines.find((l) => l.identity === tmuxSessionSnapshot);
+      if (!line) return { ok: false, reason: "identity-missing" };
+      return { ok: true, pct: line.context_pct };
+    }
+
+    // Export the two helpers under a test-seam symbol so
+    // claude-session-server.pv-sweep.test.ts can drive them without a live SSH
+    // connection. The symbol is in module scope — see the export at the bottom
+    // of this closure.
+    //
+    // NOTE: The seam is set OUTSIDE the setInterval callback so the test can
+    // capture the helper references once at flow-start time. Each call to
+    // startActiveSessionFlow re-closes over sweepScriptPresent/sweepSchemaMismatch,
+    // so the test harness must use the seam's invoke() method (not import the
+    // closure vars directly) to drive tick behaviour.
+    const __pvSweepSeam = {
+      computeContextPctLegacy,
+      computeContextPctBatch,
+      getSweepScriptPresent: () => sweepScriptPresent,
+      setSweepScriptPresent: (v: boolean | null) => { sweepScriptPresent = v; },
+      getSweepSchemaMismatch: () => sweepSchemaMismatch,
+      setSweepSchemaMismatch: (v: boolean) => { sweepSchemaMismatch = v; },
+    };
+    // Expose on the module-level seam registry so tests can retrieve it.
+    __pvSweepSeamRegistry.set(ws, __pvSweepSeam);
+
+    // Context-% poller: reads the context percentage from the JSONL every
+    // ~15s (authoritative, pane-width-independent). JSONL is the sole source
+    // of truth for context_pct post-Phase-95 Part B — the tmux capture-pane
+    // scrape fallback and plan-pending detection are removed. On a fresh
+    // session with no assistant turn yet, pct is null and the frontend
+    // renders a loading placeholder (accepted UX tradeoff per CONTEXT.md
+    // § Verification and RESEARCH §3g + G4). JSONL path from Phase 90.
+    //
+    // Phase 95 Part C: batch-first dispatch using the pv-context-pct-sweep
+    // script (distributor-shipped to ~/.local/bin/pv-context-pct-sweep).
+    // Presence probe fires once per SSH-channel lifetime (sweepScriptPresent
+    // is null initially, cached after first probe, reset to null on null-exec
+    // for transient-recovery re-probe next tick). Schema-mismatch latches
+    // sweepSchemaMismatch=true for the WS lifetime — falls back to legacy
+    // without re-probing. Option 3 (per-WS) topology locked in Plan 04.
+    const CONTEXT_PCT_INTERVAL_MS = 15000;
+    contextPctTimer = setInterval(() => {
+      if (stopped || ws.readyState !== WebSocket.OPEN) return;
+      if (!sshConn) return;
+      if (contextPctInFlight) return; // guard against slow SSH pileups
+      contextPctInFlight = true;
+      const connSnapshot = sshConn;
+      // Read currentSessionFile at poll-fire time (not up-front) so a
+      // session-file change after connect is picked up on the next tick —
+      // matches how other closure-scoped fields are consulted inside
+      // this callback.
+      const sessionFileSnapshot = currentSessionFile;
+      const tmuxSessionSnapshot = activeTmuxSession;
+      (async () => {
+        try {
+          // Presence probe on first tick per SSH-channel lifetime.
+          // After probe, sweepScriptPresent is true/false and cached for the
+          // WS lifetime. Null-exec recovery resets it to null → re-probe next tick.
+          if (sweepScriptPresent === null) {
+            const probeRaw = await execCommand(
+              connSnapshot,
+              "test -x ~/.local/bin/pv-context-pct-sweep 2>/dev/null && echo yes || echo no",
+            );
+            sweepScriptPresent = probeRaw !== null && probeRaw !== undefined && probeRaw.trim() === "yes";
+            sshLogger.info("PV context-pct sweep-script presence probed", {
+              operation: "pv_context_pct_sweep_probe",
+              present: sweepScriptPresent,
+              identity: tmuxSessionSnapshot,
+            });
+          }
+
+          let pct: number | null = null;
+
+          // Batch-first dispatch.
+          if (sweepScriptPresent && !sweepSchemaMismatch) {
+            const result = await computeContextPctBatch(connSnapshot, tmuxSessionSnapshot);
+            if (result.ok === true) {
+              pct = result.pct;
+            } else {
+              // Extract the failure narrow explicitly — tsconfig.node.json's
+              // non-strict mode doesn't always discriminate `ok: true | false`
+              // literals in an else-branch (mirrors Tanya's 92-04 fix pattern
+              // at b86f7066). Assigning to a typed local before use makes the
+              // narrow explicit.
+              const failure: {
+                ok: false;
+                reason: "null-exec" | "schema-mismatch" | "identity-missing";
+              } = result;
+              sshLogger.warn("PV context-pct batch fell back to legacy", {
+                operation: "pv_context_pct_batch_fallback",
+                reason: failure.reason,
+                identity: tmuxSessionSnapshot,
+              });
+              // Null-exec: force re-probe next tick (transient recovery).
+              if (failure.reason === "null-exec") sweepScriptPresent = null;
+              // Schema-mismatch: latch for connection lifetime (no more batch attempts).
+              if (failure.reason === "schema-mismatch") sweepSchemaMismatch = true;
+              // This-tick fallback to legacy path.
+              pct = await computeContextPctLegacy(connSnapshot, sessionFileSnapshot);
+            }
+          } else {
+            // Legacy path (script absent OR schema-mismatch latched).
+            pct = await computeContextPctLegacy(connSnapshot, sessionFileSnapshot);
+          }
+
+          // Phase 90 Plan 00 (Wave 0, D-10 delivery mechanism): dual-write
+          // into the fleet-status shared map so PrettyView (post D-03
+          // mechanical waiver) and the future Plan 06 relay-pane badge
+          // appendage both read contextPct from the same source of truth.
+          // activeHostId + activeTmuxSession are pinned in the enclosing
+          // closure via startActiveSessionFlow. WS emission BELOW preserved
+          // for backwards compat. Phase 95 Part B: null pct also emits
+          // (no guard) — frontend renders loading placeholder.
+          setContextPct(activeHostId, activeTmuxSession, pct);
+          getSubscriptionRegistry()?.republishContextPct(String(activeHostId), activeTmuxSession);
+          if (!stopped && ws.readyState === WebSocket.OPEN) {
+            try {
+              ws.send(JSON.stringify({ type: "context_pct", pct }));
+            } catch {
+              /* ws may be mid-close */
+            }
+          }
+
+          // quick 260808-cd6 — dormancy stat check (two-tier: identity-shape probe
+          // on first tick, dormant sentinel stat on subsequent ticks).
+          // Runs AFTER the context_pct emit, BEFORE the finally.
+          // Uses the SAME connSnapshot + tmuxSession captured above — zero new SSH
+          // connections, zero new timers. The dormantInFlight guard mirrors
+          // contextPctInFlight to prevent slow-SSH pileups.
+          // Only VISIBLE panes are polled — hidden-pane suppression is inherited
+          // from patch #344's WS-pause on !isVisible (the WS is closed, so poll
+          // never fires). No additional gate needed here.
+          if (!dormantInFlight && currentTmuxSession !== null && !stopped && ws.readyState === WebSocket.OPEN) {
+            // Use the escapedName for single-quote shell wrapping. tmuxSession is
+            // already validated to alphanumeric/dash/underscore by the frontend
+            // (same frontend-validated tmux-safe subset rule as the context-pct timer). Per T-cd6-02: the
+            // single-quote wrap prevents any $(…) or backtick injection.
+            const escapedName = currentTmuxSession;
+            // Build a per-connection state box pointing at the closure-scoped lets.
+            // __applyDormantPollTickForTests mutates this box; we sync back below.
+            const dormantState: __DormantStateForTests = {
+              isIdentityShapedCached,
+              identityShapeProbeInFlight,
+              dormantLastEmitted,
+              // Phase 56 Plan 01: wakeTriggerTs getter removed from the state
+              // box — the tick seam no longer emits wakingSince (frontend has
+              // no consumer after Plan 03 deletes DormancyOverlay). Closure-
+              // scoped `wakeTriggerTs` (~L3026) still lives; it's still (a)
+              // written by the wake handler at L5828 (until Plan 03 deletes
+              // that handler), (b) written by Plan 01's send-while-dormant
+              // path via the input-handler wire-up, and (c) read by the
+              // rediscovery-seam wire-up below (~L7013) which targets the
+              // DIFFERENT state.wakeTriggerTs getter on __applyDormantPoll
+              // WithRediscoveryForTests for the marker-freshness gate.
+            };
+            dormantInFlight = true;
+            // Phase 30 Plan 30-01: capture dormantLastEmitted BEFORE the seam
+            // runs so we can detect a change post-return and funnel it through
+            // paneStateEmitter WITHOUT adding paneStateEmitter as an injected
+            // dep on the pure __applyDormantPollTickForTests seam (that would
+            // break the test-seam contract — every existing test constructs
+            // deps by name).
+            const dormantEmittedBefore = dormantLastEmitted;
+            (async () => {
+              try {
+                await __applyDormantPollTickForTests(
+                  {
+                    connSnapshot,
+                    escapedName,
+                    execCommand,
+                    wsSend: (data: string) => {
+                      try { ws.send(data); } catch (err) { databaseLogger.warn(`[ws-server] send-failed err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+                    },
+                  },
+                  dormantState,
+                );
+                // Sync mutation back to closure-scoped state.
+                isIdentityShapedCached = dormantState.isIdentityShapedCached;
+                identityShapeProbeInFlight = dormantState.identityShapeProbeInFlight;
+                dormantLastEmitted = dormantState.dormantLastEmitted;
+                // Phase 30 Plan 30-01: if the tick's dormancy state changed,
+                // funnel the equivalent pane_state alongside the legacy
+                // {type:"dormant",...} frame the seam already emitted. Compare
+                // captured-before value to the post-sync value; on transition
+                // to true → emit("dormant"), on transition to false →
+                // emit("active", "dormancy_cleared").
+                if (
+                  dormantLastEmitted !== dormantEmittedBefore &&
+                  dormantLastEmitted !== null
+                ) {
+                  if (dormantLastEmitted === true) {
+                    paneStateEmitter.emit("dormant");
+                  } else {
+                    paneStateEmitter.emit("active", "dormancy_cleared");
+                  }
+                }
+              } finally {
+                dormantInFlight = false;
+              }
+            })();
+          }
+        } catch {
+          // SSH error during context-pct tick — skip silently.
+          // Peer SSH transport can drop mid-flight and reject execCommand
+          // with `Error: Command exited with code undefined` (see
+          // tmux-helper.ts § docblock). Without this catch the throw
+          // propagates out of the async IIFE below, the IIFE's implicit
+          // promise is orphaned, and starter.ts's unhandledRejection
+          // handler calls process.exit(1) — killing the backend for every
+          // user on a single peer's disconnect (yeti forensic 2026-09-29
+          // 13:15:02Z: one agent's connection dropped, crashed the container).
+          // Mirrors the "skip this tick silently" posture of
+          // __applyDormantPollTickForTests.
+        } finally {
+          contextPctInFlight = false;
+        }
+      })();
+    }, CONTEXT_PCT_INTERVAL_MS);
+
+    // Phase 14 Wave 2: aside subsystem — register this WS in the fan-out
+    // registry, run the connect-time re-attach probe, and arm the
+    // extraction poller. All three pieces reuse the pane's existing sshConn
+    // (established above during connectToPane discovery); no new SSH
+    // subsystem, no new port. Per CONTEXT.md § canonical_refs.
+    //
+    // Runs REGARDLESS of activeViewers.get(key).size — each connection
+    // independently discovers overlay presence via capture-pane on mount
+    // (per plan-checker W7 clarification). No "wait for another viewer"
+    // gate.
+    const asideKey = sessionKey(currentHostId, currentTmuxSession);
+    if (!activeViewers.has(asideKey)) activeViewers.set(asideKey, new Set());
+    activeViewers.get(asideKey)!.add(ws);
+
+    // Connect-time re-attach probe (ASIDE-09): one-shot capture-pane on
+    // mount. If the BTW overlay is already open (user closed a prior tab
+    // without dismissing, or her SSH session left a /btw hanging), emit
+    // aside_ready to THIS client so the aside re-renders in-place, and
+    // flip THIS ws's asideState.displayed = true so the overlap-ignore
+    // gate blocks new aside_arms from firing until dismiss.
+    //
+    // Do NOT broadcast to peers on this probe — other tabs either already
+    // have it displayed (their own state carries it) or their own connect-
+    // time probes will fire independently. Broadcasting here would race
+    // against peers' initial state and could double-fire aside_ready.
+    (async () => {
+      // Snapshot sshConn + currentTmuxSession — teardownPane may fire while
+      // this promise is in flight (fast connectToPane rebind), nulling the
+      // closure vars. Snapshot at kick-off preserves the correct target
+      // for this probe attempt.
+      const probeConn = sshConn;
+      const probeSession = currentTmuxSession;
+      if (!probeConn || !probeSession) return;
+      try {
+        const probeOutput = await execCommand(
+          probeConn,
+          `tmux capture-pane -p -S -200 -t ${shellQuote(probeSession)}`,
+        );
+        if (stopped || ws.readyState !== WebSocket.OPEN) return;
+        if (!probeOutput.includes(ASIDE_END_MARKER)) return;
+        const text = extractBtwAnswer(probeOutput, ASIDE_END_MARKER);
+        if (text === null || text === "") return;
+        try {
+          ws.send(JSON.stringify({ type: "aside_ready", text }));
+        } catch {
+          /* ws may be mid-close */
+        }
+        const st = asideState.get(ws);
+        if (st) st.displayed = true;
+        // Set hadMarkerLastCapture so the subsequent poll's marker-
+        // disappearance detection works from mount forward (if user
+        // Escape-closes the overlay via SSH, we want to broadcast dismiss).
+        hadMarkerLastCapture = true;
+      } catch {
+        /* Silent — probe failure is not fatal; a later aside_arm will
+           re-trigger the normal inject + poll cycle. */
+      }
+    })();
+
+    // Extraction poller (ASIDE-04) — one setInterval per WS connection,
+    // gated on `asideState.get(ws)?.armed`. When disarmed, the poll body
+    // early-returns without capturing (idle-cheap; only armed connections
+    // do exec calls). Same setInterval + execCommand + inFlight + silent-
+    // catch posture as the context-pct poller above (per PATTERNS.md
+    // L303-370). Uses scrollback (-S -200) to catch multi-line answers
+    // exceeding the visible pane per CONTEXT.md § Extraction.
+    const asideCaptureCmd =
+      `tmux capture-pane -p -S -200 -t ${shellQuote(currentTmuxSession)}`;
+    asideExtractionTimer = setInterval(() => {
+      if (stopped || ws.readyState !== WebSocket.OPEN) return;
+      if (!sshConn) return;
+      if (asideExtractionInFlight) return; // guard against slow SSH pileups
+      const st = asideState.get(ws);
+      if (!st?.armed) return; // gate — only poll when armed
+      asideExtractionInFlight = true;
+      const connSnapshot = sshConn;
+      execCommand(connSnapshot, asideCaptureCmd)
+        .then((output) => {
+          if (stopped || ws.readyState !== WebSocket.OPEN) return;
+          const markerPresent = output.includes(ASIDE_END_MARKER);
+          sshLogger.info("aside poll diag: poll", {
+            hostId: currentHostId,
+            tmuxSession: currentTmuxSession,
+            len: output.length,
+            markerPresent,
+            hadMarkerLast: hadMarkerLastCapture,
+            lastStableLen: lastStableCapture === null ? null : lastStableCapture.length,
+            tail: output.slice(-60),
+          });
+
+          // Marker-disappearance detection FIRST — cross-tab coherence
+          // when user externally Escapes via SSH, or tmux dies. If we
+          // saw the marker last poll and it's gone now AND this ws has
+          // displayed=true, the overlay closed externally. broadcast
+          // dismiss to all peers (flips this ws AND peers' displayed
+          // flags per the atomic BOTH-STEPS rule) and reset stability.
+          if (
+            hadMarkerLastCapture &&
+            !markerPresent &&
+            asideState.get(ws)?.displayed === true &&
+            currentHostId != null &&
+            currentTmuxSession != null
+          ) {
+            sshLogger.info("aside poll diag: marker-disappeared → dismiss");
+            broadcastAsideDismissed(
+              sessionKey(currentHostId, currentTmuxSession),
+            );
+            lastStableCapture = null;
+            hadMarkerLastCapture = false;
+            return;
+          }
+
+          if (!markerPresent) {
+            // Still streaming, or nothing to see. Update flag; wait.
+            hadMarkerLastCapture = false;
+            return;
+          }
+
+          // markerPresent === true from here on.
+          if (lastStableCapture !== output) {
+            // First capture with the marker, OR a later capture that has
+            // still-changing content (agent finalizing the answer). Store
+            // and wait for stability on the next poll.
+            sshLogger.info("aside poll diag: unstable-or-first", {
+              wasNull: lastStableCapture === null,
+              prevLen: lastStableCapture?.length ?? null,
+              nowLen: output.length,
+            });
+            lastStableCapture = output;
+            hadMarkerLastCapture = true;
+            return;
+          }
+
+          // Stable: same output as last capture, marker present.
+          sshLogger.info("aside poll diag: stable-extracting", {
+            len: output.length,
+            outputTail: output.slice(-400),
+          });
+          const text = extractBtwAnswer(output, ASIDE_END_MARKER);
+          if (text === null) {
+            // Degenerate — marker + no /btw echo. Disarm; swallow.
+            sshLogger.info("aside poll diag: extract-null → disarm");
+            const s = asideState.get(ws);
+            if (s) s.armed = false;
+            lastStableCapture = null;
+            hadMarkerLastCapture = true; // overlay still displayed on pane
+            return;
+          }
+
+          // Still-working guard (user 2026-07-26 UAT, iterating).
+          // The stability check (`lastStableCapture !== output`) alone
+          // false-positives when Claude Code's spinner sits byte-
+          // identical across a 300ms poll window.
+          //
+          // Guard: reject any extract ending in horizontal ellipsis `…`
+          // (U+2026). Every Claude spinner variant is `<glyph> <Verb>…`
+          // — universal suffix regardless of the ~10 dingbat asterisks
+          // Claude cycles through (✻ ✢ ✶ ✳ etc.). Real /btw answers
+          // end with normal punctuation.
+          //
+          // Ruled-out alternatives:
+          //   - `esc to close`: shown in BOTH working and done states.
+          //   - `esc to interrupt`: not present in the compact /btw
+          //      overlay layout in Claude Code v2.1.150+.
+          //   - `f to fork` in raw pane: false-positive from scrollback
+          //      containing prior completed overlays (capture-pane -S -200
+          //      includes 200 lines of scrollback).
+          //
+          // Reset lastStableCapture so the NEXT real-quiescence pair of
+          // polls re-establishes stability on the finished answer.
+          // Do NOT disarm — the /btw is still valid.
+          if (/…\s*$/.test(text)) {
+            sshLogger.info("aside poll diag: still-working → reset stability", {
+              textPreview: text.slice(0, 80),
+            });
+            lastStableCapture = null;
+            hadMarkerLastCapture = true;
+            return;
+          }
+
+          // Emit aside_ready to THIS ws AND every peer in the fan-out
+          // registry. For each recipient (including self), flip
+          // asideState.displayed = true so the overlap-ignore gate
+          // blocks further aside_arm re-injection until dismiss.
+          const frame = JSON.stringify({ type: "aside_ready", text });
+          const key =
+            currentHostId != null && currentTmuxSession != null
+              ? sessionKey(currentHostId, currentTmuxSession)
+              : null;
+          const peers = key ? activeViewers.get(key) : undefined;
+          const recipients = peers ?? new Set<import("ws").WebSocket>([ws]);
+          sshLogger.info("aside poll diag: emit aside_ready", {
+            textLen: text.length,
+            recipients: recipients.size,
+            keyPresent: key !== null,
+            peerRegistryHit: peers !== undefined,
+          });
+          // Fallback single-recipient set covers the pathological case
+          // where the pane's connectToPane hadn't yet registered this ws
+          // in activeViewers (shouldn't happen — registration is
+          // synchronous above the poller — but defensive).
+          for (const recipient of recipients) {
+            if (recipient.readyState !== WebSocket.OPEN) continue;
+            try {
+              recipient.send(frame);
+            } catch {
+              /* recipient may be mid-close */
+            }
+            const recState = asideState.get(recipient);
+            if (recState) recState.displayed = true;
+          }
+
+          // Disarm THIS ws only — peers arm/disarm on their own
+          // aside_arm messages independently.
+          const s = asideState.get(ws);
+          if (s) s.armed = false;
+          lastStableCapture = null;
+          // hadMarkerLastCapture stays true — the overlay IS still
+          // displayed on the pane; marker-disappearance detection
+          // above needs this to fire when user externally Escapes.
+          hadMarkerLastCapture = true;
+        })
+        .catch(() => {
+          /* Silent on scrape failure — matches the context-pct poller
+             posture. A miss on one tick is fine; next tick tries again. */
+        })
+        .finally(() => {
+          asideExtractionInFlight = false;
+        });
+    }, ASIDE_POLL_INTERVAL_MS);
+
+    // Harness-tasks poller: read Claude Code's on-disk task queue (populated
+    // by TaskCreate + /queue) and emit it to the client on change. Storage
+    // layout: ~/.claude/tasks/<sessionId>/<n>.json — one JSON file per task
+    // numbered from 1. sessionId is the JSONL basename we already have from
+    // the discovery result. Each task is
+    //   { id, subject, description?, activeForm?, status, blocks[], blockedBy[] }
+    // with status in {pending, in_progress, completed, ...}. Files are
+    // pretty-printed multi-line JSON; we collapse each to one line with
+    // `tr '\n' ' '` on the remote (valid JSON is whitespace-insensitive,
+    // and escaped `\n` inside string literals is TWO bytes `\` + `n` so
+    // tr on real LF only touches formatter whitespace, not string data).
+    //
+    // Live update: 3s polling on the same SSH connection as the tail (ssh2
+    // multiplexes channels — concurrent execs are fine). On payload change
+    // vs last-emitted, emit a fresh `{type:"harness_tasks", tasks}` frame;
+    // when unchanged, skip the emit to avoid pushing identical arrays every
+    // tick. The client filters completed tasks for display and hides the
+    // panel entirely when no active tasks remain.
+    //
+    // BLOCKER fix (plan-checker 2026-07-18): setup is now via the module-
+    // scoped `setupHarnessTasksPoller` helper so `transitionToActiveNew`
+    // can rebind against the fresh session's UUID after a file change. Pre-
+    // Phase-3, the poller was baked into a local `const tasksCmd` at
+    // connect time and stayed pointed at the DEAD session's UUID forever
+    // after a file change. `sessionIdFromFile` is set just above in the initial
+    // session-file assignment block.
+    setupHarnessTasksPoller(sessionIdFromFile!);
+
+    // Phase 3: discovery-repoll. Runs the SAME full
+    // `discoverClaudeSession` call the initial connectToPane branch used,
+    // once per tick, on the same SSH connection. On change:
+    //   - active + new file  → transitionToHolding("discovery_diff") then
+    //                          transitionToActiveNew(newFile) same tick
+    //                          (crash-relaunch / fresh launch)
+    //   - holding + new file → transitionToActiveNew(newFile)
+    //   - holding + no file  → increment holdingTicks; if >= timeout, dead
+    //   - active + inactive  → transitionToHolding (defensive — treated as
+    //                          recover-pending; may resolve as file appears
+    //                          in a future tick or as dead on timeout)
+    //
+    // Full discovery each tick (not a cached `ls -t $projects_dir/*.jsonl`)
+    // is LOAD-BEARING per Nelly's recover-in-different-cwd case (2026-07-15):
+    // the same session id can move projects subdirs, so the projects dir
+    // may not be the same one we started from. `discoverClaudeSession`
+    // walks pane→pid→cwd→slug fresh each tick and correctly follows the
+    // move. See CONTEXT.md D-30 and CHANGEOVER-05.
+    //
+    // quick 260813-0qx: timer setup extracted to the connection-scoped
+    // startDiscoveryRepollTimer helper (~L2600) so the attach-path
+    // launch-window branch can start the same timer without duplicating the
+    // body. Behavior byte-preserved for this steady-state site.
+    startDiscoveryRepollTimer(activeTmuxSession);
+
+    // The socket can close (tab closed / reload) while this flow is awaiting
+    // above; cleanup nulls sshConn. Opening a tail on null threw inside this
+    // un-awaited async flow → unhandled rejection → process exit.
+    if (stopped || !sshConn) {
+      sshLogger.info("Active session flow aborted before tail open — connection closed", {
+        operation: "claude_session_active_flow_aborted",
+        stopped,
+        hasSshConn: !!sshConn,
+        tmuxSession: activeTmuxSession,
+        hostId: activeHostId,
+      });
+      return;
+    }
+    // Phase 101 D-03: acquire long-lived slot before opening the tail.
+    // Released on stop() or onError — both paths are idempotent (D-06-adjacent).
+    if (keepingTail && tailHandle) {
+      // The dormant-branch tail never got a lifecycle id; give the kept,
+      // now long-lived tail one so its later stop line pairs with this one.
+      if (!tailInstanceId) tailInstanceId = randomBytes(4).toString("hex");
+      sshLogger.info(
+        `[tail-lifecycle] tail=${tailInstanceId} action=keep sessionFile=${sessionFile} reason=${startReason ?? "initial"}`,
+        {
+          operation: "claude_session_tail_lifecycle",
+          tailInstanceId,
+          action: "keep",
+          sessionFile,
+          reason: startReason ?? "initial",
+          sessionId,
+          hostId: activeHostId,
+          tmuxSession: activeTmuxSession,
+        },
+      );
+      return;
+    }
+    const tailSlot2 = acquireTailSlot(currentHostId!);
+    cancelTracker = newCancelTracker(); // the new tail replays its window
+    tailHandle = openSessionTail(
+      sshConn,
+      sessionFile,
+      (err) => { tailSlot2.release(); onError(err); },
+    );
+    const origStop2 = tailHandle.stop;
+    tailHandle.stop = () => { tailSlot2.release(); origStop2.call(tailHandle); };
+    }; // end of startActiveSessionFlow
+
+    // Archived conversation view: `connectToPane` with `archived: true` opens
+    // an archived agent's history read-only. The server decides where the
+    // agent is (live / archived / gone) from its name; the history comes
+    // from the agent's own history folder (same lookup as a sleeping
+    // agent). No pollers, no wake, no input: currentTmuxSession stays null,
+    // so every input / stop / wake frame is dropped by the entry guards.
+    if ((msg as { archived?: unknown }).archived === true) {
+      let folderState: IdentityFolderState;
+      try {
+        folderState = await probeIdentityFolderState((c) => execCommand(conn, c), tmuxSession);
+      } catch (err) {
+        if (stopped || sshConn !== conn) return;
+        try { ws.send(JSON.stringify({ type: "error", message: "Couldn't check the archive: " + (err instanceof Error ? err.message : String(err)) })); } catch { /* mid-close */ }
+        teardownPane();
+        return;
+      }
+      // The socket closed or moved to another pane while we waited.
+      if (stopped || sshConn !== conn) return;
+      sshLogger.info("Archived conversation open", {
+        operation: "claude_session_archived_open",
+        userId,
+        sessionId,
+        hostId,
+        identityKey: tmuxSession,
+        folderState,
+      });
+      let look: ArchivedIdentityLook | null = null;
+      if (folderState === "archived") {
+        try {
+          look = await readArchivedIdentityLook(conn, hostId, tmuxSession);
+        } catch (err) {
+          sshLogger.warn("Archived conversation look unreadable", {
+            operation: "claude_session_archived_look_failed",
+            hostId,
+            identityKey: tmuxSession,
+            err: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+      if (stopped || sshConn !== conn) return;
+      try { ws.send(JSON.stringify({ type: "archived_state", state: folderState, ...(look ? { look } : {}) })); } catch { /* mid-close */ }
+      if (folderState !== "archived") {
+        // live → the client turns the tab into the live conversation;
+        // gone → it says so. Either way nothing is served here.
+        teardownPane();
+        return;
+      }
+      if (stopped || sshConn !== conn) return;
+      currentHostId = hostId;
+      let openedTail: { stop: () => void } | null = null;
+      const archivedTailSlot = acquireTailSlot(hostId);
+      await __applyDormantBranchTailOpenForTests(
+        {
+          conn,
+          sshConn: conn,
+          tmuxSession,
+          discoverIdentitySessionFile,
+          tailSessionFile: (c, file, _line, errCb) => {
+            cancelTracker = newCancelTracker();
+            const handle = openSessionTail(c as import("ssh2").Client, file, (err) => {
+              archivedTailSlot.release();
+              errCb(err);
+            });
+            const origStop = handle.stop;
+            handle.stop = () => { archivedTailSlot.release(); origStop.call(handle); };
+            return handle;
+          },
+          onLine: onLineTracked,
+          onError,
+          wsSend: (data) => {
+            try { ws.send(data); } catch (err) { databaseLogger.warn(`[ws-server] send-failed err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+          },
+          logger: {
+            info: (m, meta) => sshLogger.info(m, { userId, sessionId, hostId, identityKey: tmuxSession, archived: true, ...meta }),
+            warn: (m, meta) => sshLogger.warn(m, { userId, sessionId, hostId, identityKey: tmuxSession, archived: true, ...meta }),
+          },
+          probeTotalLines: async (sessionFile) => (await readSessionFileRange(conn, sessionFile, 1, 1)).totalLines,
+        },
+        {
+          setTailHandle: (h) => {
+            openedTail = h;
+            if (!stopped && sshConn === conn) tailHandle = h;
+          },
+          setDormantSessionFile: (f) => {
+            if (!stopped && sshConn === conn) dormantSessionFile = f;
+          },
+        },
+      );
+      if (stopped || sshConn !== conn) {
+        // Torn down while opening: don't leave this pane's tail running.
+        (openedTail as { stop: () => void } | null)?.stop();
+        if (!openedTail) archivedTailSlot.release();
+        return;
+      }
+      if (!tailHandle) {
+        archivedTailSlot.release();
+        // No history kept for this agent: say so, keep nothing open.
+        try { ws.send(JSON.stringify({ type: "archived_state", state: "archived", noHistory: true })); } catch { /* mid-close */ }
+        try { conn.end(); } catch { /* already closed */ }
+        sshConn = null;
+      }
+      return;
+    }
+
+    // Phase 55 Plan 03: cache-hit / batched-fresh shim.
+    //
+    // sshConn is already established above (connectOneShot at ~L5962) — the
+    // SSH connection is needed for startActiveSessionFlow (readSessionFileRange
+    // probe + tail) regardless of which discovery path fires. RESEARCH § Pitfall 5.
+    //
+    // Cache-hit path: readSessionFileCache returns a non-null entry → call
+    //   startActiveSessionFlow directly with cached { pid, sessionFile } and
+    //   return. The aside subsystem (fan-out registration, connect-time probe,
+    //   extraction poller, harness-tasks poller, discovery-repoll timer, tail
+    //   start) is ALL inside startActiveSessionFlow (verified: L7192-7198 in
+    //   the comment block that precedes startActiveSessionFlow's call site
+    //   below). The `return;` here skips only the inactive-branch handling and
+    //   the redundant L7199 startActiveSessionFlow call — NOT the aside block.
+    //
+    // Cache-miss path: discoverClaudeSessionBatched fires (2 round-trips vs 4
+    //   serial today). Falls through to existing inactive/active branches below.
+    //
+    // Dormant-poll seam at ~L6879 (`discoverSession: (c,s) => discoverClaudeSession(...)`)
+    //   is intentionally NOT changed — dormant polling has different concurrency
+    //   semantics (ticker under dormantPollInFlight guard, 3s cadence). Batched
+    //   is used ONLY on cold attach (this shim).
+    const discoveryT0 = Date.now();
+    const cached = readSessionFileCache(hostId, tmuxSession);
+    if (cached !== null) {
+      // Liveness-check the cached PID via /proc/<pid> existence on the target
+      // host before trusting the cache entry. Regression window: Phase 55
+      // (2026-08-23, cache-hit shim) + bdb2d664 (2026-09-07, ws.close 1011 on
+      // server-driven tmux teardown → client reconnect fires) combined to
+      // route dormant-identity reconnects through this branch with a stale
+      // {sessionFile, pid} that pins the tail to the LAST-alive JSONL. If the
+      // PID is dead, fall through to discoverClaudeSessionBatched so the
+      // not_claude branch enters dormant mode and picks the latest identity
+      // JSONL via discoverIdentitySessionFile.
+      //
+      // /proc/<pid> beats `kill -0` here: no signal-permission dependency and
+      // works uniformly whether the cached process was owned by ssh-user or
+      // another user. Fail-open on SSH throw preserves pre-fix behavior on
+      // flaky transport (mirrors 6c137306's transport-vs-dead pattern).
+      let cachedPidAlive = true;
+      try {
+        const livenessOut = await execCommand(
+          conn,
+          `test -d /proc/${cached.pid} && echo alive || echo dead`,
+        );
+        cachedPidAlive = livenessOut.trim() === "alive";
+      } catch {
+        // transport error → fail open (keep pre-fix behavior)
+      }
+      if (cachedPidAlive) {
+        sshLogger.info("Claude session discovery path", {
+          operation: "claude_session_discovery_path",
+          userId,
+          sessionId,
+          hostId,
+          tmuxSession,
+          path: "shared-hit",
+          durationMs: Date.now() - discoveryT0,
+        });
+        startActiveSessionFlow({ pid: cached.pid, sessionFile: cached.sessionFile, tmuxSession, hostId });
+        return;
+      }
+      sshLogger.info("Claude session discovery path", {
+        operation: "claude_session_discovery_path",
+        userId,
+        sessionId,
+        hostId,
+        tmuxSession,
+        path: "shared-stale-pid-dead-fallthrough",
+        cachedPid: cached.pid,
+        cachedSessionFile: cached.sessionFile,
+        durationMs: Date.now() - discoveryT0,
+      });
+      // fall through to discoverClaudeSessionBatched
+    }
+
+    // Cache miss — batched fresh discovery (2 round-trips instead of 4 serial)
+    const result = await discoverClaudeSessionBatched(conn, tmuxSession);
+    sshLogger.info("Claude session discovery path", {
+      operation: "claude_session_discovery_path",
+      userId,
+      sessionId,
+      hostId,
+      tmuxSession,
+      path: "batched-fresh",
+      durationMs: Date.now() - discoveryT0,
+    });
+    // Preserve the pre-existing discovery-outcome log (RESEARCH § "Note" —
+    // the path log is ADDITIONAL to this one, not a replacement).
+    sshLogger.info("Claude session discovery result", {
+      operation: "claude_session_discovery",
+      userId,
+      sessionId,
+      hostId,
+      tmuxSession,
+      status: result.status,
+    });
+
+    if (result.status === "inactive") {
+      // quick 260808-dmz — dormancy probe BEFORE teardown.
+      // FIX §1-2: if this is an identity-shaped pane AND the .dormant sentinel
+      // exists, enter the dormant state instead of tearing down SSH. The probe is
+      // inline+await so the branch decision (teardown vs. keep-alive) is synchronous.
+      // Fail-safe: any SSH throw here falls through to the normal teardown path
+      // (do not hold an SSH conn open on error).
+      //
+      // Phase 32 (identity-first-turn session-discovery-wake-bubble-message-hi):
+      // on the DORMANT branch (identity-shape probe = yes AND .dormant present),
+      // we ALSO call discoverIdentitySessionFile(conn, tmuxSession) and — when
+      // the helper returns a non-null absolute path — open a tail on that file
+      // through the SAME onLine/onError closures the active flow uses. That
+      // wires the wake-bubble's historical message list into the existing
+      // appendDedup + eventId pipeline (D-08 latency parity — no new lambdas,
+      // no new frame types). Null-return preserves today's dormant-branch
+      // behavior byte-for-byte (D-05 fallback). This is a DIFFERENT contract
+      // from the L145-150 FALLBACK-01 rule — FALLBACK-01 governs the ACTIVE-
+      // path `inactive` handling ("never reach back to a prior session
+      // file"); this branch is dormant + identity-attributed, where the
+      // "identity's own JSONL" IS the intended source of truth. D-09 keeps
+      // the active-flow discovery at L~4634 UNCHANGED — the helper is called
+      // from this one dormant site only.
+      let enteredDormantPoll = false;
+      if (isDormancyCandidateReason(result.reason)) {
+        // Only probe for dormancy when no claude process is running (see
+        // isDormancyCandidateReason); exec_error / no_pid_session_file / etc.
+        // are not dormancy candidates — treat them as plain inactive.
+        try {
+          const escapedName = tmuxSession; // validated to safe subset by frontend
+          // Tier 1: is this an identity-shaped pane? (reuse exact command from seam line 946-950)
+          const identityProbeOut = await execCommand(
+            conn,
+            `test -d ~/fleet/identities/'${escapedName}' && echo yes || echo no`,
+          );
+          const isIdentityShape = identityProbeOut.trim() === "yes";
+          // Cache for the connection lifetime so dormant-poll and wake handler use it.
+          isIdentityShapedCached = isIdentityShape;
+          if (isIdentityShape) {
+            // Tier 2: .dormant sentinel present? (reuse exact command from seam line 956-961)
+            const dormantProbeOut = await execCommand(
+              conn,
+              `stat ~/fleet/identities/'${escapedName}'/.dormant 2>/dev/null >/dev/null && echo yes || echo no`,
+            );
+            if (dormantProbeOut.trim() === "yes") {
+              // This IS a dormant pane. Seed closure state so wake handler +
+              // dormant-poll can operate, then emit dormant:true and start poll.
+              currentHostId = hostId;
+              currentTmuxSession = tmuxSession;
+              dormantLastEmitted = true;
+              sshLogger.info("Claude session dormant state entered", {
+                operation: "claude_session_dormant_entered",
+                userId,
+                sessionId,
+                hostId,
+                tmuxSession,
+              });
+              try {
+                // Phase 56 Plan 01: wakingSince no longer emitted — the
+                // frontend no longer reconstructs waking state (DormancyOverlay
+                // deleted in Plan 03). Backend keeps wakeTriggerTs internally
+                // for the marker-freshness gate at __applyDormantPollWith
+                // RediscoveryForTests L2604-2626 (unchanged).
+                ws.send(JSON.stringify({ type: "dormant", dormant: true }));
+              } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=dormant err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+              // Phase 30 Plan 30-01 (PS30-07): initial-discovery-dormant path
+              // establishes attach-time pane_state alongside the legacy dormant
+              // frame. wakingSince stays on the legacy frame only — pane_state's
+              // reason enum is qualitative, not timestamp-carrying (T-30-01).
+              paneStateEmitter.emit("dormant");
+              // FIX §3: Start the lightweight dormant-poll loop (3s cadence).
+              // The loop polls the sentinel; on disappearance re-runs discovery;
+              // on active → transitions to active flow via startActiveSessionFlow.
+              // dormantPollInFlight guards against slow-SSH pileups.
+              dormantPollTimer = setInterval(() => {
+                if (stopped || ws.readyState !== WebSocket.OPEN || !sshConn || dormantPollInFlight || dormantTailOpening) return;
+                dormantPollInFlight = true;
+                // Phase 30 Plan 30-01: capture dormantLastEmitted BEFORE the
+                // seam runs so we can detect a change post-return and funnel
+                // it through paneStateEmitter WITHOUT injecting the emitter
+                // into the pure __applyDormantPollWithRediscoveryForTests
+                // seam (that would break the test-seam contract). The
+                // startActiveFlow callback below routes through
+                // startActiveSessionFlow which fires paneStateEmitter.emit
+                // ("active") on its own; here we cover the dormant:true and
+                // dormant:false wire emits the seam does directly.
+                const dormantEmittedBefore = dormantLastEmitted;
+                (async () => {
+                  try {
+                    await __applyDormantPollWithRediscoveryForTests(
+                      {
+                        connSnapshot: sshConn!,
+                        escapedName: currentTmuxSession!,
+                        // Phase 90 Plan 00 (Wave 0, D-10 delivery mechanism):
+                        // pass currentHostId so the dormant-branch context_pct
+                        // emit ALSO dual-writes into the fleet-status shared
+                        // map alongside the existing WS emission. When
+                        // currentHostId is null (defensive — should never be
+                        // in this context; connectToPane has resolved it),
+                        // pass undefined and the seam skips the dual-write
+                        // silently.
+                        hostId: currentHostId ?? undefined,
+                        execCommand,
+                        discoverSession: (c, s) => discoverClaudeSession(c as import("ssh2").Client, s, { knownHistoryFile: dormantSessionFile }),
+                        wsSend: (data: string) => {
+                          try { ws.send(data); } catch (err) { databaseLogger.warn(`[ws-server] send-failed err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+                        },
+                        startActiveFlow: (pid, sessionFile) => {
+                          // Transition from dormant-poll to active flow.
+                          // Clear dormant-poll timer — contextPctTimer takes over from here.
+                          if (dormantPollTimer) { clearInterval(dormantPollTimer); dormantPollTimer = null; }
+                          // Phase 32 Wave 2 (T-32-04, D-08): SAFE-CLOSE ORDERING.
+                          //
+                          // If a dormant tail was opened by the dormant-branch
+                          // wire-in above (Task 1 / __applyDormantBranchTailOpen
+                          // ForTests), stop + null it BEFORE
+                          // startActiveSessionFlow reassigns tailHandle via
+                          // `tailHandle = tailSessionFile(sshConn!, sessionFile,
+                          // onLine, onError)` at L~4634. Otherwise two tails on
+                          // different files briefly overlap: the dormant file's
+                          // tail's `s.on("data")` callback continues to fire
+                          // lines from the PRIOR file into the SAME `onLine`
+                          // closure, interleaving with the NEW active-file
+                          // tail's replay lines — producing either duplicate
+                          // eventId emissions (distinct eventIds for the same
+                          // logical position across two files) or out-of-order
+                          // emissions (dormant-file buffered lines arriving
+                          // AFTER the active file's initial replay begins).
+                          //
+                          // session-file-tail.ts:54-78's synchronous `stopped`
+                          // closure flag makes the stop() call itself immediate
+                          // — any subsequent s.on("data") callback early-
+                          // returns and never invokes onLine — so this
+                          // ordering is safe even if the underlying SSH
+                          // channel close is async (channel teardown is idem
+                          // potent-with-stopped-flag). See CASE-DT4 + DT5 in
+                          // claude-session-server.dormant-tail.test.ts.
+                          //
+                          // Since Condense, waking appends to the SAME history
+                          // file the dormant tail is already streaming — then
+                          // keep that tail instead of replaying from line 1.
+                          const keepExistingTail = tailHandle !== null && sessionFile === dormantSessionFile;
+                          if (tailHandle && !keepExistingTail) {
+                            tailHandle.stop();
+                            tailHandle = null;
+                            sshLogger.info(
+                              "Dormant tail stopped for wake handoff",
+                              {
+                                operation:
+                                  "claude_session_dormant_tail_stopped_for_wake",
+                                userId,
+                                sessionId,
+                                hostId: currentHostId,
+                                tmuxSession: currentTmuxSession,
+                              },
+                            );
+                            // Phase 62 Wave 2 (D-62-04) — paired stop log for
+                            // the dormant-handoff tail-swap. The OLD ID is
+                            // emitted here; the NEW ID is generated inside the
+                            // upcoming startActiveSessionFlow call (with
+                            // startReason: "dormant-handoff"). Do NOT reset
+                            // tailInstanceId to "" — leaving the old value
+                            // visible here then the new value visible in the
+                            // next action=start log is exactly the tail-swap
+                            // trace the diagnostic needs.
+                            sshLogger.info(
+                              `[tail-lifecycle] tail=${tailInstanceId} action=stop sessionFile=${currentSessionFile ?? "<unknown>"} reason=dormant-handoff`,
+                              {
+                                operation: "claude_session_tail_lifecycle",
+                                tailInstanceId,
+                                action: "stop",
+                                sessionFile: currentSessionFile ?? null,
+                                reason: "dormant-handoff",
+                              },
+                            );
+                          }
+                          // Belt-and-suspenders: clear wakeTriggerTs so a subsequent
+                          // dormancy+wake cycle on this same WS doesn't see a stale ts.
+                          wakeTriggerTs = null;
+                          startActiveSessionFlow({ pid, sessionFile, tmuxSession: currentTmuxSession!, hostId: currentHostId!, startReason: "dormant-handoff", keepExistingTail });
+                          // Aside subsystem registration for the wake path.
+                          // Dormant panes had no active aside connection — register now.
+                          if (currentHostId != null && currentTmuxSession != null) {
+                            const wakeAsideKey = sessionKey(currentHostId, currentTmuxSession);
+                            if (!activeViewers.has(wakeAsideKey)) activeViewers.set(wakeAsideKey, new Set());
+                            activeViewers.get(wakeAsideKey)!.add(ws);
+                          }
+                        },
+                        // quick 260808-fgf: cat .resume-complete; returns trimmed body or null.
+                        markerCommand: async (conn: unknown, name: string): Promise<string | null> => {
+                          try {
+                            const out = await execCommand(
+                              conn as import("ssh2").Client,
+                              `cat ~/fleet/identities/'${name}'/.resume-complete 2>/dev/null || echo`,
+                            );
+                            const trimmed = out.trim();
+                            return trimmed.length > 0 ? trimmed : null;
+                          } catch {
+                            return null;
+                          }
+                        },
+                        // Injectable clock — Date.now in production, deterministic in tests.
+                        now: () => Date.now(),
+                        // Dormant-branch context-pct plumbing (piggyback on this tick).
+                        readJsonlPct: readContextPctFromJsonl,
+                        dormantSessionFile: () => dormantSessionFile,
+                        onArchived: () => {
+                          if (dormantPollTimer) { clearInterval(dormantPollTimer); dormantPollTimer = null; }
+                        },
+                      },
+                      {
+                        dormantLastEmitted: () => dormantLastEmitted,
+                        setDormantLastEmitted: (v) => { dormantLastEmitted = v; },
+                        wakeTriggerTs: () => wakeTriggerTs,
+                      },
+                    );
+                    // Phase 30 Plan 30-01: if the seam flipped
+                    // dormantLastEmitted, mirror the change onto pane_state.
+                    // - false→true (sentinel re-appeared during poll):
+                    //     emit("dormant")
+                    // - true→false (sentinel disappeared; freshness check
+                    //   passed; re-discovery about to run):
+                    //     emit("active", "dormancy_cleared")
+                    // The startActiveFlow callback above ALSO fires
+                    // paneStateEmitter.emit("active") through
+                    // startActiveSessionFlow if re-discovery reports active.
+                    // The emitter's dedupe on identical (state, reason)
+                    // safely collapses the resulting back-to-back
+                    // ("active","dormancy_cleared") → ("active") pair to two
+                    // distinct wire frames (different reason), which is the
+                    // correct behavior — the first tells the client "we've
+                    // exited dormancy" and the second establishes the fresh
+                    // active session's attach-time pane_state.
+                    if (
+                      dormantLastEmitted !== dormantEmittedBefore &&
+                      dormantLastEmitted !== null
+                    ) {
+                      if (dormantLastEmitted === true) {
+                        paneStateEmitter.emit("dormant");
+                      } else {
+                        paneStateEmitter.emit("active", "dormancy_cleared");
+                      }
+                    }
+                  } finally {
+                    dormantPollInFlight = false;
+                  }
+                })();
+              }, 3000);
+              // Phase 32 Wave 2: open a dormant tail on the identity's most-
+              // recently active JSONL so the wake-bubble is backed by the
+              // historical conversation the user is deciding whether to
+              // wake. Uses the SAME closure-scoped `tailHandle` variable
+              // (L1279) as the active flow so:
+              //   1. WS-close cleanup via teardownPane() → tailHandle.stop()
+              //      at L1557-1564 works unchanged (no new ws.on("close")
+              //      code needed — this is by construction — see T-32-06).
+              //   2. Wake-handoff safe-close ordering (Task 2 Part A) can
+              //      call `if (tailHandle) { tailHandle.stop(); tailHandle
+              //      = null; }` BEFORE startActiveSessionFlow reassigns
+              //      tailHandle at L~4634 (prevents dormant+active tail
+              //      overlap — see T-32-04 + D-08).
+              //
+              // D-01: byte-pattern match delegated entirely to the helper
+              //   (which uses `line.includes` on the identity's first
+              //   `/id <name>` user turn — no JSON.parse).
+              // D-05: on null return the dormant branch is byte-identical
+              //   to today (dormant frame sent, no tail opened, no
+              //   messages). Never throws.
+              // D-08: SAME `onLine` closure (L1601) and SAME `onError`
+              //   closure (L2102) as the active flow — the dormant tail's
+              //   line-emission path IS the active-flow line-emission
+              //   path. No new lambdas, no wrapping.
+              // D-09: active-flow discovery at L~4634 UNTOUCHED — this is
+              //   the ONE production call site for the helper.
+              //
+              // T-32-05 (info disclosure): the discovered-file log payload
+              // carries `discoveredFileBasename` (the JSONL's UUID, e.g.
+              // `abc-123.jsonl`) — NOT the absolute path (which would
+              // leak the encoded project-dir path segment). The
+              // no-match log carries no path payload at all.
+              //
+              // Delegate to __applyDormantBranchTailOpenForTests — the
+              // seam is the SINGLE production implementation entry point
+              // for the discovery + tail-open + logging sequence (matches
+              // D-09's "one call site" invariant). The seam handles the
+              // null-return fallback + helper-throw fallback internally;
+              // see its docblock (~L1200) for the full contract. Log
+              // context (userId, sessionId, hostId, tmuxSession) is
+              // enriched here at the production boundary so the seam
+              // itself stays free of connection-scoped state.
+              // Phase 101 D-03: wrap deps.tailSessionFile so the dormant tail
+              // holds a long-lived semaphore slot for its full lifetime.
+              // Slot released on handle.stop() or onError — idempotent (D-06-adjacent).
+              const dormantTailSlot = acquireTailSlot(hostId);
+              dormantTailOpening = true;
+              try {
+              await __applyDormantBranchTailOpenForTests(
+                {
+                  conn,
+                  sshConn: sshConn!,
+                  tmuxSession,
+                  discoverIdentitySessionFile,
+                  tailSessionFile: (c, file, _line, errCb) => {
+                    cancelTracker = newCancelTracker(); // the new tail replays its window
+                    const handle = openSessionTail(c as import("ssh2").Client, file, (err) => {
+                      dormantTailSlot.release();
+                      errCb(err);
+                    });
+                    const origDormantStop = handle.stop;
+                    handle.stop = () => { dormantTailSlot.release(); origDormantStop.call(handle); };
+                    return handle;
+                  },
+                  onLine: onLineTracked,
+                  onError,
+                  wsSend: (data) => {
+                    try {
+                      ws.send(data);
+                    } catch (err) {
+                      databaseLogger.warn(
+                        `[ws-server] send-failed err="${err instanceof Error ? err.message : String(err)}"`,
+                        { operation: "ws_send_failed" },
+                      );
+                    }
+                  },
+                  logger: {
+                    info: (msg, meta) =>
+                      sshLogger.info(msg, {
+                        userId,
+                        sessionId,
+                        hostId,
+                        tmuxSession,
+                        ...meta,
+                      }),
+                    warn: (msg, meta) =>
+                      sshLogger.warn(msg, {
+                        userId,
+                        sessionId,
+                        hostId,
+                        tmuxSession,
+                        ...meta,
+                      }),
+                  },
+                  // Load-more visibility gate for dormant panes — see the
+                  // probeTotalLines JSDoc on __DormantBranchTailOpenDepsForTests
+                  // and the emit block inside the seam. count=1 is the cheapest
+                  // possible SSH probe (mirrors startActiveSessionFlow's
+                  // connect-time probe at L~6104).
+                  probeTotalLines: async (sessionFile) => {
+                    const result = await readSessionFileRange(
+                      sshConn!,
+                      sessionFile,
+                      1,
+                      1,
+                    );
+                    return result.totalLines;
+                  },
+                },
+                {
+                  setTailHandle: (h) => {
+                    tailHandle = h;
+                  },
+                  setDormantSessionFile: (f) => {
+                    dormantSessionFile = f;
+                  },
+                },
+              );
+              } finally {
+                dormantTailOpening = false;
+              }
+              enteredDormantPoll = true;
+            }
+          }
+        } catch {
+          // SSH throw during probe — fall through to normal teardown (fail-safe).
+          isIdentityShapedCached = false;
+        }
+      }
+      if (enteredDormantPoll) {
+        // SSH stays alive; dormant-poll loop is running. Return WITHOUT teardown.
+        return;
+      }
+
+      // quick 260813-0qx — attach-path launch-window branch.
+      //
+      // If discoverClaudeSession returned inactive with a reason that signals we
+      // are inside a launch window on THIS pane (crash-relaunch, fresh spawn,
+      // dormant wake: claude is starting but has no session file yet) — rather
+      // than a terminal "no claude here" verdict — enter holding + start the
+      // discovery-repoll timer instead of falling through to FALLBACK-01. The
+      // repoll timer's existing branches (see startDiscoveryRepollTimer /
+      // __applyRepollResultForTests) then own the recovery path: active with a
+      // new session file -> transitionToActiveNew; HOLDING_TIMEOUT_TICKS
+      // elapsed with no recovery -> transitionToDead('holding_timeout') which
+      // emits the terminal inactive frame FALLBACK-01 would have sent
+      // immediately.
+      //
+      // Launch-window reasons (classified via __classifyAttachInactiveForTests
+      // — the SINGLE SOURCE OF TRUTH shared with the test suite so the
+      // production branch and the classifier tests never drift):
+      //   * no_pid_session_file  — claude process exists but hasn't written a
+      //                            fresh PID file yet
+      //   * no_open_session_file — PID file found but new JSONL not yet open
+      //   * not_claude AND identity-shape pane WITHOUT .dormant sentinel — the
+      //                            identity pane is mid-relaunch (claude process
+      //                            gone briefly), not a bare shell. Piggybacks
+      //                            on isIdentityShapedCached set inside the
+      //                            dormant-identity probe block above; we do
+      //                            NOT re-run the SSH probe.
+      //
+      //   * no_tmux_session AND identity-shape pane WITHOUT .dormant — the
+      //                            agent has no session yet (always-on agent
+      //                            just un-archived, or woken before the
+      //                            supervisor made its session).
+      //
+      // Terminal reasons (exec_error, and not_claude / no_tmux_session on a
+      // non-identity pane) fall through unchanged to FALLBACK-01 below.
+      //
+      // WIRING CHOICE — reuse transitionToHolding("discovery_diff"): at attach
+      // time changeoverState === "active" (module default at L1690), so the
+      // helper's `if (changeoverState !== "active") return;` guard passes and
+      // it flips state to "holding", resets holdingTicks = 0, sends {type:"session_holding"} on the WS,
+      // fires paneStateEmitter.emit("holding", "discovery_diff"), and logs
+      // "claude_session_holding". currentSessionFile is null at this point
+      // (no baseline yet — the attach-time active path hadn't run) — the
+      // helper's log payload records that as `oldSessionFile: null`, which is
+      // the correct semantics: there IS no old file. Below we seed
+      // currentHostId / currentTmuxSession so the log payload references the
+      // right pane, then add an extra launch-window-specific log line and start
+      // the discovery-repoll timer via the shared helper.
+      if (
+        __classifyAttachInactiveForTests(result, isIdentityShapedCached) ===
+        "launch_window"
+      ) {
+        currentHostId = hostId;
+        currentTmuxSession = tmuxSession;
+        transitionToHolding("discovery_diff");
+        sshLogger.info(
+          "Claude session entering attach-path launch-window holding",
+          {
+            operation: "claude_session_holding_attach_launch_window",
+            reason: result.reason,
+            identityShape: isIdentityShapedCached,
+            userId,
+            sessionId,
+            hostId,
+            tmuxSession,
+          },
+        );
+        // Start the discovery-repoll timer via the shared helper (Option A).
+        // Same helper startActiveSessionFlow uses — the ticker's reducer
+        // branches (see __applyRepollResultForTests at ~L920) own the
+        // recovery path: active-with-new-file → transitionToActiveNew;
+        // HOLDING_TIMEOUT_TICKS elapsed → transitionToDead('holding_timeout').
+        // currentSessionFile stays null so the first tick that finds a real
+        // file trips the sessionFile !== currentSessionFile branch and fires
+        // transitionToActiveNew (correct recovery).
+        startDiscoveryRepollTimer(tmuxSession);
+        // SSH stays alive; repoll timer is running. Return WITHOUT teardown
+        // (mirrors the enteredDormantPoll early-return above).
+        return;
+      }
+
+      // FALLBACK-01: emit one inactive frame and STOP. Do not open a tail,
+      // do not fall through to any prior session file. The `never reach
+      // back` rule is enforced structurally — there is no branch below
+      // that could start a tail from an inactive result.
+      // An agent archived while its conversation is open: tell the tab, so
+      // every open copy closes (archiving always closes all copies). Only
+      // probed on the no-agent path, and only for agent-shaped names whose
+      // live folder is gone.
+      if ((result.reason === "not_claude" || result.reason === "no_tmux_session") && !isIdentityShapedCached) {
+        try {
+          if ((await probeIdentityFolderState((c) => execCommand(conn, c), tmuxSession)) === "archived") {
+            sshLogger.info("Open conversation's agent is archived", {
+              operation: "claude_session_agent_archived",
+              userId,
+              sessionId,
+              hostId,
+              tmuxSession,
+            });
+            ws.send(JSON.stringify({ type: "archived_state", state: "archived" }));
+          }
+        } catch {
+          // couldn't look — fall through to the plain inactive frame
+        }
+      }
+      ws.send(
+        JSON.stringify({ type: "inactive", reason: result.reason }),
+      );
+      // Phase 30 Plan 30-01 (PS30-07): initial-discovery-inactive path
+      // establishes attach-time pane_state before the WS drops back to
+      // "waiting for the next connectToPane". Reason forwards the
+      // discovery result verbatim — same string set that already reached
+      // the wire via the legacy inactive frame pre-Phase-30 (not_claude,
+      // no_pid_session_file, no_open_session_file, no_tmux_session,
+      // exec_error), so no new information disclosure surface per T-30-01.
+      paneStateEmitter.emit("inactive", result.reason);
+      // Diagnostic drop: pv-claude-session-ws-zombie-after-tmux-teardown — if the
+      // launch-window branch above (L8121-8122) seeded currentHostId /
+      // currentTmuxSession before falling through here, nulling sshConn below
+      // leaves the WS with a bound tmuxSession but no live SSH conn — a
+      // future input frame trips the entry-guard drop. Close the WS with
+      // 1011 so the client reconnects into a fresh session-bind. MUST be
+      // BEFORE `sshConn = null` below; guarded internally on ws.readyState.
+      closeForTornDownSession();
+      // Keep sshConn open? No — releasing the SSH connection here keeps
+      // idle inactive WSs cheap. A subsequent connectToPane will reopen.
+      try {
+        conn.end();
+      } catch (err) {
+        databaseLogger.warn(`[ws-server] conn-end-failed hostId=${currentHostId ?? 'null'} err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_conn_end_failed" });
+      }
+      sshConn = null;
+      return;
+    }
+
+    // Initial active discovery path: call startActiveSessionFlow now.
+    // The aside subsystem (fan-out registration, connect-time probe,
+    // extraction poller, harness-tasks poller, discovery-repoll timer,
+    // tail start) is ALL inside startActiveSessionFlow and runs here.
+    // The dormant-poll wake path calls startActiveSessionFlow() too,
+    // then does a guarded aside fan-out registration (see startActiveFlow
+    // callback in the dormant-poll block above).
+    startActiveSessionFlow({ pid: result.pid, sessionFile: result.sessionFile, tmuxSession, hostId });
+  });
+});
+
+const CLAUDE_SESSION_WS_PORT = 30011;
+sshLogger.info("Claude session WebSocket server listening", {
+  operation: "claude_session_ws_boot",
+  port: CLAUDE_SESSION_WS_PORT,
+});
+}  // end startClaudeSessionServer

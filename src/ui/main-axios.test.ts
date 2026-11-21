@@ -1,0 +1,764 @@
+// ─── main-axios.test.ts — RED tests for axios retry interceptor (Phase 54-01) ─
+//
+// TDD RED: These tests import computeBackoffMs, isRetryable, and createApiInstance
+// from ./main-axios. computeBackoffMs and isRetryable do NOT exist yet in that
+// module — this causes the test run to fail at the import/resolution stage, which
+// IS the intended RED state.
+
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import type { AxiosError, AxiosRequestConfig } from "axios";
+import axios from "axios";
+import MockAdapter from "axios-mock-adapter";
+
+// ─── Mocks (declare BEFORE importing the module under test) ──────────────────
+
+vi.mock("@/lib/db-health-monitor", () => {
+  const reportDatabaseSuccess = vi.fn();
+  const reportDatabaseError = vi.fn();
+  const reportSessionExpired = vi.fn();
+  const isDegraded = vi.fn().mockReturnValue(false);
+  return {
+    dbHealthMonitor: {
+      reportDatabaseSuccess,
+      reportDatabaseError,
+      reportSessionExpired,
+      isDegraded,
+      on: vi.fn(),
+      off: vi.fn(),
+    },
+  };
+});
+
+vi.mock("@/lib/frontend-logger", () => {
+  const mockLogger = {
+    warn: vi.fn(),
+    error: vi.fn(),
+    info: vi.fn(),
+    debug: vi.fn(),
+    success: vi.fn(),
+    requestStart: vi.fn(),
+    requestSuccess: vi.fn(),
+    requestError: vi.fn(),
+    networkError: vi.fn(),
+    authError: vi.fn(),
+  };
+  return {
+    apiLogger: mockLogger,
+    authLogger: mockLogger,
+    sshLogger: mockLogger,
+    tunnelLogger: mockLogger,
+    fileLogger: mockLogger,
+    statsLogger: mockLogger,
+    systemLogger: mockLogger,
+    dashboardLogger: mockLogger,
+  };
+});
+
+// Mock browser APIs not available in jsdom
+vi.mock("@/lib/base-path", () => ({
+  getBasePath: vi.fn().mockReturnValue(""),
+}));
+
+vi.mock("@/shell/TabContext", () => ({
+  clearSkynetSessionStorage: vi.fn(),
+}));
+
+// Stub sonner toast to avoid import errors in jsdom
+vi.mock("sonner", () => ({
+  toast: {
+    warning: vi.fn(),
+    error: vi.fn(),
+    success: vi.fn(),
+  },
+}));
+
+// ─── Import module under test AFTER mocks ────────────────────────────────────
+// computeBackoffMs and isRetryable do NOT exist yet — this is intentionally RED.
+import {
+  computeBackoffMs,
+  isRetryable,
+  createApiInstance,
+} from "./main-axios";
+
+import { dbHealthMonitor } from "@/lib/db-health-monitor";
+import { apiLogger } from "@/lib/frontend-logger";
+
+// Phase 111 SKEW-04/SKEW-06: skew-lock store + client build-id imports for
+// the new interceptor-behavior tests appended below. The store is real (not
+// mocked) — the tests exercise the actual state transition via
+// getSkewLockedSnapshot() and reset between tests with __resetForTest().
+import { CLIENT_BUILD_ID } from "@/lib/client-build-id";
+import {
+  __resetForTest as __resetSkewLockForTest,
+  getSkewLockedSnapshot,
+} from "@/state/skew-lock-store";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 1: computeBackoffMs (full-jitter shape)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("computeBackoffMs (full-jitter shape)", () => {
+  it("attempt=1: 100 samples all fall in [0, 600)", () => {
+    // attempt=1 → range [0, 300 * 2^1) = [0, 600)
+    for (let i = 0; i < 100; i++) {
+      const ms = computeBackoffMs(1);
+      expect(ms).toBeGreaterThanOrEqual(0);
+      expect(ms).toBeLessThan(600);
+    }
+  });
+
+  it("attempt=2: 100 samples all fall in [0, 1200)", () => {
+    // attempt=2 → range [0, 300 * 2^2) = [0, 1200)
+    for (let i = 0; i < 100; i++) {
+      const ms = computeBackoffMs(2);
+      expect(ms).toBeGreaterThanOrEqual(0);
+      expect(ms).toBeLessThan(1200);
+    }
+  });
+
+  it("attempt=1: mean of 500 samples is in [200, 400] proving uniform distribution not clumped", () => {
+    // Full-jitter uniform [0, 600) → mean ≈ 300 (midpoint)
+    let sum = 0;
+    for (let i = 0; i < 500; i++) {
+      sum += computeBackoffMs(1);
+    }
+    const mean = sum / 500;
+    expect(mean).toBeGreaterThan(200);
+    expect(mean).toBeLessThan(400);
+  });
+
+  it("attempt=2: mean of 500 samples is in [500, 700] proving uniform distribution not clumped", () => {
+    // Full-jitter uniform [0, 1200) → mean ≈ 600 (midpoint)
+    let sum = 0;
+    for (let i = 0; i < 500; i++) {
+      sum += computeBackoffMs(2);
+    }
+    const mean = sum / 500;
+    expect(mean).toBeGreaterThan(500);
+    expect(mean).toBeLessThan(700);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 2: isRetryable (classification tree)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function makeError(overrides: {
+  code?: string;
+  status?: number;
+  response?: unknown;
+  method?: string;
+}): AxiosError {
+  const error = new Error("test error") as AxiosError;
+  error.isAxiosError = true;
+  error.code = overrides.code;
+  if (overrides.status !== undefined || overrides.response !== undefined) {
+    error.response = (overrides.response ?? {
+      status: overrides.status,
+      data: {},
+      headers: {},
+      config: {} as AxiosRequestConfig,
+      statusText: "Error",
+    }) as AxiosError["response"];
+    if (error.response && overrides.status !== undefined) {
+      (error.response as { status: number }).status = overrides.status;
+    }
+  } else {
+    error.response = undefined;
+  }
+  return error;
+}
+
+function makeConfig(overrides: {
+  method?: string;
+  __noRetry?: boolean;
+  __silentRetry?: boolean;
+}): AxiosRequestConfig & { __noRetry?: boolean; __silentRetry?: boolean } {
+  return {
+    method: overrides.method ?? "GET",
+    url: "/test",
+    __noRetry: overrides.__noRetry,
+    __silentRetry: overrides.__silentRetry,
+  };
+}
+
+describe("isRetryable (classification tree)", () => {
+  // ─── GET + network errors ─────────────────────────────────────────────────
+
+  it("GET + ECONNREFUSED → true", () => {
+    const error = makeError({ code: "ECONNREFUSED" });
+    const config = makeConfig({ method: "GET" });
+    expect(isRetryable(error, config)).toBe(true);
+  });
+
+  it("GET + ERR_NETWORK with response=undefined → true", () => {
+    const error = makeError({ code: "ERR_NETWORK" });
+    // response is undefined (connection-level failure)
+    expect(error.response).toBeUndefined();
+    const config = makeConfig({ method: "GET" });
+    expect(isRetryable(error, config)).toBe(true);
+  });
+
+  it("GET + ETIMEDOUT → true", () => {
+    const error = makeError({ code: "ETIMEDOUT" });
+    const config = makeConfig({ method: "GET" });
+    expect(isRetryable(error, config)).toBe(true);
+  });
+
+  // ─── GET + 5xx status ────────────────────────────────────────────────────
+
+  it("GET + 502 status → true", () => {
+    const error = makeError({ status: 502 });
+    const config = makeConfig({ method: "GET" });
+    expect(isRetryable(error, config)).toBe(true);
+  });
+
+  it("GET + 503 status → true", () => {
+    const error = makeError({ status: 503 });
+    const config = makeConfig({ method: "GET" });
+    expect(isRetryable(error, config)).toBe(true);
+  });
+
+  it("GET + 504 status → true", () => {
+    const error = makeError({ status: 504 });
+    const config = makeConfig({ method: "GET" });
+    expect(isRetryable(error, config)).toBe(true);
+  });
+
+  // ─── GET + non-retryable 5xx ──────────────────────────────────────────────
+
+  it("GET + 500 status → false", () => {
+    // 500 is a server bug, no transient shape
+    const error = makeError({ status: 500 });
+    const config = makeConfig({ method: "GET" });
+    expect(isRetryable(error, config)).toBe(false);
+  });
+
+  it("GET + 501 status → false", () => {
+    // not implemented, no transient shape
+    const error = makeError({ status: 501 });
+    const config = makeConfig({ method: "GET" });
+    expect(isRetryable(error, config)).toBe(false);
+  });
+
+  // ─── GET + 4xx — never retry ─────────────────────────────────────────────
+
+  it("GET + 401 status → false", () => {
+    // 4xx never retries
+    const error = makeError({ status: 401 });
+    const config = makeConfig({ method: "GET" });
+    expect(isRetryable(error, config)).toBe(false);
+  });
+
+  it("GET + 400 status → false", () => {
+    const error = makeError({ status: 400 });
+    const config = makeConfig({ method: "GET" });
+    expect(isRetryable(error, config)).toBe(false);
+  });
+
+  it("GET + 403 status → false", () => {
+    const error = makeError({ status: 403 });
+    const config = makeConfig({ method: "GET" });
+    expect(isRetryable(error, config)).toBe(false);
+  });
+
+  it("GET + 404 status → false", () => {
+    const error = makeError({ status: 404 });
+    const config = makeConfig({ method: "GET" });
+    expect(isRetryable(error, config)).toBe(false);
+  });
+
+  it("GET + 409 status → false", () => {
+    const error = makeError({ status: 409 });
+    const config = makeConfig({ method: "GET" });
+    expect(isRetryable(error, config)).toBe(false);
+  });
+
+  it("GET + 422 status → false", () => {
+    const error = makeError({ status: 422 });
+    const config = makeConfig({ method: "GET" });
+    expect(isRetryable(error, config)).toBe(false);
+  });
+
+  it("GET + 429 status → false", () => {
+    const error = makeError({ status: 429 });
+    const config = makeConfig({ method: "GET" });
+    expect(isRetryable(error, config)).toBe(false);
+  });
+
+  // ─── POST idempotency safeguard — 5xx must NOT retry ─────────────────────
+
+  it("POST + 502 status → false", () => {
+    // idempotency safeguard — server may have processed
+    const error = makeError({ status: 502 });
+    const config = makeConfig({ method: "POST" });
+    expect(isRetryable(error, config)).toBe(false);
+  });
+
+  it("POST + 503 status → false", () => {
+    const error = makeError({ status: 503 });
+    const config = makeConfig({ method: "POST" });
+    expect(isRetryable(error, config)).toBe(false);
+  });
+
+  it("POST + 504 status → false", () => {
+    const error = makeError({ status: 504 });
+    const config = makeConfig({ method: "POST" });
+    expect(isRetryable(error, config)).toBe(false);
+  });
+
+  // ─── POST + connection drops — only a refused connection is safe ─────────
+
+  it("POST + ECONNREFUSED → true", () => {
+    // connection never established, safe to retry
+    const error = makeError({ code: "ECONNREFUSED" });
+    const config = makeConfig({ method: "POST" });
+    expect(isRetryable(error, config)).toBe(true);
+  });
+
+  it("POST + ERR_NETWORK with response=undefined → false (server may have acted)", () => {
+    const error = makeError({ code: "ERR_NETWORK" });
+    expect(error.response).toBeUndefined();
+    const config = makeConfig({ method: "POST" });
+    expect(isRetryable(error, config)).toBe(false);
+  });
+
+  it("POST + ECONNABORTED (timeout) → false", () => {
+    const error = makeError({ code: "ECONNABORTED" });
+    const config = makeConfig({ method: "POST" });
+    expect(isRetryable(error, config)).toBe(false);
+  });
+
+  it("PUT / PATCH / DELETE + ERR_NETWORK → false", () => {
+    for (const method of ["PUT", "PATCH", "DELETE"]) {
+      const error = makeError({ code: "ERR_NETWORK" });
+      expect(isRetryable(error, makeConfig({ method }))).toBe(false);
+    }
+  });
+
+  // ─── Other non-idempotent methods ─────────────────────────────────────────
+
+  it("PUT + 502 → false", () => {
+    const error = makeError({ status: 502 });
+    const config = makeConfig({ method: "PUT" });
+    expect(isRetryable(error, config)).toBe(false);
+  });
+
+  it("PATCH + 502 → false", () => {
+    const error = makeError({ status: 502 });
+    const config = makeConfig({ method: "PATCH" });
+    expect(isRetryable(error, config)).toBe(false);
+  });
+
+  it("DELETE + 502 → false", () => {
+    const error = makeError({ status: 502 });
+    const config = makeConfig({ method: "DELETE" });
+    expect(isRetryable(error, config)).toBe(false);
+  });
+
+  it("DELETE + ECONNREFUSED → true", () => {
+    const error = makeError({ code: "ECONNREFUSED" });
+    const config = makeConfig({ method: "DELETE" });
+    expect(isRetryable(error, config)).toBe(true);
+  });
+
+  // ─── HEAD and OPTIONS treated as GET ──────────────────────────────────────
+
+  it("HEAD + 502 → true", () => {
+    // treated as GET
+    const error = makeError({ status: 502 });
+    const config = makeConfig({ method: "HEAD" });
+    expect(isRetryable(error, config)).toBe(true);
+  });
+
+  it("OPTIONS + 502 → true", () => {
+    // treated as GET
+    const error = makeError({ status: 502 });
+    const config = makeConfig({ method: "OPTIONS" });
+    expect(isRetryable(error, config)).toBe(true);
+  });
+
+  // ─── Escape hatches ───────────────────────────────────────────────────────
+
+  it("config.__noRetry === true → false regardless of error", () => {
+    // escape hatch
+    const error = makeError({ code: "ECONNREFUSED" });
+    const config = makeConfig({ method: "GET", __noRetry: true });
+    expect(isRetryable(error, config)).toBe(false);
+  });
+
+  it("config.__silentRetry === true → false regardless of error", () => {
+    // don't double-retry
+    const error = makeError({ code: "ECONNREFUSED" });
+    const config = makeConfig({ method: "GET", __silentRetry: true });
+    expect(isRetryable(error, config)).toBe(false);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 3: retry interceptor integration
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("retry interceptor integration", () => {
+  let mock: MockAdapter;
+  let instance: ReturnType<typeof axios.create>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // Suppress fake timers for integration tests unless specifically needed
+    // createApiInstance needs to call document APIs; set up minimal stubs
+    if (typeof document === "undefined") {
+      return;
+    }
+    // Create an axios instance via the factory
+    // Note: createApiInstance will be exported by Task 2
+    instance = createApiInstance("http://test.local", "TEST");
+    mock = new MockAdapter(instance, { onNoMatch: "throwException" });
+  });
+
+  afterEach(() => {
+    mock?.restore();
+    vi.useRealTimers();
+  });
+
+  it("GET that fails ECONNREFUSED twice then succeeds returns 200 after 3 total attempts", async () => {
+    // Use fake timers to avoid actual delays; advance timers concurrently
+    // with the request promise to avoid PromiseRejectionHandledWarning.
+    vi.useFakeTimers();
+
+    let callCount = 0;
+    mock.onGet("/data").reply(() => {
+      callCount++;
+      if (callCount < 3) {
+        return [0, null, {}]; // status 0 = network failure in mock-adapter
+      }
+      return [200, { ok: true }];
+    });
+
+    // Advance timers concurrently so intermediate retry promises are chained
+    // before Node.js can flag them as unhandled rejections.
+    const [response] = await Promise.all([
+      instance.get("/data"),
+      vi.runAllTimersAsync(),
+    ]);
+
+    expect(response.status).toBe(200);
+    expect(callCount).toBe(3);
+  });
+
+  it("GET that fails 502 all 3 attempts rejects with the last error and calls dbHealthMonitor.reportDatabaseError", async () => {
+    vi.useFakeTimers();
+
+    let callCount = 0;
+    mock.onGet("/data").reply(() => {
+      callCount++;
+      return [502, { error: "Bad Gateway" }];
+    });
+
+    await expect(
+      Promise.all([instance.get("/data"), vi.runAllTimersAsync()]),
+    ).rejects.toThrow();
+    expect(callCount).toBe(3);
+    // reportDatabaseError called once (after all retries exhausted)
+    expect(dbHealthMonitor.reportDatabaseError).toHaveBeenCalledTimes(1);
+  });
+
+  it("successful retry (attempt 2 succeeds after attempt 1 ECONNREFUSED) calls dbHealthMonitor.reportDatabaseSuccess", async () => {
+    vi.useFakeTimers();
+
+    let callCount = 0;
+    mock.onGet("/data").reply(() => {
+      callCount++;
+      if (callCount === 1) {
+        return [0, null]; // network error first attempt
+      }
+      return [200, { ok: true }];
+    });
+
+    const [response] = await Promise.all([
+      instance.get("/data"),
+      vi.runAllTimersAsync(),
+    ]);
+
+    expect(response.status).toBe(200);
+    expect(dbHealthMonitor.reportDatabaseSuccess).toHaveBeenCalled();
+  });
+
+  it("401 SESSION_EXPIRED reaches reportSessionExpired on FIRST attempt with zero retry delay", async () => {
+    const start = Date.now();
+
+    mock.onGet("/protected").reply(401, {
+      code: "SESSION_EXPIRED",
+      error: "Session has expired",
+    });
+
+    await expect(instance.get("/protected")).rejects.toBeDefined();
+
+    const elapsed = Date.now() - start;
+    // No backoff sleep — real backoff base is 1000ms so anything <250ms proves
+    // the SESSION_EXPIRED fast-path skipped the retry. Widened from 50ms
+    // 2026-08-23 (tabitha/quick-260823-9tw ship-gate) after full-suite CPU
+    // contention pushed real wall-clock to 99ms — 50ms threshold was tighter
+    // than the assertion's intent (prove no retry, not exact latency).
+    expect(elapsed).toBeLessThan(250);
+    // reportSessionExpired called once
+    expect(dbHealthMonitor.reportSessionExpired).toHaveBeenCalledTimes(1);
+    // mock called exactly once (no retry)
+    expect(mock.history.get.length).toBe(1);
+  });
+
+  it("POST that fails 502 rejects on first attempt without retry (idempotency safeguard)", async () => {
+    vi.useFakeTimers();
+
+    let callCount = 0;
+    mock.onPost("/action").reply(() => {
+      callCount++;
+      return [502, { error: "Bad Gateway" }];
+    });
+
+    await expect(
+      Promise.all([
+        instance.post("/action", { data: "test" }),
+        vi.runAllTimersAsync(),
+      ]),
+    ).rejects.toBeDefined();
+    // POST + 502 → no retry → only called once
+    expect(callCount).toBe(1);
+  });
+
+  it("POST whose connection drops is NOT re-sent (server may already have acted)", async () => {
+    vi.useFakeTimers();
+
+    let callCount = 0;
+    mock.onPost("/action").reply(() => {
+      callCount++;
+      return [0, null]; // browser-style drop: no response, ERR_NETWORK
+    });
+
+    await expect(
+      Promise.all([
+        instance.post("/action", { data: "test" }),
+        vi.runAllTimersAsync(),
+      ]),
+    ).rejects.toBeDefined();
+    expect(callCount).toBe(1);
+  });
+
+  it("config.__noRetry: true suppresses retry even on ECONNREFUSED GET", async () => {
+    vi.useFakeTimers();
+
+    let callCount = 0;
+    mock.onGet("/data").reply(() => {
+      callCount++;
+      return [0, null]; // network error
+    });
+
+    await expect(
+      Promise.all([
+        instance.get("/data", {
+          __noRetry: true,
+        } as AxiosRequestConfig & { __noRetry?: boolean }),
+        vi.runAllTimersAsync(),
+      ]),
+    ).rejects.toBeDefined();
+    // __noRetry → mock called exactly once
+    expect(callCount).toBe(1);
+  });
+
+  it("every retry attempt emits a structured log line via the resolved logger", async () => {
+    vi.useFakeTimers();
+
+    let callCount = 0;
+    mock.onGet("/data").reply(() => {
+      callCount++;
+      return [502, { error: "Bad Gateway" }];
+    });
+
+    await expect(
+      Promise.all([instance.get("/data"), vi.runAllTimersAsync()]),
+    ).rejects.toBeDefined();
+
+    // After 3 attempts (2 retries), there should be 2 per-attempt warn calls
+    // with http_retry_attempt and 1 retries_exhausted call
+    const warnCalls = vi.mocked(apiLogger.warn).mock.calls;
+    const retryAttemptLogs = warnCalls.filter(
+      (call) => call[0] === "http_retry_attempt",
+    );
+    expect(retryAttemptLogs.length).toBeGreaterThanOrEqual(1);
+    // Verify the structure of the retry log
+    const firstRetryLog = retryAttemptLogs[0];
+    const context = firstRetryLog[1] as Record<string, unknown>;
+    expect(context).toHaveProperty("requestId");
+    expect(context).toHaveProperty("method");
+    expect(context).toHaveProperty("url");
+    expect(context).toHaveProperty("attempt");
+    expect(context).toHaveProperty("delayMs");
+    expect(context).toHaveProperty("errorCode");
+    expect(context).toHaveProperty("errorMessage");
+  });
+
+  it("final give-up emits summary log line with attempts=3 and finalErrorCode", async () => {
+    vi.useFakeTimers();
+
+    let callCount = 0;
+    mock.onGet("/data").reply(() => {
+      callCount++;
+      return [502, { error: "Bad Gateway" }];
+    });
+
+    await expect(
+      Promise.all([instance.get("/data"), vi.runAllTimersAsync()]),
+    ).rejects.toBeDefined();
+
+    expect(callCount).toBe(3);
+
+    // Should have a retries_exhausted log with attempts=3
+    const warnCalls = vi.mocked(apiLogger.warn).mock.calls;
+    const exhaustedLog = warnCalls.find(
+      (call) => call[0] === "retries_exhausted",
+    );
+    expect(exhaustedLog).toBeDefined();
+    const exhaustedContext = exhaustedLog![1] as Record<string, unknown>;
+    expect(exhaustedContext.attempts).toBe(3);
+    expect(exhaustedContext).toHaveProperty("finalErrorCode");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 4: SKEW-04 request stamping + SKEW-06 response drift detection
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Phase 111 Plan 04. Tests the two new interceptor behaviors added inside
+// `createApiInstance`:
+//
+//   - Request interceptor: stamps `X-Skynet-Client-Build: <CLIENT_BUILD_ID>`
+//     on every outgoing request (covers all 8 axios instances via the shared
+//     factory).
+//
+//   - Response interceptor: fires `lockSkewedSession(...)` on either drift
+//     signal:
+//       (a) successful response carrying `x-skynet-server-build` != CLIENT_BUILD_ID
+//           → reason "response_tag_mismatch" (SKEW-06a).
+//       (b) 409 error with `{error: "stale_client", ...}` body
+//           → reason "server_refused_stale_client" (SKEW-06b).
+//
+// The store is the REAL store (not mocked). Each test resets via
+// __resetForTest() so state is hermetic between cases. Uses
+// getSkewLockedSnapshot() to observe the transition.
+
+describe("SKEW-04 request stamping + SKEW-06 response drift detection", () => {
+  let mock: MockAdapter;
+  let instance: ReturnType<typeof axios.create>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    __resetSkewLockForTest();
+    instance = createApiInstance("http://test.local", "TEST");
+    mock = new MockAdapter(instance, { onNoMatch: "throwException" });
+  });
+
+  afterEach(() => {
+    mock?.restore();
+    __resetSkewLockForTest();
+    vi.useRealTimers();
+  });
+
+  it("Test 1: request carries X-Skynet-Client-Build header equal to CLIENT_BUILD_ID", async () => {
+    mock.onGet("/x").reply(200, {});
+
+    await instance.get("/x");
+
+    expect(mock.history.get.length).toBe(1);
+    const req = mock.history.get[0];
+    // axios-mock-adapter preserves headers as AxiosHeaders when config.headers.set exists.
+    const headerVal =
+      typeof req.headers?.get === "function"
+        ? req.headers.get("X-Skynet-Client-Build")
+        : (req.headers as Record<string, string>)?.["X-Skynet-Client-Build"];
+    expect(headerVal).toBe(CLIENT_BUILD_ID);
+  });
+
+  it("Test 2: mismatched x-skynet-server-build on 200 → store transitions to locked with response_tag_mismatch", async () => {
+    mock
+      .onGet("/y")
+      .reply(200, {}, { "x-skynet-server-build": "some-other-build" });
+
+    const response = await instance.get("/y");
+    expect(response.status).toBe(200);
+
+    const snap = getSkewLockedSnapshot();
+    expect(snap.locked).toBe(true);
+    expect(snap.reason).toBe("response_tag_mismatch");
+    expect(snap.clientBuild).toBe(CLIENT_BUILD_ID);
+    expect(snap.serverBuild).toBe("some-other-build");
+  });
+
+  it("Test 3: matching x-skynet-server-build on 200 → store NOT locked", async () => {
+    mock
+      .onGet("/z")
+      .reply(200, {}, { "x-skynet-server-build": CLIENT_BUILD_ID });
+
+    const response = await instance.get("/z");
+    expect(response.status).toBe(200);
+
+    expect(getSkewLockedSnapshot().locked).toBe(false);
+  });
+
+  it("Test 4: 409 stale_client body → axios REJECTS + store locked with server_refused_stale_client", async () => {
+    mock.onGet("/w").reply(
+      409,
+      {
+        error: "stale_client",
+        clientBuild: CLIENT_BUILD_ID,
+        serverBuild: "different",
+      },
+      { "x-skynet-server-build": "different" },
+    );
+
+    await expect(instance.get("/w")).rejects.toBeDefined();
+
+    const snap = getSkewLockedSnapshot();
+    expect(snap.locked).toBe(true);
+    expect(snap.reason).toBe("server_refused_stale_client");
+    expect(snap.clientBuild).toBe(CLIENT_BUILD_ID);
+    expect(snap.serverBuild).toBe("different");
+  });
+
+  it("Test 5: 409 without stale_client body → axios rejects, store NOT locked", async () => {
+    mock.onGet("/v").reply(409, { error: "some_other_conflict" });
+
+    await expect(instance.get("/v")).rejects.toBeDefined();
+
+    expect(getSkewLockedSnapshot().locked).toBe(false);
+  });
+
+  it("Test 6: two consecutive drift responses → store notifies subscribers only once (idempotent)", async () => {
+    mock
+      .onGet("/y")
+      .reply(200, {}, { "x-skynet-server-build": "some-other-build" });
+
+    // Fire two requests that both would trigger drift detection.
+    await instance.get("/y");
+    await instance.get("/y");
+
+    const snap = getSkewLockedSnapshot();
+    expect(snap.locked).toBe(true);
+    // First-drift-wins: reason and serverBuild reflect the first signal only.
+    expect(snap.reason).toBe("response_tag_mismatch");
+    expect(snap.serverBuild).toBe("some-other-build");
+  });
+
+  it("Test 7: existing behaviors unaffected — 401 SESSION_EXPIRED fires reportSessionExpired without triggering the lock", async () => {
+    mock.onGet("/protected").reply(401, {
+      code: "SESSION_EXPIRED",
+      error: "Session has expired",
+    });
+
+    await expect(instance.get("/protected")).rejects.toBeDefined();
+
+    // Legacy 401 handler still fired.
+    expect(dbHealthMonitor.reportSessionExpired).toHaveBeenCalledTimes(1);
+    // Skew lock NOT activated by a 401.
+    expect(getSkewLockedSnapshot().locked).toBe(false);
+  });
+});

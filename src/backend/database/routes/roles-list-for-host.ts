@@ -1,0 +1,410 @@
+/**
+ * Phase 22 (SRIC-02): /roles?hostId=<n> — target-host-side role directory
+ * enumeration endpoint.
+ *
+ * GET /roles?hostId=<n>
+ *   → [{ name, description }]
+ *
+ * SSH-only: opens a connectOneShot connection and runs two exec calls:
+ *   1. `ls -1 "$HOME/fleet/roles"` — enumerate role directories.
+ *   2. Batched `cat` (===ROLE:<n>=== delimited) — fetch each role's `<name>.md`
+ *      markdown in a single SSH round-trip.
+ *
+ * Each result's `description` is the role file's frontmatter `description:`
+ * (collapsed to one line). Missing key → empty string (dropdown still renders
+ * the role by name); the `## Role` section is never used as a fallback.
+ *
+ * Security:
+ *   - authenticateJWT gates the route.
+ *   - resolveHostById(hostId, userId) provides per-user host isolation (404 for
+ *     cross-user / unknown hosts) — matches identity-exists-on-host.ts pattern.
+ *   - ROLE_NAME_PATTERN (kebab-case-lowercase: /^[a-z0-9-]+$/) filters ls
+ *     entries BEFORE they're shell-interpolated into the batched cat command.
+ *     Malformed dir names are silently dropped (defense-in-depth per RESEARCH
+ *     Security Domain V4 / STRIDE T-22-02-02).
+ *   - SSH errors (connect timeout, exec failure) → 502 with generic message
+ *     ("SSH connect failed" / "SSH exec failed"); no upstream error detail
+ *     leaked into response body (T-22-02 information disclosure).
+ *   - try/finally guarantees conn.end() cleanup on every exit path (matches
+ *     claude-session-server.ts SSH resource cleanup pattern from RESEARCH F8-B6).
+ *
+ * Mount ordering:
+ *   Mounted BEFORE /identities in database.ts. Even though /roles is not a
+ *   subpath of /identities, keeping standalone mounts in a stable order
+ *   preserves clarity when future /roles subpaths land.
+ */
+
+import type { AuthenticatedRequest } from "../../../types/index.js";
+import { getInstanceWide, syncedMachineForHostRow } from "../../instance-wide/production.js";
+import express from "express";
+import type { Request, Response } from "express";
+import { AuthManager } from "../../utils/auth-manager.js";
+import { resolveHostById } from "../../ssh/host-resolver.js";
+import { connectOneShot } from "../../ssh/ssh-one-shot.js";
+import { execCommand } from "../../ssh/tmux-helper.js";
+import { sshLogger, systemLogger } from "../../utils/logger.js";
+// Phase 90 Plan 90-01 (D-08.1 — planner picks extend-existing over companion):
+// reuse the identity-side cosmetic frontmatter extractor to attach role-level
+// cosmetics (title/displayName/colorHue/voice/avatar) to each response entry.
+// Empty {} return means "no cosmetics on disk" — cosmetic fields OMITTED from
+// the response entry (not defaulted, not null-emitted).
+import { extractCosmeticsFromFrontmatter } from "../../claude-session/identity-artifact-reader.js";
+// Phase 90 Plan 90-10 (LOW-severity cleanup): ROLE_NAME_PATTERN promoted to
+// `src/backend/utils/role-name-pattern.ts`. Was previously cloned locally here
+// and in roles.ts. Import from shared location to prevent regex-divergence.
+import { ROLE_NAME_PATTERN } from "../../utils/role-name-pattern.js";
+import { readRoleBorrowableFromMarkdown, readRoleDescriptionFromMarkdown } from "../../utils/role-description.js";
+// Phase 129 Plan 129-03: per-user visibility gate on GET /roles?hostId=<n>
+// (role-picker gate). This is D-7 deep-gate seam #3 — the "+ New Session"
+// flow's role dropdown MUST filter out roles the caller can't see (shape
+// file §"What would make it wrong" bullet 5). The gate uses the ROLE side
+// only (identityCos=null) because the picker is invoked BEFORE any
+// identity exists — the identity-side gate has nothing to compare against
+// yet. Raw cosmetics (including `users:`) are preserved in a parallel
+// Map<name, RawCosmetics> so the gate can consult `users` without leaking
+// it into the response body (D-6 wire-shape lock: no new UI affordance).
+import { isIdentityVisibleToUser } from "../../fleet-status/identity-visibility-gate.js";
+import { getUsernameForUserId } from "../../utils/host-user-counter.js";
+
+const router = express.Router();
+
+/**
+ * Shared roles removed everywhere whose copy is still being deleted from the
+ * home folder this host row reaches. Rows into other accounts on the box hold
+ * only their own roles and are left alone.
+ */
+async function removingRoleNames(hostId: number, rowUsername: unknown): Promise<string[]> {
+  try {
+    const engine = getInstanceWide();
+    const machine = engine ? await syncedMachineForHostRow(hostId, async () => rowUsername) : null;
+    if (!engine || !machine) return [];
+    return await engine.pendingRemovalNames("role", machine.machineId);
+  } catch (err) {
+    systemLogger.warn("roles list: couldn't read pending shared-role removals", {
+      operation: "roles_list_pending_removals",
+      hostId,
+      error: err instanceof Error ? err.message : "Unknown",
+    });
+    return [];
+  }
+}
+
+const authManager = AuthManager.getInstance();
+const authenticateJWT = authManager.createAuthMiddleware();
+
+/** SSH connect timeout — matches other one-shot SSH endpoints. */
+const SSH_CONNECT_TIMEOUT_MS = 5000;
+
+/** SSH exec race timeout — bounded so a hung remote can't stall the route. */
+const SSH_EXEC_TIMEOUT_MS = 5000;
+
+/**
+ * Race an exec against a timeout so a hung remote can't stall the route.
+ * Matches identity-artifact-reader.execWithTimeout shape.
+ */
+function execWithTimeout(
+  conn: Awaited<ReturnType<typeof connectOneShot>>,
+  command: string,
+  timeoutMs: number = SSH_EXEC_TIMEOUT_MS,
+): Promise<string> {
+  return Promise.race([
+    execCommand(conn, command),
+    new Promise<string>((_, reject) =>
+      setTimeout(
+        () => reject(new Error(`SSH exec timeout after ${timeoutMs}ms`)),
+        timeoutMs,
+      ),
+    ),
+  ]);
+}
+
+/**
+ * GET /roles?hostId=<n>
+ * Returns [{name, description}] for every valid role in ~/fleet/roles/ on the target host.
+ */
+router.get(
+  "/",
+  authenticateJWT,
+  async (req: Request, res: Response) => {
+    const userId = (req as AuthenticatedRequest).userId;
+
+    // 1. Parse + validate hostId
+    const rawHostId = req.query.hostId;
+    if (rawHostId === undefined || rawHostId === "") {
+      return res.status(400).json({ error: "hostId is required" });
+    }
+    const hostId = parseInt(String(rawHostId), 10);
+    if (!Number.isFinite(hostId) || hostId <= 0 || !Number.isInteger(hostId)) {
+      return res.status(400).json({ error: "hostId must be a positive integer" });
+    }
+
+    // 2. Verify host ownership — returns null for cross-user / unknown hosts.
+    const host = await resolveHostById(hostId, userId);
+    if (!host) {
+      return res.status(404).json({ error: "Host not found" });
+    }
+
+    // Phase 129 Plan 129-03: per-request callerUsername lookup for the D-2
+    // role-side gate applied per-role below. Fetched EXACTLY ONCE per
+    // request (matches identities.ts / sessions.ts per-request-cost
+    // discipline). Runs AFTER host-access check so unauthorized callers
+    // never trigger the DB lookup.
+    //
+    // Null result (unknown / orphaned userId) is a shape-violation
+    // defensive branch — we do NOT abort the request. Per D-8 the
+    // visibility gate is NOT a permission system; a defective username
+    // lookup must fall OPEN (return the unfiltered role list the current
+    // host-access predicate would allow) rather than empty the picker.
+    // isIdentityVisibleToUser short-circuits to `true` on a null
+    // callerUsername (Plan 129-01 Task 2 Test 1 — the internal-server /
+    // test / admin-bypass semantic). Ops needs a log crumb to trace
+    // "why did the gate not run for this request?" so we emit a
+    // structured warn.
+    const callerUsername = await getUsernameForUserId(userId);
+    if (callerUsername === null) {
+      systemLogger.warn(
+        "Phase 129: GET /roles?hostId=<n> callerUsername lookup failed — gate disabled for this request",
+        {
+          operation: "roles_list_gate_username_missing",
+          userId,
+          hostId,
+        },
+      );
+    }
+
+    // 3. Open SSH connection (try/finally guarantees end() on every exit).
+    let conn: Awaited<ReturnType<typeof connectOneShot>> | null = null;
+    try {
+      try {
+        conn = await connectOneShot(
+          host as unknown as Parameters<typeof connectOneShot>[0],
+          SSH_CONNECT_TIMEOUT_MS,
+        );
+      } catch (err) {
+        sshLogger.warn("roles-list-for-host: SSH connect failed", {
+          operation: "roles_list_for_host_connect",
+          hostId,
+          error: err instanceof Error ? err.message : "Unknown",
+        });
+        return res.status(502).json({ error: "SSH connect failed" });
+      }
+
+      // 4. List role directories. `|| true` protects the exit code if the
+      //    directory does not exist; empty ls just yields the empty array.
+      let lsOutput: string;
+      try {
+        lsOutput = await execWithTimeout(
+          conn,
+          `ls -1 "$HOME/fleet/roles" 2>/dev/null || true`,
+        );
+      } catch (err) {
+        sshLogger.warn("roles-list-for-host: SSH exec (ls) failed", {
+          operation: "roles_list_for_host_ls",
+          hostId,
+          error: err instanceof Error ? err.message : "Unknown",
+        });
+        // Non-fatal: return empty list so dropdown renders "no roles" instead
+        // of a hard error surface (user sees empty state, not a 500).
+        return res.json([]);
+      }
+
+      const rawEntries = lsOutput
+        .split("\n")
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0);
+
+      // 5. Silently drop entries that fail the kebab-case gate (STRIDE T-22-02-02).
+      const validRoles = rawEntries
+        .filter((name) => ROLE_NAME_PATTERN.test(name))
+        .sort();
+
+      if (validRoles.length === 0) {
+        return res.json([]);
+      }
+
+      // 6. Batched cat with ===ROLE:<n>=== delimiters (single SSH round-trip).
+      //    Role names are pre-validated by ROLE_NAME_PATTERN so shell
+      //    interpolation is safe (kebab-case has no shell-special chars).
+      //
+      //    The trailing `echo ""` after each cat is load-bearing: role files
+      //    on disk are not guaranteed to end with a newline, and without this
+      //    padding the NEXT role's `===ROLE:X===` marker concatenates to the
+      //    previous file's last byte. The split regex in step 7 requires the
+      //    marker at start-of-line (`/m` flag anchors `^` per-line), so a
+      //    missing-newline predecessor silently drops the next role's block
+      //    and returns {name, description:"", <no cosmetics>} for it.
+      const catCmd = validRoles
+        .map(
+          (r) =>
+            `echo "===ROLE:${r}==="; cat "$HOME/fleet/roles/${r}/${r}.md" 2>/dev/null; echo ""`,
+        )
+        .join(" ; ");
+
+      let catOutput: string;
+      try {
+        catOutput = await execWithTimeout(conn, catCmd);
+      } catch (err) {
+        sshLogger.warn("roles-list-for-host: SSH exec (cat) failed", {
+          operation: "roles_list_for_host_cat",
+          hostId,
+          error: err instanceof Error ? err.message : "Unknown",
+        });
+        // Same graceful path — return names with empty descriptions so
+        // user can still pick a role even if descriptions failed to load.
+        const removing = new Set(await removingRoleNames(hostId, (host as { username?: unknown }).username));
+        return res.json(validRoles.filter((name) => !removing.has(name)).map((name) => ({ name, description: "" })));
+      }
+
+      // 7. Split on ===ROLE:<n>=== delimiters and extract per-role description
+      //    + per-role cosmetic frontmatter.
+      //    First split yields ["", "<name>", "<body>", "<name>", "<body>", ...]
+      //    because the delimiter is at the start of every block.
+      //
+      // Phase 90 Plan 90-01 (D-08.1): in addition to the frontmatter
+      // description, also parse cosmetic YAML frontmatter (title, displayName,
+      // colorHue, voice, avatar) via the shared extractCosmeticsFromFrontmatter
+      // helper. Anything the extractor drops (malformed YAML, missing keys,
+      // out-of-range values) is silently absent from the response entry —
+      // callers ignore unknown keys and safe-default at render time.
+      const blocks = catOutput.split(/^===ROLE:([a-z0-9-]+)===\s*$/m);
+      // blocks[0] is the pre-first-delimiter text (empty or whitespace).
+      // Then pairs of [name, body] follow.
+      const descByName = new Map<string, string>();
+      const borrowableRoles = new Set<string>();
+      // Only forward the 4 role-facing cosmetic fields. `coordinator` and
+      // `task` from the identity-side extractor are NOT surfaced here (roles
+      // don't consume them) per Plan 90-01 Task 1 acceptance criteria.
+      // Pretty-names shape (2026-09-30): `title?` is gone — roles write
+      // `displayName:` instead. Hard cutover, no back-compat read.
+      type RoleCosmetics = {
+        displayName?: string;
+        colorHue?: number;
+        voice?: string;
+        avatar?: string;
+      };
+      const cosByName = new Map<string, RoleCosmetics>();
+      // Phase 129 Plan 129-03: parallel map of RAW cosmetics (including
+      // `users?: string[]`) preserved separately from the response-facing
+      // RoleCosmetics narrowing. Option A per PATTERNS.md § "roles-list-
+      // for-host.ts": keep the RoleCosmetics wire-shape UNCHANGED (D-6
+      // lock: NO new UI affordance; the frontend never sees `users:`) but
+      // preserve the raw extraction so the gate below can consult it.
+      // Extending the narrowing to include `users:` would leak the field
+      // into the response body — forbidden by D-6.
+      const rawCosByName = new Map<
+        string,
+        ReturnType<typeof extractCosmeticsFromFrontmatter>
+      >();
+      for (let i = 1; i < blocks.length; i += 2) {
+        const name = blocks[i];
+        const body = blocks[i + 1] ?? "";
+        if (ROLE_NAME_PATTERN.test(name)) {
+          // extractCosmeticsFromFrontmatter anchors on `^---` at the very start
+          // of the string — strip the leading newline the delimiter split leaves
+          // behind so a frontmatter block sitting immediately after the delimiter
+          // still matches. `replace` with a start-anchored regex is cheap and
+          // preserves body content otherwise.
+          const trimmedBody = body.replace(/^\s*\r?\n/, "");
+          descByName.set(name, readRoleDescriptionFromMarkdown(trimmedBody));
+          if (readRoleBorrowableFromMarkdown(trimmedBody)) borrowableRoles.add(name);
+          const raw = extractCosmeticsFromFrontmatter(trimmedBody);
+          // Phase 129 Plan 129-03: stash the raw extraction so the gate
+          // filter below sees the `users?: string[]` field. cosByName gets
+          // the narrowed 5-field version that lands in the response.
+          rawCosByName.set(name, raw);
+          // Narrow to the 4 role-facing fields; omit coordinator/task AND
+          // users (D-6 wire-shape lock: NO new UI affordance).
+          // Pretty-names shape (2026-09-30): `title` is retired — only
+          // `displayName` is surfaced. Roles' frontmatter now carries
+          // `displayName:` written by the create endpoint.
+          const narrowed: RoleCosmetics = {};
+          if (raw.displayName !== undefined) narrowed.displayName = raw.displayName;
+          if (raw.colorHue !== undefined) narrowed.colorHue = raw.colorHue;
+          if (raw.voice !== undefined) narrowed.voice = raw.voice;
+          if (raw.avatar !== undefined) narrowed.avatar = raw.avatar;
+          cosByName.set(name, narrowed);
+        }
+      }
+
+      // Phase 129 Plan 129-03: D-7 deep-gate seam #3 — role-picker gate.
+      // Filter validRoles against the role-side D-2 gate BEFORE building
+      // the response. Identity-side gate is IGNORED (`null` first arg)
+      // because the picker is invoked BEFORE any identity exists; the
+      // identity-side users list has nothing to compare against yet
+      // (locked by 129-CONTEXT.md § "Locked decisions" bullet 6 + shape
+      // file §"What would make it wrong" bullet 5).
+      //
+      // Roles whose frontmatter has no `users:` key (D-3 fallback) fall
+      // open on the role side; roles whose `users:` list excludes the
+      // caller are filtered out. If callerUsername is null (unknown JWT
+      // userId), isIdentityVisibleToUser short-circuits to true and every
+      // role surfaces (fail-open per D-8).
+      const gatedRoles = validRoles.filter((name) => {
+        const raw = rawCosByName.get(name) ?? null;
+        const visible = isIdentityVisibleToUser(null, raw, callerUsername);
+        if (!visible) {
+          systemLogger.debug(
+            "Phase 129: role hidden by picker gate",
+            {
+              operation: "roles_list_gate_hidden",
+              role: name,
+              hostId,
+              callerUsername,
+            },
+          );
+        }
+        return visible;
+      });
+
+      // Instance-wide roles are flagged so the roles window can list them in
+      // their own section and the role picker can mark them.
+      const instanceWideRoles = new Set(
+        (await getInstanceWide()?.listNames("role")) ?? [],
+      );
+      // A shared role just removed everywhere is still on disk here until the
+      // sync deletes it — leave it out meanwhile.
+      const removingRoles = new Set(await removingRoleNames(hostId, (host as { username?: unknown }).username));
+      const result = gatedRoles.filter((name) => !removingRoles.has(name)).map((name) => ({
+        name,
+        description: descByName.get(name) ?? "",
+        ...(instanceWideRoles.has(name) ? { instanceWide: true } : {}),
+        ...(borrowableRoles.has(name) ? { borrowable: true } : {}),
+        // Spread cosmetics last — only present keys land on the entry.
+        // NB: this is `cosByName` (the narrowed RoleCosmetics), NOT
+        // `rawCosByName` — the raw map is gate-only and never leaks
+        // `users:` into the response (D-6 wire-shape lock).
+        ...(cosByName.get(name) ?? {}),
+      }));
+
+      return res.json(result);
+    } finally {
+      if (conn) {
+        try {
+          conn.end();
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  },
+);
+
+// Generic 500 fallback error handler (mirrors identities.ts / identity-exists-on-host.ts)
+router.use(
+  (
+    err: Error,
+    _req: Request,
+    res: Response,
+    _next: express.NextFunction,
+  ) => {
+    sshLogger.error("roles-list-for-host: unhandled error", {
+      operation: "roles_list_for_host_error",
+      error: err?.message,
+    });
+    return res
+      .status(500)
+      .json({ error: "internal" });
+  },
+);
+
+export default router;

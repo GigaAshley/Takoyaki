@@ -1,0 +1,683 @@
+// URL-encoded workspace addressing so Chrome tab-restore preserves the
+// full Skynet tab set in each browser tab. See patches #25 (single tab),
+// #34 (only=1 marker), #35 (multi-tab).
+//
+// State lives in the URL FRAGMENT (hash), NOT the query string. Chrome's
+// window-restore code path (Ctrl+Shift+T after closing a whole window) reverts
+// to the canonical navigation URL and drops replaceState'd query params — the
+// fragment survives because Chrome treats it as part of the URL identity.
+//
+// Wire URL form:
+//   #tab=<spec>[&tab=<spec>...][&active=<index>][&only=1]
+// Each <spec>:
+//   tmux:<host>:<session-name>   attach named tmux session on SSH host
+//   terminal:<host>              plain SSH terminal (Windows / non-tmux hosts)
+//   rdp:<host>                   RDP via guacamole
+//   vnc:<host>                   VNC via guacamole
+//   telnet:<host>                telnet via guacamole
+//   file:<b64url>                a file pane: base64url of JSON [host, path,
+//                                origin?] (file URL host segment, absolute
+//                                path, the source conversation's spec)
+//   desktop:<hostId>:<identity>  an agent's virtual desktop pane (numeric
+//                                host id, identity name)
+//   archived:<host>:<identity>   an archived agent's conversation, view-only
+//                                (opened from search; same shape as tmux)
+//
+// active=<N> is the zero-based index (within the emitted `tab=` list) of the
+// tab that should be focused on restore. Omitted if the active tab isn't
+// URL-addressable (e.g. Dashboard).
+//
+// only=1 is a one-shot marker set ONLY by Move-to-new-window (patch #34).
+// Tells AppShell.loadSavedTabs to skip the persisted-tab rehydrate pass so
+// the new Chrome tab shows JUST the URL's tabs. The ambient URL-sync effect
+// never sets it.
+//
+// Legacy `?tab=` query form is also accepted on parse for bookmarks predating
+// patch #25, and single-tab bookmarks (`#tab=one:spec`) predating patch #35
+// still parse as a length-1 workspace.
+//
+// The <host> component is the host record's `name` field (case-insensitive
+// lookup); numeric IDs work as a rename-fallback (`#tab=rdp:7`).
+//
+// Persistence: snapshot the URL into sessionStorage at page load BEFORE any
+// auth-flow replaceState can strip it — sessionStorage is per-Chrome-tab.
+// AppShell consumes it after tabs are restored, then clears it.
+
+import type { TabType } from "@/types/ui-types";
+import { isValidFileAddress } from "@/features/pretty-view/file-url";
+
+export const PENDING_TAB_STORAGE_KEY = "skynet_pending_tab";
+const STORAGE_KEY = PENDING_TAB_STORAGE_KEY;
+
+// Phase 97 Plan 05 (Finding 7): TabSpec is a discriminated union — the harness
+// variant carries `host: string` (unchanged from the original interface); the
+// relay variant carries an opaque Matrix `roomId: string` and NO host. The
+// `host?: never` / `session?: never` / `roomId?: never` markers force TS to
+// narrow exhaustively — consumers that read `spec.host` must first guard
+// against the relay variant (either `if (spec.protocol === "relay") ...` or
+// `if (spec.protocol === "relay") continue;` early-out). See D-15/D-16 and
+// 97-RESEARCH.md § Finding 7 for the rationale (opaque Matrix room ID as URL
+// identifier; URL shape mirrors the harness case's protocol-prefix pattern).
+//
+// Phase 120 D-16: adds a third variant `{ protocol: "app"; hostId: string;
+// slug: string }` carrying the (hostId, slug) tuple that identifies an app
+// leaf, so app tabs survive URL-fragment persistence (workspace-share and
+// Chrome-tab-restore flows). The `?: never` discipline is preserved
+// symmetrically — every variant carries `?: never` markers for every field
+// it does NOT own, so consumers reading `spec.hostId`, `spec.slug`,
+// `spec.host`, `spec.session`, or `spec.roomId` narrow correctly against
+// whichever discriminant is present.
+export type TabSpec =
+  | {
+      // "archived" = an archived agent's conversation: host + identity name
+      // carried in `session`, the same shape as tmux.
+      protocol: "tmux" | "archived" | "terminal" | "rdp" | "vnc" | "telnet";
+      host: string;
+      session?: string;
+      roomId?: never;
+      hostId?: never;
+      slug?: never;
+      fileHost?: never;
+      path?: never;
+      origin?: never;
+      identityKey?: never;
+    }
+  | {
+      protocol: "relay";
+      roomId: string;
+      host?: never;
+      session?: never;
+      hostId?: never;
+      slug?: never;
+      fileHost?: never;
+      path?: never;
+      origin?: never;
+      identityKey?: never;
+    }
+  | {
+      // Phase 120 D-16 — app-leaf tuple carried through the URL fragment.
+      // hostId is stringified at the URL-boundary (the wire is textual);
+      // slug matches APP_SLUG_RE = /^[a-z0-9-]{1,64}$/ on the backend.
+      protocol: "app";
+      hostId: string;
+      slug: string;
+      host?: never;
+      session?: never;
+      roomId?: never;
+      fileHost?: never;
+      path?: never;
+      origin?: never;
+      identityKey?: never;
+    }
+  | {
+      // File leaf: the Skynet file URL's host segment + absolute path, plus
+      // the encoded spec of the conversation it came from when known.
+      // Wire form `file:<base64url of JSON [host, path, origin?]>`.
+      protocol: "file";
+      fileHost: string;
+      path: string;
+      origin?: string;
+      host?: never;
+      session?: never;
+      roomId?: never;
+      hostId?: never;
+      slug?: never;
+      identityKey?: never;
+    }
+  | {
+      // Desktop leaf: an agent's virtual desktop. hostId is stringified at
+      // the URL boundary like the app variant's; identityKey matches the
+      // backend's IDENTITY_KEY_RE. Wire form `desktop:<hostId>:<identity>`.
+      protocol: "desktop";
+      hostId: string;
+      identityKey: string;
+      host?: never;
+      session?: never;
+      roomId?: never;
+      slug?: never;
+      fileHost?: never;
+      path?: never;
+      origin?: never;
+    };
+
+// Full workspace state carried in the URL: an ordered list of tab specs,
+// optional active-index, optional one-shot `only` marker, and (phase 6)
+// an optional `mobileView` marker indicating "the user is on the mobile
+// view screen right now, not the list screen." Only mobile viewports
+// consume the flag; desktop ignores it. See src/ui/lib/mobile-flow.ts.
+// Lives in the URL fragment for the same Chrome-window-restore reason
+// the `tab=` scheme does — see the module doc-comment above.
+export interface WorkspaceSpec {
+  tabs: TabSpec[];
+  activeIndex?: number;
+  only?: boolean;
+  mobileView?: boolean;
+  /**
+   * Phase 56 Plan 02 — pre-encoded URL fragment (`s=...&t=...`) produced by
+   * `encodeSplitTreeToUrl` in `split-tree-url.ts`. Present when the workspace
+   * has a split arrangement; absent for single-active-tab workspaces.
+   * Round-trips through `encodeWorkspaceSpec` / `consumePendingWorkspace` as
+   * an opaque string — this module does NOT parse the tree grammar. Both `s`
+   * and `t` params are required together; a URL with only one is treated as
+   * malformed and the whole `splitTree` field is dropped (fail-safe null).
+   */
+  splitTree?: string;
+}
+
+const PROTOCOLS: TabSpec["protocol"][] = [
+  "tmux",
+  "archived",
+  "terminal",
+  "rdp",
+  "vnc",
+  "telnet",
+  "relay",
+  "app", // Phase 120 D-16 — app-leaf URL-fragment variant
+  "file",
+  "desktop",
+];
+
+// App leaf identity shape (MEDIUM-7). Shared with the cross-window app-bar
+// drop path (shell/cross-window-drag.ts) so every way an app leaf is minted
+// from outside input applies the same gate.
+export const APP_HOST_ID_RE = /^[1-9][0-9]{0,9}$/;
+export const APP_SLUG_RE = /^[a-z0-9-]{1,64}$/;
+// Identity name shape — mirrors the backend's IDENTITY_KEY_RE.
+export const DESKTOP_IDENTITY_RE = /^[a-z0-9_-]{1,64}$/;
+
+// UTF-8-safe base64url (no padding) for the file variant's payload.
+function base64UrlEncode(text: string): string {
+  const bytes = new TextEncoder().encode(text);
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+// Ceiling on a file payload: comfortably above the worst case the encoder
+// can produce for a valid address (4096-char path + 1024-char origin, every
+// character JSON-escaped to 6 bytes, then base64's 4/3) so any pane that was
+// written always reads back.
+const MAX_FILE_PAYLOAD = 65536;
+
+/** Throws on anything that isn't base64url of valid UTF-8. */
+function base64UrlDecode(text: string): string {
+  if (text.length === 0 || text.length > MAX_FILE_PAYLOAD || !/^[A-Za-z0-9_-]+$/.test(text)) {
+    throw new Error("not base64url");
+  }
+  const b64 = text.replace(/-/g, "+").replace(/_/g, "/");
+  const bin = atob(b64 + "=".repeat((4 - (b64.length % 4)) % 4));
+  const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+  return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+}
+
+export function parseTabParam(raw: string | null): TabSpec | null {
+  if (!raw) return null;
+  const idx1 = raw.indexOf(":");
+  if (idx1 === -1) return null;
+  const protocol = raw.slice(0, idx1) as TabSpec["protocol"];
+  if (!PROTOCOLS.includes(protocol)) return null;
+  const rest = raw.slice(idx1 + 1);
+  // Phase 97 Plan 05 (Finding 7): relay variant — opaque Matrix room ID.
+  // Branch BEFORE the host-required paths below because relay tabs have no
+  // fleet host (the room lives on the Matrix relay). See D-15/D-16.
+  //
+  // Phase 97 code-review Fix 5: wrap decodeURIComponent in try/catch. Malformed
+  // percent-encoding (e.g., a stray '%' with no hex pair, or '%ZZ') throws
+  // URIError, which would crash tab restoration. The function's contract for
+  // other malformed inputs is 'return null'; matching that contract here.
+  if (protocol === "relay") {
+    let roomId: string;
+    try {
+      roomId = decodeURIComponent(rest);
+    } catch {
+      // URIError — malformed percent-encoding. Fail-safe: drop the tab. We
+      // don't log the raw payload (would echo user input into ops logs);
+      // the length is the only forensic signal that's safe to emit.
+      // eslint-disable-next-line no-console
+      console.info({
+        operation: "parse_tab_param_relay_malformed_uri",
+        restLen: rest.length,
+      });
+      return null;
+    }
+    if (!roomId) return null;
+    // Defense-in-depth: reject grossly oversized roomIds. Browser URL fragment
+    // has a ~2000-char practical limit; realistic Matrix roomIds are ~40.
+    // See 97-RESEARCH.md § Security Domain (T-97-05-02 mitigation).
+    if (roomId.length > 512) return null;
+    return { protocol: "relay", roomId };
+  }
+  if (protocol === "tmux" || protocol === "archived") {
+    const idx2 = rest.indexOf(":");
+    if (idx2 === -1) return null;
+    // Phase 97 code-review Fix 5 (extended via quick-260910-gqi): tmux mirror
+    // of the relay guard above. Wrap BOTH decodes in a single try/catch so a
+    // malformed percent-encoding on either the host or session slot returns
+    // null instead of throwing URIError. Same fail-safe contract as the relay
+    // branch — see lines 110-113 for rationale.
+    let host: string;
+    let session: string;
+    try {
+      host = decodeURIComponent(rest.slice(0, idx2));
+      session = decodeURIComponent(rest.slice(idx2 + 1));
+    } catch {
+      // eslint-disable-next-line no-console
+      console.info({
+        operation: "parse_tab_param_tmux_malformed_uri",
+        restLen: rest.length,
+      });
+      return null;
+    }
+    if (!host || !session) return null;
+    if (protocol === "archived" && !DESKTOP_IDENTITY_RE.test(session)) return null;
+    return { protocol, host, session };
+  }
+  // Phase 120 D-16: app variant — two-argument grammar `app:<hostId>:<slug>`.
+  // Mirrors the tmux two-arg shape but with a distinct payload semantic. Same
+  // decodeURIComponent try/catch fail-safe (malformed % escapes drop the tab
+  // rather than crash tab restoration). Slugs match APP_SLUG_RE on the
+  // backend ([a-z0-9-]{1,64}) — no encoding is strictly required, but we
+  // decode symmetrically with the other variants for defence-in-depth.
+  //
+  // MEDIUM-7 code-review fix (2026-09-19): validate hostId + slug shape
+  // BEFORE handing the tuple upstream to AppShell's restore path, which
+  // does `Number(spec.hostId)` unconditionally. Pre-fix, a URL fragment
+  // carrying `?tab=app:foo:bar` produced a Tab.app with `hostId: NaN`,
+  // yielding a broken `/apps/NaN/bar/pane/` URL at the proxy layer (the
+  // backend catches this via `Number.isFinite`, but the leaf renders an
+  // interstitial for a request that should never have been constructed).
+  // A URL with `?tab=app:${'9'.repeat(10_000)}:foo` also parsed
+  // successfully — no cap. Fix: match `hostId` against a positive-integer
+  // regex (up to 10 digits — matches the JS safe-integer boundary for
+  // real fleet-scale hostIds) and `slug` against the same APP_SLUG_RE
+  // shape the backend enforces (`/^[a-z0-9-]{1,64}$/`). Failure returns
+  // null → dropped tab (matching the fail-safe contract of the other
+  // TabSpec variants).
+  if (protocol === "app") {
+    const idx2 = rest.indexOf(":");
+    if (idx2 === -1) return null;
+    let hostId: string;
+    let slug: string;
+    try {
+      hostId = decodeURIComponent(rest.slice(0, idx2));
+      slug = decodeURIComponent(rest.slice(idx2 + 1));
+    } catch {
+      // eslint-disable-next-line no-console
+      console.info({
+        operation: "parse_tab_param_app_malformed_uri",
+        restLen: rest.length,
+      });
+      return null;
+    }
+    if (!hostId || !slug) return null;
+    // MEDIUM-7: positive-integer regex on hostId (fleet-realistic 10-digit
+    // upper bound stays well within Number.MAX_SAFE_INTEGER, so downstream
+    // `Number(spec.hostId)` is guaranteed safe post-validation).
+    if (!APP_HOST_ID_RE.test(hostId)) return null;
+    // MEDIUM-7: APP_SLUG_RE-shape on slug (mirrors the backend at
+    // `src/backend/claude-session/identity-artifact-reader.ts`). Reject
+    // anything outside `[a-z0-9-]{1,64}`.
+    if (!APP_SLUG_RE.test(slug)) return null;
+    return { protocol: "app", hostId, slug };
+  }
+  // Desktop variant — `desktop:<hostId>:<identity>`. Same shape gates as
+  // the app variant; anything malformed drops the tab.
+  if (protocol === "desktop") {
+    const idx2 = rest.indexOf(":");
+    if (idx2 === -1) return null;
+    const hostId = rest.slice(0, idx2);
+    const identityKey = rest.slice(idx2 + 1);
+    if (!APP_HOST_ID_RE.test(hostId)) return null;
+    if (!DESKTOP_IDENTITY_RE.test(identityKey)) return null;
+    return { protocol: "desktop", hostId, identityKey };
+  }
+  // File variant — `file:<base64url of JSON [host, path, origin?]>`. The
+  // payload is base64url because the split-tree alphabet is percent-decoded
+  // once on its way into the fragment (encodeWorkspaceSpec re-parses it), so
+  // any %-escape in a path or origin would not survive; base64url has none.
+  // Same fail-safe contract: anything malformed drops the tab.
+  if (protocol === "file") {
+    let parts: unknown;
+    try {
+      parts = JSON.parse(base64UrlDecode(rest));
+    } catch {
+      // eslint-disable-next-line no-console
+      console.info({
+        operation: "parse_tab_param_file_malformed",
+        restLen: rest.length,
+      });
+      return null;
+    }
+    if (!Array.isArray(parts) || parts.length < 2 || parts.length > 3) return null;
+    const [fileHost, path, origin] = parts as unknown[];
+    if (!isValidFileAddress(fileHost, path)) return null;
+    // The origin is itself a tab spec; keep it only when it parses as a
+    // conversation (never another file or an app).
+    const originSpec = typeof origin === "string" && origin.length <= 1024 ? parseTabParam(origin) : null;
+    const keepOrigin =
+      originSpec !== null && originSpec.protocol !== "file" && originSpec.protocol !== "app";
+    return keepOrigin
+      ? { protocol: "file", fileHost, path: path as string, origin: origin as string }
+      : { protocol: "file", fileHost, path: path as string };
+  }
+  // Phase 97 code-review Fix 5 (extended via quick-260910-gqi): generic-host
+  // mirror of the relay guard above. Covers terminal / rdp / vnc / telnet
+  // (every non-tmux, non-relay member of PROTOCOLS). Includes `protocol` in
+  // the log payload because this branch handles four distinct protocols — a
+  // useful forensic signal that the single-protocol relay + tmux branches
+  // don't need.
+  let host: string;
+  try {
+    host = decodeURIComponent(rest);
+  } catch {
+    // eslint-disable-next-line no-console
+    console.info({
+      operation: "parse_tab_param_host_malformed_uri",
+      restLen: rest.length,
+      protocol,
+    });
+    return null;
+  }
+  if (!host) return null;
+  return { protocol, host };
+}
+
+export function encodeTabSpec(spec: TabSpec): string {
+  // Phase 97 Plan 05 (Finding 7): relay variant emits `relay:<encoded roomId>`.
+  // Branch first so TS narrows `spec.host` to `string` in the else branch (the
+  // discriminated union carries `host?: never` on the relay variant).
+  if (spec.protocol === "relay") {
+    return `relay:${encodeURIComponent(spec.roomId)}`;
+  }
+  // Phase 120 D-16: app variant emits `app:<hostId>:<encoded slug>`. Branch
+  // BEFORE the host-carrying fall-through — without this, `spec.host` is
+  // `undefined` (the never-marker) and the fall-through would emit
+  // `app:undefined`, breaking the URL round-trip. hostId is a positive-
+  // integer string (no encode needed); slug is `[a-z0-9-]{1,64}` per
+  // APP_SLUG_RE (encoding is a no-op, included as defence-in-depth).
+  if (spec.protocol === "app") {
+    return `app:${spec.hostId}:${encodeURIComponent(spec.slug)}`;
+  }
+  if (spec.protocol === "desktop") {
+    return `desktop:${spec.hostId}:${spec.identityKey}`;
+  }
+  if (spec.protocol === "file") {
+    const parts = spec.origin ? [spec.fileHost, spec.path, spec.origin] : [spec.fileHost, spec.path];
+    return `file:${base64UrlEncode(JSON.stringify(parts))}`;
+  }
+  const parts = [spec.protocol, encodeURIComponent(spec.host)];
+  if ((spec.protocol === "tmux" || spec.protocol === "archived") && spec.session) {
+    parts.push(encodeURIComponent(spec.session));
+  }
+  return parts.join(":");
+}
+
+// Build the fragment payload from a WorkspaceSpec:
+// tab=X&tab=Y[&active=N][&only=1]. URLSearchParams handles the multi-value
+// tab= keys natively.
+export function encodeWorkspaceSpec(ws: WorkspaceSpec): string {
+  const params = new URLSearchParams();
+  for (const spec of ws.tabs) {
+    params.append("tab", encodeTabSpec(spec));
+  }
+  if (
+    typeof ws.activeIndex === "number" &&
+    ws.activeIndex >= 0 &&
+    ws.activeIndex < ws.tabs.length
+  ) {
+    params.set("active", String(ws.activeIndex));
+  }
+  if (ws.only) params.set("only", "1");
+  if (ws.mobileView) params.set("mv", "1");
+  // Phase 56 Plan 02 — splice pre-encoded splitTree `s=`/`t=` into the outer
+  // WorkspaceSpec params so the final URL has one consolidated param set.
+  if (ws.splitTree) {
+    const st = new URLSearchParams(ws.splitTree);
+    const s = st.get("s");
+    const t = st.get("t");
+    if (s !== null) params.set("s", s);
+    if (t !== null) params.set("t", t);
+  }
+  return params.toString();
+}
+
+// Derive the wire spec from a Tab-shaped input. Returns null for tabs that
+// aren't URL-addressable (dashboard, singletons without a host).
+//
+// Phase 97 Plan 05 (Finding 7): input widened with optional `sessionKind` +
+// `relayRoomId` fields so relay-room tabs (which have NO fleet host — the room
+// lives on the Matrix relay) route through the relay branch BEFORE the
+// host-required check below. See D-15/D-16.
+export function specForTab(input: {
+  type: TabType;
+  host?: { name?: string; id?: string };
+  targetTmuxSession?: string | null;
+  sessionKind?: "harness" | "relay-room" | "archived";
+  relayRoomId?: string;
+  // Phase 120 D-16 — app-leaf tuple, mirrors `Tab.app` from ui-types.ts.
+  // Present ONLY when input.type === "app". Plan 07's AppShell callsite
+  // invokes `specForTab({ type: "app", app: tab.app })`.
+  app?: { hostId: number; slug: string };
+  // File leaf — mirrors `Tab.file`; present ONLY when input.type === "file".
+  file?: { host: string; path: string; origin?: string | null };
+  // Desktop leaf — mirrors `Tab.desktop`; present ONLY when input.type === "desktop".
+  desktop?: { hostId: number; identityKey: string };
+}): TabSpec | null {
+  // Phase 97 Plan 05: relay-room tabs surface via sessionKind + relayRoomId.
+  // MUST come before the host-required check — relay tabs have no host.
+  if (input.sessionKind === "relay-room") {
+    if (!input.relayRoomId) return null;
+    return { protocol: "relay", roomId: input.relayRoomId };
+  }
+  // Phase 120 D-16: app tabs surface via input.type === "app" + the app
+  // tuple. MUST come before the host-required check — app tabs have no
+  // `host` object (the host is identified by hostId on the app tuple).
+  // Cast `Tab.app.hostId` (number) to string at the type-boundary to
+  // match TabSpec.app.hostId's textual wire shape.
+  if (input.type === "app") {
+    if (!input.app) return null;
+    return {
+      protocol: "app",
+      hostId: String(input.app.hostId),
+      slug: input.app.slug,
+    };
+  }
+  if (input.type === "file") {
+    if (!input.file) return null;
+    return input.file.origin
+      ? {
+          protocol: "file",
+          fileHost: input.file.host,
+          path: input.file.path,
+          origin: input.file.origin,
+        }
+      : { protocol: "file", fileHost: input.file.host, path: input.file.path };
+  }
+  if (input.type === "desktop") {
+    if (!input.desktop) return null;
+    return {
+      protocol: "desktop",
+      hostId: String(input.desktop.hostId),
+      identityKey: input.desktop.identityKey,
+    };
+  }
+  if (!input.host?.name) return null;
+  const host = input.host.name;
+  if (input.type === "terminal") {
+    if (input.sessionKind === "archived") {
+      return input.targetTmuxSession ? { protocol: "archived", host, session: input.targetTmuxSession } : null;
+    }
+    if (input.targetTmuxSession) {
+      return { protocol: "tmux", host, session: input.targetTmuxSession };
+    }
+    return { protocol: "terminal", host };
+  }
+  if (input.type === "rdp" || input.type === "vnc" || input.type === "telnet") {
+    return { protocol: input.type, host };
+  }
+  return null;
+}
+
+// Read the full workspace payload from the URL. Prefers hash form
+// (#tab=...&tab=...), falls back to query form (?tab=...) for legacy
+// bookmarks predating patch #25. Preserves ALL tab= values plus active
+// and only. Returns null if no tab param present.
+function readTabPayloadFromUrl(): string | null {
+  if (typeof window === "undefined") return null;
+
+  const build = (p: URLSearchParams): string | null => {
+    const tabs = p.getAll("tab");
+    if (tabs.length === 0) return null;
+    const out = new URLSearchParams();
+    for (const t of tabs) out.append("tab", t);
+    const active = p.get("active");
+    if (active !== null) out.set("active", active);
+    if (p.get("only") === "1") out.set("only", "1");
+    if (p.get("mv") === "1") out.set("mv", "1");
+    // Phase 56 Plan 02 — preserve the split-tree params through the
+    // sessionStorage snapshot pass so they survive replaceState during the
+    // auth flow (same rationale as the tab= / active= preservation above).
+    const s = p.get("s");
+    if (s !== null) out.set("s", s);
+    const tParam = p.get("t");
+    if (tParam !== null) out.set("t", tParam);
+    return out.toString();
+  };
+
+  const hash = window.location.hash;
+  if (hash.length > 1) {
+    const payload = build(new URLSearchParams(hash.slice(1)));
+    if (payload) return payload;
+  }
+  return build(new URLSearchParams(window.location.search));
+}
+
+// Called at module load in main.tsx BEFORE the React tree renders. Reads the
+// URL and stashes into sessionStorage so it survives every downstream
+// replaceState (auth flow, OIDC, etc.). sessionStorage is per-Chrome-tab, so a
+// browser with N Skynet tabs open holds N independent pending workspaces.
+export function snapshotPendingTab(): void {
+  if (typeof window === "undefined") return;
+  try {
+    const payload = readTabPayloadFromUrl();
+    if (payload) window.sessionStorage.setItem(STORAGE_KEY, payload);
+  } catch {
+    // sessionStorage may be blocked (private mode with strict setting) — the
+    // URL fallback in consumePendingWorkspace still works if the hash survives.
+  }
+}
+
+// Consumed once by AppShell after tabs are ready. Prefers sessionStorage
+// (which survives auth-flow URL-stripping), falls back to the current URL.
+// Returns the full workspace spec (or null if no tab param decoded).
+export function consumePendingWorkspace(): WorkspaceSpec | null {
+  if (typeof window === "undefined") return null;
+  let payload: string | null = null;
+  try {
+    payload = window.sessionStorage.getItem(STORAGE_KEY);
+    if (payload) window.sessionStorage.removeItem(STORAGE_KEY);
+  } catch {
+    // ignore
+  }
+  if (!payload) payload = readTabPayloadFromUrl();
+  if (!payload) return null;
+  const params = new URLSearchParams(payload);
+  const tabs = params.getAll("tab").map(parseTabParam).filter(
+    (t): t is TabSpec => t !== null,
+  );
+  if (tabs.length === 0) return null;
+  const ws: WorkspaceSpec = { tabs };
+  const activeRaw = params.get("active");
+  if (activeRaw !== null) {
+    const n = parseInt(activeRaw, 10);
+    if (Number.isFinite(n) && n >= 0 && n < tabs.length) {
+      ws.activeIndex = n;
+    }
+  }
+  if (params.get("only") === "1") ws.only = true;
+  // Phase 6 (mobile-flow.ts): `mv=1` means "the user is on the mobile view
+  // screen." Strict boolean coerce — only exact `1` counts. Absent, or any
+  // other value (including `0`, `yes`, `true`), parses to `mobileView: false`
+  // (via the field being undefined). See mobile-flow.ts for the reader path.
+  if (params.get("mv") === "1") ws.mobileView = true;
+  // Phase 56 Plan 02 — extract the split-tree `s=`/`t=` pair back out as an
+  // opaque round-trip string. BOTH are required; a URL with only one is
+  // malformed and the whole field is dropped (fail-safe null; the decoder
+  // in split-tree-url.ts returns null on that case anyway).
+  const sParam = params.get("s");
+  const tParam = params.get("t");
+  if (sParam !== null && tParam !== null) {
+    ws.splitTree = new URLSearchParams({ s: sParam, t: tParam }).toString();
+  }
+  return ws;
+}
+
+// Push a WorkspaceSpec into the URL fragment via replaceState (no history
+// entry). null clears any existing #tab=. Called from AppShell's URL-sync
+// effect on every tab-set / active-tab / tmux-session change.
+//
+// We use the fragment specifically because Chrome's window-restore code path
+// (Ctrl+Shift+T after closing a whole window) doesn't preserve replaceState'd
+// query params, but does preserve the fragment.
+//
+// Patch #132 Fix B: `mv=` semantics on write. mobile-flow.ts's
+// navigateToView / navigateToList are the AUTHORITATIVE writers of the
+// `mv=` flag. This writer's rule:
+//   - ws === null                 → strip mv= (clearing the whole workspace)
+//   - ws.mobileView === true      → set mv=1 (spec wins; supports URL restore)
+//   - ws.mobileView === false     → strip mv= (explicit clear)
+//   - ws.mobileView === undefined → PRESERVE whatever mv= is currently in
+//                                    the URL
+// The undefined-preserves-URL branch is what breaks the bounce race:
+// AppShell's URL sync effect passes `mobileView` as `mobileScreen === "view"
+// ? true : undefined`, and a transient `mobileScreen === "list"` no longer
+// strips a live mv=1 — it just doesn't touch it. mobile-flow retains
+// exclusive ownership of when mv= disappears.
+// Also PRESERVES current history.state instead of wiping it with `{}` — the
+// wipe used to clobber navigateToView's sentinel and force navigateToList
+// into its URL-rewrite fallback path (see mobile-flow.ts:119-149).
+export function writeWorkspaceToUrl(ws: WorkspaceSpec | null): void {
+  if (typeof window === "undefined") return;
+  const payload = ws && ws.tabs.length > 0 ? encodeWorkspaceSpec(ws) : "";
+  // Resolve final mv= per the rule table above.
+  let finalMv: "1" | null;
+  if (ws === null) {
+    finalMv = null;
+  } else if (ws.mobileView === true) {
+    finalMv = "1";
+  } else if (ws.mobileView === false) {
+    finalMv = null;
+  } else {
+    const currentHashParams = new URLSearchParams(
+      window.location.hash.slice(1),
+    );
+    finalMv = currentHashParams.get("mv") === "1" ? "1" : null;
+  }
+  // `encodeWorkspaceSpec` only emits mv=1 when ws.mobileView===true; reset
+  // via a fresh URLSearchParams pass so `finalMv` is authoritative.
+  let nextHash = "";
+  if (payload) {
+    const p = new URLSearchParams(payload);
+    p.delete("mv");
+    if (finalMv === "1") p.set("mv", "1");
+    nextHash = `#${p.toString()}`;
+  }
+  const currentHash = window.location.hash;
+  // Also strip any legacy ?tab= that might be lurking from a bookmarked pre-hash URL.
+  const params = new URLSearchParams(window.location.search);
+  params.delete("tab");
+  params.delete("active");
+  params.delete("only");
+  params.delete("mv");
+  // Phase 56 Plan 02 — strip any legacy `?s=` / `?t=` that might live in the
+  // query string from a bookmarked pre-hash URL. The split-tree lives in the
+  // fragment for the same window-restore reason `?tab=` does.
+  params.delete("s");
+  params.delete("t");
+  const qs = params.toString();
+  const nextSearch = qs ? `?${qs}` : "";
+  const nextUrl = window.location.pathname + nextSearch + nextHash;
+  if (currentHash === nextHash && window.location.search === nextSearch) return;
+  // Preserve existing history.state so navigateToView's sentinel survives.
+  window.history.replaceState(window.history.state, "", nextUrl);
+}

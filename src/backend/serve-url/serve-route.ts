@@ -1,0 +1,171 @@
+/**
+ * Phase 103 Plan 05 Task 2 — serveUrlHandler.
+ *
+ * Runs AFTER subdomain-dispatch has attached `req.serveTarget`. Composes:
+ *   tunnelCache.getOrCreate(target)  → tunnelPort (SSH tunnel setup)
+ *   getOrCreateProxyForTarget(target, tunnelPort) → RequestHandler
+ *   handler(req, res, next)          → http-proxy-middleware does the rest
+ *                                       (HTTP + WS + streaming body)
+ *
+ * On tunnel errors, classifies via the D-14 error taxonomy and renders a
+ * Skynet-styled interstitial (does NOT propagate a raw 502 to the browser).
+ *
+ * MUST NOT re-invoke the auth manager or permission manager here —
+ * subdomain-dispatch already validated JWT + canAccessHost per D-03.
+ *
+ * ---
+ *
+ * FAIL-LOUD env enforcement (W4 + D-23):
+ *
+ * Module-load reads `process.env.SKYNET_COOKIE_DOMAIN`. If unset, THROWS.
+ * NO hardcoded primary-domain fallback — each instance sets its own value
+ * sets its own value. Same source-of-truth as subdomain-dispatch.ts —
+ * kept as a duplicate module-load throw here (rather than routing through
+ * a shared config module) because both files independently need to fail
+ * loud, and a shared helper would just add indirection.
+ *
+ * ---
+ *
+ * Info-leak invariant (T-40-05):
+ *
+ * - `classifyTunnelError` uses ONLY err.code / err.level / err.name for
+ *   discrimination — NEVER the raw Error text body or stack.
+ * - Log context carries { errorClass, target, duration } — never the
+ *   underlying Error text body.
+ * - Interstitial bodies carry only the classified sentence + hostname + port
+ *   (per interstitial.ts's renderInterstitial signature which structurally
+ *   forbids passing an Error).
+ */
+
+import type { Request, Response, NextFunction } from "express";
+import { tunnelCache } from "./tunnel-cache.js";
+import {
+  getOrCreateAppDocumentProxyForTarget,
+  getOrCreateProxyForTarget,
+} from "./proxy-factory.js";
+import { handleAppHomeScreenRequest } from "./app-home-screen.js";
+import { renderInterstitial, writeInterstitial } from "./interstitial.js";
+import { sshLogger } from "../utils/logger.js";
+import { classifyTunnelError } from "./error-classifier.js";
+import type { ServeTarget } from "./types.js";
+
+/* ------------------------------------------------------------------------ */
+/*  Module-load fail-loud env check (W4 / D-23)                              */
+/* ------------------------------------------------------------------------ */
+
+const PRIMARY_DOMAIN = (() => {
+  const value = process.env.SKYNET_COOKIE_DOMAIN;
+  if (!value) {
+    throw new Error(
+      "serve-url serve-route: SKYNET_COOKIE_DOMAIN env var is required " +
+        "(per D-23; no hardcoded fallback — fail-loud per W4)",
+    );
+  }
+  return value;
+})();
+
+/* ------------------------------------------------------------------------ */
+/*  Types                                                                   */
+/* ------------------------------------------------------------------------ */
+
+type ServeRouteRequest = Request & {
+  serveTarget?: ServeTarget;
+};
+
+/* ------------------------------------------------------------------------ */
+/*  Handler                                                                 */
+/* ------------------------------------------------------------------------ */
+
+/**
+ * serveUrlHandler — consumed by database.ts's middleware chain immediately
+ * after createSubdomainDispatchMiddleware(). If dispatch attached a
+ * ServeTarget, we open (or reuse) a tunnel and proxy. Otherwise we
+ * fall-through to the next middleware.
+ */
+export async function serveUrlHandler(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  const routeReq = req as ServeRouteRequest;
+  const target = routeReq.serveTarget;
+  if (!target) {
+    // Defensive fall-through: dispatch chose not to attach a target
+    // (unknown/missing subdomain — request is for the primary Skynet
+    // frontend), or the mount order is wrong. Either way, hand off.
+    return next();
+  }
+
+  // An app's address answers its own home-screen icon + manifest paths
+  // without touching the app.
+  if (target.app && (await handleAppHomeScreenRequest(req, res, target.app, target.host))) {
+    return;
+  }
+
+  const startEpoch = Date.now();
+  const cacheKey = `${target.hostname}:${target.port}`;
+
+  // Wire the success log BEFORE invoking the proxy middleware — the
+  // http-proxy-middleware handler will pipe request → upstream → response
+  // asynchronously, so the listener must be attached before dispatch or a
+  // fast-completing response could fire finish before we register.
+  res.on("finish", () => {
+    sshLogger.info("serve-url proxy: ok", {
+      operation: "serve_url_proxy",
+      target: cacheKey,
+      status: res.statusCode,
+      duration: Date.now() - startEpoch,
+    });
+  });
+
+  let tunnelPort: number;
+  try {
+    const instance = await tunnelCache.getOrCreate(target);
+    tunnelPort = instance.tunnelPort;
+  } catch (err) {
+    const errorClass = classifyTunnelError(err);
+    sshLogger.warn("serve-url proxy: tunnel-error", {
+      operation: "serve_url_proxy",
+      target: cacheKey,
+      errorClass,
+      duration: Date.now() - startEpoch,
+    });
+    // Compute originalUrl for the "Try again" anchor. The Host header
+    // reflects Caddy's forwarded {host}, matching what the browser
+    // requested. Fall back to a domain-less URL if Host is absent (test
+    // environments).
+    const hostHeader = req.headers.host ?? "";
+    const originalUrl = hostHeader
+      ? `https://${hostHeader}${req.originalUrl}`
+      : req.originalUrl;
+    const result = renderInterstitial(
+      errorClass,
+      target,
+      originalUrl,
+      PRIMARY_DOMAIN,
+    );
+    writeInterstitial(res, result);
+    return;
+  }
+
+  // Tunnel is up. Hand the request to http-proxy-middleware. The
+  // middleware is cached per (target, tunnelPort) in proxy-factory so
+  // repeated requests to the same target reuse the same instance (required
+  // per R&D GOTCHA 2). It handles HTTP + WS upgrade + streaming from here.
+  // Page navigations on an app's address get the home-screen <head> lines;
+  // everything else (assets, data, live connections) takes the plain proxy.
+  const proxyMiddleware =
+    target.app && isPageNavigation(req)
+      ? getOrCreateAppDocumentProxyForTarget(target, tunnelPort)
+      : getOrCreateProxyForTarget(target, tunnelPort);
+  proxyMiddleware(req, res, next);
+}
+
+/** A top-level page load: Sec-Fetch-Dest says so, or (older browsers) a GET
+ *  that accepts HTML. fetch()/XHR HTML fragments are never touched. */
+function isPageNavigation(req: Request): boolean {
+  if (req.method !== "GET") return false;
+  const dest = req.headers["sec-fetch-dest"];
+  if (typeof dest === "string" && dest.length > 0) return dest === "document";
+  return String(req.headers.accept ?? "").includes("text/html");
+}

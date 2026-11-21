@@ -1,0 +1,598 @@
+// ─── App tiles store (Phase 119 Plan 119-02 — sidebar apps surface) ─────────
+// Standalone client-side subscription slice for the Phase 118 app-registry
+// channel. Consumes the three app frames dispatched by fleet-status-client
+// (app-snapshot / app-update / app-gone — see fleet-status-client.ts cases
+// added by 119-01) and exposes a sorted `useAppTiles()` reader hook that
+// PrettyConversationsPanel's new "Apps" section (119-04) will consume.
+//
+// D-14 (atomic reconciliation): every frame triggers a full re-render via
+//   useSyncExternalStore's notify chain. Store mutation is atomic per frame
+//   — publishAppSnapshot clears-and-repopulates in one map replacement,
+//   publishAppUpdate mutates one key in a fresh map, publishAppGone deletes
+//   one key from a fresh map. No partial states, no throttling, no batching.
+//
+// D-15 (stable sort): alphabetical by title with `${hostId}:${slug}` tiebreak,
+//   case-insensitive locale-aware via
+//   `String.prototype.localeCompare(other, undefined, { sensitivity: "base" })`.
+//   Same sort applies to healthy + unhealthy tiles — no health-based grouping.
+//   Tiebreak matters (Pitfall 6 from 117-RESEARCH.md): frames arrive
+//   unordered; two apps with the same title on different hosts would swap
+//   positions on every re-sort without a total order.
+//
+// D-16 (standalone slice): NOT bolted onto conversation-store, identities-
+//   store, session-working-store, or any other pre-existing state module.
+//   Different data axis, different lifecycle — mixing surfaces is where
+//   regressions hide.
+//
+// D-17 (localStorage seed for cold-boot paint — REVERSED from original
+//   in-memory-only design): the store seeds `state.map` from
+//   `APP_TILES_CACHE_KEY` at module load, so a page refresh paints tiles
+//   from the last-known snapshot BEFORE the fleet-status WS first frame
+//   arrives. First `app-snapshot` from the WS is still authoritative and
+//   replaces the seeded map wholesale — cache is a paint hint, not a
+//   source of truth. `notify()` writes the current tile list back to
+//   localStorage on every state change, so the cache is always as fresh
+//   as the last-received frame. Silent on read/write failure (mirrors
+//   identities-store appearance-cache pattern).
+//
+// Snapshot semantics (per 117-RESEARCH.md open question 3, RESOLVED):
+//   Treat `app-snapshot` as an authoritative full-list replacement, not a
+//   merge. If an `app-update` races ahead of `app-snapshot` on a fresh
+//   subscription, the snapshot overwrites.
+//
+// Store shape mirrors src/ui/state/session-working-store.ts —
+//   module-scoped `state: { map }`, `snapshotVersion` counter, `Set<() => void>`
+//   of listeners, `notify()` bumps version + fans out, `subscribe(cb)` returns
+//   a disposer. Persistence layer per D-17.
+
+import { useMemo, useSyncExternalStore } from "react";
+import type { AppState } from "../api/fleet-status-types.js";
+import {
+  readUserScopedCache,
+  writeUserScopedCache,
+} from "@/state/user-scoped-cache";
+
+// Storage key for the app-tiles cold-boot cache read at module load and
+// written on every state-change notify(). Bump the version suffix on any
+// schema change to AppState (avoids reading a stale-shape cache into an
+// incompatible reader).
+//
+// Bumped v1 → v2 to add the owner-tag wrapper. Pre-v2 payloads were a bare
+// AppState[] with no owner tag, which allowed user A's app tiles (visible
+// via backend access checks) to flash in user B's sidebar during a
+// logout → login-as-different-user flow on the same browser.
+const APP_TILES_CACHE_KEY = "skynet:app-tiles-cache:v2";
+const APP_TILES_CACHE_LEGACY_KEYS = ["skynet:app-tiles-cache:v1"];
+
+// ─── Internal state ─────────────────────────────────────────────────────────
+
+type State = {
+  // Key: `${hostId}:${slug}` — the compound identifier the wire protocol uses.
+  map: Map<string, AppState>;
+};
+
+// Module-load seed from localStorage: paint tiles on cold refresh BEFORE
+// the fleet-status WS first-frame arrives (D-17). Empty / missing /
+// malformed cache falls back to the empty initial state; readAppTilesCache
+// is silent by contract.
+let state: State = (() => {
+  const cached = readAppTilesCache();
+  const map = new Map<string, AppState>();
+  for (const app of cached) {
+    map.set(`${app.hostId}:${app.slug}`, app);
+  }
+  return { map };
+})();
+
+let snapshotVersion = 0;
+
+const listeners = new Set<() => void>();
+
+// Pending-archive filter: composite `${hostId}:${slug}` keys for apps whose
+// archive was just fired from the sidebar. AppTile's Archive click drops the
+// tile via publishAppGone immediately after firing archiveApp, but the app
+// keeps appearing in the backend's app-snapshot / app-update frames until
+// the supervisor's next sweep tick moves the app folder. Without this filter
+// the next `app-update` frame's publishAppUpdate would re-insert the tile
+// (visual flicker-back). Mirrors the pendingArchiveKeys pattern in
+// conversation-store for identity archive.
+//
+// Lifecycle — the mark must not outlive the archive, or a later un-archive /
+// same-slug re-create stays invisible in this tab until reload:
+//   - cleared on archive-failure rollback (clearPendingAppArchive)
+//   - cleared on a backend `app-gone` frame (AppShell onAppGone)
+//   - cleared when an app-snapshot no longer contains the app
+//   - cleared when an un-archive of the same app succeeds
+//   - expires after PENDING_APP_ARCHIVE_TTL_MS as a backstop
+// Value = expiry epoch-ms. Module-scope, in-memory only.
+export const PENDING_APP_ARCHIVE_TTL_MS = 2 * 60 * 1000;
+const pendingAppArchiveKeys = new Map<string, number>();
+
+function pendingAppArchiveKey(hostId: string, slug: string): string {
+  return `${hostId}:${slug}`;
+}
+
+function isPendingAppArchive(key: string): boolean {
+  if (pendingAppArchiveKeys.size === 0) return false;
+  const expiresAt = pendingAppArchiveKeys.get(key);
+  if (expiresAt === undefined) return false;
+  if (Date.now() >= expiresAt) {
+    pendingAppArchiveKeys.delete(key);
+    console.warn({
+      operation: "pending_app_archive_expired",
+      key,
+      ttlMs: PENDING_APP_ARCHIVE_TTL_MS,
+    });
+    return false;
+  }
+  return true;
+}
+
+export function markPendingAppArchive(hostId: string, slug: string): void {
+  pendingAppArchiveKeys.set(
+    pendingAppArchiveKey(hostId, slug),
+    Date.now() + PENDING_APP_ARCHIVE_TTL_MS,
+  );
+}
+
+export function clearPendingAppArchive(hostId: string, slug: string): void {
+  pendingAppArchiveKeys.delete(pendingAppArchiveKey(hostId, slug));
+}
+
+// Pending-title overrides (app-rename shape): `${hostId}:${slug}` → title the
+// user just typed. AppTile's Rename applies the new title immediately via
+// setPendingAppTitle, but the backend keeps sending the OLD title in
+// app-snapshot / app-update frames until the host sweep re-reads app.json.
+// Every incoming frame for an overridden key gets its title replaced by the
+// override; the override clears itself the first time a frame arrives that
+// already carries the new title (the sweep caught up), or on rename-failure
+// rollback via clearPendingAppTitle. In-memory only — a reload drops it,
+// by which point the sweep has long since caught up.
+const pendingAppTitles = new Map<string, string>();
+
+/**
+ * Apply an incoming frame against the pending-title overrides. Returns the
+ * AppState to store (title replaced while the override is still pending).
+ */
+function applyPendingTitle(app: AppState): AppState {
+  const key = `${app.hostId}:${app.slug}`;
+  const pending = pendingAppTitles.get(key);
+  if (pending === undefined) return app;
+  if (app.title === pending) {
+    pendingAppTitles.delete(key);
+    return app;
+  }
+  return { ...app, title: pending };
+}
+
+/**
+ * Optimistically retitle one tile. No-op on the store map if the tile isn't
+ * present (the override still applies to later frames).
+ */
+export function setPendingAppTitle(hostId: string, slug: string, title: string): void {
+  const key = `${hostId}:${slug}`;
+  pendingAppTitles.set(key, title);
+  const current = state.map.get(key);
+  if (!current || current.title === title) return;
+  const nextMap = new Map(state.map);
+  nextMap.set(key, { ...current, title });
+  state = { map: nextMap };
+  notify();
+}
+
+/**
+ * Roll back an optimistic retitle: drop the override and restore
+ * `previousTitle` on the tile (if it's still showing the override). The next
+ * fleet-status frame is authoritative either way.
+ */
+export function clearPendingAppTitle(
+  hostId: string,
+  slug: string,
+  previousTitle: string,
+): void {
+  const key = `${hostId}:${slug}`;
+  const pending = pendingAppTitles.get(key);
+  pendingAppTitles.delete(key);
+  const current = state.map.get(key);
+  if (!current || pending === undefined || current.title !== pending) return;
+  const nextMap = new Map(state.map);
+  nextMap.set(key, { ...current, title: previousTitle });
+  state = { map: nextMap };
+  notify();
+}
+
+// Pending-move overrides (project-scoped apps): `${hostId}:${slug}` → where
+// the user just moved the app (a project slug, or null for the sidebar). The
+// machine carries the move out on its next tick (~15s) and the sweep reports
+// it after that, so Move to shows the app in its new place immediately and
+// every frame still describing the old place is shown as the new one. The
+// override clears itself on the first frame that already agrees, after
+// PENDING_MOVE_TTL_MS (a move the machine refused — the app goes back to
+// where it really is), or on request failure via clearPendingAppMove. Generous:
+// on a busy machine the move can wait behind other app work for a minute or two.
+const PENDING_MOVE_TTL_MS = 300_000;
+const pendingAppMoves = new Map<string, { project: string | null; at: number }>();
+
+function applyPendingMove(app: AppState): AppState {
+  const key = `${app.hostId}:${app.slug}`;
+  const pending = pendingAppMoves.get(key);
+  if (pending === undefined) return app;
+  const arrived = (app.owner ?? null) === null && (app.project ?? null) === pending.project;
+  if (arrived || Date.now() - pending.at > PENDING_MOVE_TTL_MS) {
+    pendingAppMoves.delete(key);
+    return app;
+  }
+  return { ...app, owner: null, project: pending.project };
+}
+
+function applyPending(app: AppState): AppState {
+  return applyPendingMove(applyPendingTitle(app));
+}
+
+/** Optimistically show an app in its new place: a project, or the sidebar (null). */
+export function setPendingAppMove(hostId: string, slug: string, project: string | null): void {
+  const key = `${hostId}:${slug}`;
+  pendingAppMoves.set(key, { project, at: Date.now() });
+  const current = state.map.get(key);
+  if (!current) return;
+  const nextMap = new Map(state.map);
+  nextMap.set(key, { ...current, owner: null, project });
+  state = { map: nextMap };
+  notify();
+}
+
+/** Roll back an optimistic move: the app goes back to `previous`. */
+export function clearPendingAppMove(
+  hostId: string,
+  slug: string,
+  previous: { owner: string | null; project: string | null },
+): void {
+  const key = `${hostId}:${slug}`;
+  pendingAppMoves.delete(key);
+  const current = state.map.get(key);
+  if (!current) return;
+  const nextMap = new Map(state.map);
+  nextMap.set(key, { ...current, owner: previous.owner, project: previous.project });
+  state = { map: nextMap };
+  notify();
+}
+
+function notify(): void {
+  // Single-authority cache write: every state change that reaches listeners
+  // also updates the localStorage cache so the next cold paint has the
+  // freshest tile list to seed from. Silent on write failure by contract.
+  writeAppTilesCache(Array.from(state.map.values()));
+  snapshotVersion += 1;
+  for (const l of listeners) l();
+}
+
+function subscribe(cb: () => void): () => void {
+  listeners.add(cb);
+  return () => {
+    listeners.delete(cb);
+  };
+}
+
+/**
+ * Public subscribe API for cross-store bridges + tests. Mirrors
+ * `subscribeSessionWorkingStore` from session-working-store.ts. Returns a
+ * disposer that removes the listener from the module-scoped Set.
+ *
+ * Consumers should prefer the `useAppTiles()` hook (which uses
+ * useSyncExternalStore under the hood) over calling this directly.
+ */
+export function subscribeAppTilesStore(cb: () => void): () => void {
+  return subscribe(cb);
+}
+
+// ─── Publish fns ────────────────────────────────────────────────────────────
+
+/**
+ * Snapshot-as-full-list replacement (D-14).
+ *
+ * Builds a fresh Map from the incoming list (keyed by `${hostId}:${slug}`),
+ * replaces the module-scoped state atomically, and notifies subscribers. Any
+ * prior tiles NOT present in `apps` are dropped — this is the load-bearing
+ * "snapshot = authoritative full picture" contract that Phase 118's
+ * subscription registry emits on subscribe and on every reconnect.
+ *
+ * Notifies on any change, including the transition from "some tiles" to
+ * "no tiles" (a meaningful re-render for the sidebar — empty-expanded state
+ * renders the D-04 prompt). A snapshot identical to the current map (same
+ * keys, every tile field-equal) is a no-op.
+ */
+export function publishAppSnapshot(apps: AppState[]): void {
+  console.info({
+    operation: "app_tiles_store_snapshot",
+    appCount: apps.length,
+  });
+
+  const nextMap = new Map<string, AppState>();
+  const presentKeys = new Set<string>();
+  for (const app of apps) {
+    const key = pendingAppArchiveKey(app.hostId, app.slug);
+    presentKeys.add(key);
+    // Pending-archive filter: skip apps whose archive was fired but the
+    // supervisor hasn't yet moved the folder. Without this, an app-snapshot
+    // arriving mid-window would re-insert the tile the user just archived.
+    if (isPendingAppArchive(key)) continue;
+    const next = applyPending(app);
+    const current = state.map.get(key);
+    // Keep the stored object when nothing changed so tile identity is stable.
+    nextMap.set(key, current !== undefined && appStateEqual(current, next) ? current : next);
+  }
+  // A full snapshot that no longer carries a pending app means the archive
+  // completed backend-side — release the mark.
+  for (const key of [...pendingAppArchiveKeys.keys()]) {
+    if (!presentKeys.has(key)) pendingAppArchiveKeys.delete(key);
+  }
+  // Identical snapshot (e.g. a reconnect re-sending the same list): same
+  // keys and every tile reused above → nothing to re-render.
+  if (nextMap.size === state.map.size) {
+    let same = true;
+    for (const [key, tile] of nextMap) {
+      if (state.map.get(key) !== tile) {
+        same = false;
+        break;
+      }
+    }
+    if (same) return;
+  }
+  state = { map: nextMap };
+  notify();
+}
+
+/**
+ * Field-wise equality over every AppState field (all primitives). Used to
+ * drop no-op frames: the backend re-sends unchanged app-update frames on a
+ * loop (~hundreds per app per hour), and each notify re-rendered every
+ * useAppTiles consumer. A health flip, retitle, icon bump etc. changes at
+ * least one field, so it still notifies.
+ */
+function appStateEqual(a: AppState, b: AppState): boolean {
+  return (
+    a.hostId === b.hostId &&
+    // A frame that fills in the machine id over a tile cached without it
+    // must land, or app links naming the machine keep missing the tile.
+    (a.machineId ?? null) === (b.machineId ?? null) &&
+    a.slug === b.slug &&
+    a.title === b.title &&
+    a.description === b.description &&
+    a.port === b.port &&
+    a.hasIcon === b.hasIcon &&
+    (a.iconVersion ?? null) === (b.iconVersion ?? null) &&
+    a.createdAtMs === b.createdAtMs &&
+    a.isHealthy === b.isHealthy &&
+    a.healthMessage === b.healthMessage &&
+    // convo-scoped apps: owner decides sidebar vs conversation, so a frame
+    // that changes it (or fills it in over a cached tile) must not be
+    // dropped as a no-op. Absent and null are the same (sidebar app).
+    (a.owner ?? null) === (b.owner ?? null) &&
+    // project-scoped apps: same for the project (a Move to changes it).
+    (a.project ?? null) === (b.project ?? null) &&
+    (a.asleep ?? null) === (b.asleep ?? null)
+  );
+}
+
+/**
+ * Upsert one tile on the atomic reconcile path (D-14).
+ *
+ * Clones the current map, sets the `${hostId}:${slug}` key to the incoming
+ * AppState (overwriting any prior value for the same key), replaces state,
+ * notifies. Identical frames (every field equal to the stored tile, after
+ * the pending-title override) are a silent no-op — no log, no notify — so
+ * a health flip still re-renders but the backend's unchanged re-sends cost
+ * nothing.
+ */
+export function publishAppUpdate(app: AppState): void {
+  const key = `${app.hostId}:${app.slug}`;
+  if (isPendingAppArchive(key)) return;
+  const next = applyPending(app);
+  const current = state.map.get(key);
+  if (current !== undefined && appStateEqual(current, next)) return;
+  console.info({
+    operation: "app_tiles_store_update",
+    hostId: app.hostId,
+    slug: app.slug,
+    isHealthy: app.isHealthy,
+  });
+
+  const nextMap = new Map(state.map);
+  nextMap.set(key, next);
+  state = { map: nextMap };
+  notify();
+}
+
+/**
+ * Delete one tile on the atomic reconcile path (D-14).
+ *
+ * Early-returns without notifying when the key is absent — matches the
+ * server-side SubscriptionRegistry.publishAppGone shape (no-op on unknown
+ * keys) and prevents double-delete churn from sweep restart cycles or racing
+ * frames. When the key exists, clones the current map, deletes, replaces
+ * state, notifies.
+ */
+export function publishAppGone(hostId: string, slug: string): void {
+  const key = `${hostId}:${slug}`;
+  if (!state.map.has(key)) return; // no-op
+
+  console.info({
+    operation: "app_tiles_store_gone",
+    hostId,
+    slug,
+  });
+
+  const nextMap = new Map(state.map);
+  nextMap.delete(key);
+  state = { map: nextMap };
+  notify();
+}
+
+// ─── Reader hook ────────────────────────────────────────────────────────────
+
+function getMapSnapshot(): ReadonlyMap<string, AppState> {
+  return state.map;
+}
+
+/**
+ * React hook — subscribe to the sorted app-tile list.
+ *
+ * Returns an array of AppState sorted by title (case-insensitive,
+ * locale-aware) with a `${hostId}:${slug}` tiebreak per D-15. Same sort
+ * applies to healthy and unhealthy tiles — no grouping.
+ *
+ * useSyncExternalStore semantics: the identity of the returned Map changes
+ * on every mutation (publish fns replace `state.map` wholesale), so the
+ * useMemo below recomputes the sorted array on every publish. Between
+ * publishes the memo returns the cached array — stable identity for
+ * downstream React children that memoise on the tiles reference.
+ */
+export function useAppTiles(): AppState[] {
+  const snapshot = useSyncExternalStore(
+    subscribe,
+    getMapSnapshot,
+    getMapSnapshot,
+  );
+  return useMemo(() => {
+    return Array.from(snapshot.values()).sort((a, b) => {
+      // Primary: title compared case-insensitively via `sensitivity: "base"`
+      // (per D-15 — matches user expectation that "apple" and "Apple" sort
+      // together, and that "Banana" falls between "apple" and "cherry").
+      const t = a.title.localeCompare(b.title, undefined, {
+        sensitivity: "base",
+      });
+      if (t !== 0) return t;
+      // Tiebreak: full compound key. Prevents Pitfall 6 sort thrash — two
+      // apps with the same title on different hosts stay in stable order
+      // across every re-sort.
+      return `${a.hostId}:${a.slug}`.localeCompare(`${b.hostId}:${b.slug}`);
+    });
+  }, [snapshot]);
+}
+
+// Suppress "declared but never read" for snapshotVersion (bumped by notify()).
+void snapshotVersion;
+
+// ─── Cache read/write ───────────────────────────────────────────────────────
+
+function isCachedAppState(x: unknown): x is AppState {
+  if (!x || typeof x !== "object") return false;
+  const r = x as Record<string, unknown>;
+  if (typeof r.hostId !== "string") return false;
+  if (r.machineId != null && typeof r.machineId !== "string") return false;
+  if (typeof r.slug !== "string") return false;
+  if (typeof r.title !== "string") return false;
+  if (typeof r.description !== "string") return false;
+  if (r.port !== null && typeof r.port !== "number") return false;
+  if (typeof r.hasIcon !== "boolean") return false;
+  if (r.iconVersion != null && typeof r.iconVersion !== "string") return false;
+  if (typeof r.createdAtMs !== "number") return false;
+  if (typeof r.isHealthy !== "boolean") return false;
+  if (r.healthMessage !== null && typeof r.healthMessage !== "string")
+    return false;
+  if (r.owner != null && typeof r.owner !== "string") return false;
+  if (r.project != null && typeof r.project !== "string") return false;
+  return true;
+}
+
+export function readAppTilesCache(): AppState[] {
+  try {
+    // v2: owner-tagged — mismatch returns null + clears the key.
+    const parsed = readUserScopedCache<unknown>(
+      APP_TILES_CACHE_KEY,
+      APP_TILES_CACHE_LEGACY_KEYS,
+    );
+    if (!Array.isArray(parsed)) return [];
+    const valid: AppState[] = [];
+    for (const item of parsed) {
+      if (isCachedAppState(item)) {
+        // Defensive per-field pick — only canonical fields make it back into
+        // memory even if a future writer accidentally serialized more.
+        valid.push({
+          hostId: item.hostId,
+          ...(item.machineId != null ? { machineId: item.machineId } : {}),
+          slug: item.slug,
+          title: item.title,
+          description: item.description,
+          port: item.port,
+          hasIcon: item.hasIcon,
+          iconVersion: item.iconVersion ?? null,
+          createdAtMs: item.createdAtMs,
+          isHealthy: item.isHealthy,
+          healthMessage: item.healthMessage,
+          // convo-scoped apps: without the owner a cached conversation app
+          // would render as a sidebar tile until the next live frame.
+          owner: item.owner ?? null,
+          // project-scoped apps: likewise for a project app.
+          project: item.project ?? null,
+        });
+      }
+    }
+    return valid;
+  } catch {
+    return [];
+  }
+}
+
+export function writeAppTilesCache(list: AppState[]): void {
+  try {
+    if (typeof localStorage === "undefined") return;
+    const canonical = list.map((a) => ({
+      hostId: a.hostId,
+      ...(a.machineId != null ? { machineId: a.machineId } : {}),
+      slug: a.slug,
+      title: a.title,
+      description: a.description,
+      port: a.port,
+      hasIcon: a.hasIcon,
+      iconVersion: a.iconVersion ?? null,
+      createdAtMs: a.createdAtMs,
+      isHealthy: a.isHealthy,
+      healthMessage: a.healthMessage,
+      owner: a.owner ?? null,
+      project: a.project ?? null,
+    }));
+    writeUserScopedCache(APP_TILES_CACHE_KEY, canonical);
+  } catch {
+    // Silent — cache write failure is non-fatal.
+  }
+}
+
+// ─── Test-only helpers ──────────────────────────────────────────────────────
+
+/**
+ * Reset the store to an empty Map + bump version + notify. Used by
+ * app-tiles-store.test.ts's `beforeEach` so each test starts from a
+ * known-empty state. Also clears the localStorage cache so cross-test
+ * bleed via seed-on-load can't happen. NOT a public API.
+ */
+export function __resetForTest(): void {
+  try {
+    if (typeof localStorage !== "undefined") {
+      localStorage.removeItem(APP_TILES_CACHE_KEY);
+    }
+  } catch {
+    // Silent.
+  }
+  pendingAppTitles.clear();
+  pendingAppMoves.clear();
+  pendingAppArchiveKeys.clear();
+  state = { map: new Map<string, AppState>() };
+  notify();
+}
+
+/**
+ * Re-run the module-load cache seed after tests have populated localStorage.
+ * Production callers rely on the IIFE at module init; tests can't easily
+ * control that timing (module loads once per file), so this helper exposes
+ * the same seed logic on demand.
+ */
+export function __seedFromCacheForTest(): void {
+  const cached = readAppTilesCache();
+  const map = new Map<string, AppState>();
+  for (const app of cached) {
+    map.set(`${app.hostId}:${app.slug}`, app);
+  }
+  state = { map };
+  notify();
+}

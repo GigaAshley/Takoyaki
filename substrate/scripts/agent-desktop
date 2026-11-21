@@ -1,0 +1,690 @@
+#!/usr/bin/env bash
+# agent-desktop — per-identity virtual desktop (Xvnc + openbox) for GUI work.
+#
+# Canonical copy lives in the app's source repo at substrate/scripts/agent-desktop and
+# is distributed to every managed host by the fleet-substrate distributor (see
+# src/backend/distributor/catalog.ts). Installed per-box at
+# ~/.local/bin/agent-desktop. Do NOT hand-edit the installed copy.
+#
+# Each identity gets its own X display, served by TigerVNC's Xvnc (one process
+# that is both the virtual framebuffer and the VNC server) with openbox as the
+# window manager. The display number is allocated once and kept stable, so the
+# VNC port (15900 + display) is predictable for the backend.
+#
+# Lifecycle is owned by the templated systemd user unit
+# agent-desktop@<identity>.service (ExecStart = `agent-desktop serve <identity>`),
+# so a crashed desktop restarts and `systemctl --user stop` reaps it. Boxes
+# without a usable systemd user manager fall back to a detached process.
+#
+# Usage:
+#   agent-desktop up      [--identity NAME] [--quiet]   # start (idempotent); prints DISPLAY=:N
+#   agent-desktop down    [--identity NAME]             # stop
+#   agent-desktop status  [--identity NAME] [--json]    # running? display, port, geometry
+#   agent-desktop env     [--identity NAME]             # prints DISPLAY=:N (no start)
+#   agent-desktop run     [--identity NAME] -- CMD...   # launch an app on the desktop (detached)
+#   agent-desktop control take|release [--identity NAME] [--by WHO]  # human control lease
+#   agent-desktop browser up|down [--identity NAME] [--quiet]  # the desktop's browser (up prints BROWSER_SOCKET=...)
+#   agent-desktop serve   NAME                          # internal: foreground server (systemd ExecStart)
+#
+# The identity defaults to $FLEET_IDENTITY (exported by agent-supervisor into
+# every claude launch).
+#
+# Per-identity state: ~/fleet/identities/<name>/desktop/
+#   display        allocated display number (stable across restarts)
+#   geometry       screen size, fixed at first allocation (default 1280x800)
+#   vnc-passwd     VNC password file (vncpasswd -f format), mode 600
+#   vnc-password   same password in plain text, mode 600 — read by the
+#                  backend to open the Guacamole VNC connection
+#   control-lock   a human has taken control: a LEASE, live only while its
+#                  mtime is under CONTROL_LEASE_SECONDS old. The viewer renews
+#                  it (`control take` again) every 30s; a closed tab simply
+#                  stops renewing and the agent gets the desktop back. (desktop-mcp
+#                  refuses input actions while it exists)
+#   serve.pid      pid of the `serve` process (fallback mode)
+#   serve.log      server + window-manager output
+#   apps.log       output of apps launched via `agent-desktop run`
+#   browser.pid    pid of the browser host (fallback mode)
+#   browser.sock   the browser host's socket (desktop-mcp connects here)
+#   browser.log    browser host + Playwright output
+#   browser-profile/, browser-output/   Chromium profile (sign-ins) and Playwright output
+#
+# Browser: `browser up` starts the browser host (`desktop-mcp browser-host`), which runs
+# Playwright MCP (headed Chromium on this desktop) and serves it on browser.sock, so the
+# box-wide desktop-mcp can restart without closing anyone's tabs, and only this user can
+# reach it. Under systemd it is the transient unit agent-browser@<identity>.service, bound
+# to the desktop's unit: stopping the desktop (down, dormancy, archive) stops it.
+#
+# Env overrides (tests / operator tuning):
+#   AGENT_DESKTOP_GEOMETRY      screen size for NEW allocations (default 1280x800)
+#   AGENT_DESKTOP_BASE_DISPLAY  first display number to allocate (default 100)
+#   AGENT_DESKTOP_NO_SYSTEMD=1  never use systemd; always use the detached fallback
+#   AGENT_DESKTOP_START_TIMEOUT seconds to wait for the display to come up (default 20)
+#   AGENT_DESKTOP_BROWSER_START_TIMEOUT  seconds to wait for the browser host (default 300;
+#                               its first start may download the npm package)
+#   DESKTOP_MCP_PLAYWRIGHT_PKG  Playwright MCP package (default pinned below)
+#   DESKTOP_MCP_PLAYWRIGHT_CMD  command to run instead of `npx -y <pkg>` (tests: a fake)
+#   DESKTOP_BROWSER_EXECUTABLE  a browser binary to use instead of Playwright's own download
+#
+# Set flags: `-e` is intentionally NOT set (matches image-gen / agent-supervisor):
+# several probes below are expected to fail on the not-yet-running paths.
+
+set -uo pipefail
+
+FLEET_DIR="${HOME}/fleet"
+IDENTITIES_DIR="${FLEET_DIR}/identities"
+LOCK_FILE="${FLEET_DIR}/.agent-desktop.lock"
+DEFAULT_GEOMETRY="${AGENT_DESKTOP_GEOMETRY:-1280x800}"
+BASE_DISPLAY="${AGENT_DESKTOP_BASE_DISPLAY:-100}"
+START_TIMEOUT="${AGENT_DESKTOP_START_TIMEOUT:-20}"
+# VNC port = VNC_PORT_BASE + display. Not the classic 5900+N: with displays
+# starting at 100 that lands on 6000+, the X11-over-TCP range.
+VNC_PORT_BASE=15900
+# Must match CONTROL_LEASE_SECONDS in desktop-mcp.py.
+CONTROL_LEASE_SECONDS=90
+# Matches the browser host's own handshake limit (a first start may download the package).
+BROWSER_START_TIMEOUT="${AGENT_DESKTOP_BROWSER_START_TIMEOUT:-300}"
+# Pinned: tool names/shapes are part of the agent's contract (see the desktop
+# skill). Must match PLAYWRIGHT_MCP_PKG in desktop-mcp.py.
+PLAYWRIGHT_MCP_PKG="${DESKTOP_MCP_PLAYWRIGHT_PKG:-@playwright/mcp@0.0.83}"
+SELF="$(command -v agent-desktop 2>/dev/null || true)"
+[ -n "$SELF" ] || SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+die() { printf 'agent-desktop: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  sed -n '/^# Usage:/,/^# The identity defaults/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' | sed '$d' >&2
+}
+
+# ---- identity + state paths --------------------------------------------------
+
+identity=""
+resolve_identity() {
+  [ -n "$identity" ] || identity="${FLEET_IDENTITY:-}"
+  [ -n "$identity" ] || die "no identity: pass --identity NAME or set FLEET_IDENTITY"
+  # Identity names are slugs (spaces -> hyphens); refuse anything that could
+  # escape the identities dir or break a systemd instance name.
+  case "$identity" in
+    *[!A-Za-z0-9._-]*|.*) die "invalid identity name: '$identity'" ;;
+  esac
+  STATE_DIR="${IDENTITIES_DIR}/${identity}/desktop"
+  BROWSER_SOCK="$STATE_DIR/browser.sock"
+}
+
+# Refuse to (re)create state for an identity whose folder is gone (archived): a
+# late `up` or control-lease renewal would otherwise mkdir a stray
+# identities/<name>/desktop/ that blocks un-archive and hides an orphan desktop.
+require_live_identity() {
+  [ -f "${IDENTITIES_DIR}/${identity}/${identity}.md" ] \
+    || die "identity '$identity' does not exist (archived?)"
+}
+
+ensure_state_dir() {
+  mkdir -p "$STATE_DIR" || die "cannot create $STATE_DIR"
+  chmod 700 "$STATE_DIR" 2>/dev/null || true
+}
+
+read_display() { cat "$STATE_DIR/display" 2>/dev/null || true; }
+read_geometry() {
+  local g
+  g="$(cat "$STATE_DIR/geometry" 2>/dev/null || true)"
+  printf '%s' "${g:-$DEFAULT_GEOMETRY}"
+}
+
+# ---- display allocation ------------------------------------------------------
+
+# A display number is "taken" if another identity has claimed it, or if an X
+# server (ours or anyone's) holds its socket or lock file.
+display_claimed_by_other() {
+  local n="$1" f
+  for f in "$IDENTITIES_DIR"/*/desktop/display; do
+    [ -f "$f" ] || continue
+    [ "$f" = "$STATE_DIR/display" ] && continue
+    [ "$(cat "$f" 2>/dev/null)" = "$n" ] && return 0
+  done
+  return 1
+}
+display_in_use() {
+  local n="$1"
+  [ -e "/tmp/.X11-unix/X${n}" ] || [ -e "/tmp/.X${n}-lock" ]
+}
+
+# Allocate (or re-validate) this identity's display number under a box-wide
+# lock so two identities starting at once can't pick the same number.
+allocate_display() {
+  mkdir -p "$FLEET_DIR"
+  exec 9>"$LOCK_FILE"
+  flock -w 10 9 || die "timed out waiting for $LOCK_FILE"
+
+  local cur n
+  cur="$(read_display)"
+  if [ -n "$cur" ] && ! display_claimed_by_other "$cur"; then
+    # Keep the stable number unless a foreign X server now squats on it.
+    if ! display_in_use "$cur" || server_ready "$cur"; then
+      flock -u 9; exec 9>&-
+      return 0
+    fi
+  fi
+
+  n="$BASE_DISPLAY"
+  while display_claimed_by_other "$n" || display_in_use "$n"; do
+    n=$((n + 1))
+    [ "$n" -lt $((BASE_DISPLAY + 500)) ] || die "no free display number"
+  done
+  printf '%s\n' "$n" > "$STATE_DIR/display"
+  [ -f "$STATE_DIR/geometry" ] || printf '%s\n' "$DEFAULT_GEOMETRY" > "$STATE_DIR/geometry"
+  flock -u 9; exec 9>&-
+}
+
+ensure_password() {
+  [ -s "$STATE_DIR/vnc-passwd" ] && [ -s "$STATE_DIR/vnc-password" ] && return 0
+  local pw
+  # VNC auth only uses the first 8 characters.
+  pw="$(head -c 64 /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 8)"
+  [ "${#pw}" -eq 8 ] || die "could not generate a VNC password"
+  ( umask 077
+    printf '%s\n' "$pw" > "$STATE_DIR/vnc-password"
+    printf '%s\n' "$pw" | vncpasswd -f > "$STATE_DIR/vnc-passwd" ) || die "vncpasswd failed"
+}
+
+# ---- dependencies ------------------------------------------------------------
+
+missing_deps() {
+  local missing=()
+  command -v Xvnc      >/dev/null 2>&1 || missing+=(Xvnc)
+  command -v vncpasswd >/dev/null 2>&1 || missing+=(vncpasswd)
+  command -v openbox   >/dev/null 2>&1 || missing+=(openbox)
+  command -v xdotool   >/dev/null 2>&1 || missing+=(xdotool)
+  command -v import    >/dev/null 2>&1 || missing+=(import)
+  printf '%s\n' "${missing[@]}"
+}
+
+# Best-effort install in the shape of agent-supervisor's ensure_inotifywait:
+# only with non-interactive root, never prompts.
+ensure_deps() {
+  local missing
+  missing="$(missing_deps)"
+  [ -z "$missing" ] && return 0
+
+  local SUDO=""
+  if [ "$(id -u)" != 0 ]; then
+    sudo -n true 2>/dev/null || die "missing: ${missing//$'\n'/ } — install tigervnc-standalone-server tigervnc-tools openbox xdotool imagemagick"
+    SUDO="sudo -n"
+  fi
+  printf 'agent-desktop: installing desktop packages (one-time)...\n' >&2
+  if [ -e /run/ostree-booted ] && command -v rpm-ostree >/dev/null 2>&1; then
+    # Image-based Fedora (Bazzite, Bluefin, Silverblue): /usr is read-only and
+    # dnf can't install. Layer only what's missing — rpm-ostree refuses a
+    # package the base image already ships — and apply live, no reboot.
+    local pkgs=() m
+    for m in $missing; do
+      case "$m" in
+        Xvnc|vncpasswd) pkgs+=(tigervnc-server) ;;
+        openbox) pkgs+=(openbox) ;;
+        xdotool) pkgs+=(xdotool) ;;
+        import) pkgs+=(ImageMagick) ;;
+      esac
+    done
+    command -v xsetroot >/dev/null 2>&1 || pkgs+=(xsetroot)
+    # shellcheck disable=SC2046
+    $SUDO rpm-ostree install --idempotent --apply-live $(printf '%s\n' "${pkgs[@]}" | sort -u) >/dev/null 2>&1 </dev/null
+  elif command -v apt-get >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y -q --no-install-recommends \
+      tigervnc-standalone-server tigervnc-tools openbox xdotool imagemagick x11-xserver-utils >/dev/null 2>&1 </dev/null
+  elif command -v dnf >/dev/null 2>&1; then
+    $SUDO dnf install -y -q tigervnc-server openbox xdotool ImageMagick xsetroot >/dev/null 2>&1 </dev/null
+  fi
+  missing="$(missing_deps)"
+  [ -z "$missing" ] || die "missing after install attempt: ${missing//$'\n'/ }"
+}
+
+# ---- readiness ---------------------------------------------------------------
+
+server_ready() {
+  local n="$1"
+  [ -n "$n" ] || return 1
+  DISPLAY=":$n" timeout 3 xdotool getdisplaygeometry >/dev/null 2>&1
+}
+
+wait_ready() {
+  local n="$1" i=0
+  while [ "$i" -lt $((START_TIMEOUT * 4)) ]; do
+    server_ready "$n" && return 0
+    sleep 0.25
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# ---- systemd vs fallback -----------------------------------------------------
+
+use_systemd() {
+  [ "${AGENT_DESKTOP_NO_SYSTEMD:-0}" = 1 ] && return 1
+  command -v systemctl >/dev/null 2>&1 || return 1
+  [ -f "$HOME/.config/systemd/user/agent-desktop@.service" ] || return 1
+  systemctl --user show-environment >/dev/null 2>&1
+}
+
+unit_name() { printf 'agent-desktop@%s.service' "$(systemd-escape -- "$identity")"; }
+
+start_server() {
+  if use_systemd; then
+    systemctl --user start "$(unit_name)" || die "systemctl --user start $(unit_name) failed"
+  else
+    # Detached fallback: own session so it outlives the caller's shell.
+    setsid nohup "$SELF" serve "$identity" >>"$STATE_DIR/serve.log" 2>&1 < /dev/null &
+    disown 2>/dev/null || true
+  fi
+}
+
+stop_server() {
+  stop_browser
+  if use_systemd && systemctl --user is-active --quiet "$(unit_name)" 2>/dev/null; then
+    systemctl --user stop "$(unit_name)"
+  fi
+  local pid
+  pid="$(cat "$STATE_DIR/serve.pid" 2>/dev/null || true)"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>/dev/null
+    local i=0
+    while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 40 ]; do sleep 0.25; i=$((i + 1)); done
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
+  rm -f "$STATE_DIR/serve.pid"
+}
+
+# ---- browser server ----------------------------------------------------------
+
+browser_unit_name() { printf 'agent-browser@%s.service' "$(systemd-escape -- "$identity")"; }
+
+# The browser host's socket answers once Playwright MCP is up and initialized.
+browser_ready() {
+  [ -S "$BROWSER_SOCK" ] || return 1
+  python3 -c 'import socket, sys
+s = socket.socket(socket.AF_UNIX); s.settimeout(2); s.connect(sys.argv[1])' "$BROWSER_SOCK" 2>/dev/null
+}
+
+# Chromium's "Save password?" bubble (and the breached-password warning) covers the page
+# right after every sign-in, hiding what the agent is doing from anyone watching. Turn the
+# password manager off in the profile before each launch (and clear the crash-restore
+# bubble, below); merged in, so the rest of the
+# profile (sign-ins, other settings) is kept, and an existing profile is fixed on its next start.
+seed_browser_prefs() {
+  local prefs="$STATE_DIR/browser-profile/Default/Preferences"
+  mkdir -p "$(dirname "$prefs")"
+  python3 - "$prefs" <<'PY' || printf '%s agent-desktop: could not update browser prefs\n' "$(date -Is)" >>"$STATE_DIR/browser.log"
+import json, os, sys
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        prefs = json.load(f)
+    if not isinstance(prefs, dict):
+        prefs = {}
+except (OSError, ValueError):
+    prefs = {}
+prefs["credentials_enable_service"] = False
+prefs["credentials_enable_autosignin"] = False
+profile = prefs.get("profile") if isinstance(prefs.get("profile"), dict) else {}
+profile["password_manager_enabled"] = False
+profile["password_manager_leak_detection"] = False
+# The browser is always stopped by signal, so Chromium would otherwise open with a
+# "Restore pages?" bubble over the page after every restart.
+profile["exit_type"] = "Normal"
+profile["exited_cleanly"] = True
+prefs["profile"] = profile
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(prefs, f)
+os.replace(tmp, path)
+PY
+}
+
+start_browser() {
+  local n="$1" cwd argv=() host
+  seed_browser_prefs
+  host="$(command -v desktop-mcp 2>/dev/null || true)"
+  [ -n "$host" ] || host="$(dirname "$SELF")/desktop-mcp.py"
+  [ -f "$host" ] || die "desktop-mcp not found (needed to host the browser)"
+  if [ -n "${DESKTOP_MCP_PLAYWRIGHT_CMD:-}" ]; then
+    read -ra argv <<<"$DESKTOP_MCP_PLAYWRIGHT_CMD"
+  else
+    argv=(npx -y "$PLAYWRIGHT_MCP_PKG")
+  fi
+  argv+=(--browser chromium --user-data-dir "$STATE_DIR/browser-profile" --output-dir "$STATE_DIR/browser-output")
+  [ -n "${DESKTOP_BROWSER_EXECUTABLE:-}" ] && argv+=(--executable-path "$DESKTOP_BROWSER_EXECUTABLE")
+  argv=(python3 "$host" browser-host "$BROWSER_SOCK" -- "${argv[@]}")
+  cwd="${IDENTITIES_DIR}/${identity}/workspace"
+  [ -d "$cwd" ] || cwd="$STATE_DIR"
+  printf '%s agent-desktop: starting browser for %s on :%s\n' "$(date -Is)" "$identity" "$n" >>"$STATE_DIR/browser.log"
+  if use_systemd; then
+    # -p values are C-unescaped by systemd-run, so the desktop unit's own escapes
+    # (\x2d for each '-') must be doubled or it names (and starts) a different unit.
+    local desktop_unit
+    desktop_unit="$(unit_name)"
+    desktop_unit="${desktop_unit//\\/\\\\}"
+    # X11-only env, as in cmd_run: the user manager may carry a graphical login's Wayland setup.
+    systemd-run --user --quiet --collect --unit "$(browser_unit_name)" \
+      -p BindsTo="$desktop_unit" -p After="$desktop_unit" \
+      -p Restart=on-failure -p RestartSec=5 -p StartLimitIntervalSec=300 -p StartLimitBurst=5 \
+      -p UnsetEnvironment="WAYLAND_DISPLAY ELECTRON_OZONE_PLATFORM_HINT" \
+      -p StandardOutput="append:$STATE_DIR/browser.log" -p StandardError="append:$STATE_DIR/browser.log" \
+      --working-directory="$cwd" \
+      -E PATH="$PATH" -E DISPLAY=":$n" -E XDG_SESSION_TYPE=x11 -E GDK_BACKEND=x11 \
+      -E QT_QPA_PLATFORM=xcb -E MOZ_ENABLE_WAYLAND=0 -E SDL_VIDEODRIVER=x11 \
+      -- "${argv[@]}" || die "systemd-run $(browser_unit_name) failed"
+  else
+    # Only the host itself is backgrounded (not a subshell around it), so $! is its pid
+    # and nothing is left holding the caller's stdout open.
+    ( cd "$cwd" || exit 1
+      env -u WAYLAND_DISPLAY -u ELECTRON_OZONE_PLATFORM_HINT \
+        XDG_SESSION_TYPE=x11 GDK_BACKEND=x11 QT_QPA_PLATFORM=xcb MOZ_ENABLE_WAYLAND=0 SDL_VIDEODRIVER=x11 \
+        DISPLAY=":$n" setsid nohup "${argv[@]}" >>"$STATE_DIR/browser.log" 2>&1 < /dev/null 8>&- &
+      printf '%s\n' "$!" > "$STATE_DIR/browser.pid" )
+  fi
+}
+
+# The host process exists but isn't answering yet: it is still starting (handshake, maybe
+# an npm download). Not "activating" — that's a unit waiting to restart after a crash.
+browser_starting() {
+  if use_systemd; then
+    [ "$(systemctl --user is-active "$(browser_unit_name)" 2>/dev/null)" = active ]
+  else
+    local pid
+    pid="$(cat "$STATE_DIR/browser.pid" 2>/dev/null || true)"
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+  fi
+}
+
+stop_browser() {
+  if use_systemd; then
+    # Unconditional: a unit waiting to restart reports "activating", not active, and
+    # would block the next systemd-run of the same name.
+    systemctl --user stop "$(browser_unit_name)" >/dev/null 2>&1
+    systemctl --user reset-failed "$(browser_unit_name)" >/dev/null 2>&1
+  fi
+  local pid
+  pid="$(cat "$STATE_DIR/browser.pid" 2>/dev/null || true)"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    # Own session (setsid): the group takes Playwright and Chromium down with the host.
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+    local i=0
+    while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 40 ]; do sleep 0.25; i=$((i + 1)); done
+    kill -KILL -- "-$pid" 2>/dev/null || true
+  fi
+  rm -f "$STATE_DIR/browser.pid" "$BROWSER_SOCK"
+}
+
+cmd_browser() {
+  local action="${1:-}" quiet=0
+  [ $# -gt 0 ] && shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --identity) identity="${2:-}"; shift 2 ;;
+      --quiet)    quiet=1; shift ;;
+      *) die "browser: unknown argument '$1'" ;;
+    esac
+  done
+  resolve_identity
+  case "$action" in
+    up)
+      local disp n i=0
+      require_live_identity
+      ensure_state_dir
+      # One starter at a time per identity (the server, an older stdio session, the CLI),
+      # taken before the desktop start too so two first calls can't both start it.
+      exec 8>"$STATE_DIR/browser.lock"
+      flock -w $((BROWSER_START_TIMEOUT + 60)) 8 || die "timed out waiting for $STATE_DIR/browser.lock"
+      disp="$(cmd_up --identity "$identity" --quiet 8>&-)" || exit 1
+      n="${disp#DISPLAY=:}"
+      if ! browser_ready; then
+        if ! browser_starting; then
+          [ "$quiet" = 1 ] || printf 'agent-desktop: starting browser for %s\n' "$identity" >&2
+          stop_browser
+          start_browser "$n"
+        fi
+        until browser_ready; do
+          [ "$i" -lt $((BROWSER_START_TIMEOUT * 4)) ] || die "browser did not come up within ${BROWSER_START_TIMEOUT}s (see $STATE_DIR/browser.log)"
+          sleep 0.25
+          i=$((i + 1))
+        done
+      fi
+      printf 'BROWSER_SOCKET=%s\n' "$BROWSER_SOCK"
+      ;;
+    down)
+      [ -d "$STATE_DIR" ] || return 0
+      stop_browser
+      ;;
+    *) die "browser: expected up or down" ;;
+  esac
+}
+
+# ---- subcommands -------------------------------------------------------------
+
+cmd_up() {
+  local quiet=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --identity) identity="${2:-}"; shift 2 ;;
+      --quiet)    quiet=1; shift ;;
+      *) die "up: unknown argument '$1'" ;;
+    esac
+  done
+  resolve_identity
+  require_live_identity
+  ensure_state_dir
+
+  local n
+  n="$(read_display)"
+  if server_ready "$n"; then
+    printf 'DISPLAY=:%s\n' "$n"
+    return 0
+  fi
+
+  ensure_deps
+  allocate_display
+  ensure_password
+  n="$(read_display)"
+  [ "$quiet" = 1 ] || printf 'agent-desktop: starting desktop :%s for %s\n' "$n" "$identity" >&2
+  start_server
+  wait_ready "$n" || die "desktop :$n did not come up within ${START_TIMEOUT}s (see $STATE_DIR/serve.log)"
+  printf 'DISPLAY=:%s\n' "$n"
+}
+
+cmd_down() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --identity) identity="${2:-}"; shift 2 ;;
+      *) die "down: unknown argument '$1'" ;;
+    esac
+  done
+  resolve_identity
+  [ -d "$STATE_DIR" ] || return 0
+  stop_server
+}
+
+cmd_status() {
+  local json=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --identity) identity="${2:-}"; shift 2 ;;
+      --json)     json=1; shift ;;
+      *) die "status: unknown argument '$1'" ;;
+    esac
+  done
+  resolve_identity
+
+  local n running=false port="" geometry controlled=false
+  n="$(read_display)"
+  geometry="$(read_geometry)"
+  server_ready "$n" && running=true
+  [ -n "$n" ] && port=$((VNC_PORT_BASE + n))
+  control_live && controlled=true
+
+  if [ "$json" = 1 ]; then
+    jq -cn --arg id "$identity" --argjson running "$running" \
+      --arg display "$n" --arg port "$port" --arg geometry "$geometry" \
+      --argjson controlled "$controlled" \
+      '{identity:$id, running:$running,
+        display:(if $display=="" then null else ($display|tonumber) end),
+        vncPort:(if $port=="" then null else ($port|tonumber) end),
+        geometry:$geometry, userHasControl:$controlled}'
+  elif [ "$running" = true ]; then
+    printf 'running  DISPLAY=:%s  vnc=localhost:%s  %s%s\n' "$n" "$port" "$geometry" \
+      "$([ "$controlled" = true ] && printf '  (user has control)')"
+  else
+    printf 'stopped\n'
+  fi
+  [ "$running" = true ]
+}
+
+# Is a human's control lease present and fresh?
+control_live() {
+  local f="$STATE_DIR/control-lock" mtime
+  [ -f "$f" ] || return 1
+  mtime="$(stat -c %Y "$f" 2>/dev/null)" || return 1
+  [ $(( $(date +%s) - mtime )) -lt "$CONTROL_LEASE_SECONDS" ]
+}
+
+# Take (or renew) / release a human's control lease. The agent's desktop-mcp
+# refuses input while it is live.
+cmd_control() {
+  local action="${1:-}" by=""
+  [ $# -gt 0 ] && shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --identity) identity="${2:-}"; shift 2 ;;
+      --by)       by="${2:-}"; shift 2 ;;
+      *) die "control: unknown argument '$1'" ;;
+    esac
+  done
+  resolve_identity
+  case "$action" in
+    take)
+      require_live_identity
+      ensure_state_dir
+      jq -cn --arg by "$by" --argjson at "$(date +%s)" '{by:$by, renewedAt:$at}' \
+        > "$STATE_DIR/control-lock.tmp" && mv -f "$STATE_DIR/control-lock.tmp" "$STATE_DIR/control-lock"
+      ;;
+    release)
+      rm -f "$STATE_DIR/control-lock"
+      ;;
+    *) die "control: expected take or release" ;;
+  esac
+}
+
+cmd_env() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --identity) identity="${2:-}"; shift 2 ;;
+      *) die "env: unknown argument '$1'" ;;
+    esac
+  done
+  resolve_identity
+  local n
+  n="$(read_display)"
+  [ -n "$n" ] || die "no desktop allocated for $identity (run: agent-desktop up)"
+  printf 'DISPLAY=:%s\n' "$n"
+}
+
+cmd_run() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --identity) identity="${2:-}"; shift 2 ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
+  [ $# -gt 0 ] || die "run: no command given (usage: agent-desktop run -- CMD...)"
+  resolve_identity
+  local disp
+  disp="$(cmd_up --identity "$identity" --quiet)" || exit 1
+  disp="${disp#DISPLAY=}"
+  # Detached + own session: the app outlives the agent's Bash tool call.
+  # X11-only env: a host's graphical login leaks its Wayland setup into agent
+  # sessions, and Wayland-capable apps would draw on the host's real screen.
+  # Unsetting WAYLAND_DISPLAY alone isn't enough — libwayland falls back to
+  # the wayland-0 socket — so each toolkit is pinned to X11. Mirrors x11_env
+  # in desktop-mcp.
+  # Under systemd the app gets its own scope, so it isn't accounted to (or killed with)
+  # whoever launched it — desktop-mcp.service has a MemoryMax meant for the server alone.
+  local scope=()
+  use_systemd && scope=(systemd-run --user --scope --quiet --collect --)
+  env -u WAYLAND_DISPLAY -u ELECTRON_OZONE_PLATFORM_HINT \
+    XDG_SESSION_TYPE=x11 GDK_BACKEND=x11 QT_QPA_PLATFORM=xcb MOZ_ENABLE_WAYLAND=0 SDL_VIDEODRIVER=x11 \
+    DISPLAY="$disp" FLEET_IDENTITY="$identity" setsid nohup "${scope[@]}" "$@" >>"$STATE_DIR/apps.log" 2>&1 < /dev/null &
+  local pid=$!
+  disown 2>/dev/null || true
+  printf 'started pid %s on DISPLAY=%s\n' "$pid" "$disp"
+}
+
+# Foreground server. Runs Xvnc + openbox; exits (non-zero) when Xvnc dies so
+# systemd's Restart=on-failure brings it back.
+cmd_serve() {
+  identity="${1:-}"
+  resolve_identity
+  ensure_state_dir
+  allocate_display
+  ensure_password
+
+  local n geometry
+  n="$(read_display)"
+  geometry="$(read_geometry)"
+
+  # Clear a stale lock/socket left by a crashed server on OUR display.
+  if display_in_use "$n" && ! server_ready "$n"; then
+    rm -f "/tmp/.X${n}-lock" "/tmp/.X11-unix/X${n}" 2>/dev/null || true
+  fi
+
+  printf '%s\n' "$$" > "$STATE_DIR/serve.pid"
+
+  # -localhost: VNC listens on loopback only; the backend reaches it
+  # over an SSH port-forward (or directly when co-located).
+  # -AlwaysShared: the user's viewer never kicks another viewer off.
+  Xvnc ":$n" \
+    -geometry "$geometry" -depth 24 \
+    -rfbport $((VNC_PORT_BASE + n)) -localhost \
+    -SecurityTypes VncAuth -PasswordFile "$STATE_DIR/vnc-passwd" \
+    -AlwaysShared -desktop "$identity" \
+    -nolisten tcp &
+  local xpid=$! wmpid=""
+
+  cleanup_serve() {
+    [ -n "$wmpid" ] && kill -TERM "$wmpid" 2>/dev/null
+    kill -TERM "$xpid" 2>/dev/null
+    wait "$xpid" 2>/dev/null
+    rm -f "$STATE_DIR/serve.pid"
+  }
+  trap 'cleanup_serve; exit 0' TERM INT
+
+  if ! wait_ready "$n"; then
+    printf 'agent-desktop: Xvnc :%s failed to start\n' "$n" >&2
+    cleanup_serve
+    exit 1
+  fi
+
+  command -v xsetroot >/dev/null 2>&1 && DISPLAY=":$n" xsetroot -solid '#2b2f36' 2>/dev/null
+  DISPLAY=":$n" openbox &
+  wmpid=$!
+
+  wait "$xpid"
+  local rc=$?
+  [ -n "$wmpid" ] && kill -TERM "$wmpid" 2>/dev/null
+  rm -f "$STATE_DIR/serve.pid"
+  exit "$((rc == 0 ? 1 : rc))"
+}
+
+# ---- dispatch ----------------------------------------------------------------
+
+sub="${1:-}"
+[ $# -gt 0 ] && shift
+case "$sub" in
+  up)     cmd_up "$@" ;;
+  down)   cmd_down "$@" ;;
+  status) cmd_status "$@" ;;
+  env)    cmd_env "$@" ;;
+  run)    cmd_run "$@" ;;
+  control) cmd_control "$@" ;;
+  browser) cmd_browser "$@" ;;
+  serve)  cmd_serve "$@" ;;
+  -h|--help|help|"") usage; [ -n "$sub" ] ;;
+  *) usage; exit 2 ;;
+esac

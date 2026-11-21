@@ -1,0 +1,946 @@
+// ─── PrettyConversationRow ───────────────────────────────────────────────────
+// Phase 48 Plan 05 (v14 locked shape, user 2026-08-19) — biggest surface
+// change since Phase 41 Plan 01. Retired vs pre-Phase-48:
+//   * `.pv-meta` right column — element removed from the row entirely; the
+//     right-column grid slot is gone. Bounty badges were relocated to avatar
+//     corners (Pin + Monitor); ready-dot deleted outright. Phase 104 Plan 03
+//     later retired the two bounty-count badges themselves alongside the
+//     bounty-count wire; the trapped-work indicator (Phase 104 Plan 02) is now
+//     the sole avatar-corner affordance.
+//   * The pre-Phase-48 ready-dot span (with its inline display-block hack)
+//     plus the 4-input `isWorking-false + !isRecycling` JSX render gate — the
+//     "come look" cue was inverted to a working spinner ring on the avatar,
+//     itself retired 2026-10-21 — the unread outline + DM badge carry it.
+//   * `.pv-host` Server-icon rendering — hostname migrates to the title line
+//     wrapped in parens (`identityName (hostname)`); the subtitle line becomes
+//     the aiTitle text (or an italic ellipsis placeholder when aiTitle is null).
+//   * `subtitleMode` prop-driven sublabel branching — the prop is still
+//     ACCEPTED on the interface for backward compat with the 5 panel render
+//     sites (search-flat, pinned, middle, RDP, hidden), but its value has no
+//     runtime effect: the subtitle is always the aiTitle string (or the
+//     placeholder ellipsis when null). Kept in the interface so a plan-scope
+//     grep-and-remove pass across all 5 render sites is a follow-up concern.
+// New in Phase 48 Plan 05:
+//   * Title-line hostname suffix: `<span className="pv-hostname-suffix">
+//     ({row.host.name})</span>` — parens same font-size as identity name,
+//     alpha 0.85 (CSS-owned).
+//   * Subtitle line: `<span className="pv-ai-title">{aiTitle}</span>` when
+//     aiTitle is truthy; `<span className="pv-ai-title pv-ai-title--placeholder">
+//     …</span>` when aiTitle is null. Muted italic ellipsis anchors row height
+//     regardless of ai-title presence.
+//   * `.pv-avatar` originally gained Pin + Monitor bounty-count badge corners
+//     in Phase 48 Plan 05 (retired in Phase 104 Plan 03 alongside the
+//     bounty-count wire). The current avatar-corner affordance is the
+//     Phase 104 Plan 02 trapped-work indicator.
+//
+// Phase 13 Plan 01 (user 2026-07-23 lift-from-mock v4) — as amended by
+// Phase 41 Plan 01 (user 2026-08-14 ambient-retirement): the row renders the
+// mock's semantic markup with class-toggle state variants. Every visual
+// definition (base body, avatar disc, selected treatment, hover, RDP,
+// spinner ring) lives in pretty-conversations.css.
+//
+// Phase 41 Plan 01 retired the ambient-recession visual entirely: this
+// component no longer derives the pre-Phase-41 amb-recession flag and no
+// longer toggles the recession className. The related CSS block is deleted;
+// every row carries the same visual weight regardless of active-set membership.
+// The `inActiveSet` prop is PRESERVED — it still drives the deactivate-
+// action visibility gate (`.active-set` classname toggle at L873 below).
+// Only the ambient VISUAL axis retired.
+//
+// This component keeps only the surviving JS-only concerns:
+//
+//   - Avatar image src selection (identity.avatarUrl vs initial letter vs
+//     tabIcon fallback).
+//   - Click / keyboard / touch handlers, aria-labels, `--pv-hue` custom
+//     property emission for hue-bearing rows.
+//   - Mobile long-press → context menu (quick-260802-pq2): a 500ms touch
+//     hold with <10px movement opens the SAME PrettyConversationContextMenu
+//     desktop right-click uses, at the touch coordinates. Replaces the
+//     retired swipe-to-reveal action strip (which had a bleed-through class
+//     of bug through translucent ambient/hidden row backgrounds — bounty
+//     `swipe-actions-visible-through-translucent-rows`). Nothing painted
+//     behind rows = no bleed-through, ever.
+//
+// State variants are className toggles composed via `cn`:
+//   className={cn('pv-row', variantClass, selected && 'selected',
+//     inActiveSet && 'active-set', isWorking === true && 'working',
+//     pinned && 'pinned', isRdp && 'rdp')}
+// (Phase 41 Plan 01 dropped the retired amb-recession className toggle.)
+//
+// The ONE inline style on `.pv-row` is `{'--pv-hue': hue}` for hue-bearing
+// rows. Post-pq2 mobile has no transform (no swipe machinery) — the row body
+// is a static CSS-rendered card in both variants.
+//
+// Retired vs pre-Phase-13:
+//   - All JS-computed CSSProperties for base body / avatar / selected /
+//     hover overlays (~250 lines) — now in pretty-conversations.css as
+//     class-toggled selectors. (Ambient overlays formerly in this list
+//     were retired entirely in Phase 41 Plan 01.)
+//   - `useState(hover)` + onMouseEnter/onMouseLeave handlers — CSS `:hover`
+//     handles hover natively.
+//   - `PC_ROW_MIN_H_MOBILE/DESKTOP` tokens — CSS variants (`.pv-row--mobile`
+//     vs `.pv-row--desktop`) handle density.
+//   - Tailwind layout scaffolding (`flex-1 min-w-0 flex flex-col gap-0.5`,
+//     `shrink-0 flex items-center gap-1.5`, `rounded-full`, `w-12 h-12` /
+//     `w-10 h-10`, `px-4 py-3` / `px-3 py-2.5`, `gap-3` / `gap-2.5`) on the
+//     row/avatar/body/meta divs — CSS handles layout via `display: flex`,
+//     `flex: 1`, `padding`, etc.
+//   - quick-260802-pq2: swipe state machine (swipedOpen / dxLive / start refs /
+//     onTouchStart / onTouchMove / onTouchEnd), swipe-reveal strip JSX,
+//     PinAction / DeactivateAction / HideAction imports (only rendered inside
+//     the retired strip), PC_SWIPE_* tokens, forceClosed / onSwipeOpenChange
+//     props, data-swiped-open attribute.
+//
+// Identity carry-through mirrors ConversationRow.tsx lines 41-47 verbatim so
+// identity-tinted rows keep the same "which session is this" reading after
+// the sidebar is retired.
+
+import {
+  memo,
+  useCallback,
+  type ComponentProps,
+  type CSSProperties,
+  type DragEvent,
+  type KeyboardEvent,
+} from "react";
+import { Archive, GitPullRequestDraft, Mail } from "lucide-react";
+
+import { tabIcon } from "@/shell/tabUtils";
+import { sessionMatchKey } from "@/features/terminal/session-hue";
+import { useIdentities } from "@/state/identities-store";
+// quick-260912-0t4: type-only import for the byHostKey → byKey fallback IIFE
+// return-type annotation (see identity-resolution block below).
+import type { Identity } from "@/api/identities-api";
+// Phase 68 Plan 04: avatarUrlWithHost DELETED — backend bakes hostId into identity.avatarUrl.
+// Phase 104 Plan 02: per-identity trapped-work indicator (D-05, D-06, D-07).
+import { useTrappedWork } from "@/state/trapped-work-store";
+import { cn } from "@/lib/utils";
+import { armOutboundDrag, mintDragId } from "@/shell/cross-window-drag";
+import { promptAndRenameIdentity } from "@/shell/rename-identity";
+import type { ConversationRow as ConversationRowShape } from "@/state/conversation-store";
+import { specForTab, encodeWorkspaceSpec } from "@/lib/tab-url";
+import {
+  hasNeutralLook,
+  identityRolesLabel,
+  isMultiRole,
+  NEUTRAL_HUE,
+} from "@/lib/identity-roles";
+import { AvatarImage } from "@/components/avatar-image";
+
+// The row's actions live in a RowKebabMenu inside the row body: ⋮ on hover
+// and right-click on desktop; press-and-hold on touch screens, where the ⋮ is
+// hidden (shape-sidebar). RowKebabMenu's portal-click-containment prevents
+// item-click leaks to the row's onClick (row body is a clickable surface for
+// session selection).
+import { isCoarsePointer, useRowTouchGestures } from "./row-touch-gestures";
+import {
+  RowKebabMenu,
+  useRowKebabContextMenu,
+  type RowKebabMenuItem,
+  type RowKebabSubmenuItem,
+} from "./RowKebabMenu";
+
+// ─── Prop shape ──────────────────────────────────────────────────────────────
+// `variant` drives the density class (`pv-row--mobile` vs `pv-row--desktop`)
+// AND the long-press wiring gate (mobile-only). Desktop rows never arm the
+// long-press timer.
+//
+// quick-260802-pq2: the swipe machinery (forceClosed / onSwipeOpenChange
+// props, PC_SWIPE_* tokens, swipedOpen state, transform emission,
+// reveal-strip JSX) was fully removed. The mobile row exposes the same
+// context menu desktop right-click uses via a 500ms long-press touch hold.
+
+/**
+ * RDP rows sit under a "Remote desktop" header, so a trailing "-RDP" /
+ * " RDP" / "(RDP)" on the host name is redundant there. Display-only; a bare
+ * trailing "rdp" with no separator (e.g. "xrdp") is left alone.
+ */
+export function rdpDisplayName(name: string): string {
+  const trimmed = name.replace(/(?:[\s_-]+rdp|\s*\(rdp\))\s*$/i, "");
+  return trimmed.length > 0 ? trimmed : name;
+}
+
+// Set the native `title` attribute on hover iff the element's text is truncated
+// (scrollWidth > clientWidth). Wired to `.pv-label` and `.pv-ai-title` spans so
+// long task strings surface a tooltip with the full text, without showing a
+// redundant tooltip when the text already fits.
+function setTitleIfOverflowing(e: React.MouseEvent<HTMLElement>): void {
+  const el = e.currentTarget;
+  if (el.scrollWidth > el.clientWidth) {
+    el.title = el.textContent ?? "";
+  } else {
+    el.removeAttribute("title");
+  }
+}
+
+// Row-level unified tooltip: shows the identity's displayName so the user can
+// tell which identity the convo is for without opening it; appends the full
+// task on a second line iff the task label is currently truncated. Subsumes
+// the per-span overflow tooltip in the task-primary branch.
+function setRowTooltip(
+  displayName: string | null | undefined,
+  task: string | null | undefined,
+): (e: React.MouseEvent<HTMLElement>) => void {
+  return (e) => {
+    const rowEl = e.currentTarget;
+    if (!displayName) {
+      rowEl.removeAttribute("title");
+      return;
+    }
+    const label = rowEl.querySelector<HTMLElement>(".pv-label");
+    const overflowing = !!label && label.scrollWidth > label.clientWidth;
+    rowEl.title = task && overflowing ? `${displayName}\n${task}` : displayName;
+  };
+}
+
+function PrettyConversationRowImpl({
+  row,
+  selected,
+  pinned,
+  variant,
+  onSelect,
+  onTogglePin,
+  onDeactivate,
+  onArchive,
+  onSwipeArchive,
+  onKill,
+  onMoveToProject,
+  onCreateProject,
+  projects = [],
+  currentProjectSlug = null,
+  isWorking = null,
+  inActiveSet = false,
+  subtitleMode = "hostname",
+  aiTitle = null,
+  identity,
+}: {
+  row: ConversationRowShape;
+  selected: boolean;
+  pinned: boolean;
+  variant: "mobile" | "desktop";
+  onSelect: () => void;
+  // Fired by the "Pinned" entry of the Move-to submenu (when `pinned` is
+  // false) and by its "Unpin" leaf (when true). Omitted for rows that can't
+  // be pinned (relay rooms, non-identity terminals — no `.pinned` sentinel
+  // to write); Pinned is then left out of the submenu.
+  onTogglePin?: () => void;
+  // quick-260727-gm3: fired when user clicks the red-tinted Deactivate
+  // menu item (desktop right-click OR mobile long-press). MUST be provided by
+  // the panel whenever inActiveSet === true — otherwise the menu item is
+  // filtered out at items[] build time. See
+  // PrettyConversationsPanel.handleRowDeactivate for the store-mutation +
+  // tab-close composition. As of quick-260804-uo4, RDP rows also receive this
+  // prop (RDP context menu is now enabled).
+  onDeactivate?: () => void;
+  /**
+   * Phase 115 Plan 115-06 (D-01 / D-02 / D-03): fired when user clicks the
+   * red Archive menu item. When provided, the Archive item appears in the
+   * context menu (row + badge). The PANEL is responsible for gating this
+   * prop on fleet-synthetic identity-backed rows only (via
+   * canonicalArchiveIdForRow) — the row component itself just renders when
+   * the prop is present.
+   *
+   * The confirmation dialog + the actual archiveIdentity() call live at the
+   * panel level (handleArchive), not here — this callback simply fires;
+   * handleArchive owns the window.confirm + POST + pane-close composition.
+   */
+  onArchive?: () => void;
+  /**
+   * Swipe-to-archive on touch (shape-sidebar): fired once the row has slid
+   * out. No confirm — the panel removes the row at once and offers Undo for a
+   * few seconds before archiving. Omitted for rows that can't be archived;
+   * those rows don't swipe.
+   */
+  onSwipeArchive?: () => void;
+  /**
+   * quick-260810-n3a: Fired when user clicks the red Kill menu item.
+   * Provided by the panel only when !isRdp && !identity && row.targetTmuxSession.
+   * The panel wraps the actual kill in a window.confirm — this callback fires
+   * ONLY on confirm=true. See PrettyConversationsPanel.handleRowKill.
+   */
+  onKill?: () => void;
+  /**
+   * shape-move-to-project-context-menu (2026-09-23): fired when the user
+   * picks a project (or "Remove from project") from the row's context-menu
+   * drill-in submenu. Called with the target project slug, or `null` to
+   * clear the assignment (null-clears semantic, matching setSessionProject
+   * / setRelayRoomProject). The panel wires this to the same routing
+   * handleProjectDrop uses (identity vs relay-room based on the row's own
+   * data). The panel gates this prop on !isRdp AND projects.length > 0, so
+   * absence at the row is the row's signal to leave projects (and "Remove
+   * from project") out of the "Move to" submenu.
+   */
+  onMoveToProject?: (slug: string | null) => void;
+  /**
+   * Fired by the "New project…" leaf in the "Move to" submenu. The panel
+   * opens the create-project modal and moves this row into the new project
+   * once it exists. Provided for every non-RDP row — including hosts with
+   * no projects yet, where it is the submenu's only project entry.
+   */
+  onCreateProject?: () => void;
+  /**
+   * shape-move-to-project-context-menu (2026-09-23): the project list shown
+   * inside the "Move to" submenu, in the same order the sidebar
+   * renders its project sections. Empty array is the "zero projects"
+   * signal — combined with `onMoveToProject` being provided/absent, the
+   * row's items[] gate handles hiding the parent item.
+   */
+  // `depth` indents nested projects so the list mirrors the sidebar tree.
+  projects?: readonly { slug: string; displayName: string; depth?: number }[];
+  /**
+   * shape-move-to-project-context-menu (2026-09-23): the slug of the
+   * project this row currently belongs to, or `null` if unassigned. Drives
+   * the checkmark on the currently-assigned project inside the submenu,
+   * the "Remove from project" visibility (only shown when non-null), and
+   * the silent-no-op behavior when tapping the currently-assigned project
+   * (fires no setter, just closes the menu).
+   */
+  currentProjectSlug?: string | null;
+  // Patch #137: WS-published working state for the row's (host, tmux)
+  // pair. `true` = agent busy, `false` = idle, `null` = unknown
+  // (backend hasn't published yet). Only `false` allows the ready-dot
+  // to render; `null` and `true` both suppress. Panel resolves via
+  // useSessionWorking(sessionWorkingKey(row)).
+  isWorking?: boolean | null;
+  // Phase 47 Plan 04 — the identity's freshest ai-title sourced from the
+  // working-store's aiTitle axis (Plan 47-03 LAST-WINS chokepoint). Null
+  // when no ai-title has been published yet, or when this row has no
+  // working-store key (RDP rows via sessionKey === null → hook short-
+  // circuits). Panel resolves via useSessionAiTitle(sessionWorkingKey(row))
+  // — keyed identically to the isWorking store. Consumed
+  // in Plan 47-05 as the row's subtitle content; NOT yet
+  // rendered by this component's tree — the prop is accepted here so the
+  // type surface is stable before Plan 47-05 wires the visual. Default
+  // null so tests constructing the row without the prop keep working.
+  aiTitle?: string | null;
+  // Patch #137 (updated Phase 41 Plan 01): whether this row is in user's
+  // active-set (any session she has selectConversation-ed in this browser-tab
+  // session). Phase 41 retired the ambient-recession visual entirely, so this
+  // flag no longer controls "full-bubble vs recessed" appearance — every row
+  // carries the same visual weight. The flag SURVIVES because it still gates:
+  //   1. The `.active-set` className toggle at L873, which drives the
+  //      deactivate-action hover-reveal CSS at pretty-conversations.css:978/994.
+  //   2. Context-menu item gating (Move-vs-Open new-window side effect).
+  inActiveSet?: boolean;
+  // quick-260727-f9v: sublabel render mode.
+  //   "hostname"      → default; sublabel renders hostname + Server icon
+  //                     (verbatim pre-f9v behavior, backward-compatible).
+  //   "identityTitle" → sublabel renders identity.title (falling back to
+  //                     identity.displayName when title is null), and the
+  //                     Server icon is DROPPED (the per-host divider chip
+  //                     rendered by the panel above the group already
+  //                     carries the Server glyph, so duplicating it here
+  //                     would be noisy). If no identity resolves, the
+  //                     row falls back verbatim to "hostname" mode as a
+  //                     terminal safety net — see the render block below
+  //                     and Tina's patch #149 lesson in the plan.
+  //
+  // RDP render site omits the prop → default "hostname" (RDP rows don't
+  // resolve identities). Pinned + grouped + active-set render sites all
+  // pass "identityTitle" (patch #184 for pinned, quick-260727-f9v for
+  // grouped, patch #195 for active-set — closes the last scope gap).
+  subtitleMode?: "hostname" | "identityTitle";
+  // Resolved identity for this row (see resolveRowIdentity). Passed in rather
+  // than read from useIdentities() here so a memoized row re-renders only
+  // when ITS identity object changes, not on every identities-store notify.
+  identity: Identity | null;
+}) {
+  // ─── Identity resolution ───────────────────────────────────────────────────
+  // `identity` arrives resolved (resolveRowIdentity below: hostId-scoped
+  // byHostKey first, bare-name byKey fallback).
+  const isRdp = row.rdpHostRow === true;
+
+  // Host.id is a string in the fork's ui-types; we convert with parseInt
+  // (same shape AppShell uses at openTab hostId derivation). Consumed by
+  // useTrappedWork and the rename gate below.
+  const rowHostIdNum = row.host ? parseInt(row.host.id, 10) : NaN;
+
+  // An identity with no roles and no colorHue paints in the neutral grey.
+  const neutralLook = hasNeutralLook(identity);
+  const hue: number | null = identity?.colorHue ?? (neutralLook ? NEUTRAL_HUE : null);
+
+  // Phase 104 Plan 02 (D-05, D-06, D-07): per-identity trapped-work snapshot.
+  // Hook short-circuits to undefined when identityKey is null. Both undefined
+  // (pre-fetch / non-identity row) AND {hasTrappedWork:false} render nothing
+  // — the indicator gates on strict `=== true` at the JSX site below.
+  //
+  // Phase 104 code-review finding #3: hostIdNum > 0 matches the WS handler's
+  // coercion (claude-session-server.ts:1211-1216). Any non-positive hostId
+  // (0 or negative) routes as local; without this gate, the row keys the
+  // store on `${...}:0` but the response echoes hostId=null → lookup misses.
+  const trappedWork = useTrappedWork(
+    identity?.identityKey ?? null,
+    Number.isFinite(rowHostIdNum) && rowHostIdNum > 0 ? rowHostIdNum : null,
+  );
+
+  // Phase 41 Plan 01 (user 2026-08-14): the pre-Phase-41 amb-recession
+  // derivation (`!isRdp && !inActiveSet`) and its className toggle were
+  // retired here. The related CSS block is deleted; every row carries the
+  // same visual weight. `isRdp` and `inActiveSet` survive as separate flags
+  // for their other consumers (deactivate-action gating, context-menu item
+  // wiring — see the className composition below).
+
+  const isMobile = variant === "mobile";
+  const variantClass = isMobile ? "pv-row--mobile" : "pv-row--desktop";
+
+  // shape-sidebar-header-affordances: useIsTouchDevice / acceptsTouch gating
+  // + DEV-only touch-handler-wired breadcrumb RETIRED alongside the context
+  // menu + long-press machinery. Row context menu is now a RowKebabMenu
+  // rendered inside the row body (hover-reveal on desktop, always-visible on
+  // mobile via a CSS-only group-hover + viewport-width gate at the kebab's
+  // wrapper div — no runtime touch-device detection needed).
+
+  // Phase 56 Plan 03 (user 2026-08-28 shape file):
+  // HTML5 native drag. Coexists with the existing tap-select (onClick),
+  // touch long-press context menu (500ms timer inside onTouchStart), and
+  // desktop right-click context menu (onContextMenu). Browser's built-in
+  // drag threshold (~5px on desktop,
+  // long-press-and-move on touch) is the disambiguation mechanism — no manual
+  // dx/dy gate is needed. The dataTransfer payload shape (`text/plain` with
+  // the row's tab id) is the wire contract with `SplitView.tsx`'s Pane onDrop
+  // handler, established by Plan 56-02 and preserved verbatim.
+  const onRowDragStart = useCallback(
+    (e: DragEvent<HTMLDivElement>) => {
+      // Patch #511: the drop handler needs enough info to reproduce the
+      // click-flow's row-type priority ladder (rdpHostRow → openTab rdp;
+      // fleetOnly → openTab terminal with targetTmuxSession; otherwise
+      // treat as already-open tab id). Patch #509/510 wrote only row.id,
+      // which silent-no-op'd on selectConversation when the row was a
+      // fleet-only detached row (not yet in openTabs) — the split then
+      // referenced a tab id that didn't exist, rendering an empty "Pane
+      // 1 empty" cell in place of the intended session.
+      //
+      // Cross-window drag (2026-09-17): mint a dragId and arm the outbound
+      // drag so a drop in a DIFFERENT same-origin Skynet window can echo
+      // the dragId back via BroadcastChannel; AppShell's accept subscriber
+      // then closes this window's source tab (hard-move semantics). Rows
+      // already carry the descriptor pieces (host + targetTmuxSession +
+      // fleetOnly + rdpHostRow) that AppShell's resolveRowPayloadTabId
+      // needs to open a fresh session in the target window, so no new
+      // fields are needed here — just the dragId.
+      const dragId = mintDragId();
+      armOutboundDrag(dragId, row.id);
+      e.dataTransfer.setData("text/plain", row.id);
+      // Phase 117 Plan 117-08: DnD payload extended with `matrixRoomId` +
+      // `identityKey` so the projects drop-lane handler at PrettyProject
+      // SectionHeader → PrettyConversationsPanel can route the drop to
+      // setRelayRoomProject (relay-room rows) vs setSessionProject (identity
+      // rows) without a second store lookup at the drop site. Both fields
+      // are OPTIONAL on the wire — null-carrier is the row's kind marker:
+      //   - matrixRoomId set (row.kind === "relay-room") → relay-room path
+      //   - identityKey set (identity row) → identity path
+      //   - neither → fleet-only row falls through the panel's guard
+      // Backward-compat: the pre-117-08 SplitView Pane onDrop reads only
+      // `id`, so the added fields are additive per the row-shape's
+      // "backward-compat rule per PATTERNS.md" (see Phase 90 Plan 07 Task 3
+      // comment at PrettyConversationRow.tsx L119-134).
+      e.dataTransfer.setData(
+        "application/x-skynet-row",
+        JSON.stringify({
+          id: row.id,
+          dragId,
+          host: row.host ?? null,
+          targetTmuxSession: row.targetTmuxSession ?? null,
+          fleetOnly: row.fleetOnly === true,
+          rdpHostRow: row.rdpHostRow === true,
+          matrixRoomId: row.roomId ?? null,
+          // roomTitle carries the human-readable relay-room label so a
+          // cross-window resolver can label the freshly-opened target tab
+          // (openTab's label option). Null for non-relay rows.
+          roomTitle: row.roomTitle ?? null,
+          identityKey: identity?.identityKey ?? null,
+        }),
+      );
+      e.dataTransfer.effectAllowed = "move";
+    },
+    [
+      row.id,
+      row.host,
+      row.targetTmuxSession,
+      row.fleetOnly,
+      row.rdpHostRow,
+      row.roomId,
+      row.roomTitle,
+      identity?.identityKey,
+    ],
+  );
+
+  // shape-sidebar-header-affordances: long-press timer unmount cleanup +
+  // notifyMenuClosed singleton drain RETIRED (both targeted machinery that no
+  // longer exists). RowKebabMenu's Radix implementation manages its own
+  // open/close lifecycle via portal.
+
+  // ─── Row-body click ────────────────────────────────────────────────────────
+  // Mobile short-tap AND desktop click both fire onSelect. The pre-shape-3
+  // suppressNextClickRef gate (which caught the synthesized click following a
+  // long-press on real browsers) is retired alongside the long-press timer.
+  const onBodyClick = useCallback(() => {
+    onSelect();
+  }, [onSelect]);
+
+  const onBodyKeyDown = useCallback(
+    (e: KeyboardEvent<HTMLDivElement>) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        onBodyClick();
+      }
+    },
+    [onBodyClick],
+  );
+
+  // ─── Class composition ────────────────────────────────────────────────────
+  // Every state variant is a CSS class toggle; the CSS file (pretty-
+  // conversations.css) handles all visual response. Phase 41 Plan 01 retired
+  // the amb-recession className toggle — the corresponding CSS block is
+  // deleted so the row no longer emits that class.
+
+  // No working affordance on the row (user 2026-10-21): the avatar spinner
+  // ring is retired — the unread outline and DM badge below carry the
+  // "come look" cue. The `working` class stays as a state hook.
+
+  const rowClassName = cn(
+    "pv-row",
+    variantClass,
+    selected && "selected",
+    inActiveSet && "active-set",
+    isWorking === true && "working",
+    pinned && "pinned",
+    // Unread: the agent finished a turn this user hasn't seen. Brighter
+    // outline in the row's own hue (pretty-conversations.css).
+    row.unread === true && "pv-row--unread",
+    // DM'd: the agent DM'd this user. Keeps the unread outline; a red
+    // envelope takes the unread dot's place at the row's end.
+    row.dm === true && "pv-row--dm",
+    // Phase 41 Plan 01: amb-recession className toggle retired.
+    // (Phase 115 post-code-review fix 3: `hidden && "hidden"` className toggle
+    //  retired alongside the Hide/Show menu branch — hidden prop is gone.)
+    isRdp && "rdp",
+    isMultiRole(identity) && "pv-multi-role",
+    neutralLook && "pv-neutral",
+  );
+
+  // ─── Hue custom property ─────────────────────────────────────────────────
+  // The ONLY structural inline style on `.pv-row` is `--pv-hue: {hue}` for
+  // hue-bearing rows.
+  const bodyStyle: CSSProperties =
+    hue !== null ? ({ "--pv-hue": hue } as CSSProperties) : {};
+
+  // ─── Render tree ───────────────────────────────────────────────────────────
+  const wrapperClass = "relative";
+
+  // Kebab items (shared by the ⋮ trigger and right-click on the row body).
+  // (Open in new tab / Rename… / Move to / Close / Kill / Archive).
+  const kebabItems = ((): RowKebabMenuItem[] => {
+    const items: RowKebabMenuItem[] = [];
+    // Open in new tab — desktop-only, only when the row is URL-
+    // addressable (specForTab produces a spec). Window.open without
+    // "noopener" so we can detect popup-blocker returns null.
+    if (!isMobile) {
+      const spec = specForTab({ type: row.type, host: row.host, targetTmuxSession: row.targetTmuxSession });
+      if (spec !== null) {
+        items.push({
+          label: "Open in new tab",
+          onClick: () => {
+            const payload = encodeWorkspaceSpec({ tabs: [spec], activeIndex: 0, only: true });
+            const w = window.open("#" + payload, "_blank");
+            if (w !== null && inActiveSet) {
+              onDeactivate?.();
+            }
+          },
+          testId: "pv-row-kebab-item-open-new-window",
+        });
+      }
+    }
+    // Rename… — sets the identity's `task:`, the row's title line. Identity
+    // rows only: relay rooms, RDP hosts and bare tmux sessions have no
+    // identity file to write.
+    if (identity && Number.isFinite(rowHostIdNum) && rowHostIdNum > 0) {
+      items.push({
+        label: "Rename…",
+        onClick: () =>
+          promptAndRenameIdentity({
+            hostId: rowHostIdNum,
+            identityKey: identity.identityKey,
+            currentTitle: identity.task || identity.displayName || identity.identityKey,
+          }),
+        testId: "pv-row-kebab-item-rename",
+      });
+    }
+    // Move to — drill-in submenu. Pinned and every project are destinations
+    // of the same kind: a row is in at most one of them (pinned and in-a-
+    // project are mutually exclusive), so they share one list with a
+    // checkmark on wherever the row is now, followed by the leaf that takes
+    // it out ("Unpin" / "Remove from project"). Pinned is offered when the
+    // row is pinnable (onTogglePin); projects when the panel provides
+    // onMoveToProject (non-RDP, this host has projects). "New project…"
+    // follows the projects when the panel provides onCreateProject.
+    {
+      const submenu: RowKebabSubmenuItem[] = [];
+      const canPin = onTogglePin !== undefined && !isRdp;
+      if (canPin) {
+        submenu.push({
+          label: "Pinned",
+          checked: pinned,
+          onClick: () => {
+            if (!pinned) onTogglePin?.();
+          },
+          testId: "pv-row-kebab-item-move-to-pinned",
+        });
+      }
+      if (onMoveToProject) {
+        for (const p of projects) {
+          const isCurrent = p.slug === currentProjectSlug;
+          submenu.push({
+            label: p.displayName,
+            checked: isCurrent,
+            indent: p.depth,
+            onClick: () => {
+              if (!isCurrent) onMoveToProject(p.slug);
+            },
+            testId: `pv-row-kebab-item-move-to-${p.slug}`,
+          });
+        }
+      }
+      if (onCreateProject) {
+        submenu.push({
+          label: "New project…",
+          onClick: onCreateProject,
+          testId: "pv-row-kebab-item-new-project",
+        });
+      }
+      if (pinned && canPin) {
+        submenu.push({
+          label: "Unpin",
+          onClick: onTogglePin,
+          testId: "pv-row-kebab-item-unpin",
+        });
+      } else if (onMoveToProject && currentProjectSlug !== null) {
+        submenu.push({
+          label: "Remove from project",
+          onClick: () => onMoveToProject(null),
+          testId: "pv-row-kebab-item-remove-from-project",
+        });
+      }
+      if (submenu.length > 0) {
+        items.push({
+          label: "Move to",
+          submenu,
+          testId: "pv-row-kebab-item-move-to",
+        });
+      }
+    }
+    // No Close here — the sidebar row's menu leaves it out; an open pane
+    // closes from its badge menu or the drop lane.
+    // Kill — hard-terminates the underlying tmux session. Gated to
+    // rows without an identity backing (identity rows have /id save
+    // state and must not be nuked from a context menu).
+    if (
+      onKill &&
+      !isRdp &&
+      !identity &&
+      row.targetTmuxSession !== null &&
+      row.targetTmuxSession !== undefined
+    ) {
+      items.push({
+        label: "Kill",
+        onClick: onKill,
+        danger: true,
+        testId: "pv-row-kebab-item-kill",
+      });
+    }
+    // Archive — gated on `onArchive` being provided. The panel
+    // provides it only for fleet-synthetic identity-backed rows.
+    if (onArchive) {
+      items.push({
+        label: "Archive",
+        onClick: onArchive,
+        danger: true,
+        testId: "pv-row-kebab-item-archive",
+      });
+    }
+    return items;
+  })();
+  const kebabContextMenu = useRowKebabContextMenu(kebabItems);
+  // Touch: press-and-hold opens the same menu; swipe left archives. Phone rows
+  // carry no ⋮ on touch screens (CSS), so the hold is the way in.
+  const touch = useRowTouchGestures({
+    onHold: kebabContextMenu.openAt,
+    onSwipeArchive: onSwipeArchive,
+  });
+
+  return (
+    <div
+      className={wrapperClass}
+      data-conversation-id={row.id}
+      data-selected={selected ? "true" : "false"}
+      data-pinned={pinned ? "true" : "false"}
+      data-unread={row.unread === true ? "true" : undefined}
+      data-dm={row.dm === true ? "true" : undefined}
+      data-variant={variant}
+      data-rdp-host-row={isRdp ? "true" : undefined}
+      data-swiping={touch.offset !== 0 ? "true" : undefined}
+    >
+      {onSwipeArchive && touch.offset !== 0 && (
+        <div className="pv-row-swipe-action" aria-hidden="true">
+          <Archive />
+          <span>Archive</span>
+        </div>
+      )}
+      {/* Row body — the CSS file (pretty-conversations.css) handles all
+          layout, background, border, shadow, hover, and state variants via
+          the composed className. The only inline style is `--pv-hue` (for
+          hue-bearing rows). shape-sidebar-header-affordances: `group` class
+          added for the kebab's hover-reveal below. onTouchStart/Move/End/Cancel
+          long-press handlers stay retired; onContextMenu opens the SAME kebab
+          menu at the cursor (useRowKebabContextMenu) as a desktop convenience. */}
+      <div
+        role="button"
+        tabIndex={0}
+        // Touch screens drag nothing (a draggable row would turn a
+        // press-and-hold into a drag); a narrow mouse window still drags.
+        draggable={!isCoarsePointer()}
+        aria-pressed={selected}
+        onClick={onBodyClick}
+        {...touch.handlers}
+        onContextMenu={kebabContextMenu.onContextMenu}
+        onKeyDown={(e) => {
+          // The keyboard's menu key (or Shift+F10) opens the row menu under
+          // the row — the way in for keyboards and screen readers.
+          if (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) {
+            e.preventDefault();
+            const r = e.currentTarget.getBoundingClientRect();
+            kebabContextMenu.openAt(r.left + 24, r.bottom);
+            return;
+          }
+          onBodyKeyDown(e);
+        }}
+        onMouseEnter={setRowTooltip(identity?.displayName, identity?.task)}
+        onDragStart={onRowDragStart}
+        style={{ ...bodyStyle, ...touch.style }}
+        className={cn("group", rowClassName)}
+      >
+        {/* Avatar disc — identity avatar OR initial letter OR tabIcon fallback.
+            Phase 104 Plan 03: `.pv-avatar` now hosts ONLY the trapped-work
+            indicator (Plan 02). The prior Pin + Monitor bounty-count badges
+            were retired alongside the bounty-count wire in this plan. */}
+        <div className="pv-avatar" data-testid="pcrow-avatar">
+          {identity ? (
+            // Phase 66 Plan 05: hostId threading — Plan 03's GET /:id/avatar
+            // requires hostId query param. `rowHostIdNum` above is
+            // parseInt(row.host.id, 10) when row.host is present; NaN when
+            // absent. If NaN we can't fetch the avatar (backend 400s) so
+            // fall back to the initial-letter placeholder rather than
+            // producing a broken-image affordance. user 2026-09-01:
+            // "some conversation-list rows show broken-image icons" — this
+            // gates on avatarUrl truthiness (Phase 68: hostId is baked in by backend).
+            // An image that fails to load (e.g. a roleless agent with no
+            // avatar of its own) falls back to the initial too.
+            <AvatarImage
+              // Phase 68 Plan 04: avatarUrlWithHost deleted — backend bakes hostId
+              // into identity.avatarUrl at emit time; render directly.
+              src={identity.avatarUrl}
+              name={identity.displayName}
+              className="pv-avatar-img"
+              style={{ width: "100%", height: "100%", objectFit: "cover", borderRadius: "999px" }}
+              initialClassName="pv-avatar-initial"
+            />
+          ) : (
+            <span className="pv-avatar-fallback-icon" aria-hidden="true">
+              {tabIcon(row.type)}
+            </span>
+          )}
+          {/* Phase 104 Plan 02 — trapped-work indicator (D-05, D-06, D-07).
+              Bottom-right corner of the avatar in a warm-amber pilled disc.
+              Gates on strict `=== true` — pre-fetch (undefined) AND
+              hasTrappedWork:false both render nothing (D-06 start-absent +
+              silent-for-non-participants). Icon: GitPullRequestDraft from
+              lucide-react. Tooltip copy VERBATIM per D-07. No click behavior
+              (hover-only affordance per D-05). */}
+          {trappedWork?.hasTrappedWork === true && (
+            <span
+              className="pv-trapped-work-indicator"
+              data-testid="pv-trapped-work-indicator"
+              title="Has local work not yet pushed to any remote"
+            >
+              <GitPullRequestDraft
+                className="pv-trapped-work-icon"
+                aria-hidden="true"
+              />
+            </span>
+          )}
+        </div>
+
+        {/* Body: title line + subtitle line.
+            Phase 48 Plan 05 (user 2026-08-19) established the shape:
+              Title line — identity displayName (or row.label as safety-net
+              fallback) followed by a parenthetical suffix. Subtitle line —
+              aiTitle (or `…` placeholder). Server icon dropped.
+
+            inline-261001-conv-title-role-suffix (user 2026-10-01):
+              The parenthetical PREFERS the identity's role display name over
+              `row.host.name`. User verbatim: "right now it would show
+              'Aqua (workstation)' but it should say the role instead of host
+              like 'Aqua (Secretary)'". Role carries the "who is this" signal
+              a glance needs; the host basically never matters.
+              Resolution order:
+                1. identity's roles → identityRolesLabel(identity)
+                2. row.host?.name — fallback when identity has no role, or for
+                   non-identity rows (unresolved sessions)
+                3. absent — no parens at all
+              Supersedes inline-260823's `identity.title || host.name` ladder;
+              `identity.title` is no longer consulted for the no-task branch
+              (parity with the task-primary branch, which already uses role).
+              The CSS class name `pv-hostname-suffix` is kept for backward
+              compat — it now styles a role OR hostname parenthetical. */}
+        {/* Phase 80 Plan 08: gated task-primary body swap (D-03, D-06).
+            When `identity?.task` is truthy → task-primary display:
+              - Top line: the task string alone (reuses .pv-label typography).
+              - Subtitle: role prominent via <strong> + (displayName) muted
+                via existing .pv-hostname-suffix class.
+              - The aiTitle drops entirely from this branch — user greenlit
+                the drop per 80-CONTEXT specifics §last bullet ("do NOT quietly
+                preserve it").
+            When `identity?.task` is null/empty → fallback branch preserves the
+            pre-Phase-80 markup VERBATIM (D-06 graceful degradation for legacy
+            identities without task). Reuses .pv-label / .pv-hostname-suffix /
+            .pv-ai-title verbatim per D-03 — no new CSS selectors invented at
+            plan time. */}
+        <div className="pv-body">
+          {identity?.task ? (
+            <>
+              <span className="pv-label">{identity.task}</span>
+              <span className="pv-ai-title">
+                {/* No roles: the machine name instead, as the no-task
+                    branch's parenthetical does. */}
+                {identityRolesLabel(identity) ? (
+                  <strong>{identityRolesLabel(identity)}</strong>
+                ) : (
+                  row.host?.name
+                )}
+              </span>
+            </>
+          ) : (
+            <>
+              <span className="pv-label" onMouseEnter={setTitleIfOverflowing}>
+                {identity ? identity.displayName : isRdp ? rdpDisplayName(row.label) : row.label}
+                {(() => {
+                  // inline-261001-conv-title-role-suffix: prefer role display
+                  // name over host.name in the parens; host.name is the
+                  // fallback for identities without a role, or for rows with
+                  // no identity resolved at all.
+                  // RDP rows get no suffix (their title IS the host), and a
+                  // suffix identical to the title is dropped rather than
+                  // shown twice.
+                  if (isRdp) return null;
+                  const rolesLabel = identity ? identityRolesLabel(identity) : "";
+                  const suffix = rolesLabel || row.host?.name;
+                  const title = identity ? identity.displayName : row.label;
+                  const duplicatesTitle =
+                    suffix?.trim().toLowerCase() === title?.trim().toLowerCase();
+                  return suffix && !duplicatesTitle ? (
+                    <span className="pv-hostname-suffix"> ({suffix})</span>
+                  ) : null;
+                })()}
+              </span>
+              {aiTitle !== null ? (
+                <span className="pv-ai-title" onMouseEnter={setTitleIfOverflowing}>{aiTitle}</span>
+              ) : (
+                <span className="pv-ai-title pv-ai-title--placeholder">…</span>
+              )}
+            </>
+          )}
+        </div>
+
+        {/* Unread: a small dot in the agent's own colour at the row's end
+            (pretty-conversations.css). Notified (the agent DM'd this user):
+            a bigger red envelope in the dot's place. Pinned rows carry no pin
+            glyph — they already sit under Pinned. */}
+        {row.dm === true ? (
+          <span
+            className="pv-dm-badge"
+            data-testid="pv-dm-badge"
+            role="img"
+            aria-label="Notified you"
+            title="Notified you"
+          >
+            <Mail className="pv-dm-badge-icon" aria-hidden="true" />
+          </span>
+        ) : row.unread === true && (
+          <span className="pv-unread-dot" data-testid="pv-unread-dot" aria-label="Unread" role="img" />
+        )}
+        {/* Phase 48 Plan 05 — the right-column meta wrapper RETIRED entirely.
+            Retired symbols and their replacements:
+              - The pre-Phase-48 badges → Phase 104 Plan 03 retired those
+                entirely (per-identity indicator wire deletion).
+              - The pre-Phase-48 ready-dot span (with its inline display-block
+                hack) plus the 4-input `isWorkingFalse + notRecycling +
+                noQueuePending` JSX render gate → replaced by an avatar spinner
+                ring, retired 2026-10-21 in favor of the unread outline. */}
+        {/* Row-level kebab menu, right edge of the row, vertically centred.
+            Desktop: appears on hover / keyboard focus. Narrow mouse windows:
+            always shown. Touch screens: hidden — press-and-hold opens the same
+            menu (pretty-conversations.css). RowKebabMenu's portal-click-
+            containment keeps item clicks from reaching the row body. */}
+        <div
+          className="pv-row-kebab-slot"
+          data-testid="pv-row-kebab-slot"
+        >
+          <RowKebabMenu
+            ariaLabel="Conversation menu"
+            testId="pv-row-kebab-trigger"
+            items={kebabItems}
+          />
+          {kebabContextMenu.menu}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Resolve a row's identity. quick-260912-0t4: scope the lookup by hostId so
+ * two identities sharing a name across fleet hosts don't collide; fall back
+ * to the bare-name map when the scoped lookup misses (row without a host,
+ * legacy fixtures seeding only byKey, or the window before the first
+ * fleet-populated fetch resolves).
+ */
+export function resolveRowIdentity(
+  row: ConversationRowShape,
+  byHostKey: ReadonlyMap<string, Identity> | undefined,
+  byKey: ReadonlyMap<string, Identity> | undefined,
+): Identity | null {
+  const key = sessionMatchKey(row.targetTmuxSession);
+  if (!key) return null;
+  const hostIdNum = row.host ? parseInt(row.host.id, 10) : NaN;
+  if (Number.isFinite(hostIdNum)) {
+    const scoped = byHostKey?.get(`${hostIdNum}::${key}`);
+    if (scoped) return scoped;
+  }
+  return byKey?.get(key) ?? null;
+}
+
+export type PrettyConversationRowProps = Omit<
+  ComponentProps<typeof PrettyConversationRowImpl>,
+  "identity"
+>;
+
+/**
+ * Memoized row for list renderers (the sidebar panel) that resolve the
+ * identity themselves and pass stable callbacks: re-renders only when one of
+ * its own props changes.
+ */
+export const PrettyConversationRowView = memo(PrettyConversationRowImpl);
+
+/**
+ * Standalone row: subscribes to the identities store and resolves its own
+ * identity. Prefer PrettyConversationRowView inside long lists.
+ */
+export function PrettyConversationRow(props: PrettyConversationRowProps) {
+  const { byHostKey, byKey } = useIdentities();
+  return (
+    <PrettyConversationRowImpl
+      {...props}
+      identity={resolveRowIdentity(props.row, byHostKey, byKey)}
+    />
+  );
+}

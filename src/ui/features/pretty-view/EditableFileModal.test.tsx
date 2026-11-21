@@ -1,0 +1,542 @@
+/**
+ * Phase 40 Plan 40-03 Task 2 — EditableFileModal tests (14 total).
+ *
+ * Covers LOCKED decisions:
+ *   - D-04 (fresh fetch at open; visible failure over silent stale — via
+ *     in-body error copy only; toast layer removed per rev-2 /close 2026-08-14)
+ *   - D-05 (chrome fork from GlobalFilesModal minus host picker + tabs bar;
+ *     body reuses GlobalFileTab)
+ *   - D-06 (editor stateless — mtime sentinel captured once; every save =
+ *     fresh attachment)
+ *   - UI-SPEC L167-169 draft-guard confirm gate (rev-2 explicit greenlight
+ *     2026-08-14; tests 11-14)
+ *
+ * Tests:
+ *   1. fetch fires exactly once on open (with expected URL)
+ *   2. fetch does NOT fire when open=false
+ *   3. success renders GlobalFileTab in ready state (textarea shows content)
+ *   4. failure renders in-body error copy (in-modal error state — the ONLY
+ *      "visible failure" surface; toast layer removed per rev-2)
+ *   5. error-body Close button fires onOpenChange(false)
+ *   6. save handler wiring — onStageEditedFile called w/ (filename,content),
+ *      modal closes (composebox chip is the confirmation; toast removed rev-2)
+ *   7. mtime sentinel stable (Pitfall 6 defense — typed content stays)
+ *   8. portal target === document.body (Pitfall 7 defense)
+ *   9. onInteractOutside guard prevents mousedown-close; Esc still closes
+ *  10. state reset on close — re-open fires fetch again
+ *  11. draft-guard: dirty + cancel confirm → stays open
+ *  12. draft-guard: dirty + confirm → closes
+ *  13. draft-guard: save-success close bypasses confirm
+ *  14. draft-guard: clean close (no edits) does NOT prompt confirm
+ *
+ * File-window redesign (shape-file-modal 2026-10-22): notes.md is a "read
+ * first" file, so it opens locked and the save tests press Edit first; the
+ * save button is the head's "Save"; there is no foot, so closes
+ * go through the head X.
+ */
+
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { render, screen, fireEvent, waitFor, act, configure } from "@testing-library/react";
+
+// The editor lazy-loads; under heavy box load the default 1s async wait
+// lets Save stay disabled past the deadline and these tests flake.
+configure({ asyncUtilTimeout: 10_000 });
+
+// ── Hoisted module mocks ─────────────────────────────────────────────────────
+
+vi.mock("@/api/editable-file-api", () => ({
+  fetchTailnetUrl: vi.fn(),
+  fetchHostFileUrl: vi.fn(),
+}));
+
+// Stub MDXEditor with a textarea (inside a text-carrying [contenteditable], so
+// the empty-pane guard keeps it) and CodeEditorImpl with a textarea, so
+// getByRole("textbox") + fireEvent.change work on both markdown branches.
+vi.mock("@mdxeditor/editor", async () => (await import("./file-window.test-mocks")).mdxEditor());
+vi.mock("./CodeEditorImpl", async () => (await import("./file-window.test-mocks")).codeEditor());
+
+// ── Late imports (after mocks are registered) ────────────────────────────────
+
+import { __resetKitDialogsForTests, autoAnswerKitDialogs } from "@/components/kit";
+import EditableFileModal from "./EditableFileModal";
+import {
+  fetchTailnetUrl,
+  fetchHostFileUrl,
+} from "@/api/editable-file-api";
+
+// ── Fixture ──────────────────────────────────────────────────────────────────
+
+const DEFAULT_PROPS = {
+  open: true,
+  onOpenChange: vi.fn(),
+  messageEventId: "evt-1",
+  url: "http://100.64.0.1:8000/notes.md",
+  filename: "notes.md",
+  agentIdentityName: "tanya",
+  onStageEditedFile: vi.fn(),
+};
+
+const successFetch = () =>
+  (fetchTailnetUrl as ReturnType<typeof vi.fn>).mockResolvedValue({
+    contentBase64: btoa("hello"),
+    sizeBytes: 5,
+    contentType: "text/plain",
+    extension: "md",
+    filename: "notes.md",
+    isTextByExt: true,
+  });
+
+// Markdown opens for reading: Edit unlocks it (the editor remounts editable).
+async function startEditing(): Promise<HTMLTextAreaElement> {
+  fireEvent.click(await screen.findByTestId("file-window-edit"));
+  return waitFor(() => {
+    const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
+    expect(ta.readOnly).toBe(false);
+    return ta;
+  });
+}
+
+// Saving in a chat sends an edited copy; the button sits in the head.
+const sendCopyButton = (): HTMLButtonElement =>
+  screen.getByRole("button", { name: "Save" }) as HTMLButtonElement;
+
+// No foot any more: the head X (or Esc) closes.
+const headClose = (): HTMLElement => screen.getByRole("button", { name: "Close" });
+
+const failFetch = (msg = "boom") =>
+  (fetchTailnetUrl as ReturnType<typeof vi.fn>).mockRejectedValue(
+    new Error(msg),
+  );
+
+describe("EditableFileModal — Phase 40 Plan 40-03 Task 2", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    DEFAULT_PROPS.onOpenChange = vi.fn();
+    DEFAULT_PROPS.onStageEditedFile = vi.fn();
+  });
+
+  afterEach(() => {
+    __resetKitDialogsForTests();
+  });
+
+  it("test 1: fetch fires exactly once on open with the expected URL", async () => {
+    successFetch();
+    render(<EditableFileModal {...DEFAULT_PROPS} />);
+    await waitFor(() => {
+      expect(fetchTailnetUrl).toHaveBeenCalledWith("http://100.64.0.1:8000/notes.md");
+    });
+    expect(fetchTailnetUrl).toHaveBeenCalledTimes(1);
+  });
+
+  it("test 2: fetch does NOT fire when open=false", async () => {
+    successFetch();
+    render(<EditableFileModal {...DEFAULT_PROPS} open={false} />);
+    // Wait a tick to be sure any effect had a chance to fire
+    await new Promise((r) => setTimeout(r, 20));
+    expect(fetchTailnetUrl).not.toHaveBeenCalled();
+  });
+
+  it("test 3: success renders GlobalFileTab in ready state (textarea seeded)", async () => {
+    successFetch();
+    render(<EditableFileModal {...DEFAULT_PROPS} />);
+    const ta = await waitFor(() => screen.getByRole("textbox"));
+    expect((ta as HTMLTextAreaElement).value).toBe("hello");
+    // Markdown is a "read first" file: it opens locked, with Edit.
+    expect((ta as HTMLTextAreaElement).readOnly).toBe(true);
+    expect(screen.getByTestId("file-window-edit")).toBeTruthy();
+    expect(screen.queryByTestId("file-window-save")).toBeNull();
+  });
+
+  it("test 4: failure renders in-body error body (in-modal is the only visible-failure surface)", async () => {
+    failFetch();
+    render(<EditableFileModal {...DEFAULT_PROPS} />);
+    await waitFor(() => {
+      expect(screen.getByText(/Can't fetch the current file/i)).toBeTruthy();
+    });
+    // UI-SPEC L110 verbatim body copy is present
+    expect(
+      screen.getByText(/temporary server may have shut down/i),
+    ).toBeTruthy();
+    // Rev-2 /close 2026-08-14: no parallel toast — the in-body error copy is
+    // the sole "visible failure" surface. The toast layer sat at the app-wide
+    // bottom-right anchor and would have occluded the composebox on mobile.
+  });
+
+  it("test 5: error-body Close button fires onOpenChange(false)", async () => {
+    failFetch();
+    const onOpenChange = vi.fn();
+    render(<EditableFileModal {...DEFAULT_PROPS} onOpenChange={onOpenChange} />);
+    // Modal-unification 2026-09-29: the canonical <Modal> shell adds a
+    // head close X (aria-label "Close"), so /^close$/i is ambiguous.
+    // Target the in-body error Close via testid.
+    const closeBtn = await waitFor(() =>
+      screen.getByTestId("editable-file-modal-error-close"),
+    );
+    fireEvent.click(closeBtn);
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("test 6: save wiring — onStageEditedFile(filename,content) + modal closes (composebox chip is the confirmation)", async () => {
+    successFetch();
+    const onStageEditedFile = vi.fn();
+    const onOpenChange = vi.fn();
+    render(
+      <EditableFileModal
+        {...DEFAULT_PROPS}
+        onStageEditedFile={onStageEditedFile}
+        onOpenChange={onOpenChange}
+      />,
+    );
+    const ta = await startEditing();
+    fireEvent.change(ta, { target: { value: "hello world" } });
+    const saveBtn = sendCopyButton();
+    await waitFor(() => expect(saveBtn.disabled).toBe(false));
+    await act(async () => {
+      fireEvent.click(saveBtn);
+    });
+    await waitFor(() => {
+      expect(onStageEditedFile).toHaveBeenCalledWith("notes.md", "hello world");
+    });
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    // Rev-2 /close 2026-08-14: no save-success toast — the shape never asked
+    // for ambient success feedback, and the toast anchor would have occluded
+    // the composebox on mobile. The chip appearing in the composebox on save
+    // is the confirmation.
+  });
+
+  it("test 7: mtime sentinel is stable — typed content survives re-renders (Pitfall 6)", async () => {
+    successFetch();
+    const { rerender } = render(<EditableFileModal {...DEFAULT_PROPS} />);
+    const ta = await startEditing();
+    fireEvent.change(ta, { target: { value: "typed content" } });
+    expect(ta.value).toBe("typed content");
+    // Force a re-render with the same props — if mtime were computed inline
+    // per render, the useEffect in GlobalFileTab would re-seed the draft
+    // back to state.data.content ("hello"). With a stable ref, mtime is
+    // unchanged so the reseed does not fire.
+    rerender(<EditableFileModal {...DEFAULT_PROPS} />);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(ta.value).toBe("typed content");
+  });
+
+  it("test 8: portal target === document.body (Pitfall 7)", async () => {
+    successFetch();
+    render(<EditableFileModal {...DEFAULT_PROPS} />);
+    const dialog = await waitFor(() => screen.getByRole("dialog"));
+    expect(document.body.contains(dialog)).toBe(true);
+  });
+
+  it("test 9: onInteractOutside guard — outside mousedown does NOT close; Esc DOES close", async () => {
+    successFetch();
+    const onOpenChange = vi.fn();
+    render(<EditableFileModal {...DEFAULT_PROPS} onOpenChange={onOpenChange} />);
+    await waitFor(() => screen.getByRole("textbox"));
+    // Simulate outside mousedown — the DialogContent's onInteractOutside
+    // e.preventDefault() should suppress the close.
+    fireEvent.mouseDown(document.body);
+    // Allow radix's outside-interaction detector to process
+    await new Promise((r) => setTimeout(r, 20));
+    // No onOpenChange(false) from the outside click alone
+    const outsideCloseCalls = onOpenChange.mock.calls.filter(
+      (c) => c[0] === false,
+    );
+    expect(outsideCloseCalls.length).toBe(0);
+
+    // Esc key on the dialog → radix routes to onOpenChange(false)
+    const dialog = screen.getByRole("dialog");
+    fireEvent.keyDown(dialog, { key: "Escape", code: "Escape" });
+    await waitFor(() => {
+      const escCloses = onOpenChange.mock.calls.filter((c) => c[0] === false);
+      expect(escCloses.length).toBeGreaterThanOrEqual(1);
+    });
+  });
+
+  it("test 10: state reset on close — reopening re-fires fetch", async () => {
+    successFetch();
+    const { rerender } = render(<EditableFileModal {...DEFAULT_PROPS} />);
+    await waitFor(() => expect(fetchTailnetUrl).toHaveBeenCalledTimes(1));
+    // Close
+    rerender(<EditableFileModal {...DEFAULT_PROPS} open={false} />);
+    await new Promise((r) => setTimeout(r, 20));
+    // Re-open — fetch should re-fire (D-06 stateless — every open = fresh)
+    rerender(<EditableFileModal {...DEFAULT_PROPS} open={true} />);
+    await waitFor(() => expect(fetchTailnetUrl).toHaveBeenCalledTimes(2));
+  });
+
+  // ── Draft-guard confirm gate (UI-SPEC L167-169, rev-2 tests 11-14) ────────
+
+  it("test 11: draft-guard — dirty + cancel confirm → modal stays open (onOpenChange NOT called with false)", async () => {
+    successFetch();
+    const dialogs = autoAnswerKitDialogs({ confirm: false });
+    const onOpenChange = vi.fn();
+    render(<EditableFileModal {...DEFAULT_PROPS} onOpenChange={onOpenChange} />);
+    const ta = await startEditing();
+    // Make draft dirty
+    fireEvent.change(ta, { target: { value: "hello world" } });
+    // Wait for GlobalFileTab's onDraftChange effect to mark the modal dirty
+    // (Save enables on isDirty); a fixed sleep flakes under full-suite load.
+    await waitFor(() => expect(sendCopyButton().disabled).toBe(false));
+    // Trigger a close via the head X (routes through handleOpenChange).
+    fireEvent.click(headClose());
+    // Kit confirm asked with the exact copy per UI-SPEC L168 (answered "cancel").
+    await waitFor(() => expect(dialogs.calls.length).toBe(1));
+    expect(dialogs.calls[0].opts.title).toBe("Discard unsaved changes?");
+    await act(async () => {});
+    // Guard suppressed the close — no onOpenChange(false) call
+    const closeCalls = onOpenChange.mock.calls.filter((c) => c[0] === false);
+    expect(closeCalls.length).toBe(0);
+  });
+
+  it("test 12: draft-guard — dirty + confirm confirm → closes (onOpenChange called with false)", async () => {
+    successFetch();
+    const dialogs = autoAnswerKitDialogs({ confirm: true });
+    const onOpenChange = vi.fn();
+    render(<EditableFileModal {...DEFAULT_PROPS} onOpenChange={onOpenChange} />);
+    const ta = await startEditing();
+    fireEvent.change(ta, { target: { value: "hello world" } });
+    await waitFor(() => expect(sendCopyButton().disabled).toBe(false));
+    fireEvent.click(headClose());
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
+    expect(dialogs.calls.length).toBe(1);
+    expect(dialogs.calls[0].opts.title).toBe("Discard unsaved changes?");
+  });
+
+  it("test 13: draft-guard — save-success close bypasses confirm (savingRef)", async () => {
+    successFetch();
+    const dialogs = autoAnswerKitDialogs({ confirm: false });
+    const onOpenChange = vi.fn();
+    const onStageEditedFile = vi.fn();
+    render(
+      <EditableFileModal
+        {...DEFAULT_PROPS}
+        onOpenChange={onOpenChange}
+        onStageEditedFile={onStageEditedFile}
+      />,
+    );
+    const ta = await startEditing();
+    fireEvent.change(ta, { target: { value: "hello world" } });
+    await waitFor(() => expect(sendCopyButton().disabled).toBe(false));
+    const saveBtn = sendCopyButton();
+    await act(async () => {
+      fireEvent.click(saveBtn);
+    });
+    // Save path called onOpenChange(false) directly — confirm NOT invoked
+    expect(dialogs.calls.length).toBe(0);
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    expect(onStageEditedFile).toHaveBeenCalled();
+  });
+
+  it("test 14: draft-guard — clean close (no edits) does NOT prompt confirm", async () => {
+    successFetch();
+    const dialogs = autoAnswerKitDialogs({ confirm: true });
+    const onOpenChange = vi.fn();
+    render(<EditableFileModal {...DEFAULT_PROPS} onOpenChange={onOpenChange} />);
+    // Wait for load — do NOT type
+    await waitFor(() => screen.getByRole("textbox"));
+    // Give the initial onDraftChange(false) time to fire
+    await new Promise((r) => setTimeout(r, 20));
+    fireEvent.click(headClose());
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
+    expect(dialogs.calls.length).toBe(0);
+  });
+
+  // Rev-3 2026-08-14 code-review B2: UTF-8 decode regression guard. The
+  // previous `atob()` returned a Latin-1 binary string; non-ASCII content
+  // (emoji, CJK, accents) became mojibake in the textarea. Any subsequent
+  // save then re-encoded the mojibake as UTF-8, producing a different byte
+  // sequence than the agent originally served — silent corruption. The fix
+  // is a two-step decode: base64 → raw bytes → UTF-8 via TextDecoder. This
+  // test proves both directions: (a) the textarea shows the correct
+  // characters (decode), and (b) saving an appended version surfaces the
+  // full corrected string to onStageEditedFile (round-trip). We append
+  // rather than save-unchanged because GlobalFileTab disables the save
+  // button while draft === state.data.content — that's the shipped UX.
+  it("test 15 (rev-3 B2): non-ASCII UTF-8 content decodes correctly + round-trips on save", async () => {
+    const original = "日本語 emoji 🎉 café résumé";
+    const appended = original + " — edited";
+    // Encode the same way a real backend response would: UTF-8 → base64.
+    const utf8Bytes = new TextEncoder().encode(original);
+    let base64 = "";
+    for (const b of utf8Bytes) base64 += String.fromCharCode(b);
+    base64 = btoa(base64);
+    (fetchTailnetUrl as ReturnType<typeof vi.fn>).mockResolvedValue({
+      contentBase64: base64,
+      sizeBytes: utf8Bytes.byteLength,
+      contentType: "text/markdown; charset=utf-8",
+      extension: "md",
+      filename: "notes.md",
+      isTextByExt: true,
+    });
+    const onStageEditedFile = vi.fn();
+    const onOpenChange = vi.fn();
+    render(
+      <EditableFileModal
+        {...DEFAULT_PROPS}
+        onStageEditedFile={onStageEditedFile}
+        onOpenChange={onOpenChange}
+      />,
+    );
+    const ta = (await waitFor(() =>
+      screen.getByRole("textbox"),
+    )) as HTMLTextAreaElement;
+    // (a) textarea shows the correct characters (proves decode)
+    expect(ta.value).toBe(original);
+    // (b) append + save surfaces the CORRECTLY-encoded string (not mojibake)
+    const editor = await startEditing();
+    fireEvent.change(editor, { target: { value: appended } });
+    const saveBtn = sendCopyButton();
+    await waitFor(() => expect(saveBtn.disabled).toBe(false));
+    await act(async () => {
+      fireEvent.click(saveBtn);
+    });
+    await waitFor(() => expect(onStageEditedFile).toHaveBeenCalled());
+    const [savedFilename, savedContent] = (
+      onStageEditedFile as ReturnType<typeof vi.fn>
+    ).mock.calls[0];
+    expect(savedFilename).toBe("notes.md");
+    expect(savedContent).toBe(appended);
+  });
+
+  // Rev-3 2026-08-14 code-review M6: savingRef must reset if onStageEditedFile
+  // throws — otherwise the next close attempt silently bypasses the draft-
+  // guard even though the content was never stored.
+  it("test 16 (rev-3 M6): savingRef resets on throw so draft-guard fires next close", async () => {
+    successFetch();
+    const boom = new Error("stage failed");
+    const onStageEditedFile = vi.fn(() => { throw boom; });
+    const onOpenChange = vi.fn();
+    const dialogs = autoAnswerKitDialogs({ confirm: false });
+    render(
+      <EditableFileModal
+        {...DEFAULT_PROPS}
+        onStageEditedFile={onStageEditedFile}
+        onOpenChange={onOpenChange}
+      />,
+    );
+    const ta = await startEditing();
+    fireEvent.change(ta, { target: { value: "dirty draft" } });
+    // let onDraftChange(true) fire (Save enables on isDirty)
+    await waitFor(() => expect(sendCopyButton().disabled).toBe(false));
+    const saveBtn = sendCopyButton();
+    // Save throws — we don't care what surfaces, only that savingRef reset.
+    await act(async () => {
+      try { fireEvent.click(saveBtn); } catch { /* expected */ }
+    });
+    // The save handler threw so onOpenChange(false) was never called; the
+    // modal is still open. Now close via the head X — draft is dirty,
+    // savingRef must be false, so the discard confirm must open.
+    fireEvent.click(headClose());
+    await waitFor(() => expect(dialogs.calls.length).toBe(1));
+    expect(dialogs.calls[0].opts.title).toBe("Discard unsaved changes?");
+  });
+
+  // ─── Phase 75 Plan 75-02 Task 2 — file-URL dispatch + per-class error copy ─
+  //
+  // Contract additions:
+  //   - When the modal opens with a URL matching /^https:\/\/[^/]+\/file\//,
+  //     it fires fetchHostFileUrl(url), NOT fetchTailnetUrl.
+  //   - When it opens with a tailnet URL, it still fires fetchTailnetUrl.
+  //   - Backend error classes are surfaced as human-readable copy — no HTTP
+  //     status codes, no stack traces. The class-to-copy mapping lives at
+  //     modal L305-341 (extended in this plan).
+  //   - The D-04 fresh-fetch invariant + D-06 initialMtimeRef-once-at-success
+  //     invariant remain intact (no regression).
+
+  const FILE_URL_PROPS = {
+    ...DEFAULT_PROPS,
+    url: "https://term.example.com/file/boreal/home/ubuntu/note.md",
+    filename: "note.md",
+  };
+
+  const successFileFetch = () =>
+    (fetchHostFileUrl as ReturnType<typeof vi.fn>).mockResolvedValue({
+      contentBase64: btoa("hi from boreal"),
+      sizeBytes: 16,
+      contentType: null,
+      extension: "md",
+      filename: "note.md",
+      isTextByExt: true,
+    });
+
+  const failFileFetch = (errorClass: string) =>
+    (fetchHostFileUrl as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error(errorClass),
+    );
+
+  it("test 17 (Phase 75): file URL open dispatches to fetchHostFileUrl, NOT fetchTailnetUrl", async () => {
+    successFileFetch();
+    render(<EditableFileModal {...FILE_URL_PROPS} />);
+    await waitFor(() => {
+      expect(fetchHostFileUrl).toHaveBeenCalledWith(FILE_URL_PROPS.url);
+    });
+    expect(fetchHostFileUrl).toHaveBeenCalledTimes(1);
+    expect(fetchTailnetUrl).not.toHaveBeenCalled();
+  });
+
+  it("test 18 (Phase 75): tailnet URL open still dispatches to fetchTailnetUrl (no regression)", async () => {
+    successFetch();
+    render(<EditableFileModal {...DEFAULT_PROPS} />);
+    await waitFor(() => {
+      expect(fetchTailnetUrl).toHaveBeenCalledWith(DEFAULT_PROPS.url);
+    });
+    expect(fetchTailnetUrl).toHaveBeenCalledTimes(1);
+    expect(fetchHostFileUrl).not.toHaveBeenCalled();
+  });
+
+  it("test 19 (Phase 75): host_unreachable error class renders \"Host unreachable\" human copy", async () => {
+    failFileFetch("host_unreachable");
+    render(<EditableFileModal {...FILE_URL_PROPS} />);
+    await waitFor(() => {
+      expect(screen.getByText(/Host unreachable/i)).toBeTruthy();
+    });
+    // T-40-05: no HTTP status codes, no stack traces
+    expect(screen.queryByText(/502/)).toBeNull();
+    expect(screen.queryByText(/stack/i)).toBeNull();
+  });
+
+  it("test 20 (Phase 75): not_found error class renders \"File not found\" human copy", async () => {
+    failFileFetch("not_found");
+    render(<EditableFileModal {...FILE_URL_PROPS} />);
+    await waitFor(() => {
+      expect(screen.getByText(/File not found/i)).toBeTruthy();
+    });
+    expect(screen.queryByText(/404/)).toBeNull();
+  });
+
+  it("test 21 (Phase 75): permission_denied error class renders \"Permission denied\" human copy referencing the hostname", async () => {
+    failFileFetch("permission_denied");
+    render(<EditableFileModal {...FILE_URL_PROPS} />);
+    await waitFor(() => {
+      expect(screen.getByText(/Permission denied/i)).toBeTruthy();
+    });
+    // The hostname is safe to include (user typed/saw it in the URL, no
+    // info leak — see plan action block for the copy design).
+    expect(screen.getByText(/boreal/i)).toBeTruthy();
+    expect(screen.queryByText(/403/)).toBeNull();
+  });
+
+  it("test 22 (Phase 75): too_large error class explains the 2 MB cap", async () => {
+    failFileFetch("too_large");
+    render(<EditableFileModal {...FILE_URL_PROPS} />);
+    await waitFor(() => {
+      expect(screen.getByText(/2\s?MB/i)).toBeTruthy();
+    });
+    expect(screen.queryByText(/413/)).toBeNull();
+  });
+
+  it("test 23 (Phase 75): D-04 fresh-fetch invariant preserved — re-open fires fetch again", async () => {
+    successFileFetch();
+    const { rerender } = render(<EditableFileModal {...FILE_URL_PROPS} />);
+    await waitFor(() =>
+      expect(fetchHostFileUrl).toHaveBeenCalledTimes(1),
+    );
+    rerender(<EditableFileModal {...FILE_URL_PROPS} open={false} />);
+    await new Promise((r) => setTimeout(r, 20));
+    rerender(<EditableFileModal {...FILE_URL_PROPS} open={true} />);
+    await waitFor(() =>
+      expect(fetchHostFileUrl).toHaveBeenCalledTimes(2),
+    );
+    // Tailnet helper still never called
+    expect(fetchTailnetUrl).not.toHaveBeenCalled();
+  });
+});

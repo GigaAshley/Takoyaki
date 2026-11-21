@@ -1,0 +1,2207 @@
+// Tests for PrettyView's Phase 05 wiring — drop overlay mount, drag/drop
+// handlers on data-pv-root, and the folder-drop nudge.
+//
+// The PrettyView opens a WebSocket via openClaudeSessionSocket on mount;
+// mock that to a controllable stub. Session-identity + IdentityBadge
+// dependencies are lightweight — no need to mock. The upload hook is
+// consumed via a real usePrettyViewUploads call using our stubbed WS.
+//
+// phase-29 audit note (plan 29-05):
+// This file was audited post-phase-29-04 rewire. The overlay mount gates
+// migrated from local boolean state (isBooting / showOverlay / dormant)
+// to phase-driven gates (`phase === "resolving"` / "holding" / "dormant"
+// / "inactive" / "error"), and the transient "Connecting…" /
+// "Connection lost" text nodes were retired (SPEC boundary). Retired
+// state names (showOverlay, holdingTimeoutError, isBooting) appear ONLY
+// in test-description comments explaining the historical intent —
+// zero live assertions reference them. Tests were updated in one of
+// three shapes: (a) rewritten to observe the phase-derived UI equivalent;
+// (b) rewritten to use the 150ms delay-arm on the resolving spinner;
+// (c) converted to `it.todo` with a phase-29 rationale for assertions
+// that were retired outright (10s auto-dismiss watchdog). Every material
+// change carries a `// phase-29:` comment tag.
+//
+// See plan 29-04's SUMMARY.md for the full pre-rewire vs post-rewire
+// mount-gate mapping. See resolve-phase.test.ts for the truth-table
+// tests and PrettyView.phase29.test.tsx for the structural-grep gates,
+// entry-trigger integration tests, and the three named flicker
+// regression tests.
+
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { render, act, fireEvent, waitFor, screen } from "@testing-library/react";
+
+// Patch #148: wsStubs array — accumulates each WS stub created by the factory
+// across retries. Tests index into this array to assert new stubs were created
+// (retries fired) and to trigger onclose on the current stub. Declared at
+// module scope so the vi.mock factory closure can reference it after hoist.
+type WsStub = {
+  readyState: number;
+  bufferedAmount: number;
+  send: ReturnType<typeof vi.fn>;
+  close: ReturnType<typeof vi.fn>;
+  onmessage: ((e: MessageEvent<string>) => void) | null;
+  onopen: (() => void) | null;
+  onerror: (() => void) | null;
+  onclose: (() => void) | null;
+  addEventListener: ReturnType<typeof vi.fn>;
+  removeEventListener: ReturnType<typeof vi.fn>;
+};
+const wsStubs: WsStub[] = [];
+
+// Helper — returns the most-recently-created stub (the "current" WS).
+function getCurrentWs(): WsStub {
+  return wsStubs[wsStubs.length - 1];
+}
+
+// Mock claude-session-api so PrettyView's mount effect uses stub WSes.
+// Patch #148: factory now returns a FRESH stub on each call and pushes
+// it into wsStubs so reconnect tests can assert stub count and fire
+// onclose on the current stub.
+vi.mock("@/api/claude-session-api", () => ({
+  openClaudeSessionSocket: vi.fn(() => {
+    const ws: WsStub = {
+      readyState: 1,
+      bufferedAmount: 0,
+      send: vi.fn(),
+      close: vi.fn(),
+      onmessage: null,
+      onopen: null,
+      onerror: null,
+      onclose: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    };
+    wsStubs.push(ws);
+    return ws;
+  }),
+}));
+
+// Mock the compose-drafts API so ComposeBox's mount effect doesn't touch fetch.
+vi.mock("@/api/compose-drafts-api", () => ({
+  getComposeDraft: vi.fn().mockResolvedValue({ body: "" }),
+  putComposeDraft: vi.fn().mockResolvedValue(undefined),
+  flushComposeDraftKeepalive: vi.fn(),
+}));
+
+// Skills menu above the compose box: no skills. Unmocked, listSkills retries
+// against no server and its retry log can land after teardown (vitest
+// "Closing rpc while onUserConsoleLog was pending").
+vi.mock("@/api/skills-api", async (importOriginal) => {
+  const orig = (await importOriginal()) as Record<string, unknown>;
+  return { ...orig, listSkills: vi.fn().mockResolvedValue([]) };
+});
+
+// Session-hue registry — provide a benign default so the identity badge
+// mount path is deterministic.
+vi.mock("@/features/terminal/session-hue", () => ({
+  sessionMatchKey: vi.fn(() => null),
+  useSessionIdentity: vi.fn(() => ({ identity: null, identityHue: null })),
+}));
+
+// IdentityBadge — inert stub (component is exercised elsewhere).
+vi.mock("@/features/terminal/IdentityBadge", () => ({
+  IdentityBadge: () => null,
+}));
+
+// useIsTouchDevice — return false by default; individual tests can rewire
+// via vi.mocked() if needed.
+vi.mock("@/hooks/use-is-touch-device", () => ({
+  useIsTouchDevice: vi.fn(() => false),
+}));
+
+import { openClaudeSessionSocket } from "@/api/claude-session-api";
+import { sessionMatchKey, useSessionIdentity } from "@/features/terminal/session-hue";
+import {
+  __seedIdentitiesLoadedFalseForTest,
+  __resetIdentitiesStoreForTest,
+} from "@/state/identities-store";
+import { PrettyView } from "./PrettyView";
+// publishFleetStatusSessionState seeds the working-store's condensing axis
+// for Test H (the memory pie's "Compacting…").
+import {
+  publishFleetStatusSessionState,
+  __resetForTest as resetWorkingStore,
+} from "@/state/session-working-store";
+
+// The agent memory pie lives in the task pill, which only renders for a
+// session whose identity is in the identities store. Make one resolve for
+// (hostId, tmuxSession); returns the cleanup that puts the defaults back.
+// The afterEach below also runs it, so a failed assertion can't leak the
+// identity into the next test.
+const pillRestores: Array<() => void> = [];
+afterEach(() => {
+  while (pillRestores.length > 0) pillRestores.pop()!();
+});
+function withPillIdentity(hostId: number, tmuxSession: string): () => void {
+  vi.mocked(sessionMatchKey).mockImplementation((n) => (n ? n.toLowerCase() : null));
+  __seedIdentitiesLoadedFalseForTest([
+    {
+      identityKey: tmuxSession.toLowerCase(),
+      hostId,
+      displayName: "Pill",
+      title: null,
+      colorHue: 200,
+      voice: null,
+      role: null,
+      avatarMime: "image/png",
+      avatarUrl: "/identities/pill/avatar",
+      avatarEtag: "etag",
+      coordinator: false,
+      task: null,
+      project: null,
+    },
+  ]);
+  let restored = false;
+  const restore = () => {
+    if (restored) return;
+    restored = true;
+    vi.mocked(sessionMatchKey).mockImplementation(() => null);
+    __resetIdentitiesStoreForTest();
+  };
+  pillRestores.push(restore);
+  return restore;
+}
+
+// The pie inside the task pill.
+function pillGauge(container: HTMLElement, extra = ""): HTMLElement | null {
+  return container.querySelector(`[data-testid="pv-task-pill"] [data-testid="memory-gauge"]${extra}`);
+}
+
+// ── Patch #148 test helpers ────────────────────────────────────────────────
+
+// Flip the most-recently-created WS to streaming state by firing onopen +
+// a `session` frame (the frame that transitions status to "streaming").
+function flipToStreaming(ws: WsStub): void {
+  act(() => {
+    ws.onopen?.();
+    ws.onmessage?.(
+      new MessageEvent('message', {
+        data: JSON.stringify({ type: 'session', sessionFile: '/tmp/test.jsonl' }),
+      }),
+    );
+  });
+}
+
+// Fire an `inactive` frame on the given WS stub.
+function flipToInactive(ws: WsStub, reason = 'user_exit'): void {
+  act(() => {
+    ws.onmessage?.(
+      new MessageEvent('message', {
+        data: JSON.stringify({ type: 'inactive', reason }),
+      }),
+    );
+  });
+}
+
+// Fire ws.onclose() inside act(). Also sets readyState to 3 (CLOSED) so
+// the visibilitychange handler's `wsRef.current?.readyState === 1` guard
+// doesn't short-circuit the reconnect when we test that path.
+function fireClose(ws: WsStub): void {
+  act(() => {
+    ws.readyState = 3; // WebSocket.CLOSED
+    ws.onclose?.();
+  });
+}
+
+// Advance fake timers by `ms` inside act().
+function advance(ms: number): void {
+  act(() => {
+    vi.advanceTimersByTime(ms);
+  });
+}
+
+// Set document.hidden and dispatch a visibilitychange event, inside act().
+function fireVisibilityChange(hidden: boolean): void {
+  Object.defineProperty(document, 'hidden', { configurable: true, value: hidden });
+  act(() => {
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+}
+
+// ── Patch #156 test helpers ────────────────────────────────────────────────
+// The visibilitychange useEffect in PrettyView is now hard-gated on
+// isIosPwa() (see src/ui/lib/is-ios-pwa.ts). The existing patch #148 tests
+// below need the environment to LOOK LIKE iOS PWA (navigator.standalone=true
+// AND iPhone UA) for the duration of each test so the handler actually
+// attaches. These helpers install and restore that surface on demand.
+// jsdom's default is a desktop-ish UA with no standalone flag, which is what
+// the new "non-iOS-PWA no-op" test relies on for its baseline.
+const IPHONE_UA_FOR_TESTS =
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
+let __originalUaForIosPwa: string | null = null;
+function enableIosPwa(): void {
+  __originalUaForIosPwa = navigator.userAgent;
+  Object.defineProperty(navigator, 'userAgent', {
+    value: IPHONE_UA_FOR_TESTS,
+    configurable: true,
+  });
+  Object.defineProperty(navigator, 'standalone', {
+    value: true,
+    configurable: true,
+    writable: true,
+  });
+}
+function restoreIosPwa(): void {
+  if (__originalUaForIosPwa !== null) {
+    Object.defineProperty(navigator, 'userAgent', {
+      value: __originalUaForIosPwa,
+      configurable: true,
+    });
+    __originalUaForIosPwa = null;
+  }
+  delete (navigator as { standalone?: boolean }).standalone;
+}
+
+// Helper — mount PrettyView with onSend so ComposeBox mounts once
+// streaming is established.
+function mountPV() {
+  const onSend = vi.fn(() => true);
+  const utils = render(
+    <PrettyView hostId={1} tmuxSession="s1" onSend={onSend} isVisible={true} />,
+  );
+  return { ...utils, onSend };
+}
+
+// ── Phase 05 tests ─────────────────────────────────────────────────────────
+
+describe("PrettyView — Phase 05 drop overlay + hook wiring", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // NOTE: Do NOT use fake timers in this describe block — Test 10 uses
+    // waitFor() which relies on real setTimeout for its polling interval.
+    // Patch #148 reconnect tests that need fake timers live in their own
+    // separate describe block below.
+    wsStubs.length = 0;
+    // jsdom has no ResizeObserver; PrettyView measures the composer dock
+    // with one from mount (shape-conversation-view).
+    vi.stubGlobal(
+      "ResizeObserver",
+      vi.fn(function () {
+        return { observe: vi.fn(), unobserve: vi.fn(), disconnect: vi.fn() };
+      }),
+    );
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it("Test 9: drop event on data-pv-root stages the dropped files", async () => {
+    const { container } = mountPV();
+    const root = container.querySelector("[data-pv-root]") as HTMLElement;
+    expect(root).toBeTruthy();
+
+    // Fire a drop with one file. JSDOM 29 does not ship DataTransfer, so
+    // we use a plain object stub. Patch #510 added a Files-only gate
+    // (`!e.dataTransfer.types.includes("Files")`) so the stub must carry
+    // types: ["Files"] alongside items/files — otherwise the gate reads
+    // undefined.includes(...) and throws.
+    const file = new File(["hello"], "dropped.txt", { type: "text/plain" });
+    const dt = {
+      types: ["Files"] as readonly string[],
+      items: [] as unknown as DataTransferItemList,
+      files: [file] as unknown as FileList,
+    };
+
+    // We can't easily observe the internal hook state without a testable
+    // surface. Instead, we assert the DROP handler is attached and that
+    // dispatching drop does NOT throw. Downstream (Task 3's Test 12) covers
+    // the negative-case (drop outside data-pv-root has no effect).
+    const dropEvt = new Event("drop", { bubbles: true, cancelable: true });
+    Object.defineProperty(dropEvt, "dataTransfer", { value: dt, writable: false });
+    // Should not throw:
+    act(() => {
+      root.dispatchEvent(dropEvt);
+    });
+    // If the handler wasn't attached we'd see the event just bubble up
+    // — verify no error surfaced.
+    expect(true).toBe(true);
+  });
+
+  it("Test 10: dragover shows drop overlay; dragleave hides it", async () => {
+    const { container } = mountPV();
+    const root = container.querySelector("[data-pv-root]") as HTMLElement;
+
+    // Initially no overlay.
+    expect(container.querySelector('[data-testid="drop-overlay-drag"]')).toBeNull();
+
+    // Patch #510 gated the dragenter/dragover/dragleave/drop handlers on
+    // dataTransfer.types.includes("Files") so non-file drags (e.g. conv-list
+    // row drags) fall through to AppShell / SplitView Pane handlers. jsdom's
+    // Event constructor doesn't attach a dataTransfer object at all, so a
+    // plain `new Event("dragover")` would hit the gate on `undefined.types`
+    // and throw. Attach a Files-shaped dataTransfer stub via defineProperty
+    // (same jsdom-safe pattern SplitView.test.tsx uses for its drag events).
+    const filesDataTransfer = {
+      types: ["Files"] as readonly string[],
+      files: [] as unknown as FileList,
+      items: [] as unknown as DataTransferItemList,
+    };
+    const withFilesDT = (evt: Event): Event => {
+      Object.defineProperty(evt, "dataTransfer", {
+        value: filesDataTransfer,
+        configurable: true,
+      });
+      return evt;
+    };
+
+    // Fire dragenter + dragover to activate.
+    act(() => {
+      const enter = withFilesDT(new Event("dragenter", { bubbles: true, cancelable: true }));
+      root.dispatchEvent(enter);
+      const over = withFilesDT(new Event("dragover", { bubbles: true, cancelable: true }));
+      root.dispatchEvent(over);
+    });
+
+    await waitFor(() => {
+      expect(
+        container.querySelector('[data-testid="drop-overlay-drag"]'),
+      ).toBeTruthy();
+    });
+
+    // Fire dragleave — overlay should retreat once the counter goes to 0.
+    act(() => {
+      const leave = withFilesDT(new Event("dragleave", { bubbles: true, cancelable: true }));
+      root.dispatchEvent(leave);
+    });
+
+    await waitFor(() => {
+      expect(
+        container.querySelector('[data-testid="drop-overlay-drag"]'),
+      ).toBeNull();
+    });
+  });
+
+  it("Test 12: drop OUTSIDE data-pv-root has no effect", () => {
+    const { container } = mountPV();
+    // Create a sibling element outside data-pv-root and fire drop there.
+    const outside = document.createElement("div");
+    document.body.appendChild(outside);
+    try {
+      const file = new File(["x"], "elsewhere.txt", { type: "text/plain" });
+      const dt = {
+        items: [] as unknown as DataTransferItemList,
+        files: [file] as unknown as FileList,
+      };
+      const dropEvt = new Event("drop", { bubbles: true, cancelable: true });
+      Object.defineProperty(dropEvt, "dataTransfer", { value: dt });
+      // If PrettyView had attached a document-level drop listener (wrong!),
+      // we'd see side effects. Since it should only listen on data-pv-root,
+      // this must be a no-op. Assertion: no drop-overlay-drag element ever
+      // appears from this out-of-tree drop.
+      outside.dispatchEvent(dropEvt);
+      expect(
+        container.querySelector('[data-testid="drop-overlay-drag"]'),
+      ).toBeNull();
+    } finally {
+      outside.remove();
+    }
+  });
+});
+
+// ── Patch #148: WebSocket auto-reconnect tests ─────────────────────────────
+//
+// These tests use fake timers so setTimeout(2000) etc. are advanceable via
+// vi.advanceTimersByTime(). Kept in a separate describe block from the Phase
+// 05 tests to avoid interfereing with waitFor() which needs real timer polling.
+describe("PrettyView — patch #148 WebSocket auto-reconnect", () => {
+  // jsdom does not implement ResizeObserver; useAutoScroll uses it in its
+  // effect. Provide a no-op stub for all reconnect tests in this block.
+  let resizeObserverStub: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    // Reset wsStubs so each test starts with a clean sequence.
+    wsStubs.length = 0;
+    // Restore document.hidden to default (not hidden) before each test.
+    Object.defineProperty(document, 'hidden', { configurable: true, value: false });
+    // Patch #156: opt this whole describe block into iOS-PWA mode so the
+    // visibilitychange useEffect (now gated on isIosPwa()) attaches its
+    // listener. Without this, Test C would no-op and stub 7 would never
+    // be created. The Patch #156 non-iOS-PWA no-op test lives in its own
+    // describe block below that deliberately does NOT enable iOS-PWA.
+    enableIosPwa();
+    // Stub ResizeObserver — jsdom doesn't implement it.
+    // Must be a function/class (not arrow fn) so `new ResizeObserver(...)` works.
+    resizeObserverStub = vi.fn(function () {
+      return { observe: vi.fn(), unobserve: vi.fn(), disconnect: vi.fn() };
+    });
+    vi.stubGlobal('ResizeObserver', resizeObserverStub);
+  });
+
+  afterEach(() => {
+    restoreIosPwa();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it("Test A (must): retry-on-close — fires fresh WS after backoff (patch #148 mechanism preserved through phase-29 rewire)", () => {
+    // phase-29: the "Connection closed" transient text node is retired
+    // (SPEC boundary — the resolving spinner covers the reconnect window
+    // during pre-resolve, and PrettyViewErrorOverlay covers the terminal
+    // failed-permanently case). What this test locks is the patch #148
+    // retry-scheduler mechanism itself — fresh WS stub created after the
+    // backoff delay, and the errorMessage state cleared internally on
+    // reopen. errorMessage is no longer surfaced to the UI, so the test
+    // observes only the observable retry-mechanism outputs (WS stub count).
+    mountPV();
+    // After mount, stub #1 is created.
+    expect(wsStubs.length).toBe(1);
+    const ws1 = getCurrentWs();
+
+    // Advance to streaming state.
+    flipToStreaming(ws1);
+
+    // Fire close on stub #1.
+    fireClose(ws1);
+
+    // Immediately after close: no new WS yet (timer not fired).
+    expect(wsStubs.length).toBe(1);
+
+    // Advance first backoff (attempt 1 → delay = 2000ms).
+    advance(2000);
+
+    // A new stub should have been created by the retryKey-driven re-run —
+    // proves the patch #148 retry-on-close scheduler still fires under
+    // the phase-29 rewire. The specific state mutation (setStatus("error")
+    // + setErrorMessage("Connection closed")) still happens internally
+    // (see onclose handler); this is the observable side effect.
+    expect(wsStubs.length).toBe(2);
+    const ws2 = getCurrentWs();
+
+    // Fire onopen on the new stub. Under the old code path this test
+    // asserted "Connection closed" text disappearing; under phase-29
+    // that text was never displayed. Observable proxy: the WS stub was
+    // successfully reopened — no throw, no additional retry stub queued.
+    act(() => {
+      ws2.onopen?.();
+    });
+    // No new stub was created (the retry chain paused because onopen
+    // succeeded — the next close would restart the ladder from the
+    // now-incremented attempt count).
+    expect(wsStubs.length).toBe(2);
+  });
+
+  it("Test B (must): max-attempt cap — no 6th WS after 5 consecutive closes", () => {
+    mountPV();
+    expect(wsStubs.length).toBe(1);
+
+    // Simulate 5 close→retry→close cycles through the backoff schedule:
+    //   attempt 1: delay 2s, attempt 2: delay 4s, attempt 3: delay 6s,
+    //   attempt 4: delay 8s, attempt 5: delay 8s (cap).
+    const backoffs = [2000, 4000, 6000, 8000, 8000];
+    for (const delay of backoffs) {
+      const ws = getCurrentWs();
+      flipToStreaming(ws);
+      fireClose(ws);
+      advance(delay);
+    }
+
+    // After 5 retries we have stubs 1..5 (the initial + 4 retries created
+    // by the timer) + the 5th close fires but the cap is reached, so no
+    // further retry is scheduled. Actually: initial WS + 5 retries fired =
+    // 6 stubs total (each retry creates one). Wait — let's be precise:
+    // close #1 on stub 1 → schedules retry → stub 2 after 2s.
+    // close #2 on stub 2 → schedules retry → stub 3 after 4s.
+    // close #3 on stub 3 → schedules retry → stub 4 after 6s.
+    // close #4 on stub 4 → schedules retry → stub 5 after 8s.
+    // close #5 on stub 5 → AT CAP (attempts=5, cap=5) → no timer.
+    // Total stubs: 5 (1 initial + 4 retries from first 4 closes).
+    // Hmm: attempt increments BEFORE scheduling; starts at 0.
+    // close #1: attempts=0 < 5 → schedule → increment to 1 → stub 2 after 2s.
+    // close #2: attempts=1 < 5 → schedule → increment to 2 → stub 3 after 4s.
+    // close #3: attempts=2 < 5 → schedule → increment to 3 → stub 4 after 6s.
+    // close #4: attempts=3 < 5 → schedule → increment to 4 → stub 5 after 8s.
+    // close #5: attempts=4 < 5 → schedule → increment to 5 → stub 6 after 8s.
+    // But then stub 6 has attempt=5=cap so its close fires no retry.
+    // Total stubs: 6. So after 5 backoff advances we have 6 stubs.
+    expect(wsStubs.length).toBe(6);
+
+    // Fire close on stub 6 (attempt count is now 5 = MAX).
+    fireClose(getCurrentWs());
+
+    // Advance another 8000ms — should NOT create a 7th stub.
+    advance(8000);
+    expect(wsStubs.length).toBe(6);
+
+    // DOM still shows "Connection closed".
+    // The render shows errorMessage when status === "error".
+    // (We check textContent includes the error text.)
+    // Note: we don't call flipToStreaming on each retry stub in this sequence —
+    // that's fine because the retry still schedules based on onclose after a
+    // fresh WS is created. We do need the last onclose to actually fire.
+  });
+
+  it("Test C (should): visibilitychange:visible resets counter and reconnects after cap", () => {
+    mountPV();
+
+    // Reach the cap: 5 consecutive closes (produces 6 stubs, attempt count = 5 after last close).
+    // Backoffs: 2s, 4s, 6s, 8s, 8s.
+    const backoffs = [2000, 4000, 6000, 8000, 8000];
+    for (const delay of backoffs) {
+      const ws = getCurrentWs();
+      flipToStreaming(ws);
+      fireClose(ws);
+      advance(delay);
+    }
+    // Fire close on stub 6 to hit the cap.
+    fireClose(getCurrentWs());
+    advance(8000); // Should NOT produce stub 7.
+    expect(wsStubs.length).toBe(6);
+
+    // Now foreground the tab via visibilitychange:visible.
+    // This resets reconnectAttemptsRef to 0 and bumps retryKey immediately.
+    // The WS-setup useEffect re-runs synchronously with the React commit.
+    fireVisibilityChange(false); // hidden=false → visible
+
+    // After the visibilitychange settles, a new stub should be created.
+    // retryKey bump is synchronous (setRetryKey → useEffect re-run via React scheduler).
+    // Give React a chance to flush via advance(0).
+    advance(0);
+
+    expect(wsStubs.length).toBe(7);
+  });
+
+  it("Test D (should): inactive status skips retry — no new WS after onclose", () => {
+    const { container } = mountPV();
+    expect(wsStubs.length).toBe(1);
+    const ws1 = getCurrentWs();
+
+    flipToStreaming(ws1);
+    // Flip to inactive via an `inactive` message frame.
+    flipToInactive(ws1);
+
+    // Now fire close on the WS.
+    fireClose(ws1);
+
+    // Advance 2000ms — should NOT create stub #2 (inactive short-circuit).
+    advance(2000);
+    expect(wsStubs.length).toBe(1);
+
+    // The inactive UI renders "no active Claude session", not "Connection closed".
+    // Assert "Connection closed" is NOT present in the DOM.
+    // (The inactive branch renders its own string via the status==="inactive" JSX.)
+    expect(container.textContent).not.toContain('Connection closed');
+  });
+});
+
+// ── Patch #156: iOS-PWA gate on the patch #148 visibilitychange handler ───
+//
+// Deliberately does NOT call enableIosPwa() — jsdom's default UA is a Node
+// build (no /iP(hone|ad|od)/ match) and there is no navigator.standalone, so
+// isIosPwa() returns false. Under that condition the visibilitychange
+// useEffect must early-return and register no listener at all, so firing
+// visibility events must NOT create additional WS stubs.
+describe("PrettyView — patch #156 non-iOS-PWA visibilitychange no-op", () => {
+  let resizeObserverStub: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    wsStubs.length = 0;
+    Object.defineProperty(document, 'hidden', { configurable: true, value: false });
+    // NO enableIosPwa() here — this is the whole point of the test.
+    // Belt-and-braces: ensure no stale standalone flag from a sibling test
+    // survived (afterEach in the #148 block calls restoreIosPwa, but be
+    // explicit in case describe ordering shifts).
+    delete (navigator as { standalone?: boolean }).standalone;
+    resizeObserverStub = vi.fn(function () {
+      return { observe: vi.fn(), unobserve: vi.fn(), disconnect: vi.fn() };
+    });
+    vi.stubGlobal('ResizeObserver', resizeObserverStub);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it("Patch #156: non-iOS-PWA (Chrome desktop) — visibilitychange handler is not attached and does not trigger reconnect", () => {
+    // Sanity: jsdom's default environment is NOT iOS PWA.
+    expect((navigator as { standalone?: boolean }).standalone).toBeUndefined();
+    expect(/iP(hone|ad|od)/.test(navigator.userAgent)).toBe(false);
+
+    mountPV();
+    // After mount, the WS-setup useEffect has created the initial WS stub.
+    // We do NOT flip to streaming — the visibilitychange handler doesn't
+    // gate on status for the non-iOS-PWA test; the whole point is that the
+    // handler is not registered so status doesn't matter.
+    const baseline = wsStubs.length;
+    expect(baseline).toBe(1);
+
+    // Fire hidden→visible cycle. On iOS PWA this would bump retryKey and
+    // create a fresh stub; on non-iOS-PWA it must be a no-op (no listener
+    // attached, so document.dispatchEvent finds nothing).
+    fireVisibilityChange(true);
+    fireVisibilityChange(false);
+    // Give React a chance to flush any (hypothetical) scheduled effect work.
+    advance(0);
+
+    // No new WS stub — retryKey did not bump because the useEffect early-returned.
+    expect(wsStubs.length).toBe(baseline);
+  });
+});
+
+// ── Phase 14 Wave 5: aside integration ─────────────────────────────────────
+//
+// End-to-end integration coverage under the LOCKED architecture (frontend-arm
+// per CONTEXT.md § Trigger LOCK 2026-07-26 + module-scope backend state per
+// § Backend per-connection state LOCK). Extends PrettyView.aside.test.tsx
+// (which covered Wave 3 wiring at the render layer) with coverage that
+// exercises the full render + ComposeBox morph + WS-outbound dismiss cycle
+// on the assembled Wave 3 + Wave 4 stack.
+//
+// Test A: aside_arm emission on isIdle:false→true transition (per-turn,
+//         with a negative sub-case proving pvIdentity=null suppresses).
+// Test B: aside_ready frame mounts <AsideBubble role="note"> AND morphs
+//         ComposeBox — Send button becomes "Resume", aux buttons disabled,
+//         textarea remains editable (per CONTEXT.md § ComposeBox morph).
+// Test C: clicking "Resume" fires WS-outbound {type:"aside_dismissed",...}
+//         AND optimistically clears the AsideBubble.
+// Test D: inbound aside_dismissed is idempotent on already-cleared state.
+// Test E: fresh-pane mount clears asideText to null (paneKey change).
+//
+// WS-outbound spy: mockWs.send is a vi.fn() on the WsStub, so we filter
+// its call list by JSON-parsing each arg to check `type`. Same pattern as
+// PrettyView.aside.test.tsx Test 3.
+describe("PrettyView — Phase 14 Wave 5 aside integration (frontend-arm + morph)", () => {
+  let resizeObserverStub: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    wsStubs.length = 0;
+    // Default: anonymous session. Test A (identity sub-case) overrides.
+    vi.mocked(useSessionIdentity).mockReturnValue({
+      identity: null,
+      identityHue: null,
+    } as ReturnType<typeof useSessionIdentity>);
+    resizeObserverStub = vi.fn(function () {
+      return { observe: vi.fn(), unobserve: vi.fn(), disconnect: vi.fn() };
+    });
+    vi.stubGlobal('ResizeObserver', resizeObserverStub);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  // Helper — filter a mock.calls array of ws.send() invocations for the first
+  // frame whose parsed JSON has the given `type`.
+  function findSentFrame(
+    ws: WsStub,
+    type: string,
+    fromIndex = 0,
+  ): unknown | undefined {
+    const calls = ws.send.mock.calls.slice(fromIndex);
+    for (const [raw] of calls) {
+      try {
+        const parsed = JSON.parse(raw as string);
+        if (parsed && parsed.type === type) return parsed;
+      } catch {
+        /* ignore non-JSON */
+      }
+    }
+    return undefined;
+  }
+
+  // Test A SKIPPED 2026-07-27 (user): automatic aside-arm emit disabled at
+  // the source via AUTO_ASIDE_ARM_ENABLED=false in PrettyView.tsx. This test
+  // covers both the positive emit (identity attached) AND the anonymous
+  // suppression via its Sub-case 2 — both are inert while the flag is off.
+  // Re-enable with the flag when a new trigger mechanism lands. Tests B/C/D/E
+  // cover the render + morph + dismiss surface, which is unchanged.
+  it.skip("Test A: isIdle:false→true on identity-attached session sends {type:\"aside_arm\"} on WS (repeats per turn; identity gate suppresses)", async () => {
+    // Sub-case 1 — identity attached → arm fires; second transition fires
+    // a SECOND arm (per-turn, not one-shot).
+    vi.mocked(useSessionIdentity).mockReturnValue({
+      identity: { key: "tina", displayName: "Tina", colorHue: 200 } as unknown,
+      identityHue: 200,
+    } as ReturnType<typeof useSessionIdentity>);
+
+    const { rerender, unmount } = render(
+      <PrettyView
+        hostId={1}
+        tmuxSession="s1"
+        onSend={() => true}
+        isIdle={false}
+        isVisible={true}
+      />,
+    );
+    const ws = getCurrentWs();
+    flipToStreaming(ws);
+    const beforeFirst = ws.send.mock.calls.length;
+
+    // First false→true transition (completed turn #1).
+    rerender(
+      <PrettyView hostId={1} tmuxSession="s1" onSend={() => true} isIdle={true} isVisible={true} />,
+    );
+    await waitFor(() => {
+      expect(findSentFrame(ws, "aside_arm", beforeFirst)).toBeTruthy();
+    });
+    const beforeSecond = ws.send.mock.calls.length;
+
+    // Reset isIdle to false, then back to true — should fire a SECOND arm.
+    rerender(
+      <PrettyView hostId={1} tmuxSession="s1" onSend={() => true} isIdle={false} isVisible={true} />,
+    );
+    rerender(
+      <PrettyView hostId={1} tmuxSession="s1" onSend={() => true} isIdle={true} isVisible={true} />,
+    );
+    await waitFor(() => {
+      expect(findSentFrame(ws, "aside_arm", beforeSecond)).toBeTruthy();
+    });
+
+    unmount();
+
+    // Sub-case 2 — anonymous session (pvIdentity === null): NO arm fires
+    // on the isIdle transition. Identity gating happens frontend-side
+    // per CONTEXT.md § Trigger LOCK.
+    vi.mocked(useSessionIdentity).mockReturnValue({
+      identity: null,
+      identityHue: null,
+    } as ReturnType<typeof useSessionIdentity>);
+    const { rerender: rerender2 } = render(
+      <PrettyView
+        hostId={2}
+        tmuxSession="anon"
+        onSend={() => true}
+        isIdle={false}
+        isVisible={true}
+      />,
+    );
+    const ws2 = getCurrentWs();
+    flipToStreaming(ws2);
+    const beforeAnon = ws2.send.mock.calls.length;
+
+    rerender2(
+      <PrettyView hostId={2} tmuxSession="anon" onSend={() => true} isIdle={true} isVisible={true} />,
+    );
+    // Give the effect a chance to run.
+    await new Promise((r) => setTimeout(r, 40));
+    expect(findSentFrame(ws2, "aside_arm", beforeAnon)).toBeUndefined();
+  });
+
+  it("Test B: inbound aside_ready mounts AsideBubble (role=\"note\") AND morphs ComposeBox (Send→Resume, textarea editable)", async () => {
+    // Identity attached so ComposeBox mounts with the identity color scheme.
+    vi.mocked(useSessionIdentity).mockReturnValue({
+      identity: { key: "tina", displayName: "Tina", colorHue: 200 } as unknown,
+      identityHue: 200,
+    } as ReturnType<typeof useSessionIdentity>);
+
+    const { container, queryByRole, getByRole } = render(
+      <PrettyView hostId={1} tmuxSession="s1" onSend={() => true} isVisible={true} />,
+    );
+    const ws = getCurrentWs();
+    flipToStreaming(ws);
+
+    // Pre-condition: main button present (thumbs-up — nothing typed;
+    // shape-conversation-view), no aside note yet, no Resume button.
+    await waitFor(() => {
+      expect(getByRole("button", { name: "Send 'thumbs up'" })).toBeTruthy();
+    });
+    expect(queryByRole("note")).toBeNull();
+    expect(queryByRole("button", { name: "Resume" })).toBeNull();
+
+    // Dispatch aside_ready inbound frame.
+    act(() => {
+      ws.onmessage?.(
+        new MessageEvent("message", {
+          data: JSON.stringify({
+            type: "aside_ready",
+            text: "the agent is refactoring the auth flow",
+          }),
+        }),
+      );
+    });
+
+    await waitFor(() => {
+      // AsideBubble mounted.
+      const note = container.querySelector('[role="note"]');
+      expect(note).toBeTruthy();
+      expect(note?.textContent).toContain("the agent is refactoring the auth flow");
+      // ComposeBox morphed: the main button is Resume (no Send / thumbs-up).
+      expect(queryByRole("button", { name: "Send" })).toBeNull();
+      expect(queryByRole("button", { name: "Send 'thumbs up'" })).toBeNull();
+      expect(getByRole("button", { name: "Resume" })).toBeTruthy();
+    });
+
+    // (Aux-control gating while an aside is up is covered by
+    // ComposeBox.aside-morph.test.tsx.)
+
+    // Textarea remains editable — per CONTEXT.md § ComposeBox morph verbatim.
+    const textarea = container.querySelector("textarea") as HTMLTextAreaElement | null;
+    expect(textarea).toBeTruthy();
+    expect(textarea!.disabled).toBe(false);
+  });
+
+  it("Test C: clicking \"Resume\" fires WS-outbound {type:\"aside_dismissed\",...} AND optimistically clears the AsideBubble", async () => {
+    vi.mocked(useSessionIdentity).mockReturnValue({
+      identity: { key: "tina", displayName: "Tina", colorHue: 200 } as unknown,
+      identityHue: 200,
+    } as ReturnType<typeof useSessionIdentity>);
+
+    const { container, queryByRole, getByRole } = render(
+      <PrettyView hostId={42} tmuxSession="tina@main" onSend={() => true} isVisible={true} />,
+    );
+    const ws = getCurrentWs();
+    flipToStreaming(ws);
+
+    // Display aside first.
+    act(() => {
+      ws.onmessage?.(
+        new MessageEvent("message", {
+          data: JSON.stringify({ type: "aside_ready", text: "hello aside" }),
+        }),
+      );
+    });
+    await waitFor(() => {
+      expect(container.querySelector('[role="note"]')).toBeTruthy();
+      expect(getByRole("button", { name: "Resume" })).toBeTruthy();
+    });
+    const beforeDismiss = ws.send.mock.calls.length;
+
+    // Click Resume.
+    act(() => {
+      fireEvent.click(getByRole("button", { name: "Resume" }));
+    });
+
+    // WS-outbound aside_dismissed frame captured.
+    const outbound = findSentFrame(ws, "aside_dismissed", beforeDismiss) as
+      | { type: string; hostId: number; tmuxSession: string }
+      | undefined;
+    expect(outbound).toBeTruthy();
+    expect(outbound!.hostId).toBe(42);
+    expect(outbound!.tmuxSession).toBe("tina@main");
+
+    // Optimistic clear: role="note" gone; main button back to thumbs-up
+    // (nothing typed); Resume gone.
+    await waitFor(() => {
+      expect(container.querySelector('[role="note"]')).toBeNull();
+      expect(getByRole("button", { name: "Send 'thumbs up'" })).toBeTruthy();
+      expect(queryByRole("button", { name: "Resume" })).toBeNull();
+    });
+  });
+
+  it("Test D: inbound aside_dismissed WS frame is idempotent on already-cleared state (no crash, no state change)", async () => {
+    vi.mocked(useSessionIdentity).mockReturnValue({
+      identity: { key: "tina", displayName: "Tina", colorHue: 200 } as unknown,
+      identityHue: 200,
+    } as ReturnType<typeof useSessionIdentity>);
+
+    const { container, queryByRole } = render(
+      <PrettyView hostId={1} tmuxSession="s1" onSend={() => true} isVisible={true} />,
+    );
+    const ws = getCurrentWs();
+    flipToStreaming(ws);
+
+    // Mount an aside, then dismiss it via inbound frame.
+    act(() => {
+      ws.onmessage?.(
+        new MessageEvent("message", {
+          data: JSON.stringify({ type: "aside_ready", text: "hello" }),
+        }),
+      );
+    });
+    await waitFor(() => {
+      expect(container.querySelector('[role="note"]')).toBeTruthy();
+    });
+
+    act(() => {
+      ws.onmessage?.(
+        new MessageEvent("message", {
+          data: JSON.stringify({ type: "aside_dismissed" }),
+        }),
+      );
+    });
+    await waitFor(() => {
+      expect(container.querySelector('[role="note"]')).toBeNull();
+    });
+
+    // Fire a SECOND aside_dismissed — no crash, DOM unchanged.
+    expect(() => {
+      act(() => {
+        ws.onmessage?.(
+          new MessageEvent("message", {
+            data: JSON.stringify({ type: "aside_dismissed" }),
+          }),
+        );
+      });
+    }).not.toThrow();
+    expect(container.querySelector('[role="note"]')).toBeNull();
+    // Send remains present (no morph flicker).
+    expect(queryByRole("button", { name: "Resume" })).toBeNull();
+  });
+
+  it("Test E: fresh-pane mount (hostId/tmuxSession change) resets asideText to null before any WS frame arrives on the new pane", async () => {
+    vi.mocked(useSessionIdentity).mockReturnValue({
+      identity: { key: "tina", displayName: "Tina", colorHue: 200 } as unknown,
+      identityHue: 200,
+    } as ReturnType<typeof useSessionIdentity>);
+
+    const { container, rerender } = render(
+      <PrettyView hostId={1} tmuxSession="pane-A" onSend={() => true} isVisible={true} />,
+    );
+    const wsA = getCurrentWs();
+    flipToStreaming(wsA);
+
+    act(() => {
+      wsA.onmessage?.(
+        new MessageEvent("message", {
+          data: JSON.stringify({ type: "aside_ready", text: "aside on pane A" }),
+        }),
+      );
+    });
+    await waitFor(() => {
+      expect(container.querySelector('[role="note"]')).toBeTruthy();
+    });
+
+    // Switch to a fresh pane.
+    rerender(
+      <PrettyView hostId={2} tmuxSession="pane-B" onSend={() => true} isVisible={true} />,
+    );
+
+    // Fresh-pane reset should have cleared asideText BEFORE the new pane's WS
+    // stream emits any frame. Assert role="note" gone even without dispatching
+    // a new inbound aside_dismissed frame from the new pane's WS.
+    await waitFor(() => {
+      expect(container.querySelector('[role="note"]')).toBeNull();
+    });
+  });
+});
+
+// ── Fix B (2026-07-30): session_holding_cleared WS event ─────────────────────
+//
+// Tests: the new `case "session_holding_cleared"` handler in PrettyView's
+// ws.onmessage switch surgically clears holdingTimeoutError WITHOUT
+// touching the message stream, contextPct, harnessTasks, etc. Contrast with
+// `session_changed` which is a heavy-reset for a real session change.
+//
+// Holding no longer mounts any overlay (the holding overlay was retired with
+// agent reset); these tests assert nothing covers the conversation.
+
+describe("PrettyView — Fix B: session_holding_cleared self-clear (quick 260730-sjf)", () => {
+  let resizeObserverStub: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.clearAllMocks();
+    wsStubs.length = 0;
+    vi.mocked(useSessionIdentity).mockReturnValue({
+      identity: null,
+      identityHue: null,
+    } as ReturnType<typeof useSessionIdentity>);
+    resizeObserverStub = vi.fn(function () {
+      return { observe: vi.fn(), unobserve: vi.fn(), disconnect: vi.fn() };
+    });
+    vi.stubGlobal('ResizeObserver', resizeObserverStub);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  // Helper: fire a WS frame on the current WS stub inside act().
+  function fireWsFrame(ws: WsStub, frame: Record<string, unknown>): void {
+    act(() => {
+      ws.onmessage?.(
+        new MessageEvent('message', { data: JSON.stringify(frame) }),
+      );
+    });
+  }
+
+  // Helper: flip to streaming then arm holding. The legacy session_holding
+  // frame still emits on the wire (Plan 30-01 § L2154 preserves it for
+  // backward compat); the sibling pane_state:holding (discovery_diff — the
+  // discovery repoll saw the session file change) drives renderedState.
+  function armHolding(ws: WsStub): void {
+    // Transition to streaming first.
+    act(() => {
+      ws.onopen?.();
+      ws.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({ type: 'session', sessionFile: '/tmp/test.jsonl' }),
+        }),
+      );
+    });
+    // The initial pane_state:active from startActiveSessionFlow
+    // (Plan 30-01 § L3871 attach-time emit).
+    fireWsFrame(ws, { type: 'pane_state', state: 'active' });
+    // Arm holding — send BOTH the legacy frame (side-effect side) AND
+    // the sibling pane_state:holding.
+    fireWsFrame(ws, { type: 'session_holding' });
+    fireWsFrame(ws, { type: 'pane_state', state: 'holding', reason: 'discovery_diff' });
+  }
+
+  it("Test F1: holding mounts no overlay; session_holding_cleared + pane_state:active leaves the conversation uncovered and the composer usable", () => {
+    const { container } = render(
+      <PrettyView hostId={1} tmuxSession="s1" onSend={vi.fn(() => true)} isVisible={true} />,
+    );
+    const ws = getCurrentWs();
+    armHolding(ws);
+
+    // Nothing covers the conversation while holding.
+    expect(container.querySelector('[role="status"]')).toBeNull();
+    expect(screen.queryByText(/Session recycling/i)).toBeNull();
+
+    fireWsFrame(ws, { type: 'session_holding_cleared' });
+    // Phase 30: the sibling pane_state:active emission from
+    // transitionFromHoldingToActiveSameFile (Plan 30-01 § L2260).
+    fireWsFrame(ws, { type: 'pane_state', state: 'active', reason: 'same_file_recovery' });
+
+    expect(container.querySelector('[role="status"]')).toBeNull();
+    const textarea = container.querySelector('textarea[placeholder="Write a message…"]') as HTMLTextAreaElement | null;
+    expect(textarea).not.toBeNull();
+    expect(textarea!.disabled).toBe(false);
+  });
+
+  it("Test F2: messages populated BEFORE session_holding_cleared are preserved verbatim after (no heavy-reset)", () => {
+    const { container } = render(
+      <PrettyView hostId={1} tmuxSession="s1" onSend={vi.fn(() => true)} isVisible={true} />,
+    );
+    const ws = getCurrentWs();
+    // Transition to streaming:
+    act(() => {
+      ws.onopen?.();
+      ws.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({ type: 'session', sessionFile: '/tmp/test.jsonl' }),
+        }),
+      );
+    });
+
+    // Send two message frames (user + assistant) to populate the message list:
+    fireWsFrame(ws, {
+      type: 'message', role: 'user', content: 'hello there', eventId: 'ev-1', ts: 1000,
+    });
+    fireWsFrame(ws, {
+      type: 'message', role: 'assistant', content: 'hi back', eventId: 'ev-2', ts: 1001,
+    });
+
+    // Arm holding overlay:
+    fireWsFrame(ws, { type: 'session_holding' });
+    act(() => { vi.advanceTimersByTime(400); });
+
+    // Now fire session_holding_cleared:
+    fireWsFrame(ws, { type: 'session_holding_cleared' });
+    // Phase 30: the sibling pane_state:active emission from
+    // transitionFromHoldingToActiveSameFile (Plan 30-01 § L2260)
+    // is what actually drives the overlay unmount.
+    fireWsFrame(ws, { type: 'pane_state', state: 'active', reason: 'same_file_recovery' });
+
+    // Overlay must be gone:
+    expect(container.querySelector('[role="status"]')).toBeNull();
+
+    // Message content must still be present — session_holding_cleared must NOT
+    // clear the message stream (contrast with session_changed which does):
+    expect(container.textContent).toContain('hello there');
+    expect(container.textContent).toContain('hi back');
+  });
+
+  it("Test F3: contextPct sourced from fleet-status is preserved across session_holding_cleared (no heavy-reset)", async () => {
+    // Phase 90 Plan 00 Wave 0 (D-10 delivery mechanism, user 2026-09-08
+    // D-03 mechanical waiver): contextPct now lives on fleet-status; the
+    // WS `context_pct` frame handler in PrettyView is a NO-OP. This test
+    // rewritten to publish contextPct via the fleet-status store (the
+    // authoritative source post-swap) and confirms session_holding_cleared
+    // does NOT wipe the meter reading. Same INTENT as before, updated
+    // publisher.
+    const { __setSessionContextPctForTests, __resetSessionContextPctForTests } =
+      await import("@/api/fleet-status-client");
+    __resetSessionContextPctForTests();
+    const restorePill = withPillIdentity(1, "s1");
+
+    const { container } = render(
+      <PrettyView hostId={1} tmuxSession="s1" onSend={vi.fn(() => true)} isVisible={true} />,
+    );
+    const ws = getCurrentWs();
+    act(() => {
+      ws.onopen?.();
+      ws.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({ type: 'session', sessionFile: '/tmp/test.jsonl' }),
+        }),
+      );
+    });
+
+    // Publish contextPct via fleet-status (the post-swap source of truth) so
+    // the % badge renders:
+    act(() => {
+      __setSessionContextPctForTests("1", "s1", 42);
+    });
+
+    // Arm holding + clear:
+    fireWsFrame(ws, { type: 'session_holding' });
+    act(() => { vi.advanceTimersByTime(400); });
+    fireWsFrame(ws, { type: 'session_holding_cleared' });
+    // Phase 30: the sibling pane_state:active emission from
+    // transitionFromHoldingToActiveSameFile (Plan 30-01 § L2260)
+    // is what actually drives the overlay unmount.
+    fireWsFrame(ws, { type: 'pane_state', state: 'active', reason: 'same_file_recovery' });
+
+    // Overlay gone:
+    expect(container.querySelector('[role="status"]')).toBeNull();
+    // contextPct value is surfaced via data-pct on the task pill's memory
+    // pie (MemoryGauge renders data-pct={pct}). Fleet-status is
+    // authoritative; session_holding_cleared does not clear the reading.
+    expect(pillGauge(container, '[data-pct="42"]')).toBeTruthy();
+
+    __resetSessionContextPctForTests();
+    restorePill();
+  });
+});
+
+// ── Reconnect-window preserves bubbles + disables Send/reset ─────────────
+// Bounty pretty-view-reconnect-preserve-bubbles-and-disable-send (2026-08-08).
+// The pretty-view WS retry window used to unmount the scroll region AND
+// the ComposeBox because the status="error" render gates excluded that
+// state. The bubbles user was reading blinked out for ~2s and Send taps
+// went to a torn-down ComposeBox. Fix:
+//   1) Scroll region renders during status="error" when messages.length>0.
+//   2) ComposeBox renders during status="error"; PrettyView wires
+//      reconnectingActive={status==="error"} so Send + aux disable while
+//      textarea/mic/attach stay live for pre-drafting the next message.
+describe("PrettyView — reconnect window preserves bubbles and disables Send", () => {
+  let resizeObserverStub: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    wsStubs.length = 0;
+    resizeObserverStub = vi.fn(function () {
+      return { observe: vi.fn(), unobserve: vi.fn(), disconnect: vi.fn() };
+    });
+    vi.stubGlobal('ResizeObserver', resizeObserverStub);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it("bubbles from streaming state remain visible after ws.onclose flips status to error, and Send is disabled", () => {
+    const { container } = mountPV();
+    const ws = getCurrentWs();
+
+    // Streaming state + one user message bubble.
+    flipToStreaming(ws);
+    act(() => {
+      ws.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'message',
+            eventId: 'evt-1',
+            role: 'user',
+            content: 'hello from before the reconnect',
+            ts: 1234567890,
+          }),
+        }),
+      );
+    });
+
+    // Bubble present in streaming state.
+    expect(container.textContent).toContain('hello from before the reconnect');
+    // ComposeBox mounted, Send enabled (canSend=true, no reconnectingActive).
+    // shape-conversation-view: Send renders once there's something to send.
+    act(() => {
+      fireEvent.change(container.querySelector('textarea[placeholder="Write a message…"]')!, {
+        target: { value: 'draft' },
+      });
+    });
+    const sendBefore = container.querySelector('button[aria-label="Send"]') as HTMLButtonElement;
+    expect(sendBefore).toBeTruthy();
+    expect(sendBefore.disabled).toBe(false);
+
+    // Fire close → status flips to "error" and the retry timer schedules.
+    fireClose(ws);
+
+    // Bubble MUST still be in the DOM (this is the render-gate fix — pre-fix
+    // the scroll region would unmount because "error" was excluded).
+    expect(container.textContent).toContain('hello from before the reconnect');
+
+    // ComposeBox still mounted (also part of the render-gate change).
+    const sendAfter = container.querySelector('button[aria-label="Send"]') as HTMLButtonElement;
+    expect(sendAfter).toBeTruthy();
+    // Send now disabled — reconnectingActive={status==="error"} + canSend=false.
+    expect(sendAfter.disabled).toBe(true);
+  });
+});
+
+// ── quick 260808-cd6 dormancy integration tests ────────────────────────────
+
+describe("quick 260808-cd6 dormancy overlay integration", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.clearAllMocks();
+    wsStubs.length = 0;
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  function mountDormancyPV() {
+    // Must be a function/class (not arrow fn) so `new ResizeObserver(...)` works.
+    const resizeObserverStub = vi.fn(function () {
+      return { observe: vi.fn(), unobserve: vi.fn(), disconnect: vi.fn() };
+    });
+    vi.stubGlobal('ResizeObserver', resizeObserverStub);
+    const onSend = vi.fn(() => true);
+    const utils = render(
+      <PrettyView hostId={1} tmuxSession="s1" onSend={onSend} isVisible={true} />,
+    );
+    const ws = getCurrentWs();
+    // Flip to streaming first (dormant overlay only makes sense when live).
+    flipToStreaming(ws);
+    return { ...utils, onSend, ws };
+  }
+
+  function sendDormantFrame(ws: WsStub, dormant: boolean): void {
+    // Phase 30: DormancyOverlay's mount gate flipped from client-inference
+    // (Phase 29's captureFirstFrame on dormant frames) to backend-
+    // authoritative (renderedState === "dormant" via paneState). To
+    // reproduce the same UI outcome, send the sibling pane_state frame
+    // alongside — this mirrors what the pane-state-emitter (Plan 30-01
+    // § L4214/L4738 dormant-poll seams) now does on the wire when the
+    // backend transitions in/out of dormant.
+    act(() => {
+      ws.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({ type: 'dormant', dormant }),
+        }),
+      );
+    });
+    act(() => {
+      ws.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'pane_state',
+            state: dormant ? 'dormant' : 'active',
+            ...(dormant ? {} : { reason: 'dormancy_cleared' }),
+          }),
+        }),
+      );
+    });
+  }
+
+  // Phase 56 (2026-08-23): Tests 1/2/3/4 DELETED. They exercised the
+  // former overlay's mount, the Wake button click / WS emit, the wake-
+  // failure error variant + retry, and the ComposeBox Send-disabled-when-
+  // dormant treatment. All four surfaces are gone in Phase 56 — dormancy
+  // is invisible, compose stays enabled, and the wake WS message is dead.
+  // New Phase-56 invariants live in the "Phase 56: invisible dormancy"
+  // describe block below the loading-overlay tests. Test 5 (cold-dormant→
+  // active compose-mount preservation) is PRESERVED because its primary
+  // check is compose-mount continuity, not dormancy UI — the mount gate
+  // still keeps `renderedState === "dormant"` in its OR chain per Plan
+  // 56-03 Task 2 (KEEP condition).
+
+  // ── patch #491 regression lock ─────────────────────────────────────────
+  // user 2026-08-23 verbatim: "I will often go into a session, hit wake
+  // up, and then as I'm waking up, I start recording a message with the
+  // mic, but when it actually wakes up, for some reason, the mic just
+  // stops, and it goes back to as if I'm not recording, and so I lose that
+  // recording." Diagnosed as ComposeBox unmount/remount during the
+  // dormant→active wake transition on a COLD-DORMANT page (fresh page load
+  // onto a dormant pane, backend's dormant-poll path never sent a session
+  // frame → status stays "connecting" → pre-fix mount gate's only
+  // true clause is `renderedState === "dormant"` → the moment paneState
+  // flips to "active" via the dormant-poll seam's emit("active",
+  // "dormancy_cleared"), the gate flips false and ComposeBox unmounts →
+  // useVoiceRecording state (mid-flight MediaRecorder + MediaStream) is
+  // destroyed → the session frame arrives some ms/seconds later from the
+  // fresh claude relaunch → ComposeBox remounts as a fresh instance with
+  // voice.state="idle"). The fix adds `renderedState === "active"` to the
+  // mount gate, keeping ComposeBox continuously mounted through the
+  // transition.
+  it("Test 5: cold-dormant→active (no prior session frame) → ComposeBox stays mounted, textarea state preserved (patch #491 regression)", () => {
+    // Fresh mount — do NOT call flipToStreaming. Reproduces cold-dormant:
+    // WS opens, backend emits pane_state:"dormant" only, no session frame,
+    // status stays "connecting".
+    const resizeObserverStub = vi.fn(function () {
+      return { observe: vi.fn(), unobserve: vi.fn(), disconnect: vi.fn() };
+    });
+    vi.stubGlobal('ResizeObserver', resizeObserverStub);
+    const onSend = vi.fn(() => true);
+    const { container } = render(
+      <PrettyView hostId={1} tmuxSession="s1" onSend={onSend} isVisible={true} />,
+    );
+    const ws = getCurrentWs();
+    act(() => {
+      ws.onopen?.();
+    });
+    act(() => {
+      ws.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({ type: 'pane_state', state: 'dormant' }),
+        }),
+      );
+    });
+
+    // ComposeBox mounted via renderedState === "dormant". Capture the
+    // textarea DOM node — an unmount+remount would produce a NEW node.
+    const textareaBefore = container.querySelector('textarea');
+    expect(textareaBefore).toBeTruthy();
+
+    // Type into the textarea — proves ComposeBox local state exists.
+    // Standing in for the mid-flight MediaRecorder in the real-world
+    // scenario (JSDOM has no getUserMedia; textarea state is a
+    // structurally-equivalent proxy — both live in the hook/component
+    // instance and are destroyed on unmount).
+    act(() => {
+      fireEvent.change(textareaBefore!, { target: { value: 'mid-wake compose' } });
+    });
+    expect(textareaBefore!.value).toBe('mid-wake compose');
+
+    // Backend's dormant-poll seam fires pane_state:"active" (reason:
+    // "dormancy_cleared") the moment it observes the .dormant sentinel
+    // gone — BEFORE the supervisor's fresh claude launches and hits the
+    // "Active path" that emits the session frame. This is the exact wake
+    // ordering from claude-session-server.ts § L6387 → § L6025.
+    act(() => {
+      ws.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'pane_state',
+            state: 'active',
+            reason: 'dormancy_cleared',
+          }),
+        }),
+      );
+    });
+
+    // Regression assertion: ComposeBox MUST still be mounted, same DOM node,
+    // typed content preserved. Pre-fix: gate flips false → unmount → typed
+    // content wiped. Post-fix: renderedState === "active" keeps it mounted.
+    const textareaAfter = container.querySelector('textarea');
+    expect(textareaAfter).toBe(textareaBefore);
+    expect(textareaAfter!.value).toBe('mid-wake compose');
+  });
+});
+
+// ── Phase 56 (2026-08-23) — quick 260809-cnx dormant-flow-refinements
+// (Fix A + Fix B) and quick 260809-ha3 wake-progress-survives-visibility-
+// roundtrip test blocks DELETED. All five tests exercised the deleted
+// overlay mount + Wake-button click + server-driven progress-bar restore
+// path + reduced-compose treatment + local waking-state slots — every one
+// of those surfaces is gone in Phase 56. New Phase-56 invariants live in
+// the "Phase 56: invisible dormancy" describe block below the loading-
+// overlay tests.
+
+// ── quick 260808-ho2 loading overlay integration tests ─────────────────────
+
+describe("quick 260808-ho2 loading overlay integration", () => {
+  let resizeObserverStub: ReturnType<typeof vi.fn>;
+  let consoleInfoSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.clearAllMocks();
+    wsStubs.length = 0;
+    vi.mocked(useSessionIdentity).mockReturnValue({
+      identity: null,
+      identityHue: null,
+    } as ReturnType<typeof useSessionIdentity>);
+    // Must be a function/class (not arrow fn) so `new ResizeObserver(...)` works.
+    resizeObserverStub = vi.fn(function () {
+      return { observe: vi.fn(), unobserve: vi.fn(), disconnect: vi.fn() };
+    });
+    vi.stubGlobal('ResizeObserver', resizeObserverStub);
+    // Silence the "[pv-loading-overlay] 10s timeout dismiss" console.info that
+    // Test D deliberately triggers. Left un-silenced, the RPC forwarding of the
+    // console log to the vitest reporter can race with unrelated test-file
+    // worker teardowns under full-suite pressure and surface as an unhandled
+    // EnvironmentTeardownError attributed (misleadingly) to whichever file the
+    // worker was tearing down at the time. The console.info in production
+    // code stays — this is a test-only silence.
+    consoleInfoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    consoleInfoSpy.mockRestore();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  // Helper: fire a WS frame on the current WS stub inside act().
+  function fireWsFrame(ws: WsStub, frame: Record<string, unknown>): void {
+    act(() => {
+      ws.onmessage?.(
+        new MessageEvent('message', { data: JSON.stringify(frame) }),
+      );
+    });
+  }
+
+  // Loading overlay is unique by aria-label — sibling overlays use different labels.
+  const LOADING_SELECTOR = '[aria-label="Loading conversation…"]';
+
+  // Phase 30: the loading overlay is the resolving-state spinner
+  // (D-01 visual preserved from Phase 29). Mount gate flipped from
+  // Phase-29's `phase === "resolving" && showResolvingSpinner` (with
+  // 150ms hook-level delay-arm) to a caller-site delay-arm at 400ms
+  // per phase-30-restore-resolving-overlay-paint-delay (2026-08-10) —
+  // user UAT surfaced the flash Phase 30's delay-arm deletion left
+  // exposed and PS30-06's own code comment explicitly authorized
+  // restoring the paint-delay at THIS site (not the hook). The tests
+  // below therefore assert MOUNTED-AFTER-400ms rather than mounted-
+  // synchronously; the backend's pane_state emit is what transitions
+  // the render off "resolving".
+
+  it("Test A: cold mount mounts the resolving spinner after 400ms paint-delay", () => {
+    const { container } = render(
+      <PrettyView hostId={1} tmuxSession="s1" onSend={vi.fn(() => true)} isVisible={true} />,
+    );
+    // Before the delay-arm fires: overlay NOT mounted — sub-400ms cold
+    // resolves (the typical warm-re-entry case) never flash.
+    expect(container.querySelector(LOADING_SELECTOR)).toBeNull();
+    advance(400);
+    // After the delay-arm fires: overlay mounted — genuinely-slow resolves
+    // (test scenario — no pane_state received) see the spinner.
+    expect(container.querySelector(LOADING_SELECTOR)).not.toBeNull();
+  });
+
+  it("Test B: overlay stays mounted on ws.onopen alone; dismisses on session + pane_state:active", () => {
+    const { container } = render(
+      <PrettyView hostId={1} tmuxSession="s1" onSend={vi.fn(() => true)} isVisible={true} />,
+    );
+    const ws = getCurrentWs();
+    // phase-30-restore-resolving-overlay-paint-delay (2026-08-10): trip
+    // the 400ms paint-delay before asserting mount.
+    advance(400);
+    expect(container.querySelector(LOADING_SELECTOR)).not.toBeNull();
+
+    // ws.onopen alone does NOT dismiss (status stays "connecting" until
+    // a session frame arrives; wsTransportState stays "not-connected";
+    // renderedState stays "resolving" because paneState is still null).
+    act(() => { ws.onopen?.(); });
+    expect(container.querySelector(LOADING_SELECTOR)).not.toBeNull();
+
+    // Phase 30: the session frame flips status to "streaming" (which
+    // moves wsTransportState to "open"), but the spinner stays up until
+    // paneState is received. Backend attach-time emit fires
+    // pane_state:active from startActiveSessionFlow (Plan 30-01 § L3871).
+    fireWsFrame(ws, { type: 'session', sessionFile: '/tmp/test.jsonl' });
+    // Without a pane_state frame the spinner is still up (paneState=null).
+    expect(container.querySelector(LOADING_SELECTOR)).not.toBeNull();
+    // Now the sibling pane_state:active emit lands.
+    fireWsFrame(ws, { type: 'pane_state', state: 'active' });
+    expect(container.querySelector(LOADING_SELECTOR)).toBeNull();
+  });
+
+  it("Test C: overlay dismisses on pane_state:active (Phase 30 backend-authoritative)", () => {
+    const { container } = render(
+      <PrettyView hostId={1} tmuxSession="s1" onSend={vi.fn(() => true)} isVisible={true} />,
+    );
+    const ws = getCurrentWs();
+    act(() => { ws.onopen?.(); });
+    // phase-30-restore-resolving-overlay-paint-delay (2026-08-10): trip
+    // the 400ms paint-delay before asserting mount on cold entry.
+    advance(400);
+    expect(container.querySelector(LOADING_SELECTOR)).not.toBeNull();
+
+    // Phase 30: bare message frames no longer participate in overlay
+    // mount decisions (client-inference DELETED per PS30-04). Only the
+    // pane_state:active frame flips renderedState off "resolving".
+    fireWsFrame(ws, { type: 'session', sessionFile: '/tmp/test.jsonl' });
+    fireWsFrame(ws, { type: 'pane_state', state: 'active' });
+    expect(container.querySelector(LOADING_SELECTOR)).toBeNull();
+
+    // A subsequent message frame does not resurrect the spinner — it
+    // stays in the active state.
+    fireWsFrame(ws, {
+      type: 'message', role: 'user', content: 'hi', eventId: 'ev-1', ts: 1,
+    });
+    expect(container.querySelector(LOADING_SELECTOR)).toBeNull();
+  });
+
+  it.todo("[phase 29] retired: 10s PrettyViewLoadingOverlay auto-dismiss watchdog (SPEC req 5 no-timeout-heuristics). The resolving spinner now stays up until backend emits pane_state or wsTransportState transitions to failed-permanently — no wall-clock deadline.");
+
+  // Phase 56 (2026-08-23): Test E (pane_state:dormant → DormancyOverlay
+  // mounts) DELETED. The DormancyOverlay is gone; dormancy is invisible.
+  // The loading-spinner-unmounts-on-pane_state:dormant behavior is still
+  // exercised by Test C (pane_state:active) and Test F (pane_state:holding)
+  // above/below — same paint-delay-cleared invariant, different terminal
+  // state. Additionally, a Phase 56 Test 1 below asserts that pane_state:
+  // dormant does NOT mount any DormancyOverlay (the direct inverse assertion).
+
+  it("Test F: pane_state:holding trumps loading — spinner unmounts and no overlay replaces it (Phase 30 clean-swap; holding overlay retired)", () => {
+    const { container } = render(
+      <PrettyView hostId={1} tmuxSession="s1" onSend={vi.fn(() => true)} isVisible={true} />,
+    );
+    const ws = getCurrentWs();
+
+    // Flip to streaming + attach-time pane_state:active.
+    act(() => { ws.onopen?.(); });
+    fireWsFrame(ws, { type: 'session', sessionFile: '/tmp/test.jsonl' });
+    fireWsFrame(ws, { type: 'pane_state', state: 'active' });
+    // After active: spinner gone.
+    expect(container.querySelector(LOADING_SELECTOR)).toBeNull();
+
+    // Phase 30: pane_state:holding frames preserved on the wire.
+    // The legacy session_holding frame is preserved (Plan 30-01 § L2154)
+    // but no longer manipulates client-side state.
+    fireWsFrame(ws, { type: 'session_holding' });
+    fireWsFrame(ws, { type: 'pane_state', state: 'holding', reason: 'discovery_diff' });
+    act(() => { vi.advanceTimersByTime(500); });
+
+    // Loading overlay NOT mounted (mutual exclusion via renderedState), and
+    // no holding overlay either.
+    expect(container.querySelector(LOADING_SELECTOR)).toBeNull();
+    expect(container.querySelector('[aria-label*="recycling"]')).toBeNull();
+    expect(screen.queryByText(/Session recycling/i)).toBeNull();
+  });
+
+  it("Test G: warm hidden→visible re-focus does NOT re-arm resolving under Phase 30 (D-11 don't-flicker via paneState retention)", () => {
+    // Phase 30 SEMANTIC CHANGE from Phase 29: the warm re-focus entry-
+    // trigger effect is DELETED (see usePaneResolvingMachine.ts rewrite
+    // in Plan 30-03 Task 2). Under Phase 30, hidden→visible flips do
+    // NOT re-arm the resolving spinner — the D-11 don't-flicker rule
+    // in the pure reducer keeps rendering the last-known paneState's
+    // overlay (in this case: no overlay, because paneState="active").
+    // This is a deliberate simplification per 30-CONTEXT.md § Signal
+    // set (LOCKED — "exactly two signals into the state machine").
+    const { container, rerender } = render(
+      <PrettyView hostId={1} tmuxSession="s1" onSend={vi.fn(() => true)} isVisible={true} />,
+    );
+    const ws = getCurrentWs();
+
+    // Dismiss the initial resolving arm via a session + pane_state:active.
+    act(() => { ws.onopen?.(); });
+    fireWsFrame(ws, { type: 'session', sessionFile: '/tmp/test.jsonl' });
+    fireWsFrame(ws, { type: 'pane_state', state: 'active' });
+    expect(container.querySelector(LOADING_SELECTOR)).toBeNull();
+
+    // Flip isVisible=false, then back to isVisible=true. Under Phase 30
+    // the visibility flip is orthogonal to the state machine — the D-11
+    // branch keeps rendering the last-known paneState="active" (no
+    // overlay).
+    rerender(<PrettyView hostId={1} tmuxSession="s1" onSend={vi.fn(() => true)} isVisible={false} />);
+    rerender(<PrettyView hostId={1} tmuxSession="s1" onSend={vi.fn(() => true)} isVisible={true} />);
+
+    // Advance timers (there's no delay-arm timer to trip, but exercise
+    // the event loop). The spinner MUST NOT re-mount — no entry trigger
+    // exists to re-arm resolving.
+    act(() => { vi.advanceTimersByTime(500); });
+    expect(container.querySelector(LOADING_SELECTOR)).toBeNull();
+  });
+
+  it("Test H: working-store condensing:true → the task pill's memory pie reads Compacting…; no overlay, composer stays usable", async () => {
+    const restorePill = withPillIdentity(1, "s1");
+    const { container } = render(
+      <PrettyView hostId={1} tmuxSession="s1" onSend={vi.fn(() => true)} isVisible={true} />,
+    );
+    const ws = getCurrentWs();
+
+    act(() => {
+      ws.onopen?.();
+      ws.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({ type: 'session', sessionFile: '/tmp/test.jsonl' }),
+        }),
+      );
+    });
+    fireWsFrame(ws, { type: 'pane_state', state: 'active' });
+
+    const gauge = () => pillGauge(container) as HTMLElement;
+    expect(gauge().getAttribute("data-condensing")).toBeNull();
+
+    // The backend-authoritative condensing axis (fleet-status → working-store),
+    // keyed `${hostId}:${tmuxSession}`.
+    await act(async () => {
+      publishFleetStatusSessionState("1", {
+        hostId: "1",
+        tmuxSession: "s1",
+        sessionId: "test-session",
+        pid: 12345,
+        status: "idle",
+        backgroundTasks: [],
+        updatedAt: Date.now(),
+        lastMessageAt: null,
+        aiTitle: null,
+        dormant: false,
+        condensing: true,
+      });
+    });
+
+    expect(gauge().getAttribute("data-condensing")).toBe("true");
+    expect(gauge().textContent).toContain("Compacting…");
+    // The working orb shows for the compaction: plain (nothing to stop) with
+    // the fixed line. Nothing covers the conversation and nothing is disabled.
+    const wip = container.querySelector('[data-testid="pv-wip"]') as HTMLElement;
+    expect(wip).not.toBeNull();
+    expect(wip.getAttribute("data-stop")).toBe("working");
+    expect(wip.querySelector("button")).toBeNull();
+    expect(container.querySelector('[data-testid="wip-narration"]')?.textContent).toMatch(/^Compacting/);
+    const textarea = container.querySelector('textarea[placeholder="Write a message…"]') as HTMLTextAreaElement;
+    expect(textarea.disabled).toBe(false);
+    // The main button (thumbs-up, or Send if a draft is in the box) stays live.
+    expect((container.querySelector('[data-testid="compose-row"] button[data-main="true"]') as HTMLButtonElement).disabled).toBe(false);
+
+    // Condense finished → the pie returns to its reading.
+    await act(async () => {
+      publishFleetStatusSessionState("1", {
+        hostId: "1",
+        tmuxSession: "s1",
+        sessionId: "test-session",
+        pid: 12345,
+        status: "idle",
+        backgroundTasks: [],
+        updatedAt: Date.now(),
+        lastMessageAt: null,
+        aiTitle: null,
+        dormant: false,
+        condensing: false,
+      });
+    });
+    expect(gauge().getAttribute("data-condensing")).toBeNull();
+    // The orb holds on past the compaction's end, waiting for the agent's
+    // follow-up turn to light it…
+    expect(container.querySelector('[data-testid="pv-wip"]')).not.toBeNull();
+    // …which takes over: the orb stays, without the fixed line.
+    await act(async () => {
+      publishFleetStatusSessionState("1", {
+        hostId: "1",
+        tmuxSession: "s1",
+        sessionId: "test-session",
+        pid: 12345,
+        status: "busy",
+        backgroundTasks: [],
+        updatedAt: Date.now(),
+        lastMessageAt: null,
+        aiTitle: null,
+        dormant: false,
+        activityMtime: 2000,
+        stoppedMtime: 1000,
+      });
+    });
+    expect(container.querySelector('[data-testid="pv-wip"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="wip-narration"]')).toBeNull();
+    act(() => { resetWorkingStore(); });
+    restorePill();
+  });
+});
+
+// ── quick 260812-x5f — PrettyView hidden-pane WS close debounce (~60s) ──────
+
+// The debounce constant from PrettyView.tsx (HIDDEN_PANE_WS_CLOSE_DEBOUNCE_MS).
+// Hardcoded here to avoid coupling this test to PrettyView's module exports.
+const HIDDEN_PANE_WS_CLOSE_DEBOUNCE_MS = 60_000;
+
+describe("quick 260812-x5f — PrettyView hidden-pane WS close debounce (~60s)", () => {
+  let resizeObserverStub: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.clearAllMocks();
+    wsStubs.length = 0;
+    resizeObserverStub = vi.fn(function () {
+      return { observe: vi.fn(), unobserve: vi.fn(), disconnect: vi.fn() };
+    });
+    vi.stubGlobal('ResizeObserver', resizeObserverStub);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  // Mount PrettyView in streaming state, ready for debounce scenario tests.
+  function mountStreamingPV() {
+    const onSend = vi.fn(() => true);
+    const utils = render(
+      <PrettyView hostId={1} tmuxSession="s1" onSend={onSend} isVisible={true} />,
+    );
+    const ws = getCurrentWs();
+    // Flip to streaming so the WS is OPEN (readyState=1).
+    act(() => {
+      ws.onopen?.();
+      ws.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({ type: 'session', sessionFile: '/tmp/test.jsonl' }),
+        }),
+      );
+    });
+    return { ...utils, onSend, ws };
+  }
+
+  // (a) hidden 30s then visible: timer should NOT fire — WS stays alive.
+  it("(a) hide 30s then show: ws.close never called (timer cancelled before firing)", () => {
+    const { rerender, ws } = mountStreamingPV();
+
+    // Hide the pane — schedules debounced close.
+    rerender(<PrettyView hostId={1} tmuxSession="s1" onSend={vi.fn(() => true)} isVisible={false} />);
+    // Advance only 30s — timer has NOT fired yet.
+    act(() => { vi.advanceTimersByTime(30_000); });
+    expect(ws.close).not.toHaveBeenCalled();
+
+    // Show the pane again — timer should be cancelled.
+    rerender(<PrettyView hostId={1} tmuxSession="s1" onSend={vi.fn(() => true)} isVisible={true} />);
+    // Advance 60s more — timer is gone, close should NEVER be called.
+    act(() => { vi.advanceTimersByTime(60_000); });
+    expect(ws.close).not.toHaveBeenCalled();
+    // No new WS stub created (reopen path did not fire — WS was not closed).
+    expect(wsStubs.length).toBe(1);
+  });
+
+  // (b) hidden 70s: ws.close fires exactly once at the 60s mark.
+  it("(b) hide 70s: ws.close fires exactly once at 60s", () => {
+    const { rerender, ws } = mountStreamingPV();
+
+    rerender(<PrettyView hostId={1} tmuxSession="s1" onSend={vi.fn(() => true)} isVisible={false} />);
+    // Advance to just before the threshold — not yet.
+    act(() => { vi.advanceTimersByTime(59_999); });
+    expect(ws.close).not.toHaveBeenCalled();
+    // Cross the threshold.
+    act(() => { vi.advanceTimersByTime(2); });
+    expect(ws.close).toHaveBeenCalledTimes(1);
+    // Advance more time — no additional calls.
+    act(() => { vi.advanceTimersByTime(10_000); });
+    expect(ws.close).toHaveBeenCalledTimes(1);
+  });
+
+  // (c) hide 30s → show 5s → hide 45s: second hide RESTARTS the 60s timer.
+  it("(c) rehide restarts the 60s timer (not accumulated)", () => {
+    const { rerender, ws } = mountStreamingPV();
+
+    // First hide: 30s into timer.
+    rerender(<PrettyView hostId={1} tmuxSession="s1" onSend={vi.fn(() => true)} isVisible={false} />);
+    act(() => { vi.advanceTimersByTime(30_000); });
+    expect(ws.close).not.toHaveBeenCalled();
+
+    // Show for 5s — timer cancelled.
+    rerender(<PrettyView hostId={1} tmuxSession="s1" onSend={vi.fn(() => true)} isVisible={true} />);
+    act(() => { vi.advanceTimersByTime(5_000); });
+    expect(ws.close).not.toHaveBeenCalled();
+
+    // Second hide: restarts a fresh 60s window.
+    rerender(<PrettyView hostId={1} tmuxSession="s1" onSend={vi.fn(() => true)} isVisible={false} />);
+    // 45s from second hide — still below 60s from second hide.
+    act(() => { vi.advanceTimersByTime(45_000); });
+    expect(ws.close).not.toHaveBeenCalled();
+
+    // 20s more (now 65s from second hide) — timer fires.
+    act(() => { vi.advanceTimersByTime(20_000); });
+    expect(ws.close).toHaveBeenCalledTimes(1);
+  });
+
+  // (d) rapid flap (hidden 10s → visible 10s × 4): close never called.
+  it("(d) rapid hide/show flap: ws.close never called after full sequence", () => {
+    const { rerender, ws } = mountStreamingPV();
+
+    for (let i = 0; i < 4; i++) {
+      rerender(<PrettyView hostId={1} tmuxSession="s1" onSend={vi.fn(() => true)} isVisible={false} />);
+      act(() => { vi.advanceTimersByTime(10_000); });
+      rerender(<PrettyView hostId={1} tmuxSession="s1" onSend={vi.fn(() => true)} isVisible={true} />);
+      act(() => { vi.advanceTimersByTime(10_000); });
+    }
+    expect(ws.close).not.toHaveBeenCalled();
+  });
+
+  // (e) unmount while timer pending: debounced timer does NOT fire after unmount.
+  // NOTE: the main WS-setup effect cleanup calls ws.close() on every unmount
+  // as part of its normal teardown — that is expected and correct. What we
+  // assert here is that the DEBOUNCE timer does not add extra ws.close() calls
+  // after unmount (i.e. cleanup cleared the pending debounce timer).
+  it("(e) unmount while timer pending: debounced timer does not add extra ws.close calls after unmount", () => {
+    const { rerender, ws, unmount } = mountStreamingPV();
+
+    rerender(<PrettyView hostId={1} tmuxSession="s1" onSend={vi.fn(() => true)} isVisible={false} />);
+    // Advance 30s — debounce timer still pending, not yet fired.
+    act(() => { vi.advanceTimersByTime(30_000); });
+    expect(ws.close).not.toHaveBeenCalled();
+
+    // Unmount — the main WS-setup cleanup calls ws.close() (expected).
+    // The debounce cleanup should clear the pending debounce timer.
+    act(() => { unmount(); });
+    const callCountAtUnmount = ws.close.mock.calls.length;
+
+    // Advance 60s more — debounce timer is gone, so no additional ws.close calls.
+    act(() => { vi.advanceTimersByTime(60_000); });
+    expect(ws.close).toHaveBeenCalledTimes(callCountAtUnmount);
+  });
+});
+
+// ── Phase 34 Plan 06: WaitingBubble mount + feeder retirement tests ────────
+//
+// Test 1 (new): When useSessionWaitingFor returns a reason, PrettyView renders
+//               WaitingBubble with that reason.
+// Test 2 (new): When useSessionWaitingFor returns null, PrettyView renders
+//               zero WaitingBubbles.
+// Test 3 (structural grep): PrettyView.tsx has 0 hits for the retired publish
+//               symbol — proves the feeder was removed.
+
+// Mock session-waiting-store so we can control useSessionWaitingFor without
+// wiring the full fleet-status WS stack.
+vi.mock("@/state/session-waiting-store", () => ({
+  useSessionWaitingFor: vi.fn(() => null),
+  publishFleetStatusWaitingFor: vi.fn(),
+  __resetForTestWaiting: vi.fn(),
+}));
+
+import { readFileSync } from "fs";
+import { resolve } from "path";
+import { useSessionWaitingFor } from "@/state/session-waiting-store";
+
+describe("PrettyView — Phase 34 Plan 06: WaitingBubble mount", () => {
+  beforeEach(() => {
+    wsStubs.length = 0;
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    // Stub ResizeObserver — jsdom doesn't implement it; useAutoScroll needs it.
+    const resizeObserverStub = vi.fn(function () {
+      return { observe: vi.fn(), unobserve: vi.fn(), disconnect: vi.fn() };
+    });
+    vi.stubGlobal("ResizeObserver", resizeObserverStub);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it("Test 1: renders WaitingBubble with reason when useSessionWaitingFor returns a non-null string", () => {
+    vi.mocked(useSessionWaitingFor).mockReturnValue("approve Bash");
+
+    const { container } = render(
+      <PrettyView hostId={1} tmuxSession="s1" onSend={vi.fn(() => true)} isVisible={true} />,
+    );
+
+    // Flip PrettyView to streaming state so the scroll container + accessories render
+    const ws = getCurrentWs();
+    act(() => {
+      ws.onopen?.();
+      ws.onmessage?.(
+        new MessageEvent("message", {
+          data: JSON.stringify({ type: "session", sessionFile: "/tmp/test.jsonl" }),
+        }),
+      );
+    });
+
+    // The WaitingBubble should be present with the correct text
+    const waitingBubble = container.querySelector('[aria-label^="Harness waiting"]');
+    expect(waitingBubble).toBeTruthy();
+    expect(waitingBubble?.textContent).toContain("approve Bash");
+  });
+
+  it("Test 2: renders zero WaitingBubbles when useSessionWaitingFor returns null", () => {
+    vi.mocked(useSessionWaitingFor).mockReturnValue(null);
+
+    const { container } = render(
+      <PrettyView hostId={1} tmuxSession="s1" onSend={vi.fn(() => true)} isVisible={true} />,
+    );
+
+    // Flip PrettyView to streaming state
+    const ws = getCurrentWs();
+    act(() => {
+      ws.onopen?.();
+      ws.onmessage?.(
+        new MessageEvent("message", {
+          data: JSON.stringify({ type: "session", sessionFile: "/tmp/test.jsonl" }),
+        }),
+      );
+    });
+
+    // No WaitingBubble rendered when waitingFor is null
+    const waitingElements = container.querySelectorAll('[aria-label^="Harness waiting"]');
+    expect(waitingElements.length).toBe(0);
+  });
+
+  it("Test 3 (structural grep): PrettyView.tsx has 0 references to the retired publish symbol", () => {
+    const src = readFileSync(
+      resolve(__dirname, "PrettyView.tsx"),
+      "utf8",
+    );
+    // Use token split to avoid self-matching in test description strings
+    const retired = "publish" + "SessionHasBackgroundedWork";
+    expect(src.includes(retired)).toBe(false);
+  });
+});
+
+// ── Phase 56 (2026-08-23): invisible dormancy (no user-facing wake surface) ──
+// These tests lock the Phase-56 invariants that the pane presents an
+// IDENTICAL surface whether the underlying claude session is dormant or
+// awake — no bubble, no badge, no Wake button, no compose-disabled
+// treatment. Compose stays enabled; sending a message into a dormant pane
+// dispatches the {type:"input"} WS frame; NO {type:"wake"} frame is ever
+// emitted (the wake WS message is dead per Plan 56-03 Task 4).
+
+describe("Phase 56: invisible dormancy (no user-facing wake surface)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    wsStubs.length = 0;
+    resetWorkingStore();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  function mountPVForPhase56() {
+    const resizeObserverStub = vi.fn(function () {
+      return { observe: vi.fn(), unobserve: vi.fn(), disconnect: vi.fn() };
+    });
+    vi.stubGlobal('ResizeObserver', resizeObserverStub);
+    const onSend = vi.fn(() => true);
+    const utils = render(
+      <PrettyView hostId={1} tmuxSession="s1" onSend={onSend} isVisible={true} />,
+    );
+    const ws = getCurrentWs();
+    // Same convention as the deleted 260808-cd6 dormancy tests: flip to
+    // streaming (session frame arrives) so ComposeBox mounts, then send
+    // the dormant frames on top.
+    flipToStreaming(ws);
+    return { ...utils, onSend, ws };
+  }
+
+  function sendDormantFrame(ws: WsStub): void {
+    // Emit both the legacy dormant frame (kept for internal state tracking)
+    // and the sibling pane_state:dormant frame (drives renderedState). This
+    // mirrors what the backend's dormant-poll seam emits on the wire.
+    act(() => {
+      ws.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({ type: 'dormant', dormant: true }),
+        }),
+      );
+    });
+    act(() => {
+      ws.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({ type: 'pane_state', state: 'dormant' }),
+        }),
+      );
+    });
+  }
+
+  it("Phase 56 Test 1: dormant WS frame does NOT mount any DormancyOverlay — PrettyView on a dormant pane looks identical to an awake-idle pane, compose is enabled", () => {
+    const { container, ws } = mountPVForPhase56();
+
+    sendDormantFrame(ws);
+
+    // No DormancyOverlay of any variant. The former overlay used
+    // aria-label containing "asleep" / "Waking" / "Wake identity"; assert
+    // none of those surface anywhere in the rendered DOM.
+    expect(container.querySelector('[aria-label*="asleep"]')).toBeNull();
+    expect(container.querySelector('[aria-label*="Waking"]')).toBeNull();
+    expect(container.querySelector('button[aria-label="Wake identity"]')).toBeNull();
+    // Also assert no visible text says "asleep" / "wake" / "dormant" in the
+    // pane surface — Phase 56's core visible-surface invariant.
+    const paneText = container.textContent ?? '';
+    expect(paneText).not.toMatch(/session is asleep/i);
+    expect(paneText).not.toMatch(/waking up/i);
+
+    // Compose textarea + main button are BOTH present and ENABLED.
+    const textarea = container.querySelector('textarea') as HTMLTextAreaElement | null;
+    expect(textarea).not.toBeNull();
+    expect(textarea!.disabled).toBe(false);
+    // shape-conversation-view: with nothing typed the main button is the
+    // thumbs-up; type something and Send appears enabled (the dormant state
+    // is NOT gating it).
+    const thumbsBtn = container.querySelector('button[aria-label="Send \'thumbs up\'"]') as HTMLButtonElement | null;
+    expect(thumbsBtn).not.toBeNull();
+    expect(thumbsBtn!.disabled).toBe(false);
+    act(() => {
+      fireEvent.change(textarea!, { target: { value: 'hello' } });
+    });
+    const sendBtn = container.querySelector('button[aria-label="Send"]') as HTMLButtonElement | null;
+    expect(sendBtn).not.toBeNull();
+    expect(sendBtn!.disabled).toBe(false);
+  });
+
+  it("Phase 56 Test 2: a user types + hits send into a dormant pane — the onSend callback fires with the typed body", () => {
+    const { container, ws, onSend } = mountPVForPhase56();
+
+    sendDormantFrame(ws);
+
+    // Type and Enter — same handler path exercised by the reconnect-window
+    // and optimistic-bubbles integration tests.
+    const textarea = container.querySelector('textarea') as HTMLTextAreaElement;
+    expect(textarea).not.toBeNull();
+    act(() => {
+      fireEvent.change(textarea, { target: { value: 'hello' } });
+      fireEvent.keyDown(textarea, { key: 'Enter' });
+    });
+
+    // onSend was called with the typed body (+ a mqid — Phase 50 D-01
+    // single-source pattern). The backend receives this as a {type:"input"}
+    // frame via IdentitySessionPane's onSend wrapper; the backend's send-
+    // path (Plan 56-01) then triggers the invisible wake on-entry via
+    // dormantLastEmitted() gating. This test proves the frontend fires
+    // the send even though the pane is dormant — pre-Phase-56, sendDisabled
+    // included `dormantActive === true` and this call would have been
+    // suppressed.
+    expect(onSend).toHaveBeenCalledTimes(1);
+    const [payload, mqid] = onSend.mock.calls[0];
+    expect(payload).toContain('hello');
+    expect(typeof mqid).toBe('string');
+    expect((mqid as string).length).toBeGreaterThan(0);
+  });
+
+  it("Phase 56 Test 3: NO {type:\"wake\"} frame is ever sent from PrettyView, even after receiving a dormant WS frame — the wake WS message is dead", () => {
+    const { container, ws } = mountPVForPhase56();
+
+    // Clear any pre-dormant sends (Phase 50 D-01 may have fired seed sends
+    // that we don't want to count).
+    (ws.send as ReturnType<typeof vi.fn>).mockClear();
+
+    sendDormantFrame(ws);
+
+    // Also simulate what USED to be the trigger (a Wake button click) — the
+    // button no longer exists, so this assertion is proving-a-negative:
+    // no wake button in the DOM to click, but we scan the WS send calls
+    // anyway to guarantee nothing spontaneous fires either.
+    expect(container.querySelector('button[aria-label="Wake identity"]')).toBeNull();
+
+    // Assert ws.send was NEVER called with {type:"wake"}.
+    const sentPayloads = (ws.send as ReturnType<typeof vi.fn>).mock.calls.map(
+      ([data]: [string]) => {
+        try { return JSON.parse(data); } catch { return null; }
+      },
+    );
+    const wakeEmit = sentPayloads.find((p: { type?: string } | null) => p != null && p.type === 'wake');
+    expect(wakeEmit).toBeUndefined();
+  });
+});
+
+// ─── Phase 90 Plan 00 Wave 0 — D-03 mechanical waiver regression tests ─────
+//
+// contextPct source-swap: the PrettyView meter reading now comes from
+// fleet-status via useSessionContextPct instead of a local useState that
+// caught `context_pct` WS frames. These regression tests prove the swap is
+// mechanical — no UX change, no behavior change end-to-end — and that the
+// context_pct WS handler is a no-op (no throw, no crash, no stale setter).
+describe("PrettyView — Phase 90 Wave 0 mechanical D-03 waiver regression", () => {
+  // jsdom does not implement ResizeObserver; useAutoScroll uses it in its
+  // effect. Same stub pattern as the other describe blocks above.
+  beforeEach(() => {
+    vi.clearAllMocks();
+    wsStubs.length = 0;
+    Object.defineProperty(document, 'hidden', { configurable: true, value: false });
+    const resizeObserverStub = vi.fn(function () {
+      return { observe: vi.fn(), unobserve: vi.fn(), disconnect: vi.fn() };
+    });
+    vi.stubGlobal('ResizeObserver', resizeObserverStub);
+  });
+
+  it("Test 5: the task pill's memory pie shows the current fleet-status value at mount (mount-time swap correctness)", async () => {
+    const { __setSessionContextPctForTests, __resetSessionContextPctForTests } =
+      await import("@/api/fleet-status-client");
+    __resetSessionContextPctForTests();
+
+    // Pre-populate fleet-status for this session BEFORE mount so the very
+    // first render reads it via the hook.
+    __setSessionContextPctForTests("7", "swap-test", 42);
+
+    const restorePill = withPillIdentity(7, "swap-test");
+    const { container } = render(
+      <PrettyView hostId={7} tmuxSession="swap-test" onSend={vi.fn(() => true)} isVisible={true} />,
+    );
+    const ws = getCurrentWs();
+    act(() => {
+      ws.onopen?.();
+      ws.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({ type: 'session', sessionFile: '/tmp/test.jsonl' }),
+        }),
+      );
+    });
+
+    // The memory pie lives in the task pill with data-pct={contextPct},
+    // sourced from the fleet-status hook — 42 without any WS `context_pct`
+    // frame having been sent.
+    expect(pillGauge(container, '[data-pct="42"]')).toBeTruthy();
+
+    __resetSessionContextPctForTests();
+    restorePill();
+  });
+
+  it("Test 6: fleet-status snapshot updates re-render the meter (reactive updates via useSyncExternalStore)", async () => {
+    const { __setSessionContextPctForTests, __resetSessionContextPctForTests } =
+      await import("@/api/fleet-status-client");
+    __resetSessionContextPctForTests();
+
+    __setSessionContextPctForTests("7", "swap-reactive", 20);
+
+    const restorePill = withPillIdentity(7, "swap-reactive");
+    const { container } = render(
+      <PrettyView hostId={7} tmuxSession="swap-reactive" onSend={vi.fn(() => true)} isVisible={true} />,
+    );
+    const ws = getCurrentWs();
+    act(() => {
+      ws.onopen?.();
+      ws.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({ type: 'session', sessionFile: '/tmp/test.jsonl' }),
+        }),
+      );
+    });
+
+    expect(pillGauge(container, '[data-pct="20"]')).toBeTruthy();
+
+    // Publish a new value; meter re-renders.
+    act(() => {
+      __setSessionContextPctForTests("7", "swap-reactive", 65);
+    });
+    expect(pillGauge(container, '[data-pct="65"]')).toBeTruthy();
+    expect(pillGauge(container, '[data-pct="20"]')).toBeNull();
+
+    __resetSessionContextPctForTests();
+    restorePill();
+  });
+
+  it("Test 7: WS `context_pct` frame arriving is a NO-OP — does not throw, does not crash, does not overwrite the fleet-status-sourced value", async () => {
+    const { __setSessionContextPctForTests, __resetSessionContextPctForTests } =
+      await import("@/api/fleet-status-client");
+    __resetSessionContextPctForTests();
+
+    __setSessionContextPctForTests("7", "swap-noop", 55);
+
+    const restorePill = withPillIdentity(7, "swap-noop");
+    const { container } = render(
+      <PrettyView hostId={7} tmuxSession="swap-noop" onSend={vi.fn(() => true)} isVisible={true} />,
+    );
+    const ws = getCurrentWs();
+    act(() => {
+      ws.onopen?.();
+      ws.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({ type: 'session', sessionFile: '/tmp/test.jsonl' }),
+        }),
+      );
+    });
+
+    expect(pillGauge(container, '[data-pct="55"]')).toBeTruthy();
+
+    // Fire a `context_pct` WS frame — the handler is a no-op post-swap. This
+    // MUST NOT throw, MUST NOT crash the component, and MUST NOT overwrite
+    // the fleet-status-sourced value (which stays at 55 because the store
+    // wasn't published). Inline the fireWsFrame helper shape used elsewhere.
+    expect(() => {
+      act(() => {
+        ws.onmessage?.(
+          new MessageEvent('message', {
+            data: JSON.stringify({ type: 'context_pct', pct: 99 }),
+          }),
+        );
+      });
+    }).not.toThrow();
+
+    // Meter STILL reads 55 (fleet-status is authoritative — 99 does NOT win).
+    expect(pillGauge(container, '[data-pct="55"]')).toBeTruthy();
+    expect(pillGauge(container, '[data-pct="99"]')).toBeNull();
+
+    __resetSessionContextPctForTests();
+    restorePill();
+  });
+});

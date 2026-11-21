@@ -1,0 +1,116 @@
+import { authApi } from "@/main-axios";
+
+// OPEN TABS API
+// ============================================================================
+
+export interface OpenTabRecord {
+  id: string;
+  userId: string;
+  tabType: string;
+  hostId: number | null;
+  label: string;
+  tabOrder: number;
+  backendSessionId: string | null;
+  targetTmuxSession: string | null;
+  // Phase 120 D-16 — app-leaf slug half of the (hostId, slug) tuple. Null
+  // for every non-app tab type (matches the backend column shape from
+  // Plan 03 — user_open_tabs.app_slug is a nullable TEXT column).
+  appSlug: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface OpenTabSyncPayload {
+  id: string;
+  tabType: string;
+  hostId?: number | null;
+  label: string;
+  tabOrder: number;
+  backendSessionId?: string | null;
+  targetTmuxSession?: string | null;
+  // Phase 120 D-16 — see OpenTabRecord.appSlug JSDoc.
+  appSlug?: string | null;
+}
+
+export interface OpenTabUpsertPayload {
+  id: string;
+  tabType: string;
+  hostId?: number | null;
+  label: string;
+  tabOrder: number;
+  backendSessionId?: string | null;
+  targetTmuxSession?: string | null;
+  // Phase 120 D-16 — see OpenTabRecord.appSlug JSDoc.
+  appSlug?: string | null;
+}
+
+export interface ActiveSessionInfo {
+  sessionId: string;
+  hostId: number;
+  hostName: string;
+  tabInstanceId: string | null;
+  isConnected: boolean;
+  createdAt: number;
+}
+
+export async function getOpenTabs(): Promise<OpenTabRecord[]> {
+  const response = await authApi.get("/open-tabs");
+  return response.data;
+}
+
+export async function syncOpenTabs(tabs: OpenTabSyncPayload[]): Promise<void> {
+  await authApi.put("/open-tabs", { tabs });
+}
+
+export async function deleteOpenTab(instanceId: string): Promise<void> {
+  await authApi.delete(`/open-tabs/${instanceId}`);
+}
+
+export async function patchOpenTab(
+  instanceId: string,
+  updates: Partial<
+    Pick<
+      OpenTabRecord,
+      "label" | "tabOrder" | "backendSessionId" | "targetTmuxSession"
+    >
+  >,
+): Promise<void> {
+  await authApi.patch(`/open-tabs/${instanceId}`, updates);
+}
+
+export async function addOpenTab(tab: OpenTabUpsertPayload): Promise<void> {
+  await authApi.post("/open-tabs", tab);
+}
+
+export async function getActiveSessions(): Promise<ActiveSessionInfo[]> {
+  const response = await authApi.get("/open-tabs/active-sessions");
+  return response.data;
+}
+
+// ============================================================================
+// USER PREFERENCES API
+// ============================================================================
+
+export interface UserPreferences {
+  // reopenTabsOnLogin: DELETED per Phase 137 D-31 (dead fork holdover)
+  theme?: string | null;
+  fontSize?: string | null;
+  accentColor?: string | null;
+  language?: string | null;
+  fallbackVoice?: string | null; // Phase 137 D-14 — per-user fallback voice for the speak flow; null resolves to the TTS provider's default voice
+  ttsPlaybackRate?: number | null; // per-user speak playback speed (0.25-4); null resolves to 1.0
+  voiceModeEndOfTurn?: "timed" | "phrase" | null; // hands-free voice mode turn end; null resolves to "timed"
+  voiceModeSendPhrase?: string | null; // spoken send phrase for "phrase" mode; null resolves to "over"
+  voiceModePauseSeconds?: number | null; // "timed" mode silence length in whole seconds (2-3600); null resolves to 3
+}
+
+export async function getUserPreferences(): Promise<UserPreferences> {
+  const response = await authApi.get("/user-preferences");
+  return response.data;
+}
+
+export async function saveUserPreferences(
+  prefs: Partial<UserPreferences>,
+): Promise<void> {
+  await authApi.put("/user-preferences", prefs);
+}

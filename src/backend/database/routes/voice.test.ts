@@ -1,0 +1,1934 @@
+/**
+ * Phase 109 plan 03 — voice route tests, rewired to Amazon Nova Sonic on Bedrock.
+ *
+ * Handler-level tests (no Express harness, no auth middleware — the auth gate
+ * is verified by construction: the route wires authenticateJWT before multer
+ * before the handler in voice.ts). Follows the handleConsoleLog pattern from
+ * debug.test.ts.
+ *
+ * SDK strategy: `@aws-sdk/client-polly` is mocked at module level via
+ * `vi.hoisted` + `vi.mock`. The Nova Sonic adapter (`nova-sonic-adapter.ts`)
+ * and audio-transcode helper (`webmToPcm16k`) are each mocked as adapter
+ * facades — the same pattern used by polly-adapter.test.ts (Plan 04). No real
+ * AWS call is made from this file.
+ *
+ * NOT tested here (dropped or covered elsewhere):
+ *   - Chatterbox-URL forwarding — dead; the old shared-constants module (Phase
+ *     79 Plan 02) was deleted in Phase 98 Plan 10 alongside all its imports.
+ *   - Chunked-path tests from the prior Phase (T1-T6) — deleted per D-CUTOVER (109-03);
+ *     equivalent coverage lives in the rewritten handleTranscribe block below.
+ */
+
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { Readable } from "node:stream";
+
+// -----------------------------------------------------------------------------
+// Hoisted mocks — must be defined before vi.mock factory calls that reference them.
+// -----------------------------------------------------------------------------
+
+const {
+  pollyClientCtor,
+  synthesizeSpeechCmdCtor,
+  pollySendMock,
+  transcribeNovaSonicMock,
+} = vi.hoisted(() => ({
+  pollyClientCtor: vi.fn(),
+  synthesizeSpeechCmdCtor: vi.fn(),
+  pollySendMock: vi.fn(),
+  transcribeNovaSonicMock: vi.fn(),
+}));
+
+// AWS SDK mocks — function-ctor pattern so `new PollyClient(...)` works.
+vi.mock("@aws-sdk/client-polly", () => {
+  function PollyClient(this: unknown, cfg: unknown) {
+    pollyClientCtor(cfg);
+    (this as { send: unknown }).send = pollySendMock;
+  }
+  function SynthesizeSpeechCommand(this: unknown, input: unknown) {
+    synthesizeSpeechCmdCtor(input);
+    (this as { input: unknown }).input = input;
+  }
+  return { PollyClient, SynthesizeSpeechCommand };
+});
+
+// audio-transcode mock — stub webmToPcm16k so tests exercise the transcode
+// plumbing in handleTranscribe without spawning real ffmpeg. padPcmToMinDuration
+// is passed through as identity so route-level assertions on the buffer flowing
+// into transcribeNovaSonic stay unchanged; its own unit tests cover the pad math.
+vi.mock("../../voice/audio-transcode.js", () => ({
+  webmToPcm16k: vi.fn(async (buf: Buffer) => buf),
+  padPcmToMinDuration: vi.fn((buf: Buffer) => buf),
+  MIN_PCM_DURATION_MS: 3000,
+}));
+
+// Nova Sonic adapter facade mock — matches the polly-adapter pattern.
+// Route tests verify adapter call count + args; the adapter's own unit tests
+// cover the Bedrock session protocol (nova-sonic-adapter.test.ts).
+vi.mock("../../voice/nova-sonic-adapter.js", () => ({
+  transcribeNovaSonic: transcribeNovaSonicMock,
+}));
+
+// Skill-catalog fetcher stub — same reason as before (avoid SSH round-trip).
+vi.mock("../../voice/skill-catalog.js", () => ({
+  fetchSkillCatalog: vi.fn(),
+  DEFAULT_SKILL_CATALOG_TIMEOUT_MS: 10_000,
+}));
+
+// node:fs mock preserved so handleTranscribe's fire-and-forget disk-bank
+// write is intercepted (not touching the real filesystem).
+vi.mock("node:fs", async (importActual) => {
+  const actual = await importActual<typeof import("node:fs")>();
+  return {
+    ...actual,
+    default: {
+      ...actual,
+      promises: {
+        ...actual.promises,
+        writeFile: vi.fn(async () => undefined),
+        mkdir: vi.fn(async () => undefined),
+      },
+    },
+    promises: {
+      ...actual.promises,
+      writeFile: vi.fn(async () => undefined),
+      mkdir: vi.fn(async () => undefined),
+    },
+  };
+});
+
+// -----------------------------------------------------------------------------
+// Imports AFTER vi.mock so the handler picks up mocked SDKs.
+// -----------------------------------------------------------------------------
+
+import {
+  handleTranscribe,
+  handleSpeak,
+  handleSpeakStream,
+  handleListVoices,
+  handleTtsProviders,
+  SPEAK_TEXT_MAX,
+  VOICE_TRANSCRIBE_DEADLINE_MS,
+} from "./voice.js";
+import { clearProviderBench } from "../../voice/tts-fallback.js";
+import { clearVoiceListCache } from "../../voice/tts-provider.js";
+import { TAIL_GUARD_FILLER } from "../../voice/tail-guard.js";
+import { fetchSkillCatalog } from "../../voice/skill-catalog.js";
+import { webmToPcm16k } from "../../voice/audio-transcode.js";
+import { transcribeNovaSonic } from "../../voice/nova-sonic-adapter.js";
+import fs from "node:fs";
+
+// -----------------------------------------------------------------------------
+// Minimal Express req/res mocks — same shape as prior test file.
+// -----------------------------------------------------------------------------
+
+type MockRes = {
+  _status: number;
+  _body: unknown;
+  _ended: boolean;
+  _endedBuf: Buffer | undefined;
+  _headers: Record<string, string>;
+  _writes: Uint8Array[];
+  _streamedEnded: boolean;
+  _destroyed: boolean;
+  status: (code: number) => MockRes;
+  json: (body: unknown) => MockRes;
+  end: (buf?: Buffer | Uint8Array) => MockRes;
+  set: (key: string, value: string) => MockRes;
+  setHeader: (key: string, value: string) => MockRes;
+  write: (chunk: Buffer | Uint8Array) => boolean;
+  destroy: () => void;
+  on: (event: string, cb: unknown) => MockRes;
+  once: (event: string, cb: unknown) => MockRes;
+  emit: (event: string, ...args: unknown[]) => boolean;
+};
+
+function makeRes(): MockRes {
+  const res: MockRes = {
+    _status: 200,
+    _body: undefined,
+    _ended: false,
+    _endedBuf: undefined,
+    _headers: {},
+    _writes: [],
+    _streamedEnded: false,
+    _destroyed: false,
+    status(code) {
+      this._status = code;
+      return this;
+    },
+    json(body) {
+      this._body = body;
+      return this;
+    },
+    end(buf?: Buffer | Uint8Array) {
+      this._ended = true;
+      this._streamedEnded = true;
+      if (buf !== undefined) {
+        if (buf instanceof Uint8Array && !Buffer.isBuffer(buf)) {
+          this._writes.push(buf);
+          this._endedBuf = Buffer.from(buf);
+        } else {
+          this._writes.push(buf as Uint8Array);
+          this._endedBuf = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+        }
+      }
+      return this;
+    },
+    set(key, value) {
+      this._headers[key] = value;
+      return this;
+    },
+    setHeader(key, value) {
+      this._headers[key] = value;
+      return this;
+    },
+    write(chunk) {
+      this._writes.push(chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk));
+      return true;
+    },
+    destroy() {
+      this._destroyed = true;
+    },
+    on() {
+      return this;
+    },
+    once() {
+      return this;
+    },
+    emit() {
+      return true;
+    },
+  };
+  return res;
+}
+
+type MockReq = {
+  file?: {
+    buffer: Buffer;
+    mimetype: string;
+    originalname?: string;
+    size?: number;
+  };
+  body?: Record<string, unknown>;
+};
+
+function makeReq(file?: MockReq["file"], body?: Record<string, unknown>): MockReq {
+  return { file, body };
+}
+
+function makeSpeakReq(body: Record<string, unknown>): { body: Record<string, unknown> } {
+  return { body };
+}
+
+// -----------------------------------------------------------------------------
+// Helpers: Polly Readables + error factories.
+// -----------------------------------------------------------------------------
+
+function makeAccessDeniedError(): Error {
+  const err = new Error("User is not authorized to perform this action");
+  (err as { name: string }).name = "AccessDeniedException";
+  (err as { $metadata: { httpStatusCode: number } }).$metadata = {
+    httpStatusCode: 403,
+  };
+  return err;
+}
+
+// -----------------------------------------------------------------------------
+// Setup / teardown
+// -----------------------------------------------------------------------------
+
+beforeEach(() => {
+  vi.mocked(fs.promises.writeFile).mockClear();
+  vi.mocked(fs.promises.mkdir).mockClear();
+  vi.mocked(fs.promises.writeFile).mockResolvedValue(undefined);
+  vi.mocked(fs.promises.mkdir).mockResolvedValue(undefined);
+  pollySendMock.mockReset();
+  synthesizeSpeechCmdCtor.mockClear();
+  transcribeNovaSonicMock.mockReset();
+  vi.mocked(webmToPcm16k).mockReset();
+  vi.mocked(webmToPcm16k).mockImplementation(async (buf: Buffer) => buf);
+  vi.mocked(fetchSkillCatalog).mockReset();
+  clearVoiceListCache();
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+// =============================================================================
+// handleTranscribe — happy path + disk-bank + slash-transform + 502/503 errors
+// =============================================================================
+
+describe("handleTranscribe (Amazon Nova Sonic on Bedrock)", () => {
+  it("returns 200 with {text} from Nova Sonic when webm arrives (single path)", async () => {
+    const audioBytes = Buffer.from("fake webm bytes");
+    const req = makeReq({ buffer: audioBytes, mimetype: "audio/webm", size: audioBytes.length });
+    const res = makeRes();
+
+    transcribeNovaSonicMock.mockResolvedValueOnce("hello world");
+
+    await handleTranscribe(
+      req as unknown as import("express").Request,
+      res as unknown as import("express").Response,
+    );
+
+    expect(res._status).toBe(200);
+    expect((res._body as { text: string }).text).toBe("hello world");
+    // Single path: webmToPcm16k called once, transcribeNovaSonic called once.
+    expect(vi.mocked(webmToPcm16k)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(transcribeNovaSonic)).toHaveBeenCalledTimes(1);
+    // transcribeNovaSonic receives the buffer returned by webmToPcm16k.
+    const pcmBuf = await vi.mocked(webmToPcm16k).mock.results[0]?.value;
+    expect(vi.mocked(transcribeNovaSonic)).toHaveBeenCalledWith(pcmBuf, expect.any(AbortSignal));
+  });
+
+  it("returns 400 when req.file is missing", async () => {
+    const req = makeReq(undefined);
+    const res = makeRes();
+
+    await handleTranscribe(
+      req as unknown as import("express").Request,
+      res as unknown as import("express").Response,
+    );
+
+    expect(res._status).toBe(400);
+    expect((res._body as { error: string }).error).toBe("missing file field");
+  });
+
+  it("disk-bank writes raw multipart bytes BEFORE any transcode (Pitfall 6 / D-14)", async () => {
+    const audioBytes = Buffer.from("raw-webm-bytes-fixture");
+    const req = makeReq({ buffer: audioBytes, mimetype: "audio/webm", size: audioBytes.length });
+    const res = makeRes();
+
+    transcribeNovaSonicMock.mockResolvedValueOnce("hello");
+
+    await handleTranscribe(
+      req as unknown as import("express").Request,
+      res as unknown as import("express").Response,
+    );
+
+    // Let fire-and-forget microtasks settle:
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(vi.mocked(fs.promises.writeFile)).toHaveBeenCalledTimes(1);
+    const call = vi.mocked(fs.promises.writeFile).mock.calls[0];
+    const writtenPath = call[0] as string;
+    // filename shape (timestamp-userId-size-rand.ext): rand tail prevents
+    // silent overwrite on concurrent same-user same-size uploads (M3 fix
+    // from Phase 98 unbiased code review).
+    expect(writtenPath).toMatch(/^.*\/\d{8}T\d{6}Z-(anon|\d+)-\d+-[a-z0-9]{1,6}\.webm$/);
+    // Bank-written bytes ARE the RAW multipart bytes, not the transcoded output:
+    const writtenData = call[1] as Buffer;
+    expect(Buffer.isBuffer(writtenData)).toBe(true);
+    expect(writtenData.equals(audioBytes)).toBe(true);
+
+    // Call-ordering: mkdir was invoked BEFORE webmToPcm16k (bank-write kicks off first).
+    const mkdirOrder = vi.mocked(fs.promises.mkdir).mock.invocationCallOrder[0];
+    const transcodeOrder = vi.mocked(webmToPcm16k).mock.invocationCallOrder[0];
+    expect(mkdirOrder).toBeLessThan(transcodeOrder);
+  });
+
+  it("returns 502 when webmToPcm16k throws", async () => {
+    const audioBytes = Buffer.from("raw webm");
+    const req = makeReq({ buffer: audioBytes, mimetype: "audio/webm", size: audioBytes.length });
+    const res = makeRes();
+
+    vi.mocked(webmToPcm16k).mockRejectedValueOnce(new Error("pcm transcode failed"));
+
+    await handleTranscribe(
+      req as unknown as import("express").Request,
+      res as unknown as import("express").Response,
+    );
+
+    expect(res._status).toBe(502);
+    const body = res._body as { error: string; status: number };
+    expect(body.status).toBe(502);
+    expect(typeof body.error).toBe("string");
+  });
+
+  it("gives up with a 502 once the overall voice limit passes, never hanging past it", async () => {
+    vi.useFakeTimers();
+    try {
+      const audioBytes = Buffer.from("raw webm");
+      const req = makeReq({ buffer: audioBytes, mimetype: "audio/webm", size: audioBytes.length });
+      const res = makeRes();
+      transcribeNovaSonicMock.mockImplementationOnce(() => new Promise<string>(() => {}));
+
+      const done = handleTranscribe(
+        req as unknown as import("express").Request,
+        res as unknown as import("express").Response,
+      );
+      await vi.advanceTimersByTimeAsync(VOICE_TRANSCRIBE_DEADLINE_MS - 1);
+      expect(res._body).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1);
+      await done;
+      expect(res._status).toBe(502);
+      // The hung AWS request was told to stop, not left running.
+      const signal = vi.mocked(transcribeNovaSonic).mock.calls.at(-1)?.[1] as AbortSignal | undefined;
+      expect(signal?.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops transcribing when the browser disconnects before the answer", async () => {
+    const audioBytes = Buffer.from("raw webm");
+    const req = makeReq({ buffer: audioBytes, mimetype: "audio/webm", size: audioBytes.length });
+    const res = makeRes();
+    let onClose: (() => void) | undefined;
+    res.on = (event: string, cb: unknown) => {
+      if (event === "close") onClose = cb as () => void;
+      return res;
+    };
+    transcribeNovaSonicMock.mockImplementationOnce(() => new Promise<string>(() => {}));
+    const done = handleTranscribe(
+      req as unknown as import("express").Request,
+      res as unknown as import("express").Response,
+    );
+    await new Promise((r) => setTimeout(r, 10));
+    onClose?.();
+    await done;
+    const signal = vi.mocked(transcribeNovaSonic).mock.calls.at(-1)?.[1] as AbortSignal | undefined;
+    expect(signal?.aborted).toBe(true);
+  });
+
+  it("returns 503 when Nova Sonic throws AccessDeniedException (T-109-03-01)", async () => {
+    const audioBytes = Buffer.from("raw webm");
+    const req = makeReq({ buffer: audioBytes, mimetype: "audio/webm", size: audioBytes.length });
+    const res = makeRes();
+
+    transcribeNovaSonicMock.mockRejectedValueOnce(makeAccessDeniedError());
+
+    await handleTranscribe(
+      req as unknown as import("express").Request,
+      res as unknown as import("express").Response,
+    );
+
+    expect(res._status).toBe(503);
+    const body = res._body as { error: string; status: number };
+    expect(body.error).toBe("voice STT unavailable");
+    expect(body.status).toBe(503);
+  });
+
+  it("preserves slash-command transform: wake-word HIT + catalog HIT → transformed text returned", async () => {
+    const audioBytes = Buffer.from("bytes");
+    const req = makeReq(
+      { buffer: audioBytes, mimetype: "audio/webm", size: audioBytes.length },
+      { hostId: "42" },
+    );
+    (req as unknown as { userId: string }).userId = "user-1";
+    const res = makeRes();
+
+    transcribeNovaSonicMock.mockResolvedValueOnce("slash gsd status");
+    vi.mocked(fetchSkillCatalog).mockResolvedValue(new Set(["gsd", "bounty"]));
+
+    await handleTranscribe(
+      req as unknown as import("express").Request,
+      res as unknown as import("express").Response,
+    );
+
+    expect(res._status).toBe(200);
+    expect((res._body as { text: string }).text).toBe("/gsd status");
+    expect(vi.mocked(fetchSkillCatalog)).toHaveBeenCalledWith(42, "user-1", 10_000);
+  });
+
+  it("preserves slash-command transform: wake-word MISS → raw transcript returned, catalog NOT fetched", async () => {
+    const audioBytes = Buffer.from("bytes");
+    const req = makeReq(
+      { buffer: audioBytes, mimetype: "audio/webm", size: audioBytes.length },
+      { hostId: "1" },
+    );
+    (req as unknown as { userId: string }).userId = "user-1";
+    const res = makeRes();
+
+    transcribeNovaSonicMock.mockResolvedValueOnce("hello world");
+
+    await handleTranscribe(
+      req as unknown as import("express").Request,
+      res as unknown as import("express").Response,
+    );
+
+    expect(res._status).toBe(200);
+    expect((res._body as { text: string }).text).toBe("hello world");
+    expect(vi.mocked(fetchSkillCatalog)).not.toHaveBeenCalled();
+  });
+});
+
+// =============================================================================
+// handleSpeak — validation + RIFF-header dataSize + AccessDenied
+// =============================================================================
+
+describe("handleTranscribe (STT_PROVIDER selection)", () => {
+  const savedEnv = { ...process.env };
+  const fetchMock = vi.fn<typeof fetch>();
+
+  beforeEach(() => {
+    vi.stubGlobal("fetch", fetchMock);
+    fetchMock.mockReset();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    process.env = { ...savedEnv };
+  });
+
+  async function transcribe(): Promise<MockRes> {
+    const audioBytes = Buffer.from("fake webm bytes");
+    const req = makeReq({ buffer: audioBytes, mimetype: "audio/webm", size: audioBytes.length });
+    const res = makeRes();
+    await handleTranscribe(
+      req as unknown as import("express").Request,
+      res as unknown as import("express").Response,
+    );
+    return res;
+  }
+
+  it("STT_PROVIDER=groq sends the raw upload over HTTP — no PCM transcode, no Bedrock", async () => {
+    process.env.STT_PROVIDER = "groq";
+    process.env.GROQ_API_KEY = "gq-key";
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ text: "hi from groq" }), { status: 200 }));
+
+    const res = await transcribe();
+
+    expect(res._status).toBe(200);
+    expect((res._body as { text: string }).text).toBe("hi from groq");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(webmToPcm16k)).not.toHaveBeenCalled();
+    expect(vi.mocked(transcribeNovaSonic)).not.toHaveBeenCalled();
+  });
+
+  it("retries a 503 from an HTTP provider, then succeeds", async () => {
+    process.env.STT_PROVIDER = "elevenlabs";
+    process.env.ELEVENLABS_API_KEY = "el-key";
+    fetchMock
+      .mockResolvedValueOnce(new Response("busy", { status: 503 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ text: "second try" }), { status: 200 }));
+
+    const res = await transcribe();
+
+    expect(res._status).toBe(200);
+    expect((res._body as { text: string }).text).toBe("second try");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("provider out of credits → 503 quota_exhausted with a plain message", async () => {
+    process.env.STT_PROVIDER = "elevenlabs";
+    process.env.ELEVENLABS_API_KEY = "el-key";
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ detail: { status: "quota_exceeded", message: "This request exceeds your quota of 10000." } }), { status: 401 }),
+    );
+
+    const res = await transcribe();
+
+    expect(res._status).toBe(503);
+    const body = res._body as { reason: string; message: string };
+    expect(body.reason).toBe("quota_exhausted");
+    expect(body.message).toBe("transcription quota exhausted — your audio was saved");
+  });
+
+  it("selected HTTP provider without its API key → 503 voice STT unavailable", async () => {
+    process.env.STT_PROVIDER = "mistral";
+    delete process.env.MISTRAL_API_KEY;
+
+    const res = await transcribe();
+
+    expect(res._status).toBe(503);
+    expect((res._body as { error: string }).error).toBe("voice STT unavailable");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("unknown STT_PROVIDER → 503, never a silent fallback to another provider", async () => {
+    process.env.STT_PROVIDER = "nope";
+
+    const res = await transcribe();
+
+    expect(res._status).toBe(503);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(vi.mocked(transcribeNovaSonic)).not.toHaveBeenCalled();
+  });
+
+  it("unknown STT_PROVIDER with a backup set → still 503, the backup is not used", async () => {
+    process.env.STT_PROVIDER = "nope";
+    process.env.STT_FALLBACK_PROVIDER = "groq";
+    process.env.GROQ_API_KEY = "gq-key";
+
+    const res = await transcribe();
+
+    expect(res._status).toBe(503);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("handleTranscribe (STT_FALLBACK_PROVIDER)", () => {
+  const savedEnv = { ...process.env };
+  const fetchMock = vi.fn<typeof fetch>();
+  const QUOTA_BODY = JSON.stringify({ detail: { status: "quota_exceeded", message: "This request exceeds your quota." } });
+
+  beforeEach(() => {
+    vi.stubGlobal("fetch", fetchMock);
+    fetchMock.mockReset();
+    process.env.STT_PROVIDER = "elevenlabs";
+    process.env.STT_FALLBACK_PROVIDER = "groq";
+    process.env.ELEVENLABS_API_KEY = "el-key";
+    process.env.GROQ_API_KEY = "gq-key";
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    process.env = { ...savedEnv };
+  });
+
+  async function transcribe(): Promise<MockRes> {
+    const audioBytes = Buffer.from("fake webm bytes");
+    const req = makeReq({ buffer: audioBytes, mimetype: "audio/webm", size: audioBytes.length });
+    const res = makeRes();
+    await handleTranscribe(
+      req as unknown as import("express").Request,
+      res as unknown as import("express").Response,
+    );
+    return res;
+  }
+
+  const calledUrls = () => fetchMock.mock.calls.map((c) => String(c[0]));
+  const ok = (text: string) => new Response(JSON.stringify({ text }), { status: 200 });
+
+  it("primary out of credit → the same recording goes to the backup at once, user gets its text", async () => {
+    fetchMock.mockResolvedValueOnce(new Response(QUOTA_BODY, { status: 401 })).mockResolvedValueOnce(ok("from groq"));
+
+    const res = await transcribe();
+
+    expect(res._status).toBe(200);
+    expect((res._body as { text: string }).text).toBe("from groq");
+    expect(calledUrls()).toEqual([
+      "https://api.elevenlabs.io/v1/speech-to-text",
+      "https://api.groq.com/openai/v1/audio/transcriptions",
+    ]);
+    const sent = fetchMock.mock.calls.map((c) => (c[1]!.body as FormData).get("file") as Blob);
+    expect(Buffer.from(await sent[1].arrayBuffer()).toString()).toBe("fake webm bytes");
+  });
+
+  it("quota reported as 429 is not retried — straight to the backup", async () => {
+    fetchMock.mockResolvedValueOnce(new Response(QUOTA_BODY, { status: 429 })).mockResolvedValueOnce(ok("from groq"));
+
+    const res = await transcribe();
+
+    expect(res._status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("both fail → the backup's failure decides the answer", async () => {
+    fetchMock.mockResolvedValueOnce(new Response(QUOTA_BODY, { status: 401 })).mockResolvedValueOnce(new Response("nope", { status: 401 }));
+
+    const res = await transcribe();
+
+    // Backup's rejected key → plain unavailable, not the primary's quota message.
+    expect(res._status).toBe(503);
+    expect(res._body).toEqual({ error: "voice STT unavailable", status: 503 });
+  });
+
+  it("both out of credit → the quota message", async () => {
+    fetchMock.mockImplementation(async () => new Response(QUOTA_BODY, { status: 401 }));
+
+    const res = await transcribe();
+
+    expect(res._status).toBe(503);
+    expect((res._body as { reason: string }).reason).toBe("quota_exhausted");
+  });
+
+  it("backup with a bad-audio rejection → 502", async () => {
+    fetchMock.mockResolvedValueOnce(new Response(QUOTA_BODY, { status: 401 })).mockResolvedValueOnce(new Response("bad", { status: 400 }));
+
+    const res = await transcribe();
+
+    expect(res._status).toBe(502);
+  });
+
+  it("no backup set → only the selected provider is asked", async () => {
+    delete process.env.STT_FALLBACK_PROVIDER;
+    fetchMock.mockResolvedValue(new Response(QUOTA_BODY, { status: 401 }));
+
+    const res = await transcribe();
+
+    expect(res._status).toBe(503);
+    expect(calledUrls()).toEqual(["https://api.elevenlabs.io/v1/speech-to-text"]);
+  });
+});
+
+describe("handleSpeak (AWS Polly SynthesizeSpeech, non-streaming)", () => {
+  it("returns 400 when body.text is missing", async () => {
+    const req = makeSpeakReq({});
+    const res = makeRes();
+
+    await handleSpeak(
+      req as unknown as import("express").Request,
+      res as unknown as import("express").Response,
+    );
+
+    expect(res._status).toBe(400);
+    expect(typeof (res._body as { error: string }).error).toBe("string");
+  });
+
+  it("returns 400 when body.text is empty string", async () => {
+    const req = makeSpeakReq({ text: "" });
+    const res = makeRes();
+
+    await handleSpeak(
+      req as unknown as import("express").Request,
+      res as unknown as import("express").Response,
+    );
+
+    expect(res._status).toBe(400);
+  });
+
+  it("returns 400 when body.text length exceeds SPEAK_TEXT_MAX", async () => {
+    const req = makeSpeakReq({ text: "a".repeat(SPEAK_TEXT_MAX + 1) });
+    const res = makeRes();
+
+    await handleSpeak(
+      req as unknown as import("express").Request,
+      res as unknown as import("express").Response,
+    );
+
+    expect(res._status).toBe(400);
+  });
+
+  it("skips a voice the active provider doesn't offer ('Elena.wav') and speaks the default — never a 400", async () => {
+    const req = makeSpeakReq({ text: "hello", voice: "Elena.wav" });
+    const res = makeRes();
+    pollySendMock.mockResolvedValueOnce({ AudioStream: Readable.from([Buffer.alloc(10)]) });
+
+    await handleSpeak(
+      req as unknown as import("express").Request,
+      res as unknown as import("express").Response,
+    );
+
+    expect(res._status).toBe(200);
+    expect(synthesizeSpeechCmdCtor.mock.calls[0]?.[0].VoiceId).toBe("Joanna");
+  });
+
+  it("returns 400 when a voice is malformed (non-string or over-long)", async () => {
+    for (const body of [{ text: "hello", voice: 42 }, { text: "hello", voices: ["x".repeat(65)] }, { text: "hello", voices: "Joanna" }]) {
+      const res = makeRes();
+      await handleSpeak(
+        makeSpeakReq(body) as unknown as import("express").Request,
+        res as unknown as import("express").Response,
+      );
+      expect(res._status).toBe(400);
+    }
+    expect(pollySendMock).not.toHaveBeenCalled();
+  });
+
+  it("accepts a valid Polly voice ID ('Joanna') and returns 200", async () => {
+    const pcmBytes = Buffer.alloc(3200); // 3200 bytes of zeros
+    const req = makeSpeakReq({ text: "hello", voice: "Joanna" });
+    const res = makeRes();
+    pollySendMock.mockResolvedValueOnce({
+      AudioStream: Readable.from([pcmBytes]),
+    });
+
+    await handleSpeak(
+      req as unknown as import("express").Request,
+      res as unknown as import("express").Response,
+    );
+
+    expect(res._status).toBe(200);
+    // Verify VoiceId passed through:
+    const cmdArgs = synthesizeSpeechCmdCtor.mock.calls[0]?.[0];
+    expect(cmdArgs.VoiceId).toBe("Joanna");
+  });
+
+  it("uses Polly's default voice (Joanna) when no voice is sent", async () => {
+    const pcmBytes = Buffer.alloc(100);
+    const req = makeSpeakReq({ text: "hello" });
+    const res = makeRes();
+    pollySendMock.mockResolvedValueOnce({
+      AudioStream: Readable.from([pcmBytes]),
+    });
+
+    await handleSpeak(
+      req as unknown as import("express").Request,
+      res as unknown as import("express").Response,
+    );
+
+    expect(res._status).toBe(200);
+    const cmdArgs = synthesizeSpeechCmdCtor.mock.calls[0]?.[0];
+    expect(cmdArgs.VoiceId).toBe("Joanna");
+  });
+
+  it("prepends RIFF header with dataSize = pcmBuf.length (byte-accurate, NOT 0xFFFFFFFF sentinel)", async () => {
+    const pcmSize = 3200;
+    const pcmBytes = Buffer.alloc(pcmSize); // deterministic byte count
+    const req = makeSpeakReq({ text: "hello", voice: "Joanna" });
+    const res = makeRes();
+    pollySendMock.mockResolvedValueOnce({
+      AudioStream: Readable.from([pcmBytes]),
+    });
+
+    await handleSpeak(
+      req as unknown as import("express").Request,
+      res as unknown as import("express").Response,
+    );
+
+    expect(res._status).toBe(200);
+    expect(res._headers["Content-Type"]).toBe("audio/wav");
+
+    // Reassemble the full response body from _writes (may include header + pcm as separate frames):
+    const totalLen = res._writes.reduce((acc, w) => acc + w.length, 0);
+    const body = Buffer.alloc(totalLen);
+    let offset = 0;
+    for (const w of res._writes) {
+      body.set(w, offset);
+      offset += w.length;
+    }
+    // RIFF header is the first 44 bytes:
+    expect(body.length).toBe(44 + pcmSize);
+    // Byte-accurate dataSize (bytes 40-43 LE uint32):
+    expect(body.readUInt32LE(40)).toBe(pcmSize);
+    // Byte-accurate RIFF chunk size (bytes 4-7 LE uint32) = dataSize + 36:
+    expect(body.readUInt32LE(4)).toBe(pcmSize + 36);
+    // Sanity: NOT the 0xFFFFFFFF sentinel.
+    expect(body.readUInt32LE(40)).not.toBe(0xffffffff);
+  });
+
+  it("returns 503 when Polly throws AccessDeniedException (P98-OFF-01)", async () => {
+    const req = makeSpeakReq({ text: "hello", voice: "Joanna" });
+    const res = makeRes();
+    pollySendMock.mockRejectedValueOnce(makeAccessDeniedError());
+
+    await handleSpeak(
+      req as unknown as import("express").Request,
+      res as unknown as import("express").Response,
+    );
+
+    expect(res._status).toBe(503);
+    const body = res._body as { error: string; status: number };
+    expect(body.error).toBe("voice TTS unavailable");
+    expect(body.status).toBe(503);
+  });
+
+  it("returns 502 when Polly throws a generic (non-AccessDenied) error", async () => {
+    const req = makeSpeakReq({ text: "hello", voice: "Joanna" });
+    const res = makeRes();
+    pollySendMock.mockRejectedValueOnce(new Error("network down"));
+
+    await handleSpeak(
+      req as unknown as import("express").Request,
+      res as unknown as import("express").Response,
+    );
+
+    expect(res._status).toBe(502);
+  });
+});
+
+// =============================================================================
+// handleSpeakStream — validation + chunk-and-stitch orchestration + AccessDenied
+// =============================================================================
+
+describe("handleSpeakStream (AWS Polly, streaming with chunk-and-stitch)", () => {
+  it("returns 400 when body.text is missing", async () => {
+    const req = makeSpeakReq({});
+    const res = makeRes();
+
+    await handleSpeakStream(
+      req as unknown as import("express").Request,
+      res as unknown as import("express").Response,
+    );
+
+    expect(res._status).toBe(400);
+  });
+
+  it("returns 400 when body.text is empty string", async () => {
+    const req = makeSpeakReq({ text: "" });
+    const res = makeRes();
+
+    await handleSpeakStream(
+      req as unknown as import("express").Request,
+      res as unknown as import("express").Response,
+    );
+
+    expect(res._status).toBe(400);
+  });
+
+  it("returns 400 when body.text length exceeds SPEAK_TEXT_MAX", async () => {
+    const req = makeSpeakReq({ text: "a".repeat(SPEAK_TEXT_MAX + 1) });
+    const res = makeRes();
+
+    await handleSpeakStream(
+      req as unknown as import("express").Request,
+      res as unknown as import("express").Response,
+    );
+
+    expect(res._status).toBe(400);
+  });
+
+  it("speaks the first candidate Polly offers, skipping ones it doesn't (identity → role → fallback)", async () => {
+    const req = makeSpeakReq({ text: "hello", voices: ["SAz9YHcvj6GT2YYXdXww", "marin", "Matthew", "Ruth"] });
+    const res = makeRes();
+    pollySendMock.mockResolvedValueOnce({ AudioStream: Readable.from([Buffer.alloc(4)]) });
+
+    await handleSpeakStream(
+      req as unknown as import("express").Request,
+      res as unknown as import("express").Response,
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(res._status).toBe(200);
+    expect(synthesizeSpeechCmdCtor.mock.calls[0]?.[0].VoiceId).toBe("Matthew");
+  });
+
+  it("short text (single chunk) — sets audio/wav + X-Accel-Buffering headers and pipes PCM bytes with RIFF prefix", async () => {
+    const pcmBytes = Buffer.from([1, 2, 3, 4, 5, 6, 7, 8]);
+    const req = makeSpeakReq({ text: "Hello.", voice: "Joanna" });
+    const res = makeRes();
+    pollySendMock.mockResolvedValueOnce({
+      AudioStream: Readable.from([pcmBytes]),
+    });
+
+    await handleSpeakStream(
+      req as unknown as import("express").Request,
+      res as unknown as import("express").Response,
+    );
+
+    // Allow the pipe to drain:
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(res._status).toBe(200);
+    expect(res._headers["Content-Type"]).toBe("audio/wav");
+    expect(res._headers["X-Accel-Buffering"]).toBe("no");
+    // First write is the 44-byte RIFF header:
+    expect(res._writes[0].length).toBe(44);
+    // Subsequent writes contain the PCM bytes:
+    const totalPcmWritten = res._writes
+      .slice(1)
+      .reduce((acc, w) => acc + w.length, 0);
+    expect(totalPcmWritten).toBe(pcmBytes.length);
+    // Exactly one Polly SynthesizeSpeech call (single chunk):
+    expect(pollySendMock).toHaveBeenCalledTimes(1);
+    // Voice passed through:
+    const cmdArgs = synthesizeSpeechCmdCtor.mock.calls[0]?.[0];
+    expect(cmdArgs.VoiceId).toBe("Joanna");
+  });
+
+  it("returns 503 when Polly throws AccessDeniedException BEFORE any bytes flushed", async () => {
+    const req = makeSpeakReq({ text: "Hello.", voice: "Joanna" });
+    const res = makeRes();
+    pollySendMock.mockRejectedValueOnce(makeAccessDeniedError());
+
+    await handleSpeakStream(
+      req as unknown as import("express").Request,
+      res as unknown as import("express").Response,
+    );
+
+    expect(res._status).toBe(503);
+    const body = res._body as { error: string; status: number };
+    expect(body.error).toBe("voice TTS unavailable");
+    expect(body.status).toBe(503);
+    expect(res._destroyed).toBe(false);
+  });
+
+  it("uses Polly's default voice (Joanna) when no voice is sent", async () => {
+    const pcmBytes = Buffer.from([1, 2]);
+    const req = makeSpeakReq({ text: "hi." });
+    const res = makeRes();
+    pollySendMock.mockResolvedValueOnce({
+      AudioStream: Readable.from([pcmBytes]),
+    });
+
+    await handleSpeakStream(
+      req as unknown as import("express").Request,
+      res as unknown as import("express").Response,
+    );
+
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const cmdArgs = synthesizeSpeechCmdCtor.mock.calls[0]?.[0];
+    expect(cmdArgs.VoiceId).toBe("Joanna");
+  });
+});
+
+
+// =============================================================================
+// TTS_PROVIDER selection — speak routes + GET /voices against the provider
+// contract (tts-provider.ts). HTTP providers are exercised through a stubbed
+// global fetch; Polly through the mocked SDK above.
+// =============================================================================
+
+describe("TTS_PROVIDER selection", () => {
+  const savedEnv = { ...process.env };
+  const fetchMock = vi.fn<typeof fetch>();
+
+  beforeEach(() => {
+    vi.stubGlobal("fetch", fetchMock);
+    fetchMock.mockReset();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    process.env = { ...savedEnv };
+  });
+
+  function pcmResponse(bytes = 8): Response {
+    return new Response(new Uint8Array(bytes), { status: 200 });
+  }
+
+  async function speakStream(body: Record<string, unknown>): Promise<MockRes> {
+    const res = makeRes();
+    await handleSpeakStream(
+      makeSpeakReq(body) as unknown as import("express").Request,
+      res as unknown as import("express").Response,
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    return res;
+  }
+
+  async function listVoices(): Promise<MockRes> {
+    const res = makeRes();
+    await handleListVoices(
+      {} as unknown as import("express").Request,
+      res as unknown as import("express").Response,
+    );
+    return res;
+  }
+
+  function sentBody(callIndex = 0): Record<string, unknown> {
+    return JSON.parse(String(fetchMock.mock.calls[callIndex]?.[1]?.body));
+  }
+
+  it("TTS_PROVIDER=openai: streams OpenAI PCM with a 24 kHz RIFF header, default voice marin, no Polly", async () => {
+    process.env.TTS_PROVIDER = "openai";
+    process.env.OPENAI_API_KEY = "oa-key";
+    fetchMock.mockResolvedValueOnce(pcmResponse(6));
+
+    const res = await speakStream({ text: "Hello there." });
+
+    expect(res._status).toBe(200);
+    expect(pollySendMock).not.toHaveBeenCalled();
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe("https://api.openai.com/v1/audio/speech");
+    expect(sentBody()).toEqual({
+      model: "gpt-4o-mini-tts",
+      input: `Hello there. ${TAIL_GUARD_FILLER}`,
+      voice: "marin",
+      response_format: "pcm",
+    });
+    const header = Buffer.from(res._writes[0]);
+    expect(header.readUInt32LE(24)).toBe(24000);
+    expect(res._writes.slice(1).reduce((n, w) => n + w.length, 0)).toBe(6);
+  });
+
+  it("openai: a saved Polly voice is skipped for the next candidate the provider offers", async () => {
+    process.env.TTS_PROVIDER = "openai";
+    process.env.OPENAI_API_KEY = "oa-key";
+    fetchMock.mockResolvedValueOnce(pcmResponse());
+
+    await speakStream({ text: "Hi.", voices: ["Joanna", "nova"] });
+
+    expect(sentBody().voice).toBe("nova");
+  });
+
+  it("TTS_MODEL and TTS_DEFAULT_VOICE override the provider's model and default voice", async () => {
+    process.env.TTS_PROVIDER = "openai";
+    process.env.OPENAI_API_KEY = "oa-key";
+    process.env.TTS_MODEL = "tts-1-hd";
+    process.env.TTS_DEFAULT_VOICE = "onyx";
+    fetchMock.mockResolvedValueOnce(pcmResponse());
+
+    await speakStream({ text: "Hi.", voices: ["Joanna"] });
+
+    expect(sentBody()).toMatchObject({ model: "tts-1-hd", voice: "onyx", input: "Hi." });
+  });
+
+  describe("tail guard (gpt-4o-mini-tts drops final sentences)", () => {
+    const SR = 24000;
+    // Speech = 440 Hz tone; pause = digital silence.
+    function synthPcm(segs: Array<["speech" | "pause", number]>): Uint8Array {
+      const total = segs.reduce((n, [, s]) => n + Math.round(s * SR), 0);
+      const buf = Buffer.alloc(total * 2);
+      let i = 0;
+      for (const [kind, s] of segs) {
+        for (let k = 0; k < Math.round(s * SR); k++, i++) {
+          buf.writeInt16LE(kind === "speech" ? Math.round(8000 * Math.sin((2 * Math.PI * 440 * i) / SR)) : 0, i * 2);
+        }
+      }
+      return new Uint8Array(buf);
+    }
+    // The provider body arrives in several reads, odd-sized, like a real stream.
+    function streamedResponse(bytes: Uint8Array): Response {
+      const parts: Uint8Array[] = [];
+      for (let off = 0; off < bytes.length; off += 4801) parts.push(bytes.subarray(off, off + 4801));
+      return new Response(new ReadableStream({ start(c) { parts.forEach((p) => c.enqueue(p)); c.close(); } }), { status: 200 });
+    }
+    const streamedPcmBytes = (res: MockRes) => res._writes.slice(1).reduce((n, w) => n + w.length, 0);
+
+    beforeEach(() => {
+      process.env.TTS_PROVIDER = "openai";
+      process.env.OPENAI_API_KEY = "oa-key";
+    });
+
+    it("cuts the filler off a short single-chunk message", async () => {
+      fetchMock.mockResolvedValueOnce(streamedResponse(synthPcm([["speech", 2], ["pause", 0.5], ["speech", 4.5], ["pause", 0.3]])));
+      const res = await speakStream({ text: "Want me to push?" });
+      expect(streamedPcmBytes(res)).toBe(Math.round(2.15 * SR) * 2);
+    });
+
+    it("streams everything before the held-back tail and cuts the filler off a long message", async () => {
+      fetchMock.mockResolvedValueOnce(streamedResponse(synthPcm([["speech", 14], ["pause", 0.5], ["speech", 4.5], ["pause", 0.3]])));
+      const res = await speakStream({ text: "A long message. Want me to push?" });
+      expect(res._writes.length).toBeGreaterThan(3);
+      expect(streamedPcmBytes(res)).toBe(Math.round(14.15 * SR) * 2);
+    });
+
+    it("ends unpunctuated text with a period so the model pauses before the filler", async () => {
+      fetchMock.mockResolvedValueOnce(streamedResponse(synthPcm([["speech", 8]])));
+      await speakStream({ text: "Next step:" });
+      expect(sentBody().input).toBe(`Next step:. ${TAIL_GUARD_FILLER}`);
+      fetchMock.mockResolvedValueOnce(streamedResponse(synthPcm([["speech", 8]])));
+      await speakStream({ text: 'He said "go."' });
+      expect(sentBody(1).input).toBe(`He said "go." ${TAIL_GUARD_FILLER}`);
+    });
+
+    it("plays untrimmed when no pause fits the filler", async () => {
+      const pcm = synthPcm([["speech", 8]]);
+      fetchMock.mockResolvedValueOnce(streamedResponse(pcm));
+      const res = await speakStream({ text: "Hi." });
+      expect(streamedPcmBytes(res)).toBe(pcm.length);
+    });
+
+    it("cuts the filler on the non-streaming speak route too", async () => {
+      fetchMock.mockResolvedValueOnce(streamedResponse(synthPcm([["speech", 2], ["pause", 0.5], ["speech", 4.5]])));
+      const res = makeRes();
+      await handleSpeak(
+        makeSpeakReq({ text: "Sample." }) as unknown as import("express").Request,
+        res as unknown as import("express").Response,
+      );
+      expect(sentBody().input).toBe(`Sample. ${TAIL_GUARD_FILLER}`);
+      expect(res._endedBuf?.length).toBe(Math.round(2.15 * SR) * 2);
+    });
+  });
+
+  it("splits long text at the active provider's own per-request limit", async () => {
+    const sentence = `${"word ".repeat(379)}end.`; // 1899 chars
+    const text = `${sentence} ${sentence}`; // 3799 chars: one OpenAI request, two Polly requests
+
+    process.env.TTS_PROVIDER = "openai";
+    process.env.OPENAI_API_KEY = "oa-key";
+    fetchMock.mockImplementation(async () => pcmResponse());
+    await speakStream({ text });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    delete process.env.TTS_PROVIDER;
+    pollySendMock.mockImplementation(async () => ({ AudioStream: Readable.from([Buffer.alloc(4)]) }));
+    await speakStream({ text });
+    expect(pollySendMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("unknown TTS_PROVIDER → 503 on speak and on the voice list, never a fallback provider", async () => {
+    process.env.TTS_PROVIDER = "nope";
+
+    const speakRes = await speakStream({ text: "Hi." });
+    const listRes = await listVoices();
+
+    expect(speakRes._status).toBe(503);
+    expect((speakRes._body as { error: string }).error).toBe("voice TTS unavailable");
+    expect(listRes._status).toBe(503);
+    expect(pollySendMock).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("selected provider without its API key → 503, no request sent", async () => {
+    process.env.TTS_PROVIDER = "openai";
+    delete process.env.OPENAI_API_KEY;
+
+    const res = await speakStream({ text: "Hi." });
+
+    expect(res._status).toBe(503);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("provider rejecting the key (401) or out of credits (402) → 503 voice TTS unavailable", async () => {
+    process.env.TTS_PROVIDER = "openai";
+    process.env.OPENAI_API_KEY = "oa-key";
+    for (const status of [401, 402]) {
+      fetchMock.mockResolvedValueOnce(new Response("no", { status }));
+      const res = await speakStream({ text: "Hi." });
+      expect(res._status).toBe(503);
+    }
+  });
+
+  it("out of credit (429 insufficient_quota) → 503 straight away, no retries", async () => {
+    process.env.TTS_PROVIDER = "openai";
+    process.env.OPENAI_API_KEY = "oa-key";
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ error: { code: "insufficient_quota" } }), { status: 429 }),
+    );
+
+    const res = await speakStream({ text: "Hi." });
+
+    expect(res._status).toBe(503);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("TTS_DEFAULT_VOICE from another provider → 503 on speak and on the voice list, nothing sent", async () => {
+    process.env.TTS_PROVIDER = "openai";
+    process.env.OPENAI_API_KEY = "oa-key";
+    process.env.TTS_DEFAULT_VOICE = "Joanna";
+
+    const speakRes = await speakStream({ text: "Hi." });
+    const listRes = await listVoices();
+
+    expect(speakRes._status).toBe(503);
+    expect(listRes._status).toBe(503);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("retries a 429 from the provider before any audio, then streams", async () => {
+    process.env.TTS_PROVIDER = "openai";
+    process.env.OPENAI_API_KEY = "oa-key";
+    fetchMock
+      .mockResolvedValueOnce(new Response("slow down", { status: 429 }))
+      .mockResolvedValueOnce(pcmResponse(4));
+
+    const res = await speakStream({ text: "Hi." });
+
+    expect(res._status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  describe("provider stream stalls (OpenAI goes quiet mid-body)", () => {
+    // Some bytes, then nothing — the connection stays open.
+    function stallingResponse(bytes: number): Response {
+      return new Response(
+        new ReadableStream({ start(c) { if (bytes > 0) c.enqueue(new Uint8Array(bytes)); } }),
+        { status: 200 },
+      );
+    }
+    const pcmBytesOut = (res: MockRes) => res._writes.slice(1).reduce((n, w) => n + w.length, 0);
+
+    beforeEach(() => {
+      process.env.TTS_PROVIDER = "openai";
+      process.env.OPENAI_API_KEY = "oa-key";
+      process.env.TTS_STALL_TIMEOUT_MS = "40";
+    });
+
+    it("stalls before any audio reached the listener → retried from scratch, then streams", async () => {
+      // Tail guard holds back 10s, so this stall's few bytes never went out.
+      fetchMock
+        .mockResolvedValueOnce(stallingResponse(4800))
+        .mockResolvedValueOnce(pcmResponse(6));
+
+      const res = await speakStream({ text: "Hi." });
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(res._status).toBe(200);
+      expect(pcmBytesOut(res)).toBe(6); // only the retry's audio — the stalled attempt's held bytes are dropped
+      expect(res._streamedEnded).toBe(true);
+      expect(res._destroyed).toBe(false);
+    });
+
+    it("gives up after three stalled attempts and ends the response instead of hanging", async () => {
+      fetchMock.mockImplementation(async () => stallingResponse(0));
+
+      const res = await speakStream({ text: "Hi." });
+
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(pcmBytesOut(res)).toBe(0);
+      expect(res._streamedEnded).toBe(true);
+    });
+
+    it("stalls after audio is out → ends the message there, no retry, no later chunks", async () => {
+      process.env.TTS_MODEL = "tts-1"; // no tail guard: audio streams straight through
+      const sentence = `${"word ".repeat(700)}end.`; // ~3504 chars → one chunk each
+      fetchMock
+        .mockResolvedValueOnce(stallingResponse(10))
+        .mockImplementation(async () => pcmResponse());
+
+      const res = await speakStream({ text: `${sentence} ${sentence}` });
+
+      expect(fetchMock).toHaveBeenCalledTimes(2); // chunk 0 + chunk 1's prefetch; chunk 0 not retried
+      expect(pcmBytesOut(res)).toBe(10); // chunk 1 never written after the cut
+      expect(res._streamedEnded).toBe(true);
+      expect(res._destroyed).toBe(false);
+    });
+
+    it("non-streaming speak (voice sample): a stalled provider fails the request instead of hanging", async () => {
+      fetchMock.mockImplementation(async () => stallingResponse(4));
+      const res = makeRes();
+      await handleSpeak(
+        makeSpeakReq({ text: "Sample." }) as unknown as import("express").Request,
+        res as unknown as import("express").Response,
+      );
+      expect(res._status).toBeGreaterThanOrEqual(500);
+    });
+
+    it("a stalled prefetched chunk is retried", async () => {
+      process.env.TTS_MODEL = "tts-1";
+      const sentence = `${"word ".repeat(700)}end.`;
+      fetchMock
+        .mockResolvedValueOnce(pcmResponse(4))
+        .mockResolvedValueOnce(stallingResponse(2))
+        .mockResolvedValueOnce(pcmResponse(6));
+
+      const res = await speakStream({ text: `${sentence} ${sentence}` });
+
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(pcmBytesOut(res)).toBe(10);
+      expect(res._streamedEnded).toBe(true);
+    });
+  });
+
+  it("elevenlabs: speaks a saved voice from the account list, 24 kHz PCM, default model", async () => {
+    process.env.TTS_PROVIDER = "elevenlabs";
+    process.env.ELEVENLABS_API_KEY = "el-key";
+    fetchMock.mockImplementation(async (url) =>
+      String(url).endsWith("/v1/voices")
+        ? new Response(JSON.stringify({ voices: [{ voice_id: "EXAVITQu4vr4xnSDxMaL", name: "Sarah - Mature" }] }), { status: 200 })
+        : pcmResponse(),
+    );
+
+    const res = await speakStream({ text: "Hi.", voices: ["Joanna", "EXAVITQu4vr4xnSDxMaL"] });
+
+    expect(res._status).toBe(200);
+    const synthCall = fetchMock.mock.calls.find((c) => String(c[0]).includes("/text-to-speech/"));
+    expect(String(synthCall?.[0])).toBe(
+      "https://api.elevenlabs.io/v1/text-to-speech/EXAVITQu4vr4xnSDxMaL/stream?output_format=pcm_24000",
+    );
+    expect(JSON.parse(String(synthCall?.[1]?.body))).toEqual({ text: "Hi.", model_id: "eleven_multilingual_v2" });
+  });
+
+  it("elevenlabs: a saved voice still speaks when the voice list can't be fetched", async () => {
+    process.env.TTS_PROVIDER = "elevenlabs";
+    process.env.ELEVENLABS_API_KEY = "el-key";
+    fetchMock.mockImplementation(async (url) => {
+      if (String(url).endsWith("/v1/voices")) throw new TypeError("fetch failed");
+      return pcmResponse();
+    });
+
+    const res = await speakStream({ text: "Hi.", voices: ["Joanna", "EXAVITQu4vr4xnSDxMaL"] });
+
+    expect(res._status).toBe(200);
+    expect(fetchMock.mock.calls.some((c) => String(c[0]).includes("/text-to-speech/EXAVITQu4vr4xnSDxMaL/"))).toBe(true);
+  });
+
+  function geminiSse(events: unknown[], done = true): Response {
+    const text =
+      events.map((e) => `event: x\ndata: ${JSON.stringify(e)}\n\n`).join("") + (done ? "event: done\ndata: [DONE]\n\n" : "");
+    return new Response(text, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+  }
+
+  function geminiAudio(bytes: number): unknown {
+    return {
+      event_type: "step.delta",
+      index: 0,
+      delta: { type: "audio", mime_type: "audio/l16;rate=24000", data: Buffer.alloc(bytes, 1).toString("base64") },
+    };
+  }
+
+  it("gemini: decodes streamed audio events into 24 kHz PCM, default voice Kore", async () => {
+    process.env.TTS_PROVIDER = "gemini";
+    process.env.GEMINI_API_KEY = "g-key";
+    fetchMock.mockResolvedValueOnce(
+      geminiSse([{ event_type: "step.start", index: 0 }, geminiAudio(4), geminiAudio(6), { event_type: "step.stop", index: 0 }]),
+    );
+
+    const res = await speakStream({ text: "Hello there.", voices: ["marin"] });
+
+    expect(res._status).toBe(200);
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe("https://generativelanguage.googleapis.com/v1beta/interactions");
+    expect((fetchMock.mock.calls[0]?.[1]?.headers as Record<string, string>)["x-goog-api-key"]).toBe("g-key");
+    expect(sentBody()).toEqual({
+      model: "gemini-3.8-flash-tts",
+      input: [{ type: "user_input", content: [{ type: "text", text: "Hello there." }] }],
+      response_format: { type: "audio" },
+      generation_config: { speech_config: [{ voice: "Kore" }] },
+      stream: true,
+    });
+    expect(Buffer.from(res._writes[0]).readUInt32LE(24)).toBe(24000);
+    expect(res._writes.slice(1).reduce((n, w) => n + w.length, 0)).toBe(10);
+  });
+
+  it("gemini: an error event before any audio is retried like an HTTP 503", async () => {
+    process.env.TTS_PROVIDER = "gemini";
+    process.env.GEMINI_API_KEY = "g-key";
+    fetchMock
+      .mockResolvedValueOnce(geminiSse([{ event_type: "error", error: { code: "unavailable", message: "overloaded" } }]))
+      .mockResolvedValueOnce(geminiSse([geminiAudio(4)]));
+
+    const res = await speakStream({ text: "Hi.", voices: ["Puck"] });
+
+    expect(res._status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(sentBody(1)).toMatchObject({ generation_config: { speech_config: [{ voice: "Puck" }] } });
+    expect(res._writes.slice(1).reduce((n, w) => n + w.length, 0)).toBe(4);
+  });
+
+  it("gemini: a rejected key reported as an error event → TTS unavailable, no retry", async () => {
+    process.env.TTS_PROVIDER = "gemini";
+    process.env.GEMINI_API_KEY = "g-key";
+    fetchMock.mockResolvedValue(geminiSse([{ event_type: "error", error: { code: "permission_denied", message: "bad key" } }]));
+
+    const res = await speakStream({ text: "Hi." });
+
+    expect(res._status).toBe(503);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("gemini: a malformed key (HTTP 400 API_KEY_INVALID) → TTS unavailable, no retry", async () => {
+    process.env.TTS_PROVIDER = "gemini";
+    process.env.GEMINI_API_KEY = "AIza-bad";
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify([{ error: { code: 400, status: "INVALID_ARGUMENT", details: [{ reason: "API_KEY_INVALID" }] } }]), { status: 400 }),
+    );
+
+    const res = await speakStream({ text: "Hi." });
+
+    expect(res._status).toBe(503);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("gemini: an error event in Google's numeric shape is classified by its code", async () => {
+    process.env.TTS_PROVIDER = "gemini";
+    process.env.GEMINI_API_KEY = "g-key";
+    fetchMock
+      .mockResolvedValueOnce(geminiSse([{ event_type: "error", error: { code: 503, status: "UNAVAILABLE", message: "busy" } }]))
+      .mockResolvedValueOnce(geminiSse([geminiAudio(4)]));
+
+    const res = await speakStream({ text: "Hi." });
+
+    expect(res._status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("gemini: a malformed event is retried", async () => {
+    process.env.TTS_PROVIDER = "gemini";
+    process.env.GEMINI_API_KEY = "g-key";
+    fetchMock
+      .mockResolvedValueOnce(new Response("event: step.delta\ndata: {not json\n\n", { status: 200 }))
+      .mockResolvedValueOnce(geminiSse([geminiAudio(4)]));
+
+    const res = await speakStream({ text: "Hi." });
+
+    expect(res._status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("gemini: a stream that ends without audio is retried, not spoken as silence", async () => {
+    process.env.TTS_PROVIDER = "gemini";
+    process.env.GEMINI_API_KEY = "g-key";
+    fetchMock.mockResolvedValueOnce(geminiSse([{ event_type: "step.stop", index: 0 }])).mockResolvedValueOnce(geminiSse([geminiAudio(2)]));
+
+    const res = await speakStream({ text: "Hi." });
+
+    expect(res._status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("listener hangs up mid-message → no further chunks are requested from the provider", async () => {
+    process.env.TTS_PROVIDER = "openai";
+    process.env.OPENAI_API_KEY = "oa-key";
+    const sentence = `${"word ".repeat(700)}end.`; // ~3504 chars → one chunk each
+    const text = [sentence, sentence, sentence].join(" ");
+    // Chunk 0's audio never finishes; chunk 1's prefetch answers normally.
+    fetchMock
+      .mockResolvedValueOnce(new Response(new ReadableStream({ start(c) { c.enqueue(new Uint8Array(4)); } }), { status: 200 }))
+      .mockImplementation(async () => pcmResponse());
+
+    const listeners: Record<string, Array<() => void>> = {};
+    const res = makeRes();
+    res.once = (event: string, cb: unknown) => {
+      (listeners[event] ??= []).push(cb as () => void);
+      return res;
+    };
+    const done = handleSpeakStream(
+      makeSpeakReq({ text }) as unknown as import("express").Request,
+      res as unknown as import("express").Response,
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    expect(res._status).toBe(200);
+
+    for (const cb of listeners.close ?? []) cb(); // the browser went away
+    await done;
+
+    expect(fetchMock).toHaveBeenCalledTimes(2); // chunk 0 + the one prefetch; chunk 2 never asked for
+    expect(res._streamedEnded).toBe(false);
+  });
+
+  it("listener hangs up while a prefetched chunk is downloading → the request finishes", async () => {
+    // Polly's stream, unlike the HTTP providers', emits only "close" on destroy().
+    delete process.env.TTS_PROVIDER;
+    const sentence = `${"word ".repeat(560)}end.`; // ~2804 chars → one Polly chunk each
+    const text = [sentence, sentence, sentence].join(" ");
+    let n = 0;
+    pollySendMock.mockImplementation(async () => {
+      n++;
+      if (n < 3) return { AudioStream: Readable.from([Buffer.alloc(4)]) };
+      const never = new Readable({ read() {} });
+      never.push(Buffer.alloc(4));
+      return { AudioStream: never };
+    });
+
+    const listeners: Record<string, Array<() => void>> = {};
+    const res = makeRes();
+    res.once = (event: string, cb: unknown) => {
+      (listeners[event] ??= []).push(cb as () => void);
+      return res;
+    };
+    let finished = false;
+    const done = handleSpeakStream(
+      makeSpeakReq({ text }) as unknown as import("express").Request,
+      res as unknown as import("express").Response,
+    ).then(() => {
+      finished = true;
+    });
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    expect(pollySendMock).toHaveBeenCalledTimes(3);
+
+    for (const cb of listeners.close ?? []) cb();
+    await Promise.race([done, new Promise((resolve) => setTimeout(resolve, 200))]);
+
+    expect(finished).toBe(true);
+    expect(res._streamedEnded).toBe(false);
+  });
+
+  it("GET /voices: Polly's seven voices + Joanna default when TTS_PROVIDER is unset", async () => {
+    delete process.env.TTS_PROVIDER;
+
+    const res = await listVoices();
+
+    expect(res._status).toBe(200);
+    const body = res._body as { voices: { id: string; name: string }[]; defaultVoice: string; listError: boolean };
+    expect(body.voices.map((v) => v.id)).toEqual(["Danielle", "Joanna", "Ruth", "Salli", "Tiffany", "Matthew", "Stephen"]);
+    expect(body.defaultVoice).toBe("Joanna");
+    expect(body.listError).toBe(false);
+  });
+
+  it("GET /voices: elevenlabs account voices with names split from descriptions; cached between calls", async () => {
+    process.env.TTS_PROVIDER = "elevenlabs";
+    process.env.ELEVENLABS_API_KEY = "el-key";
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          voices: [
+            { voice_id: "SAz9YHcvj6GT2YYXdXww", name: "River - Relaxed, Neutral, Informative" },
+            { voice_id: "wL82Y8r3Rj84NiLda6qb", name: "Arvis" },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+
+    const res = await listVoices();
+    await listVoices();
+
+    expect(res._body).toMatchObject({
+      voices: [
+        { id: "SAz9YHcvj6GT2YYXdXww", name: "River", description: "Relaxed, Neutral, Informative" },
+        { id: "wL82Y8r3Rj84NiLda6qb", name: "Arvis" },
+      ],
+      defaultVoice: "SAz9YHcvj6GT2YYXdXww",
+      listError: false,
+    });
+    // Names for saved voices of any provider: the active list + every fixed list.
+    const labels = (res._body as { labels: Record<string, string> }).labels;
+    expect(labels).toMatchObject({ SAz9YHcvj6GT2YYXdXww: "River", Joanna: "Joanna", marin: "Marin" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("GET /voices: list down after a successful fetch → saved voices still named from the last known list", async () => {
+    process.env.TTS_PROVIDER = "elevenlabs";
+    process.env.ELEVENLABS_API_KEY = "el-key";
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ voices: [{ voice_id: "EXAVITQu4vr4xnSDxMaL", name: "Sarah - Mature" }] }), { status: 200 }),
+    );
+    await listVoices();
+    vi.spyOn(Date, "now").mockReturnValue(Date.now() + 10 * 60_000); // past the list TTL
+    fetchMock.mockRejectedValueOnce(new TypeError("fetch failed"));
+
+    const res = await listVoices();
+
+    expect(res._body).toMatchObject({ voices: [], listError: true, labels: { EXAVITQu4vr4xnSDxMaL: "Sarah" } });
+  });
+
+  it("GET /voices: list unreachable → 200 with listError so pickers keep showing the saved voice", async () => {
+    process.env.TTS_PROVIDER = "elevenlabs";
+    process.env.ELEVENLABS_API_KEY = "el-key";
+    fetchMock.mockRejectedValue(new TypeError("fetch failed"));
+
+    const res = await listVoices();
+
+    expect(res._status).toBe(200);
+    expect(res._body).toMatchObject({ voices: [], defaultVoice: "SAz9YHcvj6GT2YYXdXww", listError: true });
+    // Fixed-list providers can still be named; the account's own voices can't.
+    const labels = (res._body as { labels: Record<string, string> }).labels;
+    expect(labels.Joanna).toBe("Joanna");
+    expect(labels.SAz9YHcvj6GT2YYXdXww).toBeUndefined();
+  });
+});
+
+describe("TTS_FALLBACK_PROVIDER (backup provider takes over)", () => {
+  const savedEnv = { ...process.env };
+  const fetchMock = vi.fn<typeof fetch>();
+  const OPENAI = "https://api.openai.com/v1/audio/speech";
+  const isEleven = (url: unknown) => String(url).includes("/text-to-speech/");
+
+  beforeEach(() => {
+    vi.stubGlobal("fetch", fetchMock);
+    fetchMock.mockReset();
+    clearProviderBench();
+    process.env.TTS_PROVIDER = "openai";
+    process.env.OPENAI_API_KEY = "oa-key";
+    process.env.TTS_MODEL = "tts-1"; // no tail guard: OpenAI audio streams straight through
+    process.env.TTS_FALLBACK_PROVIDER = "elevenlabs";
+    process.env.ELEVENLABS_API_KEY = "el-key";
+    process.env.TTS_STALL_TIMEOUT_MS = "40";
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    process.env = { ...savedEnv };
+    clearProviderBench();
+  });
+
+  const pcm = (bytes: number) => new Response(new Uint8Array(bytes), { status: 200 });
+  // Some bytes, then nothing — the connection stays open.
+  const stalling = (bytes: number) =>
+    new Response(new ReadableStream({ start(c) { if (bytes > 0) c.enqueue(new Uint8Array(bytes)); } }), { status: 200 });
+  const pcmBytesOut = (res: MockRes) => res._writes.slice(1).reduce((n, w) => n + w.length, 0);
+  const openAiCalls = () => fetchMock.mock.calls.filter((c) => String(c[0]) === OPENAI);
+  const elevenCalls = () => fetchMock.mock.calls.filter((c) => isEleven(c[0]));
+  const elevenText = (k = 0) => JSON.parse(String(elevenCalls()[k]?.[1]?.body)).text as string;
+
+  /** Route fetch by URL: OpenAI answers come from `openai` in order; ElevenLabs from `eleven`. */
+  function answer(openai: Array<() => Response>, eleven: Array<() => Response> = [() => pcm(8)]) {
+    let o = 0;
+    let e = 0;
+    fetchMock.mockImplementation(async (url) => {
+      if (String(url) === OPENAI) return (openai[o++] ?? openai[openai.length - 1])();
+      if (isEleven(url)) return (eleven[e++] ?? eleven[eleven.length - 1])();
+      throw new Error(`unexpected fetch ${String(url)}`);
+    });
+  }
+
+  async function speakStream(body: Record<string, unknown>): Promise<MockRes> {
+    const res = makeRes();
+    await handleSpeakStream(
+      makeSpeakReq(body) as unknown as import("express").Request,
+      res as unknown as import("express").Response,
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    return res;
+  }
+
+  it("primary refuses before any audio → backup speaks the whole message", async () => {
+    answer([() => new Response("bad key", { status: 401 })]);
+
+    const res = await speakStream({ text: "Hello there. How are you?" });
+
+    expect(res._status).toBe(200);
+    expect(Buffer.from(res._writes[0]).readUInt32LE(24)).toBe(24000);
+    expect(elevenText()).toBe("Hello there. How are you?");
+    expect(pcmBytesOut(res)).toBe(8);
+    expect(res._streamedEnded).toBe(true);
+    expect(res._destroyed).toBe(false);
+  });
+
+  const openAiText = (k: number) => JSON.parse(String(openAiCalls()[k]?.[1]?.body)).input as string;
+
+  it("primary stalls early → retried on the primary from the first sentence; the backup isn't asked", async () => {
+    const sentences = Array.from({ length: 10 }, (_, k) => `This is sentence number ${k} here.`); // 32-33 chars
+    // 2.5 s of 24 kHz audio out ≈ 30 chars at the conservative resume rate → inside sentence 0.
+    answer([() => stalling(120_000), () => pcm(6)]);
+
+    const res = await speakStream({ text: sentences.join(" ") });
+
+    expect(openAiCalls()).toHaveLength(2);
+    expect(openAiText(1)).toBe(sentences.join(" ")); // nothing skipped: sentence 0 is repeated
+    expect(elevenCalls()).toHaveLength(0);
+    expect(pcmBytesOut(res)).toBe(120_000 + 6);
+    expect(res._streamedEnded).toBe(true);
+    expect(res._destroyed).toBe(false);
+  });
+
+  it("further into the message, the retry starts at the sentence in progress", async () => {
+    const sentences = Array.from({ length: 10 }, (_, k) => `This is sentence number ${k} here.`);
+    answer([() => stalling(480_000), () => pcm(6)]); // 10 s ≈ 120 chars → inside sentence 3; one back for margin
+
+    await speakStream({ text: sentences.join(" ") });
+
+    expect(openAiText(1)).toBe(sentences.slice(2).join(" "));
+  });
+
+  it("primary stalls on every retry → the backup takes over, nothing skipped", async () => {
+    const sentences = Array.from({ length: 10 }, (_, k) => `This is sentence number ${k} here.`);
+    answer([() => stalling(0)]);
+
+    const res = await speakStream({ text: sentences.join(" ") });
+
+    expect(openAiCalls()).toHaveLength(3);
+    expect(elevenText()).toBe(sentences.join(" "));
+    expect(pcmBytesOut(res)).toBe(8);
+    expect(res._streamedEnded).toBe(true);
+  });
+
+  it("a later chunk stalls → retried on the primary starting exactly at that chunk", async () => {
+    const a = `${"alpha ".repeat(600)}end.`;
+    const b = `${"bravo ".repeat(600)}end.`; // ~3600 chars each → one OpenAI chunk each
+    answer([() => pcm(4), () => stalling(2), () => pcm(6)]);
+
+    const res = await speakStream({ text: `${a} ${b}` });
+
+    expect(openAiCalls()).toHaveLength(3);
+    expect(openAiText(2)).toBe(b);
+    expect(elevenCalls()).toHaveLength(0);
+    expect(pcmBytesOut(res)).toBe(4 + 6);
+    expect(res._streamedEnded).toBe(true);
+  });
+
+  it("a later chunk errors → the backup starts exactly at that chunk", async () => {
+    const a = `${"alpha ".repeat(600)}end.`;
+    const b = `${"bravo ".repeat(600)}end.`;
+    answer([() => pcm(4), () => new Response("bad input", { status: 400 })]);
+
+    const res = await speakStream({ text: `${a} ${b}` });
+
+    expect(openAiCalls()).toHaveLength(2);
+    expect(elevenText()).toBe(b);
+    expect(pcmBytesOut(res)).toBe(4 + 8);
+  });
+
+  it("a stall doesn't bench the primary: the next message goes to it first", async () => {
+    answer([() => stalling(0), () => pcm(6)]);
+    await speakStream({ text: "First." });
+
+    await speakStream({ text: "Second." });
+
+    expect(openAiCalls()).toHaveLength(3);
+    expect(elevenCalls()).toHaveLength(0);
+  });
+
+  it("after a takeover the primary is benched: the next message goes straight to the backup", async () => {
+    answer([() => new Response("bad key", { status: 401 })]);
+    await speakStream({ text: "First." });
+    expect(openAiCalls()).toHaveLength(1);
+
+    const res = await speakStream({ text: "Second." });
+
+    expect(openAiCalls()).toHaveLength(1);
+    expect(elevenText(1)).toBe("Second.");
+    expect(res._status).toBe(200);
+  });
+
+  it("the bench runs out after 15 minutes and the primary is tried again", async () => {
+    answer([() => new Response("bad key", { status: 401 }), () => pcm(6)]);
+    await speakStream({ text: "First." });
+    vi.spyOn(Date, "now").mockReturnValue(Date.now() + 16 * 60_000);
+
+    const res = await speakStream({ text: "Second." });
+
+    expect(openAiCalls()).toHaveLength(2);
+    expect(elevenCalls()).toHaveLength(1);
+    expect(pcmBytesOut(res)).toBe(6);
+  });
+
+  it("backup also stalls → the primary speaks the rest", async () => {
+    answer([() => stalling(48_000), () => stalling(0), () => stalling(0), () => pcm(6)], [() => stalling(10)]);
+
+    const res = await speakStream({ text: "One sentence. Another sentence." });
+
+    expect(openAiCalls()).toHaveLength(4);
+    expect(pcmBytesOut(res)).toBe(48_000 + 10 + 6);
+    expect(res._streamedEnded).toBe(true);
+    expect(res._destroyed).toBe(false);
+  });
+
+  it("primary stalls on every retry, backup is out of credits → the primary has the last word", async () => {
+    answer(
+      [() => stalling(0), () => stalling(0), () => stalling(0), () => pcm(6)],
+      [() => new Response("quota_exceeded", { status: 401 })],
+    );
+
+    const res = await speakStream({ text: "Hello there." });
+
+    expect(res._status).toBe(200);
+    expect(openAiCalls()).toHaveLength(4);
+    expect(elevenCalls()).toHaveLength(1);
+    expect(pcmBytesOut(res)).toBe(6);
+    expect(res._streamedEnded).toBe(true);
+  });
+
+  it("both benched → the primary goes first", async () => {
+    answer(
+      [() => new Response("bad key", { status: 401 }), () => new Response("bad key", { status: 401 }), () => pcm(6)],
+      [() => new Response("quota_exceeded", { status: 401 })],
+    );
+    await speakStream({ text: "First." }); // OpenAI refuses and is benched; ElevenLabs refuses and is benched too
+
+    const res = await speakStream({ text: "Second." });
+
+    expect(res._status).toBe(200);
+    expect(pcmBytesOut(res)).toBe(6);
+    expect(openAiCalls()).toHaveLength(3);
+    expect(elevenCalls()).toHaveLength(1); // not asked again for the second message
+  });
+
+  it("primary benched, backup refuses → the primary still speaks the message", async () => {
+    answer([() => new Response("bad key", { status: 401 }), () => pcm(6)], [
+      () => pcm(8),
+      () => new Response("quota_exceeded", { status: 401 }),
+    ]);
+    await speakStream({ text: "First." }); // OpenAI benched, ElevenLabs speaks
+    expect(elevenCalls()).toHaveLength(1);
+
+    const res = await speakStream({ text: "Second." });
+
+    expect(res._status).toBe(200);
+    expect(elevenCalls()).toHaveLength(2);
+    expect(pcmBytesOut(res)).toBe(6);
+  });
+
+  it("backup at another sample rate is resampled to the rate already in the header", async () => {
+    process.env.TTS_FALLBACK_PROVIDER = "polly";
+    answer([() => stalling(48_000), () => stalling(0)]);
+    pollySendMock.mockResolvedValueOnce({ AudioStream: Readable.from([Buffer.alloc(16_000)]) }); // 0.5 s at 16 kHz
+
+    const res = await speakStream({ text: "One sentence. Another sentence." });
+
+    expect(Buffer.from(res._writes[0]).readUInt32LE(24)).toBe(24000);
+    const backupBytes = pcmBytesOut(res) - 48_000;
+    expect(Math.abs(backupBytes - 24_000)).toBeLessThanOrEqual(4); // 0.5 s at 24 kHz
+  });
+
+  it("the backup ignores TTS_MODEL and TTS_DEFAULT_VOICE (they belong to the primary)", async () => {
+    process.env.TTS_DEFAULT_VOICE = "marin";
+    answer([() => new Response("bad key", { status: 401 })]);
+
+    await speakStream({ text: "Hi." });
+
+    const call = elevenCalls()[0];
+    expect(String(call?.[0])).toContain("/text-to-speech/SAz9YHcvj6GT2YYXdXww/");
+    expect(JSON.parse(String(call?.[1]?.body)).model_id).toBe("eleven_multilingual_v2");
+  });
+
+  it("main audio cut mid-sample → padded so the backup's samples stay on the frame grid", async () => {
+    answer([() => stalling(4801), () => stalling(0)]);
+
+    const res = await speakStream({ text: "One sentence. Another sentence." });
+
+    expect(pcmBytesOut(res)).toBe(4801 + 1 + 8);
+    expect(pcmBytesOut(res) % 2).toBe(0);
+  });
+
+  it("a failure specific to the message (400) still hands off but doesn't bench the main provider", async () => {
+    answer([() => new Response("bad input", { status: 400 }), () => pcm(6)]);
+    await speakStream({ text: "First." });
+    expect(elevenText()).toBe("First.");
+
+    await speakStream({ text: "Second." });
+
+    expect(openAiCalls()).toHaveLength(2);
+    expect(elevenCalls()).toHaveLength(1);
+  });
+
+  it("misconfigured TTS_PROVIDER stays a 503 — the backup is not used", async () => {
+    process.env.TTS_PROVIDER = "poly";
+    answer([() => pcm(6)]);
+
+    const res = await speakStream({ text: "Hi." });
+
+    expect(res._status).toBe(503);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("only a pass that can hand off uses the short stall timeout", async () => {
+    delete process.env.TTS_STALL_TIMEOUT_MS;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      // Benched main → backup speaks alone; it pauses 5 s, which is fine without a hand-off.
+      answer([() => new Response("down", { status: 503 })], [
+        () =>
+          new Response(
+            new ReadableStream({
+              start(c) {
+                c.enqueue(new Uint8Array(8));
+                setTimeout(() => {
+                  c.enqueue(new Uint8Array(8));
+                  c.close();
+                }, 5_000);
+              },
+            }),
+            { status: 200 },
+          ),
+      ]);
+      clearProviderBench();
+      const res = makeRes();
+      const done = handleSpeakStream(
+        makeSpeakReq({ text: "Hi." }) as unknown as import("express").Request,
+        res as unknown as import("express").Response,
+      );
+      await vi.advanceTimersByTimeAsync(20_000);
+      await done;
+      expect(pcmBytesOut(res)).toBe(16);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("backup set to the primary itself is ignored → single-provider behaviour (503)", async () => {
+    process.env.TTS_FALLBACK_PROVIDER = "openai";
+    answer([() => new Response("bad key", { status: 401 })]);
+
+    const res = await speakStream({ text: "Hi." });
+
+    expect(res._status).toBe(503);
+    expect(elevenCalls()).toHaveLength(0);
+  });
+
+  it("GET /voice/providers reports what the server resolves", () => {
+    const run = () => {
+      const res = makeRes();
+      handleTtsProviders({} as import("express").Request, res as unknown as import("express").Response);
+      return res._body;
+    };
+    expect(run()).toMatchObject({
+      primary: { id: "openai", label: "OpenAI" },
+      backup: { id: "elevenlabs", label: "ElevenLabs" },
+    });
+    process.env.TTS_FALLBACK_PROVIDER = "none";
+    expect(run()).toMatchObject({ backup: { id: null, label: null } });
+    process.env.TTS_FALLBACK_PROVIDER = "openai";
+    expect(run()).toMatchObject({ backup: { id: null, error: "Same as the main service — ignored" } });
+    process.env.TTS_FALLBACK_PROVIDER = "bogus";
+    process.env.TTS_PROVIDER = "nope";
+    expect(run()).toMatchObject({
+      primary: { id: null, error: 'Unknown service "nope"' },
+      backup: { id: null, error: 'Unknown service "bogus" — ignored' },
+    });
+  });
+
+  it("GET /voice/providers also reports the speech-to-text main and backup", () => {
+    const run = () => {
+      const res = makeRes();
+      handleTtsProviders({} as import("express").Request, res as unknown as import("express").Response);
+      return (res._body as { stt: unknown }).stt;
+    };
+    delete process.env.STT_PROVIDER;
+    delete process.env.STT_FALLBACK_PROVIDER;
+    expect(run()).toEqual({
+      primary: { id: "bedrock", label: "Amazon Nova Sonic" },
+      backup: { id: null, label: null },
+    });
+    process.env.STT_PROVIDER = "elevenlabs";
+    process.env.STT_FALLBACK_PROVIDER = "groq";
+    expect(run()).toEqual({
+      primary: { id: "elevenlabs", label: "ElevenLabs" },
+      backup: { id: "groq", label: "Groq" },
+    });
+    process.env.STT_FALLBACK_PROVIDER = "elevenlabs";
+    expect(run()).toMatchObject({ backup: { id: null, error: "Same as the main service — ignored" } });
+    process.env.STT_PROVIDER = "nope";
+    process.env.STT_FALLBACK_PROVIDER = "whisper";
+    expect(run()).toMatchObject({
+      primary: { id: null, error: 'Unknown service "nope"' },
+      backup: { id: null, error: 'Unknown service "whisper" — ignored' },
+    });
+  });
+});

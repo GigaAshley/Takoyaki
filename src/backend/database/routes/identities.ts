@@ -1,0 +1,1238 @@
+import type { AuthenticatedRequest } from "../../../types/index.js";
+import {
+  resolveIdentityAppearance,
+  capitalizeFirstIdentityKey,
+  AVATAR_VERSION_RE,
+} from "../../fleet-status/identity-appearance.js";
+import express from "express";
+import multer from "multer";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import yaml from "js-yaml";
+import type { Request, Response } from "express";
+import { databaseLogger, systemLogger } from "../../utils/logger.js";
+// Phase 129 Plan 129-02: per-user visibility gate on GET /identities. The
+// gate lives in a companion pure function (identity-visibility-gate.ts) per
+// the Phase 111 T-111-08 one-cascade-authority invariant — call sites hold
+// gate authority so "did we gate this call site?" is answered by grepping
+// for the gate function name in this file (see the single call site below
+// inside identityKeys.map, right before the publicIdentity return). The
+// username-lookup helper translates the JWT-authenticated userId into the
+// Skynet username string the gate compares against on-disk `users:`
+// frontmatter lists (case-sensitive per Pitfall 7 lock; see 129-01 SUMMARY
+// for the design rationale).
+import {
+  isIdentityVisibleToUser,
+  resolveGateRoleSide,
+} from "../../fleet-status/identity-visibility-gate.js";
+import { getUsernameForUserId } from "../../utils/host-user-counter.js";
+// Phase 103 D-10: multipart-origin-guard — CORS-simple content types don't preflight
+import { multipartOriginGuard } from "../../utils/multipart-origin-guard.js";
+import { AuthManager } from "../../utils/auth-manager.js";
+import {
+  readIdentityFile,
+  listIdentityKeysOnHost,
+  writeIdentityFile,
+  writeAvatarSiblingFile,
+  readAvatarSiblingFile,
+  extractCosmeticsFromFrontmatter,
+  repairFrontmatterTaskLine,
+  isLocalHostId,
+  getLocalIdentitiesRoot,
+  extractRoleFromMarkdown,
+  extractRolesFromMarkdown,
+  flowRolesInYamlDump,
+  MIME_TO_AVATAR_EXT,
+  IDENTITY_KEY_RE,
+  // Phase 85 Plan 85-01 Task 2: role-cosmetic merge (per-host memo in GET /
+  // fanout) + role-folder avatar fallback in GET /:identityKey/avatar.
+  readRoleFileByName,
+  readAvatarSiblingFileByRole,
+  stringifyColorHueForYaml,
+} from "../../claude-session/identity-artifact-reader.js";
+import { connectOneShot } from "../../ssh/ssh-one-shot.js";
+import { execCommand } from "../../ssh/tmux-helper.js";
+import { resolveHostById } from "../../ssh/host-resolver.js";
+// Phase 98 Plan 07: replaces the legacy filename regex (`/^[A-Z][A-Za-z]+\.wav$/`)
+// with isRecognizedVoiceId: a voice id of ANY known TTS provider is accepted,
+// whichever provider the instance is using — saved voices are never rejected
+// for belonging to an inactive provider (see tts-provider.ts). Plan 98-05's
+// boot-time migration wipes any legacy `.wav` values BEFORE Skynet accepts
+// HTTP traffic, so this validator can be strict from first request.
+import { isRecognizedVoiceId } from "../../voice/tts-provider.js";
+// Phase 92 (renumbered from 92 in ROADMAP → Phase 105 post-collision with tina P92)
+// Plan 92-02 Task 1: per-identity `.pinned` sentinel probe. identityFileExists is
+// the read-side of the D-05 wire — a fail-closed stat against
+// `~/fleet/identities/<identityKey>/.pinned` on the identity's host.
+import { identityFileExists } from "../../claude-session/per-identity-file.js";
+import { getHostSemaphore } from "../../ssh/host-semaphore-registry.js";
+
+import { getAvatarVersion, forgetAvatarVersion } from "../../fleet-status/avatar-version-registry.js";
+import { normalizeAvatar, normalizeUploadedAvatar } from "../../utils/avatar-normalize.js";
+import { composeSplitAvatar, type SplitAvatarPart } from "../../utils/avatar-split.js";
+import { getCachedAvatar, invalidateCachedAvatar } from "./identity-avatar-cache.js";
+
+const router = express.Router();
+const authManager = AuthManager.getInstance();
+const authenticateJWT = authManager.createAuthMiddleware();
+
+const ALLOWED_AVATAR_MIMES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+]);
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 2 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (ALLOWED_AVATAR_MIMES.has(file.mimetype)) cb(null, true);
+    else cb(new Error("Avatar must be PNG, JPEG, or WebP"));
+  },
+});
+
+// Phase 98 Plan 07: the legacy voice-shape regex constant (formerly matching
+// `/^[A-Z][A-Za-z]+\.wav$/`) is deleted here — voice-value validation now goes
+// through `isRecognizedVoiceId` imported above from `tts-provider.ts`. Any
+// old-shape `Foo.wav` value fails validation.
+
+// Phase 86 code-review fix: match roles-create.ts MAX_TITLE_LENGTH so the two
+// authoring surfaces (POST /roles at create, PUT /identities/:key at override)
+// have consistent length semantics. Both sides trim + cap identically.
+const IDENTITY_TITLE_MAX_LENGTH = 128;
+
+type IdentityMetadata = {
+  identityKey?: string;
+  displayName?: string;
+  title?: string | null;
+  colorHue?: number | null;
+  voice?: string | null;
+  /** Phase modal-unification 2026-09-29: task is now editable via the
+   *  IdentityModal head inline-pencil (user call). Same absent/null/set
+   *  semantics as title above. Relaxes the pre-existing "write-once at
+   *  birth" property — both agents and the user can now update task. */
+  task?: string | null;
+  /** 260909-dls: avatar-revert wire. null = delete the identity's avatar
+   *  frontmatter key + hard-delete sibling file (see null-delete overlay
+   *  branch below). Absent = leave alone. Non-null string values via this
+   *  field are ignored — avatar bytes arrive via req.file (multipart upload). */
+  avatar?: string | null;
+  /** Phase 66 Plan 66-02: required for the PUT disk-write flip. The
+   *  frontend threads this from IdentityModal's existing `hostId` prop
+   *  (which flows through per Phase 22 SRIC). The backend uses it to
+   *  route the artifact-reader (isLocalHostId LOCAL branch vs
+   *  connectOneShot REMOTE branch). Missing/invalid → 400. */
+  hostId?: number;
+};
+
+function parseMultipartMetadata(req: Request): IdentityMetadata | null {
+  if (!req.body?.data) return {};
+  try {
+    return JSON.parse(req.body.data);
+  } catch {
+    return null;
+  }
+}
+
+
+/**
+ * Phase 68 Plan 68-02: publicIdentity rewired to (identityKey, hostId, cosmetics, role).
+ * Drops the DB row argument entirely. avatarUrl bakes hostId as a query param.
+ *
+ * Phase 85 Plan 85-01 Task 2: extended to (identityKey, hostId, cosmetics, role, roleCosmetics).
+ * The fifth arg carries the role's raw cosmetic frontmatter and is merged per
+ * `identity ?? role ?? null` (D-CTX-85-inherit). The response gains
+ * `roleDefaults` — the role's raw values so the frontend Identity modal can
+ * render inherit-vs-override affordances (Plan 85-05) without a second RPC.
+ *
+ * Signature: publicIdentity(identityKey, hostId, cosmetics, role, roleCosmetics)
+ *
+ * Returned object shape (12 fields — DROPPED: id, createdAt, updatedAt):
+ *   identityKey, displayName, title, colorHue, voice, task, avatarMime, avatarUrl,
+ *   avatarEtag, coordinator, role, roleDefaults.
+ *
+ * avatarUrl = `/identities/${identityKey}/avatar?hostId=${hostId}` — hostId baked
+ * into the URL string. The frontend helper avatarUrlWithHost is no longer needed
+ * (Wave 3 removes it; interim: the baked URL is self-sufficient). URL shape does
+ * NOT change under Phase 85's role-avatar fallback — the backend does the
+ * fallback internally in GET /:identityKey/avatar; the URL is what the frontend
+ * renders and stays identical.
+ *
+ * `cosmetics` overlay semantics (unchanged from Phase 66/67):
+ *   - present string → use it (overrides safe-default)
+ *   - present number for colorHue → use it (overrides null)
+ *   - present boolean for coordinator → use it; absent → safe-default false (actor)
+ *   - absent → falls through to roleCosmetics under Phase 85 merge
+ *
+ * `roleCosmetics` merge semantics (Phase 85 Plan 85-01):
+ *   - null (no role or role-read failed) → resolved cosmetics fall to null
+ *     safe-defaults; `roleDefaults` field emitted as null
+ *   - {} (role has no cosmetic frontmatter) → resolved falls to null; but
+ *     `roleDefaults` emitted as {} (frontend distinguishes "role has no
+ *     defaults" from "no role" via the `role` field being non-null)
+ *   - {title/colorHue/voice/avatar: ...} → each present field is merged per
+ *     `identity ?? role ?? null`; `roleDefaults` echoes the role's raw values
+ *     verbatim
+ *
+ * Exported so colocated tests (PUB-*, PUB-M-* in get-disk.test.ts) can unit-test
+ * the shape directly without going through the route.
+ */
+export function publicIdentity(
+  identityKey: string,
+  hostId: number,
+  cosmetics: {
+    displayName?: string;
+    title?: string;
+    colorHue?: number;
+    voice?: string;
+    avatarMime?: string;
+    avatarEtag?: string;
+    coordinator?: boolean;
+    /** Phase 80 Plan 80-03: task string from identity file frontmatter.
+     *  When present-and-string, surfaced verbatim; otherwise emitted as null
+     *  (matches voice/title null-fallback shape). */
+    task?: string;
+    /** Phase 117 Plan 117-07 (D-05 identity carrier): project slug from
+     *  identity file frontmatter. When present-and-string, surfaced verbatim;
+     *  otherwise emitted as null. Not inherited from role (per-identity, same
+     *  write-once discipline as `task`). */
+    project?: string;
+  } = {},
+  role: string | null = null,
+  /** Phase 85 Plan 85-01 Task 2: role's raw cosmetic frontmatter, merged
+   *  under identity per D-CTX-85-inherit. null when no role resolvable
+   *  OR when the role-read failed; {} when role exists but carries no
+   *  cosmetic frontmatter fields. */
+  roleCosmetics: {
+    title?: string;
+    displayName?: string;
+    colorHue?: number;
+    voice?: string;
+    avatar?: string;
+  } | null = null,
+  /** Phase 92 Plan 92-02 Task 1: pinned:boolean surface for the per-identity
+   *  `.pinned` sentinel (D-03/D-04). Populated by the GET /identities disk
+   *  fanout via identityFileExists in the same Promise.all wave as the
+   *  role-cosmetic read (see disk-fanout below at L280+). Default false is
+   *  the fail-closed safe-default per D-01 "presence is meaning" — a caller
+   *  that omits this argument (e.g. PUT response-echo prior to Plan 92-04's
+   *  frontend rewire) reports the identity as unpinned rather than
+   *  fabricating a truthy state. */
+  pinned: boolean = false,
+  /** Every role the identity holds (frontmatter order). Omitted → derived
+   *  from `role` (single-role shape). For a multi-role identity `role` is
+   *  null — it inherits no role's look — and this carries the list. */
+  roles?: string[],
+) {
+  // Phase 111 Plan 111-02: delegate the identity-over-role merge to the single
+  // authority in `src/backend/fleet-status/identity-appearance.ts`. This keeps
+  // ONE cascade in the entire codebase (T-111-08 mitigation). The two carve-outs
+  // (task not inherited; displayName falls to capitalizeFirst not role.displayName)
+  // live in resolveIdentityAppearance, tested by identity-appearance.test.ts.
+  const resolved = resolveIdentityAppearance({
+    identityKey,
+    hostId,
+    cosmetics,
+    roleCosmetics,
+    role,
+    roles,
+    pinned,
+    avatarVersion: getAvatarVersion(hostId, identityKey),
+  });
+
+  return {
+    identityKey,
+    // quick-260912-0t4: surface hostId as a top-level field so the frontend
+    // can key its `byHostKey` composite map (`${hostId}::${identityKey}`)
+    // without having to reverse-parse avatarUrl. Fixes cross-host cosmetics
+    // collision when two identities share a name on different fleet hosts.
+    hostId,
+    displayName: resolved.displayName,
+    title: resolved.title,
+    colorHue: resolved.colorHue,
+    voice: resolved.voice,
+    // Phase 80 Plan 80-03: task surfaces on every identity object (D-05
+    // write-once semantics — read straight from disk frontmatter via
+    // extractCosmeticsFromFrontmatter's task narrowing). Not merged with
+    // role: task is per-identity (D-05 write-once at birth).
+    task: resolved.task,
+    // Phase 117 Plan 117-07 (D-05 identity carrier): project slug from
+    // identity file frontmatter. Same per-identity discipline as `task` —
+    // not inherited from the role. Consumed by the frontend's
+    // conversation-store projects-derived selector (Wave 4 sidebar).
+    project: resolved.project,
+    avatarMime:
+      typeof cosmetics.avatarMime === "string" ? cosmetics.avatarMime : "",
+    // Phase 68: hostId baked into avatarUrl so the frontend no longer needs
+    // to append it via avatarUrlWithHost (Wave 3 removes that helper).
+    // Phase 85: URL shape unchanged — backend does role-folder fallback
+    // internally in GET /:identityKey/avatar handler.
+    avatarUrl: resolved.avatarUrl,
+    avatarEtag:
+      typeof cosmetics.avatarEtag === "string" ? cosmetics.avatarEtag : "",
+    // Phase 67 Plan 67-01: coordinator overlay. Absence = actor = false (safe-default).
+    coordinator: resolved.coordinator,
+    role: resolved.role,
+    roles: resolved.roles,
+    // Phase 85 Plan 85-01: roleDefaults echoes the role's raw cosmetic
+    // values so IdentityModal (Plan 85-05) can render inherit-vs-override
+    // affordances. null when no role; {} when role has no cosmetics.
+    roleDefaults: resolved.roleDefaults,
+    // Phase 92 Plan 92-02: pinned:boolean derived from on-demand disk read
+    // of `.pinned` sentinel via identityFileExists at request time (D-03).
+    // No DB mirror, no in-memory cache. Frontend Plan 04 rewires
+    // conversation-store's pinnedIds derivation from GET /user-preferences
+    // to this per-identity field.
+    pinned: resolved.pinned,
+  };
+}
+
+// Phase 66 Plan 03: GET / accepts an optional `identityHosts` query param
+// (URL-encoded JSON map `{ identityKey: hostId }`). For each row whose key
+// is IN the map, we per-request lazy-fetch the identity's on-disk .md file
+// via the artifact-reader on the caller-specified box and overlay the
+// parsed cosmetics onto publicIdentity(). Rows with no hostId in the map,
+// or whose disk fetch fails (unreachable / missing / malformed), come back
+// with SAFE-DEFAULT cosmetics for that row (publicIdentity emits
+// capitalizeFirst(identityKey) + null-nullables + ""-for-non-null-strings).
+// The endpoint NEVER errors 5xx due to a per-row fetch failure — user
+// greenlit "accept the ugly render" per the shape file.
+//
+// Plan 05 (wave 3) rewires the frontend caller to pass a populated
+// identityHosts map from conversation-store fleetSessions; in the transition
+// window (Plan 03 shipped, Plan 05 pending) the map arrives as `{}` and
+// every row comes back with safe-defaults on first render.
+function parseIdentityHosts(raw: unknown): Record<string, number> {
+  if (typeof raw !== "string" || raw.length === 0) return {};
+  try {
+    const decoded = decodeURIComponent(raw);
+    const parsed = JSON.parse(decoded);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const out: Record<string, number> = {};
+    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof v === "number" && Number.isInteger(v) && v > 0) {
+        out[k.toLowerCase()] = v;
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+// Phase 68 disk-fanout enumeration. No DB SELECT. Fans out to unique hostIds
+// from identityHosts map; per-host silent-swallow on error. Cross-host name
+// collisions surface as SEPARATE rows (one per (hostId, identityKey) tuple);
+// the frontend's `byHostKey` composite key disambiguates on the render side
+// (per quick-260912-0t4).
+router.get("/", authenticateJWT, async (req: Request, res: Response) => {
+  const userId = (req as AuthenticatedRequest).userId;
+  try {
+    // 1. Parse identityHosts from query param.
+    const identityHosts = parseIdentityHosts(req.query.identityHosts);
+
+    // 2. Empty map → no hosts to fan out to.
+    if (Object.keys(identityHosts).length === 0) {
+      return res.json([]);
+    }
+
+    // Phase 129 Plan 129-02: per-request callerUsername lookup for the D-2
+    // visibility gate applied below inside identityKeys.map. Fetched EXACTLY
+    // ONCE per request — not per host, not per identity — matching this
+    // file's per-request-cost discipline (see the roleReadCache comment
+    // further down for the analogous per-host memo rationale).
+    //
+    // A null result (unknown / orphaned userId) is a shape-violation defensive
+    // branch — we do NOT abort the request. Per D-8 the visibility gate is
+    // NOT a permission system; a defective username lookup must fall OPEN
+    // (return rows the current host-access predicate would allow) rather
+    // than empty out the caller's sidebar. isIdentityVisibleToUser
+    // short-circuits to `true` on a null callerUsername (Plan 129-01
+    // Task 2 Test 1 — the internal-server / test / admin-bypass semantic).
+    // Ops needs a log crumb to trace "why did the gate not run for this
+    // request?" so we emit a structured warn.
+    const callerUsername = await getUsernameForUserId(userId);
+    if (callerUsername === null) {
+      systemLogger.warn(
+        "Phase 129: GET /identities callerUsername lookup failed — gate disabled for this request",
+        {
+          operation: "identities_gate_username_missing",
+          userId,
+        },
+      );
+    }
+
+    // 3. Collect unique hostIds (Set preserves insertion order on iteration).
+    //    By default only the VALUES are used — the identity-name keys are
+    //    ignored, so `{"zeus":11}` enumerates ALL of host 11, not just zeus.
+    //    `?only=1` opts into the per-name filter: each host returns just the
+    //    identities the map names for that host. The birth flow uses it to
+    //    load the newborn without paying a fleet-wide fanout (every identity
+    //    file on every host) before the new tab can open.
+    const onlyNamed = req.query.only === "1";
+    const uniqueHostIds = [...new Set(Object.values(identityHosts))];
+
+    // 4. Per-host fanout via Promise.all. Each host returns an array of publicIdentity objects.
+    //    Per-host try/catch provides silent-swallow: one dead box does not break the
+    //    endpoint — it just contributes zero identities (T-68-02-02, T-68-02-03).
+    const perHostResults = await Promise.all(
+      uniqueHostIds.map(async (hostId): Promise<ReturnType<typeof publicIdentity>[]> => {
+        try {
+          const local = isLocalHostId(hostId);
+          let conn: import("ssh2").Client | null = null;
+
+          if (!local) {
+            const host = await resolveHostById(hostId, userId);
+            if (!host) return [];
+            conn = await connectOneShot(host, 5_000);
+          }
+
+          try {
+            // Every SSH channel this handler opens goes through the shared
+            // per-host semaphore (default cap 8, sized against sshd's
+            // MaxSessions=10). The cap MUST be at the individual-channel
+            // level, not per identity: the fanout opens 2 channels per
+            // identity (identity file + `.pinned`), so an 8-slot cap
+            // applied per identity would still permit 16 concurrent
+            // channels and blow the ceiling exactly as before.
+            // (Phase 115 Plan 115-02: the third channel — `.hidden` —
+            // was retired per D-21. Prior comment cited 3 channels / 24.)
+            //
+            // Local hosts (conn === null) read the bind-mount with no SSH
+            // channel at all, so they bypass the semaphore rather than
+            // occupying slots they don't need.
+            const withSlot = local
+              ? <T,>(fn: () => Promise<T>): Promise<T> => fn()
+              : <T,>(fn: () => Promise<T>): Promise<T> =>
+                  getHostSemaphore(hostId).run(fn);
+
+            // Enumerate keys on this host.
+            const allIdentityKeys = await withSlot(() =>
+              listIdentityKeysOnHost(conn),
+            );
+            const identityKeys = onlyNamed
+              ? allIdentityKeys.filter(
+                  (k) => identityHosts[k.toLowerCase()] === hostId,
+                )
+              : allIdentityKeys;
+
+            // Phase 85 Plan 85-01 Task 2: per-host role-cosmetics memo.
+            // Multiple identities of the same role on the same host must
+            // read the role file AT MOST ONCE (T-85-01-03 DoS mitigation).
+            // Map<roleName, Promise<cosmetics-or-{}-on-error>>. Storing the
+            // in-flight Promise (not the resolved value) collapses parallel
+            // reads within the same Promise.all fanout — the second caller
+            // awaits the first caller's in-flight readRoleFileByName rather
+            // than kicking off a second SSH exec. Lives inside the per-host
+            // try block so it's fresh per request, not module-global.
+            const roleReadCache = new Map<
+              string,
+              Promise<ReturnType<typeof extractCosmeticsFromFrontmatter>>
+            >();
+            const readRoleCosmeticsMemoized = (
+              roleName: string,
+            ): Promise<ReturnType<typeof extractCosmeticsFromFrontmatter>> => {
+              const existing = roleReadCache.get(roleName);
+              if (existing !== undefined) return existing;
+              const p = (async () => {
+                try {
+                  const { markdown: roleMd } = await withSlot(() =>
+                    readRoleFileByName(conn, roleName),
+                  );
+                  return roleMd ? extractCosmeticsFromFrontmatter(roleMd) : {};
+                } catch {
+                  // Silent-swallow: role read failed. Identity still surfaces
+                  // with its own cosmetics + roleDefaults={} so frontend
+                  // distinguishes "role has no defaults" from "no role" via
+                  // the `role` field being non-null.
+                  return {} as ReturnType<typeof extractCosmeticsFromFrontmatter>;
+                }
+              })();
+              roleReadCache.set(roleName, p);
+              return p;
+            };
+
+            // Per-key parallel read of cosmetics + role + .pinned sentinel.
+            const identityList = await Promise.all(
+              identityKeys.map(async (identityKey) => {
+                try {
+                  // Phase 92 Plan 92-02 Task 1: launch the .pinned probe in
+                  // the SAME Promise.all wave as the readIdentityFile call so
+                  // the pin state is a parallel disk read, not a second
+                  // serial round-trip per identity (PUB-92-04).
+                  //
+                  // H3 lowercase-on-disk invariant: identityKey is the raw
+                  // folder name from listIdentityKeysOnHost. Passed VERBATIM
+                  // to identityFileExists for `.pinned` — no case coercion,
+                  // no reconstruction from cosmetics. The reader regex
+                  // (identity-artifact-reader.ts:174) guarantees this string
+                  // is already lowercase, so it matches the on-disk folder
+                  // segment byte-for-byte.
+                  // Grep-hygiene marker: identityFileExists → .pinned wiring.
+                  const pinnedPromise = withSlot(() =>
+                    identityFileExists(identityKey, ".pinned", {
+                      hostId,
+                      conn,
+                    }),
+                  ).catch(() => false); // fail-closed per D-01 (PUB-92-03)
+
+                  const [{ markdown }, pinned] = await Promise.all([
+                    withSlot(() => readIdentityFile(conn, identityKey)),
+                    pinnedPromise,
+                  ]);
+                  const cosmetics = extractCosmeticsFromFrontmatter(markdown);
+                  const role = extractRoleFromMarkdown(markdown) ?? null;
+                  const roles = extractRolesFromMarkdown(markdown);
+
+                  // Phase 85: resolve role cosmetics via per-host memo.
+                  // No role → pass null so publicIdentity emits roleDefaults=null.
+                  const roleCosmetics =
+                    role !== null
+                      ? await readRoleCosmeticsMemoized(role)
+                      : null;
+
+                  // Phase 129 Plan 129-02: D-7 deep-gate seam #1. Called
+                  // AFTER cosmetics + roleCosmetics are extracted so both
+                  // `users:` frontmatter lists are available; BEFORE
+                  // publicIdentity so the hidden identity's row is NEVER
+                  // constructed (no stripped-down "something's here"
+                  // ghost — the row simply does not appear in the response).
+                  //
+                  // Return-null collapses onto the existing L450
+                  // `.filter((x): x is ... !== null)` — no new filter, no
+                  // shape change. Same drop channel as the mid-fanout read
+                  // failure above, but the log level and semantic are
+                  // different: read-fail is a warn (unexpected); gate-hide
+                  // is a debug (by-design).
+                  if (
+                    !isIdentityVisibleToUser(
+                      cosmetics,
+                      // Multi-role: every listed role's `users:` must pass.
+                      roles.length > 1
+                        ? await resolveGateRoleSide(
+                            roles,
+                            readRoleCosmeticsMemoized,
+                          )
+                        : roleCosmetics,
+                      callerUsername,
+                    )
+                  ) {
+                    systemLogger.debug(
+                      "Phase 129: identity hidden by visibility gate",
+                      {
+                        operation: "identities_gate_hidden",
+                        identityKey,
+                        hostId,
+                        callerUsername,
+                      },
+                    );
+                    return null;
+                  }
+
+                  return publicIdentity(
+                    identityKey,
+                    hostId,
+                    cosmetics,
+                    role,
+                    roleCosmetics,
+                    pinned,
+                    roles,
+                  );
+                } catch (err) {
+                  // Skip this key, but say so: an identity that is absent from
+                  // disk and one whose read was refused are very different
+                  // facts, and collapsing them silently made an SSH channel
+                  // exhaustion present as a UI glitch (2026-09-15).
+                  databaseLogger.warn("Dropping identity from roster — read failed", {
+                    operation: "list_identities_key_read",
+                    hostId,
+                    identityKey,
+                    error: err instanceof Error ? err.message : String(err),
+                  });
+                  return null;
+                }
+              }),
+            );
+
+            return identityList.filter((x): x is ReturnType<typeof publicIdentity> => x !== null);
+          } finally {
+            if (conn) {
+              try { conn.end(); } catch { /* ignore */ }
+            }
+          }
+        } catch (err) {
+          // Per-host silent-swallow: unreachable host contributes zero
+          // identities rather than failing the whole endpoint (T-68-02-03).
+          // The log line the original comment claimed was never actually
+          // emitted, which left a whole host vanishing with no trace.
+          databaseLogger.warn("Dropping host from identity roster — fanout failed", {
+            operation: "list_identities_host_fanout",
+            hostId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          return [];
+        }
+      }),
+    );
+
+    // 5. Flatten per-host arrays into a single merged list. Cross-host
+    // identityKey collisions surface as separate rows (one per (hostId,
+    // identityKey) tuple); the frontend disambiguates via byHostKey (per
+    // quick-260912-0t4).
+    const merged = perHostResults.flat();
+
+    return res.json(merged);
+  } catch (e) {
+    databaseLogger.error("Failed to list identities", e, {
+      operation: "list_identities",
+      userId,
+    });
+    return res.status(500).json({ error: "Failed to list identities" });
+  }
+});
+
+// Phase 68 Plan 68-02: POST / — Option A (410 GONE). The raw-POST create flow is
+// retired; identity creation goes through POST /identities/birth (identity-birth.ts)
+// which handles disk-side work (create folder, write frontmatter, save avatar).
+// Wave 4 removes identity-birth.ts's DB INSERT as part of the table drop.
+router.post("/", authenticateJWT, (_req: Request, res: Response) => {
+  return res.status(410).json({
+    error: "POST /identities is retired — use POST /identities/birth to create new identities",
+  });
+});
+
+// Phase 68 Plan 68-02: PUT /:identityKey rekeyed from /:id.
+// Row lookup, row bump, and forceSave all removed — disk write is the sole side-effect.
+// Phase 68: no row bump means no forceSave (disk write already fsynced by
+// writeMarkdownFileAtomic + writeAvatarSiblingFile from Phase 66 Plan 66-01 Track 1).
+router.put(
+  "/:identityKey",
+  // Phase 103 D-10: multipart-origin-guard — CORS-simple content types don't preflight
+  multipartOriginGuard,
+  authenticateJWT,
+  upload.single("avatar"),
+  async (req: Request, res: Response) => {
+    const userId = (req as AuthenticatedRequest).userId;
+    const identityKey = String(req.params.identityKey);
+    // Route param becomes disk path + SSH command interpolation via readIdentityFile /
+    // writeIdentityFile. Gate BEFORE any of those touch it so `../etc/passwd` and
+    // shell-metachar names can't reach the filesystem or shell.
+    if (!IDENTITY_KEY_RE.test(identityKey)) {
+      return res.status(400).json({
+        error: "identityKey must match [a-z0-9_-]{1,64}",
+      });
+    }
+    const meta = parseMultipartMetadata(req);
+    if (meta === null) {
+      return res.status(400).json({ error: "Invalid JSON in data field" });
+    }
+
+    // hostId is required in the PUT body — routes the artifact-reader (LOCAL vs REMOTE).
+    // Validate BEFORE SSH work so a bad payload fails fast.
+    const hostId = meta.hostId;
+    if (
+      typeof hostId !== "number" ||
+      !Number.isFinite(hostId) ||
+      !Number.isInteger(hostId) ||
+      hostId <= 0
+    ) {
+      return res
+        .status(400)
+        .json({ error: "hostId required in request body (positive integer)" });
+    }
+
+    // Field-shape validation — still needed BEFORE the disk-write branch so a bad
+    // hue/voice fails fast.
+    if (meta.displayName !== undefined) {
+      const dn = String(meta.displayName).trim();
+      if (!dn) {
+        return res
+          .status(400)
+          .json({ error: "displayName cannot be empty" });
+      }
+    }
+    // Phase 86 code-review fix (H1 + H2): title empty-string → coerce to null
+    // (matches frontend IdentityModal semantics that empty-after-trim = revert
+    // to role default), and cap length to IDENTITY_TITLE_MAX_LENGTH matching
+    // roles-create.ts. Coercion happens BEFORE the overlay branch so the
+    // downstream `meta.title === null ? delete : set` logic sees a normalized
+    // value.
+    if (meta.title !== undefined && meta.title !== null) {
+      const t = String(meta.title);
+      if (t.trim() === "") {
+        meta.title = null;
+      } else if (t.length > IDENTITY_TITLE_MAX_LENGTH) {
+        return res
+          .status(400)
+          .json({ error: `title must be ≤${IDENTITY_TITLE_MAX_LENGTH} chars` });
+      }
+    }
+    if (
+      meta.colorHue !== undefined &&
+      meta.colorHue !== null &&
+      (typeof meta.colorHue !== "number" ||
+        meta.colorHue < 0 ||
+        meta.colorHue > 359)
+    ) {
+      return res.status(400).json({ error: "colorHue must be 0-359" });
+    }
+    if (
+      meta.voice !== undefined &&
+      meta.voice !== null &&
+      !isRecognizedVoiceId(meta.voice)
+    ) {
+      return res
+        .status(400)
+        .json({ error: "voice must be a supported voice ID" });
+    }
+
+    // Route via isLocalHostId (module-load parsed IDENTITIES_LOCAL_HOST_IDS
+    // allowlist). LOCAL → conn=null, no SSH. REMOTE → resolveHostById +
+    // connectOneShot; failure = 502.
+    const local = isLocalHostId(hostId);
+    // REMOTE: connect + read + rewrite + avatar writes + post-write echo
+    // reads are all SERIAL on one connection, so one per-host semaphore slot
+    // bounds this request's channels (verify:ssh-cap). LOCAL: no slot.
+    const withSlot = local
+      ? <T,>(fn: () => Promise<T>): Promise<T> => fn()
+      : <T,>(fn: () => Promise<T>): Promise<T> =>
+          getHostSemaphore(hostId).run(fn);
+    return withSlot(async () => {
+      let conn: import("ssh2").Client | null = null;
+
+      if (!local) {
+        try {
+          const host = await resolveHostById(hostId, userId);
+          if (!host) {
+            return res
+              .status(502)
+              .json({ error: "identity home box unreachable" });
+          }
+          conn = await connectOneShot(host, 30_000);
+        } catch (connErr) {
+          databaseLogger.warn("PUT /identities/:identityKey — SSH connect failed", {
+            operation: "update_identity_ssh_connect_failed",
+            userId,
+            identityKey,
+            hostId,
+            error:
+              connErr instanceof Error ? connErr.message : "Unknown error",
+          });
+          return res
+            .status(502)
+            .json({ error: "identity home box unreachable" });
+        }
+      }
+
+      try {
+        // ---- Read the existing on-disk identity file ----
+        const { markdown: existing } = await readIdentityFile(conn, identityKey);
+        if (!existing || existing.length === 0) {
+          // Data-integrity violation: the identity's home is supposed to hold the .md
+          // file. No implicit-create (shape file: "error and move on"). Canned message
+          // per threat T-66-02-04 / T-68-02-04.
+          return res
+            .status(500)
+            .json({ error: "identity file missing on target host" });
+        }
+
+        // ---- Parse frontmatter ----
+        const fmMatch = existing.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+        let overlaid: Record<string, unknown> = {};
+        let bodyAfterFm = existing;
+        if (fmMatch) {
+          try {
+            const parsed = yaml.load(repairFrontmatterTaskLine(fmMatch[1])) as
+              | Record<string, unknown>
+              | null;
+            if (parsed && typeof parsed === "object") {
+              overlaid = { ...parsed };
+            }
+          } catch (yamlErr) {
+            // Malformed frontmatter YAML — do NOT silently reset to {} because
+            // that would drop the mandatory `roles:` pointer (and anything else
+            // the identity carried) on the next write, permanently bricking the
+            // identity for every downstream artifact reader. Fail loud instead;
+            // the operator must repair the frontmatter on disk before Skynet
+            // will touch it again. (Code review HIGH #1, 2026-09-01.)
+            databaseLogger.warn(
+              "identity update: existing frontmatter YAML malformed — refusing overlay",
+              {
+                operation: "identity_update_frontmatter_parse",
+                userId,
+                identityKey,
+                error: yamlErr instanceof Error ? yamlErr.message : "Unknown",
+              },
+            );
+            return res.status(500).json({
+              error:
+                "existing identity frontmatter is malformed — repair on disk before editing",
+            });
+          }
+          bodyAfterFm = existing.slice(fmMatch[0].length);
+          // Strip a leading newline after the closing `---` (we re-add \n in
+          // the emit below). If the original body starts with \n we keep the
+          // rest verbatim.
+          if (bodyAfterFm.startsWith("\n")) {
+            bodyAfterFm = bodyAfterFm.slice(1);
+          } else if (bodyAfterFm.startsWith("\r\n")) {
+            bodyAfterFm = bodyAfterFm.slice(2);
+          }
+        }
+
+        // Capture old avatar ext (if any) for post-write cleanup
+        const oldAvatar =
+          typeof overlaid.avatar === "string" ? overlaid.avatar : null;
+        const oldExt =
+          oldAvatar && oldAvatar.startsWith(`${identityKey}.`)
+            ? oldAvatar.slice(identityKey.length + 1)
+            : null;
+
+        // ---- Overlay changed fields ----
+        // absent → leave alone; explicit null → REMOVE; present → set.
+        if (meta.displayName !== undefined) {
+          // Empty string already rejected above.
+          overlaid.displayName = String(meta.displayName).trim();
+        }
+        if (meta.title !== undefined) {
+          if (meta.title === null) delete overlaid.title;
+          else overlaid.title = String(meta.title);
+        }
+        // Phase modal-unification 2026-09-29: task is editable via the
+        // IdentityModal head inline-pencil (user call). Mirrors the title
+        // overlay above: absent → leave alone, null → REMOVE, present → set.
+        // This relaxes the pre-existing "write-once at birth" property of
+        // task (D-05 origin), which is fine — the identity's frontmatter is
+        // the source of truth and both agents and the user can now update it.
+        if (meta.task !== undefined) {
+          if (meta.task === null) delete overlaid.task;
+          else overlaid.task = String(meta.task);
+        }
+        if (meta.colorHue !== undefined) {
+          if (meta.colorHue === null) delete overlaid.colorHue;
+          else overlaid.colorHue = meta.colorHue;
+        }
+        if (meta.voice !== undefined) {
+          if (meta.voice === null) delete overlaid.voice;
+          else overlaid.voice = meta.voice;
+        }
+        if (meta.avatar !== undefined) {
+          if (meta.avatar === null) delete overlaid.avatar;
+          // Non-null values in meta.avatar are silently ignored — avatar bytes
+          // arrive via req.file (multipart upload) at the "---- Avatar handling
+          // ----" block below, NOT via the JSON meta payload. Only the null-
+          // revert case is meaningful here.
+        }
+
+        // ---- Avatar handling ----
+        let newExt: string | null = null;
+        if (req.file) {
+          await normalizeUploadedAvatar(req.file);
+          const mapped = MIME_TO_AVATAR_EXT[req.file.mimetype];
+          if (!mapped) {
+            return res
+              .status(415)
+              .json({ error: "Avatar must be PNG, JPEG, or WebP" });
+          }
+          newExt = mapped;
+          overlaid.avatar = `${identityKey}.${newExt}`;
+        }
+
+        // ---- Emit new file body ----
+        // `roles:` round-trips as a list; flowRolesInYamlDump restores the
+        // canonical flow form (`roles: [a, b]`) yaml.dump would block-ify.
+        const yamlBody = flowRolesInYamlDump(
+          yaml.dump(stringifyColorHueForYaml(overlaid), {
+            sortKeys: false,
+            lineWidth: -1,
+            noRefs: true,
+            forceQuotes: false,
+          }),
+        );
+        let newBody = `---\n${yamlBody}---\n${bodyAfterFm}`;
+        // REMOTE reads come back through execCommand, which trims stdout, so
+        // the original file's trailing newline is lost before we get here.
+        // Identity markdown files always end with "\n" on disk; restore it so
+        // a remote rewrite doesn't strip it. LOCAL reads are byte-exact and
+        // are written back unchanged (no normalization).
+        if (!local && !newBody.endsWith("\n")) newBody += "\n";
+
+        // ---- Write markdown ----
+        await writeIdentityFile(conn, identityKey, newBody);
+
+        // ---- Write avatar sibling (if new bytes) ----
+        if (req.file && newExt) {
+          await writeAvatarSiblingFile(
+            conn,
+            identityKey,
+            newExt as import("../../claude-session/identity-artifact-reader.js").AvatarExt,
+            req.file.buffer,
+          );
+
+          // Ext-swap cleanup: hard-delete the old sibling file. Best-effort
+          // (missing-file is fine — this is opportunistic hygiene, not a
+          // correctness guarantee).
+          if (oldExt && oldExt !== newExt) {
+            if (local) {
+              const oldPath = path.join(
+                getLocalIdentitiesRoot(),
+                identityKey,
+                `${identityKey}.${oldExt}`,
+              );
+              await fs.unlink(oldPath).catch(() => {
+                /* best-effort */
+              });
+            } else if (conn) {
+              await execCommand(
+                conn,
+                `rm -f "$HOME/fleet/identities/${identityKey}/${identityKey}.${oldExt}"`,
+              ).catch(() => {
+                /* best-effort */
+              });
+            }
+          }
+        }
+
+        // 260909-dls: avatar-revert sibling-file cleanup. When the null-delete
+        // branch above ran AND the identity previously had an avatar override
+        // whose filename matches the canonical `<identityKey>.<ext>` shape,
+        // hard-delete the sibling file on disk. Best-effort (missing file is
+        // fine — matches the ext-swap cleanup pattern above). Ordering:
+        // this runs AFTER writeIdentityFile so the frontmatter delete is
+        // persisted before the sibling removal. A mid-motion crash between
+        // the two steps leaves an orphaned sibling file, but readers correctly
+        // fall back to the role's avatar via Phase 86 Plan 86-01, so the
+        // invariant holds. Gated on `oldExt` (only set when oldAvatar starts
+        // with `${identityKey}.`) — a hand-edited non-canonical frontmatter
+        // value is silently skipped so no non-identityKey filename ever flows
+        // into fs.unlink or (more importantly) the REMOTE shell command.
+        if (meta.avatar === null && oldExt) {
+          const canonicalName = `${identityKey}.${oldExt}`;
+          if (local) {
+            const oldPath = path.join(
+              getLocalIdentitiesRoot(),
+              identityKey,
+              canonicalName,
+            );
+            await fs.unlink(oldPath).catch(() => {
+              /* best-effort */
+            });
+          } else if (conn) {
+            await execCommand(
+              conn,
+              `rm -f "$HOME/fleet/identities/${identityKey}/${canonicalName}"`,
+            ).catch(() => {
+              /* best-effort */
+            });
+          }
+        }
+
+        // Avatar changed → drop the server-side cached bytes, and forget the
+        // sweep's version so this response (and any GET /identities before the
+        // next sweep) emits an unversioned URL instead of the old immutable one.
+        if (req.file || meta.avatar === null) {
+          invalidateCachedAvatar(hostId, identityKey);
+          forgetAvatarVersion(hostId, identityKey);
+        }
+
+        // ---- Post-write re-read for response echo ----
+        // Re-read the identity's on-disk cosmetics AFTER the write completes and overlay
+        // them onto publicIdentity so the response echoes the true state — most notably
+        // the coordinator flag, which is disk-authoritative (Phase 67 Plan 67-01).
+        // Errors during the read → fall back to safe-defaults (empty cosmetics).
+        let echoCosmetics: ReturnType<typeof extractCosmeticsFromFrontmatter> = {};
+        let postWriteMd = "";
+        try {
+          const readResult = await readIdentityFile(conn, identityKey);
+          postWriteMd = readResult.markdown ?? "";
+          if (postWriteMd && postWriteMd.length > 0) {
+            echoCosmetics = extractCosmeticsFromFrontmatter(postWriteMd);
+          }
+        } catch {
+          // Swallow — response falls back to safe-defaults (empty cosmetics).
+          echoCosmetics = {};
+        }
+
+        // Phase 85 Plan 85-01 Task 2: PUT response echo must also carry
+        // roleDefaults so the frontend gets the same merged shape it receives
+        // on GET /identities. Reads the role file once after the write; role
+        // read failure → pass {} (identity's own values still surface).
+        const roleName = extractRoleFromMarkdown(postWriteMd);
+        let echoRoleCosmetics:
+          | ReturnType<typeof extractCosmeticsFromFrontmatter>
+          | null = null;
+        if (roleName !== null) {
+          try {
+            const { markdown: roleMd } = await readRoleFileByName(conn, roleName);
+            echoRoleCosmetics = roleMd
+              ? extractCosmeticsFromFrontmatter(roleMd)
+              : {};
+          } catch {
+            echoRoleCosmetics = {};
+          }
+        }
+
+        return res.json(
+          publicIdentity(
+            identityKey,
+            hostId,
+            echoCosmetics,
+            roleName ?? null,
+            echoRoleCosmetics,
+            false,
+            extractRolesFromMarkdown(postWriteMd),
+          ),
+        );
+      } catch (e) {
+        databaseLogger.error("Failed to update identity on disk", e, {
+          operation: "update_identity_disk_write",
+          userId,
+          identityKey,
+        });
+        return res.status(500).json({ error: "Failed to update identity" });
+      } finally {
+        if (conn) {
+          try {
+            conn.end();
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+    });
+  },
+);
+
+
+// Phase 68 Plan 68-02: GET /:identityKey/avatar rekeyed from /:id/avatar.
+// Row lookup removed — the URL param IS the identityKey used by readAvatarSiblingFile.
+// Identity's on-disk existence check falls to readAvatarSiblingFile's null return.
+router.get(
+  "/:identityKey/avatar",
+  authenticateJWT,
+  async (req: Request, res: Response) => {
+    const userId = (req as AuthenticatedRequest).userId;
+    const identityKey = String(req.params.identityKey);
+    // readAvatarSiblingFile self-validates identityKey, but return a clean 400 here
+    // rather than a downstream null-as-404 so bad callers get an actionable error.
+    if (!IDENTITY_KEY_RE.test(identityKey)) {
+      return res.status(400).json({
+        error: "identityKey must match [a-z0-9_-]{1,64}",
+      });
+    }
+
+    // hostId query validation — fail fast BEFORE SSH work.
+    const rawHost = req.query.hostId;
+    const hostIdNum =
+      typeof rawHost === "string" ? Number(rawHost) : Number.NaN;
+    if (
+      !Number.isFinite(hostIdNum) ||
+      !Number.isInteger(hostIdNum) ||
+      hostIdNum <= 0
+    ) {
+      return res
+        .status(400)
+        .json({ error: "hostId query required (positive integer)" });
+    }
+
+    // `v` = the sweep's avatar version baked into avatarUrl. Only the version
+    // the sweep currently reports is trusted: it makes the response immutable
+    // (the URL changes when the avatar does) and keys the cache. Any other
+    // `v` (stale, or made up by the caller) is served as unversioned, so it
+    // can neither pin bytes as immutable nor churn the cache.
+    const rawVersion = req.query.v;
+    const version =
+      typeof rawVersion === "string" &&
+      AVATAR_VERSION_RE.test(rawVersion) &&
+      rawVersion === getAvatarVersion(hostIdNum, identityKey)
+        ? rawVersion
+        : null;
+
+    // Host access check runs BEFORE the cache so a cache hit never serves a
+    // remote host's avatar to a caller without access to that host.
+    const local = isLocalHostId(hostIdNum);
+    let host: Awaited<ReturnType<typeof resolveHostById>> = null;
+    if (!local) {
+      try {
+        host = await resolveHostById(hostIdNum, userId);
+      } catch {
+        host = null;
+      }
+      if (!host) {
+        return res
+          .status(502)
+          .json({ error: "identity home box unreachable" });
+      }
+    }
+
+    const startedAt = Date.now();
+    let result: Awaited<ReturnType<typeof getCachedAvatar>>;
+    try {
+      result = await getCachedAvatar(hostIdNum, identityKey, version, () =>
+        loadAvatarFromDisk(hostIdNum, host, identityKey),
+      );
+    } catch {
+      // SSH-layer / SFTP error → 502 with canned message (T-68-02-01);
+      // never leak raw SSH exceptions into the response body.
+      return res
+        .status(502)
+        .json({ error: "identity home box unreachable" });
+    }
+    if (!result.hit) {
+      systemLogger.info("Identity avatar cache fill", {
+        operation: "identity_avatar_cache_fill",
+        hostId: hostIdNum,
+        identityKey,
+        versioned: version !== null,
+        found: result.avatar !== null,
+        bytes: result.avatar?.bytes.byteLength ?? 0,
+        ms: Date.now() - startedAt,
+      });
+    }
+
+    const avatar = result.avatar;
+    if (avatar === null) {
+      return res
+        .status(404)
+        .json({ error: "no avatar on disk for this identity" });
+    }
+
+    // Versioned URL → immutable: the browser never re-requests it, and a new
+    // avatar arrives as a new URL via the sweep. Unversioned (sweep hasn't
+    // reported this identity yet) → stale-while-revalidate as before.
+    const cacheControl =
+      version !== null
+        ? "private, max-age=31536000, immutable"
+        : "max-age=0, stale-while-revalidate=86400";
+    const ifNoneMatch = req.headers["if-none-match"];
+    if (ifNoneMatch && ifNoneMatch === avatar.etag) {
+      res.setHeader("ETag", avatar.etag);
+      res.setHeader("Cache-Control", cacheControl);
+      return res.status(304).end();
+    }
+    res.setHeader("Content-Type", avatar.mime);
+    res.setHeader("Content-Length", String(avatar.bytes.byteLength));
+    res.setHeader("ETag", avatar.etag);
+    res.setHeader("Cache-Control", cacheControl);
+    return res.send(avatar.bytes);
+  },
+);
+
+/**
+ * Read an identity's avatar from its home box: its own sibling file, else its
+ * role's avatar (Phase 85 Plan 85-01 role-folder fallback), else — for a
+ * multi-role identity — a split avatar composed from every role's avatar.
+ * Returns normalized bytes, or null when nothing applies (e.g. a roleless
+ * identity with no avatar of its own — a plain 404; the frontend draws an
+ * initial). SSH errors throw.
+ */
+async function loadAvatarFromDisk(
+  hostId: number,
+  host: Awaited<ReturnType<typeof resolveHostById>>,
+  identityKey: string,
+): Promise<{ bytes: Buffer; mime: string } | null> {
+  // REMOTE (host non-null): connect + every read below + end hold ONE
+  // per-host semaphore slot — the reads are serial on one connection, so a
+  // cold-load burst of N avatar misses opens at most `cap` channels
+  // (verify:ssh-cap). LOCAL (host null) reads the bind-mount, no slot.
+  if (!host) return loadAvatarOverConn(null, identityKey);
+  return getHostSemaphore(hostId).run(async () => {
+    const conn = await connectOneShot(host, 5_000);
+    try {
+      return await loadAvatarOverConn(conn, identityKey);
+    } finally {
+      try { conn.end(); } catch { /* ignore */ }
+    }
+  });
+}
+
+async function loadAvatarOverConn(
+  conn: import("ssh2").Client | null,
+  identityKey: string,
+): Promise<{ bytes: Buffer; mime: string } | null> {
+  let readResult: { bytes: Buffer; mime: string } | null =
+    await readAvatarSiblingFile(conn, identityKey);
+
+  // Role-folder fallback: when the identity has no sibling avatar of its
+  // own, resolve its role(s) via frontmatter. One role → serve that role's
+  // avatar if it names one and the file exists. Several roles → serve a
+  // split avatar composed from every role's avatar (a multi-role identity
+  // inherits no single role's look). Any error in the role-side chain is
+  // treated as "no fallback found" — never surfaces as 5xx.
+  if (readResult === null) {
+    try {
+      const { markdown } = await readIdentityFile(conn, identityKey);
+      const roles = extractRolesFromMarkdown(markdown);
+      if (roles.length > 1) {
+        const parts: SplitAvatarPart[] = [];
+        for (const role of roles) {
+          parts.push({ role, image: await readRoleAvatar(conn, role) });
+        }
+        const composite = await composeSplitAvatar(parts);
+        systemLogger.info("Split avatar composed for multi-role identity", {
+          operation: "identity_split_avatar_composed",
+          identityKey,
+          roles,
+          missing: parts.filter((p) => p.image === null).map((p) => p.role),
+          bytes: composite.bytes.byteLength,
+        });
+        return composite;
+      }
+      if (roles.length === 1) {
+        readResult = await readRoleAvatar(conn, roles[0]);
+      }
+    } catch (err) {
+      systemLogger.warn("Identity avatar role fallback failed", {
+        operation: "identity_avatar_role_fallback_failed",
+        identityKey,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  if (readResult === null) return null;
+  return normalizeAvatar(readResult.bytes, readResult.mime);
+}
+
+/**
+ * A role's avatar bytes from its role folder, or null when the role names no
+ * avatar or the file is missing/unreadable. Used by the identity avatar's
+ * role fallback (single role) and split composite (several roles).
+ */
+async function readRoleAvatar(
+  conn: import("ssh2").Client | null,
+  role: string,
+): Promise<{ bytes: Buffer; mime: string } | null> {
+  try {
+    const { markdown: roleMd } = await readRoleFileByName(conn, role);
+    if (!roleMd) return null;
+    const roleCos = extractCosmeticsFromFrontmatter(roleMd);
+    if (typeof roleCos.avatar !== "string" || roleCos.avatar.length === 0) {
+      return null;
+    }
+    return await readAvatarSiblingFileByRole(conn, role, roleCos.avatar);
+  } catch {
+    return null;
+  }
+}
+
+router.use(
+  (
+    err: Error & { code?: string },
+    _req: Request,
+    res: Response,
+    _next: express.NextFunction,
+  ) => {
+    if (err?.code === "LIMIT_FILE_SIZE") {
+      return res.status(413).json({ error: "Avatar exceeds 2 MB limit" });
+    }
+    if (err?.message?.startsWith("Avatar must be")) {
+      return res.status(415).json({ error: err.message });
+    }
+    return res
+      .status(500)
+      .json({ error: err?.message ?? "Identity route error" });
+  },
+);
+
+export default router;

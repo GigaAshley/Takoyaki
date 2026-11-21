@@ -1,0 +1,5648 @@
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { takeAgentWindowReopen, type AgentWindowState } from "@/features/archived-view/archived-identity";
+import { ArrowDown } from "lucide-react";
+import { cn } from "@/lib/utils";
+import { isIosPwa } from "@/lib/is-ios-pwa";
+import { registerPane, type PaneSnapshot } from "@/lib/diag-registry";
+import {
+  openClaudeSessionSocket,
+  type ClaudeSessionServerEvent,
+  type ConnectToPanePayload,
+  type HarnessTask,
+  type BackgroundedAgent,
+  type BackgroundedShell,
+  type MessageEvent as ChatMessageEvent,
+  type ImageEvent,
+  type RelayOutboundEvent,
+  type RelaySendResultEvent,
+  type RelayInboundEvent,
+  type MalformedLineEvent,
+  type CompactionEvent,
+  type CompactionGuidanceEvent,
+  // Phase 47 (load-more button) — send-side wire type for the click handler
+  // (Plan 04 handleLoadOlder). Response type FetchOlderRangeBatchEvent is
+  // consumed via ClaudeSessionServerEvent's discriminated union (Plan 01
+  // widened the union) — no separate import needed.
+  type FetchOlderRangePayload,
+  type ArchivedStateEvent,
+} from "@/api/claude-session-api";
+// Phase 47 (load-more button) — presentational component (Plan 02 output).
+// Mounted at the top of the message-list scroll container by Task 2b.
+import { LoadMoreOlderButton } from "./LoadMoreOlderButton";
+import { speakVoiceCandidates } from "./voice-candidates";
+import {
+  queuedOutboundBytes,
+  selectUnsentFrames,
+  trackOutboundBytes,
+  type InputFrameRecord,
+} from "./unsent-input-frames";
+import { ChatMessage } from "./ChatMessage";
+import {
+  FILE_CHIP_MIME,
+  OPEN_FILE_IN_CONVERSATION_EVENT,
+  type OpenFileInConversationDetail,
+} from "./file-url";
+import { encodeTabSpec } from "@/lib/tab-url";
+import { systemLogger } from "@/lib/frontend-logger";
+import EditableFileModal from "./EditableFileModal";
+import { ImageBubble, stripImagePasteMarkers } from "./ImageBubble";
+import { RelayOutboundBubble } from "./RelayOutboundBubble";
+import { RelayInboundBubble } from "./RelayInboundBubble";
+import { MalformedBubble } from "./MalformedBubble";
+import { CompactionDivider } from "./CompactionDivider";
+import { WipBubble } from "./WipBubble";
+import { attentionKey, subscribeDmArrival } from "@/state/attention-store";
+import "@/components/kit/kit.css";
+import "./conversation.css";
+import { AsideBubble } from "./AsideBubble";
+import { PrettyViewLoadingOverlay } from "./PrettyViewLoadingOverlay";
+import { PrettyViewErrorOverlay } from "./PrettyViewErrorOverlay";
+import { usePaneResolvingMachine } from "./usePaneResolvingMachine";
+import type { WsTransportState, PaneState } from "./resolve-phase";
+import { IdentityModal } from "./IdentityModal";
+// The roles window, opened straight onto a role from the agent's window
+// (the role name link); closing it returns to the agent's window.
+import { RolesWindow } from "./roles-window/RolesWindow";
+import type { Host, HostFolder } from "@/types/ui-types";
+// Phase 92 Slice 1 (D-07): ChatSurfaceSource discriminated-union prop +
+// unified adapter hook. Slice 1 wires the type and the hook contract; the
+// harness case is byte-preserved (redundant legacy hostId/tmuxSession props
+// stay). Slice 4 retires the redundant legacy props post-cleanup.
+import type { ChatSurfaceSource } from "./sources/chat-surface-source";
+import { useChatSurfaceAdapter } from "./sources/use-chat-surface-adapter";
+// Phase 93 Slice 2 (D-01/D-02/D-03): MultiBadgeAnchor extends the badge
+// anchor with the relay-case multi-participant row. Only mounted when
+// `source.kind === "relay"`. Pure render — takes participants +
+// viewingUserMxid + fleetIdentityHosts + isReady as explicit props.
+import { MultiBadgeAnchor } from "./MultiBadgeAnchor";
+import { ChatSurfaceErrorState } from "./ChatSurfaceErrorState";
+import { useViewingUserMxid } from "@/state/viewing-user-store";
+import {
+  popIdentityModalOpen,
+  pushIdentityModalOpen,
+} from "@/state/identity-modal-open-store";
+import { buildIdentityHostsFromFleet } from "@/state/identities-store";
+import {
+  getFleetSessionsSnapshot,
+  subscribeConversationStore,
+} from "@/state/conversation-store";
+import {
+  listRolesForHost,
+  type Identity,
+  type RoleSummary,
+} from "@/api/identities-api";
+import { useAutoScroll } from "./use-auto-scroll";
+import { ComposeBox } from "./ComposeBox";
+import { INTERRUPT_THROTTLE_MS, type InterruptFeedback } from "./interrupt-feedback";
+import { DropOverlay } from "./DropOverlay";
+import { HarnessTasksPanel } from "./HarnessTasksPanel";
+import { deriveOpenAsk } from "./ask/open-ask";
+import { usePrettyViewUploads } from "./use-pretty-view-uploads";
+import { buildCancelledSendRestore, fetchRestoreFiles } from "./cancelled-send-restore";
+import {
+  sessionMatchKey,
+  useSessionIdentity,
+} from "@/features/terminal/session-hue";
+import { TaskPill, type TaskPillJumpTab } from "./TaskPill";
+import { useSessionDesktopRunning } from "@/api/fleet-status-client";
+import type { RowKebabMenuItem } from "@/features/pretty-conversations/RowKebabMenu";
+import { useIsTouchDevice } from "@/hooks/use-is-touch-device";
+import {
+  formatInjectedUserTurn,
+  parseInjectedUserTurn,
+} from "@/api/pretty-view-upload-protocol";
+// Phase 137 Plan 03 (D-16): UserPreferences type for the fallbackVoice
+// resolution chain in the speak flow.
+import type { UserPreferences } from "@/api/open-tabs-api";
+import {
+  useSessionIsWorking,
+  useSessionIsWorkingRaw,
+  useSessionActivityMtime,
+} from "@/state/session-working-store";
+import { useSessionCompacting } from "@/state/compact-request-store";
+import { useSessionWaitingFor } from "@/state/session-waiting-store";
+// Phase 126 Plan 02 (D-01, D-02, D-03, D-22) — per-row armed:boolean latch.
+// Read/written imperatively from the arm-effect + fire-effect below (~L1725
+// area) — no useSyncExternalStore, no render reactivity. See the store's
+// header comment for the full state-machine contract.
+import {
+  armRow,
+  disarmRow,
+  isRowArmed,
+} from "@/state/ready-cue-latch-store";
+// Phase 126 Plan 02 (D-03) — the audio primitive from Plan 01. Called
+// synchronously from the WIP true→false edge observer when the latch is
+// armed AND the pane is visible. Fire-and-forget; pre-unlock is a silent
+// no-op (D-19). AppShell installs the unlock listeners at mount (D-18).
+import { playTink } from "@/audio/ready-cue";
+import { WaitingBubble } from "./WaitingBubble";
+import { usePermissionPrompt } from "./use-permission-prompt";
+// Phase 124 Plan 02 (shape 3 — message thumbs): PrettyView owns the
+// exchange-text computation, the feedback fire paths, and the thumbs-down
+// FeedbackModal mount. ChatMessage exposes onThumbsUp / onThumbsDown
+// callbacks (Plan 01); this file threads them and turns each fire into a
+// real POST /feedback + sonner toast per shape 1's contract (D-18/D-25/D-27).
+// The modal mount is thumbs-down only (D-23/D-37); the general variant
+// stays with AppShell's dev-chord modal per Pattern S-04 option (B).
+import { postFeedback } from "@/feedback/feedback-api";
+import { FeedbackModal } from "@/feedback/FeedbackModal";
+import { toast } from "sonner";
+import { hasNeutralLook, isMultiRole, NEUTRAL_HUE } from "@/lib/identity-roles";
+import { COMMAND_REFUSED_MESSAGE } from "@/types/blocked-commands";
+import { markTextAreaSend, textAreaSendKind, type TextAreaSendKind } from "./text-area-sends";
+import { flashScrollbars } from "@/lib/scrollbar-reveal";
+import { QuoteButton } from "./QuoteButton";
+import { COMPOSE_PRIMARY_ATTR, formatQuote } from "./quote-selection";
+import { mxidLocalpart } from "./relay-addressing";
+
+// An OS file drag (upload) — not a FileChip drag, which split view owns even
+// if a browser ever tags it with Files.
+function isOsFileDrag(dt: DataTransfer): boolean {
+  return dt.types.includes("Files") && !dt.types.includes(FILE_CHIP_MIME);
+}
+
+// Patch #148: mirror Terminal.tsx's proven WebSocket auto-reconnect pattern.
+// When the claude-session bridge WS closes unexpectedly (deploy container
+// recreate, iOS PWA backgrounding, transient network blip), PrettyView now
+// retries up to MAX_RECONNECT_ATTEMPTS times with a linear-with-cap backoff
+// schedule (2s, 4s, 6s, 8s, 8s ≈ 28s total window). On each retryKey bump,
+// the WS-setup useEffect re-runs and opens a fresh WS. The "inactive" server
+// state short-circuits ALL retry paths — it is the authoritative terminal
+// frame and must not be overstepped by client-side reconnect logic.
+// A separate visibilitychange handler (the direct user iOS PWA fix) resets
+// the attempt counter to 0 and triggers an immediate reconnect when the user
+// foregrounds the PWA tab — so her next tap always gets a live connection.
+const MAX_RECONNECT_ATTEMPTS = 5;
+// Stop button: how long an outcome ("Stopped", "Cancelled", …) stays up, and
+// how long "Stopping" waits for the server's verdict before giving up.
+const INTERRUPT_OUTCOME_HOLD_MS = 2000;
+const INTERRUPT_RESULT_TIMEOUT_MS = 8000;
+
+// user 2026-07-27: automatic aside triggering DISABLED. The Phase 14
+// isIdle-transition auto-fire of {type:"aside_arm"} was burning session
+// tokens without delivering value; user plans to switch to a different
+// trigger mechanism. The aside subsystem itself (backend arm handler,
+// poller, extract, dismiss, frontend AsideBubble render on aside_ready)
+// stays wired — only the automatic frontend emit is off. Flip to `true`
+// to restore the original Phase 14 behavior.
+const AUTO_ASIDE_ARM_ENABLED = false;
+
+// quick-260812-x5f — debounced hidden-pane WS close (~60s).
+// user 2026-08-12: voice-record + send + immediately switching to another
+// session broke because the WS used for the transcription-and-send pipeline
+// was closed immediately on isVisible=false (quick-260808-b74 regression).
+// A 60s grace window lets in-flight nav-away work (queued sends, pending
+// fetches, transcription pipelines) finish before the WS is ripped out.
+// See bounty: debounced-hidden-pane-ws-drop.
+// NOTE: this constant is intentionally DUPLICATED from Terminal.tsx — the
+// two files stay independent per bounty guidance (no shared helper invented).
+const HIDDEN_PANE_WS_CLOSE_DEBOUNCE_MS = 60_000;
+
+// ── Phase 45 — client-side working-set cap ────────────────────────────────
+// WORKING_SET_CAP — max messages in DOM at once; drop-oldest fires past this.
+// Server emits every JSONL line on connect (tail -F -n +1); client caps the
+// sustained message array to this size to bound memory on long sessions.
+// Loss of scroll-back-forever is explicit trade-off per Phase 45 UAT — see
+// .planning/phases/45-fix-forward-on-phase-43-restore-correct-architecture-for-win/45-CONTEXT.md § "Client architecture" for rationale.
+const WORKING_SET_CAP = 20;
+
+// Transcript frames held while the opening batch arrives (see historyHoldRef).
+const HISTORY_HELD_TYPES = new Set<string>([
+  "message",
+  "image",
+  "relay_outbound",
+  "relay_send_result",
+  "relay_inbound",
+  "malformed_line",
+  "compaction",
+  "compaction_guidance",
+  "messages_hidden",
+  "messages_unhidden",
+]);
+// Safety valve: if history_ready never comes, show what arrived anyway.
+const HISTORY_HOLD_TIMEOUT_MS = 15_000;
+
+/**
+ * Client-side pending-send timeout constants.
+ *
+ * PENDING_SEND_TIMEOUT_MS_DORMANT applies when a send is armed while
+ * dormantRef.current === true. Sizing per D-62-02: the backend
+ * pv-send-watchdog (src/backend/claude-session/pv-send-watchdog.ts) waits
+ * up to MARKER_FALLBACK_MS_MIRROR (90_000ms) for the .resume-complete
+ * marker before it arms its own dormant-send watchdog, whose
+ * GIVE_UP_MS_DORMANT is MARKER_FALLBACK_MS_MIRROR + GIVE_UP_MS + 10_000
+ * = 120_000ms. Backend ceiling from user-send = 210_000ms. Client must
+ * not fire before backend gives up. 220_000ms gives a 10s margin.
+ *
+ * PENDING_SEND_TIMEOUT_MS_NORMAL applies when a send is armed while the
+ * pane is NOT dormant. Historically 20_000ms (Phase 50 Plan 03), widened
+ * to 90_000ms because dormant-at-arm detection has proved unreliable
+ * across Phases 60/62/76 — the false-red-bubble bug persists whenever
+ * dormantRef.current is stale at arm time (WS reconnect races, React
+ * useEffect timing), and the truly-cheap workaround is to make NORMAL
+ * forgiving enough that mis-detection doesn't matter. 90s comfortably
+ * covers observed wake times (~31s in the 2026-08-30 log trace) while
+ * still giving user feedback within a reasonable window on genuine
+ * non-dormant failures (network drop, harness crash mid-alive).
+ *
+ * NOTE for future maintainers: if the backend widens GIVE_UP_MS_DORMANT
+ * further, bump PENDING_SEND_TIMEOUT_MS_DORMANT to stay above the sum
+ * (MARKER_FALLBACK_MS_MIRROR + GIVE_UP_MS_DORMANT). No automated cross-
+ * file drift guard here (frontend can't import backend) — this comment
+ * is the coupling.
+ */
+export const PENDING_SEND_TIMEOUT_MS_NORMAL = 90_000;
+export const PENDING_SEND_TIMEOUT_MS_DORMANT = 220_000;
+/**
+ * Optimistic-WIP release window once a send is evidently delivered (user
+ * echo or assistant message). Several fleet-status polls
+ * (2s cadence) — long enough for backend isWorking to take over a real turn,
+ * short enough that a turn the poll never observed doesn't hold the
+ * indicator for the full send ceiling.
+ */
+export const OPTIMISTIC_WIP_DELIVERED_GRACE_MS = 10_000;
+
+// Minimal read-only pretty view for a live Claude Code session.
+//
+// Opens a WebSocket to the claude-session bridge (Plan 01-02), sends
+// connectToPane with the given host + tmux session, and renders each
+// incoming "message" frame as a chat bubble in a scrollable list.
+//
+// The three non-obvious behaviors:
+//
+//   1. RENDER-01 hard-lock (defense in depth): this component does NOT
+//      branch on any block sub-type. Every frame whose top-level type
+//      is "message" becomes a bubble; the parser (Plan 01-01) and the
+//      WS server (Plan 01-02) already drop non-text blocks upstream.
+//
+//   2. RENDER-03 auto-scroll: two-state position-derived state machine via
+//      `useAutoScroll`. Modes: `at-bottom` (chase-on-content-change)
+//      and `not-at-bottom` (frozen). Transitions: OUT-of-at-bottom ONLY on
+//      user-input events (wheel/touch/scrollbar/keyboard) outside a ~28px
+//      tolerance; INTO-at-bottom on jump-clicked, send-fired, or user-input
+//      inside tolerance. Programmatic writes NEVER transition mode. Symmetric
+//      event handling: new messages, WIP indicator appear/disappear, accessory
+//      bubbles (WipBubble / WaitingBubble / AsideBubble)
+//      appear/disappear, window resize, pane-count / split-layout change —
+//      all one event class ('content-changed' or 'container-resized') consumed
+//      uniformly by the reducer. Chase writes are instant (no smooth-scroll),
+//      coalesced one-per-RAF. Browser scroll-anchoring (`overflow-anchor:none`)
+//      disabled on the container — the hook owns scroll position exclusively.
+//      Mount-landing via hide-pin-reveal: the content wrapper starts
+//      `visibility:hidden`, the hook waits for the first non-zero
+//      content-height measurement, jumps to bottom, then flips `revealed`.
+//      See use-auto-scroll.ts + auto-scroll-machine.ts headers and
+//      .planning/shapes/shape-pv-autoscroll-rewrite.md for LOCKED shape.
+//
+//   3. FALLBACK-01 clean inactive render: on `type:"inactive"` we
+//      render exactly one literal string (see the JSX below) inside a
+//      single wrapper div — no message list, no session picker, no
+//      retry affordance. Do NOT retry automatically: any resumption
+//      logic here would risk stepping past an inactive frame and
+//      violating the FALLBACK-01 letter.
+
+export interface PrettyViewProps {
+  // Phase 92 Slice 1 (D-07): discriminated-union source prop. Every case-
+  // based branch introduced by phase 92 reads `source.kind` (D-08). The
+  // flat `hostId` / `tmuxSession` / `tabId` props below are INTENTIONALLY
+  // RETAINED alongside `source` during Slices 1-4 per Blocker 1 resolution
+  // — many PrettyView internal consumers (badge anchor at ~L3349, task
+  // pill, IdentityModal, fleet-identity-hosts lookup, useSessionIsWorking)
+  // still read the flat props. Retirement of the redundant legacy props
+  // happens in a follow-up cleanup post-Slice-4 once every internal
+  // consumer has been proven to read from `source` for the relay case.
+  //
+  // OPTIONAL DURING SLICE 1 (auto-fix Rule 3 / Slice-1 test compatibility):
+  // Slice 1 accepts a nullable source so existing PrettyView tests that
+  // predate Phase 92 mount without a `source` prop still typecheck AND
+  // render byte-identically to pre-slice. When omitted, PrettyView
+  // synthesizes a harness-kind source from the flat `hostId` /
+  // `tmuxSession` / `tabId` props on the fly (see body below). Task 3
+  // updates the sole production call site (IdentitySessionPane) to pass
+  // `source={{ kind: "harness", ... }}` explicitly ALONGSIDE the redundant
+  // legacy props. When Slice 4 rewires the tabUtils dispatcher for relay
+  // tabs, callers MUST pass `source` explicitly — the synthesized fallback
+  // is harness-only by construction. Post-Slice-4 cleanup can flip this
+  // back to required once every internal caller has been migrated.
+  source?: ChatSurfaceSource;
+  hostId: number;
+  /**
+   * String hostname (e.g. `harbor`) for the target host — matches
+   * `hosts.name` in the DB and the `<host>` segment of the Skynet
+   * `/file/<host>/<abs-path>` URL grammar. Threaded down to ChatMessage
+   * so the injected user-turn's file entries can be rendered as
+   * interactive FileChips pointing at the landing path on that host.
+   * Optional so the relay-source mount site (which has no fleet host)
+   * can pass undefined; when absent, user attachment chips stay in
+   * their static read-only form.
+   */
+  hostName?: string;
+  tmuxSession: string;
+  className?: string;
+  style?: React.CSSProperties;
+  // Optional; when omitted, PrettyView renders as read-only (Phase
+  // 1 backward-compat). When provided, the compose box mounts at
+  // the bottom and pipes typed messages through this callback.
+  //
+  // Phase 50 D-18 / Blocker #4: onSend widened to accept the
+  // ComposeBox-generated mqid as the optional second arg so the SAME
+  // mqid threads through the whole chain (ComposeBox → handleComposeSend
+  // → parent onSend → IdentitySessionPane → pvSendInputRef →
+  // backend armPvSendWatchdog). Optional at the prop-type level for
+  // back-compat with any caller that doesn't participate in the
+  // pending-bubble flow.
+  onSend?: (text: string, mqid?: string) => boolean;
+  // Patch #120: safety-valve Ctrl-C. Threaded straight through to
+  // ComposeBox's onInterrupt — see ComposeBox for the full contract.
+  // Omit when PrettyView is read-only; the Stop button then never
+  // renders.
+  onInterrupt?: () => void;
+  // Phase 41 Plan 02: isIdle prop removed — PrettyView derives isIdle
+  // internally from the fleet-status session-working-store via
+  // useSessionIsWorkingRaw (wired in Phase 41-01). Terminal.tsx no longer
+  // renders PrettyView; IdentitySessionPane renders it without this prop.
+  // Phase 05: fires when upload_ready_to_inject arrives from the backend
+  // for a completed batch. The text is the formatInjectedUserTurn(...)
+  // output (caption + delimiter + per-file metadata lines) and the
+  // messageQueueItemId is the id patch #60 uses for atomic delete-on-send.
+  // Plan 03 wires this to Terminal.tsx sendInput so the injected turn
+  // flows through the existing split-and-delay path (patch #100) under
+  // the same lifecycle key.
+  onInjectedTurnReady?: (text: string, messageQueueItemId: string) => void;
+  // Quick 260808-b74 (hidden-pane-cost-mitigation-empirical-rotation, iteration 1):
+  // When false, the Claude-session WS is closed to eliminate the ~10-13
+  // WS frames/30s per hidden pane. When flipped back to true, the existing
+  // patch #148 reconnect scheduler reopens the WS. Terminal.tsx is the sole
+  // caller and always has `isVisible` in scope — required, not optional.
+  isVisible: boolean;
+  // Phase 35 — ref-forwarding registration surface for pretty-view outbound
+  // writes. Terminal.tsx holds two refs (pvSendInputRef, pvSendInterruptRef)
+  // that PrettyView populates on mount so MessageQueueDrawer (mounted OUTSIDE
+  // PrettyView as a sibling at Terminal.tsx:3327) and other Terminal.tsx-scope
+  // callers can write to PrettyView's WS without prop-drilling `wsRef` upward.
+  //
+  // Pattern: parent (Terminal.tsx) passes inline lambdas that write the fn
+  // into a React ref. PrettyView calls onRegisterSendInput?.(sendInput) in a
+  // mount effect; on unmount, calls onUnregisterSendInput?.() to null the ref.
+  // Callers read `.current?.()` at call time — null when PrettyView is
+  // unmounted (isPrettyMode=false), treated as a silent noop (same posture as
+  // the pre-cutover `if (!ws || ws.readyState !== 1) return` guard).
+  onRegisterSendInput?: (fn: (text: string, mqid?: string) => boolean) => void;
+  onUnregisterSendInput?: () => void;
+  onRegisterSendInterrupt?: (fn: () => void) => void;
+  onUnregisterSendInterrupt?: () => void;
+  // Phase 58 Plan 02: forwarded to the inner IdentityBadge (~L2927) so
+  // drag-source semantics activate for pretty-view-mounted badges (Plan
+  // 58-01 gates draggable on `!!tabId && !isMobile`). Optional so pre-
+  // Phase-58 callers (tests, standalone previews) keep working — badge
+  // falls back to draggable=false when tabId is absent. IdentitySessionPane
+  // (the sole production caller) always has `tab.id` in scope and passes
+  // it through.
+  tabId?: string;
+  // Menu items for the IdentityBadge. Absent OR empty array = no menu.
+  // Present with items = the badge shows a ⋮ kebab and right-click opens
+  // the same menu (shared RowKebabMenu surface). Caller owns each item's
+  // onClick semantic (e.g. "Move to new tab" builds a workspace spec
+  // + window.open + closes the current tab). Same items list flows to
+  // both surfaces (terminal-mode and pretty-mode badges) — the caller
+  // filters items per-surface (e.g. "Move to new tab" is desktop-only,
+  // "Switch to (terminal/chat) view" is admin-only).
+  identityBadgeContextMenuItems?: RowKebabMenuItem[];
+  // Phase 137 Plan 03 (D-16): per-user voice preferences for the speak
+  // flow. fallbackVoice is the last voice candidate after the identity's and
+  // role's voices, before the TTS provider's default (voice-candidates.ts).
+  // Optional with a default of {} so existing call sites without the prop
+  // keep working (no fallback candidate is sent).
+  userPrefs?: UserPreferences;
+  /**
+   * An archived agent's conversation, view-only (opened from search). The
+   * pane connects with `archived: true`, paints the given identity, has no
+   * compose box (`footer` takes its place) and opens the agent window
+   * view-only.
+   */
+  archived?: ArchivedViewProps;
+  /** A live conversation whose agent the server says is archived — the
+   *  pane closes (archiving closes every open copy). */
+  onAgentArchived?: () => void;
+}
+
+export interface ArchivedViewProps {
+  identity: Identity;
+  /** Roles whose own folder is archived (plain text in the agent window). */
+  archivedRoles: string[];
+  onState: (event: ArchivedStateEvent) => void;
+  /** Shown where the compose box would be. */
+  footer: React.ReactNode;
+  /** A notice over the messages (no history kept, no longer archived). */
+  overlay?: React.ReactNode;
+  /** Kept current with the agent window's open state and tab. */
+  windowState?: { current: AgentWindowState };
+}
+
+type Status = "connecting" | "streaming" | "inactive" | "error";
+
+// Patch #86: pretty-view's message stream now interleaves text messages
+// and image bubbles in strict wire order (the whole point of the patch —
+// user sees "the agent read this image" at the correct chronological
+// position). Both event shapes share `eventId` + `ts`, so appendDedup's
+// dedup logic remains a one-line hash check.
+type StreamEvent =
+  | ChatMessageEvent
+  | ImageEvent
+  | RelayOutboundEvent
+  | RelayInboundEvent
+  | MalformedLineEvent
+  | CompactionEvent
+  | CompactionGuidanceEvent;
+
+// inline-260823-pv-line-sorted-insert (user 2026-08-23): insertion-sort by
+// `line` so out-of-arrival-order frames land in chronological position.
+// Trigger case: after a load-more click flips capOff=true, a hidden-pane-close
+// → WS re-open triggers re-hydration from line 1 of the session file. Every
+// eid never seen before (lines that were cap-dropped during initial hydration)
+// gets appendDedup'd — under naive append-at-end that placed session-start
+// content at the DOM BOTTOM (user's Patricia report 2026-08-23: "the first
+// 20 bubbles of the session" appeared BELOW her most-recent messages).
+//
+// Sort key: `line: number` on every wire frame (Plan 01 additive widening on
+// StreamEvent). Frames without `line` (defensive; every current backend path
+// stamps it) fall back to `ts` for relative ordering. Uses binary search for
+// O(log N) index resolution, splice for insert. Rendering downstream is
+// `messages.map` in array order → chronological order in DOM.
+function lineKey(m: StreamEvent): number {
+  if (typeof m.line === "number") return m.line;
+  if (typeof m.ts === "number") return m.ts;
+  return 0;
+}
+
+// Binary search: return insertion index for `key` in `arr` (already sorted
+// ascending by lineKey). Stable — equal keys insert AFTER existing entries
+// so arrival-order breaks ties (matches prior append-at-end semantics for
+// same-line duplicates like enqueue/dequeue pairs).
+function findInsertIndex(arr: StreamEvent[], key: number): number {
+  let lo = 0;
+  let hi = arr.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (lineKey(arr[mid]!) <= key) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+function appendDedup(
+  prev: StreamEvent[],
+  next: StreamEvent,
+): StreamEvent[] {
+  if (prev.some((m) => m.eventId === next.eventId)) return prev;
+  // Relay-inbound matrixEventId dedup (2026-09-01, user bug report: peer
+  // messages showing as 2-4 duplicate bubbles). A single Matrix event
+  // arriving during a busy turn can produce up to THREE distinct jsonl
+  // envelopes (queue-operation enqueue, attachment queued_command, user
+  // task-notification — see session-file-parser.ts § detectRelayInbound
+  // envelope table), each with its own uuid → distinct eventId → not caught
+  // by the eventId check above. The `matrixEventId` field on
+  // RelayInboundEvent is the recv.sh $EVENT_ID, stable across all three
+  // envelopes for the same physical message; drop later arrivals for a
+  // matrixEventId we've already accepted.
+  if (next.type === "relay_inbound" && next.matrixEventId) {
+    if (
+      prev.some(
+        (m) => m.type === "relay_inbound" && m.matrixEventId === next.matrixEventId,
+      )
+    ) {
+      console.info(`[diag-dormant-send] dedup-drop mqid=n/a path=inbound incoming_matrixEventId=${next.matrixEventId} incoming_eventId=${next.eventId} matched_existing=true`);
+      return prev;
+    }
+  }
+  const idx = findInsertIndex(prev, lineKey(next));
+  // Fast path: insertion at end (arrival-order matches chronological, which
+  // is the norm for live-tail) → cheap array spread.
+  if (idx === prev.length) return [...prev, next];
+  const out = prev.slice();
+  out.splice(idx, 0, next);
+  return out;
+}
+
+// Live-append with drop-oldest cap. Enforced during both initial hydration
+// (as the server drains its full-file emission the client drops-oldest as it
+// grows past CAP) AND live-tail (post-hydration frames continue to enforce
+// the same cap so long-lived sessions bound their memory). Original
+// `appendDedup` retained above as a documented pair per plan 43-07b
+// key-decisions; deleting it is out of scope for Phase 45.
+//
+// inline-260823-pv-line-sorted-insert: also insertion-sorted (same rationale
+// as appendDedup above). Under cap enforcement drop-oldest still drops from
+// the FRONT — which under insertion-sort is the CHRONOLOGICAL oldest, matching
+// the intended semantic.
+function appendDedupWithCap<T extends { eventId: string; line?: number; ts?: number }>(
+  prev: T[],
+  next: T,
+  cap: number,
+  onCapDrop?: () => void,
+): T[] {
+  if (prev.some((m) => m.eventId === next.eventId)) return prev;
+  // Relay-inbound matrixEventId dedup — same rationale as appendDedup above
+  // (2026-09-01 user bug report). Generic constraint doesn't carry
+  // matrixEventId, so probe by shape at runtime; harmless on non-relay
+  // entries. Skip the later arrival of a matrixEventId already accepted so
+  // one physical Matrix message never renders as 2-4 bubbles.
+  const asRelay = next as unknown as { type?: unknown; matrixEventId?: unknown };
+  if (asRelay.type === "relay_inbound" && typeof asRelay.matrixEventId === "string" && asRelay.matrixEventId.length > 0) {
+    const mid = asRelay.matrixEventId;
+    if (
+      prev.some((m) => {
+        const p = m as unknown as { type?: unknown; matrixEventId?: unknown };
+        return p.type === "relay_inbound" && p.matrixEventId === mid;
+      })
+    ) {
+      console.info(`[diag-dormant-send] dedup-drop mqid=n/a path=inbound-cap incoming_matrixEventId=${mid} incoming_eventId=${(next as unknown as { eventId?: string }).eventId ?? "?"} matched_existing=true`);
+      return prev;
+    }
+    console.info(`[diag-dormant-send] dedup-store mqid=n/a path=inbound-cap incoming_matrixEventId=${mid} incoming_eventId=${(next as unknown as { eventId?: string }).eventId ?? "?"}`);
+  }
+  const nextKey =
+    typeof next.line === "number"
+      ? next.line
+      : typeof next.ts === "number"
+        ? next.ts
+        : 0;
+  // Binary search for insertion index (generic — mirrors findInsertIndex).
+  let lo = 0;
+  let hi = prev.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    const midKey =
+      typeof prev[mid]!.line === "number"
+        ? prev[mid]!.line!
+        : typeof prev[mid]!.ts === "number"
+          ? prev[mid]!.ts!
+          : 0;
+    if (midKey <= nextKey) lo = mid + 1;
+    else hi = mid;
+  }
+  const idx = lo;
+  const withNew =
+    idx === prev.length ? [...prev, next] : (() => {
+      const c = prev.slice();
+      c.splice(idx, 0, next);
+      return c;
+    })();
+  if (withNew.length > cap) {
+    // pv-scroll (2026-08-23): cap-drop is the primary suspect for
+    // user's "message bubble area suddenly jumps up" report — when the
+    // pane holds `cap` messages and a new one arrives, the oldest drops
+    // off the front of the DOM. If she's scrolled up reading, and the
+    // browser's overflow-anchor is defeated, the viewport shifts up by
+    // the dropped bubble's height. This log tells us when the DOM shrink
+    // event happened and lets us correlate with the pv-scroll
+    // geometry timeline emitted by use-auto-scroll.ts.
+    const dropped = withNew[0]!;
+    console.info(
+      `[pv-scroll] cap-drop prevLen=${prev.length} cap=${cap} droppedEid=${dropped.eventId.slice(0, 8)} newAddedEid=${next.eventId.slice(0, 8)}`,
+    );
+    onCapDrop?.();
+    return withNew.slice(withNew.length - cap);
+  }
+  return withNew;
+}
+
+// Phase 43 (plan 43-07a): estimatePvBubbleSize + getMessageText helpers
+// deleted — dead code after TanStack Virtual removal (estimateSize was
+// the virtualizer callback consumer). The estimateSize test file
+// (PrettyView.estimateSize.test.tsx) breaks as a result and is scheduled
+// for deletion in plan 43-08 per 43-CONTEXT.md § Deletion scope.
+
+// Phase 14 followup + UAT amendment E41 (user 2026-07-27): recognize both
+// invocation forms of the /id command. (a) SSH-typed raw form: literal
+// "/id " prefix (trailing space excludes /identity / /idle / bare /id).
+// (b) Harness slash-UI form: pretty-view's slash-UI emits the command as
+// literal XML tags into JSONL (<command-name>/id</command-name>...), NOT
+// as raw text. The .includes check is safe — that XML tag string is not
+// a legal substring of any prose user turn; it only appears when the
+// harness itself constructs the wrapper. Module-local by design (no
+// export, no shared-utils hoist) per Phase 14 no-new-shared-utils posture.
+const isIdCommand = (content: string): boolean =>
+  content.trimStart().startsWith("/id ") ||
+  content.includes("<command-name>/id</command-name>");
+
+// Phase 40 (Research A8): nice-to-have MIME hint for chip UX. Not
+// load-bearing — the composebox chip strip renders name + size, NOT MIME.
+// The MIME is set on the File object so downstream mediation (e.g., copy-
+// to-clipboard, downstream backend handlers) has an accurate hint. Fallback
+// null → caller supplies "text/plain".
+function guessMimeFromFilename(filename: string): string | null {
+  const dot = filename.lastIndexOf(".");
+  if (dot < 0 || dot === filename.length - 1) return null;
+  const ext = filename.slice(dot + 1).toLowerCase();
+  switch (ext) {
+    case "md":
+    case "markdown":
+      return "text/markdown";
+    case "json":
+      return "application/json";
+    case "yaml":
+    case "yml":
+      return "application/yaml";
+    case "ts":
+    case "tsx":
+      return "text/typescript";
+    case "js":
+    case "jsx":
+    case "mjs":
+    case "cjs":
+      return "application/javascript";
+    case "py":
+      return "text/x-python";
+    case "sh":
+    case "bash":
+    case "zsh":
+      return "application/x-sh";
+    case "txt":
+    case "log":
+    case "env":
+      return "text/plain";
+    case "html":
+    case "htm":
+      return "text/html";
+    case "css":
+      return "text/css";
+    case "xml":
+      return "application/xml";
+    case "csv":
+      return "text/csv";
+    case "sql":
+      return "application/sql";
+    case "toml":
+      return "application/toml";
+    case "ini":
+    case "conf":
+      return "text/plain";
+    default:
+      return null;
+  }
+}
+
+// Phase 93 Slice 2 (D-01/D-03): fleet-derived identityKey → hostId mapping
+// for MultiBadgeAnchor's agent cells. Ported from Slice D's standalone
+// identity-badge row (Phase 93 Slice 4 retired the source). Cached on
+// fleet-sessions array identity so successive getSnapshot calls return the
+// SAME object reference when the fleet has not changed — otherwise
+// useSyncExternalStore's Object.is check enters an infinite update loop.
+let fleetIdentityHostsCache: {
+  fleetRef: unknown;
+  map: Record<string, number>;
+} | null = null;
+
+function getFleetIdentityHostsSnapshot(): Record<string, number> {
+  const fleet = getFleetSessionsSnapshot();
+  if (
+    fleetIdentityHostsCache !== null &&
+    fleetIdentityHostsCache.fleetRef === fleet
+  ) {
+    return fleetIdentityHostsCache.map;
+  }
+  const map = buildIdentityHostsFromFleet(fleet);
+  fleetIdentityHostsCache = { fleetRef: fleet, map };
+  return map;
+}
+
+function useFleetIdentityHosts(): Record<string, number> {
+  return useSyncExternalStore(
+    subscribeConversationStore,
+    getFleetIdentityHostsSnapshot,
+    getFleetIdentityHostsSnapshot,
+  );
+}
+
+// How far below its summary a condense's guidance line may sit (on disk it's
+// two lines: the local-command caveat, then the command).
+const CONDENSE_GUIDANCE_MAX_LINES = 6;
+
+// The working orb's line while it shows only for a compaction.
+const COMPACTING_NARRATION = { short: "Compacting…", long: "Compacting the conversation…" };
+// How long the orb stays up after a compaction ends, waiting for the agent's
+// follow-up turn to light it (the two arrive on different status updates).
+const COMPACT_TAIL_MS = 15_000;
+
+export function PrettyView({
+  source: sourceProp,
+  hostId,
+  hostName,
+  tmuxSession,
+  className,
+  style,
+  onSend,
+  onInterrupt,
+  onInjectedTurnReady,
+  isVisible,
+  onRegisterSendInput,
+  onUnregisterSendInput,
+  onRegisterSendInterrupt,
+  onUnregisterSendInterrupt,
+  tabId,
+  identityBadgeContextMenuItems,
+  userPrefs = {},
+  archived,
+  onAgentArchived,
+}: PrettyViewProps) {
+  // Read inside the WS handler (a long-lived closure).
+  const archivedRef = useRef(archived);
+  archivedRef.current = archived;
+  const onAgentArchivedRef = useRef(onAgentArchived);
+  onAgentArchivedRef.current = onAgentArchived;
+  // Phase 92 Slice 1 (D-07 fallback synthesis): during Slice 1 the `source`
+  // prop is optional so existing PrettyView tests that predate Phase 92
+  // mount byte-identically. When omitted, synthesize a harness-kind source
+  // from the flat `hostId` / `tmuxSession` / `tabId` props. Task 3 wires
+  // IdentitySessionPane to pass `source` explicitly; Slice 4 rewires the
+  // tabUtils relay branch. Post-Slice-4 cleanup can flip this back to a
+  // required prop once every internal caller has been migrated.
+  const source: ChatSurfaceSource = sourceProp ?? {
+    kind: "harness",
+    hostId,
+    tmuxSession,
+    tabId,
+  };
+  // Phase 92 Slice 1 (D-09, Pitfall 2): unified adapter hook. Calls BOTH
+  // useHarnessAdapter and useRelayAdapter unconditionally (in stable order)
+  // and returns whichever adapter's state matches `source.kind`. Slice 1
+  // keeps PrettyView's own `messages` state (declared just below) as the
+  // source of truth for the harness case; the harness ingestion effect at
+  // L~1852 is gated on `source.kind === "harness"`. The adapter call here
+  // establishes the hook-order contract for later slices, and threads
+  // isVisible for the WS gate Slice 3 will wire up. The stubbed relay peer
+  // is inert in Slice 1 — no consumer routes to it yet (Slice 4 rewires
+  // the dispatcher).
+  //
+  // Phase 93 Slice 2: MultiBadgeAnchor (relay case) consumes
+  // `chatSurfaceAdapter.participants` and `chatSurfaceAdapter.isReady`.
+  // Slice 2's relay mount is defensive — Slice 3's real adapter flips
+  // `isReady=true` once the first participants frame arrives; Slice 1's
+  // stub returns `isReady=false, participants={humans:[],agents:[]}` so
+  // the anchor shows the loading placeholder immediately for a relay
+  // source (Warning 2 fix).
+  const chatSurfaceAdapter = useChatSurfaceAdapter(source, isVisible);
+  // Phase 93 Slice 6 (post-close fix): log relay-adapter error transitions
+  // via useEffect (was inline console.info inside a JSX IIFE — fired every
+  // render while error !== null, spamming logs proportional to render count).
+  // Now fires once per transition into a new error value, which is what ops-
+  // grep actually wants. Structured payload: operation slug + roomId + the
+  // error itself (never raw event body). Reset-log-suppress: when the error
+  // clears (transitions back to null), no log fires — that's a recovery, not
+  // an incident.
+  //
+  // Phase 97 code-review Fix 1: dep array is PRIMITIVES ONLY. Previously we
+  // had `[source, chatSurfaceAdapter.error]`, but `source` is a fresh object
+  // literal on every render (from `sourceProp ?? {...}` above OR from
+  // IdentitySessionPane's inline construction), so the effect fired every
+  // render — while error !== null, this re-emitted the same log proportional
+  // to render count. Same anti-pattern the Slice-6 pass fixed elsewhere.
+  // Deps are now `[source.kind, roomId-when-relay, error]` — all
+  // primitives, so Object.is dep-comparison actually stabilises.
+  useEffect(() => {
+    if (chatSurfaceAdapter.error === null) return;
+    // eslint-disable-next-line no-console
+    console.info({
+      operation: "chat_surface_relay_error",
+      error: chatSurfaceAdapter.error,
+      // D-08 discipline: relay-narrowed field read appears ONLY inline with
+      // the source.kind === "relay" narrowing on the same line (see
+      // PrettyView.source-prop.test.tsx Test 3 per-line check). An
+      // `if (!relay) return;` guard on a prior line + a bare field read
+      // later would violate the test's per-line grep.
+      roomId: source.kind === "relay" ? source.roomId : null,
+    });
+  }, [
+    source.kind,
+    source.kind === "relay" ? source.roomId : null,
+    chatSurfaceAdapter.error,
+  ]);
+  // Phase 93 Slice 2 (D-01/D-03): viewing user's mxid + fleet-identity-hosts
+  // map. Both are read unconditionally here (Rules of Hooks) — the relay case
+  // consumes them via MultiBadgeAnchor; the harness case ignores them. Slice
+  // 3's real relay adapter subscribes internally to the same viewing-user
+  // store, so this read is a defensive belt-and-suspenders that also lets
+  // Slice 2 mount the anchor without waiting for adapter work.
+  const viewingUserMxid = useViewingUserMxid();
+  const fleetIdentityHosts = useFleetIdentityHosts();
+  const [messages, setMessages] = useState<StreamEvent[]>([]);
+  // shape-interrupt-button: eventIds of prompts the transcript shows were
+  // cancelled (the agent never received them). Filtered out of everything the
+  // view renders or reads aloud; the backend sends messages_unhidden if a
+  // restart later revives one.
+  const [hiddenEventIds, setHiddenEventIds] = useState<ReadonlySet<string>>(() => new Set());
+  // shape-interrupt-button: a cancelled send's words (and attachments) to hand
+  // back to ComposeBox — set only on the view that pressed interrupt.
+  // Also used to hand back a send the server refused as a blocked command
+  // (`notice` is then shown under the box).
+  const [restoreRequest, setRestoreRequest] = useState<
+    { id: string; text: string; files: File[]; notice?: string } | null
+  >(null);
+  // shape-quote-reply: quoted lines from the Quote button, for ComposeBox
+  // to add to the end of the box (applied once per id).
+  const [quoteRequest, setQuoteRequest] = useState<{ id: string; text: string } | null>(null);
+  const quoteSeqRef = useRef(0);
+  const handleQuote = useCallback((text: string, name: string | null) => {
+    const quote = formatQuote(text, name);
+    if (quote === "") return;
+    quoteSeqRef.current += 1;
+    setQuoteRequest({ id: `quote-${quoteSeqRef.current}`, text: quote });
+  }, []);
+  const focusComposeForQuote = useCallback(() => {
+    pvRootRef.current?.querySelector<HTMLTextAreaElement>(`textarea[${COMPOSE_PRIMARY_ATTR}]`)?.focus();
+  }, []);
+  // Retired once applied, so a remounted ComposeBox never adds it twice.
+  const handleQuoteApplied = useCallback((id: string) => {
+    setQuoteRequest((cur) => (cur && cur.id === id ? null : cur));
+  }, []);
+  // What the Stop orb shows: "stopping" from the press until the verdict
+  // arrives (a cancel takes ~1.5s to decide), then the outcome for a moment.
+  const [interruptFeedback, setInterruptFeedback] = useState<InterruptFeedback | null>(null);
+  const interruptFeedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // When this view's press went out, until its verdict arrives. A verdict with
+  // no press behind it (the view was reset in between) is ignored.
+  const interruptPressedAtRef = useRef<number | null>(null);
+  const showInterruptFeedback = useCallback((next: InterruptFeedback | null, holdMs?: number) => {
+    if (interruptFeedbackTimerRef.current) clearTimeout(interruptFeedbackTimerRef.current);
+    interruptFeedbackTimerRef.current = null;
+    setInterruptFeedback(next);
+    if (next === null || holdMs === undefined) return;
+    interruptFeedbackTimerRef.current = setTimeout(() => {
+      interruptFeedbackTimerRef.current = null;
+      if (next === "stopping") {
+        console.warn(`[interrupt] no-result-after-press waitedMs=${holdMs}`);
+        showInterruptFeedback("failed", INTERRUPT_OUTCOME_HOLD_MS);
+      } else {
+        setInterruptFeedback(null);
+      }
+    }, holdMs);
+  }, []);
+  useEffect(() => () => {
+    if (interruptFeedbackTimerRef.current) clearTimeout(interruptFeedbackTimerRef.current);
+  }, []);
+  // Cleared with the message list (pane switch, session rotation, wire boot):
+  // the fresh replay decides again what is hidden, and a restore never
+  // carries over into another conversation.
+  const resetInterruptViewState = useCallback(() => {
+    interruptPressedAtRef.current = null;
+    setHiddenEventIds((prev) => (prev.size === 0 ? prev : new Set()));
+    setRestoreRequest(null);
+    showInterruptFeedback(null);
+  }, [showInterruptFeedback]);
+  const hostNameRef = useRef(hostName);
+  hostNameRef.current = hostName;
+  // relay-mcp send outcomes by toolUseId — not bubbles of their own; each one
+  // marks its relay_outbound card as failed, or names the room it went to.
+  const [relayResults, setRelayResults] = useState<Map<string, RelaySendResultEvent>>(() => new Map());
+  const addRelayResults = useCallback((results: RelaySendResultEvent[]) => {
+    if (results.length === 0) return;
+    setRelayResults((prev) => {
+      const next = new Map(prev);
+      for (const r of results) next.set(r.toolUseId, r);
+      return next;
+    });
+  }, []);
+
+  // Bubble-load diagnostic (2026-09-25): mount → first-frame → settled logs.
+  // Correlates with backend [tail-ttfb] / [tail-progress] / [session-file-tail]
+  // logs (same hostId + tmuxSession) so we can attribute slow renders to
+  // SSH-side transport vs WS delivery vs frontend render time.
+  const bubbleViewMountRef = useRef<{ atMs: number; firstFrameLogged: boolean; settledTimer: ReturnType<typeof setTimeout> | null } | null>(null);
+  useEffect(() => {
+    const mountAtMs = performance.now();
+    bubbleViewMountRef.current = { atMs: mountAtMs, firstFrameLogged: false, settledTimer: null };
+    // eslint-disable-next-line no-console
+    console.info({
+      operation: "bubble_view_mount",
+      hostId,
+      tmuxSession,
+      atEpochMs: Date.now(),
+    });
+    return () => {
+      const ref = bubbleViewMountRef.current;
+      if (ref?.settledTimer) clearTimeout(ref.settledTimer);
+      bubbleViewMountRef.current = null;
+    };
+  }, [hostId, tmuxSession]);
+  useEffect(() => {
+    const ref = bubbleViewMountRef.current;
+    if (!ref) return;
+    if (messages.length === 0) return;
+    if (!ref.firstFrameLogged) {
+      ref.firstFrameLogged = true;
+      // eslint-disable-next-line no-console
+      console.info({
+        operation: "bubble_view_first_frame",
+        hostId,
+        tmuxSession,
+        elapsedMs: Math.round(performance.now() - ref.atMs),
+        messagesLen: messages.length,
+      });
+    }
+    if (ref.settledTimer) clearTimeout(ref.settledTimer);
+    ref.settledTimer = setTimeout(() => {
+      // eslint-disable-next-line no-console
+      console.info({
+        operation: "bubble_view_settled",
+        hostId,
+        tmuxSession,
+        elapsedMs: Math.round(performance.now() - ref.atMs),
+        messagesLen: messages.length,
+      });
+      ref.settledTimer = null;
+    }, 2000);
+  }, [messages.length, hostId, tmuxSession]);
+  // Phase 93 Slice 3 (D-09): shared message store reads either from the
+  // adapter (relay case) or from PrettyView's internal `messages` state
+  // (harness case, populated by the ingestion effect gated at L~1969+).
+  // The downstream message-list rendering is case-agnostic (D-08).
+  //
+  // In the HARNESS case, `chatSurfaceAdapter.messages` is the Slice 1 inert
+  // shim `[]` — the harness ingestion effect still owns its state (Pitfall 2
+  // resolution: useHarnessAdapter does NOT own ingestion; the shim is
+  // deliberately inert). `effectiveMessages` collapses to local `messages`
+  // in this case — this is intentional. Do NOT try to unify by making
+  // `useHarnessAdapter` populate its own `messages` — that would double-write
+  // and break Pitfall 2 (the adapter is inert by design).
+  const harnessVisibleMessages = useMemo(
+    () =>
+      hiddenEventIds.size === 0
+        ? messages
+        : messages.filter((m) => !hiddenEventIds.has((m as { eventId?: string }).eventId ?? "")),
+    [messages, hiddenEventIds],
+  );
+  const effectiveMessages: StreamEvent[] =
+    source.kind === "relay" ? chatSurfaceAdapter.messages : harnessVisibleMessages;
+  // shape-interactive-responses: the question the tray holds, worked out
+  // from the transcript so every device agrees. Agent conversations only.
+  // (A user send still in flight closes it — see pendingSends below.)
+  const openAskFromHistory = useMemo(
+    () => (source.kind === "relay" ? null : deriveOpenAsk(harnessVisibleMessages, false)),
+    [source.kind, harnessVisibleMessages],
+  );
+  // A condense's guidance arrives as its own frame two lines after the summary
+  // (nothing renderable sits between them); fold it into that divider and
+  // drop the frame from the rendered list. Guidance with no divider just
+  // above it in the file (a compact command that failed) shows nothing.
+  const { renderedMessages, condenseGuidance } = useMemo(() => {
+    const guidance = new Map<string, string>();
+    const rendered: Exclude<StreamEvent, CompactionGuidanceEvent>[] = [];
+    for (const m of effectiveMessages) {
+      if (m.type === "compaction_guidance") {
+        const prev = rendered[rendered.length - 1];
+        const near =
+          typeof m.line !== "number" || typeof prev?.line !== "number" || m.line - prev.line <= CONDENSE_GUIDANCE_MAX_LINES;
+        if (prev !== undefined && prev.type === "compaction" && near && !guidance.has(prev.eventId)) {
+          guidance.set(prev.eventId, m.guidance);
+        }
+        continue;
+      }
+      rendered.push(m);
+    }
+    return { renderedMessages: rendered, condenseGuidance: guidance };
+  }, [effectiveMessages]);
+  // The latest message says the turn is over — the harness's interrupted line
+  // (shape-interrupt-button) or the assistant message that ended its turn
+  // (stop_reason end_turn) — so the work indicator goes off at once, whatever
+  // the working signal says until it catches up.
+  const turnOverTail = (() => {
+    for (let i = effectiveMessages.length - 1; i >= 0; i--) {
+      const m = effectiveMessages[i] as { type?: string; interrupted?: true; turnEnd?: true; eventId?: string; ts?: number };
+      if (m.type === "message" || m.type === "image") {
+        return m.interrupted === true || m.turnEnd === true
+          ? { eventId: m.eventId ?? `idx-${i}`, ts: typeof m.ts === "number" ? m.ts : 0 }
+          : null;
+      }
+    }
+    return null;
+  })();
+  const turnOverTailId = turnOverTail?.eventId ?? null;
+  // ── Phase 47 (load-more button) — per-pane state slots ────────────────
+  // capOff: once flipped true (via handleLoadOlder — first click), cap
+  //   enforcement in the ws.onmessage switch stops for this pane's
+  //   lifetime. Reset to false in the fresh-pane reset block at L1054-1092
+  //   (transient-across-pane-lifetimes per CONTEXT.md § Philosophy).
+  // loadOlderState: three-state discriminator wired to LoadMoreOlderButton's
+  //   `status` prop. "idle" = clickable; "in-flight" = disabled + spinner;
+  //   "error" = clickable (retry) + error aria-label.
+  // loadOlderError: error string surfaced into LoadMoreOlderButton's aria-
+  //   label when loadOlderState === "error"; null otherwise.
+  // sessionTotalLines: total JSONL line-count captured from the widened
+  //   `session` frame (Plan 01 SessionMetaEvent.totalLines?). Diagnostic
+  //   only since 2026-10-09 (logged on click); no longer gates the button.
+  // sessionHasMore: server-reported "there are still older lines behind
+  //   this batch" — flipped false when a successful response carries
+  //   hasMore: false; hides the button per Test 9 acceptance.
+  // oldestLoadedLine: cursor for the next click's beforeLine. Seeded from
+  //   the min `line?: number` across initial hydration frames (Plan 01
+  //   widened per-turn frames with optional line?). Advanced to
+  //   parsed.oldestLine on every SUCCESSFUL fetch_older_range_batch
+  //   response (gated on !parsed.error per T-47-24 mitigation — advancing
+  //   on error would cause retry to send beforeLine: 0 which the backend
+  //   rejects). null until the first hydration frame carrying `line`
+  //   lands; the click handler's runtime null-check + the visibility gate
+  //   both defend against null.
+  const [capOff, setCapOff] = useState<boolean>(false);
+  const [loadOlderState, setLoadOlderState] = useState<
+    "idle" | "in-flight" | "error"
+  >("idle");
+  const [loadOlderError, setLoadOlderError] = useState<string | null>(null);
+  const [sessionTotalLines, setSessionTotalLines] = useState<number | null>(
+    null,
+  );
+  const [sessionHasMore, setSessionHasMore] = useState<boolean>(true);
+  const [oldestLoadedLine, setOldestLoadedLine] = useState<number | null>(
+    null,
+  );
+  // capOffRef: stale-closure-safe mirror of capOff for reads inside the WS
+  // onmessage handler (which captures its React closure once per WS-setup
+  // effect run — the same rationale as isVisibleRef). The
+  // useEffect mirror below keeps it synchronized with state.
+  const capOffRef = useRef<boolean>(false);
+  // Opening-batch hold: from the start of a hydration (wire_boot, session
+  // rotation, session_changed) until the server's history_ready, transcript
+  // frames are queued and then applied in one go, so the opening messages
+  // appear at once instead of trickling in. Null when not holding.
+  // resetOnRelease: a reconnect keeps the bubbles already on screen and
+  // clears them only when the fresh batch is applied, in the same render.
+  const historyHoldRef = useRef<{
+    held: MessageEvent<string>[];
+    timer: ReturnType<typeof setTimeout> | null;
+    startedAt: number;
+    trigger: string;
+    resetOnRelease: boolean;
+  } | null>(null);
+  // loadOlderInFlightRef: SYNCHRONOUS single-request-in-flight guard for
+  // handleLoadOlder. React's setLoadOlderState('in-flight') doesn't reach
+  // the DOM's disabled attribute within the same event-loop tick, so a
+  // rapid double-click (both firing before React re-renders) would bypass
+  // Plan 02's disabled={status === "in-flight"} guard. This ref flips
+  // synchronously inside handleLoadOlder so a second immediate invocation
+  // returns early. Reset in the response case branch AND on error path AND
+  // in the fresh-pane reset. Test 7 locks the behavior.
+  const loadOlderInFlightRef = useRef<boolean>(false);
+  // capDroppedRef: true once WORKING_SET_CAP has dropped an older frame
+  // since the last reset. The tail replays the whole JSONL from line 1, so
+  // this is the exact answer to "is there anything older than what's
+  // shown?" before the first click (after it, the server's hasMore is).
+  // Written inside setMessages updaters, which run before the render that
+  // reads it.
+  const capDroppedRef = useRef<boolean>(false);
+  // staleOlderBatchesRef: fetch_older_range_batch responses still owed for
+  // requests sent before a same-socket reset (session_changed). Responses
+  // arrive in request order on one WS, so the next N batches belong to the
+  // replaced transcript and are dropped instead of prepended.
+  const staleOlderBatchesRef = useRef<number>(0);
+  const [status, setStatus] = useState<Status>("connecting");
+  const [inactiveReason, setInactiveReason] = useState<string | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  // Claude Code harness task list (TaskCreate + /queue items). Empty array
+  // = confirmed no tasks; the backend polls every 3s and emits on change.
+  // The panel above the compose box mounts only when the FILTERED list
+  // (pending + in_progress) is non-empty.
+  const [harnessTasks, setHarnessTasks] = useState<HarnessTask[]>([]);
+  // Work narration: the latest "where the agent is in the job" line for the
+  // work indicator (short for narrow panes, long when it fits). Null = none
+  // yet this turn.
+  const [workNarration, setWorkNarration] = useState<{ short: string; long: string } | null>(null);
+  // Currently-running background Agent invocations, derived by the backend
+  // from parent-JSONL tool_use/tool_result correlation (patch #61). The
+  // backend only sends this list when it CHANGES; unchanged ticks are
+  // suppressed. The panel below mounts only when non-empty — a completed
+  // subagent drops out within one tail line, so a session with no live
+  // background work carries no chrome.
+  const [backgroundedAgents, setBackgroundedAgents] = useState<
+    BackgroundedAgent[]
+  >([]);
+  // Currently-running background Bash{run_in_background:true} invocations,
+  // derived by the backend from parent-JSONL tool_use + task-notification
+  // correlation (patch #68). The backend only sends this list when it
+  // CHANGES; unchanged ticks are suppressed. The panel below mounts only
+  // when non-empty — a completed shell drops out on the completion
+  // task-notification event, so a session with no live background shells
+  // carries no chrome. Scope: Bash-only; Monitor invocations are excluded.
+  const [backgroundedShells, setBackgroundedShells] = useState<
+    BackgroundedShell[]
+  >([]);
+  // Phase 14 (plain-language-translation-asides) Wave 3: currently-
+  // displayed plain-language aside for this session. `null` = no aside;
+  // `string` = aside text extracted by the backend from the tmux BTW
+  // overlay (delivered via `{type:'aside_ready', text}` WS frame) and
+  // ready to render inside <AsideBubble />. Backend is the sole source
+  // of truth (per CONTEXT.md § State model — the tmux overlay itself is
+  // the sole source of truth; backend is a pure translator). This state
+  // flips off via:
+  //   1. `{type:'aside_dismissed'}` WS frame — server-authoritative
+  //      cross-tab-coherent broadcast on marker-disappearance OR any
+  //      client's dismiss.
+  //   2. Optimistic clear in handleAsideDismiss (X-click) BEFORE the
+  //      round-trip completes.
+  //   3. Fresh-pane reset (paneKey change) so a new pane starts clean.
+  // Refs: ASIDE-01 (arm→display), ASIDE-05 (in-flow at bottom of
+  // message stream), ASIDE-09 (re-attach probe delivers aside_ready to
+  // a late-mounting client).
+  const [asideText, setAsideText] = useState<string | null>(null);
+  // Phase 14 quick-task 260726-vbd — generation-window blocking parity.
+  //
+  // WHY: The aside-active blocking (ComposeBox aux buttons disabled +
+  // send button morphs to X/Resume) currently only covers the DISPLAY
+  // phase (post-aside_ready, pre-dismiss). This leaves the GENERATION
+  // phase (from /btw submit through aside_ready arrival, typically a
+  // few seconds to ~1 min) unblocked — user can accidentally send
+  // unrelated input that collides with Claude Code's in-flight /btw
+  // handling. The same single-Escape-primitive (dismissBtw) works
+  // to cancel an in-flight /btw OR clear a displayed aside, so a single
+  // button + handler suffices. Only the "when is aside active?" predicate
+  // needs to widen.
+  //
+  // asidePending: true from /btw submit until aside_ready arrives (or
+  // handleAsideDismiss runs, or the 60s safety timeout fires).
+  //
+  // 60s safety timeout: belt-and-suspenders for "aside_ready never
+  // arrives" (e.g. Claude Code died mid-answer). When it fires it just
+  // calls clearAsidePending() — no backend broadcast, no retry.
+  const [asidePending, setAsidePending] = useState(false);
+  const asidePendingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Phase 3: session-changeover holding state. True during the ~5s gap
+  // between the old Claude session's death and the new one's launch (per
+  // Plan 03-01 backend's Layer 1 raw-line /exit scan OR Layer 2 discovery-
+  // repoll's SIGTERM-fallback path). Cleared by `session_changed` (the new
+  // session landed) or `inactive` with reason "holding_timeout" (it never did).
+  // WebSocket is NOT closed during holding — the tail restart is server-side
+  // and transparent to this client (see CONTEXT.md § Frontend event handling).
+  //
+  // Phase 30 (PS30-04): no local holding state — the pane_state WS frame
+  // drives the rendered state directly through the paneState React state
+  // slot below.
+  // Patch #87: identity modal open state. Clicking the lg IdentityBadge sets
+  // this to true; the IdentityModal handles close via onOpenChange (Esc,
+  // backdrop, X button all route through shadcn Dialog's onOpenChange).
+  // An archived tab that just turned live hands over its open agent window
+  // (taken once, on mount) so it stays open on the same tab.
+  const [windowReopen] = useState(() => (!archived && tabId ? takeAgentWindowReopen(tabId) : null));
+  const [isIdentityModalOpen, setIsIdentityModalOpen] = useState(windowReopen !== null);
+  // Tab the task pill's round buttons asked the modal to land on (desktop /
+  // git), or the carried-over window's tab; undefined for a plain pill click
+  // (the modal's remembered tab).
+  const [identityModalTab, setIdentityModalTab] = useState<TaskPillJumpTab | string | undefined>(windowReopen?.tab);
+  // The archived view keeps its pane told whether the window is open, and on
+  // which tab, for that hand-over.
+  const [shownModalTab, setShownModalTab] = useState<string | undefined>(undefined);
+  const archivedWindowState = archived?.windowState;
+  useEffect(() => {
+    if (archivedWindowState) archivedWindowState.current = { open: isIdentityModalOpen, tab: shownModalTab };
+  }, [archivedWindowState, isIdentityModalOpen, shownModalTab]);
+  const pvDesktopRunning = useSessionDesktopRunning(hostId, tmuxSession ?? null);
+  // Publish modal-open to the app-wide store so AppShell's mobile back
+  // button can hide itself while the modal is visible. See
+  // identity-modal-open-store.ts for the root-cause writeup (per-tab
+  // wrapper caps the modal's z-index at 2, below the fixed z:30 back
+  // button — hiding the button is simpler than restructuring the stack).
+  useEffect(() => {
+    if (!isIdentityModalOpen) return;
+    pushIdentityModalOpen();
+    return () => popIdentityModalOpen();
+  }, [isIdentityModalOpen]);
+  // The identity modal's role-name jump: non-null while the roles window is
+  // open on that role. Closing it returns to the identity modal.
+  // Phase 90 Plan 90-10 (D-08.3 lock): the earlier identity-shim prop was
+  // removed from this state slot. Every read/write on the RoleModal now routes
+  // through role-name-keyed helpers (Plan 90-09), so `roleName` + `hostId`
+  // fully identifies every artifact the modal touches. `hue` is retained
+  // because it also feeds downstream chrome computations at the PrettyView
+  // level.
+  const [roleModalOpenState, setRoleModalOpenState] = useState<
+    | null
+    | {
+        roleName: string;
+        roleCosmetics: RoleSummary;
+        hue: number;
+      }
+  >(null);
+  const roleWindowHostTree = useMemo<HostFolder>(
+    () => ({
+      name: "",
+      // The agent's own machine, so it can host agents (the roles window
+      // only lists machines that can).
+      children: [{ id: String(hostId), name: hostName ?? "this host", canHostAgents: true } as unknown as Host],
+    }),
+    [hostId, hostName],
+  );
+  // Phase 40 D-05/D-06: editor modal open state. Null when closed; an object
+  // holding the URL + filename + messageEventId + agentIdentityName snapshot
+  // when open. Set by handleOpenEditor (fired from a ChatMessage affordance
+  // click), cleared to null by the modal's onOpenChange(false).
+  const [editorOpenState, setEditorOpenState] = useState<
+    | null
+    | {
+        url: string;
+        filename: string;
+        messageEventId: string;
+        agentIdentityName: string | null;
+      }
+  >(null);
+  // Phase 124 Plan 02 (shape 3 — message thumbs, D-23/D-25 / Pattern S-04):
+  // PrettyView-local atom driving the thumbs-down FeedbackModal mount. Null
+  // when closed; when a user clicks the thumbs-down button on an assistant
+  // bubble, handleThumbsDown computes the exchangeText inline and sets this
+  // slot to { eventId, exchangeText } — which is the payload context the
+  // modal's onSubmit / onDismissWithoutSubmit handlers read when POSTing.
+  // Cleared back to null by onOpenChange(false) (Radix close paths) OR by
+  // the onSubmit success path. Per Pattern S-04 option (B), this modal is
+  // owned at the PrettyView level (not AppShell) so the per-message payload
+  // context stays lexically local to the caller.
+  const [feedbackModalContext, setFeedbackModalContext] = useState<
+    null | { eventId: string; exchangeText: string }
+  >(null);
+  // The holding overlay is gone (it covered resets, which are gone too).
+  // Retired with the 10-minute client watchdog per SPEC req 5. Backend
+  // HOLDING_TIMEOUT_TICKS=200 (10min) remains the authoritative give-up
+  // signal; when it fires, backend emits `pane_state` with state=inactive
+  // and reason=holding_timeout (Phase 30 — was `inactive` frame in Phase
+  // 29) which the state machine reads via paneState.
+  // Phase 56 (2026-08-23): dormancy is now invisible — the former dormant-
+  // overlay bubble + Wake button + progress bar + elapsed-seconds ticker +
+  // local waking/waking-start-ts/wake-error state slots are ALL DELETED.
+  // Only the `dormant` slot survives because the WS onmessage `dormant` case
+  // still calls setDormant(parsed.dormant) so `dormantRef` (live-frame auto-
+  // dismiss path in the ws.onmessage handler below) has a signal to mirror.
+  // Backend still tracks dormancy internally (paneState machine, WIP-
+  // indicator gating, live-frame auto-dismiss) but no user-visible surface
+  // remains — the compose box stays enabled on dormant panes, sends into
+  // dormant panes trigger invisible wake (Plan 56-01), and the widened
+  // watchdog (Plan 56-02) covers the ~90s wake latency.
+  const [dormant, setDormant] = useState(false);
+  // phase-30-restore-resolving-overlay-paint-delay (2026-08-10): D-04 anti-flash
+  // RESTORED at THIS site (not the hook) per PS30-06's own guidance below.
+  // user UAT surfaced the flash the Phase 30 deletion left exposed — cold
+  // paneKey entry to an already-active session momentarily shows
+  // renderedState==="resolving" while the WS reopens and the backend's
+  // pane_state emit lands (~200-400ms on iPhone PWA). 400ms delay-arm here
+  // absorbs that window; genuinely-slow resolves still get the spinner just
+  // after the paint-delay expires. Hook stays trivial (Phase 30 SPEC — the
+  // hook has zero setTimeouts). Companion state slot below.
+  const [showResolvingSpinner, setShowResolvingSpinner] = useState(false);
+  // Phase 124 Plan 02 (shape 3 — message thumbs, D-18/D-23/D-32/D-33/D-34/D-35/D-38):
+  // handleThumbsUp / handleThumbsDown are the PrettyView-side handlers wired
+  // to ChatMessage's onThumbsUp / onThumbsDown callback props (Plan 01).
+  //
+  // Both handlers locate the assistant message in `effectiveMessages` by its
+  // eventId, then walk BACKWARD from that index looking for the immediately-
+  // prior `type === "message" && role === "user"` entry — the "prompting
+  // user turn." The discriminator is `m.type === "message"` (matching
+  // `MessageEvent.type` at src/ui/api/claude-session-api.ts:43-46 and the
+  // existing PrettyView idiom at ~L3346). Frames whose `type` is `"image"`,
+  // `"relay_outbound"`, `"relay_inbound"`, or `"malformed_line"` are NOT
+  // chat-exchange turns and are correctly skipped by this filter (T-124-05
+  // mitigation: a relay_inbound frame sitting between a user turn and an
+  // assistant reply MUST NOT contribute to exchangeText).
+  //
+  // exchangeText format (D-33 planner-pick — labeled two-block with a
+  // horizontal-rule separator, chosen for operator-legibility in plain-text
+  // email bodies): "**User:**\n\n<userContent>\n\n---\n\n**Assistant:**\n\n<assistantContent>"
+  // For an assistant message with no prior user turn (D-35 edge case —
+  // greeting opens the conversation), emits ONLY "**Assistant:**\n\n<assistantContent>".
+  //
+  // Option A (per PLAN 124-02): the exchange-text lookup is INLINED into
+  // each useCallback body — NO separately-extracted helper exists.
+  // This keeps `[effectiveMessages]` as the direct closure dependency and
+  // makes exhaustive-deps analysis correct without indirection.
+  const handleThumbsUp = useCallback(
+    (eventId: string) => {
+      // Locate the assistant message being thumbed.
+      const assistantIdx = effectiveMessages.findIndex(
+        (m) =>
+          m.type === "message" &&
+          m.eventId === eventId &&
+          m.role === "assistant",
+      );
+      if (assistantIdx < 0) return; // defensive — should not happen for a normally-mounted assistant bubble
+      const assistant = effectiveMessages[assistantIdx];
+      if (assistant.type !== "message") return; // narrowing for TS
+      // Walk backward for the most recent prior user turn.
+      let priorUserContent: string | null = null;
+      for (let i = assistantIdx - 1; i >= 0; i--) {
+        const m = effectiveMessages[i];
+        if (m.type === "message" && m.role === "user") {
+          priorUserContent = m.content;
+          break;
+        }
+      }
+      const exchangeText =
+        priorUserContent !== null
+          ? `**User:**\n\n${priorUserContent}\n\n---\n\n**Assistant:**\n\n${assistant.content}`
+          : `**Assistant:**\n\n${assistant.content}`;
+      void postFeedback({
+        kind: "thumbs_up",
+        userNote: "",
+        messageRef: eventId,
+        exchangeText,
+      });
+      toast.success("Thanks — feedback sent.", { duration: 2000 });
+    },
+    [effectiveMessages],
+  );
+
+  const handleThumbsDown = useCallback(
+    (eventId: string) => {
+      // Fix WR-02 (2026-09-20): if the modal is already open (against some
+      // other message the user is mid-typing on), ignore this click. Without
+      // this guard, tapping thumbs-down on message B while the modal was
+      // opened for message A would swap the modal's payload context to B
+      // WITHOUT resetting the modal's textarea — Radix's open stays true so
+      // FeedbackModal's draft-reset effect never fires — so the user's note
+      // typed for A would send attached to B's exchange. The ChatMessage
+      // second-tap-no-op guard (D-22) is per-message local and does not
+      // catch this cross-message scenario. The user's visual pressed state
+      // on B's button still applies (ChatMessage sets it before invoking
+      // the callback), so the tap feels registered.
+      if (feedbackModalContext !== null) return;
+      // Same inline lookup as handleThumbsUp (Option A — NOT extracted to a
+      // shared helper; each useCallback keeps effectiveMessages as its
+      // direct dep). The two bodies are near-duplicates by design.
+      const assistantIdx = effectiveMessages.findIndex(
+        (m) =>
+          m.type === "message" &&
+          m.eventId === eventId &&
+          m.role === "assistant",
+      );
+      if (assistantIdx < 0) return;
+      const assistant = effectiveMessages[assistantIdx];
+      if (assistant.type !== "message") return;
+      let priorUserContent: string | null = null;
+      for (let i = assistantIdx - 1; i >= 0; i--) {
+        const m = effectiveMessages[i];
+        if (m.type === "message" && m.role === "user") {
+          priorUserContent = m.content;
+          break;
+        }
+      }
+      const exchangeText =
+        priorUserContent !== null
+          ? `**User:**\n\n${priorUserContent}\n\n---\n\n**Assistant:**\n\n${assistant.content}`
+          : `**Assistant:**\n\n${assistant.content}`;
+      // Do NOT fire the feedback POST here — thumbs-down defers the fire
+      // to the modal's onSubmit / onDismissWithoutSubmit handlers (D-25).
+      // Setting this state opens the modal; the modal's handlers read the
+      // eventId + exchangeText from this atom to build the payload.
+      setFeedbackModalContext({ eventId, exchangeText });
+    },
+    // feedbackModalContext is a dep because the WR-02 guard above reads it
+    // (early-return when a modal is already open on another message).
+    [effectiveMessages, feedbackModalContext],
+  );
+  // Phase 14 quick-task 260726-vbd: single clear-primitive for asidePending.
+  // Clears both the boolean flag and the 60s safety timer. Used by:
+  //   (a) aside_ready case — display state takes over, pending flag clears.
+  //   (b) aside_dismissed case — backend observed marker disappear.
+  //   (c) handleAsideDismiss — X/Resume click during pending or displayed phase.
+  //   (d) session_changed — fresh pane starts with no in-flight aside.
+  //   (e) the 60s timeout callback itself — self-fires and nulls the ref.
+  const clearAsidePending = useCallback(() => {
+    setAsidePending(false);
+    if (asidePendingTimerRef.current !== null) {
+      clearTimeout(asidePendingTimerRef.current);
+      asidePendingTimerRef.current = null;
+    }
+  }, []);
+
+  // Phase 14 Wave 3: dismiss callback for the aside (X/Resume click in
+  // ComposeBox — Wave 4 wires the button). Two steps per CONTEXT.md
+  // § Dismiss:
+  //   1. Optimistic clear of asideText so the AsideBubble unmounts
+  //      immediately (no visible latency waiting for the WS round-trip).
+  //   2. WS-send {type:'aside_dismissed', hostId, tmuxSession} — Wave 2
+  //      backend receives this, dismissBtw's into tmux, then
+  //      broadcastAsideDismissed fans out to peer tabs on the same
+  //      sessionKey (cross-tab dismiss coherence per ASIDE-11).
+  // Idempotent: if the WS is closed or the send throws, the optimistic
+  // clear still happened. The backend's next poller cycle will detect
+  // marker-disappearance (user may still have to Escape manually via
+  // SSH in that failure mode) and broadcast dismissed; the WS
+  // aside_dismissed handler above is idempotent so no double-render.
+  // Per T-14-02-01 mitigation: the backend IGNORES msg.hostId +
+  // msg.tmuxSession for send-keys routing (uses connection-scoped
+  // currentHostId + currentTmuxSession only), so these fields are
+  // informational-only from the backend's perspective. Included here
+  // matching AsideDismissedPayload's exported type shape.
+  // Dismiss-loop guard (user 2026-07-26 UAT): dismissing an aside
+  // sends Escape into tmux to close the /btw overlay, which produces
+  // brief pane activity → Claude Code's isIdle flips false → 4s later
+  // returns true. Without a cooldown, that trailing false→true
+  // transition trips the arm-emitter useEffect and re-injects /btw,
+  // creating a dismiss→arm→dismiss loop. 8s covers the ~4-5s
+  // dismiss→settle→isIdle=true path with safety margin.
+  const dismissCooldownUntilRef = useRef<number>(0);
+
+  // Phase 14 followup (user 2026-07-26): full aside-surface reset for
+  // session-changeover paths. Extends clearAsidePending with the two
+  // pieces the pending-only clear misses — the displayed asideText and
+  // the 8s dismissCooldownUntilRef. Called from both changeover paths
+  // (paneKey change and session_changed WS event) so a new pane or
+  // restarted session starts with a genuinely blank aside surface. Safe
+  // even if the new pane's tmux has a live BTW overlay: the backend's
+  // connect-time re-attach probe (ASIDE-09) re-emits aside_ready.
+  const clearAsideState = useCallback(() => {
+    setAsideText(null);
+    clearAsidePending();
+    dismissCooldownUntilRef.current = 0;
+  }, [clearAsidePending]);
+
+  const handleAsideDismiss = useCallback(() => {
+    setAsideText(null);
+    // Phase 14 quick-task 260726-vbd: clear the pending flag and 60s timer
+    // regardless of whether the aside was still pending or already displayed.
+    // Same Escape-into-tmux payload closes an in-flight /btw OR a displayed one.
+    clearAsidePending();
+    dismissCooldownUntilRef.current = Date.now() + 8000;
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(
+          JSON.stringify({
+            type: "aside_dismissed",
+            hostId,
+            tmuxSession,
+          }),
+        );
+      } catch {
+        /* swallow — best-effort; backend detects marker disappearance on its own cycle */
+      }
+    }
+  }, [hostId, tmuxSession]);
+
+  // Phase 56 (2026-08-23): handleWake callback DELETED. The {type:"wake"} WS
+  // message is dead — no frontend surface emits it. Send-into-dormant-pane
+  // now triggers invisible wake at the backend send-path (Plan 56-01) with no
+  // user-visible ceremony.
+
+  // Phase 47 (load-more button) — click handler for the LoadMoreOlderButton
+  // mount at the top of the scroll container. Sends
+  // { type: "fetch_older_range", beforeLine: oldestLoadedLine, count: 20 }
+  // on the pane's long-lived WS, then flips local state to reflect the
+  // in-flight request. Response arrives via the "fetch_older_range_batch"
+  // case in the ws.onmessage switch above.
+  //
+  // Three defense-in-depth guards before send:
+  //   (a) readyState !== OPEN → WS is mid-close or reconnecting; the button
+  //       is already hidden in that state by the visibility gate, but this
+  //       guard defends against a torn-down socket.
+  //   (b) oldestLoadedLine === null → hydration hasn't landed a per-turn
+  //       frame carrying `line` yet (either fresh pane pre-hydration or
+  //       old backend build without Plan 01 widening); the visibility gate
+  //       ALSO hides the button when hasOlderMessages is false, but this
+  //       runtime check is defense-in-depth for stale-state click races.
+  //   (c) oldestLoadedLine <= 1 → already at start of file; sessionHasMore
+  //       is also false in that state and the button is hidden, but again
+  //       runtime defense-in-depth.
+  //
+  // Post-send state flip (order matters — capOff FIRST so the very next
+  // live-tail frame arriving between here and the response uses the
+  // uncapped appendDedup path):
+  //   1. setCapOff(true) → capOffRef mirror-effect fires on next commit;
+  //      the 5 appendDedup sites use appendDedup(prev, parsed) uncapped
+  //      from here on for this pane's lifetime.
+  //   2. setLoadOlderState("in-flight") → button disables at HTML level;
+  //      Plan 02's disabled={status === "in-flight"} prevents a rapid
+  //      second click from re-invoking this handler (Test 7 locks).
+  //   3. setLoadOlderError(null) → clears any prior error state so the
+  //      button re-enters the in-flight aria-label variant cleanly.
+  //
+  // Deps: [oldestLoadedLine] — the ONE place handleLoadOlder differs from
+  // handleWake ([]): the cursor value must be current at click time. React
+  // recreates the callback whenever oldestLoadedLine changes so the
+  // captured value inside the ws.send construction is always fresh.
+  const handleLoadOlder = useCallback(() => {
+    // Synchronous in-flight guard — React setState doesn't reach the DOM's
+    // disabled attribute within the same event-loop tick, so a rapid
+    // double-click would bypass Plan 02's disabled prop. This ref flips
+    // synchronously here so a second immediate invocation returns early
+    // BEFORE the ws.send. Cleared in the response case branch (both success
+    // and error paths). Test 7 locks the behavior.
+    if (loadOlderInFlightRef.current) return;
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    // A reconnect keeps the old bubbles up until its fresh batch lands and
+    // then rebuilds the list; an older batch fetched meanwhile would be lost.
+    if (historyHoldRef.current) {
+      console.info(`[load-older] skipped reason=history-hold hostId=${hostId} sessionId=${tmuxSession ?? 'null'}`);
+      return;
+    }
+    if (oldestLoadedLine === null) return;
+    if (oldestLoadedLine <= 1) return;
+    // quick-260822-7no: structured click log for the full click → WS →
+    // response path. Fires exactly once per click AFTER the three
+    // defense-in-depth guards and BEFORE ws.send so a grep of
+    // `[pv-load-more]` on the browser devtools console output shows every
+    // click event alongside the response and the server-side
+    // `[fetch-older-range]` entries. `messages.length` is captured via
+    // `messagesLenRef.current` to avoid a stale-closure read — deps array
+    // for this callback is [oldestLoadedLine] to prevent recreating on
+    // every incoming message frame (perf).
+    console.info(
+      `[pv-load-more] click beforeLine=${oldestLoadedLine} ` +
+        `currentMessagesLen=${messagesLenRef.current} ` +
+        `sessionHasMore=${sessionHasMore} ` +
+        `sessionTotalLines=${sessionTotalLines}`,
+    );
+    const payload: FetchOlderRangePayload = {
+      type: "fetch_older_range",
+      beforeLine: oldestLoadedLine,
+      count: 20,
+    };
+    loadOlderInFlightRef.current = true;
+    try {
+      ws.send(JSON.stringify(payload));
+    } catch {
+      /* swallow — best-effort; ws may be mid-close */
+    }
+    setCapOff(true);
+    setLoadOlderState("in-flight");
+    setLoadOlderError(null);
+  }, [oldestLoadedLine]);
+
+  const markCapDrop = useCallback(() => {
+    capDroppedRef.current = true;
+  }, []);
+
+  // Back to the default cap-enforced state. Called wherever messages[] is
+  // rebuilt from a fresh replay (pane switch, wire_boot on every WS
+  // attach/reconnect, session-file rotation, session_changed) — a cursor or
+  // capOff carried across would point into a replaced transcript, leave the
+  // replay uncapped, or leave a spinner waiting on a response that died
+  // with the old WS.
+  //
+  // sameSocket: the WS survives the reset (session_changed), so a request
+  // in flight will still be answered — from the OLD transcript. Count it
+  // stale. Otherwise the socket is new and nothing old can arrive.
+  const resetLoadOlderState = useCallback((opts?: { sameSocket?: boolean }) => {
+    if (opts?.sameSocket) {
+      if (loadOlderInFlightRef.current) staleOlderBatchesRef.current += 1;
+    } else {
+      staleOlderBatchesRef.current = 0;
+    }
+    setCapOff(false);
+    capOffRef.current = false;
+    setLoadOlderState("idle");
+    setLoadOlderError(null);
+    setSessionHasMore(true);
+    setOldestLoadedLine(null);
+    loadOlderInFlightRef.current = false;
+    // Cleared through the messages queue, not directly: setMessages
+    // updaters queued before this reset (old-transcript frames that may
+    // cap-drop) run at the next render, AFTER a direct write, and would
+    // re-set the flag for the fresh transcript.
+    setMessages((prev) => {
+      capDroppedRef.current = false;
+      return prev;
+    });
+  }, []);
+
+  // Phase 35 — outbound-write callbacks registered with Terminal.tsx via the
+  // ref-forwarding surface (onRegisterSendInput / onRegisterSendInterrupt props).
+  // Callers in Terminal.tsx (handleInjectedTurnReady, onSend, onInterrupt,
+  // MessageQueueDrawer.onSend) read pvSendInputRef.current / pvSendInterruptRef.current
+  // at call time and invoke these closures. Both close over wsRef (a stable React
+  // ref); .current is read at call time — not captured — so deps:[] is correct
+  // (same posture as handleWake above).
+
+  // sendInput: sends {type:"input", data, [messageQueueItemId]} on PrettyView's
+  // own claude-session WS. Returns true on successful send, false on guard-trip
+  // or catch. The boolean return lets callers (e.g. handleInjectedTurnReady's
+  // comment at Terminal.tsx) treat false as "batch stays in staging for retry".
+  // try/catch is AUTHORITATIVE (supersedes PATTERNS.md brevity example): ws.send
+  // CAN throw if the socket transitions from OPEN to CLOSING between the readyState
+  // guard and the actual send (backgrounding, tab-hide, mid-write network flap).
+  // Returning false on catch gives the caller a truthful no-send signal.
+  //
+  // inputFramesRef: every mqid-tagged input frame sent on the current socket,
+  // with its byte offset in that socket's outbound stream. On WS close the
+  // frames that provably never left the browser go to resendQueueRef and are
+  // resent once the next connection is attached (see unsent-input-frames.ts).
+  const inputFramesRef = useRef<Map<string, InputFrameRecord>>(new Map());
+  const resendQueueRef = useRef<InputFrameRecord[]>([]);
+  // Newest message/image `ts` seen on this pane (host clock, same as replayed
+  // frames) — the replay cutoff stamped on resend-kept pendings.
+  const lastFrameTsRef = useRef<number>(0);
+  const sendInput = useCallback((
+    text: string,
+    mqid?: string,
+    options?: { skipTagNeutralize?: boolean },
+  ): boolean => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      // pv-input diag (attachment-vanish-instrumentation): log guard-trip so
+      // we can see when a caller tried to send but the connection wasn't OPEN.
+      console.warn("[pv-input-client] sendInput guard-trip", {
+        mqid: mqid ?? null,
+        textLen: text.length,
+        wsPresent: !!ws,
+        wsReadyState: ws?.readyState ?? null,
+      });
+      return false;
+    }
+    // Neutralize harness-control-shaped tags before they land in claude's stdin.
+    // Anthropic's Claude Code parses `<bash-input>…</bash-input>`, `<system-reminder>`,
+    // etc. as its own control frames when they appear in user input, so pasting/typing
+    // such a tag would silently execute or interpret it. Inserting U+200B after every
+    // opening `<` of a tag-shaped substring breaks the harness's tag regex while
+    // remaining visually identical in bubbles and copy-outs.
+    //
+    // options.skipTagNeutralize: opt-out for SYSTEM-generated envelopes
+    // where the harness IS the intended
+    // recipient of the control frame. Neutralization is a defense against
+    // USER-typed control frames; callers that own the envelope content set this
+    // flag to deliver an intact tag.
+    const data = options?.skipTagNeutralize
+      ? text
+      : text.replace(/<(\/?[a-zA-Z][a-zA-Z0-9_-]*)/g, "<\u200B$1");
+    // pv-input diag (attachment-vanish-instrumentation): sample outbound queue
+    // depth at every text-input send so we can see whether the client's WS
+    // outbound was jammed when the injected turn was dispatched.
+    const bufBefore = ws.bufferedAmount;
+    const frameStart = queuedOutboundBytes(ws);
+    try {
+      ws.send(
+        JSON.stringify({
+          type: "input",
+          data,
+          ...(mqid ? { messageQueueItemId: mqid } : {}),
+          // Out of the text area: the server checks it for blocked commands.
+          ...(textAreaSendKind(mqid) !== null ? { textArea: true } : {}),
+        }),
+      );
+      // The Enter-only half of a two-frame send can't be resent on its own —
+      // its body went out untagged — so it isn't recorded.
+      if (mqid && text.replace(/\r/g, "").trim().length > 0) {
+        const frames = inputFramesRef.current;
+        for (const [key, r] of frames) {
+          if (r.ws !== ws) frames.delete(key);
+        }
+        frames.set(mqid, {
+          mqid,
+          text,
+          skipTagNeutralize: options?.skipTagNeutralize === true,
+          ws,
+          start: frameStart,
+        });
+      }
+      console.info("[pv-input-client] sendInput sent", {
+        mqid: mqid ?? null,
+        dataLen: data.length,
+        bufferedAmountBefore: bufBefore,
+        bufferedAmountAfter: ws.bufferedAmount,
+        wsReadyState: ws.readyState,
+      });
+      return true;
+    } catch (err) {
+      console.warn("[pv-input-client] sendInput threw", {
+        mqid: mqid ?? null,
+        dataLen: data.length,
+        bufferedAmountBefore: bufBefore,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return false;
+    }
+  }, []);
+
+  // sendInterrupt: sends {type:"interrupt"} on PrettyView's WS. Returns void
+  // (no boolean signal — matching the existing onInterrupt contract in Terminal.tsx).
+  // Swallow-on-throw is fine here: best-effort Ctrl-C, nothing to signal upstream.
+  const sendInterrupt = useCallback((): void => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    try {
+      ws.send(JSON.stringify({ type: "interrupt" }));
+    } catch {
+      /* swallow — best-effort; ws may be mid-close */
+    }
+  }, []);
+
+  // Client fast-path double-tap guard (see INTERRUPT_THROTTLE_MS — the
+  // server-side per-pane throttle is the real one).
+  const interruptLastFireRef = useRef(0);
+  // The Stop orb's press: show "Stopping" at once — the verdict can take
+  // ~1.5s — or say so when there is no connection to send it on.
+  const handleInterrupt = useCallback((): void => {
+    const now = Date.now();
+    if (now - interruptLastFireRef.current < INTERRUPT_THROTTLE_MS) {
+      console.info(`[interrupt] press-throttled hostId=${hostId} tmuxSession=${tmuxSession ?? "null"}`);
+      return;
+    }
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      // Nothing reached the pane, so nothing to guard against a repeat of.
+      console.warn(`[interrupt] press-not-sent reason=ws_not_open hostId=${hostId} tmuxSession=${tmuxSession ?? "null"}`);
+      showInterruptFeedback("failed", INTERRUPT_OUTCOME_HOLD_MS);
+      return;
+    }
+    interruptLastFireRef.current = now;
+    console.info(`[interrupt] press hostId=${hostId} tmuxSession=${tmuxSession ?? "null"}`);
+    interruptPressedAtRef.current = Date.now();
+    showInterruptFeedback("stopping", INTERRUPT_RESULT_TIMEOUT_MS);
+    onInterrupt?.();
+  }, [hostId, tmuxSession, onInterrupt, showInterruptFeedback]);
+
+  // Phase 14 quick-task 260726-vbd: onSend wrapper that detects /btw
+  // submissions and arms the asidePending flag + 60s safety timer.
+  //
+  // Detection: `text.trim().startsWith('/btw ')` OR `text.trim() === '/btw'`
+  // — `/btwXYZ` is NOT the aside slash-command; `/btw` alone or `/btw foo` are.
+  //
+  // Intentionally arms asidePending EVEN IF onSend returns false (WS not open).
+  // Rationale: ComposeBox shows an inline error; the 60s timeout clears the
+  // false alarm; X/Resume also clears immediately (sends Escape to a pane that
+  // received no /btw — a no-op in tmux). Simpler than conditionally arming
+  // based on the boolean return value.
+  //
+  // Always delegates to onSend(text) and returns its boolean result unchanged —
+  // the send itself still needs to fire (that IS what triggers the aside).
+  //
+  // Phase 32 (see .planning/phases/32-.../32-CONTEXT.md): paneKey moved upstream from its
+  // original L743 site so the useAutoScroll hook call below is upstream of handleComposeSend,
+  // letting handleComposeSend close over onSendFired directly at declaration time
+  // (no TDZ, no ref-mirror indirection). paneKey's WS-effect consumers at ~L1015/L1055 still
+  // resolve to this moved declaration.
+  const paneKey = `${hostId}::${tmuxSession}`;
+  // Phase 70: two-state position-derived state machine auto-scroll (at-bottom / not-at-bottom).
+  // paneKey is passed FOR LOGGING ONLY — the hook does not react to paneKey changes per
+  // shape-file § Session re-entry. See use-auto-scroll.ts header + shape-pv-autoscroll-rewrite.md.
+  const { scrollRef, jumpToBottom, onSendFired, noteScrolledAway, noteLayoutChanged, mode, revealed } = useAutoScroll(paneKey);
+
+  // ── Load-more scroll anchor (bounty load-more-scroll-and-order-corruption) ─
+  // The container has overflow-anchor:none (useAutoScroll owns position), so
+  // prepending an older batch leaves scrollTop where it was and the reading
+  // position slides down by the batch height — the user lands at the top of
+  // the new batch. Anchor on the top-most visible bubble instead: capture its
+  // viewport offset when the batch arrives, restore it after the prepend
+  // commits. Element-based (not scrollHeight delta) so a live frame appended
+  // in the same commit can't skew it. A programmatic scrollTop write never
+  // transitions the auto-scroll mode (the hook doesn't listen for scroll).
+  const scrollElRef = useRef<HTMLElement | null>(null);
+  const setScrollEl = useCallback(
+    (el: HTMLElement | null) => {
+      scrollElRef.current = el;
+      scrollRef(el);
+    },
+    [scrollRef],
+  );
+  // Arriving at a conversation that holds a message to the user they haven't
+  // seen (the sidebar's red envelope): land on the oldest unseen one and ring
+  // it, instead of at the bottom (shape-conversation-view). The seen tracker
+  // raises the arrival as it clears the envelope; same key as the sidebar.
+  const messagesRef = useRef(effectiveMessages);
+  messagesRef.current = effectiveMessages;
+  const revealedRef = useRef(revealed);
+  revealedRef.current = revealed;
+  // Opening a conversation that runs past the pane flashes its scrollbar so
+  // there's a hint of more above, then it hides until scrolled or hovered.
+  useEffect(() => {
+    if (revealed) flashScrollbars(scrollElRef.current, { descendants: false });
+  }, [revealed, paneKey]);
+  useEffect(() => {
+    if (source.kind !== "harness" || !tmuxSession) return;
+    let timer: number | null = null;
+    // Once the user starts moving around themselves, the jump is off.
+    const USER_MOVES = ["wheel", "touchmove", "keydown", "pointerdown"] as const;
+    const stop = () => {
+      if (timer !== null) window.clearInterval(timer);
+      timer = null;
+      for (const ev of USER_MOVES) window.removeEventListener(ev, stop, true);
+    };
+    const unsubscribe = subscribeDmArrival(attentionKey(hostId, tmuxSession), (since) => {
+      stop();
+      // Whether a message went to the user is resolved by its bubble (room
+      // members load async), and the list may still be landing (a cold
+      // reload) — keep looking for a while.
+      const MAX_TRIES = 60;
+      let tries = 0;
+      for (const ev of USER_MOVES) window.addEventListener(ev, stop, true);
+      timer = window.setInterval(() => {
+        tries += 1;
+        const container = scrollElRef.current;
+        if (!revealedRef.current || !container) {
+          if (tries >= MAX_TRIES) stop();
+          return;
+        }
+        const newer = new Set(
+          messagesRef.current
+            .filter((m) => m.type === "relay_outbound" && typeof m.ts === "number" && m.ts > since)
+            .map((m) => m.eventId),
+        );
+        const target = Array.from(container.querySelectorAll<HTMLElement>("[data-pv-bubble][data-event-id]")).find(
+          (w) => newer.has(w.dataset.eventId ?? "") && w.querySelector('[data-to-you="true"]'),
+        );
+        if (!target && tries < MAX_TRIES) return;
+        stop();
+        if (!target) {
+          console.info({ operation: "pv_dm_jump_none", hostId, tmuxSession, since });
+          return;
+        }
+        const bubble = target.querySelector<HTMLElement>('[data-to-you="true"]') ?? target;
+        bubble.scrollIntoView({ block: "center" });
+        noteScrolledAway();
+        bubble.classList.add("pv-ring");
+        window.setTimeout(() => bubble.classList.remove("pv-ring"), 2400);
+        console.info({ operation: "pv_dm_jump", hostId, tmuxSession, eventId: target.dataset.eventId });
+      }, 250);
+    });
+    return () => {
+      unsubscribe();
+      stop();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hostId, tmuxSession, source.kind]);
+  const prependAnchorRef = useRef<{ eventId: string; offset: number } | null>(
+    null,
+  );
+  const capturePrependAnchor = useCallback(() => {
+    prependAnchorRef.current = null;
+    const container = scrollElRef.current;
+    if (!container) return;
+    const containerTop = container.getBoundingClientRect().top;
+    const bubbles = container.querySelectorAll<HTMLElement>(
+      "[data-pv-bubble][data-event-id]",
+    );
+    for (const b of bubbles) {
+      const rect = b.getBoundingClientRect();
+      if (rect.bottom > containerTop) {
+        prependAnchorRef.current = {
+          eventId: b.getAttribute("data-event-id") ?? "",
+          offset: rect.top - containerTop,
+        };
+        return;
+      }
+    }
+  }, []);
+
+  // Phase 50 D-18 (Blocker #4 middle): widened to (text, mqid?) so the
+  // ComposeBox-generated mqid threads through to the parent's onSend
+  // (typically IdentitySessionPane's onSend at ~L237-270, which then
+  // forwards to pvSendInputRef and the backend armPvSendWatchdog).
+  //
+  // Phase 93 Slice 3 (D-13): case-selected. Relay case routes to the
+  // adapter's sendMessage (mqid preserved verbatim — Pitfall 4 correlation).
+  // Harness case unchanged.
+  const handleComposeSend = useCallback((text: string, mqid?: string): boolean => {
+    const trimmed = text.trim();
+    if (trimmed.startsWith('/btw ') || trimmed === '/btw') {
+      // Clear any existing timer before arming a fresh one (in case the user
+      // sends /btw twice before the first aside_ready arrives).
+      if (asidePendingTimerRef.current !== null) {
+        clearTimeout(asidePendingTimerRef.current);
+      }
+      setAsidePending(true);
+      asidePendingTimerRef.current = setTimeout(() => {
+        asidePendingTimerRef.current = null;
+        setAsidePending(false);
+      }, 60000);
+    }
+    // A send is the strongest possible "I want to see the reply" signal —
+    // force stick + jump regardless of prior scroll position.
+    onSendFired();
+    if (source.kind === "relay") {
+      // D-13: relay send routes to adapter. mqid MUST propagate byte-for-
+      // byte to preserve Pitfall 4 (Matrix unsigned.transaction_id echo
+      // correlation). If ComposeBox somehow omitted an mqid, generate a
+      // fallback so the adapter's pending-send FIFO still has a key.
+      const effectiveMqid = mqid ?? `relay-fallback-${Date.now()}`;
+      void chatSurfaceAdapter.sendMessage(text, effectiveMqid);
+      return true;
+    }
+    return onSend ? onSend(text, mqid) : false;
+  }, [onSend, onSendFired, source.kind, chatSurfaceAdapter]);
+
+  // ── Phase 50 Plan 03 (D-01..D-08 + D-15/D-19/D-20/D-21) ──────────────
+  // pendingSends: FIFO queue of optimistic-bubble state. Seeded by
+  // handleOptimisticSend synchronously when ComposeBox presses Enter;
+  // head-matched by content on incoming user-role message frames;
+  // cleared or flipped to failed by the 20s timer OR paste_send_failed
+  // OR send_keys_error WS frames. Ref-mirror because the WS onmessage
+  // handler captures a stale React closure once per WS-setup effect run.
+  type PendingSend = {
+    mqid: string;
+    content: string;
+    sentAt: number;
+    state: "sending" | "failed";
+    timer: number | null;
+    // Why the send failed, shown under the red bubble. Set only when the
+    // backend gives a reason the user can act on (a message over the size cap).
+    failNote?: string;
+    // Set on a send kept for resend after a WS drop: the newest transcript
+    // timestamp seen before the drop. The reconnect replays the transcript, and
+    // replayed user turns (ts at or below this) must not settle the bubble.
+    replayCutoffTs?: number;
+    // Phase 80 D-14: attachment metadata carried on the pending record so
+    // ChatMessage renders caption + AttachmentChipStrip via the new
+    // pending-with-attachments branch (Phase 80 D-15). Populated by the
+    // Plan 02 wiring inside PrettyView's onUploadReadyToInject closure
+    // (RESEARCH.md § Option B). Absent for text-only pending sends —
+    // existing text pending flow unchanged.
+    attachments?: Array<{
+      filename: string;
+      size: number;
+      mimetype: string;
+    }>;
+  };
+  const [pendingSends, setPendingSends] = useState<PendingSend[]>([]);
+  // Anything the user is sending closes the tray at once, before its echo.
+  const openAsk = pendingSends.some((p) => p.state === "sending") ? null : openAskFromHistory;
+  const pendingSendsRef = useRef<PendingSend[]>([]);
+  // eventId → the React key of the optimistic bubble it settled (FIFO head
+  // match), so the confirmed bubble keeps that key and React reuses the DOM
+  // node. Entries only matter for the swap itself; cleared with the pending
+  // queue.
+  const settledBubbleKeyRef = useRef<Map<string, string>>(new Map());
+  useEffect(() => {
+    pendingSendsRef.current = pendingSends;
+  }, [pendingSends]);
+
+  // Optimistic WIP: every harness send (compose, attachment batch) shows the WipBubble immediately instead of waiting for the
+  // backend working signal, which lags by a poll normally and by the whole
+  // wake on a dormant pane. Released on the first of: a false→true edge of
+  // backend isWorking after arm (handoff to the real indicator — a level
+  // check would let a still-latched "working" from the previous turn cancel
+  // it instantly), failure of the send that armed it, the same client
+  // timeout the pending bubble uses, or session teardown. Once the turn is
+  // evidently delivered (user echo / assistant message),
+  // the timeout shortens to OPTIMISTIC_WIP_DELIVERED_GRACE_MS: enough polls
+  // for the working signal to take over, without holding the indicator for
+  // the full send ceiling on turns too short for the poll to observe.
+  // Single slot — a newer send takes it over (mqid + timer).
+  const [optimisticWip, setOptimisticWip] = useState(false);
+  const optimisticWipMqidRef = useRef<string | null>(null);
+  const optimisticWipTimerRef = useRef<number | null>(null);
+  const optimisticWipDeadlineRef = useRef<number>(0);
+  const clearOptimisticWip = useCallback((reason: string) => {
+    if (optimisticWipTimerRef.current !== null) {
+      window.clearTimeout(optimisticWipTimerRef.current);
+      optimisticWipTimerRef.current = null;
+    }
+    const mqid = optimisticWipMqidRef.current;
+    if (mqid === null) return;
+    optimisticWipMqidRef.current = null;
+    setOptimisticWip(false);
+    console.info(`[pv-optim-wip] clear mqid=${mqid} reason=${reason}`);
+  }, []);
+  const scheduleOptimisticWipRelease = useCallback(
+    (timeoutMs: number, reason: string) => {
+      if (optimisticWipTimerRef.current !== null) {
+        window.clearTimeout(optimisticWipTimerRef.current);
+      }
+      optimisticWipDeadlineRef.current = Date.now() + timeoutMs;
+      optimisticWipTimerRef.current = window.setTimeout(() => {
+        optimisticWipTimerRef.current = null;
+        clearOptimisticWip(reason);
+      }, timeoutMs);
+    },
+    [clearOptimisticWip],
+  );
+  const armOptimisticWip = useCallback(
+    (mqid: string, timeoutMs: number) => {
+      optimisticWipMqidRef.current = mqid;
+      scheduleOptimisticWipRelease(timeoutMs, "timeout");
+      setOptimisticWip(true);
+      console.info(`[pv-optim-wip] arm mqid=${mqid} timeoutMs=${timeoutMs}`);
+    },
+    [scheduleOptimisticWipRelease],
+  );
+  const clearOptimisticWipForMqid = useCallback(
+    (mqid: string, reason: string) => {
+      if (optimisticWipMqidRef.current === mqid) clearOptimisticWip(reason);
+    },
+    [clearOptimisticWip],
+  );
+  const noteOptimisticWipDelivered = useCallback(
+    (signal: string) => {
+      if (optimisticWipMqidRef.current === null) return;
+      const graceDeadline = Date.now() + OPTIMISTIC_WIP_DELIVERED_GRACE_MS;
+      if (graceDeadline >= optimisticWipDeadlineRef.current) return;
+      scheduleOptimisticWipRelease(
+        OPTIMISTIC_WIP_DELIVERED_GRACE_MS,
+        `delivered-grace signal=${signal}`,
+      );
+      console.info(`[pv-optim-wip] delivered mqid=${optimisticWipMqidRef.current} signal=${signal} graceMs=${OPTIMISTIC_WIP_DELIVERED_GRACE_MS}`);
+    },
+    [scheduleOptimisticWipRelease],
+  );
+  // Phase 50 D-03 failure-path repopulate signal. Passed to ComposeBox
+  // as `overrideText`; ComposeBox's useEffect populates the textarea AND
+  // fires `onOverrideTextConsumed` synchronously so we can reset this
+  // slot back to null on the same tick (Warning #6 — otherwise the
+  // useEffect would refire on subsequent parent re-renders with the
+  // unchanged reference).
+  const [composeOverrideText, setComposeOverrideText] = useState<string | null>(
+    null,
+  );
+
+  // Mirrors ComposeBox's normalizeNewlinesForSend (CR eliminated, LF
+  // preserved) so the optimistic bubble renders the same text the user
+  // actually sent, newlines included.
+  //
+  // Formerly collapseNewlinesForMatch, which collapsed newlines to spaces to
+  // keep head-match content equality byte-identical with the parser-emitted
+  // payload. That contract is GONE: quick-260823-fzy replaced content
+  // equality with FIFO-only head-matching (see the "message" case in the WS
+  // handler), because byte equality was losing to every Claude Code input
+  // transformation. This value is now used ONLY as the pending bubble's
+  // rendered content, so collapsing would just flatten a multi-line message
+  // in the transcript.
+  const normalizeNewlinesForBubble = useCallback((s: string): string => {
+    return s.replace(/\r\n?/g, "\n");
+  }, []);
+
+  // flipToFailed: called by the 20s timer, by the paste_send_failed WS
+  // branch, and by the send_keys_error WS branch. Marks the matching
+  // pending as 'failed' (state:'failed', timer:null). The red-bordered
+  // failed bubble stays in the transcript as the record of the send;
+  // the composebox is NOT repopulated (user 2026-09-02, reversing
+  // Phase 50 D-03 edit-and-resend). Ref-based lookup so we can call
+  // from timer callbacks with fresh state. D-05 invariant: only flips
+  // pendings that are still in state:'sending'; a pending that has
+  // already been matched (removed from the array) is a no-op.
+  const flipToFailed = useCallback((mqid: string, reason: string, failNote?: string) => {
+    setPendingSends((prev) => {
+      const found = prev.find((p) => p.mqid === mqid && p.state === "sending");
+      if (!found) return prev;
+      // Cancel the timer (defense-in-depth — the 20s-timer path calls
+      // flipToFailed inline so its own timer is already firing, but the
+      // paste_send_failed / send_keys_error paths need this).
+      if (found.timer !== null) {
+        window.clearTimeout(found.timer);
+      }
+      console.info(`[diag-dormant-send] flip-to-failed mqid=${mqid} reason=${reason} elapsedMs=${Date.now() - found.sentAt} foundState=${found.state} contentLen=${found.content.length}`);
+      console.warn(
+        `[pv-optim] flip-to-failed mqid=${mqid} reason=${reason} content-length=${found.content.length}`,
+      );
+      return prev.map((p) =>
+        p.mqid === mqid ? { ...p, state: "failed", timer: null, failNote } : p,
+      );
+    });
+    clearOptimisticWipForMqid(mqid, `send-failed cause=${reason}`);
+  }, [clearOptimisticWipForMqid]);
+
+  // Dismiss on a red failed bubble: drop it from the transcript. Only failed
+  // pendings — a bubble still sending can't be dismissed out from under its timer.
+  const dismissFailedSend = useCallback((mqid: string) => {
+    console.info(`[pv-optim] dismiss-failed mqid=${mqid}`);
+    setPendingSends((prev) => prev.filter((p) => !(p.mqid === mqid && p.state === "failed")));
+  }, []);
+
+  // handleOptimisticSend: called by ComposeBox's onOptimisticSend prop
+  // synchronously with (and often BEFORE) the WS write. When
+  // immediateFailure:true (WS not open), seeds the pending in state:'failed'
+  // with no timer armed. Otherwise seeds state:'sending' and arms a
+  // 20000ms client-side timer that flips to failed if no matching parser
+  // signal arrives.
+  const handleOptimisticSend = useCallback(
+    // Phase 80 D-14/D-16: attachments carried on the pending record so
+    // ChatMessage renders caption+chip-strip via the new render branch
+    // (mqid === batchId === messageQueueItemId — RESEARCH.md Pitfall #2).
+    // Optional field: text-only funnel callers omit it (backward-compat
+    // with the Phase 50/68 text-only pending-bubble path).
+    (args: {
+      payload: string;
+      mqid: string;
+      immediateFailure: boolean;
+      attachments?: Array<{
+        filename: string;
+        size: number;
+        mimetype: string;
+      }>;
+    }) => {
+      const { payload, mqid, immediateFailure, attachments } = args;
+      // Phase 68 Plan 02 D-03: render-blacklist for /id commands (reset, etc.).
+      // The funnel ALWAYS generates and threads an mqid through — even for
+      // render-blacklisted payloads — so the backend Phase 56 wake gate fires
+      // for dormant sessions. The suppression is ONLY at this render layer:
+      // the pendingSend record is never added, so no bubble appears. The WS
+      // input frame (sendInput) is unchanged and still carries messageQueueItemId.
+      // isIdCommand (L425-427) is module-scoped and recognizes both raw `/id `
+      // prefix and the harness XML-wrapper form.
+      //
+      // Attachment sends (attachments && length > 0) bypass this gate: the
+      // caption in an attachment send is user-typed content that just happens
+      // to start with `/id `, NOT the harness /id-command intent. Skipping
+      // the seed for attachment sends would leave a real user-role echo
+      // arriving with no matching pending record, and the FIFO head-match
+      // would silently clear an unrelated in-flight pending (code-review M2,
+      // 2026-09-07 — /id-with-attachment corner case).
+
+      // Phase 62 Wave 1 — read dormantRef.current at arm time (D-62-03,
+      // symmetric to backend's dormantLastEmitted read at __applyInputMessageForTests
+      // entry). If dormant, use the widened 220000ms timeout so a healthy
+      // ~90s invisible wake + backend give-up window does not fire the
+      // client-side pre-emptive red-bubble. Reason label distinguishes the
+      // two paths so post-ship diagnostics can grep them apart (D-62-04).
+      const armedDormant = dormantRef.current === true;
+      const timeoutMs = armedDormant
+        ? PENDING_SEND_TIMEOUT_MS_DORMANT
+        : PENDING_SEND_TIMEOUT_MS_NORMAL;
+      const isAttachmentSend = !!(attachments && attachments.length > 0);
+      // Optimistic WIP skips /id commands (an identity load is not a turn
+      // of conversation). WS-not-open sends release it instead of arming.
+      if (immediateFailure) {
+        clearOptimisticWipForMqid(mqid, "immediate-failure");
+      } else if (!isIdCommand(payload) || isAttachmentSend) {
+        armOptimisticWip(mqid, timeoutMs);
+      }
+      if (isIdCommand(payload) && !isAttachmentSend) { return; }
+      const normalized = normalizeNewlinesForBubble(payload);
+      if (immediateFailure) {
+        // D-20: WS was not open on the ComposeBox side — this callback
+        // fires AFTER the first onOptimisticSend that seeded the record.
+        // We flip that existing record to failed (or, if for some reason
+        // we somehow missed the first seed, seed as failed from birth).
+        setPendingSends((prev) => {
+          const existing = prev.find((p) => p.mqid === mqid);
+          if (existing) {
+            if (existing.timer !== null) {
+              window.clearTimeout(existing.timer);
+            }
+            return prev.map((p) =>
+              p.mqid === mqid ? { ...p, state: "failed", timer: null } : p,
+            );
+          }
+          // Fallback: seed directly as failed. Phase 80 D-14: include
+          // attachments only when present + non-empty so text-only records
+          // match the pre-Phase-80 shape byte-for-byte (no unnecessary
+          // undefined key). Not currently exercised for the attachment
+          // path (D-12 gates attachment seeds behind upload success), but
+          // kept consistent so consumers never have to special-case.
+          return [
+            ...prev,
+            {
+              mqid,
+              content: normalized,
+              sentAt: Date.now(),
+              state: "failed",
+              timer: null,
+              ...(attachments && attachments.length > 0
+                ? { attachments }
+                : {}),
+            },
+          ];
+        });
+        // Do NOT populate composeOverrideText — ComposeBox preserves the
+        // draft on WS-not-open (per Task 2 design), so the textarea
+        // already holds the failed payload.
+        return;
+      }
+      const timeoutReason = armedDormant
+        ? "client_timeout_220s_dormant"
+        : "client_timeout_90s_normal";
+      console.info(`[diag-dormant-send] arm mqid=${mqid} dormant=${armedDormant} timeoutMs=${timeoutMs} arm_reason=${timeoutReason} normalizedLen=${normalized.length} pendingCount=${pendingSendsRef.current.length} now=${Date.now()} attachmentCount=${attachments?.length ?? 0}`);
+      const armSentAt = Date.now();
+      const timerHandle = window.setTimeout(() => {
+        console.info(`[diag-dormant-send] fire mqid=${mqid} elapsedMs=${Date.now() - armSentAt} dormant_at_arm=${armedDormant} dormant_at_fire=${dormantRef.current === true} branch=${armedDormant ? "widened" : "normal"} pendingCount=${pendingSendsRef.current.length} stillPending=${pendingSendsRef.current.some((p) => p.mqid === mqid && p.state === "sending")}`);
+        flipToFailed(mqid, timeoutReason);
+      }, timeoutMs);
+      setPendingSends((prev) => [
+        ...prev,
+        {
+          mqid,
+          content: normalized,
+          sentAt: Date.now(),
+          state: "sending",
+          timer: timerHandle,
+          // Phase 80 D-14: attach only when present + non-empty so text-only
+          // records match the pre-Phase-80 shape byte-for-byte (no stray
+          // undefined key). Populated by Plan 02 wiring in the
+          // onUploadReadyToInject closure.
+          ...(attachments && attachments.length > 0 ? { attachments } : {}),
+        },
+      ]);
+    },
+    [normalizeNewlinesForBubble, flipToFailed, armOptimisticWip, clearOptimisticWipForMqid],
+  );
+
+  // handleOverrideTextConsumed: ComposeBox's useEffect fires this the same
+  // tick as it calls setText(overrideText); we reset composeOverrideText
+  // to null so the next parent re-render doesn't force-repopulate the
+  // textarea with the same value (Warning #6 resolution).
+  const handleOverrideTextConsumed = useCallback(() => {
+    setComposeOverrideText(null);
+  }, []);
+
+  // WS-close + unmount cleanup: iterate every pending, clearTimeout
+  // its timer, empty the array. Prevents orphan 20s callbacks firing
+  // against a torn-down component AND matches Plan 50-02's per-connection
+  // pendingMqidsForThisConnection cleanup on the backend so both sides
+  // release together (T-50-03-05 mitigation).
+  // `keep` names pendings to leave in place (timer and all) — the sends queued
+  // for resend after a WS drop; their bubbles stay up until the resend settles.
+  const clearAllPendingSends = useCallback((reason: string = "unspecified", keep?: ReadonlySet<string>) => {
+    for (const p of pendingSendsRef.current) {
+      if (keep?.has(p.mqid)) continue;
+      if (p.timer !== null) {
+        window.clearTimeout(p.timer);
+      }
+      console.info(`[diag-dormant-send] cleanup mqid=${p.mqid} matched_by=${reason} elapsedMs=${Date.now() - p.sentAt} replaced=false state=${p.state}`);
+    }
+    if (!keep) resendQueueRef.current = [];
+    const replayCutoffTs = lastFrameTsRef.current;
+    setPendingSends((prev) =>
+      keep
+        ? prev.filter((p) => keep.has(p.mqid)).map((p) => ({ ...p, replayCutoffTs }))
+        : [],
+    );
+    settledBubbleKeyRef.current.clear();
+    clearOptimisticWip(`pending-cleanup ${reason}`);
+    setComposeOverrideText(null);
+  }, [clearOptimisticWip]);
+  useEffect(() => {
+    return () => {
+      clearAllPendingSends("ws-close-unmount");
+    };
+  }, [clearAllPendingSends]);
+  // Resends the sends that never left the browser before the last WS drop.
+  // Called once the new connection is attached to the pane (pane_state), since
+  // the server ignores input that arrives before attach. A send whose pending
+  // is gone (settled, cleared) is skipped; one the new socket refuses flips to
+  // the red failed bubble.
+  const flushResendQueue = useCallback(() => {
+    const queue = resendQueueRef.current;
+    if (queue.length === 0) return;
+    resendQueueRef.current = [];
+    for (const r of queue) {
+      const pending = pendingSendsRef.current.find((p) => p.mqid === r.mqid && p.state === "sending");
+      if (!pending) {
+        console.info(`[pv-resend] skip mqid=${r.mqid} reason=no-sending-pending`);
+        continue;
+      }
+      const ok = sendInput(r.text, r.mqid, { skipTagNeutralize: r.skipTagNeutralize });
+      console.info(`[pv-resend] resend mqid=${r.mqid} textLen=${r.text.length} ok=${ok} hostId=${hostId} tmuxSession=${tmuxSession ?? "null"}`);
+      if (ok) {
+        armOptimisticWip(r.mqid, 90_000);
+      } else {
+        flipToFailed(r.mqid, "resend-refused");
+      }
+    }
+  }, [sendInput, flipToFailed, armOptimisticWip, hostId, tmuxSession]);
+  const flushResendQueueRef = useRef(flushResendQueue);
+  flushResendQueueRef.current = flushResendQueue;
+  // WIP indicator: composite isWorking from session-working-store.
+  // Patch #260806-ixl: both the PTY-side ttyBusy signal (Terminal.tsx) and
+  // the backgrounded-work signal (PrettyView WS frames) now converge in the
+  // shared store; useSessionIsWorking derives the OR. The key format MUST
+  // match Terminal.tsx's `${hostId}:${tmuxSessionName ?? ""}` exactly —
+  // single colon, not the double-colon paneKey used for auto-scroll.
+  const sessionWorkingKey = `${hostId}:${tmuxSession ?? ""}`;
+  const isWorking = useSessionIsWorking(sessionWorkingKey);
+  // While a turn-over message is the latest one the work indicator stays off —
+  // until new work starts after it: the agent's activity marker moves past the
+  // message's time (both times come from the agent's box). Where the marker
+  // only has whole-second precision (legacy poll path) a same-second turn
+  // can't be told apart that way, so there the working signal turning on
+  // again also releases it. Not on the millisecond path: a lagging frame
+  // taken mid-turn would re-light the indicator after the turn has ended.
+  const activityMtime = useSessionActivityMtime(sessionWorkingKey);
+  const [turnOverWipReleasedFor, setTurnOverWipReleasedFor] = useState<string | null>(null);
+  const prevWorkingForTurnOverRef = useRef<boolean>(isWorking);
+  useEffect(() => {
+    const was = prevWorkingForTurnOverRef.current;
+    prevWorkingForTurnOverRef.current = isWorking;
+    if (!was && isWorking && turnOverTailId !== null) {
+      setTurnOverWipReleasedFor(turnOverTailId);
+      console.info(`[pv-turn-over] release eventId=${turnOverTailId} reason=working-edge`);
+    }
+  }, [isWorking, turnOverTailId]);
+  useEffect(() => {
+    if (turnOverTailId !== null) console.info(`[pv-turn-over] tail eventId=${turnOverTailId} isWorking=${isWorking}`);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- log once per tail
+  }, [turnOverTailId]);
+  const activityWholeSecond = activityMtime === null || activityMtime % 1000 === 0;
+  const turnOverWipReleased =
+    turnOverTail !== null &&
+    ((activityWholeSecond && turnOverWipReleasedFor === turnOverTail.eventId) ||
+      (activityMtime !== null && turnOverTail.ts > 0 && activityMtime > turnOverTail.ts));
+  // Optimistic WIP handoff on the false→true edge only (see the
+  // optimisticWip declaration for why a level check is wrong). Armed while
+  // already working: the flag simply rides along until the next edge,
+  // bridging the gap if the previous turn ends before this one is picked up.
+  const optimisticWipPrevWorkingRef = useRef<boolean>(isWorking);
+  useEffect(() => {
+    const was = optimisticWipPrevWorkingRef.current;
+    optimisticWipPrevWorkingRef.current = isWorking;
+    if (!was && isWorking) clearOptimisticWip("backend-working");
+  }, [isWorking, clearOptimisticWip]);
+
+  // Phase 126 Plan 02 (D-02, D-08, D-09, D-10, D-12) — arm-on-new-assistant-bubble.
+  //
+  // Watches `messages` length growth. For each newly-appended entry, if its
+  // discriminant is `type === "message"` AND `role === "assistant"`, arm this
+  // row's latch (D-02, D-08).
+  //
+  // Type discriminator naturally excludes the other bubble variants:
+  //   - `role === "user"` messages (D-09) — type matches but role fails.
+  //   - `type === "relay_inbound"` (D-12) — type discriminator fails; also,
+  //     relay-kind sources don't populate `messages` at all (they route
+  //     through chatSurfaceAdapter.messages, see effectiveMessages at L720),
+  //     so this effect never observes growth for relay rows — double safety.
+  //   - `RelayOutboundEvent`, `ImageEvent`, `MalformedLineEvent` (D-10) —
+  //     type discriminator fails.
+  //   - `WaitingBubble` (D-11) is rendered by a separate branch at ~L4171
+  //     and never lands in `messages[]`.
+  //
+  // T-126-07 diagnostic: `console.info` on each arm makes the decision
+  // reconstructable from console-forward logs.
+  const prevMessagesLenRef = useRef<number>(0);
+  useEffect(() => {
+    const prevLen = prevMessagesLenRef.current;
+    const currLen = messages.length;
+    if (currLen > prevLen) {
+      for (let i = prevLen; i < currLen; i += 1) {
+        const entry = messages[i];
+        if (entry && entry.type === "message" && entry.role === "assistant") {
+          armRow(sessionWorkingKey);
+          // eslint-disable-next-line no-console
+          console.info(`[ready-cue] armed key=${sessionWorkingKey}`);
+        }
+      }
+    }
+    prevMessagesLenRef.current = currLen;
+  }, [messages, sessionWorkingKey]);
+
+  // Phase 126 Plan 02 (D-03, D-04, D-05, D-06, D-23) — fire-on-WIP-true→false.
+  //
+  // Observes `isWorking` (from useSessionIsWorking at L1698, reused here).
+  // Tracks the previous value in a ref (D-23 edge-detection pattern). On the
+  // true→false edge, gates the fire in this order:
+  //
+  //   1. `isRowArmed(sessionWorkingKey)` — if false, the latch was disarmed
+  //      by a prior fire or never armed (D-04 first flicker semantics). Log
+  //      and return; do NOT call disarmRow (already false, no-op).
+  //   2. `isVisible` (the D-05 gate — AppShell already threads this prop via
+  //      renderTabContent) — if false, the pane isn't on screen and the fire
+  //      is skipped. The latch STAYS ARMED (D-05: arm survives to the next
+  //      WIP-off cycle when the pane is visible; D-06: off-screen rows do
+  //      NOT fire).
+  //   3. Both true → `playTink()` + `disarmRow(sessionWorkingKey)` (D-03,
+  //      atomically in the same effect body).
+  //
+  // T-126-07 diagnostic: three log states (armed / skip-with-reason / fired)
+  // so the console-forward log alone tells the fire decision for each edge.
+  //
+  // Relay-source safety: `useSessionIsWorking(sessionWorkingKey)` returns
+  // `false` unchanged for relay rooms (the working store is fed exclusively
+  // from fleet-status frames per session-working-store.ts:10 header; relay
+  // rooms have no matching backend session). So `wasWorking && !isWorking`
+  // is never satisfied for relay — the fire body is unreachable.
+  const prevIsWorkingRef = useRef<boolean>(isWorking);
+  useEffect(() => {
+    const wasWorking = prevIsWorkingRef.current;
+    prevIsWorkingRef.current = isWorking;
+    if (!wasWorking || isWorking) return;
+    // eslint-disable-next-line no-console
+    const log = (msg: string) => console.info(msg);
+    const armed = isRowArmed(sessionWorkingKey);
+    if (!armed) {
+      log(`[ready-cue] skip key=${sessionWorkingKey} reason=unarmed`);
+      return;
+    }
+    if (!isVisible) {
+      // D-05 gate: off-screen row — skip fire; latch STAYS armed.
+      log(`[ready-cue] skip key=${sessionWorkingKey} reason=not-visible`);
+      return;
+    }
+    // isVisible=true + armed=true → fire (D-03).
+    playTink();
+    disarmRow(sessionWorkingKey);
+    log(`[ready-cue] fired key=${sessionWorkingKey}`);
+  }, [isWorking, isVisible, sessionWorkingKey]);
+
+  // Phase 41 Plan 01: re-source isIdle from the fleet-status broadcast store
+  // instead of reading the isIdle prop (which was always null in production
+  // since Phase 34 retired the PTY-idle feeder). Three-state semantics:
+  //   null  → broadcast has never delivered for this session yet (same as
+  //           Terminal's null-on-first-mount; aside-arm and ComposeBox gate
+  //           treat null as "don't fire / don't gate open").
+  //   false → broadcast says idle (isWorking=false); isIdleDerived=true
+  //           → aside-arm may fire on false→true transition.
+  //   true  → broadcast says working; isIdleDerived=false.
+  //
+  // Phase 41 Plan 02: isIdle prop removed. PrettyView now derives isIdle
+  // entirely from the fleet-status store.
+  const isWorkingRaw = useSessionIsWorkingRaw(sessionWorkingKey);
+  const isIdleDerived: boolean | null =
+    isWorkingRaw === null ? null : !isWorkingRaw;
+
+  // Phase 34 Plan 06: fleet-status waiting signal. When the harness is in
+  // 'waiting' state (permission prompt etc.), show WaitingBubble alongside
+  // WipBubble. Key format matches sessionWorkingKey exactly.
+  const waitingKey = hostId != null ? `${hostId}:${tmuxSession ?? ""}` : null;
+  const waitingFor = useSessionWaitingFor(waitingKey);
+
+  const wsRef = useRef<WebSocket | null>(null);
+
+  // WaitingBubble Allow / Deny: probe + answer the on-screen permission prompt
+  // over this WS while fleet-status reports the pane as waiting.
+  const sendPermissionFrame = useCallback(
+    (frame: Record<string, unknown>): boolean => {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+      try {
+        ws.send(JSON.stringify(frame));
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    [],
+  );
+  const permissionPrompt = usePermissionPrompt(
+    waitingFor !== null,
+    sendPermissionFrame,
+  );
+  const permissionFrameRef = useRef(permissionPrompt.handleFrame);
+  permissionFrameRef.current = permissionPrompt.handleFrame;
+  // Phase 41 code-review H1 fix: reactive mirror of the WS instance for
+  // downstream hooks whose effects key on WS identity (usePrettyViewUploads
+  // in particular). `wsRef.current` mutations are invisible to React's
+  // render loop, so the upload hook only saw a WS transition on the next
+  // unrelated re-render — creating a small window where server-initiated
+  // upload_* frames could be dropped. Setting this in ws.onopen (and
+  // clearing it in ws.onclose + effect cleanup) forces a deterministic
+  // re-render at the exact moment the WS becomes usable.
+  const [uploadWs, setUploadWs] = useState<WebSocket | null>(null);
+  // Bounty pretty-view-per-pane-cost-diag: rolling counter of WS frames
+  // received since the last diag emit. Snapshot fn reads + resets. Also
+  // a ref-mirror of messages.length so the snapshot doesn't need to
+  // touch React state (which would need a re-render dance to stay fresh).
+  const wsFramesRef = useRef<number>(0);
+  const messagesLenRef = useRef<number>(0);
+  const pvRootRef = useRef<HTMLDivElement | null>(null);
+  // The composer dock floats over the end of the message list; the list pads
+  // its end by the dock's height (--pv-dock-h on the root) so the last message
+  // clears it. data-pv-narrow tells bubbles there's no margin for the speak
+  // button beside them.
+  const [dockEl, setDockEl] = useState<HTMLDivElement | null>(null);
+  useLayoutEffect(() => {
+    const root = pvRootRef.current;
+    if (!root) return;
+    let lastDockH = -1;
+    const measure = () => {
+      const dockH = dockEl?.offsetHeight ?? 0;
+      root.style.setProperty("--pv-dock-h", `${dockH}px`);
+      root.dataset.pvNarrow = root.clientWidth < 860 ? "true" : "false";
+      // The list pads its end by the dock's height; when that changes (a
+      // multi-line draft, the task list appearing) keep the newest message
+      // clear of the composer if the list is following the bottom.
+      if (dockH !== lastDockH) {
+        if (lastDockH !== -1) noteLayoutChanged();
+        lastDockH = dockH;
+      }
+    };
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(measure);
+    ro.observe(root);
+    if (dockEl) ro.observe(dockEl);
+    return () => ro.disconnect();
+  }, [dockEl]);
+  // Patch #148 reconnect state — mirrors Terminal.tsx's pattern.
+  // reconnectAttemptsRef: persists across retryKey re-runs; resets on hostId/tmuxSession change
+  //   and on visibilitychange:visible. NOT reset on ws.onopen (defeats the cap on rapid cycles).
+  // reconnectTimeoutRef: pending retry timer; cleared on cleanup/unmount/visibility-hide.
+  // paneKeyRef: "${hostId}::${tmuxSession}" mirror — used inside the WS effect to distinguish
+  //   a fresh pane mount (full reset needed) from a retryKey-triggered re-run (preserve state).
+  // retryKey: bumped by the retry scheduler and by the visibilitychange handler to trigger
+  //   the WS-setup useEffect re-run without losing messages/status on a new-pane navigation.
+  // statusRef: mirrors `status` via a dedicated useEffect so onclose can read current status
+  //   without calling setStatus's functional-update form from inside a WS callback.
+  const reconnectAttemptsRef = useRef<number>(0);
+  const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // quick-260812-x5f: pending debounced-close timer handle.
+  // Set when isVisible=false schedules a WS close; cleared on isVisible=true
+  // (race-safe cancellation) and on unmount (no timer leak).
+  const hiddenPaneCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const paneKeyRef = useRef<string>('');
+  // inline-260823-pv-session-file-rotation-reset: track the last sessionFile
+  // seen on this pane. Backend emits `session_changed` ONLY from the discovery-
+  // repoll ticker on an already-open connection (claude-session-server.ts:4229);
+  // a fresh WS attach that lands on a different sessionFile than the previous
+  // WS just emits the normal `session` metadata frame. When the WS is paused
+  // (hidden-pane-close) and the target's session file rotates in the meantime
+  // (e.g. a crashed agent relaunched in a fresh session), the reopen path silently lands
+  // on the new file. Under patch #504's insertion-sort, new-file frames
+  // (line=1,2,3...) then sort ABOVE the preserved old-file frames — new
+  // content lands invisible above the viewport. Compare in the `session`
+  // handler and run the same reset that `session_changed` would.
+  const lastKnownSessionFileRef = useRef<string | null>(null);
+  const [retryKey, setRetryKey] = useState<number>(0);
+  const statusRef = useRef<Status>('connecting');
+  // Quick 260808-b74: isVisibleRef mirrors the `isVisible` prop so the onclose
+  // retry scheduler and visibilitychange handler can read current visibility
+  // without adding isVisible to the main WS-setup effect deps (which would
+  // tear down and rebuild the WS on every visibility flip — we want the dedicated
+  // WS-pause effect to own that cleanly). Pattern mirrors statusRef above.
+  const isVisibleRef = useRef<boolean>(isVisible);
+  // quick 260808-cd6: dormantRef mirrors `dormant` state for stale-closure
+  // protection inside the WS onmessage handler. The WS onmessage closure
+  // captures state at closure-creation time; reading from a ref gives the
+  // current value without re-creating the socket. Pattern mirrors isVisibleRef.
+  const dormantRef = useRef<boolean>(false);
+  // Phase 14 Wave 3: previous-value ref for the isIdle-transition
+  // arm-emitter useEffect below. Holds the isIdle value from the
+  // previous render so we can detect a real false→true transition
+  // (agent settled after a completed turn — the WIP-indicator idle
+  // window). Initialized to the current isIdleDerived value so a mount
+  // with isIdleDerived already true does NOT fire arm on first paint
+  // (per CONTEXT.md § Trigger — only real transitions arm, not the
+  // initial steady-state observation).
+  // Phase 41-01: was initialized from `isIdle` prop; now uses the
+  // store-derived `isIdleDerived` (always null on first mount since
+  // no broadcast has landed yet — same behavior as before).
+  const prevIsIdleRef = useRef<boolean | null | undefined>(isIdleDerived);
+
+  // phase-29: mirror reconnectAttemptsRef into state so the wsState derivation
+  // below re-runs whenever the retry counter changes. reconnectAttemptsRef is
+  // a ref (mutations do NOT trigger re-render); this state slot is the
+  // observable projection consumed by the state machine's wsState input.
+  const [reconnectAttempts, setReconnectAttempts] = useState<number>(0);
+
+  // Phase 30 (PS30-04): paneState — the last received `pane_state.state`
+  // value from the backend wire frame (see PaneStateEvent in
+  // claude-session-api.ts). null = no pane_state frame received yet
+  // (fresh mount + WS opening). Set by the `case "pane_state"` WS handler
+  // below; reset to null on cold-mount (fresh pane) so the state machine
+  // re-enters resolving until the backend re-emits.
+  //
+  // The paneState value drives every overlay mount gate below via the
+  // trivial usePaneResolvingMachine hook + pure resolveRenderedState
+  // reducer. paneStateRef mirrors paneState for stale-closure-safe reads
+  // inside the WS onmessage handler (D-18 transition guard needs from=).
+  // Pattern mirrors dormantRef / isVisibleRef above.
+  // React state directly. No client-inference indirection — every
+  // ~10 legacy client-hint call sites DELETED per PS30-04 + PS30-05.
+  const [paneState, setPaneState] = useState<PaneState | null>(null);
+  // Phase 31 (plan 31-06): ref mirror for stale-closure-safe from= read in
+  // the [pane-state] state-transition log inside the WS onmessage handler.
+  // Mirror effect is below with other ref-mirror effects.
+  const paneStateRef = useRef<PaneState | null>(null);
+
+  // Phase 05: touch-device gate for the mobile paperclip (UPLOAD-03).
+  // The paperclip appears on touch devices only — desktop NEVER sees it
+  // regardless of window width. Do NOT re-detect touch here; the shared
+  // hook (patch #102) is the single source of truth.
+  const isTouchDevice = useIsTouchDevice();
+
+  // Phase 05: drag/drop state for the DropOverlay. `dragCounter` tracks
+  // enter/leave events, which can misfire when the drag moves over child
+  // elements (each child boundary fires dragenter then dragleave). We
+  // only flip the overlay off when the counter reaches 0.
+  const [isDragOver, setIsDragOver] = useState(false);
+  const dragCounterRef = useRef(0);
+
+  // Phase 05: upload orchestrator. Owns staged-attachment state, chunk
+  // pump, batch atomicity, retry API, and the onUploadReadyToInject seam.
+  // Phase 41 Plan 04 (D-06 → close-verdict follow-up): Uploads rewired off
+  // Terminal SSH WS per shape close-verdict follow-up. usePrettyViewUploads
+  // now receives PrettyView's own claude-session WS. Phase 41 code-review
+  // H1 fix: hand the hook `uploadWs` (React state) rather than
+  // `wsRef.current` (a ref value read at render time). The setUploadWs
+  // call in ws.onopen forces a re-render at the moment the WS is usable,
+  // so the hook's addEventListener attaches deterministically before any
+  // server-initiated upload_* frame can arrive. On close/unmount the
+  // ws.onclose + effect cleanup set uploadWs to null in tandem.
+  // Where the caption of the batch being uploaded came from — the injected
+  // turn is marked with it so the server checks a typed caption.
+  const batchTextAreaRef = useRef<TextAreaSendKind | null>(null);
+  const uploads = usePrettyViewUploads({
+    ws: uploadWs,
+    onUploadReadyToInject: ({ messageQueueItemId, files, caption }) => {
+      if (batchTextAreaRef.current !== null) markTextAreaSend(messageQueueItemId, batchTextAreaRef.current);
+      // Phase 81 D-02: seed pending bubble at upload_ready_to_inject time
+      // (post-upload, pre-echo). mqid === messageQueueItemId === batchId
+      // — RESEARCH.md Pitfall #2. Seed MUST precede formatInjectedUserTurn
+      // + onInjectedTurnReady so FIFO head-match at L1900 finds the pending
+      // record when the harness echo returns (Phase 50 D-01). Superseded /
+      // upload-failure / WS-not-open paths are naturally gated by the
+      // readyFiredRef + batchId guards in use-pretty-view-uploads.ts — the
+      // callback simply does not fire in those cases, so no seed happens
+      // (D-12, D-13).
+      //
+      // attachments mapping strips landingPath + uploadTimestamp: those are
+      // settled-bubble-only fields (chip render doesn't display them, D-05).
+      handleOptimisticSend({
+        payload: caption,
+        mqid: messageQueueItemId,
+        immediateFailure: false,
+        attachments: files.map((f) => ({
+          filename: f.filename,
+          size: f.size,
+          mimetype: f.mimetype,
+        })),
+      });
+      const injectedText = formatInjectedUserTurn({ caption, files });
+      onInjectedTurnReady?.(injectedText, messageQueueItemId);
+      // Clear staging after the injected turn is handed off.
+      uploads.resetBatch();
+    },
+    getBufferedAmount: () => uploadWs?.bufferedAmount ?? 0,
+  });
+
+  // shape-interrupt-button: ComposeBox put a cancelled send's words in
+  // `target` (always the primary box); stage its attachments (already fetched
+  // back from the agent's machine) on the same box, then retire the request so a remounted
+  // ComposeBox can never apply it again.
+  const handleRestoreApplied = useCallback(
+    (id: string, target: string) => {
+      const req = restoreRequest;
+      if (!req || req.id !== id) return;
+      if (req.files.length > 0) {
+        uploads.stageAttachments(target, req.files);
+        console.info(`[interrupt-restore] files-staged id=${id} target=${target} count=${req.files.length}`);
+      }
+      setRestoreRequest(null);
+    },
+    [restoreRequest, uploads],
+  );
+
+  // Phase 32: paneKey moved upstream — see Change 5 site above handleComposeSend.
+  // The former stub block (TEMP-disabled auto-scroll from bounty pv-disable-auto-scroll-temp)
+  // was deleted here — the phase 32 hook above is now the sole reader.
+
+  // Phase 43 (plan 43-07a): TanStack Virtual removed. The message list
+  // is now plain-DOM — every entry in messages[] renders as an in-flow
+  // child of the outer scroll container. The browser's default
+  // overflow-anchor:auto handles size-change re-anchoring natively (no
+  // more virtualizer-vs-user-scroll authority conflict). Every construct
+  // previously living here — scrollElRef, rowVirtualizer, observeElementRect,
+  // getItemKey, estimateSize, initialRect, scrollMargin — is deleted.
+  // composeScrollRefs collapsed: the outer scroll container now binds
+  // directly to useAutoScroll's scrollRef (phase-70 rewrite's stable API surface).
+  // Plan 43-07b will compose a local ref if it needs a second reader.
+
+  // 2026-09-30 UAT: patch #108's chat-region portal target for IdentityModal
+  // is retired. Portaling the modal into the pane trapped it inside the
+  // pane's stacking context, so in split view the modal rendered under the
+  // neighbouring pane. IdentityModal now portals to document.body with a
+  // proper full-viewport backdrop (blocking=true default). The chat-region
+  // wrapper below stays — it's still the geometric parent for the
+  // chat-surface overlays' `absolute inset-0`. No ref needed.
+
+  // Phase 4: derive per-pane identity + hue.
+  //
+  // useSessionIdentity(tmuxSession) reads the identities registry
+  // (patch #17) via the shared session-hue helper (patch #30 lifted the
+  // reader). Returns the matched identity or null; identityHue is the
+  // identity's stored colorHue (0-360) or null when the identity has
+  // no colorHue set.
+  //
+  // Fallback: hue 35 (warm neutral amber, matches the design mock's
+  // Tina hue and the IdentityBadge lg treatment's own fallback). This
+  // gives every pretty-view pane a coherent color chain even when the
+  // pane's identity has no colorHue set OR the pane has no identity
+  // at all. NOTE: this differs from the terminal pane (patch #26)
+  // which uses hueFromSessionName as a hash-based fallback — pretty
+  // view is deliberately more restrained per CONTEXT.md § Decisions 2.
+  // quick-260912-0t4: pass hostId so cross-host name collisions (e.g. two
+  // identities named "willow" on different fleet hosts) resolve to the RIGHT
+  // identity for this pane's host. `hostId` is a prop of PrettyView (see the
+  // Props declaration around L244) and is already threaded through the pane
+  // for context-pct, waiting-key, paneKey, etc.
+  const { identity: storeIdentity, identityHue: storeIdentityHue } = useSessionIdentity(tmuxSession, hostId);
+  // An archived agent isn't in the identities registry — its look comes in
+  // with the archived conversation.
+  const pvIdentity = archived ? archived.identity : storeIdentity;
+  const pvIdentityHue = archived ? archived.identity.colorHue : storeIdentityHue;
+  // 2026-10-06: hands-free voice mode feed for ComposeBox — same voice
+  // resolution chain as the bubble speak buttons (identity → fallback).
+  // Voice candidates in preference order (identity → role → user fallback);
+  // the server speaks in the first one the active TTS provider offers.
+  const speakVoicesKey = speakVoiceCandidates(pvIdentity, userPrefs.fallbackVoice).join("\n");
+  const speakVoices = useMemo(() => (speakVoicesKey ? speakVoicesKey.split("\n") : []), [speakVoicesKey]);
+  const voiceModeFeed = useMemo(
+    () => ({ isWorking, messages, voices: speakVoices }),
+    [isWorking, messages, speakVoices],
+  );
+  const pvIdentityKey = sessionMatchKey(tmuxSession);
+  // An identity with no roles and no colorHue paints in the neutral grey.
+  const pvNeutralLook = hasNeutralLook(pvIdentity);
+  const pvHue = pvIdentityHue ?? (pvNeutralLook ? NEUTRAL_HUE : 35);
+
+  // Phase 40 D-05/D-06: editor open + save-deposit callbacks. handleOpenEditor
+  // captures the pvIdentity displayName snapshot at click-time so the modal's
+  // "from {agent}" sub-header stays stable across the modal's open lifecycle
+  // even if the underlying identity re-resolves. handleStageEditedFile
+  // deposits the edited (filename, content) as a fresh File into the primary
+  // composebox attachment strip via the existing usePrettyViewUploads hook API
+  // (Quick 260802-wxy public surface — no new plumbing). D-07 return trip is
+  // closed by construction: from here the existing ComposeBox send-with-
+  // attachments flow takes over untouched.
+  const handleOpenEditor = useCallback(
+    (input: { messageEventId: string; url: string; filename: string }) => {
+      setEditorOpenState({
+        ...input,
+        agentIdentityName: pvIdentity?.displayName ?? null,
+      });
+    },
+    [pvIdentity?.displayName],
+  );
+
+  // A file option in the tray opens in the same file window as a chip.
+  const handleOpenAskFile = useCallback(
+    (url: string, filename: string) => {
+      if (!openAsk) return;
+      handleOpenEditor({ messageEventId: openAsk.eventId, url, filename });
+    },
+    [openAsk, handleOpenEditor],
+  );
+
+  // Encoded tab spec of this conversation. Rides file-chip drags so a file
+  // pane remembers where its file came from, and is how a file pane's
+  // "Open in modal" finds this conversation: the modal opens here, so Save
+  // attaches the edited copy to this conversation's compose box.
+  const fileDragOrigin = useMemo(() => {
+    if (source.kind === "relay") return encodeTabSpec({ protocol: "relay", roomId: source.roomId });
+    if (!hostName || !source.tmuxSession) return null;
+    return encodeTabSpec({ protocol: "tmux", host: hostName, session: source.tmuxSession });
+  }, [source, hostName]);
+  useEffect(() => {
+    if (!fileDragOrigin) return;
+    const onOpenFromPane = (e: Event) => {
+      const ev = e as CustomEvent<OpenFileInConversationDetail>;
+      if (ev.defaultPrevented || !ev.detail) return;
+      if (ev.detail.origin.toLowerCase() !== fileDragOrigin.toLowerCase()) return;
+      ev.preventDefault();
+      systemLogger.info("[file-pane] open in modal handled by conversation", {
+        operation: "pv_open_file_from_pane",
+        tabId: tabId ?? null,
+        filename: ev.detail.filename,
+      });
+      setEditorOpenState({
+        messageEventId: "",
+        url: ev.detail.url,
+        filename: ev.detail.filename,
+        agentIdentityName: pvIdentity?.displayName ?? null,
+      });
+    };
+    window.addEventListener(OPEN_FILE_IN_CONVERSATION_EVENT, onOpenFromPane);
+    return () => window.removeEventListener(OPEN_FILE_IN_CONVERSATION_EVENT, onOpenFromPane);
+  }, [fileDragOrigin, pvIdentity?.displayName, tabId]);
+
+  // Stable identities for the per-bubble handlers handed to the memoized
+  // ChatMessage. handleThumbsUp/Down depend on effectiveMessages (new on every
+  // message), so passing them
+  // directly would re-render every bubble on every append. The wrappers read
+  // the latest handler via ref at call time — same behavior, stable props.
+  const bubbleHandlersRef = useRef({ handleThumbsUp, handleThumbsDown });
+  bubbleHandlersRef.current = { handleThumbsUp, handleThumbsDown };
+  const stableThumbsUp = useCallback(
+    (eventId: string) => bubbleHandlersRef.current.handleThumbsUp(eventId),
+    [],
+  );
+  const stableThumbsDown = useCallback(
+    (eventId: string) => bubbleHandlersRef.current.handleThumbsDown(eventId),
+    [],
+  );
+
+
+  // Phase 90 Plan 90-06 (D-04): identity-modal title-line click handler.
+  // Swap-not-stack coordination — the identity modal's onClick handler
+  // already fires onOpenChange(false), so we only need to derive the
+  // RoleSummary and set roleModalOpenState here.
+  //
+  // Cosmetics derivation:
+  //   1. Prefer `identity.roleDefaults` if present — it already carries the
+  //      role's title / colorHue / voice / avatar (populated by the backend
+  //      identity read in Phase 86). No round-trip needed for the common case.
+  //   2. Fallback: `listRolesForHost(hostId).then(...)` to fetch the RoleSummary
+  //      by name. Rare — most identities have roleDefaults populated.
+  //
+  // See 90-CONTEXT.md D-04 for the fallback rationale.
+  const handleOpenRoleModal = useCallback(
+    (identity: Identity, roleName: string): void => {
+      // Preferred path: use identity.roleDefaults directly — only valid when
+      // roleName is the role the identity inherits its look from (a
+      // multi-role identity has none, so it always takes the fetch below).
+      // Pretty-names shape (2026-09-30): roles now carry `displayName` in
+      // their frontmatter instead of `title`. Read displayName.
+      if (identity.roleDefaults && roleName === identity.role) {
+        const cosmetics: RoleSummary = {
+          name: roleName,
+          description: "",
+          displayName: identity.roleDefaults.displayName,
+          colorHue: identity.roleDefaults.colorHue,
+          voice: identity.roleDefaults.voice,
+          avatar: identity.roleDefaults.avatar,
+        };
+        // Plan 90-10: no identity indirection — the modal reads/writes by role name.
+        setRoleModalOpenState({
+          roleName,
+          roleCosmetics: cosmetics,
+          hue: cosmetics.colorHue ?? 190,
+        });
+        return;
+      }
+      // Fallback path: fetch the RoleSummary via listRolesForHost.
+      listRolesForHost(hostId)
+        .then((rows) => {
+          const match = rows.find((r) => r.name === roleName);
+          if (!match) {
+            console.warn(
+              "[PrettyView] handleOpenRoleModal: role not found on host",
+              { roleName, hostId },
+            );
+            return;
+          }
+          setRoleModalOpenState({
+            roleName,
+            roleCosmetics: match,
+            hue: match.colorHue ?? 190,
+          });
+        })
+        .catch((err) => {
+          console.warn("[PrettyView] handleOpenRoleModal: fetch failed", err);
+        });
+    },
+    [hostId],
+  );
+
+  const handleStageEditedFile = useCallback(
+    (filename: string, content: string | Uint8Array) => {
+      const type = guessMimeFromFilename(filename) ?? "text/plain";
+      const file = new File([content as BlobPart], filename, { type });
+      uploads.stageAttachments("primary", [file]);
+    },
+    [uploads],
+  );
+
+  // Phase 30 (PS30-04 + PS30-06): derive wsTransportState for the trivial
+  // 2-input state machine from existing PrettyView state (D-13 — WS ladder
+  // unchanged, observed only). The pretty-view WS layer's retry ladder
+  // (patch #148) is untouched; this derivation reads only its observable
+  // state signals:
+  //   - status === "streaming" OR "inactive"                            → "open"
+  //   - status === "error" AND reconnectAttempts >= MAX_RECONNECT_ATTEMPTS
+  //     → "failed-permanently" (retry ladder terminally exhausted)
+  //   - status === "error" AND reconnectAttempts <  MAX_RECONNECT_ATTEMPTS
+  //     → "opening" (retry pending; a fresh WS is scheduled)
+  //   - status === "connecting" AND reconnectAttempts === 0             → "not-connected"
+  //   - status === "connecting" AND reconnectAttempts > 0               → "opening"
+  //
+  // Phase 30 note: the Phase-29 proof-of-life shortcut on the wsState
+  // derivation (which recognized dormant/holding/inactive frames as WS-
+  // open evidence when status hadn't flipped to streaming yet) is
+  // REMOVED. Under Phase 30 the resolveRenderedState reducer's D-11
+  // don't-flicker branch (transport transient drop + previous paneState
+  // → last-known overlay) covers the same failure mode from a different
+  // direction: if paneState !== null it renders the last-known overlay
+  // regardless of wsTransportState. Backend also emits pane_state on
+  // WS attach (see pane-state-emitter startActiveSessionFlow site), so
+  // the `session` frame arrives alongside the initial pane_state:active
+  // frame and status flips to "streaming" naturally.
+  const wsTransportState: WsTransportState =
+    status === "error" && reconnectAttempts >= MAX_RECONNECT_ATTEMPTS
+      ? "failed-permanently"
+      : status === "streaming" || status === "inactive"
+        ? "open"
+        : status === "connecting" && reconnectAttempts === 0
+          ? "not-connected"
+          : "opening";
+
+  // Phase 30 (PS30-04): trivial 2-input derivation. Consumes exactly
+  // (wsTransportState, paneState) → { renderedState, paneState }. The
+  // hook body is a single pure function evaluation; every overlay mount
+  // gate below reads `renderedState === "..."` directly.
+  const { renderedState } = usePaneResolvingMachine({
+    wsTransportState,
+    paneState,
+  });
+
+  // phase-30-restore-resolving-overlay-paint-delay (2026-08-10): 400ms paint-
+  // delay for the resolving-state spinner. Only mounts PrettyViewLoadingOverlay
+  // if renderedState stays "resolving" for >400ms. Cold-mount cases where the
+  // WS reopens + backend pane_state emit lands in <400ms — the typical warm
+  // re-entry to an already-active session — never flash the overlay. Genuinely
+  // slow resolves still see the spinner, just after the paint-delay expires.
+  // Cleanup fires immediately when renderedState leaves "resolving", so the
+  // spinner unmounts instantly on the settle event.
+  //
+  // Phase 97 Finding 1 — case-gate on source.kind === "harness". Both
+  // `paneState` and `wsTransportState` (the inputs to `renderedState`) are
+  // harness-adapter concepts and never fire for a relay mount, so this
+  // effect must be a no-op for relay. The relay case's peer veil-arm
+  // effect below dismisses on `chatSurfaceAdapter.isMessagesLoaded=true`
+  // instead. Adding the guard here is a NULL change for existing harness
+  // mounts (source.kind === "harness" in every harness call site).
+  useEffect(() => {
+    if (source.kind !== "harness") return;
+    if (renderedState !== "resolving") {
+      setShowResolvingSpinner(false);
+      return;
+    }
+    const t = setTimeout(() => {
+      setShowResolvingSpinner(true);
+    }, 400);
+    return () => {
+      clearTimeout(t);
+    };
+  }, [source.kind, renderedState]);
+
+  // Phase 97 Finding 1: relay-case peer veil-arm.
+  // Mirrors the harness veil's 400ms delay-arm treatment (flash-suppression
+  // on fast WS reconnect). Dismisses when the relay adapter reports the
+  // first history_batch frame has landed (isMessagesLoaded=true), matching
+  // the harness pane_state:active signal semantics. Empty rooms dismiss
+  // because history_batch fires regardless of events.length — the FRAME
+  // is the signal, not the array cardinality (per Phase 97 D-03 + D-04).
+  useEffect(() => {
+    if (source.kind !== "relay") return;
+    if (chatSurfaceAdapter.isMessagesLoaded === true) {
+      setShowResolvingSpinner(false);
+      return;
+    }
+    const t = setTimeout(() => {
+      setShowResolvingSpinner(true);
+    }, 400);
+    return () => {
+      clearTimeout(t);
+    };
+  }, [source.kind, chatSurfaceAdapter.isMessagesLoaded]);
+
+  useEffect(() => {
+    // Phase 92 Slice 1 (D-09): harness ingestion runs only when source is
+    // harness. Relay case's ingestion is owned by useRelayAdapter (Slice 3).
+    // Guard is the FIRST statement so no harness-specific state mutation
+    // ever runs during a relay-source mount. `source.kind` is added to the
+    // effect's dep array below so the effect re-fires if the case flips
+    // (which does not happen for a stably-mounted harness pane — so harness
+    // behavior is byte-preserved).
+    if (source.kind !== "harness") return;
+    // Patch #148: distinguish a fresh pane mount from a retryKey-triggered re-run.
+    // On a fresh pane (hostId/tmuxSession changed), reset ALL state and the attempt
+    // counter. On a retry re-run (same pane, retryKey bumped), preserve messages/
+    // status so the UI does not flash blank while reconnecting.
+    // paneKey is computed in the render body (line 1056) and passed into useAutoScroll;
+    // paneKey is now parameter-carried FOR LOGGING ONLY — the hook does not react to
+    // paneKey changes per shape-file § Session re-entry. Reuse the same value here.
+    if (paneKey !== paneKeyRef.current) {
+      // Sends queued for resend belong to the previous pane — never type them
+      // into this one.
+      if (resendQueueRef.current.length > 0) {
+        clearAllPendingSends("pane-change");
+      }
+      inputFramesRef.current.clear();
+      lastFrameTsRef.current = 0;
+      // Fresh pane mount — full reset.
+      setMessages([]);
+      resetInterruptViewState();
+      setStatus("connecting");
+      setInactiveReason(null);
+      setErrorMessage(null);
+      // Phase 90 Plan 00 Wave 0 (D-10 delivery mechanism, user 2026-09-08
+      // D-03 mechanical waiver): contextPct now lives on fleet-status —
+      // no local reset needed. The fleet-status snapshot on the WS
+      // re-subscribe repopulates the store for this key; a `gone` frame
+      // clears the store entry naturally via AppShell's onGone dispatch.
+      setHarnessTasks([]);
+      setWorkNarration(null);
+      setBackgroundedAgents([]);
+      setBackgroundedShells([]);
+      // Phase 30 (PS30-04): reset paneState on cold-mount (fresh pane needs
+      // to re-resolve). Fresh pane clears its own paneState state slot so
+      // the trivial state machine short-circuits to `resolving` per truth-
+      // table row (c) until the backend emits pane_state on the fresh WS.
+      setPaneState(null);
+      // Phase 14 followup: full aside-surface reset for fresh-pane mount.
+      // Clears displayed asideText + pending flag + 60s timer + 8s dismiss
+      // cooldown. Backend's connect-time re-attach probe (ASIDE-09) re-emits
+      // aside_ready if the NEW pane's tmux still has an open BTW overlay.
+      clearAsideState();
+      // Fix WR-01/M1 (2026-09-20): feedbackModalContext is per-pane ephemeral —
+      // it holds the eventId + exchangeText of the assistant message the user
+      // clicked thumbs-down on. Without this clear, a modal opened in pane A
+      // that stays open through a paneKey switch to pane B would fire the
+      // thumbs-down POST with pane A's eventId (D-32 says messageRef = the
+      // clicked message's eventId) against pane B's fresh transcript — a
+      // silent mis-attribution with no error surface. Reset alongside the
+      // other per-pane ephemerals here.
+      setFeedbackModalContext(null);
+      // Phase 47 (load-more button): transient-across-pane-lifetimes reset
+      // per CONTEXT.md § Philosophy — close/reopen returns the pane to the
+      // default cap-enforced state. Reset all 6 new state slots (capOff,
+      // loadOlderState, loadOlderError, sessionTotalLines, sessionHasMore,
+      // oldestLoadedLine) + defensive ref sync of capOffRef. Without this
+      // block, a re-opened pane would inherit the previous pane's cap-off
+      // flag AND its oldestLoadedLine cursor — the next click would send
+      // a beforeLine pointing into the OLD session file, contradicting
+      // CONTEXT.md § Philosophy "Transient across pane lifetimes".
+      resetLoadOlderState();
+      setSessionTotalLines(null);
+      // inline-260823-pv-session-file-rotation-reset: fresh-pane mount also
+      // clears the last-known sessionFile so the first `session` frame on the
+      // new pane doesn't spuriously flag "rotation" against a stale ref value
+      // carried over from a different pane.
+      lastKnownSessionFileRef.current = null;
+      reconnectAttemptsRef.current = 0;
+      // phase-29: mirror into state so wsState derivation re-runs on cold-mount
+      // reconnect-counter reset.
+      setReconnectAttempts(0);
+      paneKeyRef.current = paneKey;
+    }
+    // retryKey-triggered re-runs skip the reset above — preserving messages/status
+    // so the UI stays visible while the fresh WS is being opened.
+
+    let cancelled = false;
+    const ws = openClaudeSessionSocket();
+    trackOutboundBytes(ws);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      if (cancelled) return;
+      console.info(`[ctx-pct-diag] WS open sessionId=${tmuxSession ?? 'null'} hostId=${hostId} paneKey=${paneKey}`);
+      const payload: ConnectToPanePayload = {
+        type: "connectToPane",
+        hostId,
+        tmuxSession,
+        ...(archivedRef.current ? { archived: true } : {}),
+      };
+      try {
+        ws.send(JSON.stringify(payload));
+      } catch {
+        /* ws may be mid-close */
+      }
+      // Patch #148: clear any stale "Connection closed" banner from a prior
+      // attempt now that the fresh WS is confirmed open. Do NOT reset
+      // reconnectAttemptsRef here — a rapid open/close cycle would defeat the cap.
+      setErrorMessage(null);
+      // Phase 41 code-review H1 fix: publish the now-open WS into React
+      // state so usePrettyViewUploads re-renders and attaches its
+      // addEventListener before any server-initiated upload_* frame can
+      // arrive. Paired with setUploadWs(null) in ws.onclose + effect
+      // cleanup below.
+      setUploadWs(ws);
+    };
+
+    const dropHistoryHold = () => {
+      const hold = historyHoldRef.current;
+      if (!hold) return;
+      historyHoldRef.current = null;
+      if (hold.timer !== null) clearTimeout(hold.timer);
+    };
+    // Apply the held frames in order, synchronously, inside one task so
+    // React renders the opening batch once.
+    const releaseHistoryHold = (reason: "ready" | "timeout") => {
+      const hold = historyHoldRef.current;
+      if (!hold) return;
+      dropHistoryHold();
+      console.info(
+        `[history-hold] release reason=${reason} trigger=${hold.trigger} frames=${hold.held.length} ` +
+          `held_ms=${Math.round(performance.now() - hold.startedAt)} reset=${hold.resetOnRelease} ` +
+          `sessionId=${tmuxSession ?? 'null'} hostId=${hostId}`,
+      );
+      if (hold.resetOnRelease) {
+        setMessages([]);
+        resetInterruptViewState();
+        resetLoadOlderState();
+      }
+      for (const ev of hold.held) ws.onmessage?.call(ws, ev);
+    };
+    const beginHistoryHold = (trigger: string, opts?: { resetOnRelease?: boolean }) => {
+      dropHistoryHold();
+      historyHoldRef.current = {
+        held: [],
+        timer: setTimeout(() => releaseHistoryHold("timeout"), HISTORY_HOLD_TIMEOUT_MS),
+        startedAt: performance.now(),
+        trigger,
+        resetOnRelease: opts?.resetOnRelease === true,
+      };
+    };
+
+    ws.onmessage = (event: MessageEvent<string>) => {
+      if (cancelled) return;
+      // Bounty pretty-view-per-pane-cost-diag: count every landed frame
+      // regardless of parse outcome — reflects raw WS message rate.
+      wsFramesRef.current += 1;
+      let parsed: ClaudeSessionServerEvent;
+      try {
+        parsed = JSON.parse(event.data) as ClaudeSessionServerEvent;
+      } catch {
+        return;
+      }
+      if (historyHoldRef.current && HISTORY_HELD_TYPES.has(parsed.type)) {
+        historyHoldRef.current.held.push(event);
+        return;
+      }
+      // quick 260808-cd6: live-frame auto-dismiss. When the dormant overlay is
+      // up and a live-shape JSONL frame arrives, the supervisor's recover path
+      // has relaunched claude + /id ran — dismiss the overlay immediately.
+      // Uses dormantRef (not dormant state) to avoid stale-closure inside the WS
+      // onmessage handler. Hidden-pane suppression is inherited from patch #344's
+      // WS-pause on !isVisible; no additional gate needed here — a hidden pane's
+      // WS is closed so dormant frames are never received.
+      if (
+        dormantRef.current &&
+        (parsed.type === "message" ||
+          parsed.type === "image" ||
+          parsed.type === "relay_inbound" ||
+          parsed.type === "relay_outbound" ||
+          parsed.type === "malformed_line" ||
+          parsed.type === "compaction" ||
+          parsed.type === "compaction_guidance" ||
+          // context_pct WITH dormant:true is emitted from the dormant-branch
+          // JSONL read (not a supervisor-recovery signal); skip auto-dismiss
+          // in that case so the meter can update without wiping the overlay.
+          (parsed.type === "context_pct" && !parsed.dormant) ||
+          parsed.type === "harness_tasks" ||
+          parsed.type === "session")
+      ) {
+        setDormant(false);
+        // Phase 56 (2026-08-23): waking-state setters DELETED (no local slots
+        // exist any more — the former dormant-overlay is gone). The dormantRef
+        // flip above is preserved because backend still emits {type:"dormant"}
+        // frames for internal state tracking.
+      }
+      // FIFO head-match (quick-260823-fzy): an incoming user-role frame
+      // settles the oldest sending pending — send order is the match signal.
+      const settleOldestPendingSend = (
+        incomingEventId: unknown,
+        incomingLine: unknown,
+        incomingText: string,
+        frameType: "message" | "image",
+        incomingTs: unknown,
+      ) => {
+        const list = pendingSendsRef.current;
+        const isReplayFor = (p: PendingSend) =>
+          p.replayCutoffTs !== undefined && typeof incomingTs === "number" && incomingTs <= p.replayCutoffTs;
+        const oldestSendingIdx = list.findIndex((p) => p.state === "sending" && !isReplayFor(p));
+        const incomingPreview = incomingText.replace(/\s+/g, " ").trim().slice(0, 60);
+        if (oldestSendingIdx !== -1) {
+          const match = list[oldestSendingIdx]!;
+          console.info(`[diag-dormant-send] cleanup mqid=${match.mqid} matched_by=fifo-head-match frame=${frameType} elapsedMs=${Date.now() - match.sentAt} replaced=true incoming_eventId=${incomingEventId} incoming_line=${incomingLine ?? "?"} pendingCountBefore=${list.length} preview="${incomingPreview}"`);
+          if (match.timer !== null) window.clearTimeout(match.timer);
+          if (typeof incomingEventId === "string") {
+            settledBubbleKeyRef.current.set(incomingEventId, `pending-${match.mqid}`);
+          }
+          setPendingSends((prev) => prev.filter((p) => p.mqid !== match.mqid));
+        } else {
+          console.info(`[diag-dormant-send] incoming-user-frame mqid=n/a matched_by=none frame=${frameType} pendingCountBefore=${list.length} incoming_eventId=${incomingEventId} incoming_line=${incomingLine ?? "?"} action=newBubble reason=no-sending-pending preview="${incomingPreview}"`);
+        }
+      };
+      switch (parsed.type) {
+        case "archived_state": {
+          console.info(`[archived-view] state=${parsed.state} noHistory=${parsed.noHistory === true} archivedView=${archivedRef.current !== undefined} hostId=${hostId} identity=${tmuxSession ?? "null"}`);
+          if (archivedRef.current) {
+            // Settle — never leave the loading spinner up. Archived: like a
+            // sleeping pane (messages, no overlays); gone / live again: the
+            // pane's own notice and strip say what's happening.
+            setStatus("streaming");
+            setPaneState(parsed.state === "archived" ? "dormant" : "inactive");
+            archivedRef.current.onState(parsed);
+          } else if (parsed.state === "archived") {
+            onAgentArchivedRef.current?.();
+          }
+          break;
+        }
+        case "pane_state": {
+          // Phase 30 (PS30-01 + PS30-04): backend-authoritative pane-entry
+          // verdict. Backend emits on WS attach (after connectToPane
+          // discovery via startActiveSessionFlow — see Plan 30-01 funnel
+          // sites) + on every state change (holding / dormant / inactive /
+          // active-recovery / session-changed all funnel through the
+          // pane-state-emitter). Frontend just stores it — no inference,
+          // no client hints. Overlay mount gates
+          // below read paneState (via the trivial usePaneResolvingMachine
+          // hook + resolveRenderedState pure reducer) directly.
+          // parsed.state is one of "active"|"holding"|"dormant"|"inactive"|"error";
+          // parsed.reason is optional diagnostic string, currently unused by
+          // the UI (T-30-03-03 information-disclosure mitigation — future UI
+          // enhancements that surface reason must go through a fresh threat
+          // review).
+          // Phase 31 (plan 31-06 / D-16): receive-side log. Pairs with
+          // backend [pane-state-emitter] from plan 31-08 for D-16 cross-side
+          // correlation — match on sessionId= field in both logs.
+          console.info(`[pane-state] received phase=${parsed.state} reason="${parsed.reason ?? ''}" sessionId=${tmuxSession ?? 'null'} hostId=${hostId}`);
+          // D-18 discipline: only log a transition when the value actually changes.
+          // paneStateRef.current holds the stale-closure-safe previous value
+          // (mirrors paneState via the mirror useEffect below).
+          if (paneStateRef.current !== parsed.state) {
+            console.info(`[pane-state] state-transition from=${paneStateRef.current ?? 'null'} to=${parsed.state} trigger=pane-state-frame sessionId=${tmuxSession ?? 'null'} hostId=${hostId}`);
+          }
+          setPaneState(parsed.state);
+          // The connection is attached to the pane — sends lost to the last
+          // WS drop can go out now.
+          if (parsed.state === "active" || parsed.state === "dormant") {
+            flushResendQueueRef.current();
+          }
+          // Phase 76 Plan 01 — D-01/D-02 signal unification (option a):
+          //
+          // D-01: Two dormancy signal sources exist. Signal A ({type:"dormant"})
+          // is emit-on-change and can go stale on WS reconnect while dormant —
+          // the backend does not re-emit it if the cached-session fast-path fires
+          // (claude-session-server.ts:7774 condition result.reason === "not_claude"
+          // is not met). Signal B ({type:"pane_state"}) is always re-emitted on
+          // every WS attach via startActiveSessionFlow — it is never stale.
+          //
+          // D-02: Feed setDormant from BOTH signal cases so dormantRef stays
+          // authoritative through both channels (option a — strictly additive,
+          // zero consumer migration). The arm-site read at handleOptimisticSend
+          // (PrettyView.tsx:1233 — "const armedDormant = dormantRef.current === true")
+          // is UNCHANGED; it now reads a correctly-populated ref.
+          //
+          // D-04: This is the ONLY added write site. case "dormant" at
+          // PrettyView.tsx:2147 is deliberately preserved as the Signal A write
+          // site (removing it would regress the Wave 1 live-frame auto-dismiss
+          // path at PrettyView.tsx:1741-1754 which relies on Signal A). The
+          // dormantRef mirror useEffect at PrettyView.tsx:2555-2560 is unchanged.
+          //
+          // Root cause of the Phase 62 miss: reconnect while dormant → backend
+          // skips the {type:"dormant"} re-emit on the fresh WS → dormantRef.current
+          // stays false → handleOptimisticSend arms the 20s branch instead of 220s.
+          // pane_state:dormant always arrives on reconnect and now writes dormant=true.
+          //
+          // "error" pane_state is deliberately NOT handled here — it is a WS-transport-
+          // level state, not a session-dormancy assertion (Risk 2 rationale).
+          //
+          // Post-review nit fixes:
+          // - Symmetric diagnostic on BOTH true and false writes (so a future
+          //   dormant_at_arm=false mystery has a trail for the false branch too).
+          // - Transition-dedup on the diag log — mirrors the paneStateRef
+          //   transition-log dedup above so long dormancies don't spam the
+          //   console-forward server with idempotent frames.
+          //
+          // The `pane_state:holding` → setDormant(false) mapping is load-bearing
+          // in tandem with the ComposeBox mount gate below at ~L3496, which
+          // deliberately EXCLUDES renderedState === "holding" — so no send
+          // can arm during holding. If that mount gate ever adds "holding",
+          // this branch must be reconsidered (holding is Claude relaunching,
+          // not "awake and ready for input" — arming a 20s branch during
+          // holding would misfire).
+          if (parsed.state === "dormant") {
+            if (dormantRef.current !== true) {
+              console.info(`[diag-dormant-send] pane-state-drove-dormant state=${parsed.state} prev=${dormantRef.current} sessionId=${tmuxSession ?? 'null'}`);
+            }
+            setDormant(true);
+          } else if (
+            parsed.state === "active" ||
+            parsed.state === "holding" ||
+            parsed.state === "inactive"
+          ) {
+            if (dormantRef.current !== false) {
+              console.info(`[diag-dormant-send] pane-state-drove-awake state=${parsed.state} prev=${dormantRef.current} sessionId=${tmuxSession ?? 'null'}`);
+            }
+            setDormant(false);
+          }
+          // pane_state === "error" — leave dormant unchanged (Risk 2).
+          // Sister-fix to Phase 62: on reconnect against a dormant pane, backend
+          // sends pane_state but no `session` frame (the ONLY site that clears
+          // status back to "streaming" — line ~1947). Without this line, status
+          // stays "error" post-reconnect → reconnectingActive stays true →
+          // send/reset/thumbs/recap disabled even though the WS is healthy and
+          // paneState is dormant. Any healthy pane_state proves the WS works.
+          if (parsed.state !== "error" && statusRef.current === "error") {
+            console.info(`[diag-status-clear] pane-state-drove-status-clear state=${parsed.state} sessionId=${tmuxSession ?? 'null'} hostId=${hostId}`);
+            setStatus("streaming");
+          }
+          break;
+        }
+        case "session": {
+          // Session-info frame — flip to streaming; not rendered.
+          setStatus("streaming");
+          // Phase 47 (load-more button): capture the widened `totalLines`
+          // field (Plan 01 SessionMetaEvent.totalLines?). Diagnostic only —
+          // see the hasOlderMessages gate for what drives the button.
+          // Optional in the wire type for backward-compat with pre-Phase-47
+          // backend builds; we only set state when a numeric value arrives
+          // so the null default (fresh pane) is preserved for old backends.
+          if (typeof parsed.totalLines === "number") {
+            setSessionTotalLines(parsed.totalLines);
+          }
+          // inline-260823-pv-session-file-rotation-reset: rotation detection
+          // at fresh-WS attach. See the ref declaration for the full failure
+          // mode. Reset mirrors `session_changed` below (~L2130) exactly —
+          // session-scoped state must be dropped so the fresh tail's -n +1
+          // replay hydrates cleanly. Skip the reset on the first `session`
+          // frame after a fresh-pane mount (prev === null) — the fresh-pane
+          // reset already ran.
+          const prevSessionFile = lastKnownSessionFileRef.current;
+          if (prevSessionFile !== null && prevSessionFile !== parsed.sessionFile) {
+            console.info(
+              `[session-frame] rotation-detected prev=${prevSessionFile} next=${parsed.sessionFile} hostId=${hostId} tmuxSession=${tmuxSession ?? 'null'}`,
+            );
+            setMessages([]);
+            resetInterruptViewState();
+            resetLoadOlderState();
+            beginHistoryHold("rotation");
+            setHarnessTasks([]);
+            setWorkNarration(null);
+            // Phase 90 Plan 00 Wave 0 (D-10 delivery mechanism) — contextPct
+            // now lives on fleet-status; no local reset needed. Next
+            // fleet-status frame reconciles.
+            setBackgroundedAgents([]);
+            setBackgroundedShells([]);
+            clearAsideState();
+            clearAllPendingSends("session-rotation");
+          }
+          lastKnownSessionFileRef.current = parsed.sessionFile;
+          break;
+        }
+        case "dormant_session_meta": {
+          // Dormant-branch analog of "session" — populates sessionTotalLines
+          // so the load-more button's visibility gate evaluates correctly on
+          // dormant panes too. Distinct case (not a widened "session")
+          // because the "session" handler above flips status to "streaming"
+          // and the auto-dismiss guard at L2607 clears dormant state — both
+          // wrong for a dormant pane. Also stashes lastKnownSessionFileRef
+          // so if the pane later wakes and gets a real "session" frame, the
+          // rotation-detection compare has a baseline. No status flip; no
+          // dormant clear.
+          if (typeof parsed.totalLines === "number") {
+            setSessionTotalLines(parsed.totalLines);
+          }
+          lastKnownSessionFileRef.current = parsed.sessionFile;
+          break;
+        }
+        case "message": {
+          if (typeof parsed.ts === "number" && parsed.ts > lastFrameTsRef.current) {
+            lastFrameTsRef.current = parsed.ts;
+          }
+          // quick-260823-fzy: FIFO-only head-match. Byte equality on collapsed
+          // content was fighting every Claude Code input transformation:
+          // slash-command XML wrap (typed `/fake args` → jsonl frame
+          // `<command-message>fake</command-message>\n<command-name>/fake</command-name>\n<command-args>args</command-args>`),
+          // JSON paste normalization, and every future CC wrap. Real evidence:
+          // ~/.claude/projects/-home-ubuntu-skynet-tina/e958881b-e151-443b-b91f-af2973c00d4e.jsonl
+          // ts=2026-08-23T01:41:48.723Z (user's /fake in tina session).
+          // Order-based semantic is preserved by the transport: CC processes
+          // user input serially, session file is written in order, WS preserves
+          // order — SEND ORDER itself IS the match signal. First incoming
+          // user-role frame clears the oldest sending pending (FIFO + role +
+          // state gate), period. Independent of appendDedupWithCap below
+          // (per-eventId dedup, different purpose).
+          if (parsed.role === "user" || parsed.role === "assistant") {
+            noteOptimisticWipDelivered(`${parsed.role}-message`);
+          }
+          if (parsed.role === "user") {
+            settleOldestPendingSend(
+              parsed.eventId,
+              parsed.line,
+              typeof parsed.content === "string" ? parsed.content : "",
+              "message",
+              parsed.ts,
+            );
+          }
+          // Phase 43 Plan 43-07b — drop-oldest cap enforcement on live-append.
+          setMessages((prev) =>
+            capOffRef.current
+              ? appendDedup(prev, parsed)
+              : appendDedupWithCap(prev, parsed, WORKING_SET_CAP, markCapDrop),
+          );
+          // Phase 47 (load-more button) — seed oldestLoadedLine from the min
+          // `line?: number` across all incoming per-turn frames (Plan 01
+          // additive optional widening). The cursor is the smallest line
+          // seen so far; the next click's beforeLine reads this. Optional
+          // field so old backends omitting `line` are tolerated silently.
+          setOldestLoadedLine((prev) => {
+            if (typeof parsed.line !== "number") return prev;
+            if (prev === null || parsed.line < prev) return parsed.line;
+            return prev;
+          });
+          break;
+        }
+        case "image": {
+          if (typeof parsed.ts === "number" && parsed.ts > lastFrameTsRef.current) {
+            lastFrameTsRef.current = parsed.ts;
+          }
+          // Patch #86: image bubbles interleave with text messages in strict
+          // wire order — same state channel, same dedup on eventId. The
+          // render branch below discriminates on `m.type`.
+          // A user turn can arrive as an image frame when Claude Code turned
+          // image paths in the sent text into inline images. It is still the
+          // echo of the oldest pending send, so it settles that pending
+          // bubble exactly like a user message frame — otherwise the pending
+          // bubble lingers beside the confirmed one (duplicate bubble).
+          if (parsed.role === "user") {
+            noteOptimisticWipDelivered("user-image");
+            settleOldestPendingSend(
+              parsed.eventId,
+              parsed.line,
+              typeof parsed.text === "string" ? parsed.text : "",
+              "image",
+              parsed.ts,
+            );
+          }
+          // Phase 43 Plan 43-07b — drop-oldest cap enforcement on live-append.
+          setMessages((prev) =>
+            capOffRef.current
+              ? appendDedup(prev, parsed)
+              : appendDedupWithCap(prev, parsed, WORKING_SET_CAP, markCapDrop),
+          );
+          // Phase 47 (load-more button) — seed oldestLoadedLine (see message case).
+          setOldestLoadedLine((prev) => {
+            if (typeof parsed.line !== "number") return prev;
+            if (prev === null || parsed.line < prev) return parsed.line;
+            return prev;
+          });
+          break;
+        }
+        case "relay_outbound": {
+          // RELAYBUB-01: outbound relay frame → RelayOutboundBubble (identity-hue, left-aligned per patch #200).
+          // Phase 43 Plan 43-07b — drop-oldest cap enforcement on live-append.
+          setMessages((prev) =>
+            capOffRef.current
+              ? appendDedup(prev, parsed)
+              : appendDedupWithCap(prev, parsed, WORKING_SET_CAP, markCapDrop),
+          );
+          // Phase 47 (load-more button) — seed oldestLoadedLine (see message case).
+          setOldestLoadedLine((prev) => {
+            if (typeof parsed.line !== "number") return prev;
+            if (prev === null || parsed.line < prev) return parsed.line;
+            return prev;
+          });
+          break;
+        }
+        case "relay_send_result": {
+          addRelayResults([parsed]);
+          break;
+        }
+        case "relay_inbound": {
+          // RELAYBUB-02: inbound relay frame → RelayInboundBubble (sender-hue tinted, left-aligned — multi-user chat convention).
+          // Phase 43 Plan 43-07b — drop-oldest cap enforcement on live-append.
+          setMessages((prev) =>
+            capOffRef.current
+              ? appendDedup(prev, parsed)
+              : appendDedupWithCap(prev, parsed, WORKING_SET_CAP, markCapDrop),
+          );
+          // Phase 47 (load-more button) — seed oldestLoadedLine (see message case).
+          setOldestLoadedLine((prev) => {
+            if (typeof parsed.line !== "number") return prev;
+            if (prev === null || parsed.line < prev) return parsed.line;
+            return prev;
+          });
+          break;
+        }
+        case "compaction":
+        case "compaction_guidance":
+        case "malformed_line": {
+          // pv-malformed-jsonl-placeholder-bubble (2026-08-10): interleave a
+          // compact placeholder so a dropped turn is visible instead of silent.
+          // Phase 43 Plan 43-07b — drop-oldest cap enforcement on live-append.
+          setMessages((prev) =>
+            capOffRef.current
+              ? appendDedup(prev, parsed)
+              : appendDedupWithCap(prev, parsed, WORKING_SET_CAP, markCapDrop),
+          );
+          // Phase 47 (load-more button) — seed oldestLoadedLine (see message case).
+          setOldestLoadedLine((prev) => {
+            if (typeof parsed.line !== "number") return prev;
+            if (prev === null || parsed.line < prev) return parsed.line;
+            return prev;
+          });
+          break;
+        }
+        case "fetch_older_range_batch": {
+          if (staleOlderBatchesRef.current > 0) {
+            staleOlderBatchesRef.current -= 1;
+            console.info(
+              `[pv-load-more] stale-batch-dropped messagesLen=${parsed.messages.length} oldestLine=${parsed.oldestLine} hostId=${hostId} tmuxSession=${tmuxSession ?? 'null'}`,
+            );
+            break;
+          }
+          // Phase 47 (load-more button) — server response to handleLoadOlder's
+          // fetch_older_range send. Two paths:
+          //
+          //   (a) Error path (parsed.error set): flip to error state, retain
+          //       all prior state — messages, oldestLoadedLine, sessionHasMore.
+          //       T-47-24 mitigation: NOT advancing oldestLoadedLine on error
+          //       is load-bearing — the retry click MUST send the same
+          //       beforeLine (81 in tests), not the server-echoed 0. Test 8
+          //       locks this.
+          //
+          //   (b) Success path: prepend parsed.messages above the existing
+          //       array (server returns oldest-first per Plan 03 chronological-
+          //       order invariant), dedupe on eventId to defend against
+          //       overlap at the cursor boundary, advance oldestLoadedLine to
+          //       parsed.oldestLine, apply parsed.hasMore to sessionHasMore
+          //       (hasMore=false hides the button per Test 9), clear the
+          //       in-flight/error state.
+          if (parsed.error != null) {
+            // quick-260822-7no: response log (error branch). Paired with the
+            // click log so a grep of `[pv-load-more]` shows the full
+            // request/response cycle. preLen/postLen collapse to the
+            // pre-click state — no setMessages runs on error.
+            console.info(
+              `[pv-load-more] response ok=false messagesLen=0 ` +
+                `oldestLine=${parsed.oldestLine} hasMore=${parsed.hasMore} ` +
+                `error="${parsed.error}" preLen=${messagesLenRef.current} postLen=${messagesLenRef.current}`,
+            );
+            setLoadOlderState("error");
+            setLoadOlderError(parsed.error);
+            // Clear in-flight guard so the user can retry-click (retry
+            // contract per CONTEXT.md § Philosophy "Fail visibly" —
+            // error state remains clickable). Test 8 asserts a retry
+            // click sends a second fetch_older_range payload.
+            loadOlderInFlightRef.current = false;
+            break;
+          }
+          // quick-260822-7no: capture pre/post lengths INSIDE the setMessages
+          // callback so the log reflects the actual state transition rather
+          // than a stale outer-closure read. React setters invoke the
+          // callback synchronously (see the 5 pre-existing setMessages
+          // callback sites in this file), so the outer-scoped `let` is
+          // populated by the time the console.info below runs.
+          let logPreLen = 0;
+          let logPostLen = 0;
+          // pv-load-more-diag (2026-08-23): raw-batch dump for order/dedup
+          // ground truth. Flows via the frontend console-forwarder to
+          // /opt/skynet/console-forward-logs/console-forward.log so the
+          // maintainer can read a bad click without asking user to open
+          // DevTools (she's phone-first).
+          console.info(
+            `[pv-load-more-diag] batch-raw count=${parsed.messages.length} oldestLine=${parsed.oldestLine} hasMore=${parsed.hasMore}`,
+          );
+          for (let i = 0; i < parsed.messages.length; i++) {
+            const m = parsed.messages[i] as unknown as {
+              eventId: string;
+              type: string;
+              line?: number;
+              role?: string;
+              content?: string;
+              text?: string;
+              body?: string | null;
+            };
+            const rawPreview =
+              typeof m.content === "string"
+                ? m.content
+                : typeof m.text === "string"
+                  ? m.text
+                  : typeof m.body === "string"
+                    ? m.body
+                    : "";
+            const preview = rawPreview.replace(/\s+/g, " ").trim().slice(0, 60);
+            console.info(
+              `[pv-load-more-diag] batch[${i}] eid=${m.eventId.slice(0, 8)} line=${m.line ?? "?"} type=${m.type} role=${m.role ?? "-"} preview="${preview}"`,
+            );
+          }
+          const batchResults = parsed.messages.filter(
+            (m): m is RelaySendResultEvent => m.type === "relay_send_result",
+          );
+          const batchFrames = parsed.messages.filter(
+            (m): m is Exclude<typeof m, RelaySendResultEvent> => m.type !== "relay_send_result",
+          );
+          addRelayResults(batchResults);
+          capturePrependAnchor();
+          setMessages((prev) => {
+            logPreLen = prev.length;
+            const combined = [...batchFrames, ...prev];
+            const seen = new Set<string>();
+            // Relay-inbound matrixEventId dedup — mirror of the fix in
+            // appendDedup / appendDedupWithCap (commit 064be9d6, 2026-09-01).
+            // The live-tail path caught the 2-3 envelope duplicates for one
+            // physical Matrix message; the range-fetch path here needs the
+            // same guard so a "load more" click doesn't re-hydrate the same
+            // duplicate bubbles. First-arrival-wins ordering is preserved
+            // because parsed (older batch) sits BEFORE prev in `combined`.
+            const seenMatrixEventIds = new Set<string>();
+            const result: typeof combined = [];
+            const droppedByDedup: string[] = [];
+            for (const m of combined) {
+              if (seen.has(m.eventId)) {
+                droppedByDedup.push(m.eventId);
+                continue;
+              }
+              const asRelay = m as unknown as {
+                type?: unknown;
+                matrixEventId?: unknown;
+              };
+              if (
+                asRelay.type === "relay_inbound" &&
+                typeof asRelay.matrixEventId === "string" &&
+                asRelay.matrixEventId.length > 0
+              ) {
+                if (seenMatrixEventIds.has(asRelay.matrixEventId)) {
+                  console.info(`[diag-dormant-send] dedup-drop mqid=n/a path=range-fetch incoming_matrixEventId=${asRelay.matrixEventId} incoming_eventId=${m.eventId} matched_existing=true`);
+                  droppedByDedup.push(m.eventId);
+                  continue;
+                }
+                console.info(`[diag-dormant-send] dedup-store mqid=n/a path=range-fetch incoming_matrixEventId=${asRelay.matrixEventId} incoming_eventId=${m.eventId}`);
+                seenMatrixEventIds.add(asRelay.matrixEventId);
+              }
+              seen.add(m.eventId);
+              result.push(m);
+            }
+            // inline-260823-pv-line-sorted-insert: sort combined+deduped
+            // result by `line` so a subsequent WS-reconnect re-hydration's
+            // late-arriving low-line frames land in chronological position
+            // rather than at the end of the array.
+            result.sort((a, b) => lineKey(a) - lineKey(b));
+            logPostLen = result.length;
+            // pv-load-more-diag (2026-08-23): dedup + order fingerprint.
+            // overlap = eids present in BOTH parsed (older batch) AND prev
+            // (current view) — expected 0 under correct backend cursor
+            // semantics. droppedByDedup > 0 means we ate a duplicate — the
+            // load-bearing question is WHICH copy won (parsed's, because
+            // parsed is FIRST in combined). result-top3/bot3 are the eids at
+            // the extremes of the new array — bot3 should match pre-click's
+            // bot3, top3 should be the newly-prepended older batch's oldest.
+            const prevEidSet = new Set(prev.map((m) => m.eventId));
+            const overlap = batchFrames
+              .map((m) => m.eventId)
+              .filter((e) => prevEidSet.has(e));
+            const top3 = result
+              .slice(0, 3)
+              .map((m) => m.eventId.slice(0, 8))
+              .join(",");
+            const bot3 = result
+              .slice(-3)
+              .map((m) => m.eventId.slice(0, 8))
+              .join(",");
+            console.info(
+              `[pv-load-more-diag] dedup prevLen=${prev.length} batchLen=${parsed.messages.length} combined=${combined.length} result=${result.length} droppedByDedup=${droppedByDedup.length} overlap=${overlap.length}`,
+            );
+            if (overlap.length > 0) {
+              console.info(
+                `[pv-load-more-diag] overlap-eids=${overlap.slice(0, 5).map((e) => e.slice(0, 12)).join(",")}`,
+              );
+            }
+            console.info(
+              `[pv-load-more-diag] result top3=[${top3}] bot3=[${bot3}]`,
+            );
+            return result;
+          });
+          console.info(
+            `[pv-load-more] response ok=true messagesLen=${parsed.messages.length} ` +
+              `oldestLine=${parsed.oldestLine} hasMore=${parsed.hasMore} ` +
+              `error=undefined preLen=${logPreLen} postLen=${logPostLen}`,
+          );
+          setOldestLoadedLine(parsed.oldestLine);
+          setSessionHasMore(parsed.hasMore);
+          setLoadOlderState("idle");
+          setLoadOlderError(null);
+          // Clear in-flight guard so a subsequent click after the response
+          // succeeds. Response has landed → next click may fire.
+          loadOlderInFlightRef.current = false;
+          break;
+        }
+        case "inactive": {
+          // Patch #122 background: backend fires
+          // `inactive { reason: 'holding_timeout' }` from
+          // claude-session-server.ts transitionToDead() when the holding
+          // timeout expires without a fresh session. Phase 30 note: the
+          // paneState "inactive" comes from the sibling pane_state emit
+          // (funneled through the same transitionToDead site — see Plan
+          // 30-01 Task 2). Here we only capture the reason string for
+          // diagnostic display and set status to unmount the compose box.
+          // The inactive branch no longer renders a fallback banner (retired
+          // 2026-08-31); an inactive pane just shows empty space.
+          if (parsed.reason === "holding_timeout") {
+            // Do NOT setStatus("inactive") on holding_timeout — keep the
+            // compose surface flex layout intact so the overlay stays
+            // covered until session_changed (the new session landed)
+            // OR a fresh pane_state emit from the backend clears it.
+            setInactiveReason(parsed.reason);
+            break;
+          }
+          setStatus("inactive");
+          setInactiveReason(parsed.reason);
+          break;
+        }
+        case "context_pct": {
+          // Phase 90 Plan 00 Wave 0 (D-10 delivery mechanism, user
+          // 2026-09-08 D-03 mechanical waiver): NO-OP. fleet-status is now
+          // the single source of truth for contextPct; the meter reads via
+          // useSessionContextPct at L~570. Backend STILL emits this frame
+          // for backwards compat during transition (per Task 1 acceptance
+          // criterion — WS emissions preserved verbatim, grep-verified);
+          // the frontend no longer consumes it here. Diag log preserved
+          // so a repro can still confirm the frame is arriving on the WS
+          // even though the state-source is now fleet-status.
+          console.info(`[ctx-pct-diag] received pct=${parsed.pct} sessionId=${tmuxSession ?? 'null'} (no-op — fleet-status is authoritative post-Phase-90-Wave-0)`);
+          break;
+        }
+        case "dormant": {
+          setDormant(parsed.dormant);
+          // Phase 56 (2026-08-23): dormancy is now invisible. The backend still
+          // emits {type:"dormant", dormant:true|false} frames for internal state
+          // tracking (paneState machine, WIP-indicator gating, live-frame auto-
+          // dismiss), but no wake ceremony surfaces here. wakingSince field no
+          // longer exists on this frame (removed in Plan 56-01 backend); the
+          // wake_result frame no longer exists either (backend handler + API
+          // export deleted in Plan 56-03 Task 4).
+          break;
+        }
+        case "harness_tasks": {
+          setHarnessTasks(parsed.tasks);
+          break;
+        }
+        case "work_narration": {
+          setWorkNarration(parsed.short && parsed.long ? { short: parsed.short, long: parsed.long } : null);
+          break;
+        }
+        case "backgrounded_agents": {
+          // Phase 34 Plan 06: hasBgWork feeder RETIRED from this case.
+          // The fleet-status channel is now the sole source for the composite
+          // working signal. The backgrounded_agents frame still powers the
+          // BackgroundedAgentsPanel UI surface (kept) — only the store publish
+          // is removed. The panels remain fully functional.
+          setBackgroundedAgents(parsed.agents);
+          break;
+        }
+        case "backgrounded_shells": {
+          // Phase 34 Plan 06: hasBgWork feeder RETIRED from this case.
+          // Same rationale as backgrounded_agents case above.
+          setBackgroundedShells(parsed.shells);
+          break;
+        }
+        case "aside_ready": {
+          // Phase 14 Wave 3: backend extracted a /btw answer from the
+          // tmux BTW overlay (Wave 2's server-authoritative extraction
+          // poller OR Wave 2's connect-time re-attach probe for a
+          // late-mounting tab per ASIDE-09). Flip asideText to the
+          // extracted text — AsideBubble mounts as the last child of
+          // the message-stream flex column and useAutoScroll's MutationObserver
+          // dispatches {kind:'content-changed'} on this mount; the reducer's
+          // at-bottom → chase branch anchors the viewport. Cross-tab dismiss coherence (ASIDE-11) is
+          // handled by the aside_dismissed case below fanned out from
+          // the backend broadcast primitive.
+          //
+          // Phase 14 quick-task 260726-vbd: clear the pending flag and 60s timer
+          // atomically with the display-state flip. The pending→displayed transition
+          // is invisible to the user (ComposeBox stays morphed; only the flag that
+          // drives the predicate changes from asidePending to asideText).
+          clearAsidePending();
+          setAsideText(parsed.text);
+          break;
+        }
+        case "messages_hidden": {
+          const ids = parsed.eventIds;
+          console.info(`[interrupt] messages-hidden eventIds=${ids.join(",")} reason=${parsed.reason} hostId=${hostId} tmuxSession=${tmuxSession ?? "null"}`);
+          setHiddenEventIds((prev) => {
+            if (ids.every((id) => prev.has(id))) return prev;
+            const next = new Set(prev);
+            ids.forEach((id) => next.add(id));
+            return next;
+          });
+          break;
+        }
+        case "messages_unhidden": {
+          const ids = parsed.eventIds;
+          console.info(`[interrupt] messages-unhidden eventIds=${ids.join(",")} reason=${parsed.reason} hostId=${hostId} tmuxSession=${tmuxSession ?? "null"}`);
+          setHiddenEventIds((prev) => {
+            if (!ids.some((id) => prev.has(id))) return prev;
+            const next = new Set(prev);
+            ids.forEach((id) => next.delete(id));
+            return next;
+          });
+          break;
+        }
+        case "interrupt_result": {
+          const pressedAt = interruptPressedAtRef.current;
+          if (pressedAt === null) {
+            console.info(`[interrupt] result-ignored verdict=${parsed.verdict} reason=no_pending_press hostId=${hostId} tmuxSession=${tmuxSession ?? "null"}`);
+            break;
+          }
+          interruptPressedAtRef.current = null;
+          // Keep the outcome up until the server's per-pane throttle has
+          // passed, so a quick second press can't come back as "throttled"
+          // and read "Nothing to stop" while the agent is still going.
+          showInterruptFeedback(
+            parsed.verdict === "none" ? "nothing" : parsed.verdict,
+            Math.max(INTERRUPT_OUTCOME_HOLD_MS, INTERRUPT_THROTTLE_MS + 100 - (Date.now() - pressedAt)),
+          );
+          if (parsed.verdict === "failed") {
+            console.warn(`[interrupt] result verdict=failed hostId=${hostId} tmuxSession=${tmuxSession ?? "null"}`);
+            break;
+          }
+          if (parsed.verdict === "cancelled") {
+            const restore = parsed.content !== null ? buildCancelledSendRestore(parsed.content) : null;
+            console.info(
+              `[interrupt] result verdict=cancelled eventId=${parsed.eventId} restore=${restore ? "yes" : "no"} textLen=${restore?.text.length ?? 0} files=${restore?.files.length ?? 0} hostId=${hostId} tmuxSession=${tmuxSession ?? "null"}`,
+            );
+            if (restore && (restore.text.trim() !== "" || restore.files.length > 0)) {
+              const eventId = parsed.eventId;
+              const host = hostNameRef.current;
+              if (restore.files.length === 0) {
+                setRestoreRequest({ id: eventId, text: restore.text, files: [] });
+              } else if (!host) {
+                console.warn(`[interrupt-restore] files-skipped id=${eventId} reason=no_host_name count=${restore.files.length}`);
+                setRestoreRequest({ id: eventId, text: restore.text, files: [] });
+              } else {
+                // Words and files go back together, so nothing can be sent
+                // before its attachments are back on the box.
+                void fetchRestoreFiles(host, restore.files).then(({ files, failed }) => {
+                  console.info(`[interrupt-restore] files id=${eventId} fetched=${files.length} failed=${failed.length}${failed.length ? ` names=${failed.join("|")}` : ""}`);
+                  setRestoreRequest({ id: eventId, text: restore.text, files });
+                });
+              }
+            }
+          } else {
+            console.info(
+              `[interrupt] result verdict=${parsed.verdict}${parsed.verdict === "none" ? ` reason=${parsed.reason}` : ""} hostId=${hostId} tmuxSession=${tmuxSession ?? "null"}`,
+            );
+          }
+          break;
+        }
+        case "aside_dismissed": {
+          // Phase 14 Wave 3: backend observed the BTW overlay
+          // disappearing — either from THIS client's earlier X-click
+          // (handleAsideDismiss sent aside_dismissed, backend
+          // dismissBtw'd, poller saw marker vanish and broadcast
+          // dismissed) OR from any other cause (user SSH-attached
+          // and pressed Escape herself, tmux died, peer tab dismissed).
+          // Idempotent: if THIS client already optimistically cleared
+          // asideText in handleAsideDismiss, this setState is a no-op.
+          //
+          // Phase 14 quick-task 260726-vbd: also clear asidePending — the
+          // backend can broadcast aside_dismissed without this client having
+          // sent it (peer-tab dismiss OR marker-disappearance), so the
+          // pending flag must clear in this path too.
+          setAsideText(null);
+          clearAsidePending();
+          break;
+        }
+        case "session_holding": {
+          // Phase 3 Layer 1 / Layer 2 SIGTERM-fallback edge preserved on the
+          // wire for backward compat (D-migration in 30-CONTEXT.md: legacy
+          // frames stay alive alongside pane_state). The Phase-30 rendered-
+          // state transition to "holding" comes from the sibling pane_state
+          // emit funneled through transitionToHolding (see Plan 30-01
+          // § L2191). This handler no longer manipulates any client-side
+          // pane-state — the Phase-29 client-inference calls are gone.
+          // Message
+          // stream is preserved intentionally (user may want to scroll
+          // back through the old conversation while the new one starts).
+          break;
+        }
+        case "session_holding_cleared": {
+          // Fix B (2026-07-30): backend self-cleared holding because the same
+          // sessionFile came back active on the next repoll tick (not a real
+          // session change). Phase 30: the rendered-state transition off "holding"
+          // comes from the sibling pane_state emit("active",
+          // "same_file_recovery") funneled through
+          // transitionFromHoldingToActiveSameFile (see Plan 30-01 § L2260).
+          // This handler is now a no-op — the message stream / contextPct /
+          // harnessTasks / backgroundedAgents / asideText
+          // preservation semantic (surgical vs. session_changed heavy reset)
+          // is unchanged because THIS handler never touched them either.
+          break;
+        }
+        case "session_changed": {
+          // Session changed (e.g. a crashed agent relaunched): server has stopped the old tail and
+          // started a fresh one on the new sessionFile. Reset ALL per-session
+          // state; the incoming `message` events from the fresh tail (which
+          // uses `tail -F -n +1`) will re-hydrate the conversation from line 1.
+          // Do NOT touch IdentityBadge (pane-scoped, owned by Terminal.tsx)
+          // or ComposeBox draft (per patch #57's key is
+          // userId+hostId+tmuxSession, so it correctly survives).
+          //
+          // W3 fix from plan-checker: defensively setStatus("streaming"). Under
+          // normal operation, status is already "streaming" when session_changed
+          // arrives (holding only fires from active/streaming). But if a fatal
+          // `error` frame from the WS layer landed in the same window (rare —
+          // e.g. a network blip that produced a tail_error escalated to error
+          // right before the session changed), status would be "error" and
+          // the scroll region would not re-mount after our state reset,
+          // stranding the user on the error banner even though the backend
+          // has successfully switched to a fresh session. One extra line
+          // closes the edge case at zero cost.
+          //
+          // Phase 30: the rendered-state transition off "holding" cleanly
+          // into "active" comes from the sibling pane_state
+          // emit("active", "session_changed") funneled through
+          // transitionToActiveNew (see Plan 30-01 § L2345). This handler
+          // still owns the HEAVY session-scoped state reset because the
+          // pane_state emitter deliberately does not carry newSessionFile
+          // (T-30-01 mitigation — no filesystem paths in reason); the
+          // session_changed frame remains authoritative for the reset.
+          setMessages([]);
+          resetInterruptViewState();
+          resetLoadOlderState({ sameSocket: true });
+          beginHistoryHold("session_changed");
+          setHarnessTasks([]);
+          setWorkNarration(null);
+          // Phase 90 Plan 00 Wave 0 (D-10 delivery mechanism) — contextPct
+          // now lives on fleet-status; no local reset needed. Next
+          // fleet-status frame reconciles.
+          setBackgroundedAgents([]);
+          setBackgroundedShells([]);
+          setStatus("streaming");
+          // Phase 14 followup: full aside-surface reset — a new
+          // session can't carry a live BTW overlay from the OLD session,
+          // and any residual 8s dismiss cooldown is irrelevant across the
+          // change. Backend re-attach probe re-emits aside_ready if the
+          // new session somehow has one.
+          clearAsideState();
+          // Fix #3 (post-Phase-50 code review): symmetric with backend Fix
+          // #2c (clearPvSendWatchdogsForSession on transitionToActiveNew).
+          // Drop every pending optimistic send + cancel its 20s timer +
+          // clear composeOverrideText. Otherwise stale OLD-session pendings
+          // survive alongside their timers and can:
+          //   • flip to 'failed' against the NEW session's fresh replay
+          //     (surfacing red bubbles for OLD content in a NEW transcript);
+          //   • or be silently head-matched by the fresh tail's `-n +1`
+          //     replay content, incorrectly clearing pendings that should
+          //     have dropped alongside the rest of session-scoped state.
+          // Same helper the WS-close cleanup path (~L1973) uses.
+          clearAllPendingSends("session-changed");
+          // inline-260823-pv-session-file-rotation-reset: keep the last-known
+          // sessionFile ref in sync so a follow-up `session` frame carrying
+          // the same newSessionFile doesn't spuriously re-fire the rotation
+          // path in the `session` handler above.
+          lastKnownSessionFileRef.current = parsed.newSessionFile;
+          // Diagnostic: parsed.newSessionFile is available if a future console
+          // log is wanted; do not add ambient debug logging in this patch.
+          break;
+        }
+        case "tail_error": {
+          // Recoverable — surface as a banner but keep the message list.
+          setErrorMessage(parsed.message);
+          break;
+        }
+        case "wire_boot": {
+          // Backend just started a fresh WS closure (initial attach OR any
+          // reconnect — hidden-pane close then re-show, transient WS drop,
+          // container restart). The fresh replay re-sends the recent window,
+          // so the list must be rebuilt from it — but the bubbles already on
+          // screen stay until that window is complete: the clear runs inside
+          // the history-hold release, in the same render as the fresh batch.
+          // A reconnect therefore never shows an empty list, and an unchanged
+          // conversation keeps the same eventId keys (nothing visibly moves).
+          // If the socket drops before history_ready, the hold is dropped and
+          // the old bubbles simply stay. Also clear errorMessage — any stale
+          // banner from a prior WS teardown is now outdated.
+          console.info(`[wire-boot] reset deferred to history_ready sessionId=${tmuxSession ?? 'null'} hostId=${hostId} paneKey=${paneKey} kept=${messagesRef.current.length}`);
+          setErrorMessage(null);
+          beginHistoryHold("wire_boot", { resetOnRelease: true });
+          break;
+        }
+        case "history_ready": {
+          releaseHistoryHold("ready");
+          break;
+        }
+        case "error": {
+          setStatus("error");
+          setErrorMessage(parsed.message);
+          break;
+        }
+        // Phase 50 D-15/D-20 — backend send-path watchdog exhausted its
+        // three-stage escalation (retry Enter @ 2500ms, full re-send @
+        // 5500ms, give-up @ 20000ms). Wire type from Plan 50-02's
+        // pv-send-watchdog module. mqid carries the ComposeBox-generated
+        // pv-optim-<...> identifier (Blocker #4 pass-through). flipToFailed
+        // finds the matching pending, cancels its 20s timer, marks it
+        // failed, populates composeOverrideText.
+        case "paste_send_failed": {
+          if (parsed.mqid) {
+            console.info(`[diag-dormant-send] ws-paste-send-failed mqid=${parsed.mqid ?? "none"} reason=${parsed.reason ?? "paste_send_failed"} action=flipToFailed-from-backend-frame`);
+            flipToFailed(parsed.mqid, parsed.reason ?? "paste_send_failed");
+          }
+          break;
+        }
+        // Phase 50 D-21 — backend exec on tmux send-keys threw at ingress.
+        // Fires INSTANTLY (not after a 20s wait) — same visual outcome as
+        // the timer path. reason encodes where in the split-send the throw
+        // landed (exec_throw_body / exec_throw_enter / exec_throw).
+        case "permission_prompt_state":
+        case "permission_answer_result": {
+          permissionFrameRef.current(parsed);
+          break;
+        }
+        case "command_refused": {
+          // The server refused a text-area send as a blocked command; nothing
+          // reached the agent. Same end state as the composer refusing it
+          // itself: no bubble, typed words back in the box, the refusal line.
+          const refused = pendingSendsRef.current.find((p) => p.mqid === parsed.mqid);
+          const kind = textAreaSendKind(parsed.mqid);
+          console.info(`[compose] command-refused-by-server mqid=${parsed.mqid} source=${kind ?? "unknown"} hadPending=${refused !== undefined} hostId=${hostId} tmuxSession=${tmuxSession ?? "null"}`);
+          if (refused !== undefined) {
+            if (refused.timer !== null) window.clearTimeout(refused.timer);
+            setPendingSends((prev) => prev.filter((p) => p.mqid !== parsed.mqid));
+          }
+          clearOptimisticWipForMqid(parsed.mqid, "command-refused");
+          setRestoreRequest({
+            id: `refused-${parsed.mqid}`,
+            text: kind === "typed" && refused !== undefined ? refused.content : "",
+            files: [],
+            notice: COMMAND_REFUSED_MESSAGE,
+          });
+          break;
+        }
+        case "send_keys_error": {
+          if (parsed.mqid) {
+            console.info(`[diag-dormant-send] ws-send-keys-error mqid=${parsed.mqid ?? "none"} reason=${parsed.reason ?? "send_keys_error"} action=flipToFailed-from-backend-frame`);
+            flipToFailed(
+              parsed.mqid,
+              parsed.reason ?? "send_keys_error",
+              parsed.reason === "too_large" ? parsed.message : undefined,
+            );
+          }
+          break;
+        }
+      }
+    };
+
+    ws.onerror = () => {
+      if (cancelled) return;
+      // The WS `error` event carries no useful details cross-browser;
+      // rely on the subsequent `close` for the final status flip.
+    };
+
+    ws.onclose = () => {
+      dropHistoryHold();
+      if (cancelled) return;
+      // Phase 41 code-review H1 fix: null the reactive WS mirror so the
+      // upload hook detaches its message listener from this dead WS.
+      // Cleared symmetrically with the setUploadWs(ws) in ws.onopen.
+      setUploadWs(null);
+      // Phase 50 Plan 03 Task 3a (T-50-03-05 mitigation): iterate every
+      // pending, clear its 20s timer, empty the pendingSends array. Pairs
+      // with Plan 50-02's backend per-connection pendingMqidsForThisConnection
+      // cleanup so both sides release together on WS teardown.
+      // Exception: sends whose bytes were still in this socket's outbound
+      // buffer never reached the server — keep their bubbles and resend them
+      // once the next connection attaches (flushResendQueue).
+      const bufferedAtClose = ws.bufferedAmount;
+      // Not filtered against pendingSendsRef: a send made just before the
+      // drop may not have committed its pending yet. flushResendQueue skips
+      // any whose pending is gone by then.
+      const unsent = selectUnsentFrames([...inputFramesRef.current.values()], ws, bufferedAtClose);
+      inputFramesRef.current.clear();
+      console.info(`[pv-resend] ws-close bufferedAmount=${bufferedAtClose} queuedBytes=${queuedOutboundBytes(ws)} sendingCount=${pendingSendsRef.current.filter((p) => p.state === "sending").length} unsentCount=${unsent.length} mqids=${unsent.map((r) => r.mqid).join(",")} hostId=${hostId} tmuxSession=${tmuxSession ?? "null"}`);
+      if (unsent.length > 0) {
+        clearAllPendingSends("ws-close-unmount", new Set(unsent.map((r) => r.mqid)));
+        resendQueueRef.current = unsent;
+      } else {
+        clearAllPendingSends("ws-close-unmount");
+      }
+      // A fetch_older_range response can't arrive on a dead WS — release the
+      // in-flight guard so the button isn't stuck disabled on its spinner.
+      if (loadOlderInFlightRef.current) {
+        console.info(`[pv-load-more] in-flight released on ws-close hostId=${hostId} tmuxSession=${tmuxSession ?? 'null'}`);
+        loadOlderInFlightRef.current = false;
+        setLoadOlderState("idle");
+      }
+      // Patch #148: auto-reconnect on close, mirroring Terminal.tsx's pattern.
+      //
+      // INACTIVE short-circuit (FALLBACK-01 preservation): when the server has
+      // sent an "inactive" frame (status === "inactive"), that is the authoritative
+      // terminal-state signal. Client-side retry must NOT step past it. Preserve
+      // both status and errorMessage exactly as the pre-patch code did — any more-
+      // specific message from a prior "tail_error" frame survives the nullish-coalesce.
+      //
+      // NON-INACTIVE path — retry with linear-with-cap backoff:
+      //   Attempt 1 → 2s, 2 → 4s, 3 → 6s, 4 → 8s, 5 → 8s (≈28s total window).
+      //   After MAX_RECONNECT_ATTEMPTS consecutive closes, no further timer is
+      //   scheduled and "Connection closed" persists. The visibilitychange handler
+      //   (user iOS PWA fix) resets the counter to 0 on foreground, giving a
+      //   fresh 5-attempt budget per app reopen.
+      if (statusRef.current === 'inactive') {
+        // FALLBACK-01: preserve server-authoritative terminal state.
+        // Do not schedule retry; do not overwrite a more-specific errorMessage.
+        setStatus((prev) => (prev === "inactive" ? prev : "error"));
+        setErrorMessage((prev) => prev ?? "Connection closed");
+        return;
+      }
+      // Quick 260808-b74: if pane is hidden, the WS close was deliberate (from the
+      // WS-pause effect below). Do NOT schedule a reconnect — patch #148's retry
+      // loop must not fight the pause. status='error' + errorMessage are set
+      // unconditionally because patch #339's render gates rely on status='error'
+      // to keep bubbles visible during the pause (exact same UX as a real reconnect).
+      setStatus("error");
+      setErrorMessage((prev) => prev ?? "Connection closed");
+      if (!isVisibleRef.current) return;
+      if (reconnectAttemptsRef.current < MAX_RECONNECT_ATTEMPTS) {
+        // R-54-07: full-jitter — random draw in [0, capMs) prevents the 10-tab Chrome-restore herd from re-clumping on the reconnect ladder. Cap and initial-delay scale unchanged (patch #148 linear-with-cap contract preserved).
+        const capMs = Math.min(2000 * (reconnectAttemptsRef.current + 1), 8000);
+        const delay = Math.floor(Math.random() * capMs);
+        reconnectAttemptsRef.current += 1;
+        // phase-29: mirror into state so wsState derivation re-runs on
+        // retry-attempt changes (transitions "not-connected" → "opening" and
+        // may hit "failed-permanently" at the cap).
+        setReconnectAttempts(reconnectAttemptsRef.current);
+        reconnectTimeoutRef.current = setTimeout(() => {
+          reconnectTimeoutRef.current = null;
+          if (cancelled) return;
+          setRetryKey((k) => k + 1);
+        }, delay);
+      }
+      // At cap: status stays "error", errorMessage stays "Connection closed".
+      // No further timer scheduled. visibilitychange:visible gives a fresh budget.
+    };
+
+    return () => {
+      cancelled = true;
+      // Patch #148: clear any pending reconnect timer before closing the WS
+      // so unmount never fires a retry against a stale wsRef.
+      if (reconnectTimeoutRef.current !== null) {
+        clearTimeout(reconnectTimeoutRef.current);
+        reconnectTimeoutRef.current = null;
+      }
+      // Bounty frontend-websocket-leak-on-container-recreate: detach
+      // handler property refs BEFORE close() so the retention cycle
+      // (ws → ws.onopen closure → ws via ws.send at L2094) is broken. Without
+      // this, each cleanup (retryKey bump or unmount) leaves a dead WS pinned
+      // by its own handlers, and container-recreate storms compound the count
+      // against nginx worker_connections (one instance saturated at ~8k with 2 pretty
+      // views after 3 recreates = 13x baseline).
+      dropHistoryHold();
+      ws.onopen = null;
+      ws.onmessage = null;
+      ws.onerror = null;
+      ws.onclose = null;
+      try {
+        ws.close();
+      } catch {
+        /* ignore */
+      }
+      wsRef.current = null;
+      // Phase 41 code-review H1 fix: null the reactive WS mirror on
+      // unmount / retryKey re-run so the upload hook's next render sees
+      // deps.ws=null and detaches. Paired with setUploadWs(ws) in
+      // ws.onopen.
+      setUploadWs(null);
+    };
+    // Phase 92 Slice 1 (D-09): `source.kind` added so the effect re-fires
+    // when the case flips (which does not happen for a stably-mounted
+    // harness pane — dep is inert for the harness case). Guard at the top
+    // of the effect body ensures the effect short-circuits when a relay
+    // source is passed.
+  }, [source.kind, hostId, tmuxSession, retryKey]);
+
+  // Patch #148: visibilitychange handler — the direct user iOS PWA fix.
+  // Patch #156 hard-gates this effect on isIosPwa() because on Chrome desktop
+  // / Android / non-PWA Safari, WebSockets survive tab-switches and
+  // force-reconnect creates a session-attachment race that surfaces the
+  // Reconnect/Close overlay (the old WS's ws.on("close") detachWs can arrive
+  // AFTER the new WS attaches, causing destroySession to fire and the new
+  // socket to receive `disconnected`). On non-iOS-PWA browsers this early
+  // return means no listener is registered and cleanup is a no-op — exactly
+  // what we want, because those browsers don't need the workaround at all.
+  //
+  // When the user foregrounds the PWA tab after backgrounding:
+  //   - If status is "inactive", no-op (server-authoritative terminal state).
+  //   - If WS is already OPEN (readyState 1), no-op (still connected).
+  //   - Otherwise: reset reconnectAttemptsRef to 0 (fresh budget for this foreground
+  //     event) and bump retryKey so the WS-setup useEffect opens a fresh connection.
+  // When the tab hides: clear any pending reconnect timer (avoid a background
+  //   wake after ~2-8s) but do NOT reset the attempt counter — a hide during a
+  //   retry sequence should NOT drop the accumulated attempt count. The
+  //   foreground path always gets a fresh counter anyway.
+  // deps: [] — mount-once; reads only refs, no reactive state dependencies.
+  // Do NOT add retryKey to deps — that would re-register listeners on every retry.
+  useEffect(() => {
+    if (!isIosPwa()) return;
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        // Tab hidden: cancel any pending reconnect timer.
+        if (reconnectTimeoutRef.current !== null) {
+          clearTimeout(reconnectTimeoutRef.current);
+          reconnectTimeoutRef.current = null;
+        }
+        return;
+      }
+      // Tab visible: reconnect if needed.
+      if (statusRef.current === 'inactive') return;
+      // Quick 260808-b74: if the pane itself is hidden (isVisible=false), a PWA
+      // foreground event must NOT reopen the WS behind the WS-pause effect's back.
+      // The WS-pause effect owns the reopen path — it fires when isVisible flips
+      // true. This guard prevents the iOS visibilitychange foreground event from
+      // fighting the pause (single-knob isVisibleRef gate per bounty design).
+      if (!isVisibleRef.current) return;
+      if (wsRef.current?.readyState === 1) return; // still OPEN
+      // Fresh budget for this foreground event (user iOS PWA fix).
+      reconnectAttemptsRef.current = 0;
+      // phase-29: mirror into state so wsState derivation re-runs on
+      // retry-attempt reset.
+      setReconnectAttempts(0);
+      setRetryKey((k) => k + 1);
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Patch #148: statusRef mirror — keeps statusRef.current in sync with the
+  // `status` state so WS callbacks (onclose, visibilitychange handler) can
+  // read the current status WITHOUT triggering functional-update double-renders.
+  useEffect(() => {
+    statusRef.current = status;
+  }, [status]);
+
+  // Quick 260808-b74: isVisibleRef mirror — keeps isVisibleRef.current in sync
+  // with the `isVisible` prop so onclose retry scheduler and visibilitychange
+  // handler can read current pane visibility without React closure-capture issues.
+  // Pattern mirrors statusRef mirror above.
+  useEffect(() => {
+    isVisibleRef.current = isVisible;
+  }, [isVisible]);
+
+  // Phase 47 (load-more button): capOffRef mirror — keeps capOffRef.current
+  // in sync with the `capOff` state so the WS onmessage handler at the 5
+  // appendDedup sites (L1204/1224/1230/1236/1243, ternary'd in Task 2b) can
+  // read the cap-off flag without stale-closure issues. Pattern mirrors
+  // the isVisibleRef mirror above.
+  useEffect(() => {
+    capOffRef.current = capOff;
+  }, [capOff]);
+
+  // Phase 47 (load-more button) — oldestLoadedLine reconciliation.
+  //
+  // The seed sites in the 5 case branches (Task 2a) UPDATE oldestLoadedLine
+  // as frames arrive, taking a running MIN across everything seen. That
+  // running-min is wrong when the cap drops messages: a frame at line 26
+  // may have been seen (setting oldestLoadedLine=26) but then dropped by
+  // WORKING_SET_CAP=20 (only lines 31..50 remain in messages[]). If the
+  // user clicks with oldestLoadedLine=26, the server returns lines 6..25
+  // — but the client's own dropped-cache still had lines 26..30 that are
+  // no longer requested, creating a permanent gap.
+  //
+  // This effect reconciles: after every messages change, take the min of
+  // parsed.line across CURRENTLY-HELD messages (not everything ever seen).
+  // Only fires when the derived value differs — no-op when the seed sites
+  // already have the correct value (streaming-tail with no cap-drops).
+  //
+  // Skipped when capOff is true: post-first-click, the response case
+  // authoritatively sets oldestLoadedLine to parsed.oldestLine, and
+  // messages[] no longer drops-oldest — so the min-of-messages could go
+  // BACKWARD past the response cursor as older batches arrive, which
+  // would be wrong. Under capOff, oldestLoadedLine is source-of-truth for
+  // the next request cursor; only the response case advances it.
+  useEffect(() => {
+    if (capOff) return;
+    let derivedMin: number | null = null;
+    for (const m of effectiveMessages) {
+      if (typeof m.line === "number") {
+        if (derivedMin === null || m.line < derivedMin) {
+          derivedMin = m.line;
+        }
+      }
+    }
+    setOldestLoadedLine((prev) => (prev === derivedMin ? prev : derivedMin));
+  }, [effectiveMessages, capOff]);
+
+  // Load-more scroll anchor restore — see capturePrependAnchor. Layout
+  // effect so the correction lands before paint (no visible jump).
+  useLayoutEffect(() => {
+    const anchor = prependAnchorRef.current;
+    if (!anchor) return;
+    prependAnchorRef.current = null;
+    const container = scrollElRef.current;
+    if (!container) return;
+    let anchorEl: HTMLElement | null = null;
+    for (const b of container.querySelectorAll<HTMLElement>(
+      "[data-pv-bubble][data-event-id]",
+    )) {
+      if (b.getAttribute("data-event-id") === anchor.eventId) {
+        anchorEl = b;
+        break;
+      }
+    }
+    if (!anchorEl) {
+      console.info(
+        `[pv-load-more] anchor-miss eventId=${anchor.eventId.slice(0, 8)} paneKey=${paneKey}`,
+      );
+      return;
+    }
+    const offsetNow =
+      anchorEl.getBoundingClientRect().top -
+      container.getBoundingClientRect().top;
+    const delta = offsetNow - anchor.offset;
+    console.info(
+      `[pv-load-more] anchor-restore eventId=${anchor.eventId.slice(0, 8)} delta=${Math.round(delta)} scrollTopBefore=${Math.round(container.scrollTop)} paneKey=${paneKey}`,
+    );
+    if (delta !== 0) container.scrollTop += delta;
+  }, [effectiveMessages, paneKey]);
+
+  // quick 260808-cd6: dormantRef mirror — keeps dormantRef.current in sync
+  // with the `dormant` state so the WS onmessage auto-dismiss hook can read
+  // current dormant state without stale-closure issues. Pattern mirrors isVisibleRef.
+  useEffect(() => {
+    dormantRef.current = dormant;
+  }, [dormant]);
+
+  // Phase 31 (plan 31-06): paneStateRef mirror — keeps paneStateRef.current
+  // in sync with `paneState` so the WS onmessage handler's [pane-state]
+  // state-transition log can read the from= value without stale-closure risk.
+  // Pattern mirrors dormantRef / isVisibleRef above.
+  useEffect(() => {
+    paneStateRef.current = paneState;
+  }, [paneState]);
+
+  // Phase 56 (2026-08-23): prevIsVisibleRef edge detector + visibility-reset
+  // useEffect + elapsed-seconds ticker useEffect ALL DELETED. Their sole
+  // purpose was clearing/driving the local waking-state slots that fed the
+  // former dormant-overlay's progress bar and hint text — the overlay is
+  // gone, the state slots are gone, so the reset and ticker effects have
+  // no observer.
+
+  // Phase 30 note: the Phase-29 loading-arm ref-mirror useEffect + its
+  // backing state slot + ref are DELETED. The loading-overlay mount is
+  // now driven by `renderedState === "resolving"` directly, derived from
+  // (wsTransportState, paneState) via usePaneResolvingMachine.
+
+  // Quick 260808-b74 — WS-pause lifecycle effect (hidden-pane-cost-mitigation-
+  // empirical-rotation, iteration 1).
+  //
+  // PURPOSE: close the Claude-session WS when this pane is hidden (isVisible=false)
+  // and reopen it when the pane becomes visible again (isVisible=false→true).
+  // Baseline: 3 hidden PrettyViews contribute 10+13+10 = 33 Claude WS frames/30s
+  // combined. After this change, hidden panes emit ~0 frames.
+  //
+  // TEMPLATE: patch #339 (commit 50e96d6). The close+reopen UX is identical to
+  // the reconnect fix — status='error' keeps bubbles visible via the existing
+  // scroll-region and ComposeBox mount gates (nothing to duplicate here).
+  //
+  // GUARDS:
+  //   - isVisibleRef gate on onclose retry scheduler: prevents patch #148's
+  //     auto-reconnect loop from immediately reopening the WS behind our back
+  //     while the pane is still hidden (single-knob isVisibleRef per bounty
+  //     design — no pausedByHiddenRef needed).
+  //   - isVisibleRef gate on visibilitychange handler: iOS PWA foreground events
+  //     must not reopen a WS for a currently-hidden pane. The WS-pause effect
+  //     below owns the reopen path exclusively.
+  //
+  // STATE PRESERVATION: messages/contextPct/harnessTasks/backgroundedAgents/
+  // backgroundedShells/asideText are NOT touched — they
+  // survive the close and are immediately visible on re-show. appendDedup
+  // absorbs any tail-replay dupes from the fresh tail on reopen (same as reconnect).
+  //
+  // INITIAL-MOUNT NO-OP: on the first effect run isVisible is already true
+  // (Terminal.tsx only mounts PrettyView inside `isPrettyMode && ...`). The
+  // main WS-setup effect (deps [hostId, tmuxSession, retryKey]) is already
+  // opening the WS on mount — do not double-trigger.
+  //
+  // quick-260812-x5f — the close-on-hide is now DEBOUNCED by
+  // HIDDEN_PANE_WS_CLOSE_DEBOUNCE_MS (60s) so voice-record+send+nav-away
+  // and other in-flight nav-away work can complete before the WS is
+  // ripped out. Cancellation on isVisible=true is race-safe: if the
+  // timer already fired and close() ran, the existing reopen path on
+  // the next visible=false→true edge handles reconnection unchanged.
+  useEffect(() => {
+    if (!isVisible) {
+      // Pane became hidden — schedule a debounced WS close after HIDDEN_PANE_WS_CLOSE_DEBOUNCE_MS.
+      // Clear any pending debounce timer first so a re-enter of the hidden
+      // state RESTARTS the 60s window from scratch (bounty scenario c).
+      if (hiddenPaneCloseTimerRef.current !== null) {
+        clearTimeout(hiddenPaneCloseTimerRef.current);
+        hiddenPaneCloseTimerRef.current = null;
+      }
+      const ws = wsRef.current;
+      if (ws !== null && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+        console.info(`[ws-pause] hidden-pane-close-scheduled hostId=${hostId} sessionId=${tmuxSession} delayMs=${HIDDEN_PANE_WS_CLOSE_DEBOUNCE_MS}`);
+        hiddenPaneCloseTimerRef.current = setTimeout(() => {
+          hiddenPaneCloseTimerRef.current = null;
+          // Re-check readyState inside the callback — if the WS was already
+          // closed by another path during the 60s window, no-op.
+          if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+            // Clear any in-flight reconnect timer first so it doesn't fire
+            // while hidden and immediately reopen (the isVisibleRef guard on
+            // onclose's retry scheduler is the belt; this clearTimeout is the
+            // suspenders — mirrors the immediate-close variant this replaces).
+            if (reconnectTimeoutRef.current !== null) {
+              clearTimeout(reconnectTimeoutRef.current);
+              reconnectTimeoutRef.current = null;
+            }
+            console.info(`[ws-pause] hidden-pane-close-fired hostId=${hostId} sessionId=${tmuxSession} debounced=true`);
+            ws.close();
+            // onclose fires → setStatus('error') + setErrorMessage('Connection closed')
+            // (unconditional path in onclose) → patch #339 render gates keep bubbles
+            // visible and Send disabled, exactly as during a real reconnect pause.
+            // isVisibleRef.current will be false (mirror effect ran synchronously
+            // before this effect on the same render) → retry scheduler short-circuits.
+          }
+        }, HIDDEN_PANE_WS_CLOSE_DEBOUNCE_MS);
+      }
+    } else {
+      // Pane became visible — cancel any pending debounced-close first (race-safe).
+      if (hiddenPaneCloseTimerRef.current !== null) {
+        clearTimeout(hiddenPaneCloseTimerRef.current);
+        hiddenPaneCloseTimerRef.current = null;
+        console.info(`[ws-pause] hidden-pane-close-cancelled hostId=${hostId} sessionId=${tmuxSession}`);
+      }
+      // Reopen the WS if it is gone or closing.
+      const ws = wsRef.current;
+      if (ws === null || ws.readyState === WebSocket.CLOSING || ws.readyState === WebSocket.CLOSED) {
+        // Fresh budget for this re-show (mirrors visibilitychange handler at ~970).
+        reconnectAttemptsRef.current = 0;
+        // Mirror into state so wsTransportState derivation re-runs on
+        // retry-attempt reset.
+        setReconnectAttempts(0);
+        // Phase 30: paneState reset on WS-pause reopen is INTENTIONALLY
+        // OMITTED. Under Phase 29 this site reset the client-inferred
+        // first-frame axis to "not-yet" to work around the rearm-snapshot
+        // guard in the old hook. That guard is GONE (Task 2 deleted the
+        // entire snapshot mechanism). Under Phase 30 semantics, keeping
+        // the last-known paneState across a transient WS drop is EXACTLY
+        // the D-11 don't-flicker rule — resolveRenderedState renders the
+        // last-known overlay while transport is regressed rather than
+        // reverting to the resolving spinner. When the fresh WS opens,
+        // the backend emits pane_state on attach (see pane-state-emitter
+        // startActiveSessionFlow site — Plan 30-01 § L3871) and paneState
+        // updates to the fresh truth via the pane_state WS handler above.
+        setRetryKey((k) => k + 1);
+        // The WS-setup effect (deps [hostId, tmuxSession, retryKey]) fires and
+        // opens a fresh WS via the existing patch #148 reconnect path. No new
+        // connect path invented; same machinery as auto-reconnect.
+      }
+      // If WS is already OPEN or CONNECTING (e.g. initial mount with isVisible=true),
+      // no-op — don't interfere with the WS-setup effect.
+    }
+    return () => {
+      // Unmount cleanup: clear the pending debounce timer so no timer leaks
+      // into unmounted components (bounty scenario e).
+      if (hiddenPaneCloseTimerRef.current !== null) {
+        clearTimeout(hiddenPaneCloseTimerRef.current);
+        hiddenPaneCloseTimerRef.current = null;
+      }
+    };
+  }, [isVisible]); // eslint-disable-line react-hooks/exhaustive-deps
+  // deps: [isVisible] only. Reads only refs (wsRef, reconnectTimeoutRef,
+  // reconnectAttemptsRef, hiddenPaneCloseTimerRef) and calls setRetryKey —
+  // all stable across renders.
+  // Adding wsRef/setRetryKey would be superfluous (refs are stable; setRetryKey
+  // is setState-stable). Do NOT add hostId/tmuxSession/retryKey — that would
+  // conflate this effect with the main WS-setup effect.
+
+  // Bounty pretty-view-per-pane-cost-diag: mirror messages.length + register
+  // with the diag registry so the interval emitter can query this pane's
+  // cost snapshot. Registration is keyed on hostId+tmuxSession so the same
+  // pane across re-mounts reuses the slot; unregister runs on unmount /
+  // hostId or tmuxSession change.
+  useEffect(() => {
+    messagesLenRef.current = effectiveMessages.length;
+  }, [effectiveMessages]);
+  useEffect(() => {
+    const key = `pretty-view:${hostId}:${tmuxSession ?? ""}`;
+    console.info(`[render] pane-mount paneId=${key} paneType=pretty-view hostId=${hostId} sessionKey=${tmuxSession ?? 'null'}`);
+    const snapshotFn = (): PaneSnapshot => {
+      const framesSinceLast = wsFramesRef.current;
+      wsFramesRef.current = 0;
+      return {
+        kind: "pretty-view",
+        paneId: key,
+        hostId,
+        tmuxSession,
+        // quick-260809-eqk: read isVisibleRef.current so the diag emit reflects
+        // LIVE pane visibility rather than the closured value from first
+        // registration. The mirror useEffect at lines ~1150-1156 (iter 1,
+        // patch #344) keeps isVisibleRef.current fresh on every isVisible flip.
+        // Do NOT add `isVisible` to this effect's deps array — the pane
+        // registration key must stay stable across visibility flips
+        // (registerPane replaces the entry keyed on hostId+tmuxSession;
+        // re-registering on every flip would defeat the stable-slot design).
+        isVisible: isVisibleRef.current,
+        messageCount: messagesLenRef.current,
+        wsFramesSinceLast: framesSinceLast,
+        domNodeCount: pvRootRef.current
+          ? pvRootRef.current.querySelectorAll("*").length
+          : 0,
+      };
+    };
+    const unregister = registerPane(key, snapshotFn);
+    return () => {
+      console.info(`[render] pane-unmount paneId=${key} paneType=pretty-view hostId=${hostId} sessionKey=${tmuxSession ?? 'null'}`);
+      unregister();
+    };
+  }, [hostId, tmuxSession]);
+
+  // Phase 30 note: several Phase-29 useEffects that lived here are DELETED
+  // (delay-arm timers, watchdog timers, 10s auto-dismiss). Rendered-state
+  // now derives synchronously from the (wsTransportState, paneState) inputs
+  // via the pure resolveRenderedState reducer; the backend's pane_state
+  // emit is the authoritative signal for every terminal state and no
+  // client-side wall-clock deadline can override it.
+
+  // Phase 14 (plain-language-translation-asides) Wave 3 — isIdle-transition
+  // arm emitter. This is THE SOLE trigger source for the aside subsystem
+  // per CONTEXT.md § Trigger LOCK 2026-07-26 (frontend-arm architecture,
+  // decided post plan-checker B1/B2/B4): backend does NOT observe the
+  // terminal WSS's idle-signal frame (the two WSSes live on separate
+  // ports with no shared state). The frontend, which already receives
+  // `isIdle` as a prop from Terminal.tsx (the WIP-indicator's idle-window
+  // signal, established in Phase 9), emits `{type:"aside_arm"}` on the
+  // pretty-view WS at the false→true transition — that IS the aside
+  // trigger. Backend Wave 2's aside_arm handler receives it, guards
+  // against overlap-in-flight via the module-scope asideState Map, and
+  // if clear injects the fixed /btw prompt into tmux + arms the
+  // extraction poller.
+  //
+  // Three guards on the fire:
+  //   1. `prev === false && isIdle === true` — a REAL false→true
+  //      transition. `prev === undefined` (initial mount) does NOT fire.
+  //      `prev === null` (backend hasn't spoken yet) does NOT fire.
+  //      Only a real transition where the previous frame was actively
+  //      working AND the current frame is now settled qualifies.
+  //   2. `pvIdentity != null` — identity gating happens FRONTEND-SIDE
+  //      per CONTEXT.md § Trigger. Anonymous sessions never emit arm,
+  //      so the backend never needs to know identity vs anonymous
+  //      (aligned with ASIDE-02).
+  //   3. `wsRef.current` is OPEN — otherwise the send throws / no-ops
+  //      and is meaningless. Wrapped in try/catch anyway since the
+  //      backend re-arms on the next transition (best-effort emit).
+  //
+  // Deps: [isIdle, pvIdentity] — re-run only when either flips. The
+  // prevIsIdleRef.current update happens BEFORE the guard so consecutive
+  // renders with the same value are correctly detected as "no transition."
+  useEffect(() => {
+    // user 2026-07-27: kill switch for the Phase 14 auto-aside trigger.
+    // Update the ref so isIdle keeps being tracked (avoids a spurious
+    // "fresh false→true transition" on re-enable), then bail before the
+    // emit. See the AUTO_ASIDE_ARM_ENABLED declaration for the full
+    // disable rationale.
+    if (!AUTO_ASIDE_ARM_ENABLED) {
+      prevIsIdleRef.current = isIdleDerived;
+      return;
+    }
+    const prev = prevIsIdleRef.current;
+    prevIsIdleRef.current = isIdleDerived;
+    if (prev === false && isIdleDerived === true && pvIdentity != null) {
+      // Suppress the trailing false→true transition that follows a
+      // user-initiated dismiss (Escape into tmux → pane activity →
+      // isIdle bounce). See dismissCooldownUntilRef declaration.
+      if (Date.now() < dismissCooldownUntilRef.current) return;
+      // Phase 14 followup (user 2026-07-27): skip aside arm when the
+      // user's most recent turn was an /id command. /id save, /id reset,
+      // /id <name> are identity-plumbing operations whose completion
+      // ("Saved: history +2 …", "I'm Tina. …") doesn't benefit from a
+      // plain-language recap. Trailing space matters — matches `/id save`
+      // but not `/identity` / `/idle` / bare `/id`. Walks backwards past
+      // any assistant echoes so we're comparing against the last SUBMITTED
+      // turn, not whatever landed last. Covers both ComposeBox submits
+      // and SSH-attached direct-tmux submits (both round-trip through
+      // JSONL — user turn is written before the assistant response
+      // streams, so it's always in messages[] well before isIdle=true).
+      // UAT amendment E41 (user 2026-07-27): isIdCommand also matches
+      // the harness slash-UI XML-wrapper form (<command-name>/id</command-name>)
+      // — user's PRIMARY /id invocation path from pretty-view slash-UI.
+      // ── PHASE-43 ASIDE-ARM WALK START — DO NOT EDIT; byte-preserved per 43-CONTEXT.md aside-arm suppression walk decision ──
+      // Phase 93 Slice 3 (D-09): reads from `effectiveMessages` (which
+      // collapses to local `messages` in the harness case — harness walk
+      // behavior byte-preserved). Relay case's messages never carry
+      // role:"user" MessageEvent types (they're relay_inbound/outbound), so
+      // the walk's isIdCommand short-circuit is a no-op for relay — semantic
+      // unchanged.
+      for (let i = effectiveMessages.length - 1; i >= 0; i--) {
+        const m = effectiveMessages[i];
+        if (m.type === "message" && m.role === "user") {
+          if (isIdCommand(m.content)) return;
+          break;
+        }
+      }
+      // ── PHASE-43 ASIDE-ARM WALK END ──
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(JSON.stringify({ type: "aside_arm" }));
+        } catch {
+          /* swallow — best-effort; backend re-arms on next transition */
+        }
+      }
+    }
+  }, [isIdleDerived, pvIdentity, effectiveMessages]);
+
+  // Phase 14 quick-task 260726-vbd: unmount cleanup for the 60s safety timer.
+  // Ensures an asidePendingTimerRef pending during component unmount does not
+  // fire a setState on an unmounted component. Mounted once ([] deps); the ref
+  // is always current because React refs are mutable and don't need to be in deps.
+  useEffect(() => {
+    return () => {
+      if (asidePendingTimerRef.current !== null) {
+        clearTimeout(asidePendingTimerRef.current);
+      }
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Phase 35 — register sendInput + sendInterrupt with Terminal.tsx on mount;
+  // unregister on unmount. Terminal.tsx stores the registered fn in a React ref
+  // (pvSendInputRef / pvSendInterruptRef); callers read .current?.() at call
+  // time. Cleanup nulls the refs so callers treat null as a silent noop when
+  // PrettyView is unmounted (isPrettyMode=false).
+  useEffect(() => {
+    onRegisterSendInput?.(sendInput);
+    onRegisterSendInterrupt?.(sendInterrupt);
+    return () => {
+      onUnregisterSendInput?.();
+      onUnregisterSendInterrupt?.();
+    };
+  }, [sendInput, sendInterrupt, onRegisterSendInput, onRegisterSendInterrupt, onUnregisterSendInput, onUnregisterSendInterrupt]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Phase 47 (load-more button) — visibility gate for LoadMoreOlderButton.
+  // "No lie" invariant (CONTEXT.md § What would make it wrong): the button
+  // never appears on a conversation with nothing older behind it.
+  //
+  // 2026-10-09: the gate was `sessionTotalLines > messages.length`, but most
+  // JSONL lines are skip frames that never render, so it held on nearly
+  // every pane and the button lied (click → nothing older exists). Now:
+  // before the first click, shown only if the cap actually dropped an older
+  // frame from the full replay; after it, the server's hasMore decides.
+  // oldestLoadedLine guard: a click without a cursor > 1 is a no-op in
+  // handleLoadOlder (frames without `line`, or an old backend).
+  const hasOlderMessages =
+    sessionHasMore &&
+    oldestLoadedLine !== null &&
+    oldestLoadedLine > 1 &&
+    (capOff || capDroppedRef.current);
+
+  // The agent is working: drives the working orb (whose Stop is for the main
+  // turn only — see the WipBubble mount).
+  // A background sub-agent keeps working after the main turn's Stop hook
+  // darkens isWorking, so a running background agent counts too. Shells are
+  // excluded — servers run for hours. The turn-over gate applies to the
+  // main turn only; background agents keep running after the turn ends or is
+  // interrupted. Not while dormant (no live process) or while waiting on the
+  // user (the permission bubble owns that state).
+  const mainTurnWorking =
+    (isWorking || optimisticWip) &&
+    (turnOverTail === null || turnOverWipReleased || pendingSends.some((p) => p.state === "sending"));
+  const turnWorking =
+    mainTurnWorking ||
+    (status === "streaming" && !dormant && waitingFor === null && backgroundedAgents.length > 0);
+  // Compacting runs no turn, so nothing above lights the orb while the agent
+  // summarises — the orb shows for it on its own, with a fixed line and no
+  // Stop (stopping halfway would leave the compaction half-done). Lit from the
+  // moment a compaction is asked for (a sleeping agent is woken for it), and
+  // held past its end until the agent's follow-up turn lights the orb itself,
+  // so the hand-over never flickers dark — for COMPACT_TAIL_MS at most.
+  const compacting = useSessionCompacting(sessionWorkingKey);
+  // The tail starts in the same render the compaction ends (adjusting state
+  // while rendering), so the orb is never unmounted for even one render; a
+  // different session starts with no tail.
+  const [compactTail, setCompactTail] = useState(false);
+  const [compactSeen, setCompactSeen] = useState({ key: sessionWorkingKey, compacting });
+  if (compactSeen.key !== sessionWorkingKey || compactSeen.compacting !== compacting) {
+    const sameSession = compactSeen.key === sessionWorkingKey;
+    setCompactSeen({ key: sessionWorkingKey, compacting });
+    setCompactTail(sameSession && compactSeen.compacting && !compacting);
+  }
+  const loggedCompactingRef = useRef(compacting);
+  useEffect(() => {
+    if (loggedCompactingRef.current === compacting) return;
+    loggedCompactingRef.current = compacting;
+    console.info(`[pv-compacting] ${compacting ? "on" : "off"} key=${sessionWorkingKey}`);
+  }, [compacting, sessionWorkingKey]);
+  useEffect(() => {
+    if (!compactTail) return;
+    if (turnWorking) {
+      setCompactTail(false);
+      return;
+    }
+    const t = setTimeout(() => {
+      console.info(`[pv-compacting] no follow-up turn within ${COMPACT_TAIL_MS}ms — orb off key=${sessionWorkingKey}`);
+      setCompactTail(false);
+    }, COMPACT_TAIL_MS);
+    return () => clearTimeout(t);
+  }, [compactTail, turnWorking, sessionWorkingKey]);
+  const compactingOnly = !turnWorking && (compacting || compactTail) && waitingFor === null;
+  const agentWorking = turnWorking || compactingOnly;
+  // Work narration: tell the backend whether this view is showing the work
+  // indicator for a turn (narration only runs while some view is), and drop
+  // the line when the indicator goes away so the next turn starts blank.
+  // The backend starts each connection at "not watching", so only changes
+  // from that are sent.
+  const narrationWatch = turnWorking && isVisible;
+  const narrationWatchSentRef = useRef<{ ws: WebSocket; active: boolean } | null>(null);
+  useEffect(() => {
+    if (!uploadWs || uploadWs.readyState !== WebSocket.OPEN) return;
+    const last = narrationWatchSentRef.current;
+    const lastActive = last !== null && last.ws === uploadWs ? last.active : false;
+    if (narrationWatch === lastActive) return;
+    try {
+      uploadWs.send(JSON.stringify({ type: "narration_watch", active: narrationWatch }));
+      narrationWatchSentRef.current = { ws: uploadWs, active: narrationWatch };
+    } catch {
+      /* ws may be mid-close */
+    }
+  }, [uploadWs, narrationWatch]);
+  useEffect(() => {
+    if (!turnWorking) setWorkNarration(null);
+  }, [turnWorking]);
+
+  // Whether the pane has a compose box (see the mount gate's notes below).
+  const composeShown = !!(onSend || source.kind === "relay") && (status === "streaming" || status === "error" || renderedState === "error" || renderedState === "dormant" || renderedState === "active" || renderedState === "inactive" || source.kind === "relay");
+  // shape-quote-reply: in a room, your own bubbles are quoted under your
+  // relay name — the name the room's agents know you by.
+  const roomSelfName = source.kind === "relay" && viewingUserMxid ? mxidLocalpart(viewingUserMxid) : null;
+
+  return (
+    <div
+      ref={pvRootRef}
+      data-pv-root
+      onDragEnter={(e) => {
+        // Patch #510 gate: only claim the drag when it's an actual FILE
+        // drag. Conv-list row drags (patch #509 / Phase 56) carry
+        // text/plain but no Files — they must pass through this handler
+        // untouched so they bubble to the SplitView Pane or the AppShell
+        // right-side container drop handler. Without this gate, PrettyView
+        // showed the file-upload overlay on every conv-row drag AND ate
+        // the drop (silent no-op because files.length === 0).
+        if (!isOsFileDrag(e.dataTransfer)) return;
+        // Phase 05 (UPLOAD-01): show the drop overlay while any drag
+        // hovers the pretty-view surface. We use a counter because
+        // dragenter/dragleave fire on every child boundary during a
+        // drag — only when the counter returns to 0 do we hide the
+        // overlay.
+        e.preventDefault();
+        dragCounterRef.current += 1;
+        if (dragCounterRef.current > 0) setIsDragOver(true);
+      }}
+      onDragOver={(e) => {
+        // Same patch #510 gate as onDragEnter — non-Files drags pass
+        // through so the drop bubbles to the AppShell outer handler.
+        if (!isOsFileDrag(e.dataTransfer)) return;
+        // dragover MUST preventDefault to enable the subsequent drop.
+        e.preventDefault();
+      }}
+      onDragLeave={(e) => {
+        if (!isOsFileDrag(e.dataTransfer)) return;
+        e.preventDefault();
+        dragCounterRef.current = Math.max(0, dragCounterRef.current - 1);
+        if (dragCounterRef.current === 0) setIsDragOver(false);
+      }}
+      onDrop={(e) => {
+        // Patch #510 gate — non-Files drops bubble to the AppShell outer
+        // handler (patch #510) or to a SplitView Pane onDrop (Phase 56)
+        // depending on where the drop landed in the tree. PrettyView only
+        // owns FILE drops.
+        if (!isOsFileDrag(e.dataTransfer)) return;
+        // Phase 05: stage the dropped items. Prefer DataTransferItemList
+        // (has webkitGetAsEntry so folder detection works) when available;
+        // fall back to files.
+        e.preventDefault();
+        dragCounterRef.current = 0;
+        setIsDragOver(false);
+        const dt = e.dataTransfer;
+        const items = dt.items;
+        const files = Array.from(dt.files);
+        if (items && items.length > 0) {
+          // Quick 260802-wxy: primary target — drag/drop lands in the main
+          // composebox's chip strip.
+          uploads.stageAttachments("primary", items);
+        } else if (files.length > 0) {
+          uploads.stageAttachments("primary", files);
+        }
+      }}
+      className={cn(
+        // `relative overflow-hidden` anchors the absolute header pill and
+        // overlays and clips at the pane's edges.
+        "h-full w-full flex flex-col relative overflow-hidden",
+        // Multi-role identities: gold sheen on hue surfaces (index.css).
+        isMultiRole(pvIdentity) && "pv-multi-role",
+        // Roleless identities: neutral grey on hue surfaces (index.css).
+        pvNeutralLook && "pv-neutral",
+        "text-[var(--color-pv-fg)]",
+        className,
+      )}
+      style={
+        {
+          // Phase 4: expose per-pane identity hue as a CSS custom
+          // property that all descendants can consume via
+          // `hsla(var(--pv-id-hue), 75%, 52%, X)`. Plan 04-02 wires
+          // this into ChatMessage user-bubble accents, ComposeBox
+          // ctxbar fill + send-button glow + textarea focus ring,
+          // ambient panel tag styling, etc. The IdentityBadge (lg)
+          // below reads identity.colorHue directly (not via this
+          // var) because its accents apply per-pixel color values
+          // rather than composing hsla — but they use the SAME
+          // fallback of 35 for consistency.
+          "--pv-id-hue": String(pvHue),
+          // Solid, the colour the edge fades darken to (conversation.css).
+          // Background only: no filter / transform here, so this root never
+          // becomes a containing block or stacking context for its overlays.
+          backgroundColor: "rgb(11, 12, 15)",
+          ...style,
+        } as React.CSSProperties
+      }
+    >
+      {/* The task pill — the pane's handle, replacing the identity badge
+          (shape task-pill). Avatar + task; click → agent window; ⋮ /
+          right-click → the conversation menu; drag → pane handle. Round
+          buttons beside it (desktop running, unpushed work) jump straight to
+          that agent-window tab. Harness panes only — relay rooms keep their
+          badge group below. */}
+      {source.kind === "harness" && pvIdentityKey && (
+        <TaskPill
+          identityKey={pvIdentityKey}
+          hostId={hostId}
+          tmuxSession={tmuxSession || null}
+          hostName={hostName}
+          tabId={tabId}
+          identity={archived ? archived.identity : undefined}
+          dragDescriptor={{
+            tabType: "terminal",
+            sessionKind: archived ? "archived" : "harness",
+            targetTmuxSession: tmuxSession || null,
+          }}
+          menuItems={identityBadgeContextMenuItems ?? []}
+          onOpen={(tab) => {
+            setIdentityModalTab(tab);
+            setIsIdentityModalOpen(true);
+          }}
+        />
+      )}
+      {/* Phase 93 Slice 2 (D-01/D-02/D-03/D-18): relay-case multi-badge
+          anchor. Mounted unconditionally when `source.kind === "relay"` —
+          MultiBadgeAnchor handles the loading placeholder internally
+          (Warning 2 fix) so the anchor position is parked at the D-01
+          spot from mount, even while the adapter is connecting. Slice 1's
+          stubbed relay adapter returns `isReady=false, participants={
+          humans:[], agents:[] }` so a Slice-2-era relay mount immediately
+          shows the "loading participants…" placeholder; Slice 3's real
+          adapter flips isReady=true when the first participants frame
+          arrives. */}
+      {source.kind === "relay" && (
+        <MultiBadgeAnchor
+          participants={
+            chatSurfaceAdapter.participants ?? { humans: [], agents: [] }
+          }
+          viewingUserMxid={viewingUserMxid ?? ""}
+          fleetIdentityHosts={fleetIdentityHosts}
+          isReady={chatSurfaceAdapter.isReady}
+          tabId={tabId}
+          relayRoomId={source.kind === "relay" ? source.roomId : undefined}
+          relayRoomTitle={source.kind === "relay" ? source.roomTitle : undefined}
+        />
+      )}
+      {/* Patch #87: identity bounties modal. Portals to document.body via
+          shadcn Dialog so it escapes this root's relative/overflow context.
+          Mount guarded by pvIdentity non-null (Modal needs displayName,
+          title, avatarUrl from the full Identity object). onOpenChange
+          handles all close paths (Esc, backdrop click, X button). */}
+      {pvIdentity && (
+        <IdentityModal
+          open={isIdentityModalOpen}
+          initialTab={identityModalTab}
+          onTabChange={setShownModalTab}
+          desktopRunningHint={pvDesktopRunning}
+          gitReposHint={identityModalTab === "git"}
+          onOpenChange={setIsIdentityModalOpen}
+          identity={pvIdentity}
+          hue={pvHue}
+          hostId={hostId}
+          archived={archived ? { archivedRoles: archived.archivedRoles } : undefined}
+          // Phase 90 Plan 90-06 (D-04): title-line click handler — swap-not-stack
+          // coordination. IdentityModal already fires onOpenChange(false) at the
+          // same tick; this handler resolves the RoleSummary and opens the role
+          // modal (which is mounted below at document.body per D-03).
+          // Phase 89's Role skills-tab onOpenRoleSkill is retired — Role skills moved
+          // to RoleModal (Plan 90-04); nested role skill swap now goes through
+          // RoleModal's onOpenRoleSkill mounted below.
+          onOpenRoleModal={handleOpenRoleModal}
+        />
+      )}
+      {roleModalOpenState && (
+        <RolesWindow
+          open={true}
+          onOpenChange={(open, reason) => {
+            if (!open) {
+              setRoleModalOpenState(null);
+              // "Start a conversation" hands off to the new-conversation
+              // dialog; only a plain close goes back to the identity modal.
+              const backToAgent = reason === undefined;
+              console.debug("[PrettyView] roles-window-close", { backToAgent });
+              if (backToAgent) setIsIdentityModalOpen(true);
+            }
+          }}
+          // Opened from this agent: the window is scoped to its host.
+          hostTree={roleWindowHostTree}
+          start={{ view: "role", hostId, role: roleModalOpenState.roleCosmetics }}
+        />
+      )}
+      {/* Phase 40 D-05/D-06/D-07: editor modal mounts alongside IdentityModal.
+          Portal target is document.body (Research §Pitfall 7 — deliberately
+          no portal-container prop; unlike IdentityModal, the editor modal's
+          inset-4 backdrop covers the composer per UI-SPEC L216).
+          onStageEditedFile deposits the saved File into
+          uploads.stageAttachments("primary", [File]) — the chip auto-mounts
+          via the existing AttachmentChipStrip wiring at ComposeBox and the
+          existing reply-with-attachment path handles the send, so this plan
+          adds zero new plumbing on the return trip. */}
+      {editorOpenState && (
+        <EditableFileModal
+          open={true}
+          onOpenChange={(open) => {
+            if (!open) setEditorOpenState(null);
+          }}
+          messageEventId={editorOpenState.messageEventId}
+          url={editorOpenState.url}
+          filename={editorOpenState.filename}
+          agentIdentityName={editorOpenState.agentIdentityName}
+          onStageEditedFile={handleStageEditedFile}
+        />
+      )}
+      {/* Chat-region wrapper. `relative` provides the positioning parent
+          for the chat-surface overlays' `absolute inset-0`; `flex-1 flex
+          flex-col` lets its children (status branches, chat-content,
+          harness/agents/shells panels) arrange vertically with chat-content
+          flex-1 filling remaining space. (2026-09-30 UAT: IdentityModal
+          no longer portals into this wrapper — see the useState delete
+          near L2164 for why.) */}
+      <div className="relative flex-1 min-h-0 flex flex-col">
+      {/* Phase 30 (PS30-06) + phase-30-restore-resolving-overlay-paint-delay
+          (2026-08-10): PrettyViewLoadingOverlay is the resolving-state
+          spinner. Mount gate is `showResolvingSpinner` — a boolean flipped
+          true by a 400ms delay-arm useEffect above (search for the state
+          slot) that observes renderedState. Cold-mount / warm-re-entry
+          cases where WS-reopen + backend pane_state emit land in <400ms
+          never flash the overlay; genuinely-slow resolves still see the
+          spinner after the paint-delay expires. Delay-arm lives at THIS
+          site (not the hook) exactly as PS30-06's own comment authorized
+          if UAT surfaced the flash — which user's report did. */}
+      {showResolvingSpinner && <PrettyViewLoadingOverlay />}
+      {archived?.overlay}
+
+      {/* Inactive branch renders nothing — the label was noisy and sometimes
+          flashed during the dormancy transition, per user 2026-08-31. */}
+
+      {/* Phase 30 (PS30-06): PrettyViewErrorOverlay gated on
+          `renderedState === "error"`. Retry button wires to an inline
+          handler that resets the retry counter, flips status back to
+          "connecting", clears paneState (so we re-enter resolving until
+          backend re-emits), and bumps retryKey to re-run the WS-setup
+          useEffect. */}
+      {renderedState === "error" && (
+        <PrettyViewErrorOverlay
+          onRetry={() => {
+            reconnectAttemptsRef.current = 0;
+            setReconnectAttempts(0);
+            setStatus("connecting");
+            setPaneState(null); // clear last-known so we re-enter resolving until backend re-emits pane_state
+            setRetryKey((k) => k + 1);
+          }}
+        />
+      )}
+
+      {/* Phase 93 Slice 3 (D-20) + Slice 6 post-close reshape:
+          ChatSurfaceErrorState — friendly OVERLAY for relay rooms that are no
+          longer available (kicked, room-not-found, WS inactive frame). One of
+          the StatusOverlay family (loading, connection failed).
+          The message-list container below
+          stays mounted underneath the overlay. Structured log fires from a
+          separate useEffect above — do NOT re-inline it here (spamming logs
+          proportional to render count is the pre-Slice-6 bug this replaces). */}
+      {source.kind === "relay" && chatSurfaceAdapter.error !== null && (
+        <ChatSurfaceErrorState />
+      )}
+
+      {/* Phase 56 (2026-08-23): dormant-OR term removed — no former dormant-
+          overlay sibling needs the container to mount in the zero-messages/
+          dormant case any more (that overlay was deleted in Plan 56-03).
+          Phase 93 Slice 3: also mount when source.kind === "relay" (so the
+          relay adapter's messages can render even though harness `status`
+          is not "streaming"). Phase 93 Slice 6 (post-close fix): removed the
+          `!(source.kind === "relay" && chatSurfaceAdapter.error !== null)`
+          gate — the relay error state is an overlay (StatusOverlay), so the
+          message-list container stays mounted underneath the overlay rather
+          than being replaced by it. */}
+      {(status === "streaming" ||
+        ((status === "connecting" || status === "error") && effectiveMessages.length > 0) ||
+        source.kind === "relay") && (
+        <div
+          // Outer scroll container. useAutoScroll's scrollRef drives pinned-follow behavior.
+          ref={setScrollEl}
+          // mobile-scroll-freeze-overscroll-behavior (2026-08-10): `overscroll-contain`
+          // stops iOS Safari from routing rubber-band momentum to an ancestor scroller
+          // on end-of-scroll. Without it, iOS locks the touch for 10-15s while its
+          // arbitrator hunts for a scroll owner (AppShell's outer chain is all
+          // overflow-hidden), and the surface becomes unresponsive to swipes.
+          // Phase 70 (rewrite): [overflow-anchor:none] RESTORED — the state machine in
+          // useAutoScroll owns scroll position exclusively (shape-file § Explicit ownership
+          // LOCKED). Browser scroll-anchoring fighting explicit `scrollTop = scrollHeight`
+          // writes was one of the six pitfalls named in shape-file § What would make it wrong.
+          // Load-more anchor preservation is explicit too — capturePrependAnchor +
+          // the restore layout effect (bounty load-more-scroll-and-order-corruption).
+          className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden overscroll-contain [overflow-anchor:none] px-4 py-3"
+        >
+          {/* Phase 47 (load-more button) — mounted at the TOP of the scroll
+              container, immediately above the messages.map. Visibility gate
+              `hasOlderMessages` derived below matches CONTEXT.md § What would
+              make it wrong "no lie" invariant: only shown when something older
+              than the view is known to exist (see the gate's comment). Same
+              in-flow structural convention as the accessory siblings below
+              (WipBubble/WaitingBubble/etc.) — plain child of the same scroll
+              container, no position:absolute. */}
+          {/* hide-pin-reveal wrapper: content starts invisible during mount-landing.
+              The hook waits for the first non-zero content-height measurement, jumps
+              to bottom, then flips revealed=true (effect:"reveal" from the reducer).
+              visibility:hidden (not display:none) preserves layout so the scroll
+              container's geometry is measurable during the landing window.
+              Per shape-pv-autoscroll-rewrite.md § Mount landing LOCKED. */}
+          {/* Centered message column: on wide panes the bubbles sit in an
+              860px column (agent on its left edge, user on its right) instead
+              of hugging the pane edges; narrower panes fill as before. The
+              scroll container stays full-width so the scrollbar keeps to the
+              pane edge. ComposeBox's root carries the same column. */}
+          <div
+            className="mx-auto max-w-[780px]"
+            style={{
+              visibility: revealed ? "visible" : "hidden",
+              // Clear the floating composer dock, resting the last message
+              // in the light top half of its 40px fade.
+              paddingBottom: "calc(var(--pv-dock-h, 0px) - 16px)",
+            }}
+          >
+          {/* Header clearance: the badge / task pill / mobile back button float
+              over the top of this scroll container (absolute top-4, badge
+              ~66px tall). Always-present spacer so the first bubble starts
+              below them — load-older is absent on a fresh conversation, so it
+              can't be what provides the gap. */}
+          <div data-testid="pv-header-clearance" aria-hidden="true" style={{ height: 64 }} />
+          <LoadMoreOlderButton
+            hasOlder={hasOlderMessages}
+            status={loadOlderState}
+            error={loadOlderError}
+            onClick={handleLoadOlder}
+          />
+          {/* Phase 43 (plan 43-07a): plain-DOM message rendering. Every entry
+              in messages[] is a real in-flow child of the outer scroll
+              container. No sized virtualizer wrapper, no absolute positioning,
+              no measurement observer. `data-pv-bubble` is the empirical DOM-count
+              hook (post-ship diag). `data-event-id` carries the same per-message
+              identity witness so downstream diagnostics can still correlate
+              DOM nodes with their source frames. Accessory siblings
+              (WipBubble / WaitingBubble / AsideBubble;
+              former overlay and bubble siblings were retired in
+              Phase 56 Plan 03 and Phase 95 Part B respectively)
+              remain immediately below the .map output, in-flow
+              inside the same outer scroll container — same structural
+              layout invariant established by Phase 27 Plan 27-02 Step B. */}
+          {/* Confirmed and optimistic bubbles render as ONE keyed array so a
+              settled send reuses its optimistic bubble's DOM node (key looked
+              up in settledBubbleKeyRef) instead of unmount+mount — the
+              remount repainted the backdrop-blur bubble for a frame, which
+              read as a blink once the spinner no longer marked the swap. */}
+          {[...renderedMessages.map((m) => (
+            // Phase 45 Bug #2 (user UAT verbatim): 9px inter-bubble padding restored — technically padding but functionally margin per user's clarification 2026-08-18.
+            <div
+              key={settledBubbleKeyRef.current.get(m.eventId) ?? m.eventId}
+              data-pv-bubble
+              data-event-id={m.eventId}
+              style={{ paddingBottom: 9 }}
+            >
+              {/* RELAYBUB-01/RELAYBUB-02/RELAYBUB-06: relay_* frames route to their own bubble variants;
+                  normal message frames stay on ChatMessage (locked interior per user 2026-07-23).
+                  hostId is drilled into RelayInboundBubble so its file-pointer fetch can identify
+                  which pane's remote host to query. */}
+              {m.type === "image" &&
+              m.role === "user" &&
+              parseInjectedUserTurn(stripImagePasteMarkers(m.text)) ? (
+                // A Skynet attachment send that Claude Code turned into inline
+                // images: render it as the attachment bubble the user sent
+                // (caption + file chips), not as a raw image bubble.
+                <ChatMessage
+                  role="user"
+                  quoteName={roomSelfName}
+                  content={stripImagePasteMarkers(m.text)}
+                  speakVoices={speakVoices}
+                  ts={m.ts}
+                  eventId={m.eventId}
+                  hostName={hostName}
+                  onOpenEditor={handleOpenEditor}
+                  fileDragOrigin={fileDragOrigin}
+                />
+              ) : m.type === "image" ? (
+                <ImageBubble
+                  role={m.role}
+                  images={m.images}
+                  text={m.text}
+                  eventId={m.eventId}
+                  ts={m.ts}
+                />
+              ) : m.type === "relay_outbound" ? (
+                <RelayOutboundBubble
+                  room={m.room}
+                  body={m.body}
+                  to={m.to ?? null}
+                  result={m.toolUseId ? relayResults.get(m.toolUseId) ?? null : null}
+                  ts={m.ts}
+                  hostId={hostId}
+                  selfIdentity={pvIdentity}
+                  fallbackVoice={userPrefs.fallbackVoice ?? null}
+                  // Phase 97 UAT follow-up (2026-09-10): in relay-source view
+                  // (source.kind === "relay" — user chatting IN a matrix room),
+                  // bubbles render un-collapsed AND non-collapsible. In harness
+                  // view (task-notification-triggered relay bubbles), preserve
+                  // the default collapsed-with-toggle behavior.
+                  alwaysExpanded={source.kind === "relay"}
+                />
+              ) : m.type === "relay_inbound" ? (
+                <RelayInboundBubble
+                  room={m.room}
+                  sender={m.sender}
+                  body={m.body}
+                  ts={m.ts}
+                  hostId={hostId}
+                  alwaysExpanded={source.kind === "relay"}
+                  eventId={m.eventId}
+                  fallbackVoice={userPrefs.fallbackVoice ?? null}
+                  selfIdentity={pvIdentity}
+                />
+              ) : m.type === "malformed_line" ? (
+                <MalformedBubble bytes={m.bytes} ts={m.ts} />
+              ) : m.type === "compaction" ? (
+                <CompactionDivider
+                  summary={m.summary}
+                  guidance={condenseGuidance.get(m.eventId) ?? null}
+                  ts={m.ts}
+                />
+              ) : (
+                <ChatMessage
+                  role={m.role}
+                  content={m.content}
+                  speakVoices={speakVoices}
+                  ts={m.ts}
+                  eventId={m.eventId}
+                  hostName={hostName}
+                  onOpenEditor={handleOpenEditor}
+                  fileDragOrigin={fileDragOrigin}
+                  // Relay rooms have no tray: an ask reads as plain text there.
+                  askTray={source.kind !== "relay"}
+                  quoteName={m.role === "user" ? roomSelfName : null}
+                  // Phase 124 Plan 02 (shape 3 — message thumbs, D-38):
+                  // wire the thumbs callback plumbing ONLY to the
+                  // ChatMessage-branch of the message-type conditional.
+                  // RelayInboundBubble/RelayOutboundBubble/ImageBubble/
+                  // MalformedBubble/WaitingBubble and the pendingSends.map
+                  // optimistic bubbles do NOT receive these props
+                  // (D-12/D-13/D-14 hard lock).
+                  onThumbsUp={stableThumbsUp}
+                  onThumbsDown={stableThumbsDown}
+                  // Phase 97 UAT follow-up 4 (2026-09-10): relay-source
+                  // adapter injects optimistic bubbles into `messages`
+                  // with pendingState="sending" (or "failed"). Harness
+                  // path leaves pendingState undefined on confirmed
+                  // MessageEvents; harness pending sends still render via
+                  // the separate pendingSends.map below. Threaded here so
+                  // relay-source failed bubbles render red consistently
+                  // with the harness pending pattern.
+                  pendingState={m.pendingState ?? null}
+                />
+              )}
+            </div>
+          )),
+          // Phase 50 Plan 03 Task 3b (D-04/D-19): optimistic bubbles AFTER
+          // confirmed messages (chronological). 'sending' pendings render as
+          // plain bubbles (the optimistic WipBubble carries in-flight
+          // feedback); 'failed' bubbles render red so the user sees every
+          // retry candidate. Same wrapper attributes as the confirmed messages
+          // so the auto-scroll/scroll-anchor hooks see them uniformly.
+          ...pendingSends.map((p) => {
+            return (
+              <div
+                key={`pending-${p.mqid}`}
+                data-pv-bubble
+                data-event-id={`pending-${p.mqid}`}
+                style={{ paddingBottom: 9 }}
+              >
+                <ChatMessage
+                  role="user"
+                  content={p.content}
+                  pendingState={p.state}
+                  attachments={p.attachments}
+                  hostName={hostName}
+                  fileDragOrigin={fileDragOrigin}
+                />
+                {p.state === "failed" && (
+                  <div className="pv-bubble-fail-row">
+                    {p.failNote && <span data-pv-fail-note>{p.failNote}</span>}
+                    <button
+                      type="button"
+                      className="pv-bubble-fail-dismiss"
+                      data-pv-fail-dismiss
+                      onClick={() => dismissFailedSend(p.mqid)}
+                    >
+                      Dismiss
+                    </button>
+                  </div>
+                )}
+              </div>
+            );
+          })]}
+          {/* Phase 43 (plan 43-07a): accessory siblings kept immediately below
+              the message-list .map output — in-flow inside the outer scroll
+              container per the same layout invariant Phase 27 Plan 27-02 Step B
+              established. With virt gone, the "post-virtualizer sized wrapper"
+              framing collapses: accessories are simply in-flow siblings of the
+              per-message [data-pv-bubble] children. No position:sticky, no
+              position:absolute, no overlay — per ASIDE-05. Order matches the
+              pre-Phase-43 rendering (WipBubble → WaitingBubble → AsideBubble
+              → jump-to-bottom pill; former overlay and bubble siblings
+              were retired — Phase 56 Plan 03 and Phase 95 Part B). */}
+          {/* A background sub-agent keeps working after the main turn's Stop
+              hook darkens isWorking, so a running Agents-panel entry also
+              lights the bubble. Shells are excluded — servers run for hours.
+              The turn-over gate applies to the main turn only; background
+              agents keep running after the turn ends or is interrupted. Not while dormant (no
+              live process, so nothing is running) or while waiting on the
+              user (WaitingBubble owns that state). */}
+          {/* The orb is the Stop (shape-stop-on-orb): it can stop only the
+              main turn (background agents run on through it) and not while
+              a send is still being delivered. It stays up past the turn's
+              end until a press's outcome has shown. */}
+          {(agentWorking || interruptFeedback !== null) && (
+            <WipBubble
+              narration={compactingOnly ? COMPACTING_NARRATION : workNarration}
+              label={compactingOnly ? "Compacting the conversation" : undefined}
+              stop={
+                onInterrupt && source.kind !== "relay"
+                  ? {
+                      canStop: mainTurnWorking && !pendingSends.some((p) => p.state === "sending"),
+                      onStop: handleInterrupt,
+                      feedback: interruptFeedback,
+                    }
+                  : undefined
+              }
+            />
+          )}
+          {/* Phase 34 Plan 06: WaitingBubble — harness permission/dialog waiting state.
+              Mounts when the fleet-status channel reports status='waiting' for this
+              session's (hostId, tmuxSession) key. Sibling of WipBubble in the
+              in-flow message-list column. Allow / Deny when a permission prompt
+              is readable off the pane; hidden once its auto-deny countdown runs
+              out. See WaitingBubble.tsx header. */}
+          {waitingFor !== null && !permissionPrompt.hidden && (
+            <WaitingBubble
+              key={permissionPrompt.prompt?.fingerprint ?? "presence"}
+              reason={waitingFor}
+              prompt={permissionPrompt.prompt}
+              secondsLeft={permissionPrompt.secondsLeft}
+              answer={permissionPrompt.answer}
+              onAnswer={permissionPrompt.onAnswer}
+              agentName={pvIdentity?.displayName ?? null}
+            />
+          )}
+          {/* Phase 56 (2026-08-23): former dormant-overlay mount site DELETED.
+              Dormancy is now invisible — PrettyView on a dormant pane renders
+              identically to PrettyView on an awake-idle pane. Backend still
+              tracks dormant
+              state internally (paneState machine, WIP-indicator gating, live-
+              frame auto-dismiss), and the compose box stays mounted + enabled
+              on dormant panes (see compose-mount gate below which KEEPS the
+              `renderedState === "dormant"` OR-term for that reason). Sending
+              into a dormant pane triggers invisible wake at the backend send-
+              path (Plan 56-01) with the widened watchdog window (Plan 56-02). */}
+          {/* Phase 27 Plan 27-02 Step B: AsideBubble mounts as an in-flow
+              sibling immediately after the messages.map output inside the
+              scroll container. Post-refactor (Phase 27), it is no longer
+              a child of the flex column that holds the messages — that column
+              became the virtualizer's absolute-positioned sized container.
+              AsideBubble stays visually below the message list.
+              useAutoScroll's MutationObserver on the scroll container's children
+              dispatches a single {kind:'content-changed'} event to the state
+              machine — symmetric with every other content-mount signal per
+              shape § Symmetric event handling. No per-accessory-type wiring.
+              In-flow per ASIDE-05 — NOT an overlay, popup, or fixed-
+              position element. */}
+          {asideText !== null && <AsideBubble text={asideText} />}
+          {/* Jump-to-bottom pill — inside the hide-pin-reveal wrapper,
+              inside the scroll container so `sticky bottom-2` anchors it
+              to the bottom-right of the visible viewport. Shown only when
+              the user has scrolled up (mode === "not-at-bottom").
+              `jumpToBottom` dispatches {kind:"jump-clicked"} to the reducer,
+              which transitions to at-bottom and schedules a RAF chase-write.
+              Async content settle (image decode, batched WS backfill) is handled
+              by the MutationObserver + ResizeObserver in useAutoScroll — no
+              re-arm timer needed here. `mode` is reducer-derived from the
+              isTrusted scroll listener. */}
+          {mode === "not-at-bottom" && effectiveMessages.length > 0 && (
+            // Centred just above the composer dock; same look as the pill.
+            // Solid fill, no blur: it's sticky, so a blur would re-sample
+            // every scroll frame.
+            <div
+              className="sticky pointer-events-none flex justify-center"
+              style={{ bottom: "calc(var(--pv-dock-h, 0px) + 10px)" }}
+            >
+              <button
+                type="button"
+                onClick={jumpToBottom}
+                aria-label="Jump to latest"
+                title="Jump to latest"
+                className="pv-float pv-float-round pointer-events-auto"
+              >
+                <ArrowDown aria-hidden="true" />
+              </button>
+            </div>
+          )}
+          </div>
+        </div>
+      )}
+
+      {/* Background sub-agents and shells are no longer shown (shape-
+          conversation-view); PrettyView still tracks them — a running
+          background agent still lights the working orb. */}
+      </div>
+      {/* Patch #108 wrapper closes here — ComposeBox stays a peer of the
+          wrapper (below it in flex-col), so it's outside the IdentityModal's
+          coverage area. */}
+
+      {/* Top fade: messages darken as they slide under the pill. A gradient,
+          not a blur — nothing re-samples the page while it scrolls. */}
+      <div className="pv-fade-top" aria-hidden="true" />
+      {/* The dock: the task list and the composer float over the end of the
+          message list on a darkening fade (shape-conversation-view). Above
+          the chat-surface overlays (z-99) so the composer stays usable;
+          below the pill (z-101). */}
+      <div ref={setDockEl} className="pv-dock" data-touch={isTouchDevice ? "true" : undefined} data-testid="pv-dock">
+        {errorMessage && status === "streaming" && (
+          <div className="pv-compose-error text-center">
+            {errorMessage}
+          </div>
+        )}
+
+        {/* Harness tasks panel — a slim card directly above the composer. Filtered to
+            active tasks only (pending + in_progress); when the filtered list
+            is empty the panel does NOT render, so no chrome / no empty state.
+            Read-only for v1 — Claude Code owns writes to ~/.claude/tasks/. */}
+        {status === "streaming" &&
+          (() => {
+            const active = harnessTasks.filter(
+              (t) => t.status !== "completed",
+            );
+            return active.length > 0 ? (
+              <HarnessTasksPanel tasks={active} />
+            ) : null;
+          })()}
+        {/* Phase 30 ComposeBox mount gate: same shape as Phase 29, only the
+            `renderedState === ...` names differ from the old `phase === ...`.
+            `status === "streaming"` preserved (post-resolve active).
+            `status === "error"` retained so ComposeBox stays mounted during
+            the transient WS reconnect window (bubbles preserved, Send
+            disabled per patch #339). `renderedState === "error"` covers the
+            terminal-ladder-exhausted case (PrettyViewErrorOverlay up).
+            `renderedState === "dormant"` mounts the reduced-state ComposeBox
+            during the sleep window. `renderedState === "active"` (patch #491)
+            closes the wake-transition unmount gap: on a cold-dormant page
+            (fresh page load onto a dormant pane, backend's dormant-poll path
+            at claude-session-server.ts § L2570 emits {type:"dormant"} +
+            pane_state:"dormant" WITHOUT ever sending a session frame, so
+            status stays "connecting" client-side), when wake completes the
+            dormant-poll seam fires pane_state:"active" (§ L6387) BEFORE the
+            supervisor's fresh claude launches and hits the "Active path"
+            (§ L6025) that finally emits the session frame. Without the
+            `active` clause, the mount gate flips false in that window and
+            unmounts ComposeBox — destroying useVoiceRecording state (mid-
+            flight MediaRecorder + MediaStream), textarea drafts, and any
+            in-flight compose gesture. user 2026-08-23 verbatim: "as I'm
+            waking up, I start recording a message with the mic, but when
+            it actually wakes up, for some reason, the mic just stops, and
+            it goes back to as if I'm not recording, and so I lose that
+            recording." Regression locked by "Test 4 (cold-dormant→active
+            preserves compose state)" below. */}
+        {/* LOAD-BEARING INVARIANT (Phase 76 post-review): this gate deliberately
+            EXCLUDES `renderedState === "holding"` — during holding, Claude is
+            being relaunched and the pane cannot receive input. The pane_state
+            WS handler at ~L1815 relies on this: it maps `pane_state:"holding"`
+            to `setDormant(false)` (because holding is not asleep-at-send-time),
+            which is only safe because no send can arm during holding. If a
+            future change adds "holding" to this mount gate, the WS handler's
+            holding branch must be reconsidered — otherwise a send armed during
+            holding would take the 20s branch even though the pane is
+            transiently unavailable. */}
+        {/* 2026-09-25 (tina): added `renderedState === "inactive"` to unstrand
+            panes where backend discovery timed out (returns pane_state:"inactive"
+            → resolveRenderedState maps to "inactive"). Previously the gate
+            matched none of {active,dormant,error} so ComposeBox never mounted
+            (domNodeCount:6). On a busy target (load 60+ / 1500+
+            shells / 750+ claude procs) 7 of 8 concurrent discoveries hit the
+            15s timeout on rapid multi-pane reload, leaving those panes
+            permanently uncomposable. Treating "inactive" the same as "dormant"
+            for the mount decision is correct: both are "backend says no live
+            claude for this pane"; on send, the invisible-wake path handles it. */}
+        {/* An archived conversation has no compose box: its strip
+            ("Archived" + Un-archive) sits where the composer would. */}
+        {archived && archived.footer}
+        <QuoteButton
+          rootRef={scrollElRef}
+          enabled={composeShown}
+          touch={isTouchDevice}
+          onQuote={handleQuote}
+          focusCompose={focusComposeForQuote}
+        />
+        {composeShown && (
+          <ComposeBox
+            // shape-interactive-responses: the agent's open question, shown in
+            // the tray above the composer; answers and typed replies both go
+            // through the composer's own send path.
+            openAsk={openAsk}
+            hostName={hostName}
+            onOpenAskFile={handleOpenAskFile}
+            // Phase 93 D-11: pass mode based on source.kind — "relay" hides
+            // Row 1 + Paperclip monolithically; "harness" (default) preserves
+            // the full instrument bar. ChatSurfaceSource.kind is exactly
+            // `"harness" | "relay"` which matches ComposeBox's mode prop.
+            mode={source.kind}
+            onSend={handleComposeSend}
+            // Hands-free voice mode — harness only; relay rooms have no
+            // working signal (they still dictate with the mic).
+            voiceModeFeed={source.kind === "relay" ? undefined : voiceModeFeed}
+            agentWorking={agentWorking}
+            // Phase 50 D-01: seed a pending bubble synchronously with the
+            // WS write; PrettyView owns the FIFO pendingSends queue.
+            // Phase 93 Slice 6 (post-close fix): NOT seeded in relay mode — the
+            // relay adapter owns its own optimistic-bubble tracking (mqid FIFO
+            // head-matched against Matrix's `unsigned.transaction_id` echo per
+            // Pitfall 4). Passing `handleOptimisticSend` in relay mode would
+            // seed a SECOND local pending that the harness ingestion effect —
+            // gated off in relay — never head-matches, producing a duplicate
+            // bubble that flips red at the 20s timeout.
+            onOptimisticSend={source.kind === "relay" ? undefined : handleOptimisticSend}
+            // Phase 50 D-03 failure-path repopulate — set by flipToFailed
+            // to the failed pending's content; ComposeBox populates the
+            // textarea and acks via onOverrideTextConsumed on the same tick.
+            overrideText={composeOverrideText}
+            onOverrideTextConsumed={handleOverrideTextConsumed}
+            // Phase 60 finish-line fix (2026-08-29): Phase 60 widened the
+            // ComposeBox MOUNT gate above to include `renderedState === "dormant"`
+            // (invisible-wake target) and `renderedState === "active"` (cold-
+            // dormant→wake transition — see mount comment above), and removed
+            // the compose-side `dormantActive` disable — but this canSend gate
+            // stayed `status === "streaming"` only, so on a dormant pane the
+            // child ComposeBox's `sendDisabled` predicate at ComposeBox.tsx:1817
+            // still flipped true via `(canSend === false && !hasAttachments)`.
+            // Net: user typed/pasted into a dormant compose box and the Send
+            // button stayed disabled — defeating the whole Phase 60 point.
+            // Widened to also enable for the two Phase 60 renderedStates so
+            // Send works when the ComposeBox is intentionally mounted for
+            // wake-triggering. `renderedState === "error"` deliberately NOT
+            // included (an errored WS should not accept new sends until it
+            // recovers). user UAT 2026-08-29: "sometimes typing into the
+            // main text area of the compose box or pasting stuff in there
+            // doesn't enable the send button."
+            canSend={
+              // Phase 93 Slice 6 (post-close fix): relay mode is always sendable
+              // when the compose is mounted — harness `status`/`renderedState`
+              // both derive from the harness ingestion effect, which is gated
+              // off in relay mode, so they never leave the initial "connecting"
+              // state. Without this term, `canSend` stayed false in relay and
+              // the Send button rendered visually disabled. Enter-to-send still
+              // fired via ComposeBox.handleKeyDown (which bypasses canSend),
+              // which is why the relay-source tests didn't catch it.
+              // 2026-09-25 (tina): `inactive` mirrors `dormant` in the mount
+              // gate above (see comment there), so also enable Send here so
+              // the user can type/send even when discovery is inactive —
+              // otherwise mounting the ComposeBox with a disabled Send button
+              // partially re-creates the "can't compose" trap the mount-gate
+              // widening was meant to close.
+              source.kind === "relay" ||
+              status === "streaming" ||
+              renderedState === "dormant" ||
+              renderedState === "active" ||
+              renderedState === "inactive"
+            }
+            // Phase 30: reconnectingActive derives from `status === "error"
+            // || renderedState === "error"`. status="error" covers the
+            // transient reconnect window (WS onclose fired, retry ladder
+            // in-flight); renderedState="error" covers the terminal ladder-
+            // exhausted state.
+            reconnectingActive={status === "error" || renderedState === "error"}
+            // Phase 56 (2026-08-23): dormantActive prop DELETED. Compose stays
+            // enabled on dormant panes — send triggers invisible wake at the
+            // backend send-path (Plan 56-01) with widened watchdog (Plan 56-02).
+            hostId={hostId}
+            tmuxSession={tmuxSession}
+            // Phase 97 Finding 6 (D-14) originally case-branched identityName
+            // so the placeholder in the relay case read `Message room…`
+            // instead of falling back to `Message Claude…`. The placeholder
+            // is now universal ("Write a message…") and no longer consumes
+            // identityName, so the placeholder rationale is retired. The
+            // case-branch is kept because identityName still feeds the send
+            // funnel's stamped-log attribution + present/empty gating (see
+            // useComposeSend); the "room" sentinel keeps relay sends
+            // non-empty-gated the same way an identity displayName does.
+            identityName={source.kind === "relay" ? "room" : pvIdentity?.displayName}
+            onGoodToGo={jumpToBottom}
+            restoreRequest={restoreRequest}
+            onRestoreApplied={handleRestoreApplied}
+            quoteRequest={quoteRequest}
+            onQuoteApplied={handleQuoteApplied}
+            // Phase 05 upload wiring — all sourced from the local
+            // usePrettyViewUploads hook. Patch #123 split the old single
+            // paperclip-visibility-equals-touch-device line into two
+            // independent props: paperclip is now shown universally
+            // (desktop-visible too, after patch #121 freed aux-row space)
+            // and the Row 1 min-h-[44px] WCAG touch target is gated
+            // separately on the touch-device peer prop. The
+            // useIsTouchDevice() hook (patch #102) is still the sole
+            // mobile-vs-desktop discriminator, just no longer conflated
+            // with paperclip visibility.
+            stagedAttachments={uploads.stagedAttachments}
+            onRemoveAttachment={uploads.removeAttachment}
+            showPaperclip={true}
+            isTouchDevice={isTouchDevice}
+            // Quick 260802-wxy: wrap the target-aware hook API in a
+            // ComposeBox-compatible (files-only) callback that always targets
+            // "primary" — the paperclip picker and paste path both stage there.
+            onAttachFiles={(files) => uploads.stageAttachments("primary", files)}
+            // Phase 14 quick-task 260726-vbd: widened asideActive predicate
+            // covers both the GENERATION phase (asidePending=true, from /btw
+            // submit through aside_ready arrival) and the DISPLAY phase
+            // (asideText !== null, post-aside_ready pre-dismiss). Same visual
+            // state for both phases — ComposeBox aux buttons disabled + send
+            // button morphs to X/Resume. Same Escape-based dismiss primitive
+            // cancels an in-flight /btw or clears a displayed aside.
+            asideActive={asideText !== null || asidePending}
+            onAsideDismiss={handleAsideDismiss}
+            onSendWithAttachments={async (caption, textArea) => {
+              batchTextAreaRef.current = textArea;
+              // quick-260823-8ji: Promise-returning — ComposeBox awaits this
+              // outcome to gate the textarea + attachment-chip clear on a
+              // genuine success signal from the batch lifecycle
+              // (upload_ready_to_inject → { ok: true }). On failure /
+              // timeout / ws-drop the compose state is preserved and an
+              // inline error surfaces, mirroring the non-attachment path's
+              // Phase 50 D-20 / D-56 posture. See ComposeBox.tsx handleSend
+              // attachment branch + use-pretty-view-uploads.ts BatchOutcome
+              // for the full contract.
+              const ret = await uploads.startBatch(caption);
+              if (!ret) {
+                // startBatch returns null when no attachments are staged —
+                // the compose surface guards this branch on hasAttachments
+                // upstream, but defensively surface as an upload_failed so
+                // ComposeBox never sees an unresolved outcome.
+                return {
+                  ok: false as const,
+                  reason: "upload_failed" as const,
+                  message: "No attachments staged",
+                };
+              }
+              return ret.outcome;
+            }}
+            onRetryBatch={() => {
+              void uploads.retryBatch();
+            }}
+            className="shrink-0"
+          />
+        )}
+      </div>
+
+      {/* Phase 05: full-surface drop overlay. Mounts inside data-pv-root
+          so its `absolute inset-0` positioning resolves against the
+          pretty-view container (which is `relative overflow-hidden`).
+          The overlay is `pointer-events-none` — the drop event lands on
+          data-pv-root's own handler. folderDropRejected is driven by
+          the upload hook's ~3s auto-clearing state. */}
+      <DropOverlay
+        isDragOver={isDragOver}
+        folderDropRejected={uploads.folderDropRejected}
+      />
+
+      {/* Phase 124 Plan 02 (shape 3 — message thumbs, D-23/D-25/D-37 /
+          Pattern S-04 option (B)): PrettyView-scoped FeedbackModal mount
+          driving the thumbs-down flow. This modal is separate from
+          AppShell's dev-chord FeedbackModal (AppShell L4165) — Pattern
+          S-04 rationale is that the per-message payload context
+          (eventId + exchangeText) stays lexically local to the caller
+          instead of bouncing through app-scope state.
+
+          Open state derives from `feedbackModalContext !== null` — set by
+          handleThumbsDown above when the user clicks the thumbs-down
+          button on an assistant bubble. Variant is ALWAYS thumbs_down
+          (D-37 lock — this mount does not introduce a general variant;
+          the general/thumbs_down switch remains AppShell's concern).
+
+          Fire paths (D-25 — thumbs-down submit AND thumbs-down dismiss
+          BOTH fire exactly one email):
+            - onSubmit(userNote): the user typed a note and clicked Send.
+              Fires the feedback POST with the typed userNote; the dialog
+              shows "Thanks — sent." and then closes itself.
+            - onDismissWithoutSubmit(): Send without a note, close-X or
+              Escape. Fires the feedback POST with an EMPTY userNote; the
+              onOpenChange(false) that follows drops feedbackModalContext
+              to null.
+            - onOpenChange(next): only closes the modal (drops context to
+              null) — do NOT invoke the POST here; the dismiss fire is
+              handled by onDismissWithoutSubmit exclusively so the two
+              paths cannot double-fire. */}
+      <FeedbackModal
+        open={feedbackModalContext !== null}
+        variant="thumbs_down"
+        onOpenChange={(next) => {
+          if (!next) setFeedbackModalContext(null);
+        }}
+        onSubmit={(userNote) => {
+          if (feedbackModalContext == null) return;
+          // The dialog confirms, then closes itself (dropping the context via
+          // onOpenChange); it won't also fire onDismissWithoutSubmit once sent.
+          const { eventId, exchangeText } = feedbackModalContext;
+          void postFeedback({
+            kind: "thumbs_down",
+            userNote,
+            messageRef: eventId,
+            exchangeText,
+          });
+        }}
+        onDismissWithoutSubmit={() => {
+          if (feedbackModalContext == null) return;
+          void postFeedback({
+            kind: "thumbs_down",
+            userNote: "",
+            messageRef: feedbackModalContext.eventId,
+            exchangeText: feedbackModalContext.exchangeText,
+          });
+          // Send without a note shows the dialog's own "Thanks — sent.";
+          // X / Esc close straight away (onOpenChange drops the context).
+        }}
+      />
+
+      {/* inactiveReason is captured in state for potential future use
+          (e.g. Phase 2 diagnostic tooltip) but MUST NOT render as
+          visible text — FALLBACK-01 says the inactive branch renders
+          exactly the string above and nothing else. */}
+      {false && inactiveReason}
+    </div>
+  );
+}

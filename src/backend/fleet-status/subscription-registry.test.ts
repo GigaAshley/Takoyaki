@@ -1,0 +1,1843 @@
+/**
+ * Task 2 — Subscription registry tests (TDD RED phase)
+ *
+ * Tests 1-7: subscription-registry.ts behavior
+ */
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+vi.mock("../utils/logger.js", () => ({
+  systemLogger: {
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    debug: vi.fn(),
+  },
+  // Phase 90 Plan 00 Wave 0 — contextpct-store.setContextPct calls
+  // databaseLogger.debug on every write; the store is now imported
+  // transitively by subscription-registry, so the mock must cover it.
+  databaseLogger: {
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    debug: vi.fn(),
+  },
+}));
+
+import { createSubscriptionRegistry } from "./subscription-registry.js";
+import type {
+  AppState,
+  FrontendOutboundFrameType,
+  SessionState,
+} from "./wire-protocol.js";
+import { FRAME_SCHEMA_VERSION } from "./wire-protocol.js";
+import { systemLogger } from "../utils/logger.js";
+// Phase 90 Plan 00 Wave 0 — contextPct promotion.
+import {
+  setContextPct,
+  __clearAllContextPctForTests,
+} from "./contextpct-store.js";
+
+function makeState(
+  hostId: string,
+  tmuxSession: string | null,
+  sessionId: string,
+): SessionState {
+  return {
+    hostId,
+    tmuxSession,
+    sessionId,
+    pid: 1000,
+    status: "busy",
+    backgroundTasks: [],
+    updatedAt: Date.now(),
+  };
+}
+
+describe("subscription-registry", () => {
+  it("Test 1: createSubscriptionRegistry() returns a registry with an empty state Map", () => {
+    const registry = createSubscriptionRegistry();
+    expect(registry.getSnapshot()).toEqual([]);
+  });
+
+  it("Test 2: publishSessionState inserts state at correct key and fans out update frames", () => {
+    const registry = createSubscriptionRegistry();
+    const receivedFrames: FrontendOutboundFrameType[] = [];
+    registry.subscribe((frame) => receivedFrames.push(frame));
+
+    // Clear the snapshot frame
+    receivedFrames.length = 0;
+
+    const state = makeState("host-42", "tina", "session-1");
+    registry.publishSessionState("host-42", state);
+
+    const updateFrames = receivedFrames.filter((f) => f.type === "update");
+    expect(updateFrames).toHaveLength(1);
+    expect(updateFrames[0]).toMatchObject({
+      type: "update",
+      schemaVersion: FRAME_SCHEMA_VERSION,
+      state,
+    });
+  });
+
+  it("Test 3: Late subscriber receives snapshot frame containing all previously published states", () => {
+    const registry = createSubscriptionRegistry();
+
+    const stateA = makeState("host-42", "tina", "session-a");
+    const stateB = makeState("host-42", "nelly", "session-b");
+
+    registry.publishSessionState("host-42", stateA);
+    registry.publishSessionState("host-42", stateB);
+
+    // Subscribe AFTER publishes
+    const receivedFrames: FrontendOutboundFrameType[] = [];
+    registry.subscribe((frame) => receivedFrames.push(frame));
+
+    // Phase 118 Plan 118-03 (Rule 3 additive-extension ripple): subscribe()
+    // now emits an app-snapshot alongside the session snapshot. Assert the
+    // session-snapshot shape by TYPE-FILTERING rather than by position.
+    const snapshotFrames = receivedFrames.filter((f) => f.type === "snapshot");
+    expect(snapshotFrames).toHaveLength(1);
+    const snapshotFrame = snapshotFrames[0];
+    if (snapshotFrame.type === "snapshot") {
+      expect(snapshotFrame.schemaVersion).toBe(FRAME_SCHEMA_VERSION);
+      expect(snapshotFrame.states).toHaveLength(2);
+      const ids = snapshotFrame.states.map((s) => s.sessionId);
+      expect(ids).toContain("session-a");
+      expect(ids).toContain("session-b");
+    }
+  });
+
+  it("Test 4: Subscriber removed via disposer stops receiving updates", () => {
+    const registry = createSubscriptionRegistry();
+    const receivedFrames: FrontendOutboundFrameType[] = [];
+    const disposer = registry.subscribe((frame) => receivedFrames.push(frame));
+
+    // Snapshot frame received on subscribe
+    receivedFrames.length = 0;
+
+    disposer();
+
+    // Publish after disposal — should not receive
+    const state = makeState("host-42", "tina", "session-1");
+    registry.publishSessionState("host-42", state);
+
+    expect(receivedFrames).toHaveLength(0);
+  });
+
+  it("Test 5: publishSessionGone removes entry from map and sends gone frame to all subscribers", () => {
+    const registry = createSubscriptionRegistry();
+
+    const state = makeState("host-42", "tina", "session-1");
+    registry.publishSessionState("host-42", state);
+
+    const receivedFrames: FrontendOutboundFrameType[] = [];
+    registry.subscribe((frame) => receivedFrames.push(frame));
+    receivedFrames.length = 0; // clear snapshot
+
+    registry.publishSessionGone("host-42", "tina", "session-1");
+
+    // Map should be empty
+    expect(registry.getSnapshot()).toHaveLength(0);
+
+    // Subscriber received exactly one gone frame
+    const goneFrames = receivedFrames.filter((f) => f.type === "gone");
+    expect(goneFrames).toHaveLength(1);
+    expect(goneFrames[0]).toMatchObject({
+      type: "gone",
+      schemaVersion: FRAME_SCHEMA_VERSION,
+      hostId: "host-42",
+      tmuxSession: "tina",
+      sessionId: "session-1",
+      // Reason discriminator: publishSessionGone means "a claude PID died
+      // but the tmux session may persist" — frontend keeps open tabs open.
+      reason: "pid_stale",
+    });
+  });
+
+  it("Test 6: publishSessionGone for a key that doesn't exist is a no-op (zero sendFrame invocations)", () => {
+    const registry = createSubscriptionRegistry();
+    const sender = vi.fn();
+    registry.subscribe(sender);
+    sender.mockClear(); // clear snapshot call
+
+    // Gone for a key that was never published
+    registry.publishSessionGone("host-42", "nonexistent", "session-x");
+
+    // Should not have called sender with a gone frame
+    expect(sender).not.toHaveBeenCalled();
+  });
+
+  it("Test 6b: a late pid_stale gone for the OLD pid is skipped when a relaunched claude already republished the same tmux key", () => {
+    const registry = createSubscriptionRegistry();
+    // Old claude (pid 1000) → relaunch → fresh claude (pid 2000) in the same tmux.
+    registry.publishSessionState("host-42", { ...makeState("host-42", "tina", "session-old"), pid: 1000 });
+    registry.publishSessionState("host-42", { ...makeState("host-42", "tina", "session-new"), pid: 2000 });
+
+    const sender = vi.fn();
+    registry.subscribe(sender);
+    sender.mockClear();
+
+    const deleted = registry.publishSessionGone("host-42", "tina", "session-old", { pid: 1000 });
+
+    expect(deleted).toBe(false);
+    expect(sender).not.toHaveBeenCalled();
+    expect(registry.getSnapshot().map((s) => s.sessionId)).toEqual(["session-new"]);
+  });
+
+  it("Test 6c: a pid_stale gone is skipped when source B's pid-less entry now holds the key", () => {
+    const registry = createSubscriptionRegistry();
+    registry.publishSessionState("host-42", { ...makeState("host-42", "tina", "session-1"), pid: null });
+
+    expect(registry.publishSessionGone("host-42", "tina", "session-1", { pid: 1000 })).toBe(false);
+    expect(registry.getSnapshot()).toHaveLength(1);
+  });
+
+  it("Test 6d: matching pid deletes and returns true", () => {
+    const registry = createSubscriptionRegistry();
+    registry.publishSessionState("host-42", makeState("host-42", "tina", "session-1"));
+    expect(registry.publishSessionGone("host-42", "tina", "session-1", { pid: 1000 })).toBe(true);
+    expect(registry.getSnapshot()).toHaveLength(0);
+  });
+
+  it("Test 6e: watcher-path gone (no pid) is skipped when the cached sessionId differs, applied when it matches", () => {
+    const registry = createSubscriptionRegistry();
+    registry.publishSessionState("host-42", makeState("host-42", "tina", "session-new"));
+
+    expect(registry.publishSessionGone("host-42", "tina", "session-old")).toBe(false);
+    expect(registry.getSnapshot()).toHaveLength(1);
+
+    expect(registry.publishSessionGone("host-42", "tina", "session-new")).toBe(true);
+    expect(registry.getSnapshot()).toHaveLength(0);
+  });
+
+  it("Test 7: Subscribing twice from the same sender is idempotent (Set, not Array)", () => {
+    const registry = createSubscriptionRegistry();
+    const sender = vi.fn();
+
+    registry.subscribe(sender);
+    sender.mockClear(); // clear first snapshot
+
+    registry.subscribe(sender);
+    sender.mockClear(); // clear second snapshot
+
+    // Publish — should only call sender once, not twice
+    const state = makeState("host-42", "tina", "session-1");
+    registry.publishSessionState("host-42", state);
+
+    const updateCalls = sender.mock.calls.filter(
+      ([frame]: [FrontendOutboundFrameType]) => frame.type === "update",
+    );
+    expect(updateCalls).toHaveLength(1);
+  });
+
+  // -------------------------------------------------------------------------
+  // Phase 39 — Presence-signal lifecycle hooks (Tests 8-14)
+  // -------------------------------------------------------------------------
+
+  it("Test 8: onFirstSubscriber fires with ctx.userId when a subscriber joins an empty registry", () => {
+    const registry = createSubscriptionRegistry();
+    const cb = vi.fn();
+    registry.onFirstSubscriber(cb);
+
+    registry.subscribe(() => {}, { userId: "u1" });
+
+    expect(cb).toHaveBeenCalledTimes(1);
+    expect(cb).toHaveBeenCalledWith({ userId: "u1" });
+  });
+
+  it("Test 9: onFirstSubscriber does NOT fire on the second subscriber (edge already crossed)", () => {
+    const registry = createSubscriptionRegistry();
+
+    // First subscribe arrives BEFORE callback registration — the 0->1 edge has passed
+    registry.subscribe(() => {}, { userId: "u1" });
+
+    const cb = vi.fn();
+    registry.onFirstSubscriber(cb);
+
+    // Second subscribe — subscribers.size goes 1 -> 2, NOT 0 -> 1
+    registry.subscribe(() => {}, { userId: "u2" });
+
+    expect(cb).toHaveBeenCalledTimes(0);
+  });
+
+  it("Test 10: onFirstSubscriber fires again after a full teardown-and-resubscribe cycle", () => {
+    const registry = createSubscriptionRegistry();
+
+    const disposer = registry.subscribe(() => {}, { userId: "u1" });
+    disposer();
+
+    // Register the callback AFTER the first cycle completes.
+    // The registry is now empty again — the next subscribe re-enters the 0->1 edge.
+    const cb = vi.fn();
+    registry.onFirstSubscriber(cb);
+
+    registry.subscribe(() => {}, { userId: "u2" });
+
+    expect(cb).toHaveBeenCalledTimes(1);
+    expect(cb).toHaveBeenCalledWith({ userId: "u2" });
+  });
+
+  it("Test 11: onLastUnsubscriber fires exactly when the last disposer runs (1 -> 0 edge)", () => {
+    const registry = createSubscriptionRegistry();
+
+    const disposeA = registry.subscribe(() => {}, { userId: "u1" });
+    const disposeB = registry.subscribe(() => {}, { userId: "u2" });
+
+    const cb = vi.fn();
+    registry.onLastUnsubscriber(cb);
+
+    // Dispose first — subscribers.size goes 2 -> 1, callback must NOT fire yet
+    disposeA();
+    expect(cb).toHaveBeenCalledTimes(0);
+
+    // Dispose second — subscribers.size goes 1 -> 0, callback MUST fire exactly once
+    disposeB();
+    expect(cb).toHaveBeenCalledTimes(1);
+  });
+
+  it("Test 12: Disposer returned by onFirstSubscriber unregisters the callback", () => {
+    const registry = createSubscriptionRegistry();
+
+    const cb = vi.fn();
+    const unregister = registry.onFirstSubscriber(cb);
+    unregister();
+
+    // Fresh 0 -> 1 transition — callback must NOT fire since it was unregistered
+    registry.subscribe(() => {}, { userId: "u1" });
+
+    expect(cb).toHaveBeenCalledTimes(0);
+  });
+
+  it("Test 13: subscribe() without ctx does NOT fire onFirstSubscriber (backward-compat guard)", () => {
+    const registry = createSubscriptionRegistry();
+
+    const cb = vi.fn();
+    registry.onFirstSubscriber(cb);
+
+    // No ctx — callback must NOT fire (preserves the 7 legacy tests' semantics)
+    registry.subscribe(() => {});
+
+    expect(cb).toHaveBeenCalledTimes(0);
+  });
+
+  it("Test 14: Callback throws are caught and logged via systemLogger.warn", () => {
+    const registry = createSubscriptionRegistry();
+    const warnSpy = vi.mocked(systemLogger.warn);
+    warnSpy.mockClear();
+
+    const throwingCb = vi.fn(() => {
+      throw new Error("boom");
+    });
+    registry.onFirstSubscriber(throwingCb);
+
+    // subscribe MUST return normally despite the callback throwing
+    expect(() =>
+      registry.subscribe(() => {}, { userId: "u1" }),
+    ).not.toThrow();
+
+    // Callback was invoked exactly once
+    expect(throwingCb).toHaveBeenCalledTimes(1);
+
+    // systemLogger.warn was called with the fleet_status_lifecycle_cb_failed op tag
+    const lifecycleWarns = warnSpy.mock.calls.filter(
+      ([, ctx]: [string, Record<string, unknown> | undefined]) =>
+        ctx?.operation === "fleet_status_lifecycle_cb_failed",
+    );
+    expect(lifecycleWarns.length).toBeGreaterThanOrEqual(1);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Multi-tenant fleet-status orchestrator (2026-09-23) — per-user lifecycle
+  // ---------------------------------------------------------------------------
+
+  it("Test 15: onFirstUserSubscriber fires with ctx.userId when a NEW user subscribes", () => {
+    const registry = createSubscriptionRegistry();
+    const cb = vi.fn();
+    registry.onFirstUserSubscriber(cb);
+
+    registry.subscribe(() => {}, { userId: "u1" });
+
+    expect(cb).toHaveBeenCalledTimes(1);
+    expect(cb).toHaveBeenCalledWith({ userId: "u1" });
+  });
+
+  it("Test 16: onFirstUserSubscriber does NOT re-fire when the SAME user subscribes a second time (tabs 2..N)", () => {
+    const registry = createSubscriptionRegistry();
+    const cb = vi.fn();
+    registry.onFirstUserSubscriber(cb);
+
+    registry.subscribe(() => {}, { userId: "u1" }); // first tab
+    registry.subscribe(() => {}, { userId: "u1" }); // second tab, same user
+
+    expect(cb).toHaveBeenCalledTimes(1);
+    expect(cb).toHaveBeenCalledWith({ userId: "u1" });
+  });
+
+  it("Test 17: onFirstUserSubscriber fires again after that user's full teardown-and-resubscribe cycle", () => {
+    const registry = createSubscriptionRegistry();
+    const cb = vi.fn();
+    registry.onFirstUserSubscriber(cb);
+
+    const dispose = registry.subscribe(() => {}, { userId: "u1" });
+    dispose();
+    // u1 count is now 0 — a fresh subscribe re-enters the per-user 0→1 edge.
+    registry.subscribe(() => {}, { userId: "u1" });
+
+    expect(cb).toHaveBeenCalledTimes(2);
+    expect(cb).toHaveBeenNthCalledWith(1, { userId: "u1" });
+    expect(cb).toHaveBeenNthCalledWith(2, { userId: "u1" });
+  });
+
+  it("Test 18: onLastUserUnsubscriber fires exactly when that user's LAST disposer runs (multi-tab case)", () => {
+    const registry = createSubscriptionRegistry();
+    const cb = vi.fn();
+    registry.onLastUserUnsubscriber(cb);
+
+    const disposeTab1 = registry.subscribe(() => {}, { userId: "u1" });
+    const disposeTab2 = registry.subscribe(() => {}, { userId: "u1" });
+
+    disposeTab1();
+    expect(cb).toHaveBeenCalledTimes(0); // still has tab 2
+
+    disposeTab2();
+    expect(cb).toHaveBeenCalledTimes(1);
+    expect(cb).toHaveBeenCalledWith({ userId: "u1" });
+  });
+
+  it("Test 19: Per-user lifecycle for different users is independent (each user's 0→1 fires separately)", () => {
+    const registry = createSubscriptionRegistry();
+    const cb = vi.fn();
+    registry.onFirstUserSubscriber(cb);
+
+    registry.subscribe(() => {}, { userId: "u1" });
+    registry.subscribe(() => {}, { userId: "u2" });
+    registry.subscribe(() => {}, { userId: "u3" });
+
+    expect(cb).toHaveBeenCalledTimes(3);
+    expect(cb).toHaveBeenNthCalledWith(1, { userId: "u1" });
+    expect(cb).toHaveBeenNthCalledWith(2, { userId: "u2" });
+    expect(cb).toHaveBeenNthCalledWith(3, { userId: "u3" });
+  });
+
+  it("Test 20: onLastUserUnsubscriber for user A does NOT fire while user B is still subscribed", () => {
+    const registry = createSubscriptionRegistry();
+    const cb = vi.fn();
+    registry.onLastUserUnsubscriber(cb);
+
+    const disposeA = registry.subscribe(() => {}, { userId: "userA" });
+    registry.subscribe(() => {}, { userId: "userB" }); // still subscribed
+
+    disposeA();
+
+    // A's per-user 1→0 fires immediately — does NOT wait for B to also leave.
+    expect(cb).toHaveBeenCalledTimes(1);
+    expect(cb).toHaveBeenCalledWith({ userId: "userA" });
+  });
+
+  it("Test 21: bare subscribe() without ctx does NOT fire onFirstUserSubscriber (matches global-callback backward-compat)", () => {
+    const registry = createSubscriptionRegistry();
+    const cb = vi.fn();
+    registry.onFirstUserSubscriber(cb);
+
+    registry.subscribe(() => {});
+
+    expect(cb).toHaveBeenCalledTimes(0);
+  });
+
+  it("Test 22: onFirstUserSubscriber callback throws are caught and logged; subscribe returns normally", () => {
+    const registry = createSubscriptionRegistry();
+    const warnSpy = vi.mocked(systemLogger.warn);
+    warnSpy.mockClear();
+
+    const throwingCb = vi.fn(() => {
+      throw new Error("boom");
+    });
+    registry.onFirstUserSubscriber(throwingCb);
+
+    expect(() =>
+      registry.subscribe(() => {}, { userId: "u1" }),
+    ).not.toThrow();
+
+    expect(throwingCb).toHaveBeenCalledTimes(1);
+
+    const lifecycleWarns = warnSpy.mock.calls.filter(
+      ([, ctx]: [string, Record<string, unknown> | undefined]) =>
+        ctx?.operation === "fleet_status_lifecycle_cb_failed",
+    );
+    expect(lifecycleWarns.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("Test 23: onFirstUserSubscriber is independent of onFirstSubscriber (per-user fires for each new userId while global stays quiet after the first)", () => {
+    const registry = createSubscriptionRegistry();
+    const globalCb = vi.fn();
+    const perUserCb = vi.fn();
+    registry.onFirstSubscriber(globalCb);
+    registry.onFirstUserSubscriber(perUserCb);
+
+    registry.subscribe(() => {}, { userId: "u1" });
+    // Both fire on the very first subscribe (global 0→1 AND user u1's 0→1).
+    expect(globalCb).toHaveBeenCalledTimes(1);
+    expect(perUserCb).toHaveBeenCalledTimes(1);
+
+    registry.subscribe(() => {}, { userId: "u2" });
+    // Global does NOT re-fire (still non-empty). Per-user fires for u2's 0→1.
+    expect(globalCb).toHaveBeenCalledTimes(1);
+    expect(perUserCb).toHaveBeenCalledTimes(2);
+    expect(perUserCb).toHaveBeenNthCalledWith(2, { userId: "u2" });
+  });
+
+  it("Test 24: Disposer returned by onFirstUserSubscriber unregisters the callback", () => {
+    const registry = createSubscriptionRegistry();
+    const cb = vi.fn();
+    const unregister = registry.onFirstUserSubscriber(cb);
+    unregister();
+
+    registry.subscribe(() => {}, { userId: "u1" });
+
+    expect(cb).toHaveBeenCalledTimes(0);
+  });
+
+  it("Test 25: Disposer returned by onLastUserUnsubscriber unregisters the callback", () => {
+    const registry = createSubscriptionRegistry();
+    const cb = vi.fn();
+    const unregister = registry.onLastUserUnsubscriber(cb);
+    unregister();
+
+    const dispose = registry.subscribe(() => {}, { userId: "u1" });
+    dispose();
+
+    expect(cb).toHaveBeenCalledTimes(0);
+  });
+
+  it("Test 26: Per-user callback throw for user A does NOT block per-user callback for user B (failure isolation across users)", () => {
+    const registry = createSubscriptionRegistry();
+    const warnSpy = vi.mocked(systemLogger.warn);
+    warnSpy.mockClear();
+
+    // Consumer registers ONE callback that throws only for userA.
+    // In the multi-tenant starter.ts wiring this represents the watcher-
+    // factory call: if factory-for-A throws, factory-for-B must still run
+    // when B subscribes next.
+    const cb = vi.fn((ctx: { userId: string }) => {
+      if (ctx.userId === "userA") {
+        throw new Error("watcher factory boom for A");
+      }
+    });
+    registry.onFirstUserSubscriber(cb);
+
+    // userA subscribes — callback throws internally, but subscribe MUST
+    // return normally (subscribers.size incremented, no error surfaced).
+    expect(() =>
+      registry.subscribe(() => {}, { userId: "userA" }),
+    ).not.toThrow();
+
+    // userB subscribes — callback MUST fire (isolation): A's throw didn't
+    // corrupt the per-user callback state.
+    expect(() =>
+      registry.subscribe(() => {}, { userId: "userB" }),
+    ).not.toThrow();
+
+    expect(cb).toHaveBeenCalledTimes(2);
+    expect(cb).toHaveBeenNthCalledWith(1, { userId: "userA" });
+    expect(cb).toHaveBeenNthCalledWith(2, { userId: "userB" });
+
+    // A's throw was logged.
+    const lifecycleWarns = warnSpy.mock.calls.filter(
+      ([, ctx]: [string, Record<string, unknown> | undefined]) =>
+        ctx?.operation === "fleet_status_lifecycle_cb_failed" &&
+        ctx?.userId === "userA",
+    );
+    expect(lifecycleWarns.length).toBeGreaterThanOrEqual(1);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Phase 90 Plan 00 Wave 0 — contextPct promotion (behaviors 9-10 per plan)
+  // ---------------------------------------------------------------------------
+
+  describe("condensing axis carry-over", () => {
+    it("a frame that leaves condensing out keeps the last stamped value; an explicit false clears it", () => {
+      const registry = createSubscriptionRegistry();
+      const received: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => received.push(f));
+      received.length = 0;
+      registry.publishSessionState("host-42", { ...makeState("host-42", "tina", "s1"), condensing: true });
+      // A live (source A) frame mid-condense, without the axis.
+      registry.publishSessionState("host-42", makeState("host-42", "tina", "s1"));
+      registry.publishSessionState("host-42", { ...makeState("host-42", "tina", "s1"), condensing: false });
+      registry.publishSessionState("host-42", makeState("host-42", "tina", "s1"));
+      const seen = received
+        .filter((f) => f.type === "update")
+        .map((f) => (f.type === "update" ? f.state.condensing : undefined));
+      expect(seen).toEqual([true, true, false, false]);
+      // Another session is unaffected.
+      registry.publishSessionState("host-42", makeState("host-42", "nelly", "s2"));
+      const last = received[received.length - 1];
+      expect(last.type === "update" ? last.state.condensing : "x").toBeUndefined();
+    });
+  });
+
+  describe("contextPct stamping (Phase 90 Wave 0)", () => {
+    beforeEach(() => {
+      __clearAllContextPctForTests();
+    });
+
+    it(
+      "Test 9 (behavior 9): on every publish, the fanned-out SessionState includes contextPct sourced from the shared store; sessions with no stored value get null",
+      () => {
+        const registry = createSubscriptionRegistry();
+        const received: FrontendOutboundFrameType[] = [];
+        registry.subscribe((f) => received.push(f));
+        received.length = 0;
+
+        // Session A: shared store has a value (65) — the fanned-out frame
+        // must carry contextPct: 65.
+        setContextPct("host-42", "tina", 65);
+        const stateA = makeState("host-42", "tina", "session-a");
+        registry.publishSessionState("host-42", stateA);
+
+        // Session B: no store entry — the fanned-out frame must carry
+        // contextPct: null.
+        const stateB = makeState("host-42", "nelly", "session-b");
+        registry.publishSessionState("host-42", stateB);
+
+        const updateFrames = received.filter((f) => f.type === "update");
+        expect(updateFrames).toHaveLength(2);
+
+        const frameA = updateFrames[0];
+        const frameB = updateFrames[1];
+        if (frameA.type === "update" && frameB.type === "update") {
+          expect(frameA.state.contextPct).toBe(65);
+          expect(frameB.state.contextPct).toBeNull();
+        }
+
+        // Snapshot delivery must ALSO re-stamp contextPct at read time so
+        // late subscribers see the CURRENT value in the shared store, not
+        // whatever value existed at the last publish tick. Update the store
+        // AFTER publish and confirm a fresh subscriber sees the new value.
+        setContextPct("host-42", "tina", 77);
+        const lateSubscriberFrames: FrontendOutboundFrameType[] = [];
+        registry.subscribe((f) => lateSubscriberFrames.push(f));
+
+        const snapshot = lateSubscriberFrames[0];
+        expect(snapshot.type).toBe("snapshot");
+        if (snapshot.type === "snapshot") {
+          const tinaState = snapshot.states.find((s) => s.tmuxSession === "tina");
+          expect(tinaState?.contextPct).toBe(77); // fresh store value
+          const nellyState = snapshot.states.find((s) => s.tmuxSession === "nelly");
+          expect(nellyState?.contextPct).toBeNull(); // still no entry
+        }
+      },
+    );
+
+    it(
+      "Test 10 (behavior 10): additive-optional invariant preserved — SessionStateSchema still parses records from an older shape (no contextPct field) without validation failure",
+      async () => {
+        const { SessionStateSchema } = await import("./wire-protocol.js");
+
+        // Older frame shape — no contextPct field at all.
+        const olderShape: unknown = {
+          hostId: "host-42",
+          tmuxSession: "tina",
+          sessionId: "session-1",
+          pid: 1000,
+          status: "busy",
+          backgroundTasks: [],
+          updatedAt: Date.now(),
+        };
+        const result = SessionStateSchema.safeParse(olderShape);
+        expect(result.success).toBe(true);
+        if (result.success) {
+          expect(result.data.contextPct).toBeUndefined();
+        }
+
+        // Frame with contextPct: null — also accepted (nullable optional).
+        const withNullPct = { ...(olderShape as Record<string, unknown>), contextPct: null };
+        const r2 = SessionStateSchema.safeParse(withNullPct);
+        expect(r2.success).toBe(true);
+        if (r2.success) {
+          expect(r2.data.contextPct).toBeNull();
+        }
+
+        // Frame with contextPct: 42 — accepted.
+        const withNumPct = { ...(olderShape as Record<string, unknown>), contextPct: 42 };
+        const r3 = SessionStateSchema.safeParse(withNumPct);
+        expect(r3.success).toBe(true);
+        if (r3.success) {
+          expect(r3.data.contextPct).toBe(42);
+        }
+      },
+    );
+
+    it("Test 11: republishContextPct fans out an update carrying the new store value, with the rest of the cached state intact", () => {
+      const registry = createSubscriptionRegistry();
+      const received: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => received.push(f));
+      received.length = 0;
+
+      setContextPct("host-42", "copper", 81);
+      const state = makeState("host-42", "copper", "session-a");
+      registry.publishSessionState("host-42", state);
+
+      setContextPct("host-42", "copper", 14);
+      registry.republishContextPct("host-42", "copper");
+
+      const updateFrames = received.filter((f) => f.type === "update");
+      expect(updateFrames).toHaveLength(2);
+      const republished = updateFrames[1];
+      if (republished.type === "update") {
+        expect(republished.state).toEqual({ ...state, contextPct: 14 });
+      }
+    });
+
+    it("Test 12: republishContextPct is a no-op when the value is unchanged, null, or no state is cached", () => {
+      const registry = createSubscriptionRegistry();
+      const received: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => received.push(f));
+      received.length = 0;
+
+      // No cached state for this session yet — nothing to republish.
+      setContextPct("host-42", "copper", 50);
+      registry.republishContextPct("host-42", "copper");
+      expect(received).toHaveLength(0);
+
+      registry.publishSessionState("host-42", makeState("host-42", "copper", "session-a"));
+      received.length = 0;
+
+      // Same value as last stamped — repeated ticks send nothing.
+      registry.republishContextPct("host-42", "copper");
+      registry.republishContextPct("host-42", "copper");
+      expect(received).toHaveLength(0);
+
+      // A null store value (transient read failure) never blanks the meter.
+      setContextPct("host-42", "copper", null);
+      registry.republishContextPct("host-42", "copper");
+      expect(received).toHaveLength(0);
+    });
+  });
+
+  // (Phase 115 Plan 115-06 publishIdentityArchived describe retired in the
+  //  Phase 122 shape follow-up alongside the wire frame + registry cache.)
+
+  // ─── Phase 117 Plan 117-03 — publishProjectListChanged (D-37) ──────────────
+  // Wire event for the projects pool. Frames are SCOPED to one hostId; per-
+  // host cache with byte-identity skip via JSON.stringify canonicalization.
+  // Snapshot-on-subscribe replays ONE cached frame per host that has been
+  // published to.
+
+  describe("publishProjectListChanged (Phase 117 Plan 117-03)", () => {
+    const projectA = {
+      slug: "alpha",
+      displayName: "Alpha",
+      hostId: "1",
+      hostname: "harbor",
+      archived: false,
+      parent: null,
+    };
+    const projectA2 = {
+      slug: "alpha2",
+      displayName: "Alpha 2",
+      hostId: "1",
+      hostname: "harbor",
+      archived: false,
+      parent: null,
+    };
+    const projectB = {
+      slug: "beta",
+      displayName: "Beta",
+      hostId: "2",
+      hostname: "workstation",
+      archived: false,
+      parent: null,
+    };
+
+    it("Test P117-03-1: publishProjectListChanged fans out on delta — subscribers receive a project-list-changed frame with the scoped hostId + projects array", () => {
+      const registry = createSubscriptionRegistry();
+      const receivedFrames: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => receivedFrames.push(f));
+      // Drop the initial snapshot frame.
+      receivedFrames.length = 0;
+
+      registry.publishProjectListChanged("1", [projectA]);
+
+      const projectFrames = receivedFrames.filter(
+        (f) => f.type === "project-list-changed",
+      );
+      expect(projectFrames).toHaveLength(1);
+      const frame = projectFrames[0];
+      if (frame.type === "project-list-changed") {
+        expect(frame.schemaVersion).toBe(FRAME_SCHEMA_VERSION);
+        expect(frame.hostId).toBe("1");
+        expect(frame.projects).toEqual([projectA]);
+      }
+    });
+
+    it("Test P117-03-2: publishProjectListChanged is idempotent on byte-identical repeat for the same hostId — second call is a no-op", () => {
+      const registry = createSubscriptionRegistry();
+      const receivedFrames: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => receivedFrames.push(f));
+      receivedFrames.length = 0;
+
+      registry.publishProjectListChanged("1", [projectA]);
+      registry.publishProjectListChanged("1", [projectA]);
+      registry.publishProjectListChanged("1", [projectA]);
+
+      const projectFrames = receivedFrames.filter(
+        (f) => f.type === "project-list-changed",
+      );
+      expect(projectFrames).toHaveLength(1);
+    });
+
+    it("nested projects: a parent-only change is a delta — moving a project fans out a new frame carrying parent", () => {
+      const registry = createSubscriptionRegistry();
+      const receivedFrames: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => receivedFrames.push(f));
+      receivedFrames.length = 0;
+
+      registry.publishProjectListChanged("1", [projectA, projectA2]);
+      registry.publishProjectListChanged("1", [
+        projectA,
+        { ...projectA2, parent: "alpha" },
+      ]);
+
+      const projectFrames = receivedFrames.filter(
+        (f) => f.type === "project-list-changed",
+      );
+      expect(projectFrames).toHaveLength(2);
+      const moved = projectFrames[1];
+      if (moved.type === "project-list-changed") {
+        expect(moved.projects.map((p) => p.parent)).toEqual([null, "alpha"]);
+      }
+    });
+
+    it("Test P117-03-3: publishProjectListChanged fires on delta after cached state (same host) — [a] → [a, a2] produces a second frame", () => {
+      const registry = createSubscriptionRegistry();
+      const receivedFrames: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => receivedFrames.push(f));
+      receivedFrames.length = 0;
+
+      registry.publishProjectListChanged("1", [projectA]);
+      registry.publishProjectListChanged("1", [projectA, projectA2]);
+
+      const projectFrames = receivedFrames.filter(
+        (f) => f.type === "project-list-changed",
+      );
+      expect(projectFrames).toHaveLength(2);
+      const secondFrame = projectFrames[1];
+      if (secondFrame.type === "project-list-changed") {
+        expect(secondFrame.hostId).toBe("1");
+        expect(secondFrame.projects).toEqual([projectA, projectA2]);
+      }
+    });
+
+    it("Test P117-03-4: publishProjectListChanged with empty array from cached non-empty state (last project archived on this host) — subscribers receive a real delta with projects: []", () => {
+      const registry = createSubscriptionRegistry();
+      const receivedFrames: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => receivedFrames.push(f));
+      receivedFrames.length = 0;
+
+      registry.publishProjectListChanged("1", [projectA]);
+      registry.publishProjectListChanged("1", []);
+
+      const projectFrames = receivedFrames.filter(
+        (f) => f.type === "project-list-changed",
+      );
+      expect(projectFrames).toHaveLength(2);
+      const emptyFrame = projectFrames[1];
+      if (emptyFrame.type === "project-list-changed") {
+        expect(emptyFrame.hostId).toBe("1");
+        expect(emptyFrame.projects).toEqual([]);
+      }
+    });
+
+    it("Test P117-03-5: snapshot-on-subscribe replay — pre-seed the registry with two hosts, then subscribe a new client; new client receives ONE frame per host", () => {
+      const registry = createSubscriptionRegistry();
+
+      registry.publishProjectListChanged("1", [projectA]);
+      registry.publishProjectListChanged("2", [projectB]);
+
+      // Subscribe AFTER the publishes — the replay frames arrive on subscribe.
+      const receivedFrames: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => receivedFrames.push(f));
+
+      const projectFrames = receivedFrames.filter(
+        (f) => f.type === "project-list-changed",
+      );
+      expect(projectFrames).toHaveLength(2);
+      const byHost = new Map<string, typeof projectA[]>();
+      for (const f of projectFrames) {
+        if (f.type === "project-list-changed") {
+          byHost.set(f.hostId, [...f.projects] as typeof projectA[]);
+        }
+      }
+      expect(byHost.get("1")).toEqual([projectA]);
+      expect(byHost.get("2")).toEqual([projectB]);
+    });
+
+    it("Test P117-03-6: snapshot replay when no publish has occurred — no project-list-changed frame is fanned out", () => {
+      const registry = createSubscriptionRegistry();
+
+      const receivedFrames: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => receivedFrames.push(f));
+
+      const projectFrames = receivedFrames.filter(
+        (f) => f.type === "project-list-changed",
+      );
+      expect(projectFrames).toHaveLength(0);
+    });
+
+    it("Test P117-03-7: idempotent-skip compares deeply (JSON.stringify canonicalization) — distinct arrays with identical field values do NOT re-fan for same hostId", () => {
+      const registry = createSubscriptionRegistry();
+      const receivedFrames: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => receivedFrames.push(f));
+      receivedFrames.length = 0;
+
+      // Two distinct arrays with byte-identical serialized shape.
+      const arr1 = [
+        {
+          slug: "alpha",
+          displayName: "Alpha",
+          hostId: "1",
+          hostname: "harbor",
+          archived: false,
+        },
+      ];
+      const arr2 = [
+        {
+          slug: "alpha",
+          displayName: "Alpha",
+          hostId: "1",
+          hostname: "harbor",
+          archived: false,
+        },
+      ];
+
+      registry.publishProjectListChanged("1", arr1);
+      registry.publishProjectListChanged("1", arr2);
+
+      const projectFrames = receivedFrames.filter(
+        (f) => f.type === "project-list-changed",
+      );
+      expect(projectFrames).toHaveLength(1);
+    });
+
+    it("Test P117-03-8: per-host cache scoping — a publish on hostId 2 does NOT invalidate the hostId 1 cache; subscribing after both sees BOTH cached frames", () => {
+      const registry = createSubscriptionRegistry();
+      const receivedFrames: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => receivedFrames.push(f));
+      receivedFrames.length = 0;
+
+      // Publish on host 1, then host 2, then repeat host 1 with same data —
+      // last should be a no-op due to per-host idempotency.
+      registry.publishProjectListChanged("1", [projectA]);
+      registry.publishProjectListChanged("2", [projectB]);
+      registry.publishProjectListChanged("1", [projectA]);
+
+      const projectFrames = receivedFrames.filter(
+        (f) => f.type === "project-list-changed",
+      );
+      expect(projectFrames).toHaveLength(2);
+
+      // Subscribe a second client — replays one frame per cached host.
+      const received2: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => received2.push(f));
+
+      const proj = received2.filter((f) => f.type === "project-list-changed");
+      expect(proj).toHaveLength(2);
+      const byHost = new Map<string, typeof projectA[]>();
+      for (const f of proj) {
+        if (f.type === "project-list-changed") {
+          byHost.set(f.hostId, [...f.projects] as typeof projectA[]);
+        }
+      }
+      expect(byHost.get("1")).toEqual([projectA]);
+      expect(byHost.get("2")).toEqual([projectB]);
+    });
+  });
+
+  // ─── publishSessionProjectChanged (per-identity delta) ─────────────────
+  // Fires on every session-project write from the backend. Distinct from
+  // publishProjectListChanged: NO idempotent-skip cache — every call fans
+  // out. NO snapshot-on-subscribe replay — a reconnecting client learns
+  // current membership via the /identities REST fetch, not via this
+  // channel. The frame carries the delta only: { identityKey, hostId,
+  // project } where project is nullable.
+
+  describe("publishSessionProjectChanged", () => {
+    it("fans out a session-project-changed frame with identityKey/hostId/project", () => {
+      const registry = createSubscriptionRegistry();
+      const receivedFrames: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => receivedFrames.push(f));
+      receivedFrames.length = 0;
+
+      registry.publishSessionProjectChanged("wren", 5, "alpha");
+
+      const deltas = receivedFrames.filter(
+        (f) => f.type === "session-project-changed",
+      );
+      expect(deltas).toHaveLength(1);
+      const frame = deltas[0];
+      if (frame.type === "session-project-changed") {
+        expect(frame.schemaVersion).toBe(FRAME_SCHEMA_VERSION);
+        expect(frame.identityKey).toBe("wren");
+        expect(frame.hostId).toBe(5);
+        expect(frame.project).toBe("alpha");
+      }
+    });
+
+    it("fans out on every call — NO idempotent-skip; byte-identical repeats each fan out", () => {
+      const registry = createSubscriptionRegistry();
+      const receivedFrames: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => receivedFrames.push(f));
+      receivedFrames.length = 0;
+
+      registry.publishSessionProjectChanged("wren", 5, "alpha");
+      registry.publishSessionProjectChanged("wren", 5, "alpha");
+      registry.publishSessionProjectChanged("wren", 5, "alpha");
+
+      const deltas = receivedFrames.filter(
+        (f) => f.type === "session-project-changed",
+      );
+      expect(deltas).toHaveLength(3);
+    });
+
+    it("carries project=null on a clear gesture", () => {
+      const registry = createSubscriptionRegistry();
+      const receivedFrames: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => receivedFrames.push(f));
+      receivedFrames.length = 0;
+
+      registry.publishSessionProjectChanged("wren", 5, null);
+
+      const deltas = receivedFrames.filter(
+        (f) => f.type === "session-project-changed",
+      );
+      expect(deltas).toHaveLength(1);
+      const frame = deltas[0];
+      if (frame.type === "session-project-changed") {
+        expect(frame.project).toBe(null);
+      }
+    });
+
+    it("NO snapshot replay — a client that subscribes AFTER a publish does NOT receive the historical delta", () => {
+      const registry = createSubscriptionRegistry();
+
+      registry.publishSessionProjectChanged("wren", 5, "alpha");
+
+      const receivedFrames: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => receivedFrames.push(f));
+
+      const deltas = receivedFrames.filter(
+        (f) => f.type === "session-project-changed",
+      );
+      expect(deltas).toHaveLength(0);
+    });
+  });
+
+  // ─── Phase 118 Plan 118-03 — apps map + publish surface (D-09/D-10/D-13/D-14/D-16) ─
+  // Sibling to the SessionState map: apps live in their own Map<`${hostId}:${slug}`,
+  // AppState> populated by publishAppUpdate, drained by publishAppGoneByHostSlug,
+  // and snapshotted to every new subscriber via the subscribe() path. In-memory
+  // only (D-10) — no DB writes. NO idempotence guard on publishAppUpdate (D-13:
+  // health-flips must always fan out).
+  describe("Phase 118 apps map + publish surface", () => {
+    function makeAppState(
+      hostId: string,
+      slug: string,
+      overrides: Partial<AppState> = {},
+    ): AppState {
+      return {
+        hostId,
+        slug,
+        title: `App ${slug}`,
+        description: "test app",
+        port: 9591,
+        hasIcon: false,
+        createdAtMs: 1_700_000_000_000,
+        isHealthy: true,
+        healthMessage: null,
+        users: null,
+        ...overrides,
+      };
+    }
+
+    it("Test 1: publishAppUpdate inserts into the apps map + fans out exactly one app-update frame", () => {
+      const registry = createSubscriptionRegistry();
+      const receivedFrames: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => receivedFrames.push(f));
+      receivedFrames.length = 0; // drop snapshots
+
+      const app = makeAppState("h1", "todo");
+      registry.publishAppUpdate("h1", app);
+
+      // Map contains the entry
+      const snap = registry.getAppSnapshot();
+      expect(snap).toHaveLength(1);
+      expect(snap[0]).toMatchObject({ hostId: "h1", slug: "todo" });
+
+      // Exactly one app-update frame
+      const updateFrames = receivedFrames.filter((f) => f.type === "app-update");
+      expect(updateFrames).toHaveLength(1);
+      const [frame] = updateFrames;
+      expect(frame).toMatchObject({
+        type: "app-update",
+        schemaVersion: FRAME_SCHEMA_VERSION,
+        app,
+      });
+    });
+
+    it("Test 2: publishAppUpdate is NOT idempotent — repeated identical publishes fan out every time (D-13 health-flip discipline)", () => {
+      const registry = createSubscriptionRegistry();
+      const receivedFrames: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => receivedFrames.push(f));
+      receivedFrames.length = 0;
+
+      const app = makeAppState("h1", "todo");
+      registry.publishAppUpdate("h1", app);
+      registry.publishAppUpdate("h1", app);
+
+      const updateFrames = receivedFrames.filter((f) => f.type === "app-update");
+      expect(updateFrames).toHaveLength(2);
+    });
+
+    it("Test 3: publishAppGoneByHostSlug for a known key removes the entry + fans out one app-gone frame", () => {
+      const registry = createSubscriptionRegistry();
+      registry.publishAppUpdate("h1", makeAppState("h1", "todo"));
+
+      const receivedFrames: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => receivedFrames.push(f));
+      receivedFrames.length = 0; // drop snapshots
+
+      registry.publishAppGoneByHostSlug("h1", "todo");
+
+      // Map no longer contains the entry
+      expect(registry.getAppSnapshot()).toHaveLength(0);
+
+      // Exactly one app-gone frame
+      const goneFrames = receivedFrames.filter((f) => f.type === "app-gone");
+      expect(goneFrames).toHaveLength(1);
+      expect(goneFrames[0]).toMatchObject({
+        type: "app-gone",
+        schemaVersion: FRAME_SCHEMA_VERSION,
+        hostId: "h1",
+        slug: "todo",
+      });
+    });
+
+    it("Test 4: publishAppGoneByHostSlug for an unknown key is a no-op — no fan-out, no change to map", () => {
+      const registry = createSubscriptionRegistry();
+      const sender = vi.fn();
+      registry.subscribe(sender);
+      sender.mockClear(); // drop snapshot
+
+      registry.publishAppGoneByHostSlug("h1", "nonexistent");
+
+      expect(sender).not.toHaveBeenCalled();
+      expect(registry.getAppSnapshot()).toHaveLength(0);
+    });
+
+    it("Test 5: late subscriber receives an app-snapshot frame carrying every previously-published app", () => {
+      const registry = createSubscriptionRegistry();
+      registry.publishAppUpdate("h1", makeAppState("h1", "todo"));
+      registry.publishAppUpdate("h2", makeAppState("h2", "kanban"));
+
+      // Subscribe AFTER publishes
+      const receivedFrames: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => receivedFrames.push(f));
+
+      const snapshotFrames = receivedFrames.filter(
+        (f) => f.type === "app-snapshot",
+      );
+      expect(snapshotFrames).toHaveLength(1);
+      const [frame] = snapshotFrames;
+      if (frame.type === "app-snapshot") {
+        expect(frame.apps).toHaveLength(2);
+        const slugs = frame.apps.map((a) => a.slug).sort();
+        expect(slugs).toEqual(["kanban", "todo"]);
+      }
+    });
+
+    it("Test 6: subscribing with no published apps still emits an app-snapshot frame carrying apps: []", () => {
+      const registry = createSubscriptionRegistry();
+      const receivedFrames: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => receivedFrames.push(f));
+
+      const snapshotFrames = receivedFrames.filter(
+        (f) => f.type === "app-snapshot",
+      );
+      expect(snapshotFrames).toHaveLength(1);
+      const [frame] = snapshotFrames;
+      if (frame.type === "app-snapshot") {
+        expect(frame.apps).toEqual([]);
+      }
+    });
+
+    it("Test 7: publishAppUpdate fan-out uses the shared try/catch fanOut — one throwing subscriber does NOT starve others", () => {
+      const registry = createSubscriptionRegistry();
+      const goodFrames: FrontendOutboundFrameType[] = [];
+      // Bad subscriber throws
+      const badSender = vi.fn(() => {
+        throw new Error("boom");
+      });
+      registry.subscribe(badSender);
+      registry.subscribe((f) => goodFrames.push(f));
+      goodFrames.length = 0; // drop snapshots
+      badSender.mockClear();
+
+      registry.publishAppUpdate("h1", makeAppState("h1", "todo"));
+
+      // Bad subscriber was invoked (and threw); good subscriber still got the frame.
+      expect(badSender).toHaveBeenCalledTimes(1);
+      const updateFrames = goodFrames.filter((f) => f.type === "app-update");
+      expect(updateFrames).toHaveLength(1);
+    });
+  });
+
+  // ─── Phase 118 Plan 118-05 — per-user host-visibility filter on app frames ─
+  // The registry accepts an optional `deps.appFrameFilter` in its factory.
+  // When present, the async fanOutApp helper wraps every app-* fan-out call
+  // and the subscribe-path snapshot emit — per-subscriber filtering. When
+  // absent (existing 118-03 tests + starter.ts without wiring) the registry
+  // uses the sync fanOut path unchanged (backward-compat).
+  //
+  // Session + archived-identity fan-out is UNAFFECTED (D-15 scopes to app
+  // frames only; identity frames get filtered "or will be" per D-15's own
+  // language — deferred to a follow-up plan).
+  describe("Phase 118 Plan 118-05 app-frame filter integration", () => {
+    function makeFilterAppState(
+      hostId: string,
+      slug: string,
+      overrides: Partial<AppState> = {},
+    ): AppState {
+      return {
+        hostId,
+        slug,
+        title: `App ${slug}`,
+        description: "test app",
+        port: 9591,
+        hasIcon: false,
+        createdAtMs: 1_700_000_000_000,
+        isHealthy: true,
+        healthMessage: null,
+        users: null,
+        ...overrides,
+      };
+    }
+
+    async function tick(): Promise<void> {
+      // Small delay to let the fire-and-forget fanOutApp promises settle.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+
+    it("Filter-1: no appFrameFilter dep → registry runs unfiltered (backward-compat with 118-03 tests)", async () => {
+      const registry = createSubscriptionRegistry(); // no deps
+      const received: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => received.push(f), { userId: "U1" });
+      received.length = 0;
+
+      registry.publishAppUpdate("h1", makeFilterAppState("h1", "todo"));
+      await tick();
+
+      const updates = received.filter((f) => f.type === "app-update");
+      expect(updates).toHaveLength(1);
+    });
+
+    it("Filter-2: filter dep present + bare subscriber (no ctx) → THROWS (HIGH-2 fix pass 2026-09-18 belt-and-suspenders refuse)", () => {
+      // Prior behavior (Phase 118-05 land-time): the filter's own
+      // backward-compat guard passed userId === undefined frames through
+      // unchanged, which meant a bare subscriber to a filtered registry
+      // received every app frame regardless of host access — same T-118-
+      // 05-IL info-disclosure leak the filter was built to close. The
+      // HIGH-2 fix refuses bare subscribe when the filter is attached.
+      // Callers that intentionally want the unfiltered shape use
+      // `createSubscriptionRegistry()` without deps (see Filter-1 above,
+      // which is the intentional-unfiltered path and still works).
+      const filterMock = vi.fn(async (frame: FrontendOutboundFrameType) => frame);
+      const registry = createSubscriptionRegistry({ appFrameFilter: filterMock });
+
+      expect(() => registry.subscribe(() => {})).toThrow(
+        /userId ctx required when app-frame filter is attached/,
+      );
+    });
+
+    it("Filter-3: two subscribers with distinct userIds — filter drops for U2 on app-update", async () => {
+      const filterMock = vi.fn(
+        async (frame: FrontendOutboundFrameType, userId?: string) => {
+          if (userId === "U2" && frame.type === "app-update") return null;
+          return frame;
+        },
+      );
+      const registry = createSubscriptionRegistry({ appFrameFilter: filterMock });
+
+      const framesU1: FrontendOutboundFrameType[] = [];
+      const framesU2: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => framesU1.push(f), { userId: "U1" });
+      registry.subscribe((f) => framesU2.push(f), { userId: "U2" });
+      await tick();
+      framesU1.length = 0;
+      framesU2.length = 0;
+
+      registry.publishAppUpdate("h1", makeFilterAppState("h1", "todo"));
+      await tick();
+
+      expect(framesU1.filter((f) => f.type === "app-update")).toHaveLength(1);
+      expect(framesU2.filter((f) => f.type === "app-update")).toHaveLength(0);
+    });
+
+    it("Filter-4: publishAppGoneByHostSlug filtered per-subscriber — U1 sees the gone, U2 does not", async () => {
+      const filterMock = vi.fn(
+        async (frame: FrontendOutboundFrameType, userId?: string) => {
+          if (userId === "U2" && frame.type === "app-gone") return null;
+          return frame;
+        },
+      );
+      const registry = createSubscriptionRegistry({ appFrameFilter: filterMock });
+
+      // Seed the map so the gone actually fans out.
+      registry.publishAppUpdate("h1", makeFilterAppState("h1", "todo"));
+      await tick();
+
+      const framesU1: FrontendOutboundFrameType[] = [];
+      const framesU2: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => framesU1.push(f), { userId: "U1" });
+      registry.subscribe((f) => framesU2.push(f), { userId: "U2" });
+      await tick();
+      framesU1.length = 0;
+      framesU2.length = 0;
+
+      registry.publishAppGoneByHostSlug("h1", "todo");
+      await tick();
+
+      expect(framesU1.filter((f) => f.type === "app-gone")).toHaveLength(1);
+      expect(framesU2.filter((f) => f.type === "app-gone")).toHaveLength(0);
+    });
+
+    it("Filter-5: subscribe-path app-snapshot is filtered per userId (projected copy)", async () => {
+      const filterMock = vi.fn(
+        async (frame: FrontendOutboundFrameType, _userId?: string) => {
+          // Project the snapshot to only h1 apps (drop h2 apps entirely).
+          if (frame.type === "app-snapshot") {
+            return {
+              ...frame,
+              apps: frame.apps.filter((a) => a.hostId === "h1"),
+            };
+          }
+          return frame;
+        },
+      );
+      const registry = createSubscriptionRegistry({ appFrameFilter: filterMock });
+
+      // Seed with apps across two hosts BEFORE the subscribe.
+      registry.publishAppUpdate("h1", makeFilterAppState("h1", "todo"));
+      registry.publishAppUpdate("h2", makeFilterAppState("h2", "kanban"));
+      await tick();
+
+      const framesU1: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => framesU1.push(f), { userId: "U1" });
+      await tick();
+
+      const snapshots = framesU1.filter((f) => f.type === "app-snapshot");
+      expect(snapshots).toHaveLength(1);
+      const snap = snapshots[0];
+      if (snap.type === "app-snapshot") {
+        expect(snap.apps).toHaveLength(1);
+        expect(snap.apps[0].hostId).toBe("h1");
+      }
+    });
+
+    it("Filter-14: publishProjectListChanged routes through filter — U1 sees both host frames, U2 sees only accessible host frames", async () => {
+      // Mock: for U2, drop any project-list-changed frame whose scoped
+      // hostId isn't "99" (return null = frame dropped). For U1, pass
+      // through unchanged. Matches the real app-frame-filter's new
+      // per-scope gate.
+      const filterMock = vi.fn(
+        async (frame: FrontendOutboundFrameType, userId?: string) => {
+          if (userId === "U2" && frame.type === "project-list-changed") {
+            if (frame.hostId !== "99") return null;
+          }
+          return frame;
+        },
+      );
+      const registry = createSubscriptionRegistry({ appFrameFilter: filterMock });
+
+      const framesU1: FrontendOutboundFrameType[] = [];
+      const framesU2: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => framesU1.push(f), { userId: "U1" });
+      registry.subscribe((f) => framesU2.push(f), { userId: "U2" });
+      await tick();
+      framesU1.length = 0;
+      framesU2.length = 0;
+
+      registry.publishProjectListChanged("42", [
+        { slug: "a", displayName: "A", hostId: "42", hostname: "boreal", archived: false },
+      ]);
+      registry.publishProjectListChanged("99", [
+        { slug: "b", displayName: "B", hostId: "99", hostname: "workstation", archived: false },
+      ]);
+      await tick();
+
+      const listU1 = framesU1.filter((f) => f.type === "project-list-changed");
+      const listU2 = framesU2.filter((f) => f.type === "project-list-changed");
+      expect(listU1).toHaveLength(2);
+      expect(listU2).toHaveLength(1);
+      if (listU2[0].type === "project-list-changed") {
+        expect(listU2[0].hostId).toBe("99");
+        expect(listU2[0].projects).toHaveLength(1);
+        expect(listU2[0].projects[0].hostId).toBe("99");
+      }
+    });
+
+    it("Filter-15: subscribe-time project-list re-emit is filtered per subscriber (per-host frames replayed, gate applied)", async () => {
+      const filterMock = vi.fn(
+        async (frame: FrontendOutboundFrameType, userId?: string) => {
+          if (userId === "U2" && frame.type === "project-list-changed") {
+            if (frame.hostId !== "99") return null;
+          }
+          return frame;
+        },
+      );
+      const registry = createSubscriptionRegistry({ appFrameFilter: filterMock });
+
+      // Seed the project list BEFORE any subscribe — one publish per host.
+      registry.publishProjectListChanged("42", [
+        { slug: "a", displayName: "A", hostId: "42", hostname: "boreal", archived: false },
+      ]);
+      registry.publishProjectListChanged("99", [
+        { slug: "b", displayName: "B", hostId: "99", hostname: "workstation", archived: false },
+      ]);
+
+      const framesU1: FrontendOutboundFrameType[] = [];
+      const framesU2: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => framesU1.push(f), { userId: "U1" });
+      registry.subscribe((f) => framesU2.push(f), { userId: "U2" });
+      await tick();
+
+      const listU1 = framesU1.filter((f) => f.type === "project-list-changed");
+      const listU2 = framesU2.filter((f) => f.type === "project-list-changed");
+      expect(listU1).toHaveLength(2);
+      expect(listU2).toHaveLength(1);
+      if (listU2[0].type === "project-list-changed") {
+        expect(listU2[0].hostId).toBe("99");
+      }
+    });
+
+    it("Filter-7: filter throwing for one subscriber does NOT block delivery to others", async () => {
+      const filterMock = vi.fn(
+        async (frame: FrontendOutboundFrameType, userId?: string) => {
+          if (userId === "U-bad") {
+            throw new Error("filter exploded");
+          }
+          return frame;
+        },
+      );
+      const registry = createSubscriptionRegistry({ appFrameFilter: filterMock });
+
+      const framesGood: FrontendOutboundFrameType[] = [];
+      const framesBad: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => framesGood.push(f), { userId: "U-good" });
+      registry.subscribe((f) => framesBad.push(f), { userId: "U-bad" });
+      await tick();
+      framesGood.length = 0;
+      framesBad.length = 0;
+
+      registry.publishAppUpdate("h1", makeFilterAppState("h1", "todo"));
+      await tick();
+
+      expect(framesGood.filter((f) => f.type === "app-update")).toHaveLength(1);
+      // Bad subscriber's filter threw → frame not delivered to them.
+      expect(framesBad.filter((f) => f.type === "app-update")).toHaveLength(0);
+    });
+
+    it("Filter-12: publishSessionState routes through filter — U1 sees update, U2 does not", async () => {
+      const filterMock = vi.fn(
+        async (frame: FrontendOutboundFrameType, userId?: string) => {
+          if (userId === "U2" && frame.type === "update") return null;
+          return frame;
+        },
+      );
+      const registry = createSubscriptionRegistry({ appFrameFilter: filterMock });
+
+      const framesU1: FrontendOutboundFrameType[] = [];
+      const framesU2: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => framesU1.push(f), { userId: "U1" });
+      registry.subscribe((f) => framesU2.push(f), { userId: "U2" });
+      await tick();
+      framesU1.length = 0;
+      framesU2.length = 0;
+
+      registry.publishSessionState("host-42", makeState("host-42", "tina", "session-1"));
+      await tick();
+
+      expect(framesU1.filter((f) => f.type === "update")).toHaveLength(1);
+      expect(framesU2.filter((f) => f.type === "update")).toHaveLength(0);
+    });
+
+    it("Filter-13: subscribe-time session snapshot is filtered per subscriber (projected)", async () => {
+      const filterMock = vi.fn(
+        async (frame: FrontendOutboundFrameType, userId?: string) => {
+          // U2 can only see host "99"; project the snapshot down to that.
+          if (userId === "U2" && frame.type === "snapshot") {
+            return {
+              ...frame,
+              states: frame.states.filter((s) => s.hostId === "99"),
+            };
+          }
+          return frame;
+        },
+      );
+      const registry = createSubscriptionRegistry({ appFrameFilter: filterMock });
+
+      // Seed two hosts BEFORE any subscribe.
+      registry.publishSessionState("42", makeState("42", "tina", "session-1"));
+      registry.publishSessionState("99", makeState("99", "tabitha", "session-2"));
+
+      const framesU1: FrontendOutboundFrameType[] = [];
+      const framesU2: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => framesU1.push(f), { userId: "U1" });
+      registry.subscribe((f) => framesU2.push(f), { userId: "U2" });
+      await tick();
+
+      const snapU1 = framesU1.filter((f) => f.type === "snapshot");
+      const snapU2 = framesU2.filter((f) => f.type === "snapshot");
+      expect(snapU1).toHaveLength(1);
+      expect(snapU2).toHaveLength(1);
+      if (snapU1[0].type === "snapshot") {
+        expect(snapU1[0].states).toHaveLength(2);
+      }
+      if (snapU2[0].type === "snapshot") {
+        expect(snapU2[0].states).toHaveLength(1);
+        expect(snapU2[0].states[0].hostId).toBe("99");
+      }
+    });
+
+    // (Phase 115 Filter-10 + Filter-11 identity-archived-through-filter tests
+    //  retired in the Phase 122 shape follow-up alongside publishIdentityArchived.)
+
+    it("Filter-9: publishSessionGone routes through filter — U1 sees gone, U2 does not", async () => {
+      const filterMock = vi.fn(
+        async (frame: FrontendOutboundFrameType, userId?: string) => {
+          if (userId === "U2" && frame.type === "gone") return null;
+          return frame;
+        },
+      );
+      const registry = createSubscriptionRegistry({ appFrameFilter: filterMock });
+
+      // Seed the state map so publishSessionGone has an entry to delete + fan.
+      registry.publishSessionState(
+        "host-42",
+        makeState("host-42", "tmux-abc", "session-1"),
+      );
+
+      const framesU1: FrontendOutboundFrameType[] = [];
+      const framesU2: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => framesU1.push(f), { userId: "U1" });
+      registry.subscribe((f) => framesU2.push(f), { userId: "U2" });
+      await tick();
+      framesU1.length = 0;
+      framesU2.length = 0;
+
+      registry.publishSessionGone("host-42", "tmux-abc", "session-1");
+      await tick();
+
+      expect(framesU1.filter((f) => f.type === "gone")).toHaveLength(1);
+      expect(framesU2.filter((f) => f.type === "gone")).toHaveLength(0);
+    });
+
+    it("Filter-8: publishIdentityGoneByName routes through filter — U1 sees gone, U2 does not", async () => {
+      const filterMock = vi.fn(
+        async (frame: FrontendOutboundFrameType, userId?: string) => {
+          if (userId === "U2" && frame.type === "gone") return null;
+          return frame;
+        },
+      );
+      const registry = createSubscriptionRegistry({ appFrameFilter: filterMock });
+
+      // Seed the state map with (host-42, tina) so publishIdentityGoneByName
+      // has an entry to delete + fan out. tmuxSession === identityName is the
+      // source-B key convention publishIdentityGoneByName looks up.
+      registry.publishSessionState(
+        "host-42",
+        makeState("host-42", "tina", "session-1"),
+      );
+
+      const framesU1: FrontendOutboundFrameType[] = [];
+      const framesU2: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => framesU1.push(f), { userId: "U1" });
+      registry.subscribe((f) => framesU2.push(f), { userId: "U2" });
+      await tick();
+      framesU1.length = 0;
+      framesU2.length = 0;
+
+      registry.publishIdentityGoneByName("host-42", "tina");
+      await tick();
+
+      const goneFramesU1 = framesU1.filter((f) => f.type === "gone");
+      expect(goneFramesU1).toHaveLength(1);
+      // Reason discriminator: publishIdentityGoneByName means the identity
+      // folder is truly gone — frontend closes any open tabs pointing at it.
+      expect(goneFramesU1[0]).toMatchObject({ reason: "identity_gone" });
+      expect(framesU2.filter((f) => f.type === "gone")).toHaveLength(0);
+    });
+
+    it("publishIdentityGoneByName still fans out when state entry is absent — race with publishSessionGone", async () => {
+      // Regression: the ssh-poll-orchestrator's 30-second stale-sweep can win
+      // the race against the reconcile tick that calls
+      // publishIdentityGoneByName. When it does, its publishSessionGone has
+      // already deleted the state map entry. Early-returning here would drop
+      // the ONLY signal that closes the frontend's open pane (pid_stale keeps
+      // the tab open by design). The frame must fan out anyway, using
+      // identityName as tmuxSession (source-A + source-B both key identity
+      // sessions that way) so the frontend's tab-close matcher hits.
+      const registry = createSubscriptionRegistry();
+
+      const frames: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => frames.push(f), { userId: "U1" });
+      await tick();
+      frames.length = 0;
+
+      // No prior publishSessionState → state map has no entry for
+      // (host-42, ferret). This simulates the stale-sweep-won-the-race
+      // condition where publishSessionGone already deleted the entry.
+      registry.publishIdentityGoneByName("host-42", "ferret");
+      await tick();
+
+      const goneFrames = frames.filter((f) => f.type === "gone");
+      expect(goneFrames).toHaveLength(1);
+      expect(goneFrames[0]).toMatchObject({
+        type: "gone",
+        hostId: "host-42",
+        tmuxSession: "ferret",
+        sessionId: "",
+        reason: "identity_gone",
+      });
+    });
+  });
+
+  // ─── Phase 118 code-review HIGH-4 (fix pass 2026-09-18) — snapshot-first ordering ─
+  // The subscribe-path app-snapshot is fire-and-forget. Between the moment the
+  // subscriber entry is added to the Set and the moment the async snapshot's
+  // sendFrame call completes, publishAppUpdate/publishAppGoneByHostSlug ticks
+  // COULD deliver updates before the snapshot — the frontend would then
+  // overwrite the newer state with the stale snapshot ("picture has lied"
+  // race). Queue-until-snapshot-flushes closes that window.
+  describe("Phase 118 HIGH-4 fix — subscribe-snapshot ordering", () => {
+    // A controllable filter — the test awaits `resolveFilter()` to release the
+    // in-flight snapshot promise, letting us fire publishes DURING the window
+    // deterministically without racing setTimeout.
+    function makeGatedFilter() {
+      let resolveFn: (() => void) | undefined;
+      const gate = new Promise<void>((r) => {
+        resolveFn = r;
+      });
+      const filter = vi.fn(async (frame: FrontendOutboundFrameType) => {
+        await gate;
+        return frame;
+      });
+      return {
+        filter,
+        release: () => {
+          if (resolveFn) resolveFn();
+        },
+      };
+    }
+
+    function makeAppState2(
+      hostId: string,
+      slug: string,
+      overrides: Partial<AppState> = {},
+    ): AppState {
+      return {
+        hostId,
+        slug,
+        title: `App ${slug}`,
+        description: "test app",
+        port: 9591,
+        hasIcon: false,
+        createdAtMs: 1_700_000_000_000,
+        isHealthy: true,
+        healthMessage: null,
+        users: null,
+        ...overrides,
+      };
+    }
+
+    async function tick(): Promise<void> {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+
+    it("HIGH-4-1: publishAppUpdate fired DURING the subscribe-snapshot window is queued — subscriber receives snapshot FIRST, then the update", async () => {
+      const { filter, release } = makeGatedFilter();
+      const registry = createSubscriptionRegistry({ appFrameFilter: filter });
+      // Seed a pre-existing app so the snapshot contents differ from the
+      // subsequent update (semantically distinct frames — proves ordering).
+      registry.publishAppUpdate("h1", makeAppState2("h1", "todo"));
+
+      const received: FrontendOutboundFrameType[] = [];
+      // Subscribe with a userId → filter engages → pendingFrames = []
+      registry.subscribe((f) => received.push(f), { userId: "U1" });
+
+      // In the queue-window: publish an app-update BEFORE the filter releases.
+      registry.publishAppUpdate(
+        "h1",
+        makeAppState2("h1", "todo", { title: "Updated Title" }),
+      );
+
+      // Snapshot promise still gated — receiving should NOT yet contain the
+      // filtered app-snapshot OR the queued app-update.
+      const appFramesBeforeRelease = received.filter(
+        (f) => f.type === "app-snapshot" || f.type === "app-update",
+      );
+      expect(appFramesBeforeRelease).toHaveLength(0);
+
+      release();
+      await tick();
+
+      // After release: app-snapshot arrives FIRST, then the queued update.
+      const appFrames = received.filter(
+        (f) => f.type === "app-snapshot" || f.type === "app-update",
+      );
+      expect(appFrames.length).toBeGreaterThanOrEqual(2);
+      expect(appFrames[0].type).toBe("app-snapshot");
+      expect(appFrames[1].type).toBe("app-update");
+      if (appFrames[1].type === "app-update") {
+        expect(appFrames[1].app.title).toBe("Updated Title");
+      }
+    });
+
+    it("HIGH-4-2: publishAppGoneByHostSlug fired DURING the subscribe-snapshot window is also queued after the snapshot", async () => {
+      const { filter, release } = makeGatedFilter();
+      const registry = createSubscriptionRegistry({ appFrameFilter: filter });
+      registry.publishAppUpdate("h1", makeAppState2("h1", "todo"));
+
+      const received: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => received.push(f), { userId: "U1" });
+
+      // Gone fires DURING the queue window.
+      registry.publishAppGoneByHostSlug("h1", "todo");
+
+      const appFramesBeforeRelease = received.filter(
+        (f) => f.type === "app-snapshot" || f.type === "app-gone",
+      );
+      expect(appFramesBeforeRelease).toHaveLength(0);
+
+      release();
+      await tick();
+
+      const appFrames = received.filter(
+        (f) => f.type === "app-snapshot" || f.type === "app-gone",
+      );
+      expect(appFrames.length).toBeGreaterThanOrEqual(2);
+      expect(appFrames[0].type).toBe("app-snapshot");
+      expect(appFrames[1].type).toBe("app-gone");
+    });
+
+    it("HIGH-4-3: after snapshot flushes, subsequent publishes deliver normally — the queue is null and no double-buffering occurs", async () => {
+      const { filter, release } = makeGatedFilter();
+      const registry = createSubscriptionRegistry({ appFrameFilter: filter });
+
+      const received: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => received.push(f), { userId: "U1" });
+
+      release();
+      await tick();
+      received.length = 0;
+
+      // Post-flush publish delivers normally — one fanOutApp round trip.
+      registry.publishAppUpdate("h1", makeAppState2("h1", "todo"));
+      await tick();
+
+      const updates = received.filter((f) => f.type === "app-update");
+      expect(updates).toHaveLength(1);
+
+      registry.publishAppUpdate(
+        "h1",
+        makeAppState2("h1", "todo", { title: "Second" }),
+      );
+      await tick();
+      const allUpdates = received.filter((f) => f.type === "app-update");
+      expect(allUpdates).toHaveLength(2);
+    });
+
+    it("HIGH-4-4: disposer called DURING the queue window — no leaked frames delivered after unsubscribe", async () => {
+      const { filter, release } = makeGatedFilter();
+      const registry = createSubscriptionRegistry({ appFrameFilter: filter });
+
+      const received: FrontendOutboundFrameType[] = [];
+      const dispose = registry.subscribe((f) => received.push(f), {
+        userId: "U1",
+      });
+
+      // Queue an update in the pending window
+      registry.publishAppUpdate("h1", makeAppState2("h1", "todo"));
+
+      // Dispose BEFORE the filter releases
+      dispose();
+
+      release();
+      await tick();
+
+      // No app frames should reach the subscriber (snapshot AND the queued
+      // update are dropped because the disposer removed the entry from the
+      // Set + nulled the queue).
+      const appFrames = received.filter(
+        (f) =>
+          f.type === "app-snapshot" ||
+          f.type === "app-update" ||
+          f.type === "app-gone",
+      );
+      // The snapshot might still land (fire-and-forget resolves and calls
+      // sendFrame regardless of Set membership — we still send the initial
+      // snapshot via the closure's sendFrame reference). But the QUEUED
+      // update MUST NOT be delivered — the drain checks
+      // `subscribers.has(entry)` first.
+      const queuedUpdates = appFrames.filter((f) => f.type === "app-update");
+      expect(queuedUpdates).toHaveLength(0);
+    });
+  });
+});
+
+describe("publishToUser — per-user frames (read-state-changed)", () => {
+  it("delivers only to that user's subscribers, every tab of theirs", () => {
+    const registry = createSubscriptionRegistry();
+    const a1 = vi.fn();
+    const a2 = vi.fn();
+    const b = vi.fn();
+    const bare = vi.fn();
+    registry.subscribe(a1, { userId: "alice" });
+    registry.subscribe(a2, { userId: "alice" });
+    registry.subscribe(b, { userId: "bob" });
+    registry.subscribe(bare);
+    for (const f of [a1, a2, b, bare]) f.mockClear();
+
+    const frame = {
+      schemaVersion: FRAME_SCHEMA_VERSION,
+      type: "read-state-changed" as const,
+      hostId: "h1",
+      identityName: "aspen",
+      seenFinishAt: 1000,
+    };
+    registry.publishToUser("alice", frame);
+    expect(a1).toHaveBeenCalledWith(frame);
+    expect(a2).toHaveBeenCalledWith(frame);
+    expect(b).not.toHaveBeenCalled();
+    expect(bare).not.toHaveBeenCalled();
+  });
+
+  it("one subscriber throwing does not stop delivery to the user's others", () => {
+    const registry = createSubscriptionRegistry();
+    const bad = vi.fn(() => {
+      throw new Error("socket closed");
+    });
+    const good = vi.fn();
+    registry.subscribe(bad, { userId: "alice" });
+    registry.subscribe(good, { userId: "alice" });
+    good.mockClear();
+    registry.publishToUser("alice", {
+      schemaVersion: FRAME_SCHEMA_VERSION,
+      type: "read-state-changed",
+      hostId: "h1",
+      identityName: "aspen",
+      seenFinishAt: 1,
+    });
+    expect(good).toHaveBeenCalledTimes(1);
+  });
+});

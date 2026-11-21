@@ -1,0 +1,748 @@
+// ─── split-tree.ts ─────────────────────────────────────────────────────────
+// Phase 56 Plan 01 — recursive split-tree data model + pure immutable helpers.
+//
+// This module is the foundation for Phase 56 (visual session management,
+// foundation-phase scope items 1 + 5 in the phase CONTEXT.md). It replaces
+// the retired `paneTabIds: (string | null)[]` fixed-grid data model that
+// used to live inside `SplitView.tsx`.
+//
+// ROWS AND SIZES (2026-10-14, supersedes the 2026-08-28 "no draggable
+//   dividers, always 50/50" decision):
+//   A chain of nested splits that share one direction is ONE row (or column)
+//   — three panes side by side are a row of three, however the binary tree
+//   happened to be built up. `rowMembers` flattens a chain into its members.
+//   Every member of a row gets an equal share unless the user has dragged a
+//   divider in it, in which case every split in that chain carries a `ratio`
+//   (share of the split's own space given to children[0]). A row is either
+//   fully sized (every chain split has a ratio) or fully even (none do).
+//   Tree edits reset to even exactly the rows whose membership changed:
+//   `insertAtEdge` resets the row the new pane joins, `removeLeaf` resets the
+//   row the pane left (and any row a collapse merges into). A row whose
+//   membership didn't change keeps its sizes.
+//
+// INVARIANT (enforced by helpers, walked by tests):
+//   Every `{kind: 'split'}` node has EXACTLY two non-null `SplitNode`
+//   children. There is never a single-child split, never a null child,
+//   never an array of length != 2. `removeLeaf` collapses any parent that
+//   would violate this into its surviving child.
+//
+// EDGE → DIRECTION MAPPING (documented here so Plan 56-02's renderer imports
+//   the same mental model):
+//     - `left`   → direction: 'vertical'   (side-by-side; vertical divider).
+//                  New leaf goes on the LEFT (index 0).
+//     - `right`  → direction: 'vertical'   (side-by-side; vertical divider).
+//                  New leaf goes on the RIGHT (index 1).
+//     - `top`    → direction: 'horizontal' (stacked; horizontal divider).
+//                  New leaf goes on the TOP (index 0).
+//     - `bottom` → direction: 'horizontal' (stacked; horizontal divider).
+//                  New leaf goes on the BOTTOM (index 1).
+//   Convention: `direction` is the axis of the divider, matching the HTML/CSS
+//   `<hr>` convention where a "horizontal rule" is a left-to-right line.
+//
+// CONSUMERS (out of scope for this module — none of these are imported here):
+//   - Plan 56-02: `src/ui/shell/SplitView.tsx` refactor consumes SplitNode +
+//     insertAtEdge for the recursive renderer, and `src/ui/AppShell.tsx`
+//     wires URL-restore + URL-sync through split-tree-url.ts (Task 2).
+//   - Plan 56-03: row-drop-splits-cell in `PrettyConversationRow.tsx` calls
+//     insertAtEdge on drop.
+//
+// NO REACT / DOM / BACKEND IMPORTS. This module compiles and tests in any
+// TS environment. Also NO dependency on `src/types/ui-types.ts` — the tree
+// references `tabId: string`, not the `Tab` type, so the two data models
+// decouple cleanly.
+
+/** Divider axis. 'horizontal' = horizontal divider = top pane stacked over
+ *  bottom pane. 'vertical' = vertical divider = left pane beside right pane.
+ *  Matches HTML/CSS convention where "horizontal rule" is a left-to-right
+ *  line. */
+export type SplitDirection = "horizontal" | "vertical";
+
+/** The cell edge a drop landed nearest to. Consumed by `insertAtEdge`. See
+ *  the module-level edge → direction mapping. */
+export type DropEdge = "left" | "right" | "top" | "bottom";
+
+/** Phase 57 Plan 01 — the widened return type of `computeEdgeZone`. Adds
+ *  `"center"` to the four `DropEdge` values so callers can distinguish the
+ *  pane's inner dead-zone rectangle (where no drop should register) from a
+ *  real edge pick. `DropEdge` itself is UNCHANGED — Phase 56 consumers
+ *  (`insertAtEdge`, `buildSplitForEdge`, the AppShell drop handlers) still
+ *  operate on the four-value edge type; Plan 57-02's `Pane` short-circuits
+ *  before calling `insertAtEdge` when `DropZone === "center"`.
+ *
+ *  Rationale (per .planning/phases/57-drop-preview-overlay-edge-zone-hit-
+ *  testing-replace-placehold/57-CONTEXT.md §In-scope item 1 + shape file
+ *  quote): "the center dead zone exists so there is one path to closing a
+ *  session — closing is Phase 58's drag-badge-to-list". Center-drop must do
+ *  NOTHING — no replace, no swap, no no-op-with-visual-feedback — so it
+ *  cannot be a fifth `DropEdge` value that flows into `insertAtEdge`. */
+export type DropZone = DropEdge | "center";
+
+/** The tree. Root of a whole tree is `SplitNode | null` (null = empty
+ *  layout, no session shown). */
+export type SplitNode =
+  | { kind: "session"; tabId: string }
+  | {
+    kind: "split";
+    direction: SplitDirection;
+    children: [SplitNode, SplitNode];
+    /** Share (0..1, exclusive) of this split's space given to children[0].
+     *  Absent = even by row-member count. See ROWS AND SIZES above. */
+    ratio?: number;
+  };
+
+/** Sequence of `0 | 1` indices from root. Empty array = root. Number typing
+ *  is deliberate over a literal-union so callers can build paths by
+ *  iteration; helpers guard against out-of-bounds values. */
+export type SplitPath = number[];
+
+// ─── findLeaf ──────────────────────────────────────────────────────────────
+
+/** DFS. Returns the path to the leaf whose tabId matches, or null if not
+ *  found. `[]` = root leaf match. Called by consumers to locate the target
+ *  cell for a drop. */
+export function findLeaf(
+  root: SplitNode | null,
+  tabId: string,
+): SplitPath | null {
+  if (root === null) return null;
+  if (root.kind === "session") {
+    return root.tabId === tabId ? [] : null;
+  }
+  // split — search children in order.
+  for (let i = 0; i < 2; i += 1) {
+    const sub = findLeaf(root.children[i], tabId);
+    if (sub !== null) return [i, ...sub];
+  }
+  return null;
+}
+
+// ─── getNodeAt ─────────────────────────────────────────────────────────────
+
+/** Walks the path, returning null on any dead-end (leaf mid-path, index
+ *  out-of-bounds, null root). Empty path returns root. */
+export function getNodeAt(
+  root: SplitNode | null,
+  path: SplitPath,
+): SplitNode | null {
+  if (root === null) return null;
+  let node: SplitNode = root;
+  for (const idx of path) {
+    if (node.kind === "session") return null; // stepped into a leaf
+    if (idx !== 0 && idx !== 1) return null; // out-of-bounds
+    node = node.children[idx];
+  }
+  return node;
+}
+
+// ─── insertAtEdge ──────────────────────────────────────────────────────────
+
+/** Immutable insertion. Returns a new tree; every node on the rewrite path
+ *  is freshly allocated; every subtree NOT on the rewrite path is shared
+ *  by reference (Object.is holds).
+ *
+ *  Behaviour:
+ *   - `root === null` → returns `newLeaf` verbatim (edge ignored). First
+ *     drop into an empty layout just plants the seed.
+ *   - Otherwise walks to `targetPath`, which MUST resolve to a session leaf
+ *     (throws if it resolves to a split node or nowhere).
+ *   - Replaces the target leaf with a new split whose direction + child
+ *     order is dictated by `edge` per the module-level mapping.
+ *
+ *  `newLeaf` MUST be a session leaf (kind: 'session'); throws otherwise.
+ *  Callers wanting to insert a subtree should assemble the split themselves
+ *  and walk the parent path — this helper is deliberately narrow. */
+export function insertAtEdge(
+  root: SplitNode | null,
+  targetPath: SplitPath,
+  newLeaf: SplitNode,
+  edge: DropEdge,
+): SplitNode {
+  if (newLeaf.kind !== "session") {
+    throw new Error(
+      "split-tree.insertAtEdge: newLeaf must be a session leaf, got split",
+    );
+  }
+  if (root === null) {
+    // First drop into empty layout — edge is irrelevant, no cell to split.
+    return newLeaf;
+  }
+  // Walk to the target, validating each step.
+  const targetNode = getNodeAt(root, targetPath);
+  if (targetNode === null) {
+    throw new Error(
+      "split-tree.insertAtEdge: target path does not resolve to any node",
+    );
+  }
+  if (targetNode.kind !== "session") {
+    throw new Error(
+      "split-tree.insertAtEdge: target path resolves to internal split, not a leaf",
+    );
+  }
+  const replacement = buildSplitForEdge(targetNode, newLeaf, edge);
+  const next = replaceAt(root, targetPath, replacement);
+  // The new pane joins its parent's row when the new split runs the same
+  // way as the parent; that row's membership changed, so it goes even. A
+  // split the other way is a brand-new (even) row inside the old slot and
+  // leaves the surrounding sizes alone.
+  if (targetPath.length > 0) {
+    const parentPath = targetPath.slice(0, -1);
+    const parent = getNodeAt(next, parentPath);
+    if (parent !== null && parent.kind === "split" &&
+        replacement.kind === "split" &&
+        parent.direction === replacement.direction) {
+      return clearRowAt(next, parentPath);
+    }
+  }
+  return next;
+}
+
+function buildSplitForEdge(
+  existing: SplitNode,
+  nu: SplitNode,
+  edge: DropEdge,
+): SplitNode {
+  switch (edge) {
+    case "left":
+      // vertical divider (side-by-side); new leaf on LEFT.
+      return {
+        kind: "split",
+        direction: "vertical",
+        children: [nu, existing],
+      };
+    case "right":
+      return {
+        kind: "split",
+        direction: "vertical",
+        children: [existing, nu],
+      };
+    case "top":
+      // horizontal divider (stacked); new leaf on TOP.
+      return {
+        kind: "split",
+        direction: "horizontal",
+        children: [nu, existing],
+      };
+    case "bottom":
+      return {
+        kind: "split",
+        direction: "horizontal",
+        children: [existing, nu],
+      };
+  }
+}
+
+/** Return a new tree in which the node at `path` is replaced by
+ *  `replacement`. Every ancestor on the path is freshly allocated; every
+ *  sibling subtree is shared by reference. Assumes `path` is valid (caller
+ *  has already walked with getNodeAt). */
+function replaceAt(
+  root: SplitNode,
+  path: SplitPath,
+  replacement: SplitNode,
+): SplitNode {
+  if (path.length === 0) return replacement;
+  if (root.kind === "session") {
+    throw new Error(
+      "split-tree.replaceAt: path descends past a leaf (invariant violated)",
+    );
+  }
+  const [head, ...rest] = path;
+  if (head !== 0 && head !== 1) {
+    throw new Error(
+      "split-tree.replaceAt: path index out of bounds (must be 0 or 1)",
+    );
+  }
+  const currentChild = root.children[head];
+  const newChild = replaceAt(currentChild, rest, replacement);
+  const newChildren: [SplitNode, SplitNode] = head === 0
+    ? [newChild, root.children[1]]
+    : [root.children[0], newChild];
+  return { ...root, children: newChildren };
+}
+
+// ─── removeLeaf ────────────────────────────────────────────────────────────
+
+/** Walks the tree; if the leaf is not found, returns the input by
+ *  reference (cheap no-op — Object.is on input and output holds true).
+ *  If found, walks back up the path collapsing any single-child split
+ *  into the surviving child (the invariant-preserving rule). If the
+ *  removed leaf was the root, returns null. */
+export function removeLeaf(
+  root: SplitNode | null,
+  tabId: string,
+): SplitNode | null {
+  if (root === null) return null;
+  const path = findLeaf(root, tabId);
+  if (path === null) return root; // reference-identity no-op
+  if (path.length === 0) return null;
+  const parentPath = path.slice(0, -1);
+  const oldParent = getNodeAt(root, parentPath);
+  let next = removeAt(root, path);
+  if (next === null || oldParent === null || oldParent.kind !== "split") {
+    return next;
+  }
+  // The surviving sibling now sits at `parentPath`. Reset every row whose
+  // membership changed: the row the pane left (the old parent's chain —
+  // either continuing upward through the grandparent, or down through a
+  // same-direction sibling), plus any row the sibling merges into.
+  const survivor = getNodeAt(next, parentPath);
+  const grandPath = parentPath.slice(0, -1);
+  const grand = parentPath.length > 0 ? getNodeAt(next, grandPath) : null;
+  if (grand !== null && grand.kind === "split") {
+    const leftGrandRow = grand.direction === oldParent.direction;
+    const mergedIntoGrandRow = survivor !== null &&
+      survivor.kind === "split" && survivor.direction === grand.direction;
+    if (leftGrandRow || mergedIntoGrandRow) next = clearRowAt(next, grandPath);
+  }
+  if (survivor !== null && survivor.kind === "split" &&
+      survivor.direction === oldParent.direction) {
+    next = clearRowAt(next, parentPath);
+  }
+  return next;
+}
+
+/** Remove the node at `path` and collapse the resulting one-child split
+ *  by promoting the surviving sibling into the parent's slot. Every
+ *  ancestor is freshly allocated. */
+function removeAt(root: SplitNode, path: SplitPath): SplitNode | null {
+  if (path.length === 0) return null; // removed the root
+  if (root.kind === "session") {
+    throw new Error(
+      "split-tree.removeAt: path descends past a leaf (invariant violated)",
+    );
+  }
+  const [head, ...rest] = path;
+  if (head !== 0 && head !== 1) {
+    throw new Error(
+      "split-tree.removeAt: path index out of bounds (must be 0 or 1)",
+    );
+  }
+  if (rest.length === 0) {
+    // The direct child at `head` is the target. Collapse — return the
+    // surviving sibling verbatim. This is the one-child-split → sibling
+    // promotion rule.
+    return root.children[head === 0 ? 1 : 0];
+  }
+  const currentChild = root.children[head];
+  const newChild = removeAt(currentChild, rest);
+  if (newChild === null) {
+    // Only path.length === 0 returns null from removeAt. Reaching here
+    // means a future refactor loosened that invariant — throw loudly
+    // rather than silently discard the sibling subtree (the previous
+    // belt-and-braces "return the surviving sibling" was silent data
+    // loss when the invariant broke, caught in Phase 56 code review).
+    throw new Error(
+      "split-tree.removeAt: unreachable — subtree returned null mid-path (invariant violated)",
+    );
+  }
+  const newChildren: [SplitNode, SplitNode] = head === 0
+    ? [newChild, root.children[1]]
+    : [root.children[0], newChild];
+  return { ...root, children: newChildren };
+}
+
+// ─── collectTabIds ─────────────────────────────────────────────────────────
+
+/** Left-to-right DFS traversal collecting every leaf's tabId. Used by
+ *  consumers (AppShell URL-sync in Plan 56-02) to reconcile the tree
+ *  against the tabs array — orphaned leaves whose tab was closed elsewhere
+ *  can be identified by set-difference. */
+export function collectTabIds(root: SplitNode | null): string[] {
+  if (root === null) return [];
+  if (root.kind === "session") return [root.tabId];
+  return [
+    ...collectTabIds(root.children[0]),
+    ...collectTabIds(root.children[1]),
+  ];
+}
+
+// ─── computeEdgeZone (Phase 57 Plan 01) ────────────────────────────────────
+
+/** Normalized-distance threshold for the edge-zone band. Cursor is in an
+ *  edge zone when its minimum per-axis normalized distance to any of the
+ *  four rect edges is `<= EDGE_ZONE_THRESHOLD`; otherwise it is in the
+ *  `"center"` dead-zone.
+ *
+ *  Value 0.28 matches the reference prototype
+ *  (`~/fleet/roles/box-maintainer/bounties/bring-back-split-view/
+ *  prototype.html:362` — `const EDGE = 0.28`). A ~28% inner band per axis
+ *  gives roughly a 44% × 44% center dead-zone rectangle (100% - 2×28%),
+ *  user-validated live in the reference. NOT exported: the threshold is
+ *  a locked design decision; if a future phase needs to tune it, they
+ *  modify this constant in-place rather than parameterizing callers. */
+const EDGE_ZONE_THRESHOLD = 0.28;
+
+/** Phase 57 Plan 01: 5-zone hit-tester for the drop-preview overlay.
+ *
+ *  Divides a rect into 5 zones by cursor position:
+ *    - Four edge zones (left / right / top / bottom): the outer band along
+ *      each axis, ~28% of the rect's normalized dimension.
+ *    - Center dead zone: the inner ~44% × 44% rectangle where drop must NOT
+ *      register (Plan 57-02's `Pane` short-circuits before calling any
+ *      tree op). See `.planning/phases/57-drop-preview-overlay-edge-zone-
+ *      hit-testing-replace-placehold/57-CONTEXT.md` §In-scope item 1 for
+ *      the contract.
+ *
+ *  Ports `pickZone` at `~/fleet/roles/box-maintainer/bounties/
+ *  bring-back-split-view/prototype.html:361-370` verbatim (user-validated
+ *  live in the reference). Algorithm:
+ *    1. Normalize cursor to [0..1] per axis: `zx = (x - left) / width`.
+ *    2. Compute four normalized edge-distances (`distTop = zy`, `distBottom
+ *       = 1 - zy`, `distLeft = zx`, `distRight = 1 - zx`).
+ *    3. `minDist = Math.min(all four)`.
+ *    4. If `minDist > EDGE_ZONE_THRESHOLD`, return `"center"`.
+ *    5. Otherwise, first-match-wins tie-break priority `top → bottom → left
+ *       → right` (mirrors prototype's if-chain at :366-369 verbatim).
+ *
+ *  Corner-tie behaviour: cursor at the diagonally-symmetric point (e.g.
+ *  (14, 14) in a 100×100 rect where `distTop === distLeft`) resolves
+ *  deterministically to `"top"` by the tie-break priority — never
+ *  oscillates between two candidates as the cursor sits still.
+ *
+ *  Defensive property (Test 12): cursor coordinates OUTSIDE the rect (e.g.
+ *  negative `x`, or `x > right`) do NOT throw and do NOT get clamped —
+ *  the normalized distance goes negative, but the "nearest edge" argument
+ *  still holds and the function returns a defined `DropEdge` value. This
+ *  matters because `dragover` events can briefly fire with the cursor at
+ *  a pane boundary where `getBoundingClientRect()` and the event's
+ *  clientX/Y sit on opposite sides of the pixel boundary.
+ *
+ *  Pure function — no React, no DOM, no side effects. Callable from
+ *  Vitest with plain object literals; callable from Pane with a live
+ *  `getBoundingClientRect()`. Signature deliberately mirrors
+ *  `computeNearestEdge` in `src/ui/shell/SplitView.tsx:44-69` so the two
+ *  are drop-in interchangeable at the Pane callsite.
+ *
+ *  Exported for Plan 57-02 (dragover-time zone computation + drop-time
+ *  center-dead-zone short-circuit) and for direct unit coverage. */
+export function computeEdgeZone(
+  rect: DOMRect | { left: number; right: number; top: number; bottom: number },
+  clientX: number,
+  clientY: number,
+): DropZone {
+  const width = rect.right - rect.left;
+  const height = rect.bottom - rect.top;
+  const zx = (clientX - rect.left) / width;
+  const zy = (clientY - rect.top) / height;
+  const distTop = zy;
+  const distBottom = 1 - zy;
+  const distLeft = zx;
+  const distRight = 1 - zx;
+  const minDist = Math.min(distTop, distBottom, distLeft, distRight);
+  if (minDist > EDGE_ZONE_THRESHOLD) return "center";
+  // First-match-wins tie-break priority (matches prototype.html:366-369).
+  if (minDist === distTop) return "top";
+  if (minDist === distBottom) return "bottom";
+  if (minDist === distLeft) return "left";
+  return "right";
+}
+
+// ─── replaceLeaf (Phase 64 Plan 01) ────────────────────────────────────────
+
+/** Phase 64 Plan 01: pure immutable tree op backing "drop a conversation-list
+ *  row payload onto the CENTER of an already-open session's body". The dragged
+ *  session takes the target cell in place; the target session drops out of the
+ *  grid entirely (still exists in the conv list — just no longer in a slot).
+ *
+ *  See `.planning/phases/64-multi-view-center-drop/64-CONTEXT.md` § In-scope
+ *  item 1 for the semantic contract; § Edge cases items 1-4 for the four
+ *  branches implemented here.
+ *
+ *  Four branches:
+ *    1. `root === null` → return null verbatim (nothing to replace).
+ *    2. `targetTabId === replacementTabId` → return `root` by reference identity
+ *       (Object.is holds). Cheap same-id no-op, NO console.warn.
+ *    3. `targetTabId` not found in the tree → emit ONE defensive `console.warn`
+ *       and return `root` by reference identity. The Plan 64-02 AppShell
+ *       handler's guard makes this unreachable in practice; the warn helps
+ *       debuggability if the invariant ever breaks.
+ *    4. Mainline: if `replacementTabId` is ALREADY in the tree elsewhere,
+ *       `removeLeaf` evicts it first (collapsing its parent split via the
+ *       existing invariant-preserving rule). The path to `targetTabId` is
+ *       then re-discovered post-removal (an ancestor may have collapsed),
+ *       and the target leaf is replaced with a fresh `{kind:"session",
+ *       tabId: replacementTabId}` leaf via the private `replaceAt` helper.
+ *
+ *  Purity: no in-place mutation of any input SplitNode; every ancestor on the
+ *  rewrite path is freshly allocated per `replaceAt`'s documented contract at
+ *  :213-240; every subtree NOT on the rewrite path is shared by reference.
+ *
+ *  Logging: NO `console.info` from this helper body — structured
+ *  `[pv-split-drop]` logging is Plan 64-02's job at the AppShell handler
+ *  layer. Only defensive `console.warn` on missing target (branch 3). */
+export function replaceLeaf(
+  root: SplitNode | null,
+  targetTabId: string,
+  replacementTabId: string,
+): SplitNode | null {
+  // Branch 1: null tree — nothing to replace.
+  if (root === null) return root;
+  // Branch 2: same-id no-op — reference-identity return, no warn.
+  if (targetTabId === replacementTabId) return root;
+  // Branch 3: target not found — defensive warn + reference-identity return.
+  const targetPath = findLeaf(root, targetTabId);
+  if (targetPath === null) {
+    console.warn(
+      `[split-tree] replaceLeaf: target not found targetTabId=${targetTabId}`,
+    );
+    return root;
+  }
+  // Branch 4 (mainline): evict any pre-existing replacementTabId, then
+  // rediscover the target path (an ancestor may have collapsed) and swap the
+  // target leaf.
+  const withoutReplacement = removeLeaf(root, replacementTabId);
+  // Degenerate case: single-leaf root where replacement WAS that leaf and the
+  // target was ALSO that leaf's parent context — removeLeaf can return null.
+  // Guard prevents crashing on rediscovery.
+  if (withoutReplacement === null) {
+    return { kind: "session", tabId: replacementTabId };
+  }
+  const freshTargetPath = findLeaf(withoutReplacement, targetTabId);
+  // Defensive: if the target became collateral in the collapse (should not
+  // happen for distinct tabIds, but preserves the surviving cells over
+  // throwing), return the post-removal tree.
+  if (freshTargetPath === null) return withoutReplacement;
+  return replaceAt(withoutReplacement, freshTargetPath, {
+    kind: "session",
+    tabId: replacementTabId,
+  });
+}
+
+// ─── findLargestLeafPath ───────────────────────────────────────────────────
+
+/** Return the path to the leaf occupying the largest rendered area (as a
+ *  fraction of the whole layout, from `effectiveRatio`), or null if the tree
+ *  is empty. Ties resolve to the FIRST encountered in left-to-right DFS
+ *  order — deterministic but the specific pick is arbitrary by design; the
+ *  consumer treats the tiebreaker as a don't-care. */
+export function findLargestLeafPath(root: SplitNode | null): SplitPath | null {
+  if (root === null) return null;
+  if (root.kind === "session") return [];
+  let bestPath: SplitPath = [];
+  let bestArea = -Infinity;
+  // Areas compare with a small tolerance so float noise in even thirds
+  // (1/3 vs 0.333…) can't break the first-in-DFS tiebreak.
+  const walk = (node: SplitNode, path: SplitPath, area: number): void => {
+    if (node.kind === "session") {
+      if (area > bestArea + 1e-9) {
+        bestArea = area;
+        bestPath = path;
+      }
+      return;
+    }
+    const r = effectiveRatio(node);
+    walk(node.children[0], [...path, 0], area * r);
+    walk(node.children[1], [...path, 1], area * (1 - r));
+  };
+  walk(root, [], 1);
+  return bestPath;
+}
+
+// ─── splitTargetForOpen ────────────────────────────────────────────────────
+
+/** Where a sidebar open (app tile, new conversation) should slot its new
+ *  pane: the largest leaf while two or more panes are showing, else null —
+ *  the caller shows the item alone instead. A lone leaf (what's left after
+ *  closing a split back down to one pane) counts as no split, so the click
+ *  replaces the view exactly as it does when no split was ever made. */
+export function splitTargetForOpen(root: SplitNode | null): SplitPath | null {
+  if (root === null || root.kind === "session") return null;
+  return findLargestLeafPath(root);
+}
+
+// ─── swapLeaves (Phase 64 Plan 01) ─────────────────────────────────────────
+
+/** Phase 64 Plan 01: pure immutable tree op backing "drop an already-open
+ *  session's identity badge onto the CENTER of another already-open session".
+ *  The two sessions trade slots; both remain live in the grid. Pure
+ *  leaf-content-only mutation — every internal split node (direction +
+ *  structural shape) is preserved by construction because we never touch
+ *  splits, only leaf contents at two paths.
+ *
+ *  See `.planning/phases/64-multi-view-center-drop/64-CONTEXT.md` § In-scope
+ *  item 1 + § Edge cases item 7 (deep-tree swap preserves inner directions).
+ *
+ *  Three branches:
+ *    1. `root === null` → return null verbatim (nothing to swap).
+ *    2. `tabIdA === tabIdB` → return `root` by reference identity (Object.is
+ *       holds). Cheap same-id no-op, NO console.warn.
+ *    3. Either `tabIdA` or `tabIdB` not found in the tree → emit ONE
+ *       defensive `console.warn` naming the missing tabId, and return `root`
+ *       by reference identity. If BOTH are missing, `tabIdA` is named (the
+ *       first-encountered miss). The Plan 64-02 handler's guard makes this
+ *       unreachable in practice; the warn helps debuggability.
+ *    4. Mainline: `replaceAt` applied twice — first swaps `pathA`'s leaf to
+ *       `tabIdB`, then swaps `pathB`'s leaf to `tabIdA`. Order does not
+ *       matter because leaves are terminal (a leaf cannot be an ancestor of
+ *       another leaf), so `pathA` and `pathB` are guaranteed disjoint.
+ *
+ *  Purity: no in-place mutation; every ancestor on either rewrite path is
+ *  freshly allocated per `replaceAt`'s contract.
+ *
+ *  Logging: NO `console.info` from this helper body — structured
+ *  `[pv-split-drop]` logging belongs to Plan 64-02's AppShell handler layer.
+ *  Only defensive `console.warn` on missing leaves (branch 3). */
+export function swapLeaves(
+  root: SplitNode | null,
+  tabIdA: string,
+  tabIdB: string,
+): SplitNode | null {
+  // Branch 1: null tree — nothing to swap.
+  if (root === null) return root;
+  // Branch 2: same-id no-op — reference-identity return, no warn.
+  if (tabIdA === tabIdB) return root;
+  // Branch 3: missing leaf — defensive warn + reference-identity return.
+  const pathA = findLeaf(root, tabIdA);
+  const pathB = findLeaf(root, tabIdB);
+  if (pathA === null || pathB === null) {
+    const missing = pathA === null ? tabIdA : tabIdB;
+    console.warn(`[split-tree] swapLeaves: leaf not found tabId=${missing}`);
+    return root;
+  }
+  // Branch 4 (mainline): two-step leaf-content-only swap. Order-independent
+  // because leaves are terminal — pathA and pathB describe disjoint locations
+  // and neither call restructures the tree.
+  const step1 = replaceAt(root, pathA, { kind: "session", tabId: tabIdB });
+  const step2 = replaceAt(step1, pathB, { kind: "session", tabId: tabIdA });
+  return step2;
+}
+
+// ─── Rows and sizes (2026-10-14) ───────────────────────────────────────────
+
+/** One member of a row: a node that sits directly in the row (a leaf, or a
+ *  split running the OTHER way), with its path relative to the row's root. */
+export interface RowMember {
+  node: SplitNode;
+  relPath: SplitPath;
+}
+
+/** Flatten the same-direction chain rooted at `row` into its ordered
+ *  members. A leaf or other-direction split is a member; a same-direction
+ *  split is descended into. */
+export function rowMembers(row: SplitNode & { kind: "split" }): RowMember[] {
+  const out: RowMember[] = [];
+  const walk = (node: SplitNode, rel: SplitPath): void => {
+    if (node.kind === "split" && node.direction === row.direction) {
+      walk(node.children[0], [...rel, 0]);
+      walk(node.children[1], [...rel, 1]);
+      return;
+    }
+    out.push({ node, relPath: rel });
+  };
+  walk(row.children[0], [0]);
+  walk(row.children[1], [1]);
+  return out;
+}
+
+/** Number of row members under `node` when it sits in a row running
+ *  `direction` (a same-direction split contributes all of its members). */
+function memberCount(node: SplitNode, direction: SplitDirection): number {
+  if (node.kind === "split" && node.direction === direction) {
+    return memberCount(node.children[0], direction) +
+      memberCount(node.children[1], direction);
+  }
+  return 1;
+}
+
+/** Share of a split's own space given to children[0]: the stored ratio, or
+ *  the even share by member count when the row hasn't been sized. */
+export function effectiveRatio(node: SplitNode & { kind: "split" }): number {
+  if (typeof node.ratio === "number" && node.ratio > 0 && node.ratio < 1) {
+    return node.ratio;
+  }
+  const a = memberCount(node.children[0], node.direction);
+  const b = memberCount(node.children[1], node.direction);
+  return a / (a + b);
+}
+
+/** Each member's share (summing to 1) of the row rooted at `row`. */
+export function rowFractions(row: SplitNode & { kind: "split" }): number[] {
+  const out: number[] = [];
+  const walk = (node: SplitNode, share: number): void => {
+    if (node.kind === "split" && node.direction === row.direction) {
+      const r = effectiveRatio(node);
+      walk(node.children[0], share * r);
+      walk(node.children[1], share * (1 - r));
+      return;
+    }
+    out.push(share);
+  };
+  walk(row, 1);
+  return out;
+}
+
+/** Walk up from the split at `path` to the root of the row it belongs to. */
+export function rowRootPath(root: SplitNode | null, path: SplitPath): SplitPath {
+  const node = getNodeAt(root, path);
+  if (node === null || node.kind !== "split") return path;
+  let p = path;
+  while (p.length > 0) {
+    const parent = getNodeAt(root, p.slice(0, -1));
+    if (parent === null || parent.kind !== "split" ||
+        parent.direction !== node.direction) break;
+    p = p.slice(0, -1);
+  }
+  return p;
+}
+
+/** Rebuild the chain under `node` (same direction as `direction`) with
+ *  ratios taken from `fractions` (consumed left to right), or stripped
+ *  when `fractions` is null. Returns the new node and the share it covers. */
+function rebuildChain(
+  node: SplitNode,
+  direction: SplitDirection,
+  fractions: number[] | null,
+  cursor: { i: number },
+): { node: SplitNode; share: number } {
+  if (node.kind !== "split" || node.direction !== direction) {
+    const share = fractions === null ? 0 : fractions[cursor.i];
+    cursor.i += 1;
+    return { node, share };
+  }
+  const a = rebuildChain(node.children[0], direction, fractions, cursor);
+  const b = rebuildChain(node.children[1], direction, fractions, cursor);
+  const { ratio: _dropped, ...rest } = node;
+  void _dropped;
+  const children: [SplitNode, SplitNode] = [a.node, b.node];
+  if (fractions === null) {
+    return { node: { ...rest, children }, share: 0 };
+  }
+  const total = a.share + b.share;
+  return {
+    node: { ...rest, children, ratio: total > 0 ? a.share / total : 0.5 },
+    share: total,
+  };
+}
+
+/** Return the row containing the split at `path` back to even sizing.
+ *  Non-split / missing paths return the input unchanged. */
+export function clearRowAt(root: SplitNode, path: SplitPath): SplitNode;
+export function clearRowAt(root: SplitNode | null, path: SplitPath): SplitNode | null;
+export function clearRowAt(root: SplitNode | null, path: SplitPath): SplitNode | null {
+  if (root === null) return null;
+  const rp = rowRootPath(root, path);
+  const row = getNodeAt(root, rp);
+  if (row === null || row.kind !== "split") return root;
+  const rebuilt = rebuildChain(row, row.direction, null, { i: 0 }).node;
+  return replaceAt(root, rp, rebuilt);
+}
+
+/** Set the members' shares of the row rooted at `rowPath`. `fractions` must
+ *  have one positive entry per member (normalized here); anything else
+ *  returns the input unchanged. */
+export function setRowFractions(
+  root: SplitNode | null,
+  rowPath: SplitPath,
+  fractions: number[],
+): SplitNode | null {
+  if (root === null) return null;
+  const row = getNodeAt(root, rowPath);
+  if (row === null || row.kind !== "split") return root;
+  if (rowRootPath(root, rowPath).length !== rowPath.length) return root;
+  if (fractions.length !== rowMembers(row).length) return root;
+  if (!fractions.every((f) => Number.isFinite(f) && f > 0)) return root;
+  const sum = fractions.reduce((x, y) => x + y, 0);
+  const norm = fractions.map((f) => f / sum);
+  const rebuilt = rebuildChain(row, row.direction, norm, { i: 0 }).node;
+  return replaceAt(root, rowPath, rebuilt);
+}

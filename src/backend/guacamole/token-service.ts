@@ -1,0 +1,211 @@
+import crypto from "crypto";
+import { guacLogger } from "../utils/logger.js";
+// Phase 111 SKEW-10: build id lives inside the encrypted token payload.
+// Guacamole's third-party wire format prevents per-frame stamping
+// (Pitfall 1), so the encrypted `buildId` is the ONLY drift-refusal
+// enforcement point — checked at decrypt time in guacamole-server.ts
+// BEFORE any guacd tunnel is spun up.
+import { getServerBuildId } from "../config/server-build-id.js";
+
+export interface GuacamoleConnectionSettings {
+  type: "rdp" | "vnc" | "telnet";
+  settings: {
+    hostname: string;
+    port?: number;
+    username?: string;
+    password?: string;
+    domain?: string;
+    width?: number;
+    height?: number;
+    dpi?: number;
+    security?: string;
+    "ignore-cert"?: boolean;
+    "enable-wallpaper"?: boolean;
+    "enable-drive"?: boolean;
+    "drive-path"?: string;
+    "create-drive-path"?: boolean;
+    "swap-red-blue"?: boolean;
+    cursor?: string;
+    "terminal-type"?: string;
+    [key: string]: unknown;
+  };
+}
+
+export interface GuacamoleToken {
+  connection: GuacamoleConnectionSettings;
+  // Skynet session-takeover metadata — top-level on purpose. guacamole-lite's
+  // ClientConnection.mergeConnectionOptions() overwrites .connection with a
+  // flat compiledSettings dict (see node_modules/guacamole-lite/lib/
+  // ClientConnection.js), so anything inside `connection` other than
+  // .settings.* is gone by the time `on("open")` fires. Top-level fields
+  // survive because guacamole-lite's default processConnectionSettings
+  // is a pass-through and never touches keys outside `.connection`.
+  userId?: string;
+  hostId?: number;
+  /** Phase 111 SKEW-10: server's build id at token-issue time. Checked at
+   *  token decrypt (see guacamole-server.ts) to refuse stale-client
+   *  connections BEFORE guacd is contacted. Non-secret (git short SHA). */
+  buildId?: string;
+}
+
+const CIPHER = "aes-256-cbc";
+const KEY_LENGTH = 32;
+
+export class GuacamoleTokenService {
+  private static instance: GuacamoleTokenService;
+  private encryptionKey: Buffer;
+
+  private constructor() {
+    this.encryptionKey = this.initializeKey();
+  }
+
+  static getInstance(): GuacamoleTokenService {
+    if (!GuacamoleTokenService.instance) {
+      GuacamoleTokenService.instance = new GuacamoleTokenService();
+    }
+    return GuacamoleTokenService.instance;
+  }
+
+  private initializeKey(): Buffer {
+    const existingKey = process.env.GUACAMOLE_ENCRYPTION_KEY;
+    if (existingKey) {
+      if (existingKey.length === 64 && /^[0-9a-fA-F]+$/.test(existingKey)) {
+        return Buffer.from(existingKey, "hex");
+      }
+      if (existingKey.length === KEY_LENGTH) {
+        return Buffer.from(existingKey, "utf8");
+      }
+    }
+
+    const jwtSecret = process.env.JWT_SECRET;
+    if (jwtSecret) {
+      return crypto
+        .createHash("sha256")
+        .update(jwtSecret + "_guacamole")
+        .digest();
+    }
+
+    guacLogger.warn(
+      "No persistent encryption key found, generating random key",
+      {
+        operation: "guac_key_generation",
+      },
+    );
+    return crypto.randomBytes(KEY_LENGTH);
+  }
+
+  getEncryptionKey(): Buffer {
+    return this.encryptionKey;
+  }
+
+  encryptToken(tokenObject: GuacamoleToken): string {
+    const iv = crypto.randomBytes(16);
+    const cipher = crypto.createCipheriv(CIPHER, this.encryptionKey, iv);
+
+    let encrypted = cipher.update(
+      JSON.stringify(tokenObject),
+      "utf8",
+      "base64",
+    );
+    encrypted += cipher.final("base64");
+
+    const data = {
+      iv: iv.toString("base64"),
+      value: encrypted,
+    };
+
+    return Buffer.from(JSON.stringify(data)).toString("base64");
+  }
+
+  decryptToken(token: string): GuacamoleToken | null {
+    try {
+      const data = JSON.parse(Buffer.from(token, "base64").toString("utf8"));
+      const iv = Buffer.from(data.iv, "base64");
+      const decipher = crypto.createDecipheriv(CIPHER, this.encryptionKey, iv);
+
+      let decrypted = decipher.update(data.value, "base64", "utf8");
+      decrypted += decipher.final("utf8");
+
+      return JSON.parse(decrypted) as GuacamoleToken;
+    } catch (error) {
+      guacLogger.error("Failed to decrypt guacamole token", error, {
+        operation: "guac_token_decrypt_error",
+      });
+      return null;
+    }
+  }
+
+  createRdpToken(
+    hostname: string,
+    username: string,
+    password: string,
+    options: Partial<GuacamoleConnectionSettings["settings"]> = {},
+    takeover?: { userId: string; hostId: number },
+  ): string {
+    const token: GuacamoleToken = {
+      connection: {
+        type: "rdp",
+        settings: {
+          hostname,
+          username,
+          password,
+          port: 3389,
+          "ignore-cert": true,
+          ...options,
+        },
+      },
+      ...(takeover
+        ? { userId: takeover.userId, hostId: takeover.hostId }
+        : {}),
+      // Phase 111 SKEW-10: encrypted-payload skew stamp.
+      buildId: getServerBuildId(),
+    };
+    return this.encryptToken(token);
+  }
+
+  createVncToken(
+    hostname: string,
+    username?: string,
+    password?: string,
+    options: Partial<GuacamoleConnectionSettings["settings"]> = {},
+  ): string {
+    const token: GuacamoleToken = {
+      connection: {
+        type: "vnc",
+        settings: {
+          hostname,
+          ...(username ? { username } : {}),
+          password,
+          port: 5900,
+          ...options,
+        },
+      },
+      // Phase 111 SKEW-10: encrypted-payload skew stamp.
+      buildId: getServerBuildId(),
+    };
+    return this.encryptToken(token);
+  }
+
+  createTelnetToken(
+    hostname: string,
+    username?: string,
+    password?: string,
+    options: Partial<GuacamoleConnectionSettings["settings"]> = {},
+  ): string {
+    const token: GuacamoleToken = {
+      connection: {
+        type: "telnet",
+        settings: {
+          hostname,
+          username,
+          password,
+          port: 23,
+          ...options,
+        },
+      },
+      // Phase 111 SKEW-10: encrypted-payload skew stamp.
+      buildId: getServerBuildId(),
+    };
+    return this.encryptToken(token);
+  }
+}

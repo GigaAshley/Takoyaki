@@ -1,0 +1,453 @@
+import type { DragEvent as ReactDragEvent } from "react";
+import { GitPullRequestDraft, Pin } from "lucide-react";
+import { useIdentities } from "@/state/identities-store";
+import { useProjects, usePinnedIds, fleetRowId } from "@/state/conversation-store";
+import { useIsMobile } from "@/hooks/use-mobile";
+import type { TabType } from "@/types/ui-types";
+import { writeBadgeDragData } from "@/shell/badge-drag";
+import {
+  RowKebabMenu,
+  useRowKebabContextMenu,
+  type RowKebabMenuItem,
+} from "@/features/pretty-conversations/RowKebabMenu";
+import { isCoarsePointer } from "@/features/pretty-conversations/row-touch-gestures";
+// Phase 68 Plan 04: avatarUrlWithHost deleted — backend bakes hostId into identity.avatarUrl.
+// Phase 104 Plan 02: the `hostId` prop below is REACTIVATED for the trapped-
+// work store lookup (superseding the Phase 68 "no longer used" note). Existing
+// call sites already thread it (IdentitySessionPane.tsx L291,410,445); no prop
+// signature change needed.
+// Phase 104 Plan 02: per-identity trapped-work indicator (D-05 same visual
+// across both surfaces — conv-list row + this pretty-view header badge).
+import { useTrappedWork } from "@/state/trapped-work-store";
+import {
+  hasNeutralLook,
+  identityRolesLabel,
+  identityTint,
+  NEUTRAL_HUE,
+} from "@/lib/identity-roles";
+import { AvatarImage } from "@/components/avatar-image";
+
+export interface IdentityBadgeProps {
+  identityKey: string | null;
+  /** Phase 66 Plan 05 (now superseded by Phase 68 Plan 04): hostId was previously
+   *  threaded to build the avatar URL via avatarUrlWithHost. Phase 68: the backend
+   *  bakes hostId into identity.avatarUrl at emit time; this prop is no longer used
+   *  for URL construction. Kept for backward-compat with existing call sites that
+   *  still pass it; safe to omit from new call sites. */
+  hostId?: number;
+  // When provided, the badge renders as a <button> with click affordance
+  // (cursor-pointer, hover scale, aria-label). When absent, the badge
+  // renders as a <div aria-hidden> — backward-compat with call sites
+  // that don't wire the click.
+  onClick?: () => void;
+  // Phase 58 Plan 01: identity-badge as third-gesture drag source.
+  // When provided AND useIsMobile() is false, the badge root becomes
+  // draggable=true and a dragstart handler writes the wire contract
+  // (text/plain: tabId + application/x-skynet-badge: JSON.stringify({tabId}))
+  // to dataTransfer with effectAllowed="move". Downstream drop targets
+  // discriminate on the application/x-skynet-badge MIME:
+  //   - Phase 56 Pane onDrop reads text/plain and routes to
+  //     openSessionInTree(tabId, path, edge) — rearranges within the tree.
+  //   - BadgeDropLane reads application/x-skynet-badge and closes the tab
+  //     (or archives the identity, from its archive zone).
+  //   - Sidebar sections (project / Pinned / Conversations) file the
+  //     conversation the badge stands for, as its row drag would.
+  // Absent tabId OR mobile viewport → draggable=false, no handler wired.
+  tabId?: string;
+  // Optional descriptor for cross-window drag support. When present AND the
+  // badge is a drag source, the dragstart payload includes these fields so a
+  // drop in a DIFFERENT same-origin Skynet window can open a fresh session
+  // for the same (host + identity + session kind) rather than plant a leaf
+  // pointing at this window's tabId (which the target doesn't know about,
+  // producing the "Session no longer exists" placeholder). Absent for legacy
+  // call sites and tests — same-window drag/drop works unchanged.
+  dragDescriptor?: {
+    tabType: TabType;
+    sessionKind?: "harness" | "relay-room";
+    relayRoomId?: string;
+    relayRoomTitle?: string | null;
+    targetTmuxSession?: string | null;
+  };
+  // Badge menu (Move to new tab / Switch view / Move to / Archive).
+  // Non-empty → a ⋮ kebab renders at the pill's right end and right-click
+  // on the pill opens the same menu — the shared RowKebabMenu surface every
+  // sidebar kebab uses. Touch long-press is retired, as on sidebar rows: the
+  // kebab is always visible, so it is the mobile path.
+  menuItems?: RowKebabMenuItem[];
+}
+
+// Quick 260806-lzd — single-variant refactor. The former `md` branch
+// (patch #17/#38 terminal-pane treatment, 120px pill, 80px round avatar,
+// hover-opacity-fade) is REMOVED entirely. Only the former `lg` treatment
+// renders (glass pill, 56px avatar left, name+title right, hue-driven
+// rim/glow, pv-identity-breathe 5s animation). The `size` prop is gone;
+// no default value, no branch. This ships user's "one identity badge
+// treatment across terminal + pretty-view" decision.
+export function IdentityBadge({
+  identityKey,
+  hostId,
+  onClick,
+  tabId,
+  dragDescriptor,
+  menuItems,
+}: IdentityBadgeProps) {
+  const { byKey, byHostKey } = useIdentities();
+  // Cosmetics consumer: prefer byHostKey composite lookup (quick-260912-0t4)
+  // so cross-host name collisions (e.g. two identities named "wren" on
+  // different fleet hosts) resolve to the right row's cosmetics. byKey
+  // fallback preserves compat with call sites that don't thread hostId and
+  // with older test fixtures whose useIdentities mock omits byHostKey.
+  const nameLc = identityKey ? identityKey.toLowerCase() : null;
+  const identity = nameLc
+    ? typeof hostId === "number" && Number.isFinite(hostId)
+      ? (byHostKey?.get(`${hostId}::${nameLc}`) ?? byKey.get(nameLc))
+      : byKey.get(nameLc)
+    : null;
+  // Phase 58 Plan 01 (PV58-GESTURE-COEXISTENCE): mobile viewport suppresses
+  // the drag source entirely — SplitView is desktop-only per
+  // AppShell.tsx:2372 `{!isMobile && (<SplitView…/>)}`, so a draggable badge
+  // on mobile would land on nothing useful. Explicit gate here matches the
+  // shell-level mount gate.
+  const isMobile = useIsMobile();
+  // Touch screens drag nothing — a press-and-hold there opens the menu.
+  const isDragSource = !!tabId && !isMobile && !isCoarsePointer();
+
+  // Called before the `if (!identity) return null` early return (Rules of
+  // Hooks — same discipline as the hooks below).
+  const kebabItems = menuItems ?? [];
+  // Interactive badges only — the non-interactive branch is aria-hidden, and
+  // a focusable trigger can't live inside an aria-hidden subtree.
+  const hasMenu = !!onClick && kebabItems.length > 0;
+  const kebabContextMenu = useRowKebabContextMenu(kebabItems);
+
+  // Phase 104 Plan 02 (D-05, D-06, D-07): per-identity trapped-work snapshot.
+  // hostId prop is reactivated here (Pattern 4 in RESEARCH.md — Phase 68 made
+  // it a no-op for avatar-URL construction, Phase 104 puts it to work for the
+  // store lookup). Undefined pre-fetch AND {hasTrappedWork:false} both render
+  // nothing — the JSX below gates on strict `=== true`.
+  //
+  // ⚠️ Called BEFORE the `if (!identity) return null` early return below —
+  // React's Rules of Hooks require every hook to be called on every render
+  // in a stable order. Calling this after the early return would fire on
+  // some renders but not others (whenever identity resolves late from the
+  // store), producing "Rendered more/fewer hooks than during the previous
+  // render" errors. Hook handles identityKey=null gracefully (returns
+  // undefined). Phase 104 code-review finding #1.
+  const trappedWork = useTrappedWork(identityKey, hostId ?? null);
+
+  // Project display-name lookup — identity carries `project` as a slug string
+  // (Phase 117 M6); projects list carries {slug, displayName, hostId} rows.
+  // Match on slug AND identity's own hostId (projects are per-host; two hosts
+  // can hold same-slug projects that mean different things). ProjectRow.hostId
+  // is a stringified id; identity.hostId is a number — coerce for the compare.
+  // Called before the `if (!identity) return null` early return to satisfy
+  // Rules of Hooks (same discipline as useTrappedWork above).
+  // Pinned-state subscription — mirrors the sidebar's row-level pin check so
+  // the badge's indicator flips in lockstep with the row's. Checked against
+  // BOTH the open-tab id and the shadow fleet-row id (same both-sources check
+  // PrettyConversationsPanel's handleSetPinned uses), so pinning via either
+  // route surfaces here. Called BEFORE the `if (!identity) return null` early
+  // return to satisfy Rules of Hooks (same discipline as the other hooks
+  // above).
+  const pinnedIds = usePinnedIds();
+  const shadowFleetId =
+    typeof hostId === "number" &&
+    Number.isFinite(hostId) &&
+    dragDescriptor?.targetTmuxSession
+      ? fleetRowId(hostId, dragDescriptor.targetTmuxSession)
+      : null;
+  const rawPinned =
+    (tabId != null && pinnedIds.has(tabId)) ||
+    (shadowFleetId != null && pinnedIds.has(shadowFleetId));
+
+  const projects = useProjects();
+  const projectSlug = identity?.project ?? null;
+  const projectDisplayName = projectSlug
+    ? (projects.find(
+        (p) =>
+          p.slug === projectSlug &&
+          identity != null &&
+          p.hostId === String(identity.hostId),
+      )?.displayName ?? null)
+    : null;
+  // Pinned and in-a-project are mutually exclusive; project outranks a stale
+  // pin, same as the sidebar (which files the row under its project, unpinned).
+  const isPinned = rawPinned && projectDisplayName === null;
+
+  if (!identity) return null;
+
+  // Identity hue drives border + inset rim + outer glow. NULL colorHue
+  // falls back to hue 35 (warm amber, matches PrettyView's --pv-id-hue
+  // fallback) — except an identity with no roles, which paints in grey.
+  const neutralLook = hasNeutralLook(identity);
+  const hue = identity.colorHue ?? (neutralLook ? NEUTRAL_HUE : 35);
+  const tint = identityTint(hue, neutralLook);
+  // `[-webkit-touch-callout:none]` suppresses iOS Safari's native long-
+  // press callout (magnifier, share sheet, "Look Up") on the pill.
+  // `select-none` already prevents text
+  // selection on all platforms; the callout guard is iOS-specific.
+  // A relay room's participant: the conversation pill's look (solid, neutral,
+  // the agent's colour as a ring on its picture) — shape-conversation-view.
+  // Roles / project ride in the tooltip so every pill stays one line.
+  const rootClassName = "pv-identity-badge pv-float absolute top-3 right-5 z-[101] flex flex-row items-center gap-[9px] h-10 rounded-full select-none [-webkit-touch-callout:none]";
+  const rootStyle: React.CSSProperties = {
+    overflow: "hidden",
+    padding: hasMenu ? "4px 6px 4px 4px" : "4px 14px 4px 4px",
+  };
+  const avatarSrc = identity.avatarUrl;
+  // Second line: every role the identity holds — the same label the sidebar
+  // row and IdentityModal show. The wire `title` is not consulted: it is empty
+  // for multi-role identities and for roles with no `displayName:`.
+  const roleLine = identityRolesLabel(identity);
+  const avatarStyle: React.CSSProperties = {
+    position: "relative",
+    zIndex: 1,
+    width: 30,
+    height: 30,
+    borderRadius: "50%",
+    boxShadow: `0 0 0 1.5px ${tint(60, 60, 0.55)}`,
+  };
+  const pillMain = (
+    <>
+      <AvatarImage
+        src={avatarSrc}
+        name={identity.displayName}
+        className="object-cover shrink-0"
+        style={avatarStyle}
+        initialClassName="shrink-0 inline-flex items-center justify-center font-semibold"
+        initialStyle={{ ...avatarStyle, fontSize: 13, color: "#f0ebe0", background: tint(45, 35, 0.9) }}
+      />
+      <div
+        className="flex flex-col min-w-0"
+        style={{ position: "relative", zIndex: 1 }}
+      >
+        <span
+          className="font-semibold truncate leading-tight text-[color:var(--k-t1)]"
+          style={{ fontSize: 13.5 }}
+          title={[roleLine, projectDisplayName].filter(Boolean).join(" · ") || undefined}
+        >
+          {identity.displayName}
+        </span>
+      </div>
+    </>
+  );
+  const inner = (
+    <>
+      {/* Pin indicator — mirrors the sidebar row's `.pv-pin-indicator` (dark
+          circular bubble + warm-off-white Pin glyph + hue drop-shadow halo on
+          the svg). Positioned at top:7 left:7 so it sits concentric with the
+          avatar's top-left curve (the avatar origin IS 7,7 inside the pill
+          per the `padding: 7px 16px 7px 7px` above). z-index: 3 keeps it above
+          the coordinator watermark (z:0) and the trapped-work indicator (z:2).
+          Renders iff `isPinned` — gated by usePinnedIds above. */}
+      {isPinned && (
+        <span
+          aria-hidden="true"
+          data-testid="pv-identity-badge-pin-indicator"
+          style={{
+            position: "absolute",
+            top: 7,
+            left: 7,
+            width: 20,
+            height: 20,
+            borderRadius: "50%",
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            background: "rgba(10, 12, 20, 0.75)",
+            boxShadow: "inset 0 0 0 1px rgba(220, 225, 245, 0.12)",
+            color: "rgba(232, 228, 216, 0.95)",
+            pointerEvents: "none",
+            zIndex: 3,
+          }}
+        >
+          <Pin
+            width={12}
+            height={12}
+            strokeWidth={2}
+            aria-hidden="true"
+            style={{
+              filter: `drop-shadow(0 0 3px ${tint(80, 60, 0.55)})`,
+            }}
+          />
+        </span>
+      )}
+      {/* Phase 104 Plan 02 — trapped-work indicator (D-05 same visual as the
+          conv-list row's indicator, D-06 start-absent, D-07 tooltip copy).
+          Positioning math: the pill is padding 8px 18px 8px 8px around a 56px
+          avatar. Placing the 18px indicator at the avatar's bottom-right
+          corner means top/left = 8px (avatar origin) + 56px - ~14px overhang.
+          Both z-index: 2 (coordinator watermark is z-index: 0) so this stays
+          above. Coordinator watermark + this indicator are non-overlapping
+          semantic layers (identity role vs repo state) — coexistence is safe.
+          pointerEvents defaults to auto: the browser needs mouseover to
+          dispatch on this span so the native `title` attribute tooltip can
+          fire (D-07). Setting pointerEvents: "none" would silently break the
+          tooltip. Pill-level click still fires because DOM events
+          bubble from the indicator through the pill; the indicator has no
+          onClick to compete. Phase 104 code-review finding #2. */}
+      {trappedWork?.hasTrappedWork === true && (
+        <span
+          aria-hidden="true"
+          data-testid="pv-trapped-work-indicator"
+          title="Has local work not yet pushed to any remote"
+          style={{
+            position: "absolute",
+            left: "calc(7px + 50px - 13px)",
+            top: "calc(7px + 50px - 13px)",
+            width: 16,
+            height: 16,
+            borderRadius: 999,
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            background: "hsla(35, 65%, 55%, 0.85)",
+            boxShadow: "0 0 12px hsla(35, 65%, 55%, 0.4)",
+            zIndex: 2,
+          }}
+        >
+          <GitPullRequestDraft
+            width={12}
+            height={12}
+            color="#f0ebe0"
+            aria-hidden="true"
+          />
+        </span>
+      )}
+      {/* Phase 67 /close 2026-09-01 follow-up (M4): explicit z-index: 1 on
+          the avatar img + name/title stack pins them above the coordinator
+          watermark's z-index: 0 sibling. Previously relied on auto vs 0
+          emergent stacking — a future hover state that added `z-index: -1`
+          or a container that set `isolation: isolate` could have flipped
+          the watermark above primaries. `position: relative` gives z-index
+          bite on the flex items. */}
+      {onClick ? (
+        // The pill's primary control. The pill root (below) owns the click,
+        // so a click on the pill's padding still opens IdentityModal; this
+        // native button gives keyboard + screen-reader users that action,
+        // and its click bubbles to the root handler. A sibling of the kebab
+        // trigger, never its ancestor — interactive controls can't nest.
+        <button
+          type="button"
+          aria-label="Open agent info"
+          data-testid="identity-badge-open"
+          className="flex flex-row items-center gap-[11px] min-w-0 text-left cursor-pointer rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-white/50"
+        >
+          {pillMain}
+        </button>
+      ) : (
+        pillMain
+      )}
+      {hasMenu && (
+        // Relative + z-1 lifts the trigger above the absolutely-positioned
+        // coordinator watermark, same as the avatar + text column. The
+        // trigger stops mousedown/click propagation, so it never also opens
+        // IdentityModal; the menu content stops its own clicks too.
+        //
+        // The span is its own (cancelled) drag source so a press-and-move
+        // that starts on the ⋮ doesn't drag the whole badge (and move or
+        // close the pane) — the pill root is the HTML5 drag source.
+        <span
+          className="shrink-0"
+          style={{ position: "relative", zIndex: 1 }}
+          draggable
+          onDragStart={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+        >
+          <RowKebabMenu
+            items={kebabItems}
+            ariaLabel="Agent menu"
+            testId="identity-badge-kebab-trigger"
+          />
+        </span>
+      )}
+    </>
+  );
+
+  // Phase 58 Plan 01: dragstart handler. Wired only when isDragSource is true
+  // (both render branches, <button> and <div>, share the same handler).
+  //
+  // dataTransfer payload contract (PV58-BADGE-PAYLOAD-DUAL-MIME):
+  //   1. text/plain: tabId               — matches Phase 56 Pane onDrop
+  //                                        text/plain branch at SplitView.tsx
+  //                                        which routes to openSessionInTree
+  //                                        (rearrange path — reused as-is).
+  //   2. application/x-skynet-badge:
+  //        JSON.stringify({tabId, …})    — distinct from patch #511's
+  //                                        row-drag MIME; parsed by
+  //                                        shell/badge-drag.ts for the
+  //                                        BadgeDropLane + sidebar sections.
+  //   3. effectAllowed = "move"          — matches conv-list row convention.
+  //
+  // Structured log (PV58-STRUCTURED-LOGGING, T-58-01-01 mitigation):
+  // Explicit-field extraction ONLY — tabId + hasIdentity boolean. Do NOT
+  // JSON.stringify the DragEvent (leaks React SyntheticEvent internals and
+  // fights the fleet logging directive user 2026-08-11). No PII (no
+  // displayName, no colorHue, no avatar url).
+  const onDragStart = isDragSource
+    ? (e: ReactDragEvent<HTMLElement>) => {
+        // tabId is non-null when isDragSource is true (the !!tabId gate),
+        // but TS narrows it via the ternary above — assert here.
+        const id = tabId!;
+        // Cross-window drag: mint a dragId + carry enough descriptor for a
+        // target window to open a fresh session for the same identity on the
+        // same host without needing to consult a source-window session
+        // registry. hostId + identityKey are always emitted (they're first-
+        // class props); dragDescriptor is optional and only emitted when the
+        // parent supplies it. armOutboundDrag records the {dragId → tabId}
+        // pair locally so the accept-subscriber in AppShell can close this
+        // window's source tab when the target echoes the dragId back over
+        // BroadcastChannel (hard-move semantics per user directive 2026-09-17).
+        const dragId = writeBadgeDragData(e.dataTransfer, {
+          tabId: id,
+          identityKey,
+          hostId: hostId ?? null,
+          descriptor: dragDescriptor ?? null,
+        });
+        console.info(
+          `[badge-drag] tabId=${id} dragId=${dragId} hasIdentity=${identity !== null} hasDescriptor=${dragDescriptor !== undefined}`,
+        );
+      }
+    : undefined;
+
+  const contextMenuProps = hasMenu
+    ? { onContextMenu: kebabContextMenu.onContextMenu, ...kebabContextMenu.holdProps }
+    : {};
+
+  if (onClick) {
+    // Interactive branch: a plain wrapper holding two sibling controls (the
+    // open-agent-info button and, when there are menu items, the kebab).
+    // Tailwind v4 doesn't default cursor: pointer, so it's explicit.
+    return (
+      <div
+        data-testid="identity-badge-root"
+        onClick={onClick}
+        draggable={isDragSource}
+        onDragStart={onDragStart}
+        {...contextMenuProps}
+        title="Agent info"
+        className={`${rootClassName} cursor-pointer`}
+        style={rootStyle}
+      >
+        {inner}
+        {kebabContextMenu.menu}
+      </div>
+    );
+  }
+  return (
+    <div
+      data-testid="identity-badge-root"
+      aria-hidden="true"
+      draggable={isDragSource}
+      onDragStart={onDragStart}
+      {...contextMenuProps}
+      className={rootClassName}
+      style={rootStyle}
+    >
+      {inner}
+      {kebabContextMenu.menu}
+    </div>
+  );
+}

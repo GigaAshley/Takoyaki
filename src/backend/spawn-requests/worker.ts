@@ -1,0 +1,1077 @@
+/**
+ * spawn-requests/worker.ts
+ *
+ * Async birth-worker for the spawn-request queue (D-07, D-14, D-15).
+ *
+ * Provides:
+ *   - parseRequestBody: validates request file JSON body against SpawnRequestBody
+ *   - mapEndedEventToReason: maps BirthEvent ended{ok:false} to FailureReason enum
+ *   - getHostOwnerUserId: direct Drizzle host-owner lookup (Pitfall 3)
+ *   - processBirth: full birth flow — pre-flight checks, birthIdentity invocation,
+ *     success/failure response file drop via writeMarkdownFileAtomic
+ *   - buildProductionDeps: wires all real imports into a WorkerDeps object
+ *   - WorkerDeps: dependency-injection interface so tests can override every dep
+ *
+ * CRITICAL: Use writeMarkdownFileAtomic for response files — the whitelist-guarded
+ * identity-file writer blocks *.success.json / *.failure.json (Pitfall 1).
+ * CRITICAL: Do NOT modify identity-birth-orchestrator.ts (D-20).
+ */
+
+import { systemLogger } from "../utils/logger.js";
+import { connectOneShot } from "../ssh/ssh-one-shot.js";
+import { getHostSemaphore } from "../ssh/host-semaphore-registry.js";
+import { execCommand } from "../ssh/tmux-helper.js";
+import {
+  extractCosmeticsFromFrontmatter,
+  extractRolesFromMarkdown,
+  IDENTITY_KEY_RE,
+  isLocalHostId,
+  listIdentityKeysOnHost,
+  listProjects,
+  readIdentityFile,
+  readRoleFileByName,
+  writeMarkdownFileAtomic,
+} from "../claude-session/identity-artifact-reader.js";
+import {
+  listArchivedIdentityEntriesOnHost,
+  type ArchivedIdentityEntry,
+} from "../claude-session/list-archived-identity-keys.js";
+import { discoverIdentitySessionFile } from "../claude-session/discover-identity-session-file.js";
+import { resolveHostById } from "../ssh/host-resolver.js";
+import { birthIdentity, ROLE_NAME_PATTERN, SSH_CONNECT_TIMEOUT_MS, type BirthEvent, type BirthDeps, type BirthOptions } from "../database/routes/identity-birth-orchestrator.js";
+import { acquireBirthSlot } from "../identity-birth/global-throttle.js";
+import { derivePrettyNameSlug } from "../utils/pretty-name-slug.js";
+import {
+  createOrUpdateUser as matrixCreateOrUpdateUser,
+  loginAsUser as matrixLoginAsUser,
+  buildRelayJsonBody,
+  countUsersMatching as matrixCountUsersMatching,
+  deactivateUser as matrixDeactivateUser,
+} from "../matrix/matrix-admin-client.js";
+import { getMatrixAdminCreds } from "../matrix/matrix-admin-creds-store.js";
+import { getVettedPool } from "../pool/pool-loader.js";
+import { effectiveProjectAudience } from "../fleet-status/project-visibility-gate.js";
+import {
+  deriveBaseFromFolderName,
+  rankPoolCandidatesWithTiers,
+} from "../pool/rank-pool-candidates.js";
+import {
+  getFleetNameCensus,
+  mergeCensusIntoRankInput,
+  type FleetNameCensus,
+} from "../pool/fleet-name-census.js";
+import { getDb } from "../database/db/index.js";
+import { hosts } from "../database/db/schema.js";
+import { eq } from "drizzle-orm";
+import { promises as fsp } from "node:fs";
+import { exec as execCb } from "node:child_process";
+import { promisify } from "node:util";
+import type { PendingBirth, SpawnRequestBody, SuccessResponse, FailureResponse, FailureReason } from "./types.js";
+
+// ---------------------------------------------------------------------------
+// Module-level constants
+// ---------------------------------------------------------------------------
+
+const execLocal = promisify(execCb);
+
+/**
+ * Per-attempt wall-clock timeout for a single birthIdentity call.
+ *
+ * Normal births run ~1-2 min (dominated by Matrix account registration + peer-side
+ * ambient-monitor coming up). 3 min gives comfortable headroom while bounding the
+ * "silent hang" failure mode where an SSH round-trip inside birthIdentity stalls
+ * without a per-command timeout (see eda51eac/joseph-check-red-card-errors —
+ * step 8 started, never completed, no response file, identity actually born but
+ * Skynet never knew).
+ *
+ * On timeout the worker writes a `birth_timeout` failure marker naming the
+ * partially-birthed identity so operators can adopt-or-abandon rather than
+ * retry-blind (which would spawn a duplicate).
+ */
+const BIRTH_ATTEMPT_TIMEOUT_MS = 3 * 60 * 1000;
+
+// ---------------------------------------------------------------------------
+// parseRequestBody + TASK_MAX_LENGTH — re-exported from parse-request-body.ts
+// ---------------------------------------------------------------------------
+
+// parseRequestBody + TASK_MAX_LENGTH were moved to parse-request-body.ts to
+// keep the fleet-status ssh-poll-orchestrator (which needs the pure parser
+// for its per-tick spawn-request scan) from pulling worker.ts's heavy
+// transitive graph (birthIdentity → Skynet DB init, matrix admin, pool-loader)
+// into the fleet-status test module surface. Existing importers keep working
+// via this re-export; the function bodies live in parse-request-body.ts.
+export { parseRequestBody, TASK_MAX_LENGTH } from "./parse-request-body.js";
+
+// ---------------------------------------------------------------------------
+// mapEndedEventToReason
+// ---------------------------------------------------------------------------
+
+/**
+ * Map a birth ended{ok:false} event to a FailureReason enum value.
+ *
+ * The birth-orchestrator's `ended` event type carries no reason field — reasons
+ * live on `step` events (`{type:"step", phase:"failed", reason?}`). Callers
+ * pass the most-recent step:failed reason as the second arg; if none was
+ * captured, the classification collapses to "birth_failed".
+ * (Code-review fixup post-Phase-99: M1.)
+ *
+ * `role_unknown`, `pool_exhausted`, and `matrix_creds_missing` are ALSO
+ * triggered by the worker's own pre-flight (before birthIdentity is invoked)
+ * and are set directly by callers of writeFailureFile — not derived from ended
+ * events.
+ */
+export function mapEndedEventToReason(
+  ended: BirthEvent & { type: "ended" },
+  stepFailReason?: string,
+): FailureReason {
+  if (ended.ok === true) {
+    throw new Error("mapEndedEventToReason called on success event");
+  }
+
+  const reason = stepFailReason ?? "";
+  const step = ended.failedStep;
+
+  // Role folder not found on target host (Step 1 check in orchestrator — Phase 108).
+  // Checked before the network-error regex so a "role X not found" reason
+  // doesn't accidentally match /connection/ or similar.
+  if (/role.*not found|role.*does not exist|unknown role|invalid role/i.test(reason)) {
+    return "role_unknown";
+  }
+
+  // SSH / network connectivity failures — split by which system the step
+  // actually talks to (see identity-birth-orchestrator.ts step semantics):
+  //   Step 1: role-folder existence probe on the peer (SSH)
+  //   Step 2: mkdir identity dir on the peer (SSH)
+  //   Step 6: admin-mint the Matrix account via Synapse admin API (HTTP)
+  //   Step 7: build relay.json JSON body (pure local — no network)
+  //   Step 8: SFTP-write relay.json + chmod on the peer (SSH)
+  //
+  // Fallback when the failedStep isn't set or isn't one we recognize: keep
+  // the historical "matrix_homeserver_unreachable" name — a birth that got
+  // far enough to emit an ended event with a connection-flavored reason but
+  // no step number is more likely a downstream Matrix issue than a peer-SSH
+  // one (peer-SSH failures usually surface at step 1 with a step number set).
+  if (/timeout|unreachable|refused|econnrefused|connection/i.test(reason)) {
+    if (step === 1 || step === 2 || step === 8) {
+      return "peer_host_unreachable";
+    }
+    return "matrix_homeserver_unreachable";
+  }
+
+  // Default: generic birth failure
+  return "birth_failed";
+}
+
+// ---------------------------------------------------------------------------
+// getHostOwnerUserId (exported for test injection into WorkerDeps)
+// ---------------------------------------------------------------------------
+
+/**
+ * Look up the owner userId of a host via a direct Drizzle query.
+ * Does NOT use resolveHostById — that requires a pre-known userId for field
+ * decryption; hosts.userId is a plaintext foreign key (Pitfall 3).
+ */
+export const getHostOwnerUserId = async (hostIdNum: number): Promise<string | null> => {
+  const rows = await getDb()
+    .select({ userId: hosts.userId })
+    .from(hosts)
+    .where(eq(hosts.id, hostIdNum))
+    .limit(1);
+
+  systemLogger.info("spawn-request worker: host-owner lookup", {
+    operation: "spawn_request_host_owner_lookup",
+    hostIdNum,
+    found: rows.length > 0,
+  });
+
+  return rows[0]?.userId ?? null;
+};
+
+// ---------------------------------------------------------------------------
+// WorkerDeps — dependency-injection interface
+// ---------------------------------------------------------------------------
+
+/**
+ * All external side-effecting dependencies for processBirth.
+ * Tests override every field via buildTestDeps(); production wires via buildProductionDeps().
+ */
+export interface WorkerDeps {
+  connectOneShot: typeof connectOneShot;
+  writeMarkdownFileAtomic: typeof writeMarkdownFileAtomic;
+  getVettedPool: () => string[];
+  getMatrixAdminCreds: typeof getMatrixAdminCreds;
+  getHostOwnerUserId: (hostIdNum: number) => Promise<string | null>;
+  birthIdentity: typeof birthIdentity;
+  resolveHostById: typeof resolveHostById;
+  now: () => Date; // injectable for test determinism
+  // Phase 128 — tiered pool selection. Both enumerators injectable so tests
+  // can override without a real SSH round-trip.
+  listActiveIdentityKeys: typeof listIdentityKeysOnHost;
+  listArchivedIdentityEntries: typeof listArchivedIdentityEntriesOnHost;
+  /** Fleet name census; absent = the process-wide instance. */
+  nameCensus?: FleetNameCensus;
+  /** Identity-file reader for the requester's visibility (roleless
+   *  requests); absent = the real readIdentityFile. */
+  readIdentityFile?: typeof readIdentityFile;
+  /** Role-file reader for the requester's roles' `users:` lists; absent =
+   *  the real readRoleFileByName. */
+  readRoleFileByName?: typeof readRoleFileByName;
+  /** Project lister for a project's audience (unlimited request filed in a
+   *  project); absent = the real listProjects. */
+  listProjects?: typeof listProjects;
+}
+
+// ---------------------------------------------------------------------------
+// buildProductionDeps
+// ---------------------------------------------------------------------------
+
+/**
+ * Wire all real imports into a WorkerDeps object.
+ * Called once at startup by starter.ts (Plan 99-02).
+ */
+export function buildProductionDeps(): WorkerDeps {
+  return {
+    connectOneShot,
+    writeMarkdownFileAtomic,
+    getVettedPool,
+    getMatrixAdminCreds,
+    getHostOwnerUserId,
+    birthIdentity,
+    resolveHostById,
+    now: () => new Date(),
+    listActiveIdentityKeys: listIdentityKeysOnHost,
+    listArchivedIdentityEntries: listArchivedIdentityEntriesOnHost,
+    nameCensus: getFleetNameCensus(),
+    readIdentityFile,
+    readRoleFileByName,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers: response-file writes
+// ---------------------------------------------------------------------------
+
+/**
+ * Write a response file (success or failure) to the requesting host via SFTP.
+ *
+ * Opens a FRESH connectOneShot connection for the write — birthIdentity manages
+ * its own connection internally and closes it before returning (Pattern 7).
+ *
+ * REMOTE-branch contract (quick-260923-9x1): connection details come directly
+ * from `item.hostConnDetails` — the sweep-decrypted `_connDetails` bag threaded
+ * through `parseSpawnRequestBatch` from `list-substrate-hosts.ts`'s CSKEK path.
+ * No per-user `resolveHostById` call happens here (the pre-fix version passed
+ * `item.userId === ""` to that resolver, which always returned null, and the
+ * worker silently gave up → coord timed out on every remote spawn).
+ *
+ * Absence of `hostConnDetails` on a REMOTE item is a hard invariant violation:
+ * the sweep proved credentials decryptable through the defense-in-depth CSKEK
+ * filter before enqueue, so this state should never happen in normal operation.
+ * Logs at ERROR level and gives up (coord's safety timeout still catches it,
+ * but the log should be alertable).
+ *
+ * Wraps the entire operation in try/catch — per D-15 no-retry, a failed
+ * response-file write does NOT re-throw (coord timeout handles it).
+ */
+/** The slice of WorkerDeps the response-file writers need (shared with role-worker.ts). */
+export type ResponseFileDeps = Pick<WorkerDeps, "connectOneShot" | "writeMarkdownFileAtomic">;
+
+export async function writeResponseFile(
+  item: PendingBirth,
+  deps: ResponseFileDeps,
+  kind: "success" | "failure",
+  body: string,
+): Promise<void> {
+  try {
+    // LOCAL branch — hostId is in IDENTITIES_LOCAL_HOST_IDS. Skip
+    // resolveHostById + connectOneShot entirely (resolveHostById fails on
+    // co-located hosts anyway per the spawn_request_response_host_not_found
+    // log) and write straight to the bind-mounted /fleet dir. The $HOME
+    // convention here matches the REMOTE branch's SFTP $HOME resolution —
+    // writeMarkdownFileAtomic's LOCAL branch substitutes os.homedir().
+    if (isLocalHostId(item.hostIdNum)) {
+      const targetPath = `$HOME/fleet/spawn-requests/${item.uuid}.${kind}.json`;
+      await deps.writeMarkdownFileAtomic(null, targetPath, body);
+      systemLogger.info("spawn-request worker: response file dropped (local)", {
+        operation: "spawn_request_response_dropped",
+        uuid: item.uuid,
+        kind,
+        branch: "local",
+      });
+      return;
+    }
+
+    // REMOTE branch — use the sweep-decrypted _connDetails bag threaded through
+    // parseSpawnRequestBatch (quick-260923-9x1). No resolveHostById call — the
+    // sweep already proved credentials decryptable at enqueue time.
+    const hostDetails = item.hostConnDetails;
+    if (!hostDetails) {
+      systemLogger.error(
+        "spawn-request worker: hostConnDetails missing on REMOTE PendingBirth — coord will time out (sweep-side invariant violation)",
+        {
+          operation: "spawn_request_response_conn_details_missing",
+          uuid: item.uuid,
+          hostIdNum: item.hostIdNum,
+          kind,
+        },
+      );
+      return;
+    }
+
+    // Open a fresh one-shot SSH connection for the SFTP write (Pitfall 8: correct
+    // response path is fleet/spawn-requests/ per D-11).
+    // Connect + SFTP write + end run under the shared per-host semaphore
+    // (verify:ssh-cap). Callers (here and role-worker.ts) invoke this
+    // OUTSIDE any slot of their own, so there is no nested acquire.
+    await getHostSemaphore(item.hostIdNum).run(async () => {
+      const conn = await deps.connectOneShot(hostDetails as Parameters<typeof connectOneShot>[0], SSH_CONNECT_TIMEOUT_MS);
+      try {
+        // Build response path: $HOME/fleet/spawn-requests/<uuid>.{success,failure}.json
+        // Literal $HOME — SFTP resolves it (same convention as other SFTP writes in this codebase).
+        // Response path per D-11: same folder as request (spawn-requests/).
+        const targetPath = `$HOME/fleet/spawn-requests/${item.uuid}.${kind}.json`;
+        await deps.writeMarkdownFileAtomic(conn, targetPath, body);
+        systemLogger.info("spawn-request worker: response file dropped", {
+          operation: "spawn_request_response_dropped",
+          uuid: item.uuid,
+          kind,
+        });
+      } finally {
+        conn.end();
+      }
+    });
+  } catch (err) {
+    // Log but do NOT throw — per D-15 no-retry; coord's timeout catches loss.
+    systemLogger.warn("spawn-request worker: response file write failed", {
+      operation: "spawn_request_response_write_failed",
+      uuid: item.uuid,
+      kind,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+export async function writeFailureFile(
+  item: PendingBirth,
+  deps: ResponseFileDeps,
+  payload: FailureResponse,
+): Promise<void> {
+  systemLogger.warn("spawn-request worker: writing failure", {
+    operation: "spawn_request_writing_failure",
+    uuid: item.uuid,
+    reason: payload.reason,
+  });
+  await writeResponseFile(item, deps, "failure", JSON.stringify(payload, null, 2));
+}
+
+// ---------------------------------------------------------------------------
+// processBirth — the main birth-worker function
+// ---------------------------------------------------------------------------
+
+/**
+ * Process a single PendingBirth item from the queue.
+ *
+ * Flow:
+ *   1. Log worker start
+ *   2. Pre-flight checks (pool, creds, host-owner re-verify)
+ *   3. Pick pool name, assemble BirthOptions + BirthDeps
+ *   4. Invoke birthIdentity via injected dep (never throws in normal operation)
+ *   5. Drop success or failure response file via writeMarkdownFileAtomic
+ *
+ * Does NOT retry on failure (D-15). All outcomes produce a response file.
+ */
+/**
+ * Typed-name → identity slug (same derivation as the dialog's "name it
+ * myself" path). Returns null when no name was given. The parser already
+ * rejected unusable names, so a failed derivation here also returns null
+ * (falls back to a pool pick rather than crashing).
+ */
+const typedNameToSlug = (name: string | undefined): string | null => {
+  if (name === undefined) return null;
+  const derivation = derivePrettyNameSlug(name);
+  return derivation.ok === true ? derivation.slug : null;
+};
+
+/**
+ * Bump a typed slug past existing identity folders on the target host
+ * (`-2`, `-3`, ...), mirroring identity-birth.ts's resolveFreeIdentitySlug.
+ * `existing` holds active AND archived raw folder names — a slug matching an
+ * archived folder would collide when the newborn is later archived.
+ * Pretty-name slugs contain no digits, so a digit suffix is unambiguous.
+ */
+const freeTypedSlug = (base: string, existing: ReadonlySet<string>): string => {
+  let candidate = base;
+  for (let n = 2; existing.has(candidate); n++) {
+    candidate = `${base}-${n}`;
+  }
+  return candidate;
+};
+
+/**
+ * Who can see the requesting identity, as one `users` list for a roleless
+ * newborn: the intersection of the requester's own `users:` list and each of
+ * its roles' lists, mirroring the visibility gate (an absent or empty list is
+ * no gate; a missing role file is no gate). Undefined = the requester is
+ * visible to everyone, so the newborn is left open too.
+ *
+ * THROWS when the requester's identity file or one of its role files can't be
+ * read, the identity file doesn't exist, or
+ * when nobody can see the requester (an empty `users:` list would fall open) —
+ * the caller refuses the spawn rather than leave the newborn open.
+ */
+const readRequesterVisibility = async (
+  conn: Awaited<ReturnType<typeof connectOneShot>> | null,
+  requestedBy: string,
+  readIdentity: typeof readIdentityFile,
+  readRole: typeof readRoleFileByName,
+): Promise<string[] | undefined> => {
+  const { markdown } = await readIdentity(conn, requestedBy);
+  if (markdown.trim() === "") {
+    throw new Error(`requester identity ${requestedBy} not found on this host`);
+  }
+  const lists: string[][] = [];
+  const own = extractCosmeticsFromFrontmatter(markdown).users;
+  if (own && own.length > 0) lists.push(own);
+  for (const role of extractRolesFromMarkdown(markdown)) {
+    if (!ROLE_NAME_PATTERN.test(role)) continue;
+    // Strict: a role file that exists but can't be read throws (→ refused)
+    // rather than silently dropping that role's restriction.
+    const { markdown: roleMd } = await readRole(conn, role, { strict: true });
+    const roleUsers = extractCosmeticsFromFrontmatter(roleMd).users;
+    if (roleUsers && roleUsers.length > 0) lists.push(roleUsers);
+  }
+  if (lists.length === 0) return undefined;
+  const users = lists.reduce((acc, l) => acc.filter((u) => l.includes(u)));
+  if (users.length === 0) {
+    throw new Error(`requester identity ${requestedBy} is visible to nobody`);
+  }
+  return users;
+};
+
+export const processBirth = async (item: PendingBirth, deps: WorkerDeps): Promise<void> => {
+  // Phase 110: acquire a global-birth-throttle slot. Spawn-request-origin
+  // callers set bypassQueueDepth:true — disk-drop items are already
+  // durable, so silently dropping them on queue overflow is worse UX than
+  // piling up in memory. The throttle is orthogonal to spawn-requests/queue.ts
+  // (which stays as the FIFO consumer of disk-drop files); the throttle is
+  // the broader construct both entry points share.
+  const release = await acquireBirthSlot({
+    source: "spawn-request",
+    hostId: item.hostIdNum,
+    bypassQueueDepth: true,
+    requestId: item.uuid,
+  });
+  try {
+    await doBirth(item, deps);
+  } finally {
+    release();
+  }
+};
+
+/**
+ * Inner implementation of the birth flow — all pre-flight checks,
+ * birthIdentity invocation, and response-file drops. Separated from
+ * processBirth so the acquire/release try/finally wrapper above can remain
+ * small and readable, and to avoid a massive indentation shift across the
+ * existing 250-line body.
+ *
+ * Called exclusively by processBirth.
+ */
+const doBirth = async (item: PendingBirth, deps: WorkerDeps): Promise<void> => {
+  // 1. Log worker start
+  systemLogger.info("spawn-request worker: processing birth", {
+    operation: "spawn_request_worker_start",
+    uuid: item.uuid,
+    hostId: item.hostIdNum,  // LogContext.hostId is number; PendingBirth carries both string+num forms
+    role: item.roles?.[0] ?? "(none)",  // D-13 bridge: log roles[0] for operator searchability
+    roles_count: item.roles?.length ?? 0,
+    malformed: item.malformedReason !== undefined,
+    requested_by: item.requested_by ?? null,
+    typed_name: item.name ?? null,
+    project: item.project ?? null,
+  });
+
+  // 2. Sweep-side malformed short-circuit (post-code-review M2/M3).
+  //    parseSpawnRequestBatch attaches malformedReason when the request body
+  //    fails validation at scan time. Skip pre-flight + birthIdentity entirely
+  //    and drop a proper malformed failure file so coord sees {reason:"malformed",
+  //    message:<descriptive>} instead of the request silently disappearing.
+  if (item.malformedReason !== undefined) {
+    await writeFailureFile(item, deps, {
+      reason: "malformed",
+      message: item.malformedReason,
+    });
+    return;
+  }
+
+  // 3. Pre-flight checks — short-circuit before touching birthIdentity
+  //
+  //    (a) Pool check — skipped for typed-name requests, which never pick
+  //    from the pool.
+  const typedNameSlug = typedNameToSlug(item.name);
+  const pool = deps.getVettedPool();
+  if (typedNameSlug === null && pool.length === 0) {
+    await writeFailureFile(item, deps, { reason: "pool_exhausted" });
+    return;
+  }
+
+  //    (b) Matrix creds check
+  const creds = await deps.getMatrixAdminCreds();
+  if (!creds) {
+    await writeFailureFile(item, deps, { reason: "matrix_creds_missing" });
+    return;
+  }
+
+  //    (c) Re-verify host-owner userId (may be stale if host was deleted between
+  //    sweep tick and queue drain). Use currentUserId for the subsequent
+  //    birthIdentity call (item.userId no longer exists — removed per
+  //    quick-260923-9x1; the birth path derives userId from getHostOwnerUserId
+  //    while the response-write path uses hostConnDetails directly).
+  const currentUserId = await deps.getHostOwnerUserId(item.hostIdNum);
+  if (!currentUserId) {
+    await writeFailureFile(item, deps, { reason: "birth_failed" });
+    return;
+  }
+
+  // 5. Assemble BirthDeps (mirror of identity-birth.ts:325-363 — identical shape)
+  //
+  //    getCandidateForBirth: () => null  — no avatar for worker births
+  //    writeAvatarSiblingFile: no-op     — no avatar for worker births
+  //    Use the worker's injectable deps for connectOneShot + writeMarkdownFileAtomic
+  //    (testability) while wiring static helpers from the outer scope.
+  const execLocalFn = async (command: string): Promise<string> => {
+    const { stdout } = await execLocal(command);
+    return typeof stdout === "string" ? stdout.trim() : String(stdout).trim();
+  };
+
+  const birthDeps: BirthDeps = {
+    connectOneShot: deps.connectOneShot as typeof connectOneShot,
+    execCommand,
+    isLocalHostId,
+    execLocal: execLocalFn,
+    resolveHostById: async (hId, uid) => deps.resolveHostById(hId, uid),
+    // Unattended path: hand the orchestrator the sweep's system-wrapped
+    // (CSKEK) conn details so its remote connect never needs the owner's
+    // per-user data key (only in memory while they have a live session).
+    hostConnDetails: item.hostConnDetails,
+    matrixCreateOrUpdateUser: (mxid, password, displayname) =>
+      matrixCreateOrUpdateUser(mxid, password, displayname),
+    matrixLoginAsUser: (mxid, validUntilMs) =>
+      matrixLoginAsUser(mxid, validUntilMs),
+    // Rollback primitive for the mint-first atomic-birth flow (see
+    // identity-birth-orchestrator.ts's Step 6 → Step 8 → finally chain).
+    matrixDeactivateUser: (mxid) => matrixDeactivateUser(mxid),
+    matrixHomeserver: creds.homeserverBase,
+    matrixServerName: creds.serverName,
+    // 2026-09-11: Host-reachable relay.json base — falls back to
+    // homeserverBase when hostSideBase column is null (single-URL fleets).
+    // Mirrors the identity-birth.ts primary deps wiring.
+    relayJsonHomeserverBase: creds.hostSideBase ?? creds.homeserverBase,
+    buildRelayJsonBody: (bOpts) => buildRelayJsonBody(bOpts),
+    matrixCountUsersMatching: (mxid) => matrixCountUsersMatching(mxid),
+    // Phase 106 (D-05/D-06): wait-for-supervisor sensor. birthIdentity polls
+    // this after Step 8's relay.json write to confirm agent-supervisor.sh has
+    // brought the identity alive on the target host before closing the SSE
+    // stream (or the spawn-request response file, in the worker path).
+    discoverIdentitySessionFile: (conn, identityName) =>
+      discoverIdentitySessionFile(conn, identityName),
+  };
+
+  // 6. Pool-pick + invoke birthIdentity via injected dep, with bounded retry
+  //    on the pool-name collision failure mode ("identity already exists on this
+  //    host"). The vetted pool has ~222 names; a target host with ~20 identities
+  //    already installed gives ~9% per-attempt collision probability. Prior
+  //    behavior hard-failed on first collision, forcing the coordinator (or the
+  //    dropper) to retry manually. Fix: local exclusion set of just-attempted
+  //    collided names + bounded retry with a fresh random pick each iteration.
+  //    Any non-collision failure surfaces as birth_failed on the FIRST attempt
+  //    (no retry on unrelated errors); genuine exhaustion after 5 collided
+  //    attempts surfaces as pool_exhausted.
+  //
+  //    Never throws in normal operation — all failures go through emit() as
+  //    {type:"ended", ok:false}.
+  //
+  //    2026-09-18 (quick 260918-52n): folder uniqueness now comes from mxid
+  //    uniqueness — deriveMxidWithOrdinal iterates ordinals against Synapse
+  //    inside birthIdentity Step 1, and the identity folder path is derived
+  //    from the mxid localpart. So the COLLISION_REASON "identity already
+  //    exists on this host" branch below is expected to be RARE post-quick.
+  //    It now only fires when an orphaned folder from a prior failed birth
+  //    still occupies the derived path (e.g. Step 8 crashed after Step 2's
+  //    mkdir but before the supervisor picked the folder up, and the
+  //    ordinal search happened to converge on the same suffix). The retry
+  //    loop is still worth keeping for that edge case — no functional
+  //    change to the loop itself.
+  let endedEvent: (BirthEvent & { type: "ended" }) | null = null;
+  // Capture the most recent step:failed reason. Orchestrator surfaces failure
+  // classifications on step events (not on ended — the ended type has no reason
+  // field), so without this the {type:"ended", ok:false} we save above carries
+  // no diagnostic string, and mapEndedEventToReason would collapse every
+  // failure to "birth_failed" regardless of the actual cause.
+  // (Code-review fixup post-Phase-99: M1 dead-code path.)
+  let lastStepFailReason: string | undefined;
+
+  const emit = (e: BirthEvent): void => {
+    if (e.type === "step" && e.phase === "failed") {
+      lastStepFailReason = e.reason;
+    }
+    if (e.type === "ended") {
+      endedEvent = e;
+    }
+    systemLogger.info("spawn-request worker: birth event", {
+      operation: "spawn_request_birth_event",
+      uuid: item.uuid,
+      event: e,
+    });
+  };
+
+  const COLLISION_REASON = "identity already exists on this host";
+  const MAX_POOL_PICK_ATTEMPTS = 5;
+  const excluded = new Set<string>();
+  let poolExhaustedLocally = false;
+  // Hoisted so the post-loop success-file writer can reference the name of the
+  // attempt that succeeded (or the name of the last attempt if we're writing
+  // a failure — for logging).
+  let lastPickedName: string | undefined;
+
+  // Phase 128 — enumerate the target host's active + archived identities so
+  // the tiered ranker can prefer never-used → oldest-archived. One connection,
+  // both dirs in parallel, both sides soft-degrading independently on
+  // enumeration failure (partial info still beats none). Wrapped in outer
+  // try/catch so a total connect failure falls through to an empty
+  // enumeration + tier-3 (full-pool-shuffled) ranker output — preserving the
+  // pre-Phase-128 "never fail birth over pool-picker unreachability" behavior.
+  let activeNames = new Set<string>();
+  // Active ∪ archived RAW folder names (archive entries NOT reduced to pool
+  // bases). The typed-name path bumps its slug against these, mirroring the
+  // dialog's resolveFreeIdentitySlug pre-check, and they are handed to the
+  // orchestrator as BirthDeps.takenFolderNames so its
+  // ordinal search skips handles whose folder already exists on the host.
+  // Undefined when enumeration failed entirely (fall-open).
+  let takenFolderNames: Set<string> | undefined;
+  let archivedEntries: readonly ArchivedIdentityEntry[] = [];
+  // Roleless request with no `users` of its own, naming its requester:
+  // inherit who can see the requester (read over the same connection below),
+  // so a plain agent spawned by a private agent stays private. A
+  // `requested_by` that isn't an identity key names no agent — left open.
+  const requestedBy = item.requested_by;
+  const inheritRequesterUsers =
+    item.roles.length === 0 &&
+    (item.users === undefined || item.users.length === 0) &&
+    requestedBy !== undefined &&
+    IDENTITY_KEY_RE.test(requestedBy);
+  let requesterUsers: string[] | undefined;
+  // A request with no list of its own (a scheduled task with none, say),
+  // filed in a limited project, starts shared with that project's people —
+  // the same rule as an agent made inside it. A roleless one that inherits
+  // its requester's list keeps that instead. Unlimited project = no list, as
+  // before. If the projects can't be read the spawn is refused (below):
+  // going ahead would open a limited project's conversation to everyone.
+  const projectForAudience =
+    item.project && (item.users === undefined || item.users.length === 0) && !inheritRequesterUsers
+      ? item.project
+      : undefined;
+  let projectUsers: string[] | undefined;
+  let projectAudienceError: string | undefined = projectForAudience
+    ? "host unreachable while reading the project"
+    : undefined;
+  // Stays set unless the requester's visibility was actually read — a read
+  // failure or a total enumeration failure refuses the spawn below.
+  let requesterVisibilityError: string | undefined = inheritRequesterUsers
+    ? "host unreachable while reading the requester"
+    : undefined;
+  let enumConn: Awaited<ReturnType<typeof connectOneShot>> | null = null;
+  // REMOTE: the handshake and each of the two parallel exec channels take
+  // their own slot on the shared per-host semaphore (verify:ssh-cap), so the
+  // fan-out is bounded per channel and no slot is held across another
+  // acquire. LOCAL: bind-mount reads, no SSH — bypass.
+  const enumLocal = isLocalHostId(item.hostIdNum);
+  const withSlot = enumLocal
+    ? <T,>(fn: () => Promise<T>): Promise<T> => fn()
+    : <T,>(fn: () => Promise<T>): Promise<T> =>
+        getHostSemaphore(item.hostIdNum).run(fn);
+  try {
+    if (!enumLocal) {
+      // Prefer the sweep's system-wrapped conn details; the per-user
+      // resolver needs the owner's data key in memory (live session only).
+      const credSource = item.hostConnDetails ? "system" : "user";
+      systemLogger.info("spawn-request worker: resolving host for name enumeration", {
+        operation: "spawn_request_enum_host_resolve",
+        uuid: item.uuid,
+        hostId: item.hostIdNum,
+        credSource,
+      });
+      const hostForConn =
+        item.hostConnDetails ??
+        (await deps.resolveHostById(item.hostIdNum, currentUserId));
+      if (!hostForConn) {
+        // Host row was resolvable at owner-lookup (Step 3c above) but is
+        // gone now — deleted between then and here. Do NOT fall through
+        // with enumConn=null: the enumerators would then run their LOCAL
+        // branches and read THIS box's own dirs, producing a ranker
+        // result for the wrong host. Cascade to the outer catch → tier-3
+        // fallback (same as any other total-enumeration-failure).
+        throw new Error("host_row_disappeared_during_enum");
+      }
+      enumConn = await withSlot(() =>
+        deps.connectOneShot(
+          hostForConn as unknown as Parameters<typeof connectOneShot>[0],
+          SSH_CONNECT_TIMEOUT_MS,
+        ),
+      );
+    }
+    const [activeList, archivedList, requesterUsersRead, projectAudience] = await Promise.all([
+      withSlot(() => deps.listActiveIdentityKeys(enumConn)).catch((err: unknown) => {
+        systemLogger.warn(
+          "spawn-request worker: active-identity enumeration failed — soft-degrading to empty",
+          {
+            operation: "spawn_request_enum_active_failed",
+            uuid: item.uuid,
+            errorName: err instanceof Error ? err.name : "unknown",
+          },
+        );
+        return [] as string[];
+      }),
+      withSlot(() => deps.listArchivedIdentityEntries(enumConn)).catch((err: unknown) => {
+        systemLogger.warn(
+          "spawn-request worker: archived-identity enumeration failed — soft-degrading to empty",
+          {
+            operation: "spawn_request_enum_archive_failed",
+            uuid: item.uuid,
+            errorName: err instanceof Error ? err.name : "unknown",
+          },
+        );
+        return [] as ArchivedIdentityEntry[];
+      }),
+      inheritRequesterUsers
+        ? withSlot(() =>
+            readRequesterVisibility(
+              enumConn,
+              requestedBy,
+              deps.readIdentityFile ?? readIdentityFile,
+              deps.readRoleFileByName ?? readRoleFileByName,
+            ),
+          ).then(
+            (users) => ({ ok: true as const, users }),
+            (err: unknown) => {
+              const error = err instanceof Error ? err.message : String(err);
+              systemLogger.warn(
+                "spawn-request worker: requester visibility unresolved — roleless spawn will be refused",
+                {
+                  operation: "spawn_request_requester_users_read_failed",
+                  uuid: item.uuid,
+                  hostId: item.hostIdNum,
+                  identityKey: requestedBy,
+                  error,
+                },
+              );
+              return { ok: false as const, error };
+            },
+          )
+        : Promise.resolve(undefined),
+      projectForAudience
+        ? withSlot(() => (deps.listProjects ?? listProjects)(enumConn)).then(
+            (projects) => ({ ok: true as const, users: effectiveProjectAudience(projects, projectForAudience) ?? undefined }),
+            (err: unknown) => {
+              const error = err instanceof Error ? err.message : String(err);
+              systemLogger.warn("spawn-request worker: project audience unread — spawn will be refused", {
+                operation: "spawn_request_project_audience_failed",
+                uuid: item.uuid,
+                hostId: item.hostIdNum,
+                project: projectForAudience,
+                error,
+              });
+              return { ok: false as const, error };
+            },
+          )
+        : Promise.resolve(undefined),
+    ]);
+    if (projectAudience?.ok) {
+      projectUsers = projectAudience.users;
+      projectAudienceError = undefined;
+    } else if (projectAudience) {
+      projectAudienceError = projectAudience.error;
+    }
+    if (requesterUsersRead?.ok) {
+      requesterUsers = requesterUsersRead.users;
+      requesterVisibilityError = undefined;
+    } else if (requesterUsersRead) {
+      requesterVisibilityError = requesterUsersRead.error;
+    }
+    // Reduce full folder names (`clipper-box-maintainer-3`) to pool bases
+    // (`clipper`) before handing to the ranker — its filter compares against
+    // pool bases, and a shape mismatch silently bypasses the LRU logic
+    // (2026-09-27 regression fix).
+    takenFolderNames = new Set([
+      ...activeList,
+      ...archivedList.map((e) => e.name),
+    ]);
+    activeNames = new Set(activeList.map(deriveBaseFromFolderName));
+    archivedEntries = archivedList.map((e) => ({
+      name: deriveBaseFromFolderName(e.name),
+      mtimeMs: e.mtimeMs,
+    }));
+  } catch (err) {
+    // Total-failure swallow (connect refused / timeout / auth). Ranker
+    // degrades to a shuffled full-pool pick — same as the pre-Phase-128
+    // random behavior, so this preserves backward compat.
+    systemLogger.warn(
+      "spawn-request worker: host enumeration failed entirely — using tier-3 fallback",
+      {
+        operation: "spawn_request_enum_total_failed",
+        uuid: item.uuid,
+        errorName: err instanceof Error ? err.name : "unknown",
+      },
+    );
+  } finally {
+    if (enumConn) {
+      try {
+        enumConn.end();
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  if (projectForAudience) {
+    systemLogger.info("spawn-request worker: born in a project", {
+      operation: "spawn_request_project_audience",
+      uuid: item.uuid,
+      hostId: item.hostIdNum,
+      project: projectForAudience,
+      users: projectUsers ?? null,
+      refused: projectAudienceError !== undefined,
+    });
+    if (projectAudienceError !== undefined) {
+      await writeFailureFile(item, deps, {
+        reason: "visibility_unresolved",
+        message: `Could not read who can see the ${projectForAudience} project (${projectAudienceError}); the new conversation would have been visible to everyone, so nothing was created.`,
+      });
+      return;
+    }
+  }
+
+  if (inheritRequesterUsers) {
+    systemLogger.info("spawn-request worker: roleless request visibility", {
+      operation: "spawn_request_roleless_users",
+      uuid: item.uuid,
+      hostId: item.hostIdNum,
+      identityKey: requestedBy,
+      inherited: requesterUsers !== undefined,
+      users: requesterUsers ?? null,
+      refused: requesterVisibilityError !== undefined,
+    });
+    if (requesterVisibilityError !== undefined) {
+      await writeFailureFile(item, deps, {
+        reason: "visibility_unresolved",
+        message: `Could not work out who can see ${requestedBy} (${requesterVisibilityError}); a plain agent spawned by it would have been visible to everyone, so nothing was created.`,
+      });
+      return;
+    }
+  }
+
+  // Fold in the fleet name census (names live on other machines, newest
+  // archive time anywhere). Empty census = target-host-only ranking.
+  const nameCensus = deps.nameCensus ?? getFleetNameCensus();
+  const censusSnapshot = nameCensus.snapshot(item.hostIdNum);
+  const rankInput = mergeCensusIntoRankInput(
+    { activeNames, archivedEntries },
+    censusSnapshot,
+  );
+
+  // Rank the pool once — the ranking does not depend on retry state; the
+  // retry loop just walks the ranked list, skipping locally-collided names.
+  const ranked = rankPoolCandidatesWithTiers({ pool, ...rankInput });
+
+  birthDeps.takenFolderNames = takenFolderNames;
+
+  for (let attempt = 0; attempt < MAX_POOL_PICK_ATTEMPTS; attempt++) {
+    const pickedCandidate =
+      typedNameSlug !== null
+        ? undefined
+        : ranked.find((c) => !excluded.has(c.name));
+    const pickedName =
+      typedNameSlug !== null
+        ? freeTypedSlug(typedNameSlug, takenFolderNames ?? new Set<string>())
+        : pickedCandidate?.name;
+    if (pickedName === undefined) {
+      // Every ranked candidate has already collided — pool is effectively
+      // exhausted for this birth. Different from "pool.length === 0" earlier
+      // (that's a fresh pool with zero names; this is a locally-drained
+      // effective pool after N collided picks).
+      poolExhaustedLocally = true;
+      break;
+    }
+    lastPickedName = pickedName;
+    if (typedNameSlug === null) {
+      // Hold the name fleet-wide while this birth is in flight, so a
+      // concurrent pick on another machine doesn't take the same head.
+      nameCensus.reserve(item.hostIdNum, pickedName);
+      systemLogger.info("spawn-request worker: pool name picked", {
+        operation: "spawn_request_pool_pick",
+        uuid: item.uuid,
+        hostId: item.hostIdNum,
+        name: pickedName,
+        tier: pickedCandidate?.tier,
+        censusReady: censusSnapshot.ready,
+        attempt: attempt + 1,
+      });
+    }
+    const opts: BirthOptions = {
+      userId: currentUserId,
+      hostId: item.hostIdNum, // numeric — Pitfall 2: HostRecord.id is string, BirthOptions.hostId is number
+      name: (lastPickedName ?? "").toLowerCase(),
+      title: "",
+      path: `~/${pickedName.toLowerCase()}/`,
+      colorHue: null,
+      voice: null,
+      // Empty roles → roleless birth (`roles: []`, bare-name handle).
+      role: item.roles[0],
+      extraRoles: item.roles.slice(1),
+      task: item.task ?? undefined,
+      // Phase 127 follow-up: wake-up spec's `prompt` field lands as the
+      // newborn's identity-file body `## Do this first` section — id-skill
+      // reads it on load and acts on it in the same turn (pre-authorized
+      // next action). Empty prompt → undefined → absent-⇒-omit.
+      bodyContent: item.prompt || undefined,
+      // Spec-provided `users:` for the newborn's frontmatter. Scheduled-agent
+      // specs name whose box the spawn belongs to; this is the carrier field
+      // (news-watcher-riley-email → users:["riley"] → newborn's frontmatter).
+      // When absent, buildIdentityFileBody falls through to the single-string
+      // creatorUsername auto-tag path (which the worker never sets, so on a
+      // bare scan-spawn no `users:` key is emitted). A roleless request
+      // without its own list carries the requester's (see above).
+      users: item.users && item.users.length > 0 ? item.users : requesterUsers ?? projectUsers,
+      // Typed-name births use the bare-name MXID shape, same as the dialog's
+      // "name it myself" path; everything else is pool-picked (Pattern 6).
+      poolPicked: typedNameSlug === null,
+      project: item.project,
+    };
+
+    // Reset per-attempt capture state so the previous attempt's residue doesn't
+    // leak into this attempt's classification.
+    endedEvent = null;
+    lastStepFailReason = undefined;
+
+    try {
+      await Promise.race([
+        deps.birthIdentity(opts, emit, birthDeps),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error("BIRTH_ATTEMPT_TIMEOUT")),
+            BIRTH_ATTEMPT_TIMEOUT_MS,
+          ),
+        ),
+      ]);
+    } catch (err) {
+      // Outer wall-clock timeout: birthIdentity has no per-SSH-command timeout
+      // internally (D-20 forbids modifying identity-birth-orchestrator.ts), so
+      // this is the only place a hung SSH round-trip inside the birth flow gets
+      // bounded. Break out of the retry loop — a timeout may mean the identity
+      // was actually born on the peer, and re-running would produce a duplicate.
+      // The failure marker carries the partial identity name so operators can
+      // check `fleet/identities/<partialName>` before deciding whether to retry.
+      if (err instanceof Error && err.message === "BIRTH_ATTEMPT_TIMEOUT") {
+        // Pool picks compose `<name>-<role>` — or the bare name when roleless.
+        const partialName =
+          typedNameSlug !== null || item.roles.length === 0
+            ? pickedName.toLowerCase()
+            : `${pickedName.toLowerCase()}-${item.roles[0]}`;
+        // May have been born — over-counting is the safe direction.
+        nameCensus.recordBirth(item.hostIdNum, partialName);
+        systemLogger.warn("spawn-request worker: birth attempt exceeded wall-clock timeout", {
+          operation: "spawn_request_birth_attempt_timeout",
+          uuid: item.uuid,
+          partialName,
+          timeoutMs: BIRTH_ATTEMPT_TIMEOUT_MS,
+        });
+        await writeFailureFile(item, deps, {
+          reason: "birth_timeout",
+          message: `Birth exceeded ${BIRTH_ATTEMPT_TIMEOUT_MS / 1000}s wall-clock timeout. Identity '${partialName}' MAY have been born on the peer host — verify (fleet/identities/${partialName} + tmux session) BEFORE retrying to avoid duplicate.`,
+        });
+        return;
+      }
+      // Truly unexpected — orchestrator's own catch should have emitted ended{ok:false}
+      systemLogger.error("spawn-request worker: birthIdentity threw unexpectedly", {
+        operation: "spawn_request_birth_unexpected_throw",
+        uuid: item.uuid,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    if (endedEvent !== null && (endedEvent as { ok: boolean }).ok === true) {
+      break; // success — exit the retry loop, drop success file below
+    }
+    if (lastStepFailReason === COLLISION_REASON && typedNameSlug === null) {
+      // Collision — exclude this name locally, log the retry decision, and
+      // re-pick. Bounded by MAX_POOL_PICK_ATTEMPTS.
+      excluded.add(pickedName.toLowerCase());
+      systemLogger.info("spawn-request worker: pool-name collision — retrying with a fresh pick", {
+        operation: "spawn_request_pool_collision_retry",
+        uuid: item.uuid,
+        attempt: attempt + 1,
+        maxAttempts: MAX_POOL_PICK_ATTEMPTS,
+        excludedCount: excluded.size,
+      });
+      continue;
+    }
+    // Any other failure (or no ended event) — surface as birth_failed on this
+    // attempt; do NOT retry non-collision errors.
+    break;
+  }
+
+  if (poolExhaustedLocally) {
+    await writeFailureFile(item, deps, { reason: "pool_exhausted" });
+    return;
+  }
+
+  // 7. Post-birth response file drop
+  if (endedEvent === null) {
+    // Orchestrator did not emit ended — should never happen, but be defensive.
+    systemLogger.warn("spawn-request worker: no ended event received from birthIdentity", {
+      operation: "spawn_request_no_ended_event",
+      uuid: item.uuid,
+    });
+    await writeFailureFile(item, deps, { reason: "birth_failed" });
+    return;
+  }
+
+  if (endedEvent.ok === true) {
+    // Success response carries `name` only. The mxid field was originally
+    // planned as a coord-side directory-search shortcut, but the orchestrator's
+    // ended event does not surface the server-derived MXID localpart (which for
+    // pool-picked identities is PascalCase-hyphenated like "Willow-Coordinator-2"
+    // and differs from `name`). Rebuilding it here would either be wrong (using
+    // the lowercase pool key) or require a redundant deriveMxidWithOrdinal call
+    // against Synapse. Dropped per code-review fixup post-Phase-99 (H1 + H2 —
+    // see types.ts SuccessResponse doc for rationale). Coord uses `name` for
+    // dispatch; directory-search resolves name → mxid when actually needed.
+    // Report the identity FOLDER name (orchestrator's identityId — e.g.
+    // `oak-box-maintainer`), not the pool base (`oak`): the folder name is
+    // what `/id` and DMs resolve against.
+    const bornName = (endedEvent.identityId ?? lastPickedName ?? "").toLowerCase();
+    if (bornName) nameCensus.recordBirth(item.hostIdNum, bornName);
+    const successPayload: SuccessResponse = {
+      name: bornName,
+      birthed_at: deps.now().toISOString(),
+    };
+
+    systemLogger.info("spawn-request worker: birth success, writing success file", {
+      operation: "spawn_request_birth_success",
+      uuid: item.uuid,
+      name: bornName,
+      requested_by: item.requested_by ?? null,
+    });
+
+    await writeResponseFile(
+      item,
+      deps,
+      "success",
+      JSON.stringify(successPayload, null, 2),
+    );
+  } else {
+    // endedEvent.ok === false
+    const reason = mapEndedEventToReason(endedEvent, lastStepFailReason);
+    await writeFailureFile(item, deps, { reason });
+  }
+}

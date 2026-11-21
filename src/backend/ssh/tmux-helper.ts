@@ -1,0 +1,602 @@
+import type { Client, ClientChannel } from "ssh2";
+import { sshLogger } from "../utils/logger.js";
+import { hangUpChannel } from "./channel-hangup.js";
+import {
+  HostdDeadlineError,
+  HostdUnavailableError,
+  hostdChannelFor,
+  hostdEnabled,
+} from "./hostd-channel.js";
+
+export interface TmuxSessionInfo {
+  name: string;
+  created: number;
+  lastActivity: number;
+  windows: number;
+  attachedClients: number;
+}
+
+export interface TmuxDetectionResult {
+  available: boolean;
+  sessions: TmuxSessionInfo[];
+}
+
+/**
+ * Ceiling on a single exec, from asking sshd for the channel to the command
+ * exiting. Sized above the longest legitimate synchronous exec (the harness
+ * installer's 20-minute attempt deadline, harness-reconciler.ts) so it only
+ * ever fires on a wedge: a channel open sshd never answers, or a command
+ * that never exits. Without it such an exec holds its per-host semaphore
+ * slot forever and stalls whatever awaits it (e.g. the distributor's serial
+ * startup pass). Callers that know their command is short pass a tighter
+ * `timeoutMs`.
+ */
+export const DEFAULT_EXEC_TIMEOUT_MS = 30 * 60 * 1000;
+
+export interface ExecOptions {
+  timeoutMs?: number;
+}
+
+/** Rejection for an exec that hit its ceiling. `phase` says where it stuck:
+ *  "open" = sshd never answered the channel open; "run" = the command never
+ *  exited. */
+export class ExecTimeoutError extends Error {
+  constructor(
+    readonly phase: "open" | "run",
+    readonly timeoutMs: number,
+  ) {
+    super(`SSH exec timed out after ${timeoutMs}ms (${phase === "open" ? "channel never opened" : "command never exited"})`);
+    this.name = "ExecTimeoutError";
+  }
+}
+
+/**
+ * Arms the exec ceiling. Returns `settle`, which every resolve/reject path
+ * calls first: it clears the timer and reports whether the caller still owns
+ * the promise (false once the timer has fired). `adopt` hands over the stream
+ * once the channel opens — if the timer already fired, the late stream is
+ * hung up straight away so sshd frees the session.
+ */
+function armExecTimeout(
+  timeoutMs: number,
+  onTimeout: (phase: "open" | "run") => void,
+): { settle: () => boolean; adopt: (stream: ClientChannel) => boolean } {
+  let settled = false;
+  let stream: ClientChannel | undefined;
+  const timer = setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    const phase = stream ? "run" : "open";
+    // The command may still be writing; see channel-hangup.ts.
+    hangUpChannel(stream);
+    onTimeout(phase);
+  }, timeoutMs);
+  timer.unref?.();
+  return {
+    settle: () => {
+      if (settled) return false;
+      settled = true;
+      clearTimeout(timer);
+      return true;
+    },
+    adopt: (s) => {
+      if (settled) {
+        hangUpChannel(s);
+        return false;
+      }
+      stream = s;
+      return true;
+    },
+  };
+}
+
+/**
+ * Run a command through the connection's skynet-hostd channel (see
+ * hostd-channel.ts) with execCommand's exact result contract: trimmed stdout
+ * on success, an Error carrying stderr on a non-zero exit with no stdout,
+ * ExecTimeoutError("run") past the time limit. A request the helper never
+ * received (it couldn't start, or died first) is retried once on a fresh
+ * channel; there is no plain-exec fallback.
+ */
+function viaHostd(
+  conn: Client,
+  command: string,
+  opts: ExecOptions,
+  stdinBody: Buffer | undefined,
+): Promise<string> {
+  const cmdPreview = command.slice(0, 80);
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_EXEC_TIMEOUT_MS;
+  const tStart = Date.now();
+  const send = () => {
+    const hostd = hostdChannelFor(conn);
+    if (!hostd) return Promise.reject(new HostdUnavailableError("connection closed"));
+    return hostd.run(command, timeoutMs, stdinBody);
+  };
+  const runOnce = () => {
+    try {
+      return send();
+    } catch (e) {
+      return Promise.reject(e);
+    }
+  };
+  const p = runOnce()
+    .catch((err: unknown) => {
+      if (err instanceof HostdUnavailableError) {
+        sshLogger.warn(
+          `[tmux-helper] exec-retry via=hostd command="${cmdPreview}" reason="${err.reason}"`,
+          { operation: "tmux_exec_hostd_retry", via: "hostd", reason: err.reason },
+        );
+        return runOnce();
+      }
+      throw err;
+    })
+    .then(
+    (r) => {
+      const stdout = r.stdout.toString("utf-8");
+      const stderr = r.stderr.toString("utf-8");
+      const totalMs = Date.now() - tStart;
+      if (r.timeout) {
+        sshLogger.warn(
+          `[tmux-helper] exec-timeout via=hostd command="${cmdPreview}" timeoutMs=${timeoutMs} totalMs=${totalMs}`,
+          { operation: "tmux_exec_timeout", via: "hostd", phase: "run", timeoutMs, totalMs },
+        );
+        throw new ExecTimeoutError("run", timeoutMs);
+      }
+      if (r.truncated) {
+        sshLogger.warn(
+          `[tmux-helper] exec-truncated via=hostd command="${cmdPreview}" bytes=${stdout.length}`,
+          { operation: "tmux_exec_truncated", via: "hostd" },
+        );
+      }
+      if (r.code !== 0 && stdout === "") {
+        sshLogger.warn(
+          `[tmux-helper] exec-nonzero via=hostd command="${cmdPreview}" code=${r.code} stderrLen=${stderr.length} totalMs=${totalMs}`,
+          { operation: "tmux_exec_nonzero", via: "hostd", totalMs, stderrLen: stderr.length },
+        );
+        throw new Error(stderr.trim() || `Command exited with code ${r.code}`);
+      }
+      if (totalMs >= 500) {
+        sshLogger.info(
+          `[tmux-helper] exec-slow via=hostd command="${cmdPreview}" runMs=${r.ms} totalMs=${totalMs} bytes=${stdout.length}`,
+          { operation: "tmux_exec_slow", via: "hostd", totalMs, bytes: stdout.length },
+        );
+      }
+      return stdout.trim();
+    },
+    (err: unknown) => {
+      if (err instanceof HostdUnavailableError) {
+        sshLogger.error(
+          `[tmux-helper] exec-failed via=hostd command="${cmdPreview}" reason="${err.reason}"`,
+          err,
+          { operation: "tmux_exec_hostd_unavailable", via: "hostd", reason: err.reason },
+        );
+      }
+      if (err instanceof HostdDeadlineError) {
+        throw new ExecTimeoutError("run", timeoutMs);
+      }
+      throw err;
+    },
+  );
+  // See execCommand's unhandled-rejection guard docblock — same rationale.
+  p.catch(() => {});
+  return p;
+}
+
+/**
+ * Run a command on the remote host via a separate exec channel.
+ * Returns stdout as a string. Does not pollute the interactive shell.
+ *
+ * Unhandled-rejection guard: the returned promise gets a synchronous no-op
+ * `.catch()` so it is always "handled" for Node's tracker. Callers that
+ * await still receive the rejection through their own await handler; this
+ * only prevents unhandledRejection from firing when a caller uses this
+ * fire-and-forget (no await, no `.catch`, e.g. `void execCommand(...)`),
+ * or ignores the returned promise on a synchronous cleanup path.
+ * Concrete crash it prevents: a mid-flight SSH channel teardown (channel
+ * closes with `code=undefined` — normal during peer disconnect) rejects
+ * with "Command exited with code undefined"; if that promise is orphaned,
+ * starter.ts's unhandledRejection handler calls process.exit(1) and Docker
+ * restarts the container. See tmux-helper.test.ts for the fire-and-forget
+ * regression coverage.
+ */
+export function execCommand(
+  conn: Client,
+  command: string,
+  opts: ExecOptions = {},
+): Promise<string> {
+  if (hostdEnabled(conn)) return viaHostd(conn, command, opts, undefined);
+  return plainExecCommand(conn, command, opts);
+}
+
+function plainExecCommand(
+  conn: Client,
+  command: string,
+  opts: ExecOptions,
+): Promise<string> {
+  const cmdPreview = command.slice(0, 80);
+  // 2026-09-25 (tina): lifecycle timing to attribute where slow execs spend
+  // time. Under a rapid multi-pane reload, workstation execs hit the 5s
+  // per-attempt retry ceiling (see session-file-discovery.ts) but direct
+  // OpenSSH client execs to the same host complete in <200ms. Need to
+  // pinpoint whether the delay is:
+  //   (a) conn.exec callback slow → channel-open latency (SSH multiplex layer)
+  //   (b) exec cb → first stdout data slow → workstation-side fork/exec slow
+  //   (c) first data → stream close slow → command run itself slow
+  //   (d) never got to close → channel torn down mid-flight (code=undefined)
+  // One summary log at close (or on early error) with all four phases.
+  const tExecStart = Date.now();
+  // Try to read the peer address so we can filter by host. `_sock` is a private
+  // ssh2 internal (a Node net.Socket); grabbing it defensively — if the shape
+  // changes in a future ssh2 rev, silent-null keeps the diag off the crash
+  // path.
+  let peer = "";
+  try {
+    const sock = (conn as unknown as { _sock?: { remoteAddress?: string; remotePort?: number } })._sock;
+    if (sock?.remoteAddress) peer = `${sock.remoteAddress}:${sock.remotePort ?? "?"}`;
+  } catch {
+    /* ignore */
+  }
+  sshLogger.info(`[tmux-helper] exec command="${cmdPreview}"`, { operation: "tmux_exec" });
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_EXEC_TIMEOUT_MS;
+  const p = new Promise<string>((resolve, reject) => {
+    let tExecCb = 0;
+    let tFirstData = 0;
+    const guard = armExecTimeout(timeoutMs, (phase) => {
+      const totalMs = Date.now() - tExecStart;
+      sshLogger.warn(
+        `[tmux-helper] exec-timeout command="${cmdPreview}" peer=${peer} phase=${phase} timeoutMs=${timeoutMs} totalMs=${totalMs}`,
+        { operation: "tmux_exec_timeout", peer, phase, timeoutMs, totalMs },
+      );
+      reject(new ExecTimeoutError(phase, timeoutMs));
+    });
+    conn.exec(command, (err, stream) => {
+      tExecCb = Date.now();
+      if (err) {
+        if (!guard.settle()) return;
+        sshLogger.error(
+          `[tmux-helper] exec-failed command="${cmdPreview}" peer=${peer} openMs=${tExecCb - tExecStart}`,
+          err,
+          { operation: "tmux_exec_failed", peer, openMs: tExecCb - tExecStart },
+        );
+        reject(err);
+        return;
+      }
+      if (!guard.adopt(stream)) return;
+      let stdout = "";
+      let stderr = "";
+      stream.on("data", (data: Buffer) => {
+        if (tFirstData === 0) tFirstData = Date.now();
+        stdout += data.toString("utf-8");
+      });
+      stream.stderr.on("data", (data: Buffer) => {
+        stderr += data.toString("utf-8");
+      });
+      stream.on("error", (err: Error) => {
+        if (!guard.settle()) return;
+        const tEnd = Date.now();
+        sshLogger.error(
+          `[tmux-helper] exec-failed command="${cmdPreview}" peer=${peer} openMs=${tExecCb - tExecStart} totalMs=${tEnd - tExecStart}`,
+          err,
+          { operation: "tmux_exec_failed", peer, openMs: tExecCb - tExecStart, totalMs: tEnd - tExecStart },
+        );
+        reject(err);
+      });
+      stream.on("close", (code: number) => {
+        if (!guard.settle()) return;
+        const tClose = Date.now();
+        const openMs = tExecCb - tExecStart;
+        const ttfbMs = tFirstData > 0 ? tFirstData - tExecCb : -1;
+        const dataMs = tFirstData > 0 ? tClose - tFirstData : -1;
+        const totalMs = tClose - tExecStart;
+        if (code !== 0 && stdout === "") {
+          sshLogger.warn(
+            `[tmux-helper] exec-nonzero command="${cmdPreview}" peer=${peer} code=${code} stderrLen=${stderr.length} openMs=${openMs} ttfbMs=${ttfbMs} dataMs=${dataMs} totalMs=${totalMs}`,
+            { operation: "tmux_exec_nonzero", peer, openMs, ttfbMs, dataMs, totalMs, stderrLen: stderr.length },
+          );
+          reject(
+            new Error(stderr.trim() || `Command exited with code ${code}`),
+          );
+        } else {
+          // Only emit the timing summary for non-trivial execs — under normal
+          // load these fire hundreds of times per minute. Threshold matches
+          // the observed pathology (5s+ ceilings) with headroom for tail
+          // signals (>500ms is already interesting on a healthy path).
+          if (totalMs >= 500) {
+            sshLogger.info(
+              `[tmux-helper] exec-slow command="${cmdPreview}" peer=${peer} openMs=${openMs} ttfbMs=${ttfbMs} dataMs=${dataMs} totalMs=${totalMs} bytes=${stdout.length}`,
+              { operation: "tmux_exec_slow", peer, openMs, ttfbMs, dataMs, totalMs, bytes: stdout.length },
+            );
+          }
+          resolve(stdout.trim());
+        }
+      });
+    });
+  });
+  p.catch(() => {});
+  return p;
+}
+
+/**
+ * Sibling of execCommand for commands that consume a large body on stdin.
+ *
+ * The exec command string sits under Linux's per-argv-element cap
+ * (MAX_ARG_STRLEN = PAGE_SIZE * 32 = 131072 on x86_64); anything larger
+ * than ~128 KB in a single command triggers execve E2BIG at the remote
+ * shell before it even parses. Writing the body via the channel's stdin
+ * stream sidesteps that entirely: ssh2 chunks CHANNEL_DATA to 32 KB
+ * packets, and the receiving process (e.g. `base64 -d > path`) reads
+ * from its stdin — no shell parsing of the payload.
+ *
+ * Behavior mirrors execCommand: returns trimmed stdout on success,
+ * rejects on non-zero exit with empty stdout, wraps stream errors.
+ */
+export function execCommandWithStdin(
+  conn: Client,
+  command: string,
+  stdinBody: Buffer,
+  opts: ExecOptions = {},
+): Promise<string> {
+  if (hostdEnabled(conn)) return viaHostd(conn, command, opts, stdinBody);
+  return plainExecCommandWithStdin(conn, command, stdinBody, opts);
+}
+
+function plainExecCommandWithStdin(
+  conn: Client,
+  command: string,
+  stdinBody: Buffer,
+  opts: ExecOptions,
+): Promise<string> {
+  sshLogger.info(`[tmux-helper] exec-stdin command="${command.slice(0, 80)}" bodyLen=${stdinBody.length}`, { operation: "tmux_exec_stdin" });
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_EXEC_TIMEOUT_MS;
+  const tExecStart = Date.now();
+  const p = new Promise<string>((resolve, reject) => {
+    const guard = armExecTimeout(timeoutMs, (phase) => {
+      const totalMs = Date.now() - tExecStart;
+      sshLogger.warn(
+        `[tmux-helper] exec-stdin-timeout command="${command.slice(0, 80)}" phase=${phase} timeoutMs=${timeoutMs} totalMs=${totalMs}`,
+        { operation: "tmux_exec_stdin_timeout", phase, timeoutMs, totalMs },
+      );
+      reject(new ExecTimeoutError(phase, timeoutMs));
+    });
+    conn.exec(command, (err, stream) => {
+      if (err) {
+        if (!guard.settle()) return;
+        sshLogger.error(`[tmux-helper] exec-stdin-failed command="${command.slice(0, 80)}"`, err, { operation: "tmux_exec_stdin_failed" });
+        reject(err);
+        return;
+      }
+      if (!guard.adopt(stream)) return;
+      let stdout = "";
+      let stderr = "";
+      stream.on("data", (data: Buffer) => {
+        stdout += data.toString("utf-8");
+      });
+      stream.stderr.on("data", (data: Buffer) => {
+        stderr += data.toString("utf-8");
+      });
+      stream.on("error", (err: Error) => {
+        if (!guard.settle()) return;
+        sshLogger.error(`[tmux-helper] exec-stdin-failed command="${command.slice(0, 80)}"`, err, { operation: "tmux_exec_stdin_failed" });
+        reject(err);
+      });
+      stream.on("close", (code: number) => {
+        if (!guard.settle()) return;
+        if (code !== 0 && stdout === "") {
+          sshLogger.warn(`[tmux-helper] exec-stdin-nonzero command="${command.slice(0, 80)}" code=${code} stderrLen=${stderr.length}`, { operation: "tmux_exec_stdin_nonzero" });
+          reject(
+            new Error(stderr.trim() || `Command exited with code ${code}`),
+          );
+        } else {
+          resolve(stdout.trim());
+        }
+      });
+      stream.end(stdinBody);
+    });
+  });
+  // See execCommand's unhandled-rejection guard docblock — same rationale.
+  p.catch(() => {});
+  return p;
+}
+
+/**
+ * Detect whether tmux is installed and list all existing sessions with details.
+ */
+export async function detectTmux(conn: Client): Promise<TmuxDetectionResult> {
+  try {
+    await execCommand(conn, "command -v tmux");
+  } catch {
+    return { available: false, sessions: [] };
+  }
+
+  let sessions: TmuxSessionInfo[] = [];
+  try {
+    const output = await execCommand(
+      conn,
+      `tmux list-sessions -F "#{session_name}|#{session_created}|#{session_activity}|#{session_windows}|#{session_attached}" 2>/dev/null`,
+    );
+    if (output) {
+      sessions = output
+        .split("\n")
+        .filter((line) => line.length > 0)
+        .map((line) => {
+          const [name, created, activity, windows, attached] = line.split("|");
+          return {
+            name,
+            created: parseInt(created, 10) || 0,
+            lastActivity: parseInt(activity, 10) || 0,
+            windows: parseInt(windows, 10) || 0,
+            attachedClients: parseInt(attached, 10) || 0,
+          };
+        });
+    }
+  } catch {
+    // tmux server not running yet -- no sessions exist
+  }
+
+  return { available: true, sessions };
+}
+
+// tmux options applied on every attach/create:
+// - mouse on: enables mouse wheel / touch scrollback through tmux history
+// - history-limit: deep scrollback buffer on the remote host
+// - set-clipboard on: use OSC 52 to sync tmux selections to the client clipboard
+// - mode-keys vi: use vi-style keys in copy mode
+// - MouseDragEnd: stop the selection but keep it highlighted so the user can
+//   adjust and press Enter to copy (or drag again)
+// - Enter: copy the (possibly adjusted) selection and exit copy mode
+// - pane-mode-changed hook: on copy-mode entry, show a brief hint so users
+//   know to press Enter to copy the selection
+// - copy-mode WheelUp/Down: 2 lines per tick (tmux default is 5) for more
+//   control while reading through scrollback. Deliberately NOT touching the
+//   root WheelUp binding — tmux's default already correctly enters copy mode
+//   at the shell prompt and passes wheel events through inside fullscreen
+//   apps (less/vim/htop) via alternate_on detection.
+// Using -q on set/set-hook to suppress errors on older tmux versions that don't support
+// a particular option (e.g. set-clipboard on tmux < 2.5). Note: set-hook doesn't support -q.
+const TMUX_OPTS =
+  `set -gq mouse on` +
+  ` \\; set -gq history-limit 50000` +
+  ` \\; set -gq set-clipboard on` +
+  ` \\; set -gq aggressive-resize on` +
+  ` \\; set -gq mode-keys vi` +
+  ` \\; bind-key -T copy-mode-vi MouseDragEnd1Pane send-keys -X stop-selection` +
+  ` \\; bind-key -T copy-mode-vi Enter send-keys -X copy-selection-and-cancel` +
+  ` \\; bind-key -T copy-mode-vi WheelUpPane send-keys -X -N 2 scroll-up` +
+  ` \\; bind-key -T copy-mode-vi WheelDownPane send-keys -X -N 2 scroll-down` +
+  ` \\; bind-key -T copy-mode WheelUpPane send-keys -X -N 2 scroll-up` +
+  ` \\; bind-key -T copy-mode WheelDownPane send-keys -X -N 2 scroll-down` +
+  ` \\; set-hook -g pane-mode-changed` +
+  ` 'if -F "#{pane_in_mode}"` +
+  ` "display-message -d 2500 \\"Adjust selection and press Enter to copy\\""'`;
+
+/**
+ * Wait for a tmux session to appear by polling via exec channel.
+ * Returns the session name once found, or null on timeout.
+ */
+export async function waitForTmuxSession(
+  conn: Client,
+  sessionName: string,
+  timeoutMs = 5000,
+  intervalMs = 100,
+): Promise<string | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      await execCommand(
+        conn,
+        `tmux has-session -t ${shellEscape(sessionName)} 2>/dev/null`,
+      );
+      return sessionName;
+    } catch {
+      // session not ready yet
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return null;
+}
+
+/**
+ * Write tmux attach or new-session command to the interactive shell stream.
+ * Uses && exit so the shell only closes if tmux started successfully.
+ */
+export function attachOrCreateTmuxSession(
+  stream: ClientChannel,
+  existingSessionName?: string,
+  newSessionName?: string,
+): void {
+  let command: string;
+  if (existingSessionName) {
+    command = `tmux ${TMUX_OPTS} \\; attach-session -t ${shellEscape(existingSessionName)} && exit\r`;
+  } else {
+    // -A requires -s; only add when a name is supplied so it attaches
+    // to an existing session of that name instead of erroring out.
+    const nameFlag = newSessionName
+      ? ` -A -s ${shellEscape(newSessionName)}`
+      : "";
+    command = `tmux ${TMUX_OPTS} \\; new-session${nameFlag} && exit\r`;
+  }
+
+  sshLogger.info("Writing tmux command to shell", {
+    operation: "tmux_attach_or_create",
+    sessionName: existingSessionName || "(auto)",
+    isReattach: !!existingSessionName,
+  });
+
+  stream.write(command);
+}
+
+/**
+ * Query the foreground command running in the first pane of a tmux session.
+ * Used to gate idle-pulse to Claude Code sessions only.
+ * Returns null on any failure (session gone, tmux unavailable, etc.).
+ */
+export async function queryPaneCurrentCommand(
+  conn: Client,
+  sessionName: string,
+): Promise<string | null> {
+  try {
+    const output = await execCommand(
+      conn,
+      `tmux display-message -p -t ${shellEscape(sessionName)} '#{pane_current_command}' 2>/dev/null`,
+    );
+    return output || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Query the PID of the foreground process running in the first pane of a
+ * tmux session. Used by claude-session discovery to walk /proc/<pid>/fd
+ * for open JSONL session files.
+ *
+ * Two-case contract (Fix A, 2026-07-30):
+ *   - Returns null when execCommand succeeds but the output is unparseable
+ *     (empty string, non-integer, or ≤ 0). Callers treat null the same as
+ *     "no tmux session" — a benign, expected signal.
+ *   - THROWS (re-throws execCommand's error) on SSH-side failures so the
+ *     discovery layer can classify these as exec_error rather than
+ *     misreading a transient SSH failure as no_tmux_session. This is the
+ *     critical distinction: "couldn't ask" (throw) vs "asked and got no"
+ *     (null). The discovery layer wraps this call in try/catch and returns
+ *     { status: "inactive", reason: "exec_error" } on throw, which the
+ *     repoll branch treats as a silent tick (no overlay arm).
+ *
+ * Note: queryNewestTmuxSession's catch is left with its null-return posture —
+ * its callers depend on silent-null and do not need the exec_error distinction.
+ */
+export async function queryPanePid(
+  conn: Client,
+  sessionName: string,
+): Promise<number | null> {
+  // Let execCommand throws propagate to the caller (SSH-side failure).
+  // Only swallow the "unparseable output" case by returning null.
+  const output = await execCommand(
+    conn,
+    `tmux display-message -p -t ${shellEscape(sessionName)} '#{pane_pid}' 2>/dev/null`,
+  );
+  const pid = parseInt(output, 10);
+  if (Number.isNaN(pid) || pid <= 0) return null;
+  return pid;
+}
+
+/**
+ * Query the name of the most recently created tmux session via exec channel.
+ */
+export async function queryNewestTmuxSession(
+  conn: Client,
+): Promise<string | null> {
+  try {
+    const output = await execCommand(
+      conn,
+      `tmux list-sessions -F "#{session_created}:#{session_name}" 2>/dev/null | sort -rn | head -1 | cut -d: -f2-`,
+    );
+    return output || null;
+  } catch {
+    return null;
+  }
+}
+
+function shellEscape(s: string): string {
+  return "'" + s.replace(/'/g, "'\\''") + "'";
+}

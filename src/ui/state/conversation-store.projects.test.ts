@@ -1,0 +1,1088 @@
+/**
+ * Phase 117 Plan 117-07 Task 1: Tests for the projects slice + derived selector
+ * on conversation-store.ts.
+ *
+ * Covers:
+ *   1: ProjectRow shape + useProjects returns array set via setProjects.
+ *   2: setProjects identity-equal skip — same content array does NOT bump the
+ *      snapshotVersion (no listener notify).
+ *   3: setProjects delta triggers exactly one notify per real change.
+ *   4: derived selector — pinned + unassigned floats to pinnedUnassigned zone.
+ *   5: derived selector — a row that is BOTH pinned and in a project lands in
+ *      that project's section as an ordinary member (project outranks pin;
+ *      pinned and in-a-project are mutually exclusive, D-19 float retired),
+ *      sorted alphabetically with the other members — never in
+ *      pinnedUnassigned.
+ *   6: derived selector — project sections sorted alphabetical by displayName
+ *      (D-15).
+ *   7: derived selector — dangling project ref falls to middle (D-07).
+ *   8: derived selector — RDP row never in project section (D-08 defense).
+ *   9: derived selector — empty project still shows up as a section (D-11).
+ *   10: identity conversation project resolution via identityProjectAssignments.
+ *   11: relay-room conversation project resolution via roomProjectAssignments.
+ *   12: empty state — no projects, no assignments — selector still shape-stable.
+ *
+ * The derived selector's output type extends the existing snapshot with three
+ * NEW fields: `pinnedUnassigned`, `projectSections`, `rdp`. The existing
+ * `pinned` / `middle` / `rdpGroup` fields are preserved for backward
+ * compatibility with pre-Phase-117 consumers.
+ */
+
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import { renderHook, act } from "@testing-library/react";
+
+// Same putPinnedIds mock as the base conversation-store.test.ts — the store
+// imports from @/api/user-preferences-api on pin/unpin. Hoisted vi.mock.
+vi.mock("@/api/user-preferences-api", () => ({
+  putPinnedIds: vi.fn().mockResolvedValue([]),
+  setIdentityPinned: vi.fn().mockResolvedValue(undefined),
+}));
+
+import {
+  updateHostTree,
+  updateOpenTabs,
+  updateFleetSessions,
+  updateHostsFlat,
+  updateIdentitiesByKey,
+  selectConversation,
+  pinConversation,
+  useConversations,
+  useProjects,
+  setProjects,
+  mergeProjectsForHost,
+  getProjectsSnapshot,
+  setRoomProjectAssignments,
+  patchRoomProjectAssignment,
+  setIdentityProjectAssignments,
+  readProjectsCache,
+  writeProjectsCache,
+  __resetActiveSetForTest,
+  __resetPinnedIdsForTest,
+  __resetFleetSessionsForTest,
+  __resetLastMessageAtForTest,
+  __resetProjectsForTest,
+  __subscribeForTest,
+  __getSnapshotForTest,
+  fleetRowId,
+  type ProjectRow,
+  type FleetSession,
+} from "./conversation-store.js";
+import type { Tab, Host, HostFolder } from "@/types/ui-types";
+import type { Identity } from "@/api/identities-api";
+
+// ─── Test fixtures ────────────────────────────────────────────────────────────
+
+function makeHost(
+  id: string,
+  name: string,
+  overrides?: Partial<Host>,
+): Host {
+  return { id, name, ...(overrides ?? {}) } as unknown as Host;
+}
+
+function makeTab(
+  id: string,
+  type: Tab["type"],
+  host?: Host,
+  targetTmuxSession: string | null = null,
+  label?: string,
+): Tab {
+  return {
+    id,
+    instanceId: id,
+    type,
+    label: label ?? `${type}:${host?.name ?? id}`,
+    host,
+    openedAt: 0,
+    targetTmuxSession,
+  };
+}
+
+function makeIdentity(
+  identityKey: string,
+  role: string | null,
+  overrides?: Partial<Identity>,
+): Identity {
+  return {
+    identityKey,
+    displayName: identityKey,
+    title: null,
+    colorHue: null,
+    voice: null,
+    role,
+    avatarMime: "",
+    avatarUrl: "",
+    avatarEtag: "",
+    coordinator: false,
+    task: null,
+    project: null,
+    ...(overrides ?? {}),
+  };
+}
+
+function identitiesMap(...identities: Identity[]): Map<string, Identity> {
+  return new Map(identities.map((id) => [id.identityKey.toLowerCase(), id]));
+}
+
+beforeEach(() => {
+  sessionStorage.clear();
+  // Cross-user leak fix: seed skynet_auth so user-scoped caches read/write
+  // through the owner-tagged wrapper. Without this, writes become no-ops
+  // (no logged-in user → no owner tag) and the whole suite reads empty.
+  localStorage.setItem(
+    "skynet_auth",
+    JSON.stringify({ loggedIn: true, username: "test-user" }),
+  );
+  __resetActiveSetForTest();
+  __resetPinnedIdsForTest();
+  updateOpenTabs([]);
+  selectConversation(null);
+  updateHostTree(null);
+  __resetFleetSessionsForTest();
+  updateHostsFlat(new Map());
+  updateIdentitiesByKey(new Map());
+  __resetLastMessageAtForTest();
+  __resetProjectsForTest();
+});
+
+// Owner-tag wrapper matching src/ui/state/user-scoped-cache.ts.
+function wrap<T>(payload: T, owner: string = "test-user"): string {
+  return JSON.stringify({ owner, payload });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test 1: ProjectRow shape + useProjects returns the setter's rows
+// ─────────────────────────────────────────────────────────────────────────────
+describe("conversation-store (117-07): ProjectRow slice + useProjects", () => {
+  it("Test 1: setProjects([row]) then useProjects returns [row] with the exact shape", () => {
+    const row: ProjectRow = {
+      slug: "a",
+      displayName: "Alpha",
+      hostId: "1",
+      hostname: "harbor",
+      archived: false,
+    };
+    act(() => {
+      setProjects([row]);
+    });
+    const { result } = renderHook(() => useProjects());
+    expect(result.current).toHaveLength(1);
+    expect(result.current[0]).toEqual(row);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test 2: identity-equal skip — no notify on same-content re-emit
+// ─────────────────────────────────────────────────────────────────────────────
+describe("conversation-store (117-07): setProjects identity-equal skip", () => {
+  it("Test 2: setProjects twice with same content does NOT notify subscribers on the second call", () => {
+    const rows: ProjectRow[] = [
+      { slug: "a", displayName: "Alpha", hostId: "1", hostname: "harbor", archived: false },
+    ];
+    act(() => {
+      setProjects(rows);
+    });
+
+    const notifySpy = vi.fn();
+    const unsub = __subscribeForTest(notifySpy);
+    try {
+      // Second call with a fresh array of byte-identical rows — must be a
+      // no-op (no notify) per the archived-fleet-rows identity-equal skip.
+      act(() => {
+        setProjects([
+          { slug: "a", displayName: "Alpha", hostId: "1", hostname: "harbor", archived: false },
+        ]);
+      });
+      expect(notifySpy).not.toHaveBeenCalled();
+    } finally {
+      unsub();
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test 3: delta triggers notify
+// ─────────────────────────────────────────────────────────────────────────────
+describe("conversation-store (117-07): setProjects delta triggers notify", () => {
+  it("Test 3: setProjects([]) then setProjects([row]) — subscribers see exactly one notification for the delta", () => {
+    // Baseline: state.projects already starts as [] and __resetProjectsForTest
+    // reset it fresh. Subscribe now, then fire a real delta.
+    const notifySpy = vi.fn();
+    const unsub = __subscribeForTest(notifySpy);
+    try {
+      // Same-content skip (empty [] to []) — should NOT notify.
+      act(() => {
+        setProjects([]);
+      });
+      expect(notifySpy).not.toHaveBeenCalled();
+
+      // Real delta [] → [row] — should notify exactly once.
+      act(() => {
+        setProjects([
+          { slug: "a", displayName: "Alpha", hostId: "1", hostname: "harbor", archived: false },
+        ]);
+      });
+      expect(notifySpy).toHaveBeenCalledTimes(1);
+    } finally {
+      unsub();
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test 4: derived selector — pinned + unassigned floats to pinnedUnassigned
+// ─────────────────────────────────────────────────────────────────────────────
+describe("conversation-store (117-07): pinned + unassigned floats to pinnedUnassigned zone", () => {
+  it("Test 4: pinned unassigned row lands in pinnedUnassigned; unpinned unassigned row lands in middle", () => {
+    const hostA = makeHost("1", "harbor");
+    const tree: HostFolder = { name: "root", children: [hostA] };
+    act(() => {
+      updateHostTree(tree);
+      updateOpenTabs([
+        makeTab("t-pin", "terminal", hostA, "wren"),
+        makeTab("t-flat", "terminal", hostA, "beryl"),
+      ]);
+    });
+    act(() => pinConversation("t-pin"));
+
+    const { result } = renderHook(() => useConversations());
+    const snap = result.current;
+    expect(snap.pinnedUnassigned).toBeDefined();
+    expect(snap.pinnedUnassigned.map((r) => r.id)).toEqual(["t-pin"]);
+    expect(snap.middle.map((r) => r.id)).toEqual(["t-flat"]);
+    expect(snap.projectSections).toEqual([]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test 5: derived selector — pinned + in-project row is a plain project member
+// ─────────────────────────────────────────────────────────────────────────────
+// Pinned and in-a-project are mutually exclusive. A row that is somehow both
+// (a stale `.pinned` left behind) is filed under its project — project
+// outranks the pin — and sorted alphabetically with the other members. The
+// old D-19 "pinned floats to the top of its project section" rule is retired.
+describe("conversation-store: pinned + in-project row is filed under its project (project outranks pin)", () => {
+  it("Test 5: pinned in-project row lands in its project section — NOT in global pinnedUnassigned", () => {
+    const hostA = makeHost("1", "harbor");
+    const tree: HostFolder = { name: "root", children: [hostA] };
+    // Three identities in project "alpha", one pinned.
+    act(() => {
+      updateHostTree(tree);
+      updateHostsFlat(new Map([[1, hostA]]));
+      updateIdentitiesByKey(
+        identitiesMap(
+          makeIdentity("wren", "actor", { displayName: "Wren", project: "alpha" }),
+          makeIdentity("beryl", "actor", { displayName: "Beryl", project: "alpha" }),
+          makeIdentity("cora", "actor", { displayName: "Cora", project: "alpha" }),
+        ),
+      );
+      setIdentityProjectAssignments(
+        new Map<string, string>([
+          ["1::wren", "alpha"],
+          ["1::beryl", "alpha"],
+          ["1::cora", "alpha"],
+        ]),
+      );
+      setProjects([
+        { slug: "alpha", displayName: "Alpha", hostId: "1", hostname: "harbor", archived: false },
+      ]);
+      updateOpenTabs([
+        makeTab("t-cora", "terminal", hostA, "cora"),
+        makeTab("t-beryl", "terminal", hostA, "beryl"),
+        makeTab("t-wren", "terminal", hostA, "wren"),
+      ]);
+    });
+    act(() => pinConversation("t-beryl")); // pin BERYL — alphabetically first anyway; Test 5b pins the alphabetically-LAST member to prove there's no float.
+
+    const { result } = renderHook(() => useConversations());
+    const snap = result.current;
+    expect(snap.projectSections).toHaveLength(1);
+    const section = snap.projectSections[0];
+    expect(section.slug).toBe("alpha");
+    // Alphabetical by displayName: Beryl, Cora, Wren.
+    expect(section.rows.map((r) => r.id)).toEqual(["t-beryl", "t-cora", "t-wren"]);
+    // Beryl is NOT in the global pinnedUnassigned zone.
+    expect(snap.pinnedUnassigned.map((r) => r.id)).toEqual([]);
+  });
+
+  it("Test 5b: a pinned AND assigned row sorts alphabetically with its project's members (no pinned-first float) and is absent from pinnedUnassigned", () => {
+    const hostA = makeHost("1", "harbor");
+    const tree: HostFolder = { name: "root", children: [hostA] };
+    act(() => {
+      updateHostTree(tree);
+      updateHostsFlat(new Map([[1, hostA]]));
+      updateIdentitiesByKey(
+        identitiesMap(
+          makeIdentity("wren", "actor", { displayName: "Wren", project: "alpha" }),
+          makeIdentity("beryl", "actor", { displayName: "Beryl", project: "alpha" }),
+          makeIdentity("cora", "actor", { displayName: "Cora", project: "alpha" }),
+          makeIdentity("dax", "actor", { displayName: "Dax" }),
+        ),
+      );
+      setIdentityProjectAssignments(
+        new Map<string, string>([
+          ["1::wren", "alpha"],
+          ["1::beryl", "alpha"],
+          ["1::cora", "alpha"],
+        ]),
+      );
+      setProjects([
+        { slug: "alpha", displayName: "Alpha", hostId: "1", hostname: "harbor", archived: false },
+      ]);
+      updateOpenTabs([
+        makeTab("t-cora", "terminal", hostA, "cora"),
+        makeTab("t-beryl", "terminal", hostA, "beryl"),
+        makeTab("t-wren", "terminal", hostA, "wren"),
+        makeTab("t-dax", "terminal", hostA, "dax"),
+      ]);
+    });
+    // Pin WREN — alphabetically LAST in the project. Under the retired D-19
+    // rule it would have floated to the top; now it stays in sort order.
+    // Also pin DAX (no project) as a control: it belongs in pinnedUnassigned.
+    act(() => {
+      pinConversation("t-wren");
+      pinConversation("t-dax");
+    });
+
+    const { result } = renderHook(() => useConversations());
+    const snap = result.current;
+    expect(snap.projectSections).toHaveLength(1);
+    const section = snap.projectSections[0];
+    expect(section.slug).toBe("alpha");
+    expect(section.rows.map((r) => r.id)).toEqual(["t-beryl", "t-cora", "t-wren"]);
+    // Wren is filed under its project only — never in pinnedUnassigned.
+    expect(snap.pinnedUnassigned.map((r) => r.id)).toEqual(["t-dax"]);
+    expect(snap.middle.map((r) => r.id)).not.toContain("t-wren");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test 6: derived selector — project sections sorted by displayName (D-15)
+// ─────────────────────────────────────────────────────────────────────────────
+describe("conversation-store (117-07): projectSections sorted alphabetical by displayName (D-15)", () => {
+  it("Test 6: two projects — {slug:'z',displayName:'Alpha'} sorts BEFORE {slug:'a',displayName:'Zebra'}", () => {
+    const hostA = makeHost("1", "harbor");
+    act(() => {
+      updateHostTree({ name: "root", children: [hostA] });
+      updateHostsFlat(new Map([[1, hostA]]));
+      updateIdentitiesByKey(
+        identitiesMap(
+          makeIdentity("wren", "actor", { displayName: "Wren", project: "z" }),
+          makeIdentity("beryl", "actor", { displayName: "Beryl", project: "a" }),
+        ),
+      );
+      setIdentityProjectAssignments(
+        new Map<string, string>([
+          ["1::wren", "z"],
+          ["1::beryl", "a"],
+        ]),
+      );
+      setProjects([
+        { slug: "z", displayName: "Alpha", hostId: "1", hostname: "harbor", archived: false },
+        { slug: "a", displayName: "Zebra", hostId: "1", hostname: "harbor", archived: false },
+      ]);
+      updateOpenTabs([
+        makeTab("t-wren", "terminal", hostA, "wren"),
+        makeTab("t-beryl", "terminal", hostA, "beryl"),
+      ]);
+    });
+
+    const { result } = renderHook(() => useConversations());
+    const snap = result.current;
+    // displayName order: Alpha (slug=z) → Zebra (slug=a) — NOT slug order.
+    expect(snap.projectSections.map((s) => s.slug)).toEqual(["z", "a"]);
+    expect(snap.projectSections.map((s) => s.displayName)).toEqual(["Alpha", "Zebra"]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test 7: derived selector — dangling project ref falls to middle (D-07)
+// ─────────────────────────────────────────────────────────────────────────────
+describe("conversation-store (117-07): graceful degradation on dangling project ref (D-07)", () => {
+  it("Test 7: identity with project='ghost' when useProjects has no such slug → row lands in middle, no crash", () => {
+    const hostA = makeHost("1", "harbor");
+    act(() => {
+      updateHostTree({ name: "root", children: [hostA] });
+      updateHostsFlat(new Map([[1, hostA]]));
+      updateIdentitiesByKey(
+        identitiesMap(
+          makeIdentity("wren", "actor", { displayName: "Wren", project: "ghost" }),
+        ),
+      );
+      setIdentityProjectAssignments(new Map<string, string>([["1::wren", "ghost"]]));
+      setProjects([]); // no "ghost" — dangling
+      updateOpenTabs([makeTab("t-wren", "terminal", hostA, "wren")]);
+    });
+
+    const { result } = renderHook(() => useConversations());
+    const snap = result.current;
+    expect(snap.projectSections).toEqual([]);
+    expect(snap.middle.map((r) => r.id)).toEqual(["t-wren"]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test 8: derived selector — RDP row NEVER in projectSections (D-08)
+// ─────────────────────────────────────────────────────────────────────────────
+describe("conversation-store (117-07): RDP row exclusion from projects (D-08)", () => {
+  it("Test 8: rdpHostRow=true rows never appear in projectSections, even when a project assignment exists", () => {
+    const hostA = makeHost("1", "harbor", { enableRdp: true });
+    act(() => {
+      updateHostTree({ name: "root", children: [hostA] });
+      updateHostsFlat(new Map([[1, hostA]]));
+      setProjects([
+        { slug: "alpha", displayName: "Alpha", hostId: "1", hostname: "harbor", archived: false },
+      ]);
+      // Attempt to inject a poisoning assignment for the RDP row's synthetic id.
+      // rdp-host row id is `rdp-host::${host.id}` — this shouldn't normally
+      // happen but defense-in-depth mirrors backend threat model T-117-07-05.
+    });
+
+    const { result } = renderHook(() => useConversations());
+    const snap = result.current;
+    // RDP row present in `rdp` bucket (mirrors rdpGroup for the new derived
+    // selector output). Never in any projectSection.
+    expect(snap.rdp).not.toBeNull();
+    expect(snap.rdp!.rows.map((r) => r.id)).toEqual(["rdp-host::1"]);
+    for (const section of snap.projectSections) {
+      for (const row of section.rows) {
+        expect(row.rdpHostRow).not.toBe(true);
+        expect(row.id).not.toBe("rdp-host::1");
+      }
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test 9: derived selector — empty project still emits a header-only section (D-11)
+// ─────────────────────────────────────────────────────────────────────────────
+describe("conversation-store (117-07): empty project section (D-11)", () => {
+  it("Test 9: project with zero conversations still emits {slug, displayName, rows: []}", () => {
+    act(() => {
+      setProjects([
+        { slug: "empty", displayName: "Empty", hostId: "1", hostname: "harbor", archived: false },
+      ]);
+    });
+    const { result } = renderHook(() => useConversations());
+    const snap = result.current;
+    expect(snap.projectSections).toHaveLength(1);
+    expect(snap.projectSections[0]).toEqual({
+      slug: "empty",
+      hostId: expect.any(String),
+      displayName: "Empty",
+      rows: [],
+      parentKey: null,
+      depth: 0,
+    });
+  });
+
+  it("Test 9b: same slug on two hosts → two sections, each with only its own host's members", () => {
+    const hostA = makeHost("1", "hostA");
+    const hostB = makeHost("2", "hostB");
+    act(() => {
+      updateHostTree({ name: "root", children: [hostA, hostB] });
+      updateHostsFlat(new Map([[1, hostA], [2, hostB]]));
+      updateFleetSessions([
+        { hostId: 1, hostName: "hostA", sessionName: "wren", created: 1, role: null },
+        { hostId: 2, hostName: "hostB", sessionName: "finch", created: 1, role: null },
+      ]);
+      setProjects([
+        { slug: "ops", displayName: "Ops", hostId: "1", hostname: "hostA", archived: false },
+        { slug: "ops", displayName: "Ops", hostId: "2", hostname: "hostB", archived: false },
+      ]);
+      setIdentityProjectAssignments(new Map([["1::wren", "ops"], ["2::finch", "ops"]]));
+    });
+    const snap = __getSnapshotForTest();
+    const ops = snap.projectSections.filter((s) => s.slug === "ops");
+    expect(ops).toHaveLength(2);
+    const byHost = new Map(ops.map((s) => [s.hostId, s.rows.map((r) => r.targetTmuxSession)]));
+    expect(byHost.get("1")).toEqual(["wren"]);
+    expect(byHost.get("2")).toEqual(["finch"]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test 10: identity conversation project resolution via identityProjectAssignments
+// ─────────────────────────────────────────────────────────────────────────────
+describe("conversation-store (117-07): identity conversation project resolution", () => {
+  it("Test 10: identity 'wren' with identityProjectAssignments {1::wren → 'alpha'} lands in the 'alpha' section", () => {
+    const hostA = makeHost("1", "harbor");
+    act(() => {
+      updateHostTree({ name: "root", children: [hostA] });
+      updateHostsFlat(new Map([[1, hostA]]));
+      updateIdentitiesByKey(
+        identitiesMap(
+          makeIdentity("wren", "actor", { displayName: "Wren", project: "alpha" }),
+        ),
+      );
+      setIdentityProjectAssignments(
+        new Map<string, string>([["1::wren", "alpha"]]),
+      );
+      setProjects([
+        { slug: "alpha", displayName: "Alpha", hostId: "1", hostname: "harbor", archived: false },
+      ]);
+      updateOpenTabs([makeTab("t-wren", "terminal", hostA, "wren")]);
+    });
+
+    const { result } = renderHook(() => useConversations());
+    const snap = result.current;
+    expect(snap.projectSections).toHaveLength(1);
+    expect(snap.projectSections[0].slug).toBe("alpha");
+    expect(snap.projectSections[0].rows.map((r) => r.id)).toEqual(["t-wren"]);
+    expect(snap.middle).toEqual([]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test 11: relay-room conversation project resolution via roomProjectAssignments
+// ─────────────────────────────────────────────────────────────────────────────
+describe("conversation-store (117-07): relay-room conversation project resolution", () => {
+  it("Test 11: relay-room row with matrixRoomId set → hydrated via roomProjectAssignments Map<roomId, slug>", () => {
+    const roomId = "!abc:harbor";
+    // Relay-room fleet session — matches computeSnapshot's relay-room branch.
+    const relaySession: FleetSession = {
+      hostId: 0,
+      hostName: "",
+      sessionName: "",
+      created: 0,
+      role: null,
+      kind: "relay-room",
+      id: "relay-1",
+      roomId,
+      roomTitle: "Chat with Chorus",
+    };
+    act(() => {
+      updateFleetSessions([relaySession]);
+      setRoomProjectAssignments(new Map<string, string>([[roomId, "alpha"]]));
+      setProjects([
+        { slug: "alpha", displayName: "Alpha", hostId: "1", hostname: "harbor", archived: false },
+      ]);
+    });
+
+    const { result } = renderHook(() => useConversations());
+    const snap = result.current;
+    expect(snap.projectSections).toHaveLength(1);
+    const section = snap.projectSections[0];
+    expect(section.slug).toBe("alpha");
+    // The relay-room row's id is session.id ("relay-1").
+    expect(section.rows.map((r) => r.id)).toEqual(["relay-1"]);
+    expect(snap.middle).toEqual([]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test 12: empty state — no projects, no assignments — selector shape-stable
+// ─────────────────────────────────────────────────────────────────────────────
+describe("conversation-store (117-07): empty state", () => {
+  it("Test 12: no projects, no assignments — selector returns projectSections=[]", () => {
+    const hostA = makeHost("1", "harbor");
+    act(() => {
+      updateHostTree({ name: "root", children: [hostA] });
+      updateOpenTabs([
+        makeTab("t1", "terminal", hostA, "wren"),
+        makeTab("t2", "terminal", hostA, "beryl"),
+      ]);
+    });
+    act(() => pinConversation("t1"));
+
+    const { result } = renderHook(() => useConversations());
+    const snap = result.current;
+    expect(snap.projectSections).toEqual([]);
+    // Pinned t1 (no project) → pinnedUnassigned. Non-pinned t2 → middle.
+    expect(snap.pinnedUnassigned.map((r) => r.id)).toEqual(["t1"]);
+    expect(snap.middle.map((r) => r.id)).toEqual(["t2"]);
+    // Existing consumers still see the old fields unchanged.
+    expect(snap.pinned.map((r) => r.id)).toEqual(["t1"]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cache tests: cold-boot localStorage seed + write-on-setter contracts
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Cross-user leak fix: bumped v1 → v2 for owner-tag wrapper.
+const PROJECTS_CACHE_KEY = "skynet:projects-cache:v2";
+
+describe("conversation-store (projects cache): cold-boot seed + write-on-setter", () => {
+  it("setProjects writes canonical projects payload to localStorage", () => {
+    const row: ProjectRow = {
+      slug: "alpha",
+      displayName: "Alpha",
+      hostId: "1",
+      hostname: "harbor",
+      archived: false,
+    };
+    act(() => {
+      setProjects([row]);
+    });
+    const cached = readProjectsCache();
+    expect(cached.projects).toEqual([{ ...row, parent: null }]);
+    expect(cached.identityProjectAssignments.size).toBe(0);
+    expect(cached.roomProjectAssignments.size).toBe(0);
+  });
+
+  it("setIdentityProjectAssignments writes the map into the composite cache", () => {
+    const row: ProjectRow = {
+      slug: "alpha",
+      displayName: "Alpha",
+      hostId: "1",
+      hostname: "harbor",
+      archived: false,
+    };
+    act(() => {
+      setProjects([row]);
+    });
+    act(() => {
+      setIdentityProjectAssignments(new Map([["1::morpheus", "alpha"]]));
+    });
+    const cached = readProjectsCache();
+    expect(cached.projects).toEqual([{ ...row, parent: null }]);
+    expect(cached.identityProjectAssignments.get("1::morpheus")).toBe("alpha");
+  });
+
+  it("setRoomProjectAssignments writes the map into the composite cache", () => {
+    act(() => {
+      setRoomProjectAssignments(new Map([["!room:server", "alpha"]]));
+    });
+    const cached = readProjectsCache();
+    expect(cached.roomProjectAssignments.get("!room:server")).toBe("alpha");
+  });
+
+  it("patchRoomProjectAssignment applies optimistically; rollback restores the previous slug", () => {
+    act(() => setRoomProjectAssignments(new Map([["!r:hs", "alpha"]])));
+    let rollback: () => void = () => {};
+    act(() => {
+      rollback = patchRoomProjectAssignment("!r:hs", "beta");
+    });
+    expect(readProjectsCache().roomProjectAssignments.get("!r:hs")).toBe("beta");
+    act(() => rollback());
+    expect(readProjectsCache().roomProjectAssignments.get("!r:hs")).toBe("alpha");
+  });
+
+  it("patchRoomProjectAssignment(null) removes; a superseded rollback is a no-op", () => {
+    act(() => setRoomProjectAssignments(new Map([["!r:hs", "alpha"]])));
+    let first: () => void = () => {};
+    act(() => {
+      first = patchRoomProjectAssignment("!r:hs", null);
+    });
+    expect(readProjectsCache().roomProjectAssignments.has("!r:hs")).toBe(false);
+    act(() => {
+      patchRoomProjectAssignment("!r:hs", "gamma"); // newer move
+    });
+    act(() => first()); // first write's failure arrives late
+    expect(readProjectsCache().roomProjectAssignments.get("!r:hs")).toBe("gamma");
+  });
+
+  it("identity-equal skip in setProjects does not overwrite cache", () => {
+    const row: ProjectRow = {
+      slug: "alpha",
+      displayName: "Alpha",
+      hostId: "1",
+      hostname: "harbor",
+      archived: false,
+    };
+    act(() => {
+      setProjects([row]);
+    });
+    // Corrupt the cache directly, then re-emit the same rows — the setter
+    // should skip (identity-equal) and NOT re-write, so the corrupt payload
+    // stays as evidence that write-on-noop is off.
+    localStorage.setItem(PROJECTS_CACHE_KEY, "corrupted-sentinel");
+    act(() => {
+      setProjects([row]);
+    });
+    expect(localStorage.getItem(PROJECTS_CACHE_KEY)).toBe("corrupted-sentinel");
+  });
+
+  it("readProjectsCache returns empty triple on missing / malformed cache", () => {
+    localStorage.removeItem(PROJECTS_CACHE_KEY);
+    let cached = readProjectsCache();
+    expect(cached.projects).toEqual([]);
+    expect(cached.identityProjectAssignments.size).toBe(0);
+    expect(cached.roomProjectAssignments.size).toBe(0);
+
+    localStorage.setItem(PROJECTS_CACHE_KEY, "{not valid json");
+    cached = readProjectsCache();
+    expect(cached.projects).toEqual([]);
+  });
+
+  it("readProjectsCache: owner-mismatch returns empty triple + clears the key", () => {
+    localStorage.setItem(
+      PROJECTS_CACHE_KEY,
+      wrap(
+        {
+          projects: [
+            {
+              slug: "a",
+              displayName: "Alpha",
+              hostId: "1",
+              hostname: "harbor",
+              archived: false,
+            },
+          ],
+          identityProjectAssignments: [["1::morpheus", "a"]],
+          roomProjectAssignments: [["!r:s", "a"]],
+        },
+        "someone-else",
+      ),
+    );
+    const cached = readProjectsCache();
+    expect(cached.projects).toEqual([]);
+    expect(cached.identityProjectAssignments.size).toBe(0);
+    expect(cached.roomProjectAssignments.size).toBe(0);
+    expect(localStorage.getItem(PROJECTS_CACHE_KEY)).toBeNull();
+  });
+
+  it("readProjectsCache: legacy un-tagged payload (pre-v2) returns empty + clears the key", () => {
+    localStorage.setItem(
+      PROJECTS_CACHE_KEY,
+      JSON.stringify({
+        projects: [
+          {
+            slug: "a",
+            displayName: "Alpha",
+            hostId: "1",
+            hostname: "harbor",
+            archived: false,
+          },
+        ],
+        identityProjectAssignments: [],
+        roomProjectAssignments: [],
+      }),
+    );
+    const cached = readProjectsCache();
+    expect(cached.projects).toEqual([]);
+    expect(localStorage.getItem(PROJECTS_CACHE_KEY)).toBeNull();
+  });
+
+  it("readProjectsCache drops wrong-shape entries per axis", () => {
+    localStorage.setItem(
+      PROJECTS_CACHE_KEY,
+      wrap({
+        projects: [
+          { slug: "a" }, // missing required fields — dropped
+          {
+            slug: "b",
+            displayName: "Bravo",
+            hostId: "1",
+            hostname: "harbor",
+            archived: false,
+          },
+        ],
+        identityProjectAssignments: [["k", "v"], ["bad"]], // bad entry dropped by isStringPairArray → whole axis dropped
+        roomProjectAssignments: [["room", "slug"]],
+      }),
+    );
+    const cached = readProjectsCache();
+    expect(cached.projects).toHaveLength(1);
+    expect(cached.projects[0].slug).toBe("b");
+    // isStringPairArray is all-or-nothing on the array — one malformed entry
+    // means the whole axis returns empty.
+    expect(cached.identityProjectAssignments.size).toBe(0);
+    expect(cached.roomProjectAssignments.get("room")).toBe("slug");
+  });
+
+  it("writeProjectsCache round-trips through readProjectsCache", () => {
+    writeProjectsCache({
+      projects: [
+        {
+          slug: "a",
+          displayName: "Alpha",
+          hostId: "1",
+          hostname: "harbor",
+          archived: false,
+        },
+      ],
+      identityProjectAssignments: new Map([["1::morpheus", "a"]]),
+      roomProjectAssignments: new Map([["!r:s", "a"]]),
+    });
+    const cached = readProjectsCache();
+    expect(cached.projects[0].slug).toBe("a");
+    expect(cached.identityProjectAssignments.get("1::morpheus")).toBe("a");
+    expect(cached.roomProjectAssignments.get("!r:s")).toBe("a");
+  });
+
+  it("nested projects: the cache keeps each project's parent (no flat flash on reload)", () => {
+    writeProjectsCache({
+      projects: [
+        { slug: "top", displayName: "Top", hostId: "1", hostname: "harbor", archived: false, parent: null },
+        { slug: "kid", displayName: "Kid", hostId: "1", hostname: "harbor", archived: false, parent: "top" },
+      ],
+      identityProjectAssignments: new Map(),
+      roomProjectAssignments: new Map(),
+    });
+    const cached = readProjectsCache();
+    expect(cached.projects.map((p) => [p.slug, p.parent])).toEqual([
+      ["top", null],
+      ["kid", "top"],
+    ]);
+  });
+
+  it("__resetProjectsForTest clears the localStorage cache", () => {
+    act(() => {
+      setProjects([
+        {
+          slug: "a",
+          displayName: "Alpha",
+          hostId: "1",
+          hostname: "harbor",
+          archived: false,
+        },
+      ]);
+    });
+    expect(readProjectsCache().projects).toHaveLength(1);
+
+    act(() => {
+      __resetProjectsForTest();
+    });
+    expect(readProjectsCache().projects).toEqual([]);
+    expect(localStorage.getItem(PROJECTS_CACHE_KEY)).toBeNull();
+  });
+});
+
+// ─── mergeProjectsForHost — per-host wire-event merge ─────────────────────────
+// Bootstrap uses setProjects with the flat multi-host aggregate; the wire
+// event `project-list-changed` is scoped to ONE hostId and must NOT wipe
+// projects on other hosts. mergeProjectsForHost drops entries for that
+// hostId and splices in the incoming rows.
+
+describe("conversation-store: mergeProjectsForHost", () => {
+  beforeEach(() => {
+    __resetProjectsForTest();
+  });
+
+  const hostA1: ProjectRow = {
+    slug: "alpha",
+    displayName: "Alpha",
+    hostId: "1",
+    hostname: "harbor",
+    archived: false,
+  };
+  const hostA2: ProjectRow = {
+    slug: "alpha2",
+    displayName: "Alpha 2",
+    hostId: "1",
+    hostname: "harbor",
+    archived: false,
+  };
+  const hostB1: ProjectRow = {
+    slug: "beta",
+    displayName: "Beta",
+    hostId: "2",
+    hostname: "workstation",
+    archived: false,
+  };
+  const hostB2: ProjectRow = {
+    slug: "beta2",
+    displayName: "Beta 2",
+    hostId: "2",
+    hostname: "workstation",
+    archived: false,
+  };
+
+  it("replaces entries for the scoped hostId while leaving other hosts untouched (regression: adjacent-project vanish bug)", () => {
+    act(() => {
+      setProjects([hostA1, hostA2, hostB1, hostB2]);
+    });
+
+    // Wire event arrives: host 1's list is now [alpha] (alpha2 archived).
+    // BEFORE the fix, this call was setProjects([hostA1]) which wiped
+    // host 2's projects entirely — the adjacent-project vanish bug the
+    // per-host scope fix is preventing.
+    act(() => {
+      mergeProjectsForHost("1", [hostA1]);
+    });
+
+    const { result } = renderHook(() => useProjects());
+    // Host 2's entries survive; host 1 collapses to [hostA1].
+    expect(result.current.map((p) => p.slug).sort()).toEqual([
+      "alpha",
+      "beta",
+      "beta2",
+    ]);
+    expect(result.current.filter((p) => p.hostId === "2")).toEqual([
+      hostB1,
+      hostB2,
+    ]);
+  });
+
+  it("empty rows for a scoped hostId drops all entries for that host (last-project-archived)", () => {
+    act(() => {
+      setProjects([hostA1, hostB1]);
+    });
+
+    act(() => {
+      mergeProjectsForHost("1", []);
+    });
+
+    const { result } = renderHook(() => useProjects());
+    expect(result.current).toEqual([hostB1]);
+  });
+
+  it("adds entries for a new hostId that had none before", () => {
+    act(() => {
+      setProjects([hostA1]);
+    });
+
+    act(() => {
+      mergeProjectsForHost("2", [hostB1, hostB2]);
+    });
+
+    const { result } = renderHook(() => useProjects());
+    expect(result.current.map((p) => p.slug).sort()).toEqual([
+      "alpha",
+      "beta",
+      "beta2",
+    ]);
+  });
+
+  it("no-op skip: mergeProjectsForHost with byte-identical rows for the same hostId does NOT notify", () => {
+    act(() => {
+      setProjects([hostA1, hostB1]);
+    });
+
+    const spy = vi.fn();
+    const unsub = __subscribeForTest(spy);
+    try {
+      act(() => {
+        mergeProjectsForHost("1", [hostA1]);
+      });
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      unsub();
+    }
+  });
+
+  it("delta notify: mergeProjectsForHost with a real change notifies exactly once", () => {
+    act(() => {
+      setProjects([hostA1, hostB1]);
+    });
+
+    const spy = vi.fn();
+    const unsub = __subscribeForTest(spy);
+    try {
+      act(() => {
+        mergeProjectsForHost("1", [hostA1, hostA2]);
+      });
+      expect(spy).toHaveBeenCalledTimes(1);
+    } finally {
+      unsub();
+    }
+  });
+
+  it("persists to localStorage cache on real delta", () => {
+    act(() => {
+      setProjects([hostA1, hostB1]);
+    });
+
+    act(() => {
+      mergeProjectsForHost("1", []);
+    });
+
+    const cached = readProjectsCache();
+    expect(cached.projects).toEqual([{ ...hostB1, parent: null }]);
+  });
+});
+
+// Silence unused-import lint if `_makeIdentity` becomes unused during draft;
+// keep the reference to avoid a churn diff during subsequent GREEN edits.
+void makeIdentity;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Nested projects: sections come out in tree order with resolved parents.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("conversation-store: nested projects", () => {
+  beforeEach(() => {
+    __resetProjectsForTest();
+  });
+
+  const row = (slug: string, displayName: string, parent: string | null, hostId = "1"): ProjectRow => ({
+    slug,
+    displayName,
+    hostId,
+    hostname: hostId === "1" ? "harbor" : "workstation",
+    archived: false,
+    parent,
+  });
+
+  it("emits each project followed by its sub-projects, siblings alphabetical, with parentKey and depth", () => {
+    act(() => {
+      setProjects([
+        row("ops", "Ops", "skynet"),
+        row("other", "Other", null),
+        row("ui", "UI", "design"),
+        row("skynet", "SKYNET", null),
+        row("design", "Design", "skynet"),
+      ]);
+    });
+    const { result } = renderHook(() => useConversations());
+    expect(
+      result.current.projectSections.map((s) => [s.slug, s.parentKey, s.depth]),
+    ).toEqual([
+      ["other", null, 0],
+      ["skynet", null, 0],
+      ["design", "1::skynet", 1],
+      ["ui", "1::design", 2],
+      ["ops", "1::skynet", 1],
+    ]);
+  });
+
+  it("a missing parent, a parent on another host, or a loop resolves to top level — nothing vanishes", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    act(() => {
+      setProjects([
+        row("orphan", "Orphan", "gone"),
+        row("cross", "Cross", "beta"), // beta lives on host 2
+        row("beta", "Beta", null, "2"),
+        row("loop-a", "Loop A", "loop-b"),
+        row("loop-b", "Loop B", "loop-a"),
+        row("hanger", "Hanger", "loop-a"),
+      ]);
+    });
+    const { result } = renderHook(() => useConversations());
+    const bySlug = new Map(result.current.projectSections.map((s) => [s.slug, s]));
+    expect(bySlug.size).toBe(6);
+    expect(bySlug.get("orphan")!.parentKey).toBeNull();
+    expect(bySlug.get("cross")!.parentKey).toBeNull();
+    expect(bySlug.get("loop-a")!.parentKey).toBeNull();
+    expect(bySlug.get("loop-b")!.parentKey).toBeNull();
+    expect(bySlug.get("hanger")!.parentKey).toBe("1::loop-a");
+    warn.mockRestore();
+  });
+
+  it("a parent change alone counts as a change (re-renders the tree)", () => {
+    act(() => {
+      setProjects([row("a", "A", null), row("b", "B", null)]);
+    });
+    const before = getProjectsSnapshot();
+    act(() => {
+      mergeProjectsForHost("1", [row("a", "A", null), row("b", "B", "a")]);
+    });
+    expect(getProjectsSnapshot()).not.toBe(before);
+    expect(getProjectsSnapshot().find((p) => p.slug === "b")?.parent).toBe("a");
+  });
+
+  it("moving a project re-nests its section live (not only after a reload)", () => {
+    act(() => {
+      setProjects([row("morpheus", "Morpheus", null), row("m2", "M2 Schedules", null)]);
+    });
+    const { result } = renderHook(() => useConversations());
+    expect(result.current.projectSections.map((s) => [s.slug, s.parentKey])).toEqual([
+      ["m2", null],
+      ["morpheus", null],
+    ]);
+    act(() => {
+      mergeProjectsForHost("1", [row("morpheus", "Morpheus", null), row("m2", "M2 Schedules", "morpheus")]);
+    });
+    expect(
+      result.current.projectSections.map((s) => [s.slug, s.parentKey, s.depth]),
+    ).toEqual([
+      ["morpheus", null, 0],
+      ["m2", "1::morpheus", 1],
+    ]);
+    act(() => {
+      mergeProjectsForHost("1", [row("morpheus", "Morpheus", null), row("m2", "M2 Schedules", null)]);
+    });
+    expect(result.current.projectSections.find((s) => s.slug === "m2")?.parentKey).toBeNull();
+  });
+});

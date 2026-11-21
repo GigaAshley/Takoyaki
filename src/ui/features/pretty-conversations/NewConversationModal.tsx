@@ -1,0 +1,329 @@
+// Phase 91 Plan 05 — NewConversationModal.tsx
+//
+// Modal shell composing hook + sub-components for the "New conversation" flow.
+// Radix DialogPrimitive.Root with onInteractOutside prevention (X + Esc only
+// close paths — patch #111f discipline from GlobalFilesModal.tsx).
+//
+// Mobile/desktop parity: `absolute inset-4` fills the viewport on mobile;
+// on desktop the modal is capped at 560×720 and centered via
+// `md:left-1/2 md:top-1/2 md:-translate-x-1/2 md:-translate-y-1/2`.
+//
+// Data sources (T-91-FE-02 tenant scoping):
+//   - Humans: getUsersListBasic() (JWT-scoped, widened with mxid by Plan 00)
+//   - Agents: useIdentities() (fleet-local)
+//   - Self: useViewingUserMxid() (for self-exclusion + serverName extraction)
+//
+// Security:
+//   - T-91-FE-01: submitting-gate debounce — setSubmitting(true) BEFORE the
+//     createRelayRoom call; second click within same tick hits gate.ok===false.
+//   - T-91-FE-02: grep gate — no other user-listing import present.
+//   - T-91-05-T2: XSS prevention — displayName/roomName/error rendered as
+//     React text children only. No raw HTML injection.
+//   - Structured log discipline: console.info/warn with extracted plain-object fields,
+//     not raw event or error serialization.
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { KitBanner, KitButton, KitField, KitInput } from "@/components/kit";
+import { Modal, ModalHead, ModalBody, ModalFoot } from "@/components/modal";
+import type { CreateRelayRoomResponse } from "./participant-types";
+import type { PickedParticipant } from "./participant-types";
+import { useNewConversationForm } from "./useNewConversationForm";
+import { ParticipantChipStrip } from "./ParticipantChipStrip";
+import { ParticipantSearchInput } from "./ParticipantSearchInput";
+import { ParticipantList } from "./ParticipantList";
+import { createRelayRoom } from "@/api/relay-room-create-api";
+import { getUsersListBasic } from "@/api/user-management-api";
+// Phase 117 Plan 117-09 Task 2 — preSelectedProject prop follow-up. When
+// non-null, after createRelayRoom resolves the modal fires
+// setRelayRoomProject(roomId, viewingUserMxid, slug) as a fire-and-forget
+// call so the freshly-minted room carries a u.project.<slug> tag from the
+// first render (D-27). Post-processing pattern (planner recommendation):
+// no backend touch, just a follow-up API call.
+import { setRelayRoomProject } from "@/api/session-project-api";
+import { useIdentities } from "@/state/identities-store";
+import { useViewingUserMxid } from "@/state/viewing-user-store";
+import { MXID_REGEX } from "@/features/pretty-view/relay-mxid-resolve";
+import { hueFromSessionName } from "@/features/terminal/session-hue";
+import { identityRolesLabel } from "@/lib/identity-roles";
+import type { BasicUser } from "@/api/user-management-api";
+
+// ─── Hint text per gate reason (shape §Shape) ────────────────────────────────
+
+function gateHint(
+  gate: ReturnType<typeof useNewConversationForm>["gate"],
+): string | null {
+  if (gate.ok) return null;
+  switch (gate.reason) {
+    case "no-room-name":
+      return "Enter a name for this conversation";
+    case "no-participants":
+      return "Pick at least one participant";
+    case "single-agent-only":
+      return "A single-agent conversation already exists in your list";
+    case "submitting":
+      // Submit state is carried by the busy Create button.
+      return null;
+  }
+}
+
+// ─── NewConversationModal (public export) ─────────────────────────────────────
+
+export function NewConversationModal({
+  open,
+  onOpenChange,
+  onCreated,
+  preSelectedProject,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onCreated: (result: CreateRelayRoomResponse) => void;
+  /**
+   * Phase 117 Plan 117-09 Task 2 (D-27) — pre-select a project for the
+   * freshly-minted relay room. When non-null, after createRelayRoom
+   * resolves the modal fires setRelayRoomProject(roomId, viewingUserMxid,
+   * slug) as a fire-and-forget follow-up so the room's account_data
+   * carries a `u.project.<slug>` tag before first render. When null /
+   * omitted, no follow-up is performed (default behavior).
+   */
+  preSelectedProject?: string | null;
+}) {
+  // ─── Data sourcing ──────────────────────────────────────────────────────────
+
+  // T-91-FE-02: ONLY these three data sources are used for the picker.
+  const viewingUserMxid = useViewingUserMxid();
+  const { identities } = useIdentities();
+  const [basicUsers, setBasicUsers] = useState<BasicUser[] | null>(null);
+
+  // serverName derivation — extract group 2 from viewingUserMxid via MXID_REGEX.
+  // When null (fetch pending or malformed mxid), agents cannot be mxid-shaped
+  // and are omitted from the picker (Test 16 — agent filter when mxid null).
+  const serverName = useMemo(() => {
+    if (!viewingUserMxid) return null;
+    const m = viewingUserMxid.match(MXID_REGEX);
+    return m ? m[2] : null;
+  }, [viewingUserMxid]);
+
+  // Fetch humans when modal opens (not on every render — open gate).
+  // M2: AbortController per open-cycle to cancel in-flight requests on close
+  // or re-open. basicUsers is cleared on close so stale data never populates
+  // a re-opened modal.
+  useEffect(() => {
+    if (!open) {
+      // Clear stale users on close so re-open starts fresh (M2 fix).
+      setBasicUsers(null);
+      return;
+    }
+    // eslint-disable-next-line no-console
+    console.info({ operation: "new_conversation_modal_opened" });
+    const controller = new AbortController();
+    getUsersListBasic()
+      .then((users) => {
+        if (!controller.signal.aborted) {
+          setBasicUsers(users);
+        }
+      })
+      .catch((err: unknown) => {
+        if (controller.signal.aborted) return; // ignore cancelled fetches
+        setBasicUsers([]);
+        // eslint-disable-next-line no-console
+        console.warn({
+          operation: "new_conversation_modal_users_fetch_failed",
+          err: err instanceof Error ? err.message : "unknown",
+        });
+      });
+    return () => {
+      controller.abort();
+    };
+  }, [open]);
+
+  // Humans: filter out null-mxid users (Test 14), derive colorHue via
+  // hueFromSessionName(mxid) (Test 13). No persisted colorHue on BasicUser today.
+  const humans = useMemo<PickedParticipant[]>(() => {
+    if (!basicUsers) return [];
+    return basicUsers
+      .filter(
+        (u): u is BasicUser & { mxid: string } =>
+          typeof u.mxid === "string" && u.mxid.length > 0,
+      )
+      .map((u) => ({
+        mxid: u.mxid,
+        displayName: u.username,
+        colorHue: hueFromSessionName(u.mxid), // djb2 mod 360 per Test 13
+        avatarUrl: null, // humans have no persisted avatar today
+        role: "human" as const,
+        userId: u.id,
+      }));
+  }, [basicUsers]);
+
+  // Agents: derive mxid from identityKey.toLowerCase() + serverName (Test 15).
+  // Omit all agents when serverName is null (Test 16).
+  const agents = useMemo<PickedParticipant[]>(() => {
+    if (!serverName) return []; // serverName not yet resolved (Test 16)
+    return identities.map((id) => ({
+      // canonical agent mxid derivation — same convention as bridge-config-writer.ts:214.
+      mxid: `@${id.identityKey.toLowerCase()}:${serverName}`,
+      displayName: id.displayName,
+      colorHue: id.colorHue,
+      avatarUrl: id.avatarUrl ?? null,
+      role: "agent" as const,
+      identityKey: id.identityKey,
+      subtitle: id.title ?? (identityRolesLabel(id) || undefined),
+    }));
+  }, [identities, serverName]);
+
+  // ─── Form hook ──────────────────────────────────────────────────────────────
+  const form = useNewConversationForm({ humans, agents, viewingUserMxid });
+
+  // M1: Reset form state when the modal closes so the next open sees a clean
+  // slate (no stale roomName, picked participants, searchQuery, or error).
+  // The effect fires when `open` transitions false → true as well, but
+  // reset() on open is a harmless no-op (state is already empty on first open).
+  useEffect(() => {
+    if (!open) {
+      form.reset();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  // T-91-FE-01 debounce guard — a ref-based in-flight lock so the second
+  // rapid click is a no-op even before React flushes the setSubmitting(true)
+  // state update. The ref fires synchronously; the gate check is a redundant
+  // safety net for any caller that has already computed gate.ok=true.
+  const submitInFlightRef = useRef(false);
+
+  // ─── Submit handler (T-91-FE-01 debounce: gate.ok is false while submitting) ─
+  const handleSubmit = useCallback(async () => {
+    if (!form.gate.ok) return; // sync guard — catches React-batched state path
+    if (submitInFlightRef.current) return; // ref guard — debounces double-click (Test 7)
+    submitInFlightRef.current = true;
+    form.setSubmitting(true);
+    form.setError(null);
+    // eslint-disable-next-line no-console
+    console.info({
+      operation: "new_conversation_modal_submit_start",
+      roomName: form.roomName.trim(),
+      humanCount: form.picked.filter((p) => p.role === "human").length,
+      agentCount: form.picked.filter((p) => p.role === "agent").length,
+    });
+    try {
+      const result = await createRelayRoom({
+        roomName: form.roomName.trim(),
+        humanMxids: form.picked
+          .filter((p) => p.role === "human")
+          .map((p) => p.mxid),
+        agentMxids: form.picked
+          .filter((p) => p.role === "agent")
+          .map((p) => p.mxid),
+      });
+      // eslint-disable-next-line no-console
+      console.info({
+        operation: "new_conversation_modal_submit_ok",
+        roomId: result.roomId,
+        roomTitle: result.roomTitle,
+      });
+      // Phase 117 Plan 117-09 Task 2 (D-27) — write the project tag onto
+      // the newly minted room's account_data. Fire-and-forget: any error
+      // from the tag write must NOT block the onCreated + close flow, and
+      // is logged to console per D-07 graceful degradation.
+      if (
+        typeof preSelectedProject === "string" &&
+        preSelectedProject.length > 0 &&
+        typeof viewingUserMxid === "string" &&
+        viewingUserMxid.length > 0
+      ) {
+        void setRelayRoomProject(
+          result.roomId,
+          viewingUserMxid,
+          preSelectedProject,
+        ).catch((err: unknown) => {
+          // eslint-disable-next-line no-console
+          console.error({
+            operation: "new_conversation_modal_pre_select_project_failed",
+            roomId: result.roomId,
+            preSelectedProject,
+            errMessage: err instanceof Error ? err.message : "unknown",
+          });
+        });
+      }
+      onCreated(result);
+      onOpenChange(false);
+    } catch (err: unknown) {
+      const msg =
+        err instanceof Error ? err.message : "Failed to create conversation";
+      // eslint-disable-next-line no-console
+      console.warn({
+        operation: "new_conversation_modal_submit_error",
+        err: err instanceof Error ? err.message : "unknown",
+      });
+      form.setError(msg);
+    } finally {
+      form.setSubmitting(false);
+      submitInFlightRef.current = false;
+    }
+  }, [form, onCreated, onOpenChange, preSelectedProject, viewingUserMxid]);
+
+  const hint = gateHint(form.gate);
+
+  return (
+    <Modal open={open} onOpenChange={onOpenChange} size="xl">
+      <ModalHead title="New group conversation" />
+      <ModalBody className="flex flex-col gap-4">
+        {/* 1. Room name field — mandatory (Test 3 gate transition) */}
+        <KitField label="Room name" htmlFor="new-conversation-room-name">
+          <KitInput
+            type="text"
+            value={form.roomName}
+            onChange={(e) => form.setRoomName(e.target.value)}
+            placeholder="e.g. Design review"
+            aria-required="true"
+            autoFocus
+          />
+        </KitField>
+
+        {/* 2. Chips strip — selected participants */}
+        <ParticipantChipStrip picked={form.picked} onRemove={form.remove} />
+
+        {/* 3. Search input */}
+        <ParticipantSearchInput
+          value={form.searchQuery}
+          onChange={form.setSearchQuery}
+        />
+
+        {/* 4. Participant list — sectioned (Humans / Agents) */}
+        <div className="flex-1 min-h-0">
+          <ParticipantList
+            humans={form.availableHumans}
+            agents={form.availableAgents}
+            pickedMxids={new Set(form.picked.map((p) => p.mxid))}
+            onToggle={form.toggle}
+            filterActive={form.searchQuery.trim() !== ""}
+            humansTotal={humans.length}
+            agentsTotal={agents.length}
+          />
+        </div>
+      </ModalBody>
+      <ModalFoot>
+        <div className="flex flex-col gap-2 w-full">
+          {form.error && <KitBanner tone="danger">{form.error}</KitBanner>}
+          <KitButton
+            variant="primary"
+            full
+            disabled={!form.gate.ok}
+            busy={form.submitting}
+            aria-label={form.submitting ? "Creating conversation" : undefined}
+            onClick={() => {
+              void handleSubmit();
+            }}
+          >
+            Create
+          </KitButton>
+          {hint && (
+            <p className="m-0 text-[12.5px] text-center text-[var(--k-t3)]">
+              {hint}
+            </p>
+          )}
+        </div>
+      </ModalFoot>
+    </Modal>
+  );
+}

@@ -1,0 +1,162 @@
+/**
+ * attention-routes.ts — HTTP surface for per-user read state.
+ *
+ *   GET  /attention/read-state → { baselineAt, seen: [{hostId, identityName, seenFinishAt}],
+ *                                  dms: [{hostId, identityName, lastDmAt, seenDmAt}] }
+ *        Creates the user's baseline on first call (launch day = all read).
+ *   POST /attention/seen { hostId, identityName, seenFinishAt } → 204
+ *        Advances the user's seen mark (monotonic) and, when it moved, pushes
+ *        a read-state-changed frame to every one of that user's open tabs.
+ *   POST /attention/dm-seen { hostId, identityName, seenDmAt } → 204
+ *        Advances the user's seen DM (monotonic, never past the recorded DM)
+ *        and, when it moved, pushes dm-state-changed to that user's tabs.
+ *
+ * Read state is the caller's own, so the only gate is authentication.
+ */
+import express, { type Request, type Response } from "express";
+import type { AuthenticatedRequest } from "../../types/index.js";
+import { AuthManager } from "../utils/auth-manager.js";
+import { systemLogger } from "../utils/logger.js";
+import { getRegistry } from "../fleet-status/registry-holder.js";
+import { FRAME_SCHEMA_VERSION } from "../fleet-status/wire-protocol.js";
+import { getReadStateStore, isValidIdentityName } from "./read-state-store.js";
+import { publishDmState } from "./dm-recorder.js";
+
+const router = express.Router();
+const authManager = AuthManager.getInstance();
+const authenticateJWT = authManager.createAuthMiddleware();
+
+// Host ids are the numeric primary keys of the hosts table, as strings.
+const HOST_ID_RE = /^[0-9]{1,20}$/;
+
+router.get("/read-state", authenticateJWT, (req: Request, res: Response) => {
+  const userId = (req as AuthenticatedRequest).userId;
+  try {
+    const state = getReadStateStore().getForUser(userId);
+    systemLogger.info("attention read-state served", {
+      operation: "attention_read_state_get",
+      userId,
+      baselineAt: state.baselineAt,
+      seenCount: state.seen.length,
+      dmCount: state.dms.length,
+    });
+    return res.json(state);
+  } catch (err) {
+    systemLogger.error("attention read-state read failed", err, {
+      operation: "attention_read_state_get",
+      userId,
+      resultStatus: 500,
+    });
+    return res.status(500).json({ error: "failed to read read state" });
+  }
+});
+
+router.post("/seen", authenticateJWT, (req: Request, res: Response) => {
+  const userId = (req as AuthenticatedRequest).userId;
+  const body = (req.body ?? {}) as {
+    hostId?: unknown;
+    identityName?: unknown;
+    seenFinishAt?: unknown;
+  };
+  const { hostId, identityName, seenFinishAt } = body;
+  if (typeof hostId !== "string" || !HOST_ID_RE.test(hostId)) {
+    return res.status(400).json({ error: "invalid hostId" });
+  }
+  if (!isValidIdentityName(identityName)) {
+    return res.status(400).json({ error: "invalid identityName" });
+  }
+  if (typeof seenFinishAt !== "number" || !Number.isFinite(seenFinishAt) || seenFinishAt <= 0) {
+    return res.status(400).json({ error: "invalid seenFinishAt" });
+  }
+
+  let advanced: boolean;
+  try {
+    advanced = getReadStateStore().markSeen(userId, hostId, identityName, seenFinishAt);
+  } catch (err) {
+    systemLogger.error("attention mark-seen failed", err, {
+      operation: "attention_mark_seen",
+      userId,
+      fleetHostId: hostId,
+      identityName,
+      seenFinishAt,
+      resultStatus: 500,
+    });
+    return res.status(500).json({ error: "failed to mark seen" });
+  }
+
+  systemLogger.info("attention mark-seen", {
+    operation: "attention_mark_seen",
+    userId,
+    fleetHostId: hostId,
+    identityName,
+    seenFinishAt,
+    advanced,
+  });
+
+  if (advanced) {
+    const registry = getRegistry();
+    if (registry) {
+      registry.publishToUser(userId, {
+        schemaVersion: FRAME_SCHEMA_VERSION,
+        type: "read-state-changed",
+        hostId,
+        identityName,
+        seenFinishAt,
+      });
+    } else {
+      systemLogger.warn("attention mark-seen: registry not ready, other tabs not notified", {
+        operation: "attention_mark_seen_no_registry",
+        userId,
+      });
+    }
+  }
+  return res.status(204).end();
+});
+
+router.post("/dm-seen", authenticateJWT, (req: Request, res: Response) => {
+  const userId = (req as AuthenticatedRequest).userId;
+  const body = (req.body ?? {}) as {
+    hostId?: unknown;
+    identityName?: unknown;
+    seenDmAt?: unknown;
+  };
+  const { hostId, identityName, seenDmAt } = body;
+  if (typeof hostId !== "string" || !HOST_ID_RE.test(hostId)) {
+    return res.status(400).json({ error: "invalid hostId" });
+  }
+  if (!isValidIdentityName(identityName)) {
+    return res.status(400).json({ error: "invalid identityName" });
+  }
+  if (typeof seenDmAt !== "number" || !Number.isFinite(seenDmAt) || seenDmAt <= 0) {
+    return res.status(400).json({ error: "invalid seenDmAt" });
+  }
+
+  let entry: ReturnType<ReturnType<typeof getReadStateStore>["markDmSeen"]>;
+  try {
+    entry = getReadStateStore().markDmSeen(userId, hostId, identityName, seenDmAt);
+  } catch (err) {
+    systemLogger.error("attention mark-dm-seen failed", err, {
+      operation: "attention_mark_dm_seen",
+      userId,
+      fleetHostId: hostId,
+      identityName,
+      seenDmAt,
+      resultStatus: 500,
+    });
+    return res.status(500).json({ error: "failed to mark DM seen" });
+  }
+
+  systemLogger.info("attention mark-dm-seen", {
+    operation: "attention_mark_dm_seen",
+    userId,
+    fleetHostId: hostId,
+    identityName,
+    seenDmAt,
+    advanced: entry !== null,
+  });
+
+  if (entry) publishDmState(userId, entry);
+  return res.status(204).end();
+});
+
+export default router;

@@ -1,0 +1,170 @@
+import { describe, it, expect } from "vitest";
+import {
+  AUDIO_ENTRY,
+  BINARY_ENTRY,
+  COLUMNAR_ENTRY,
+  DECODED_IMAGE_ENTRY,
+  DELIMITED_ENTRY,
+  DOCX_ENTRY,
+  DIFF_ENTRY,
+  IMAGE_ENTRY,
+  LEGACY_SHEET_ENTRY,
+  LEGACY_WORD_ENTRY,
+  MODEL_3D_ENTRY,
+  NOTEBOOK_ENTRY,
+  EBOOK_ENTRY,
+  MERMAID_ENTRY,
+  GRAPHVIZ_ENTRY,
+  EXCALIDRAW_ENTRY,
+  DRAWIO_ENTRY,
+  EMAIL_ENTRY,
+  CALENDAR_ENTRY,
+  CONTACTS_ENTRY,
+  FONT_ENTRY,
+  SUBTITLE_ENTRY,
+  PDF_ENTRY,
+  PRESENTATION_ENTRY,
+  SQLITE_ENTRY,
+  XLSX_ENTRY,
+  SVG_ENTRY,
+  TEXT_ENTRY,
+  VIDEO_ENTRY,
+  extensionOf,
+  fileOpenKind,
+  isTextByName,
+  mimeFor,
+  resolveFileViewer,
+  resolveMode,
+} from "./registry";
+
+describe("extensionOf", () => {
+  it.each([
+    ["photo.PNG", "png"],
+    ["dir.v2/archive.tar.gz", "gz"],
+    [".gitignore", null],
+    ["Makefile", null],
+    ["trailing.", null],
+  ])("%s → %s", (name, ext) => {
+    expect(extensionOf(name)).toBe(ext);
+  });
+});
+
+describe("resolveFileViewer", () => {
+  it.each([
+    ["a.png", IMAGE_ENTRY],
+    ["a.svg", SVG_ENTRY],
+    ["a.mp3", AUDIO_ENTRY],
+    ["a.webm", VIDEO_ENTRY],
+    ["a.patch", DIFF_ENTRY],
+    ["a.DIFF", DIFF_ENTRY],
+    ["a.csv", DELIMITED_ENTRY],
+    ["a.TSV", DELIMITED_ENTRY],
+    ["a.psv", DELIMITED_ENTRY],
+    ["a.zip", BINARY_ENTRY],
+    ["a.pdf", PDF_ENTRY],
+    ["a.docx", DOCX_ENTRY],
+    ["a.doc", LEGACY_WORD_ENTRY],
+    ["a.ODT", LEGACY_WORD_ENTRY],
+    ["a.xlsx", XLSX_ENTRY],
+    ["a.XLSM", XLSX_ENTRY],
+    ["a.xls", LEGACY_SHEET_ENTRY],
+    ["a.ods", LEGACY_SHEET_ENTRY],
+    ["a.ppt", PRESENTATION_ENTRY],
+    ["a.pptx", PRESENTATION_ENTRY],
+    ["a.odp", PRESENTATION_ENTRY],
+    ["a.epub", EBOOK_ENTRY],
+    ["a.AZW3", EBOOK_ENTRY],
+    ["a.mobi", EBOOK_ENTRY],
+    ["a.fb2", EBOOK_ENTRY],
+    ["a.cbz", EBOOK_ENTRY],
+    ["a.7z", BINARY_ENTRY],
+    ["flow.mmd", MERMAID_ENTRY],
+    ["seq.mermaid", MERMAID_ENTRY],
+    ["deps.dot", GRAPHVIZ_ENTRY],
+    ["g.gv", GRAPHVIZ_ENTRY],
+    ["sketch.excalidraw", EXCALIDRAW_ENTRY],
+    ["arch.drawio", DRAWIO_ENTRY],
+    ["arch.dio", DRAWIO_ENTRY],
+    ["a.glb", MODEL_3D_ENTRY],
+    ["part.STEP", MODEL_3D_ENTRY],
+    ["mesh.stl", MODEL_3D_ENTRY],
+    ["scan.obj", MODEL_3D_ENTRY],
+    ["building.ifc", MODEL_3D_ENTRY],
+    ["app.sqlite", SQLITE_ENTRY],
+    ["Thumbs.db", SQLITE_ENTRY],
+    ["data.parquet", COLUMNAR_ENTRY],
+    ["frame.feather", COLUMNAR_ENTRY],
+    ["batch.arrow", COLUMNAR_ENTRY],
+    ["scan.TIFF", DECODED_IMAGE_ENTRY],
+    ["IMG_0001.HEIC", DECODED_IMAGE_ENTRY],
+    ["poster.psd", DECODED_IMAGE_ENTRY],
+    ["DSC_0001.NEF", DECODED_IMAGE_ENTRY],
+    ["IMG_1.cr3", DECODED_IMAGE_ENTRY],
+    ["analysis.ipynb", NOTEBOOK_ENTRY],
+    ["invoice.eml", EMAIL_ENTRY],
+    ["Outlook.MSG", EMAIL_ENTRY],
+    ["invite.ics", CALENDAR_ENTRY],
+    ["feed.ical", CALENDAR_ENTRY],
+    ["alice.vcf", CONTACTS_ENTRY],
+    ["book.vcard", CONTACTS_ENTRY],
+    ["Inter.ttf", FONT_ENTRY],
+    ["a.OTF", FONT_ENTRY],
+    ["a.woff2", FONT_ENTRY],
+    ["old.eot", BINARY_ENTRY],
+    ["movie.srt", SUBTITLE_ENTRY],
+    ["captions.vtt", SUBTITLE_ENTRY],
+    ["anime.ass", SUBTITLE_ENTRY],
+    ["old.ssa", SUBTITLE_ENTRY],
+    ["a.ts", TEXT_ENTRY],
+    ["a.unknownext", TEXT_ENTRY],
+    ["Dockerfile", TEXT_ENTRY],
+  ])("%s", (name, entry) => {
+    expect(resolveFileViewer(name)).toBe(entry);
+  });
+});
+
+describe("resolveMode", () => {
+  it("defaults to the first mode and falls back on unknown ids", () => {
+    expect(resolveMode(SVG_ENTRY).id).toBe("rendered");
+    expect(resolveMode(SVG_ENTRY, "source").id).toBe("source");
+    expect(resolveMode(SVG_ENTRY, "nope").id).toBe("rendered");
+  });
+});
+
+describe("mimeFor / isTextByName", () => {
+  it("knows media MIME types", () => {
+    expect(mimeFor(SVG_ENTRY, "x.svg")).toBe("image/svg+xml");
+    expect(mimeFor(TEXT_ENTRY, "x.txt")).toBe("");
+  });
+
+  it("recognises text by extension or conventional basename", () => {
+    expect(isTextByName("notes.md")).toBe(true);
+    expect(isTextByName("sub/dir/Dockerfile")).toBe(true);
+    expect(isTextByName("x.weird")).toBe(false);
+  });
+});
+
+describe("fileOpenKind — how a file opens, by type", () => {
+  it.each([
+    // Look at / watch / listen: no Edit.
+    "photo.png", "logo.svg", "song.mp3", "clip.mp4", "Font.ttf", "book.epub", "deck.pptx",
+    "budget.xlsx", "old.xls", "part.stl", "app.sqlite", "data.parquet", "scan.tiff",
+    "mail.eml", "invite.ics", "people.vcf", "change.diff", "flow.drawio", "bundle.zip",
+  ])("%s is looked at", (name) => {
+    expect(fileOpenKind(name)).toBe("view");
+  });
+
+  it.each(["notes.md", "README.MD", "report.docx", "letter.doc", "spec.pdf", "analysis.ipynb"])(
+    "%s opens for reading first",
+    (name) => {
+      expect(fileOpenKind(name)).toBe("read");
+    },
+  );
+
+  it.each([
+    "main.ts", "notes.txt", "Dockerfile", "config.yaml", "table.csv", "table.tsv",
+    "captions.srt", "chart.mmd", "graph.dot", "sketch.excalidraw",
+  ])("%s opens ready to work on", (name) => {
+    expect(fileOpenKind(name)).toBe("work");
+  });
+});

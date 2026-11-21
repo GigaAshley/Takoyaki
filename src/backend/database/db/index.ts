@@ -1,0 +1,2528 @@
+import { drizzle } from "drizzle-orm/better-sqlite3";
+import Database from "better-sqlite3";
+import * as schema from "./schema.js";
+import fs from "fs";
+import path from "path";
+import { databaseLogger } from "../../utils/logger.js";
+import { DatabaseFileEncryption } from "../../utils/database-file-encryption.js";
+import { SystemCrypto } from "../../utils/system-crypto.js";
+import { DatabaseMigration } from "../../utils/database-migration.js";
+import { DatabaseSaveTrigger } from "../../utils/database-save-trigger.js";
+import { applyMachineIdSchema } from "./machine-id-migration.js";
+import { ATTENTION_TABLES_SQL } from "../../attention/attention-schema.js";
+import { countUncountedAccounts } from "../../whats-new/count-existing-accounts.js";
+import { WHATS_NEW_NOTES } from "../../whats-new/notes.js";
+
+const dataDir = process.env.DATA_DIR || "./db/data";
+const dbDir = path.resolve(dataDir);
+if (!fs.existsSync(dbDir)) {
+  fs.mkdirSync(dbDir, { recursive: true });
+}
+
+const enableFileEncryption = process.env.DB_FILE_ENCRYPTION !== "false";
+const dbPath = path.join(dataDir, "db.sqlite");
+const encryptedDbPath = `${dbPath}.encrypted`;
+
+const actualDbPath = ":memory:";
+let memoryDatabase: Database.Database;
+let isNewDatabase = false;
+let sqlite: Database.Database;
+
+async function initializeDatabaseAsync(): Promise<void> {
+  const systemCrypto = SystemCrypto.getInstance();
+
+  await systemCrypto.getDatabaseKey();
+  if (enableFileEncryption) {
+    try {
+      if (DatabaseFileEncryption.isEncryptedDatabaseFile(encryptedDbPath)) {
+        const decryptedBuffer =
+          await DatabaseFileEncryption.decryptDatabaseToBuffer(encryptedDbPath);
+
+        memoryDatabase = new Database(decryptedBuffer);
+
+        try {
+          memoryDatabase
+            .prepare("SELECT COUNT(*) as count FROM sessions")
+            .get() as { count: number };
+        } catch {
+          // expected - sessions table may not exist yet
+        }
+      } else {
+        const migration = new DatabaseMigration(dataDir);
+        const migrationStatus = migration.checkMigrationStatus();
+
+        if (migrationStatus.needsMigration) {
+          const migrationResult = await migration.migrateDatabase();
+
+          if (migrationResult.success) {
+            migration.cleanupOldBackups();
+
+            if (
+              DatabaseFileEncryption.isEncryptedDatabaseFile(encryptedDbPath)
+            ) {
+              const decryptedBuffer =
+                await DatabaseFileEncryption.decryptDatabaseToBuffer(
+                  encryptedDbPath,
+                );
+              memoryDatabase = new Database(decryptedBuffer);
+              isNewDatabase = false;
+            } else {
+              throw new Error(
+                "Migration completed but encrypted database file not found",
+              );
+            }
+          } else {
+            databaseLogger.error("Automatic database migration failed", null, {
+              operation: "auto_migration_failed",
+              error: migrationResult.error,
+              migratedTables: migrationResult.migratedTables,
+              migratedRows: migrationResult.migratedRows,
+              duration: migrationResult.duration,
+              backupPath: migrationResult.backupPath,
+            });
+            throw new Error(
+              `Database migration failed: ${migrationResult.error}. Backup available at: ${migrationResult.backupPath}`,
+            );
+          }
+        } else {
+          memoryDatabase = new Database(":memory:");
+          isNewDatabase = true;
+        }
+      }
+    } catch (error) {
+      databaseLogger.error("Failed to initialize memory database", error, {
+        operation: "db_memory_init_failed",
+        errorMessage: error instanceof Error ? error.message : "Unknown error",
+        errorStack: error instanceof Error ? error.stack : undefined,
+        encryptedDbExists:
+          DatabaseFileEncryption.isEncryptedDatabaseFile(encryptedDbPath),
+        databaseKeyAvailable: !!process.env.DATABASE_KEY,
+        databaseKeyLength: process.env.DATABASE_KEY?.length || 0,
+      });
+
+      try {
+        const diagnosticInfo =
+          DatabaseFileEncryption.getDiagnosticInfo(encryptedDbPath);
+        databaseLogger.error(
+          "Database encryption diagnostic completed - check logs above for details",
+          null,
+          {
+            operation: "db_encryption_diagnostic_completed",
+            filesConsistent: diagnosticInfo.validation.filesConsistent,
+            sizeMismatch: diagnosticInfo.validation.sizeMismatch,
+          },
+        );
+      } catch (diagError) {
+        databaseLogger.warn("Failed to generate diagnostic information", {
+          operation: "db_diagnostic_failed",
+          error:
+            diagError instanceof Error ? diagError.message : "Unknown error",
+        });
+      }
+
+      throw new Error(
+        `Database decryption failed: ${error instanceof Error ? error.message : "Unknown error"}. This prevents data loss.`,
+        { cause: error },
+      );
+    }
+  } else {
+    memoryDatabase = new Database(":memory:");
+    isNewDatabase = true;
+  }
+}
+
+async function initializeCompleteDatabase(): Promise<void> {
+  await initializeDatabaseAsync();
+
+  databaseLogger.info(`Initializing SQLite database`, {
+    operation: "db_init",
+    path: actualDbPath,
+    encrypted:
+      enableFileEncryption &&
+      DatabaseFileEncryption.isEncryptedDatabaseFile(encryptedDbPath),
+    inMemory: true,
+    isNewDatabase,
+  });
+
+  sqlite = memoryDatabase;
+
+  sqlite.exec("PRAGMA foreign_keys = ON");
+
+  db = drizzle(sqlite, { schema });
+
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        username TEXT NOT NULL,
+        password_hash TEXT NOT NULL,
+        is_admin INTEGER NOT NULL DEFAULT 0,
+        is_oidc INTEGER NOT NULL DEFAULT 0,
+        oidc_identifier TEXT,
+        client_id TEXT,
+        client_secret TEXT,
+        issuer_url TEXT,
+        authorization_url TEXT,
+        token_url TEXT,
+        identifier_path TEXT,
+        name_path TEXT,
+        scopes TEXT DEFAULT 'openid email profile',
+        totp_secret TEXT,
+        totp_enabled INTEGER NOT NULL DEFAULT 0,
+        totp_backup_codes TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS sessions (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        jwt_token TEXT NOT NULL,
+        device_type TEXT NOT NULL,
+        device_info TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        expires_at TEXT NOT NULL,
+        last_active_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS trusted_devices (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        device_fingerprint TEXT NOT NULL,
+        device_type TEXT NOT NULL,
+        device_info TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        expires_at TEXT NOT NULL,
+        last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS ssh_data (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        name TEXT,
+        ip TEXT NOT NULL,
+        port INTEGER NOT NULL,
+        username TEXT NOT NULL,
+        folder TEXT,
+        tags TEXT,
+        pin INTEGER NOT NULL DEFAULT 0,
+        auth_type TEXT NOT NULL,
+        password TEXT,
+        key TEXT,
+        key_password TEXT,
+        key_type TEXT,
+        enable_terminal INTEGER NOT NULL DEFAULT 1,
+        enable_tunnel INTEGER NOT NULL DEFAULT 1,
+        tunnel_connections TEXT,
+        enable_file_manager INTEGER NOT NULL DEFAULT 1,
+        enable_docker INTEGER NOT NULL DEFAULT 0,
+        default_path TEXT,
+        autostart_password TEXT,
+        autostart_key TEXT,
+        autostart_key_password TEXT,
+        force_keyboard_interactive TEXT,
+        stats_config TEXT,
+        docker_config TEXT,
+        terminal_config TEXT,
+        notes TEXT,
+        use_socks5 INTEGER,
+        socks5_host TEXT,
+        socks5_port INTEGER,
+        socks5_username TEXT,
+        socks5_password TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS file_manager_recent (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        host_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        path TEXT NOT NULL,
+        last_opened TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+        FOREIGN KEY (host_id) REFERENCES ssh_data (id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS file_manager_pinned (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        host_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        path TEXT NOT NULL,
+        pinned_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+        FOREIGN KEY (host_id) REFERENCES ssh_data (id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS file_manager_shortcuts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        host_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        path TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+        FOREIGN KEY (host_id) REFERENCES ssh_data (id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS transfer_recent (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        source_host_id INTEGER NOT NULL,
+        dest_host_id INTEGER NOT NULL,
+        dest_path TEXT NOT NULL,
+        dest_path_label TEXT NOT NULL,
+        last_used TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+        FOREIGN KEY (source_host_id) REFERENCES ssh_data (id) ON DELETE CASCADE,
+        FOREIGN KEY (dest_host_id) REFERENCES ssh_data (id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS dismissed_alerts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        alert_id TEXT NOT NULL,
+        dismissed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS ssh_credentials (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        description TEXT,
+        folder TEXT,
+        tags TEXT,
+        auth_type TEXT NOT NULL,
+        username TEXT,
+        password TEXT,
+        key TEXT,
+        key_password TEXT,
+        key_type TEXT,
+        usage_count INTEGER NOT NULL DEFAULT 0,
+        last_used TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS ssh_credential_usage (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        credential_id INTEGER NOT NULL,
+        host_id INTEGER NOT NULL,
+        user_id TEXT NOT NULL,
+        used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (credential_id) REFERENCES ssh_credentials (id) ON DELETE CASCADE,
+        FOREIGN KEY (host_id) REFERENCES ssh_data (id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+
+    -- Phase 75 Plan 01 — singleton store for the @skynet-admin Matrix
+    -- relay credentials. Written via matrix-admin-creds-store.ts, which
+    -- eagerly encrypts access_token + password through FieldCrypto before
+    -- INSERT/UPDATE. IF NOT EXISTS keeps the DDL idempotent across boots.
+    -- id=1 by convention (singleton row); no user-id FK because these are
+    -- Skynet-instance-wide creds, not user-scoped.
+    CREATE TABLE IF NOT EXISTS matrix_admin_creds (
+        id INTEGER PRIMARY KEY,
+        homeserver_base TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        access_token TEXT NOT NULL,
+        password TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS snippets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        content TEXT NOT NULL,
+        description TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS c2s_tunnel_presets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        config TEXT NOT NULL,
+        platform TEXT,
+        computer_name TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS ssh_folders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        color TEXT,
+        icon TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS recent_activity (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        type TEXT NOT NULL,
+        host_id INTEGER NOT NULL,
+        host_name TEXT,
+        timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+        FOREIGN KEY (host_id) REFERENCES ssh_data (id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS command_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        host_id INTEGER NOT NULL,
+        command TEXT NOT NULL,
+        executed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+        FOREIGN KEY (host_id) REFERENCES ssh_data (id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS host_access (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        host_id INTEGER NOT NULL,
+        user_id TEXT,
+        role_id INTEGER,
+        granted_by TEXT NOT NULL,
+        permission_level TEXT NOT NULL DEFAULT 'use',
+        expires_at TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        last_accessed_at TEXT,
+        access_count INTEGER NOT NULL DEFAULT 0,
+        FOREIGN KEY (host_id) REFERENCES ssh_data (id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+        FOREIGN KEY (role_id) REFERENCES roles (id) ON DELETE CASCADE,
+        FOREIGN KEY (granted_by) REFERENCES users (id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS roles (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        display_name TEXT NOT NULL,
+        description TEXT,
+        is_system INTEGER NOT NULL DEFAULT 0,
+        permissions TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS user_roles (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        role_id INTEGER NOT NULL,
+        granted_by TEXT,
+        granted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, role_id),
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+        FOREIGN KEY (role_id) REFERENCES roles (id) ON DELETE CASCADE,
+        FOREIGN KEY (granted_by) REFERENCES users (id) ON DELETE SET NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS audit_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        username TEXT NOT NULL,
+        action TEXT NOT NULL,
+        resource_type TEXT NOT NULL,
+        resource_id TEXT,
+        resource_name TEXT,
+        details TEXT,
+        ip_address TEXT,
+        user_agent TEXT,
+        success INTEGER NOT NULL,
+        error_message TEXT,
+        timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS session_recordings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        host_id INTEGER NOT NULL,
+        user_id TEXT NOT NULL,
+        access_id INTEGER,
+        started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        ended_at TEXT,
+        duration INTEGER,
+        commands TEXT,
+        dangerous_actions TEXT,
+        recording_path TEXT,
+        terminated_by_owner INTEGER DEFAULT 0,
+        termination_reason TEXT,
+        FOREIGN KEY (host_id) REFERENCES ssh_data (id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+        FOREIGN KEY (access_id) REFERENCES host_access (id) ON DELETE SET NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS api_keys (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        token_hash TEXT NOT NULL,
+        token_prefix TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        expires_at TEXT,
+        last_used_at TEXT,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+
+    -- Phase 68: identities table dropped; identity IS the disk folder on some
+    -- host per .planning/shapes/shape-kill-identities-table.md. The table is
+    -- physically removed at boot time by runIdentitiesTableDrop() in migrateSchema().
+    -- Fresh installs never create the table; upgraded installs have it dropped on
+    -- first successful boot via the idempotent DROP TABLE IF EXISTS migration.
+
+    CREATE TABLE IF NOT EXISTS message_queue_items (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        host_id INTEGER NOT NULL,
+        tmux_session TEXT,
+        body TEXT NOT NULL DEFAULT '',
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+        FOREIGN KEY (host_id) REFERENCES ssh_data (id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_mqi_user_host_session
+        ON message_queue_items (user_id, host_id, tmux_session);
+
+    CREATE TABLE IF NOT EXISTS compose_drafts (
+        user_id TEXT NOT NULL,
+        host_id INTEGER NOT NULL,
+        tmux_session TEXT NOT NULL DEFAULT '',
+        body TEXT NOT NULL DEFAULT '',
+        queue_slots TEXT NOT NULL DEFAULT '[]',
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (user_id, host_id, tmux_session),
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+        FOREIGN KEY (host_id) REFERENCES ssh_data (id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_compose_drafts_user_host_session
+        ON compose_drafts (user_id, host_id, tmux_session);
+
+    CREATE TABLE IF NOT EXISTS user_open_tabs (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        tab_type TEXT NOT NULL,
+        host_id INTEGER,
+        label TEXT NOT NULL,
+        tab_order INTEGER NOT NULL DEFAULT 0,
+        backend_session_id TEXT,
+        target_tmux_session TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+        FOREIGN KEY (host_id) REFERENCES ssh_data (id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS user_preferences (
+        user_id TEXT PRIMARY KEY,
+        -- reopen_tabs_on_login INTEGER NOT NULL DEFAULT 0,  -- DELETED per Phase 137 D-31 (dead fork holdover)
+        theme TEXT,
+        font_size TEXT,
+        accent_color TEXT,
+        language TEXT,
+        fallback_voice TEXT,                                   -- NEW per Phase 137 D-14
+        tts_playback_rate REAL,                                -- per-user speak playback speed; NULL → 1.0
+        voice_mode_end_of_turn TEXT,                           -- voice mode turn end: 'timed' | 'phrase'; NULL → 'timed'
+        voice_mode_send_phrase TEXT,                           -- voice mode send phrase; NULL → 'over'
+        voice_mode_pause_seconds INTEGER,                      -- voice mode timed silence length; NULL → 3
+        whats_new_seen TEXT,                                   -- JSON array of seen what's-new note ids; NULL → not yet counted
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+
+    -- Phase 85 (D-01, D-02): identity_send_log — user's per-identity
+    -- last-send timestamp. Keyed on identity name only (Skynet single-tenant).
+    -- Consumed by ssh-poll-orchestrator lastMessageAt derivation. No FK
+    -- references; identity names are freestanding strings. Drizzle mirror
+    -- at schema.ts identitySendLog.
+    CREATE TABLE IF NOT EXISTS identity_send_log (
+        identity_name TEXT PRIMARY KEY,
+        last_send_at INTEGER NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Phase 89 Plan 01 (D-01, D-02) — relay_room_sessions: the stored side
+    -- of Skynet's new second session-kind. Rows are anchored to a
+    -- (user_id, room_id) pair; UNIQUE on that composite (see the CREATE
+    -- UNIQUE INDEX below) makes the observation loop + slice C's
+    -- create-room flow both idempotent without cross-path coordination
+    -- (schema IS the coordinator per D-14).
+    --
+    -- state = 'active' | 'inactive'; the store module owns those values
+    -- (SQLite has no enum). External-kick handling flips state → 'inactive'
+    -- and preserves the row (D-03) so re-invite reactivates the same row
+    -- rather than needing a new one — hence the unscoped uniqueness index.
+    --
+    -- FK matches the sessions / trusted_devices pattern above (ON DELETE
+    -- CASCADE — a user deletion sweeps their relay-room rows). Reads
+    -- filter on state='active' in the store module. Persisted via a
+    -- labeled forceSave in the migration block below (belt-and-suspenders
+    -- same as sessions / trusted_devices — the incremental probe adds a
+    -- second CREATE TABLE IF NOT EXISTS in the migration block).
+    --
+    -- Drizzle mirror at schema.ts relayRoomSessions.
+    CREATE TABLE IF NOT EXISTS relay_room_sessions (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        room_id TEXT NOT NULL,
+        room_title TEXT,
+        state TEXT NOT NULL,
+        last_activity_at TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+
+    -- Phase 89 Plan 01 (D-02, D-14) — UNSCOPED uniqueness on the composite.
+    -- Do NOT add a partial-index WHERE state = 'active' predicate here:
+    -- re-invite reactivation (D-03) must flip the same row rather than
+    -- allow a new-row insert while the old row still exists. If this
+    -- ever regresses to a scoped WHERE clause, the reactivation path
+    -- (see relay-room-sessions-store.ts::reactivateRelayRoomSession)
+    -- silently starts creating duplicate rows on external-kick then re-invite.
+    CREATE UNIQUE INDEX IF NOT EXISTS relay_room_sessions_user_room_uidx
+        ON relay_room_sessions(user_id, room_id);
+
+    -- Telegram notifications: each user sets up their OWN bot. bot_token is
+    -- FieldCrypto-encrypted with the SYSTEM key (not the user's data key) so
+    -- the push-trigger loop can send while the user is logged out. chat_id
+    -- is NULL until the user taps Start in their bot. bot_id (Telegram's
+    -- numeric bot id) is UNIQUE so two accounts can't share one bot.
+    -- Drizzle mirror at schema.ts telegramBots.
+    CREATE TABLE IF NOT EXISTS telegram_bots (
+        user_id TEXT PRIMARY KEY,
+        bot_token TEXT NOT NULL,
+        bot_id TEXT NOT NULL UNIQUE,
+        bot_username TEXT NOT NULL,
+        chat_id TEXT,
+        telegram_name TEXT NOT NULL DEFAULT '',
+        title_only INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        linked_at TEXT,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+
+    -- Phase 89 Plan 01 (D-16) — admin_rooms: Skynet-instance-owned internal
+    -- ignore-list. Populated when Skynet creates each registry room (D-10)
+    -- with the room ID Skynet knows at creation time. The observation loop
+    -- consults this list to skip materializing rooms that would otherwise
+    -- trip the D-08 multi-member materialize rule for every user (registry
+    -- rooms have many members and would produce noisy sidebar entries).
+    --
+    -- Shape choice (D-16 planner discretion) — dedicated small table rather
+    -- than a JSON array in settings: easier to inspect via SQL for ops
+    -- debugging, negligible storage overhead for the ~2 rows expected
+    -- (agents-registry + humans-registry), and the primitive extends
+    -- cleanly to any future admin-purposes-only room without a schema
+    -- migration.
+    --
+    -- No FK — room IDs are freestanding Matrix identifiers, not local rows.
+    -- Persisted via a labeled forceSave in the migration block below.
+    --
+    -- Scope per D-16 — SINGLE-INSTANCE-PER-DB. Each Skynet instance owns
+    -- its own DB and its own ignore-list (one instance's admin_rooms rows are
+    -- its own; another instance's are its own). If Skynet is ever operated multi-tenant
+    -- (one DB, multiple Skynet "instances"), this table needs a
+    -- 'skynet_instance_id' column added — otherwise different instances'
+    -- registry-room IDs would collide in the same table. Phase 89 fixup
+    -- L-1 (2026-09-08) documents this constraint.
+    --
+    -- Drizzle mirror at schema.ts adminRooms.
+    CREATE TABLE IF NOT EXISTS admin_rooms (
+        room_id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Agent services: per-user secrets a service declares (e.g. a
+    -- company-issued Zoho key). value is FieldCrypto ciphertext under the
+    -- system ENCRYPTION_KEY so agents can use it while the user is logged
+    -- out. Write-only through the API. Drizzle mirror at schema.ts
+    -- agentServiceUserSecrets; store at agent-services/user-secrets/store.ts.
+    CREATE TABLE IF NOT EXISTS agent_service_user_secrets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        service TEXT NOT NULL,
+        name TEXT NOT NULL,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        updated_by TEXT,
+        UNIQUE (user_id, service, name),
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+
+`);
+
+  // Sidebar unread marks: turn-finish log + per-user read state.
+  sqlite.exec(ATTENTION_TABLES_SQL);
+
+  try {
+    sqlite.prepare("DELETE FROM user_open_tabs").run();
+    databaseLogger.info("Open tabs cleared on startup", {
+      operation: "db_init_open_tabs_cleanup",
+    });
+  } catch (e) {
+    databaseLogger.warn("Could not clear open tabs on startup", {
+      operation: "db_init_open_tabs_cleanup_failed",
+      error: e,
+    });
+  }
+
+  try {
+    const result = sqlite
+      .prepare("DELETE FROM sessions WHERE expires_at <= ?")
+      .run(new Date().toISOString());
+    if (result.changes > 0) {
+      databaseLogger.info("Expired sessions cleaned up on startup", {
+        operation: "db_init_session_cleanup",
+        deletedSessions: result.changes,
+      });
+    }
+  } catch (e) {
+    databaseLogger.warn("Could not clear expired sessions on startup", {
+      operation: "db_init_session_cleanup_failed",
+      error: e,
+    });
+  }
+
+  await migrateSchema();
+
+  // Open sign-up and self-service password reset were removed; drop their
+  // old switches and any half-finished reset codes so nothing reads them.
+  try {
+    const removed = sqlite
+      .prepare(
+        "DELETE FROM settings WHERE key IN ('allow_registration', 'allow_password_reset') OR key LIKE 'reset\\_code\\_%' ESCAPE '\\' OR key LIKE 'temp\\_reset\\_token\\_%' ESCAPE '\\'",
+      )
+      .run();
+    if (removed.changes > 0) {
+      databaseLogger.info("Removed retired sign-up / password-reset settings", {
+        operation: "db_init_retired_settings_removed",
+        count: removed.changes,
+      });
+    }
+  } catch (e) {
+    databaseLogger.warn("Could not remove retired sign-up / reset settings", {
+      operation: "db_init",
+      error: e,
+    });
+  }
+
+  try {
+    const row = sqlite
+      .prepare("SELECT value FROM settings WHERE key = 'allow_password_login'")
+      .get();
+    if (!row) {
+      sqlite
+        .prepare(
+          "INSERT INTO settings (key, value) VALUES ('allow_password_login', 'true')",
+        )
+        .run();
+    }
+  } catch (e) {
+    databaseLogger.warn("Could not initialize allow_password_login setting", {
+      operation: "db_init",
+      error: e,
+    });
+  }
+
+  try {
+    const row = sqlite
+      .prepare("SELECT value FROM settings WHERE key = 'guac_enabled'")
+      .get();
+    if (!row) {
+      sqlite
+        .prepare(
+          "INSERT INTO settings (key, value) VALUES ('guac_enabled', 'true')",
+        )
+        .run();
+    }
+  } catch (e) {
+    databaseLogger.warn("Could not initialize guac_enabled setting", {
+      operation: "db_init",
+      error: e,
+    });
+  }
+
+  try {
+    const row = sqlite
+      .prepare("SELECT value FROM settings WHERE key = 'guac_url'")
+      .get();
+    if (!row) {
+      const defaultGuacUrl = `${process.env.GUACD_HOST || "localhost"}:${process.env.GUACD_PORT || "4822"}`;
+      sqlite
+        .prepare(
+          "INSERT INTO settings (key, value) VALUES ('guac_url', ?)",
+        )
+        .run(defaultGuacUrl);
+    }
+  } catch (e) {
+    databaseLogger.warn("Could not initialize guac_url setting", {
+      operation: "db_init",
+      error: e,
+    });
+  }
+}
+
+const addColumnIfNotExists = (
+  table: string,
+  column: string,
+  definition: string,
+) => {
+  try {
+    sqlite
+      .prepare(
+        `SELECT "${column}"
+                        FROM ${table} LIMIT 1`,
+      )
+      .get();
+  } catch {
+    try {
+      sqlite.exec(`ALTER TABLE ${table}
+                ADD COLUMN "${column}" ${definition};`);
+    } catch (alterError) {
+      databaseLogger.warn(`Failed to add column ${column} to ${table}`, {
+        operation: "schema_migration",
+        table,
+        column,
+        error: alterError,
+      });
+    }
+  }
+};
+
+// -----------------------------------------------------------------------------
+// Phase 66 Plan 04 (per B6): SQLite version preflight for ALTER TABLE DROP
+// COLUMN, which needs SQLite 3.35+ (native support). Called once at the top
+// of the drop block below — hoisted here (not inside dropColumnIfExists) so
+// we don't repeat the version pragma read 7×. Exported for test coverage.
+// -----------------------------------------------------------------------------
+export function assertSqliteSupportsDropColumn(
+  sqliteDb: Database.Database,
+): void {
+  const row = sqliteDb
+    .prepare("SELECT sqlite_version() AS v")
+    .get() as { v: string } | undefined;
+  const version = row?.v ?? "unknown";
+  const parts = version.split(".");
+  const major = Number.parseInt(parts[0] ?? "0", 10);
+  const minor = Number.parseInt(parts[1] ?? "0", 10);
+  const supported =
+    Number.isFinite(major) &&
+    Number.isFinite(minor) &&
+    (major > 3 || (major === 3 && minor >= 35));
+  if (!supported) {
+    throw new Error(
+      `Phase 66 migration requires SQLite >= 3.35 for ALTER TABLE DROP COLUMN. Runtime version: ${version}. Verify better-sqlite3 bundle version.`,
+    );
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Phase 66 Plan 04: idempotent drop-if-exists — inverse of addColumnIfNotExists.
+// Try a scoped SELECT on the column; if it succeeds the column exists → run
+// the DROP; if it throws the column is absent → return silently. Exported
+// so the migration test can exercise the "column absent" no-throw path
+// (Test 3) and the multi-column happy path (Test 1) against test-owned
+// in-memory databases without needing the singleton.
+// -----------------------------------------------------------------------------
+export function dropColumnIfExists(
+  sqliteDb: Database.Database,
+  table: string,
+  column: string,
+): void {
+  try {
+    sqliteDb
+      .prepare(`SELECT "${column}" FROM ${table} LIMIT 1`)
+      .get();
+  } catch {
+    // Column absent → no-op (mirror shape of addColumnIfNotExists inverted).
+    return;
+  }
+  try {
+    sqliteDb.exec(`ALTER TABLE ${table} DROP COLUMN "${column}";`);
+  } catch (dropError) {
+    // Non-fatal per T-66-04-01: a failed drop leaves the surviving columns
+    // intact (deadweight column, not corruption). Next boot re-tries.
+    databaseLogger.warn(
+      `Failed to drop column ${column} from ${table}`,
+      {
+        operation: "schema_migration_drop",
+        table,
+        column,
+        error: dropError,
+      },
+    );
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Phase 66 Plan 04: the seven cosmetic drops packaged as one call. Preflight
+// runs first (throws loudly on SQLite < 3.35 per B6). Exported so the
+// migration test can exercise the full drop sequence against a test-owned
+// in-memory database (Test 1 OLD-schema → shrunken, Test 2 NEW-schema
+// idempotent no-op). Called from migrateSchema() at boot time.
+// -----------------------------------------------------------------------------
+export function runIdentitiesCosmeticDrops(sqliteDb: Database.Database): void {
+  assertSqliteSupportsDropColumn(sqliteDb);
+  dropColumnIfExists(sqliteDb, "identities", "display_name");
+  dropColumnIfExists(sqliteDb, "identities", "title");
+  dropColumnIfExists(sqliteDb, "identities", "color_hue");
+  dropColumnIfExists(sqliteDb, "identities", "voice");
+  dropColumnIfExists(sqliteDb, "identities", "avatar_mime");
+  dropColumnIfExists(sqliteDb, "identities", "avatar_data");
+  dropColumnIfExists(sqliteDb, "identities", "avatar_etag");
+}
+
+// -----------------------------------------------------------------------------
+// Phase 68: drop the identities table entirely. Idempotent via IF EXISTS —
+// safe on fresh installs (table never existed) and upgraded installs
+// (table dropped on first successful boot; subsequent boots no-op).
+// Runs AFTER runIdentitiesCosmeticDrops so any lingering column drops
+// from a stale table on legacy installs complete before the whole
+// table goes away (both are no-op if the table is absent).
+//
+// Exported for test coverage (Test 5 + Test 6 exercise this against
+// test-owned in-memory databases).
+// -----------------------------------------------------------------------------
+export function runIdentitiesTableDrop(sqliteDb: Database.Database): void {
+  try {
+    sqliteDb.exec("DROP TABLE IF EXISTS identities;");
+  } catch (dropError) {
+    // Non-fatal per T-66-04-01 precedent — a failed drop leaves the
+    // table intact (deadweight, not corruption). Since no runtime code
+    // path reads or writes it post-Phase-68, a lingering table is inert.
+    // Next boot retries via IF EXISTS.
+    databaseLogger.warn(
+      "Failed to drop identities table",
+      {
+        operation: "schema_migration_drop_table",
+        table: "identities",
+        error: dropError,
+      },
+    );
+  }
+}
+
+/**
+ * Phase 92 D-02 — drop the `pinned_conversation_ids` column from
+ * `user_preferences`. Pin state lives on disk as `~/fleet/identities/
+ * <name>/.pinned` post-Phase-92 (matches `.no-dormancy` / `.recycle-
+ * requested` presence-is-meaning convention). Plan 02 already retired
+ * every reader/writer of this column in src/ — this drop retires the
+ * dead storage.
+ *
+ * Idempotent via dropColumnIfExists (probes SELECT; ALTER TABLE DROP
+ * COLUMN on hit; silent no-op on miss). The sibling `hidden_conversation
+ * _ids` column on the same row is DELIBERATELY out of scope per D-02
+ * and is not touched — regression-trapped in the migration test's Test 4.
+ *
+ * Exported so index.migration.test.ts can exercise Test 1 (OLD schema
+ * drop) + Test 2 (NEW schema idempotent no-op) against test-owned
+ * in-memory databases — parallel to runIdentitiesCosmeticDrops export
+ * pattern at L851-860.
+ */
+export function runPinColumnDrop(sqliteDb: Database.Database): void {
+  assertSqliteSupportsDropColumn(sqliteDb);
+  dropColumnIfExists(sqliteDb, "user_preferences", "pinned_conversation_ids");
+}
+
+/**
+ * Phase 107 D-02 — drop the `hidden_conversation_ids` column from
+ * `user_preferences`. Hide state lives on disk as `~/fleet/identities/
+ * <name>/.hidden` post-Phase-107 (matches `.no-dormancy` / `.recycle-
+ * requested` / `.pinned` presence-is-meaning convention). Plan 02
+ * already retired every reader/writer of this column in src/ — this
+ * drop retires the dead storage.
+ *
+ * Idempotent via dropColumnIfExists (probes SELECT; ALTER TABLE DROP
+ * COLUMN on hit; silent no-op on miss). Byte-mirror of runPinColumnDrop
+ * at L910-913 — the only difference is the column name.
+ *
+ * Exported so index.migration.test.ts can exercise Test P107-01 (OLD
+ * schema drop) + Test P107-02 (NEW schema idempotent no-op) against
+ * test-owned in-memory databases — parallel to runPinColumnDrop /
+ * runIdentitiesCosmeticDrops export pattern.
+ */
+export function runHiddenColumnDrop(sqliteDb: Database.Database): void {
+  assertSqliteSupportsDropColumn(sqliteDb);
+  dropColumnIfExists(sqliteDb, "user_preferences", "hidden_conversation_ids");
+}
+
+/**
+ * Phase 137 D-31 — drop the `reopen_tabs_on_login` column from
+ * `user_preferences`. Dead fork holdover; tab-restoration is now driven by
+ * a different mechanism. Phase 137 already retired every reader/writer in
+ * src/ — this drop retires the dead storage.
+ *
+ * Idempotent via dropColumnIfExists (probes SELECT; ALTER TABLE DROP
+ * COLUMN on hit; silent no-op on miss). Byte-mirror of runHiddenColumnDrop
+ * at L959-962 — the only difference is the column name.
+ *
+ * Exported so index.migration.test.ts can exercise the idempotent no-op
+ * path (column absent) against test-owned in-memory databases — parallel
+ * to runHiddenColumnDrop / runPinColumnDrop export pattern.
+ */
+export function runReopenTabsColumnDrop(sqliteDb: Database.Database): void {
+  assertSqliteSupportsDropColumn(sqliteDb);
+  dropColumnIfExists(sqliteDb, "user_preferences", "reopen_tabs_on_login");
+}
+
+/**
+ * Drop retired notification tables: push_subscriptions (earlier
+ * push-notification setups) and telegram_links (a short-lived shared-bot
+ * Telegram design that never held rows). Telegram setups now live in
+ * telegram_bots. Idempotent: IF EXISTS makes it a no-op on fresh installs
+ * and on every boot after the first.
+ *
+ * Exported so schema.test.ts can exercise it against in-memory DBs.
+ */
+export function runRetiredNotificationTablesDrop(sqliteDb: Database.Database): void {
+  try {
+    sqliteDb.exec(
+      "DROP INDEX IF EXISTS push_subscriptions_user_endpoint_unique;" +
+        "DROP TABLE IF EXISTS push_subscriptions;" +
+        "DROP TABLE IF EXISTS telegram_links;",
+    );
+  } catch (dropErr) {
+    databaseLogger.warn("push_subscriptions drop failed (non-fatal)", {
+      operation: "schema_migration_drop_push_subscriptions",
+      error: dropErr,
+    });
+  }
+}
+
+const migrateSchema = async () => {
+  // Phase 66 Plan 04: drop the cosmetic columns from identities (now live on
+  // disk per shape file). Preflight asserts SQLite >= 3.35 (native DROP
+  // COLUMN). Idempotent — no-op on fresh installs (columns absent) + on
+  // upgraded installs after the first successful boot (columns dropped).
+  //
+  // Runs BEFORE the addColumnIfNotExists sweep so a legacy install that had
+  // the addColumnIfNotExists lines for these columns removed simultaneously
+  // doesn't briefly re-add them here in the same boot cycle.
+  try {
+    runIdentitiesCosmeticDrops(sqlite);
+  } catch (preflightErr) {
+    // assertSqliteSupportsDropColumn throw — surface loudly (T-66-04-04:
+    // "boot aborts before schema corruption"). Rethrow so container exits
+    // rather than silently continuing with a partially-migrated schema.
+    databaseLogger.error(
+      "Phase 66 identities-drop preflight failed",
+      preflightErr,
+      { operation: "schema_migration_preflight" },
+    );
+    throw preflightErr;
+  }
+
+  // Phase 68: physically drop the identities table (the row survives only
+  // as ownership + timestamps post-Phase-66; Phase 68 shape file dictates
+  // total removal). Idempotent via IF EXISTS. Persist the schema mutation
+  // to the encrypted SQLite file via DatabaseSaveTrigger.forceSave — direct
+  // .exec() writes only reach RAM per CLAUDE.md § "In-memory SQLite pattern".
+  // Wrapped in try/catch: DatabaseSaveTrigger may not yet be initialized on
+  // the FIRST-EVER boot (handlePostInitFileEncryption at L1690-1703 wires
+  // it AFTER migrateSchema returns). A null / uninitialized-trigger failure
+  // is non-fatal — the DROP is idempotent, so the next boot re-fires the
+  // drop and forceSave together, and eventually persists. Phase 66 Plan 04
+  // shipped WITHOUT this wrapper and ran green; adding it here is cheap
+  // defense-in-depth for the first-boot race.
+  runIdentitiesTableDrop(sqlite);
+  try {
+    await DatabaseSaveTrigger.forceSave("phase-68-drop-identities-table");
+  } catch (saveError) {
+    databaseLogger.warn(
+      "[phase-68] forceSave failed post-drop (non-fatal — DROP is idempotent, next boot retries)",
+      {
+        operation: "schema_migration_force_save_post_drop",
+        reason: "phase-68-drop-identities-table",
+        error: saveError,
+      },
+    );
+  }
+
+  // Phase 92 Plan 03 (D-02): drop the pinned_conversation_ids column from
+  // user_preferences. Pin state now lives on disk as `.pinned` sentinels
+  // per identity (Plan 92-01 primitive + Plan 92-02 read/write rewire).
+  // Runs BEFORE the addColumnIfNotExists sweep below so a stale install
+  // that still has an addColumnIfNotExists line pointing at this column
+  // (there isn't one post-this-commit — see the deletion at L945 pre-drop)
+  // couldn't briefly re-add the column in the same boot cycle. Same
+  // ordering rationale as runIdentitiesCosmeticDrops at L901-913.
+  //
+  // Preflight throw is fatal — mirrors L903-913 precedent (T-66-04-04:
+  // "boot aborts before schema corruption"). The labeled forceSave that
+  // persists the schema mutation lives after the addColumnIfNotExists
+  // sweep below so a single forceSave batches the drop + all the adds
+  // in one atomic file write.
+  try {
+    runPinColumnDrop(sqlite);
+  } catch (preflightErr) {
+    databaseLogger.error(
+      "Phase 92 pin-column drop preflight failed",
+      preflightErr,
+      { operation: "schema_migration_preflight" },
+    );
+    throw preflightErr;
+  }
+
+  // Phase 107 Plan 03 (D-02): drop the hidden_conversation_ids column from
+  // user_preferences. Hidden state now lives on disk as `.hidden` sentinels
+  // per identity (Plan 107-01 primitive + Plan 107-02 read/write rewire).
+  // Runs BEFORE the addColumnIfNotExists sweep below — same ordering
+  // rationale as runPinColumnDrop above (drops before adds so a stale
+  // install cannot briefly re-add the column in the same boot cycle).
+  //
+  // Preflight throw is fatal — mirrors L903-913 precedent (T-66-04-04:
+  // "boot aborts before schema corruption"). The labeled forceSave that
+  // persists the schema mutation lives after the addColumnIfNotExists
+  // sweep below, batching this drop + all the adds in one atomic file write.
+  try {
+    runHiddenColumnDrop(sqlite);
+  } catch (preflightErr) {
+    databaseLogger.error(
+      "Phase 107 hidden-column drop preflight failed",
+      preflightErr,
+      { operation: "schema_migration_preflight" },
+    );
+    throw preflightErr;
+  }
+
+  // Phase 137 D-31/D-14 — drop the dead reopen_tabs_on_login column from
+  // user_preferences. This is a fork holdover that no longer has any
+  // reader or writer in src/ post-Phase-137. Runs BEFORE the
+  // addColumnIfNotExists sweep below (drops-before-adds ordering) so a
+  // stale install cannot briefly re-add the column in the same boot cycle.
+  //
+  // Preflight throw is fatal — mirrors the runHiddenColumnDrop precedent
+  // above (T-66-04-04: "boot aborts before schema corruption"). The
+  // labeled forceSave that persists the schema mutation lives after the
+  // addColumnIfNotExists sweep, batching this drop + the fallback_voice
+  // add in one atomic file write.
+  try {
+    runReopenTabsColumnDrop(sqlite);
+  } catch (preflightErr) {
+    databaseLogger.error(
+      "Phase 137 reopen-tabs-column drop preflight failed",
+      preflightErr,
+      { operation: "schema_migration_preflight" },
+    );
+    throw preflightErr;
+  }
+
+  addColumnIfNotExists("user_preferences", "theme", "TEXT");
+  addColumnIfNotExists("user_preferences", "font_size", "TEXT");
+  addColumnIfNotExists("user_preferences", "accent_color", "TEXT");
+  addColumnIfNotExists("user_preferences", "language", "TEXT");
+  addColumnIfNotExists("user_preferences", "fallback_voice", "TEXT");  // NEW per Phase 137 D-14
+  addColumnIfNotExists("user_preferences", "tts_playback_rate", "REAL");
+  addColumnIfNotExists("user_preferences", "voice_mode_end_of_turn", "TEXT");
+  addColumnIfNotExists("user_preferences", "voice_mode_send_phrase", "TEXT");
+  addColumnIfNotExists("user_preferences", "voice_mode_pause_seconds", "INTEGER");
+  addColumnIfNotExists("user_preferences", "whats_new_seen", "TEXT");
+  try {
+    const counted = countUncountedAccounts(sqlite, WHATS_NEW_NOTES);
+    if (counted > 0) {
+      databaseLogger.info("What's new: counted accounts with no seen record", {
+        operation: "whats_new_count_accounts",
+        counted,
+        noteCount: WHATS_NEW_NOTES.length,
+      });
+    }
+  } catch (countErr) {
+    databaseLogger.warn("What's new: counting accounts at boot failed (non-fatal; load-time counting still applies)", {
+      operation: "whats_new_count_accounts_failed",
+      error: countErr instanceof Error ? countErr.message : String(countErr),
+    });
+  }
+
+  // Phase 137 D-31/D-14 — persist the batch of schema mutations from this
+  // block to the encrypted SQLite file in one atomic write: (a) the Phase 92
+  // pinned_conversation_ids DROP (runPinColumnDrop above), (b) the Phase 107
+  // hidden_conversation_ids DROP (runHiddenColumnDrop above), (c) the Phase 137
+  // reopen_tabs_on_login DROP (runReopenTabsColumnDrop above), and (d) the
+  // user_preferences addColumnIfNotExists sweep including
+  // the new fallback_voice column.
+  //
+  // Direct .exec() writes only reach RAM per CLAUDE.md § "In-memory SQLite
+  // pattern"; without an explicit forceSave the drops live only in memory
+  // until an unrelated write fires the debounced save trigger — a restart
+  // in that window would lose the schema mutation and re-run the drop on
+  // next boot. Wrapped in try/catch with a non-fatal warn:
+  // dropColumnIfExists and addColumnIfNotExists are idempotent, so a save
+  // failure retries on the next boot cycle. The label is always the LATEST
+  // migration touching this file — per Phase 92 Plan 03 precedent, one
+  // forceSave batches all prior mutations in a single atomic write.
+  // Mirrors the L928-939 (phase-68) / L995-1006 (phase-75) precedent —
+  // same shape, same reason, same tolerance for uninitialized-trigger
+  // races on the first-ever boot.
+  try {
+    await DatabaseSaveTrigger.forceSave(
+      "phase-137-fallback-voice-schema",
+    );
+  } catch (saveError) {
+    databaseLogger.warn(
+      "[phase-137] forceSave failed post-schema (non-fatal — dropColumnIfExists + addColumnIfNotExists are idempotent, next boot retries)",
+      {
+        operation: "schema_migration_force_save_post_drop",
+        reason: "phase-137-fallback-voice-schema",
+        error: saveError,
+      },
+    );
+  }
+
+  // Bounty message-queue-in-pretty-view: queue_slots column for compose_drafts.
+  // Existing installs pick this up via addColumnIfNotExists; fresh installs get it
+  // from the CREATE TABLE IF NOT EXISTS block above.
+  addColumnIfNotExists("compose_drafts", "queue_slots", "TEXT NOT NULL DEFAULT '[]'");
+
+  addColumnIfNotExists("user_open_tabs", "target_tmux_session", "TEXT");
+  // Phase 120 — app-tab tuple's slug half. Idempotent per addColumnIfNotExists's SELECT-probe-then-ALTER shape.
+  addColumnIfNotExists("user_open_tabs", "app_slug", "TEXT");
+
+  addColumnIfNotExists("users", "is_admin", "INTEGER NOT NULL DEFAULT 0");
+
+  addColumnIfNotExists("users", "is_oidc", "INTEGER NOT NULL DEFAULT 0");
+  addColumnIfNotExists("users", "oidc_identifier", "TEXT");
+  addColumnIfNotExists("users", "client_id", "TEXT");
+  addColumnIfNotExists("users", "client_secret", "TEXT");
+  addColumnIfNotExists("users", "issuer_url", "TEXT");
+  addColumnIfNotExists("users", "authorization_url", "TEXT");
+  addColumnIfNotExists("users", "token_url", "TEXT");
+
+  addColumnIfNotExists("users", "identifier_path", "TEXT");
+  addColumnIfNotExists("users", "name_path", "TEXT");
+  addColumnIfNotExists("users", "scopes", "TEXT");
+
+  addColumnIfNotExists("users", "totp_secret", "TEXT");
+  addColumnIfNotExists("users", "totp_enabled", "INTEGER NOT NULL DEFAULT 0");
+  addColumnIfNotExists("users", "totp_backup_codes", "TEXT");
+
+  // Phase 75 Plan 01 (Q3 locked decision) — mxid column for the Matrix
+  // relay mapping. Nullable: populated via POST /users/:id/mxid (Plan 03)
+  // for humans; agents' mxids live on-disk in relay.json per fleet
+  // convention. Idempotent via addColumnIfNotExists (probes SELECT, ALTER
+  // on throw). The Drizzle mirror lives at schema.ts users.mxid.
+  addColumnIfNotExists("users", "mxid", "TEXT");
+
+  // Phase 75 Plan 01 — persist the new matrix_admin_creds table + users.mxid
+  // column to the encrypted SQLite file. Both DDLs (CREATE TABLE IF NOT
+  // EXISTS matrix_admin_creds in the top-level exec block, and the
+  // addColumnIfNotExists above) execute against the RAM SQLite; without an
+  // explicit forceSave the new schema lives only in memory until an unrelated
+  // write fires the debounced save trigger. A restart before that first
+  // unrelated write loses the schema and re-runs the DDL on next boot.
+  //
+  // Wrapped in try/catch with a non-fatal warn: DatabaseSaveTrigger may not
+  // yet be initialized on the first-ever boot (handlePostInitFileEncryption
+  // wires it AFTER migrateSchema returns per index.ts init order). Both the
+  // CREATE TABLE IF NOT EXISTS and the addColumnIfNotExists probe-then-ALTER
+  // are idempotent, so a save failure retries on the next boot cycle.
+  // Mirrors the precedent at L810-821 (phase-68 drop) — same shape, same
+  // reason, same tolerance for uninitialized-trigger races.
+  try {
+    await DatabaseSaveTrigger.forceSave("phase-75-matrix-admin-schema");
+  } catch (saveError) {
+    databaseLogger.warn(
+      "[phase-75] forceSave failed post-schema (non-fatal — CREATE IF NOT EXISTS + addColumnIfNotExists are idempotent, next boot retries)",
+      {
+        operation: "schema_migration_force_save_post_add",
+        reason: "phase-75-matrix-admin-schema",
+        error: saveError,
+      },
+    );
+  }
+
+  // Phase 85 Plan 01 (locked decision D-04) — avatar_path column for the
+  // per-user avatar file pointer. Nullable: carries only the filename under
+  // ${DATA_DIR}/user-avatars/ (D-05, deterministic + resolvable from DATA_DIR
+  // alone); pre-existing users keep null (D-13 defers backfill). Mandatoriness
+  // on new rows is enforced at POST /users/create per D-07, not the schema (D-06).
+  // Idempotent via addColumnIfNotExists (probes SELECT, ALTER on throw).
+  // The Drizzle mirror lives at schema.ts users.avatarPath.
+  addColumnIfNotExists("users", "avatar_path", "TEXT");
+
+  // Phase 85 Plan 01 — persist the new users.avatar_path column to the
+  // encrypted SQLite file. The addColumnIfNotExists above executes against
+  // RAM SQLite; without an explicit forceSave the new schema lives only in
+  // memory until an unrelated write fires the debounced save trigger. A
+  // restart before that first unrelated write loses the schema and re-runs
+  // the DDL on next boot. Wrapped in try/catch with a non-fatal warn:
+  // addColumnIfNotExists is idempotent, so a save failure retries on next boot.
+  try {
+    await DatabaseSaveTrigger.forceSave("phase-85-user-avatar-schema");
+  } catch (saveError) {
+    databaseLogger.warn(
+      "[phase-85] forceSave failed post-schema (non-fatal — addColumnIfNotExists is idempotent, next boot retries)",
+      {
+        operation: "schema_migration_force_save_post_add",
+        reason: "phase-85-user-avatar-schema",
+        error: saveError,
+      },
+    );
+  }
+
+  // agent-phone shape — E.164 phone number column for the agent-phone
+  // capability. Nullable: the agent-phone service checks this at
+  // process time and fails the request with outcome "no_phone_on_file" when
+  // absent. Format enforced at the admin update endpoint (leading "+", digits
+  // only, reasonable length). No UI to set this today — admin-cookie curl only.
+  // The Drizzle mirror lives at schema.ts users.phoneE164.
+  addColumnIfNotExists("users", "phone_e164", "TEXT");
+
+  // Notifications gate — per-user opt-in for push notifications, default off.
+  // Admins bypass it (see notifications/notifications-access.ts). Persisted by
+  // the forceSave below. The Drizzle mirror lives at schema.ts
+  // users.notificationsEnabled.
+  addColumnIfNotExists("users", "notifications_enabled", "INTEGER NOT NULL DEFAULT 0");
+
+  // agent-phone — persist the new users.phone_e164 column. Same pattern as
+  // phase-75 and phase-85 above: addColumnIfNotExists executes against RAM
+  // SQLite; without an explicit forceSave the schema lives only in memory
+  // until an unrelated write fires the debounced trigger. Idempotent probe
+  // means a save failure retries on next boot.
+  try {
+    await DatabaseSaveTrigger.forceSave("agent-phone-user-phone-schema");
+  } catch (saveError) {
+    databaseLogger.warn(
+      "[agent-phone] forceSave failed post-schema (non-fatal — addColumnIfNotExists is idempotent, next boot retries)",
+      {
+        operation: "schema_migration_force_save_post_add",
+        reason: "agent-phone-user-phone-schema",
+        error: saveError,
+      },
+    );
+  }
+
+  addColumnIfNotExists("ssh_data", "name", "TEXT");
+  addColumnIfNotExists("ssh_data", "folder", "TEXT");
+  addColumnIfNotExists("ssh_data", "tags", "TEXT");
+  addColumnIfNotExists("ssh_data", "pin", "INTEGER NOT NULL DEFAULT 0");
+  addColumnIfNotExists(
+    "ssh_data",
+    "auth_type",
+    'TEXT NOT NULL DEFAULT "password"',
+  );
+  addColumnIfNotExists("ssh_data", "password", "TEXT");
+  addColumnIfNotExists("ssh_data", "key", "TEXT");
+  addColumnIfNotExists("ssh_data", "key_password", "TEXT");
+  addColumnIfNotExists("ssh_data", "key_type", "TEXT");
+  addColumnIfNotExists(
+    "ssh_data",
+    "enable_terminal",
+    "INTEGER NOT NULL DEFAULT 1",
+  );
+  addColumnIfNotExists(
+    "ssh_data",
+    "enable_tunnel",
+    "INTEGER NOT NULL DEFAULT 1",
+  );
+  addColumnIfNotExists("ssh_data", "tunnel_connections", "TEXT");
+  addColumnIfNotExists("ssh_data", "jump_hosts", "TEXT");
+  addColumnIfNotExists(
+    "ssh_data",
+    "enable_file_manager",
+    "INTEGER NOT NULL DEFAULT 1",
+  );
+  addColumnIfNotExists("ssh_data", "default_path", "TEXT");
+  addColumnIfNotExists(
+    "ssh_data",
+    "created_at",
+    "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP",
+  );
+  addColumnIfNotExists(
+    "ssh_data",
+    "updated_at",
+    "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP",
+  );
+  addColumnIfNotExists("ssh_data", "force_keyboard_interactive", "TEXT");
+  addColumnIfNotExists("ssh_data", "autostart_password", "TEXT");
+  addColumnIfNotExists("ssh_data", "autostart_key", "TEXT");
+  addColumnIfNotExists("ssh_data", "autostart_key_password", "TEXT");
+  addColumnIfNotExists(
+    "ssh_data",
+    "credential_id",
+    "INTEGER REFERENCES ssh_credentials(id) ON DELETE SET NULL",
+  );
+  addColumnIfNotExists(
+    "ssh_data",
+    "override_credential_username",
+    "INTEGER",
+  );
+
+  addColumnIfNotExists("ssh_data", "autostart_password", "TEXT");
+  addColumnIfNotExists("ssh_data", "autostart_key", "TEXT");
+  addColumnIfNotExists("ssh_data", "autostart_key_password", "TEXT");
+  addColumnIfNotExists("ssh_data", "stats_config", "TEXT");
+  addColumnIfNotExists("ssh_data", "terminal_config", "TEXT");
+  addColumnIfNotExists("ssh_data", "quick_actions", "TEXT");
+  addColumnIfNotExists(
+    "ssh_data",
+    "enable_docker",
+    "INTEGER NOT NULL DEFAULT 0",
+  );
+  addColumnIfNotExists("ssh_data", "docker_config", "TEXT");
+
+  addColumnIfNotExists("ssh_data", "connection_type", 'TEXT NOT NULL DEFAULT "ssh"');
+  addColumnIfNotExists("ssh_data", "domain", "TEXT");
+  addColumnIfNotExists("ssh_data", "security", "TEXT");
+  addColumnIfNotExists("ssh_data", "ignore_cert", "INTEGER NOT NULL DEFAULT 0");
+  addColumnIfNotExists("ssh_data", "guacamole_config", "TEXT");
+  addColumnIfNotExists("ssh_data", "notes", "TEXT");
+
+  addColumnIfNotExists("ssh_data", "use_socks5", "INTEGER");
+  addColumnIfNotExists("ssh_data", "socks5_host", "TEXT");
+  addColumnIfNotExists("ssh_data", "socks5_port", "INTEGER");
+  addColumnIfNotExists("ssh_data", "socks5_username", "TEXT");
+  addColumnIfNotExists("ssh_data", "socks5_password", "TEXT");
+  addColumnIfNotExists("ssh_data", "socks5_proxy_chain", "TEXT");
+
+  addColumnIfNotExists("ssh_data", "host_key_fingerprint", "TEXT");
+  addColumnIfNotExists("ssh_data", "host_key_type", "TEXT");
+  addColumnIfNotExists("ssh_data", "host_key_algorithm", "TEXT DEFAULT 'sha256'");
+  addColumnIfNotExists("ssh_data", "host_key_first_seen", "TEXT");
+  addColumnIfNotExists("ssh_data", "host_key_last_verified", "TEXT");
+  addColumnIfNotExists("ssh_data", "host_key_changed_count", "INTEGER DEFAULT 0");
+
+  addColumnIfNotExists(
+    "ssh_data",
+    "show_terminal_in_sidebar",
+    "INTEGER NOT NULL DEFAULT 1",
+  );
+  addColumnIfNotExists(
+    "ssh_data",
+    "show_file_manager_in_sidebar",
+    "INTEGER NOT NULL DEFAULT 0",
+  );
+  addColumnIfNotExists(
+    "ssh_data",
+    "show_tunnel_in_sidebar",
+    "INTEGER NOT NULL DEFAULT 0",
+  );
+  addColumnIfNotExists(
+    "ssh_data",
+    "show_docker_in_sidebar",
+    "INTEGER NOT NULL DEFAULT 0",
+  );
+  addColumnIfNotExists(
+    "ssh_data",
+    "show_server_stats_in_sidebar",
+    "INTEGER NOT NULL DEFAULT 0",
+  );
+
+  // Phase 72 Plan 02 — opt-in flag for the fleet-substrate reconcile sweep.
+  // Default 0 means no host is swept until an operator explicitly flips it.
+  // Migration is idempotent via addColumnIfNotExists (probes SELECT, ALTER on
+  // throw); safe on fresh installs (column added on first successful boot)
+  // and upgraded installs (column added once, then no-op on every subsequent
+  // boot). The Drizzle mirror lives at schema.ts hosts.runsFleetSubstrate.
+  addColumnIfNotExists("ssh_data", "runs_fleet_substrate", "INTEGER NOT NULL DEFAULT 0");
+  try {
+    await DatabaseSaveTrigger.forceSave("phase-72-add-runs-fleet-substrate");
+  } catch (saveError) {
+    databaseLogger.warn(
+      "[phase-72] forceSave failed post-add (non-fatal — addColumnIfNotExists is idempotent, next boot retries)",
+      {
+        operation: "schema_migration_force_save_post_add",
+        reason: "phase-72-add-runs-fleet-substrate",
+        error: saveError,
+      },
+    );
+  }
+
+  addColumnIfNotExists("ssh_credentials", "private_key", "TEXT");
+  addColumnIfNotExists("ssh_credentials", "public_key", "TEXT");
+  addColumnIfNotExists("ssh_credentials", "detected_key_type", "TEXT");
+
+  addColumnIfNotExists("ssh_credentials", "cert_public_key", "TEXT");
+
+  addColumnIfNotExists("ssh_credentials", "system_password", "TEXT");
+  addColumnIfNotExists("ssh_credentials", "system_key", "TEXT");
+  addColumnIfNotExists("ssh_credentials", "system_key_password", "TEXT");
+
+  try {
+    const tableInfo = sqlite.prepare("PRAGMA table_info(ssh_credentials)").all() as Array<{
+      cid: number;
+      name: string;
+      type: string;
+      notnull: number;
+      dflt_value: string | null;
+      pk: number;
+    }>;
+    const usernameCol = tableInfo.find((col) => col.name === "username");
+
+    if (usernameCol && usernameCol.notnull === 1) {
+      const tempTableName = "ssh_credentials_temp_migration";
+      const allColumns = tableInfo.map((col) => col.name).join(", ");
+
+      sqlite.exec(`PRAGMA foreign_keys = OFF`);
+      sqlite.exec(`
+        CREATE TABLE ${tempTableName} (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL,
+          name TEXT NOT NULL,
+          description TEXT,
+          folder TEXT,
+          tags TEXT,
+          auth_type TEXT NOT NULL,
+          username TEXT,
+          password TEXT,
+          key TEXT,
+          key_password TEXT,
+          key_type TEXT,
+          usage_count INTEGER NOT NULL DEFAULT 0,
+          last_used TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          private_key TEXT,
+          public_key TEXT,
+          detected_key_type TEXT,
+          system_password TEXT,
+          system_key TEXT,
+          system_key_password TEXT,
+          FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+        );
+
+        INSERT INTO ${tempTableName} SELECT ${allColumns} FROM ssh_credentials;
+
+        DROP TABLE ssh_credentials;
+
+        ALTER TABLE ${tempTableName} RENAME TO ssh_credentials;
+      `);
+      sqlite.exec(`PRAGMA foreign_keys = ON`);
+
+      databaseLogger.info("Successfully migrated ssh_credentials table to remove username NOT NULL constraint", {
+        operation: "schema_migration_username_nullable",
+      });
+    }
+  } catch (migrationError) {
+    databaseLogger.warn("Failed to migrate ssh_credentials username column", {
+      operation: "schema_migration",
+      error: migrationError,
+    });
+  }
+
+  addColumnIfNotExists("file_manager_recent", "host_id", "INTEGER NOT NULL");
+  addColumnIfNotExists("file_manager_pinned", "host_id", "INTEGER NOT NULL");
+  addColumnIfNotExists("file_manager_shortcuts", "host_id", "INTEGER NOT NULL");
+
+  addColumnIfNotExists("snippets", "folder", "TEXT");
+  addColumnIfNotExists("snippets", "order", "INTEGER NOT NULL DEFAULT 0");
+  addColumnIfNotExists("snippets", "host_filter", "TEXT");
+  // When the session last proved who it is (password + code) — read by
+  // the "confirm it's you" check on sensitive actions.
+  addColumnIfNotExists("sessions", "confirmed_at", "TEXT");
+
+  try {
+    sqlite
+      .prepare("SELECT id FROM snippet_folders LIMIT 1")
+      .get();
+  } catch {
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS snippet_folders (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL,
+          name TEXT NOT NULL,
+          color TEXT,
+          icon TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+        );
+      `);
+    } catch (createError) {
+      databaseLogger.warn("Failed to create snippet_folders table", {
+        operation: "schema_migration",
+        error: createError,
+      });
+    }
+  }
+
+  try {
+    sqlite.prepare("SELECT id FROM snippet_access LIMIT 1").get();
+  } catch {
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS snippet_access (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          snippet_id INTEGER NOT NULL,
+          user_id TEXT,
+          role_id INTEGER,
+          granted_by TEXT NOT NULL,
+          permission_level TEXT NOT NULL DEFAULT 'view',
+          expires_at TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (snippet_id) REFERENCES snippets (id) ON DELETE CASCADE,
+          FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+          FOREIGN KEY (role_id) REFERENCES roles (id) ON DELETE CASCADE,
+          FOREIGN KEY (granted_by) REFERENCES users (id) ON DELETE CASCADE
+        );
+      `);
+    } catch (createError) {
+      databaseLogger.warn("Failed to create snippet_access table", {
+        operation: "schema_migration",
+        error: createError,
+      });
+    }
+  }
+
+  try {
+    sqlite.prepare("SELECT id FROM c2s_tunnel_presets LIMIT 1").get();
+  } catch {
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS c2s_tunnel_presets (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL,
+          name TEXT NOT NULL,
+          config TEXT NOT NULL,
+          platform TEXT,
+          computer_name TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+        );
+      `);
+    } catch (createError) {
+      databaseLogger.warn("Failed to create c2s_tunnel_presets table", {
+        operation: "schema_migration",
+        error: createError,
+      });
+    }
+  }
+
+  try {
+    sqlite
+      .prepare("SELECT id FROM sessions LIMIT 1")
+      .get();
+  } catch {
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS sessions (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          jwt_token TEXT NOT NULL,
+          device_type TEXT NOT NULL,
+          device_info TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          expires_at TEXT NOT NULL,
+          last_active_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (user_id) REFERENCES users (id)
+        );
+      `);
+    } catch (createError) {
+      databaseLogger.warn("Failed to create sessions table", {
+        operation: "schema_migration",
+        error: createError,
+      });
+    }
+  }
+
+  try {
+    sqlite
+      .prepare("SELECT id FROM trusted_devices LIMIT 1")
+      .get();
+  } catch {
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS trusted_devices (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          device_fingerprint TEXT NOT NULL,
+          device_type TEXT NOT NULL,
+          device_info TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          expires_at TEXT NOT NULL,
+          last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+        );
+      `);
+    } catch (createError) {
+      databaseLogger.warn("Failed to create trusted_devices table", {
+        operation: "schema_migration",
+        error: createError,
+      });
+    }
+  }
+
+  try {
+    sqlite
+      .prepare("SELECT id FROM network_topology LIMIT 1")
+      .get();
+  } catch {
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS network_topology (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL,
+          topology TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+        );
+      `);
+    } catch (createError) {
+      databaseLogger.warn("Failed to create network_topology table", {
+        operation: "schema_migration",
+        error: createError,
+      });
+    }
+  }
+
+  // Phase 89 Plan 01 (D-01, D-02, D-16) — belt-and-suspenders migration
+  // probes for relay_room_sessions + admin_rooms. The top-of-init CREATE
+  // TABLE IF NOT EXISTS blocks above cover fresh installs; these probes
+  // cover the upgrade-from-old-schema path (sessions / trusted_devices
+  // precedent). Both DDLs are idempotent (IF NOT EXISTS + IF NOT EXISTS
+  // on the unique index) so re-execing on an already-migrated DB is a
+  // no-op. The labeled forceSave below persists the migration to the
+  // encrypted disk file so a restart before the next unrelated write
+  // does not silently re-run the DDL forever.
+  try {
+    sqlite.prepare("SELECT id FROM relay_room_sessions LIMIT 1").get();
+  } catch {
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS relay_room_sessions (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          room_id TEXT NOT NULL,
+          room_title TEXT,
+          state TEXT NOT NULL,
+          last_activity_at TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS relay_room_sessions_user_room_uidx
+          ON relay_room_sessions(user_id, room_id);
+      `);
+    } catch (createError) {
+      databaseLogger.warn("Failed to create relay_room_sessions table", {
+        operation: "schema_migration",
+        error: createError,
+      });
+    }
+  }
+
+  try {
+    sqlite.prepare("SELECT room_id FROM admin_rooms LIMIT 1").get();
+  } catch {
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS admin_rooms (
+          room_id TEXT PRIMARY KEY,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+    } catch (createError) {
+      databaseLogger.warn("Failed to create admin_rooms table", {
+        operation: "schema_migration",
+        error: createError,
+      });
+    }
+  }
+
+  // Drop retired notification tables (push_subscriptions, telegram_links). The forceSave below
+  // persists the drop to the encrypted disk file.
+  runRetiredNotificationTablesDrop(sqlite);
+
+  // Phase 89 Plan 01 — persist the new relay_room_sessions + admin_rooms
+  // schema to the encrypted SQLite file. Same reason as the phase-75
+  // matrix_admin_creds save at L920-933: both DDLs above execute against
+  // RAM SQLite; without an explicit forceSave the new schema lives only
+  // in memory until an unrelated write fires the debounced save trigger.
+  // A restart before that first unrelated write loses the schema and
+  // re-runs the DDL on next boot.
+  //
+  // Wrapped in try/catch with a non-fatal warn: DatabaseSaveTrigger may
+  // not yet be initialized on the first-ever boot (handlePostInitFileEncryption
+  // wires it AFTER migrateSchema returns). Both CREATE TABLE IF NOT EXISTS
+  // + CREATE UNIQUE INDEX IF NOT EXISTS blocks are idempotent, so a save
+  // failure retries on the next boot cycle.
+  try {
+    await DatabaseSaveTrigger.forceSave("phase-89-relay-sessions-schema-init");
+  } catch (saveError) {
+    databaseLogger.warn(
+      "[phase-89] forceSave failed post-schema (non-fatal — CREATE IF NOT EXISTS + UNIQUE INDEX IF NOT EXISTS are idempotent, next boot retries)",
+      {
+        operation: "schema_migration_force_save_post_create",
+        reason: "phase-89-relay-sessions-schema-init",
+        error: saveError,
+      },
+    );
+  }
+
+  // Persist the push_subscriptions drop. Same reason as the phase-89 save
+  // above: DDL runs against RAM SQLite. DatabaseSaveTrigger may not be wired
+  // on the first-ever boot; the drop is idempotent, so the next boot retries.
+  try {
+    await DatabaseSaveTrigger.forceSave("push-subscriptions-drop");
+  } catch (saveError) {
+    databaseLogger.warn(
+      "forceSave failed after push_subscriptions drop (non-fatal — idempotent, next boot retries)",
+      {
+        operation: "schema_migration_force_save_post_create",
+        reason: "push-subscriptions-drop",
+        error: saveError,
+      },
+    );
+  }
+
+  try {
+    sqlite
+      .prepare("SELECT id FROM dashboard_preferences LIMIT 1")
+      .get();
+  } catch {
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS dashboard_preferences (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL UNIQUE,
+          layout TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+        );
+      `);
+    } catch (createError) {
+      databaseLogger.warn("Failed to create dashboard_preferences table", {
+        operation: "schema_migration",
+        error: createError,
+      });
+    }
+  }
+
+  try {
+    sqlite.prepare("SELECT id FROM host_access LIMIT 1").get();
+  } catch {
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS host_access (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          host_id INTEGER NOT NULL,
+          user_id TEXT,
+          role_id INTEGER,
+          granted_by TEXT NOT NULL,
+          permission_level TEXT NOT NULL DEFAULT 'use',
+          expires_at TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          last_accessed_at TEXT,
+          access_count INTEGER NOT NULL DEFAULT 0,
+          FOREIGN KEY (host_id) REFERENCES ssh_data (id) ON DELETE CASCADE,
+          FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+          FOREIGN KEY (role_id) REFERENCES roles (id) ON DELETE CASCADE,
+          FOREIGN KEY (granted_by) REFERENCES users (id) ON DELETE CASCADE
+        );
+      `);
+    } catch (createError) {
+      databaseLogger.warn("Failed to create host_access table", {
+        operation: "schema_migration",
+        error: createError,
+      });
+    }
+  }
+
+  try {
+    sqlite.prepare("SELECT role_id FROM host_access LIMIT 1").get();
+  } catch {
+    try {
+      sqlite.exec("ALTER TABLE host_access ADD COLUMN role_id INTEGER REFERENCES roles(id) ON DELETE CASCADE");
+    } catch (alterError) {
+      databaseLogger.warn("Failed to add role_id column", {
+        operation: "schema_migration",
+        error: alterError,
+      });
+    }
+  }
+
+  try {
+    sqlite.prepare("SELECT override_credential_id FROM host_access LIMIT 1").get();
+  } catch {
+    try {
+      sqlite.exec("ALTER TABLE host_access ADD COLUMN override_credential_id INTEGER REFERENCES ssh_credentials(id) ON DELETE SET NULL");
+    } catch (alterError) {
+      databaseLogger.warn("Failed to add override_credential_id column", {
+        operation: "schema_migration",
+        error: alterError,
+      });
+    }
+  }
+
+  try {
+    sqlite.prepare("SELECT server_name FROM matrix_admin_creds LIMIT 1").get();
+  } catch {
+    try {
+      sqlite.exec("ALTER TABLE matrix_admin_creds ADD COLUMN server_name TEXT");
+    } catch (alterError) {
+      databaseLogger.warn("Failed to add server_name column", {
+        operation: "schema_migration",
+        error: alterError,
+      });
+    }
+  }
+
+  try {
+    sqlite.prepare("SELECT host_side_base FROM matrix_admin_creds LIMIT 1").get();
+  } catch {
+    try {
+      sqlite.exec("ALTER TABLE matrix_admin_creds ADD COLUMN host_side_base TEXT");
+    } catch (alterError) {
+      databaseLogger.warn("Failed to add host_side_base column", {
+        operation: "schema_migration",
+        error: alterError,
+      });
+    }
+  }
+
+  try {
+    sqlite.prepare("SELECT sudo_password FROM ssh_data LIMIT 1").get();
+  } catch {
+    try {
+      sqlite.exec("ALTER TABLE ssh_data ADD COLUMN sudo_password TEXT");
+    } catch (alterError) {
+      databaseLogger.warn("Failed to add sudo_password column", {
+        operation: "schema_migration",
+        error: alterError,
+      });
+    }
+  }
+
+  const sshDataMigrations: Array<{ column: string; sql: string }> = [
+    { column: "connection_type", sql: "ALTER TABLE ssh_data ADD COLUMN connection_type TEXT NOT NULL DEFAULT 'ssh'" },
+    { column: "credential_id", sql: "ALTER TABLE ssh_data ADD COLUMN credential_id INTEGER" },
+    { column: "override_credential_username", sql: "ALTER TABLE ssh_data ADD COLUMN override_credential_username INTEGER" },
+    { column: "jump_hosts", sql: "ALTER TABLE ssh_data ADD COLUMN jump_hosts TEXT" },
+    { column: "show_terminal_in_sidebar", sql: "ALTER TABLE ssh_data ADD COLUMN show_terminal_in_sidebar INTEGER NOT NULL DEFAULT 1" },
+    { column: "show_file_manager_in_sidebar", sql: "ALTER TABLE ssh_data ADD COLUMN show_file_manager_in_sidebar INTEGER NOT NULL DEFAULT 0" },
+    { column: "show_tunnel_in_sidebar", sql: "ALTER TABLE ssh_data ADD COLUMN show_tunnel_in_sidebar INTEGER NOT NULL DEFAULT 0" },
+    { column: "show_docker_in_sidebar", sql: "ALTER TABLE ssh_data ADD COLUMN show_docker_in_sidebar INTEGER NOT NULL DEFAULT 0" },
+    { column: "show_server_stats_in_sidebar", sql: "ALTER TABLE ssh_data ADD COLUMN show_server_stats_in_sidebar INTEGER NOT NULL DEFAULT 0" },
+    { column: "quick_actions", sql: "ALTER TABLE ssh_data ADD COLUMN quick_actions TEXT" },
+    { column: "domain", sql: "ALTER TABLE ssh_data ADD COLUMN domain TEXT" },
+    { column: "security", sql: "ALTER TABLE ssh_data ADD COLUMN security TEXT" },
+    { column: "ignore_cert", sql: "ALTER TABLE ssh_data ADD COLUMN ignore_cert INTEGER NOT NULL DEFAULT 0" },
+    { column: "guacamole_config", sql: "ALTER TABLE ssh_data ADD COLUMN guacamole_config TEXT" },
+    { column: "socks5_proxy_chain", sql: "ALTER TABLE ssh_data ADD COLUMN socks5_proxy_chain TEXT" },
+    { column: "host_key_fingerprint", sql: "ALTER TABLE ssh_data ADD COLUMN host_key_fingerprint TEXT" },
+    { column: "host_key_type", sql: "ALTER TABLE ssh_data ADD COLUMN host_key_type TEXT" },
+    { column: "host_key_algorithm", sql: "ALTER TABLE ssh_data ADD COLUMN host_key_algorithm TEXT NOT NULL DEFAULT 'sha256'" },
+    { column: "host_key_first_seen", sql: "ALTER TABLE ssh_data ADD COLUMN host_key_first_seen TEXT" },
+    { column: "host_key_last_verified", sql: "ALTER TABLE ssh_data ADD COLUMN host_key_last_verified TEXT" },
+    { column: "host_key_changed_count", sql: "ALTER TABLE ssh_data ADD COLUMN host_key_changed_count INTEGER NOT NULL DEFAULT 0" },
+    { column: "mac_address", sql: "ALTER TABLE ssh_data ADD COLUMN mac_address TEXT" },
+    { column: "port_knock_sequence", sql: "ALTER TABLE ssh_data ADD COLUMN port_knock_sequence TEXT" },
+    { column: "enable_ssh", sql: "ALTER TABLE ssh_data ADD COLUMN enable_ssh INTEGER NOT NULL DEFAULT 1" },
+    { column: "enable_rdp", sql: "ALTER TABLE ssh_data ADD COLUMN enable_rdp INTEGER NOT NULL DEFAULT 0" },
+    { column: "enable_vnc", sql: "ALTER TABLE ssh_data ADD COLUMN enable_vnc INTEGER NOT NULL DEFAULT 0" },
+    { column: "enable_telnet", sql: "ALTER TABLE ssh_data ADD COLUMN enable_telnet INTEGER NOT NULL DEFAULT 0" },
+    { column: "ssh_port", sql: "ALTER TABLE ssh_data ADD COLUMN ssh_port INTEGER DEFAULT 22" },
+    { column: "rdp_port", sql: "ALTER TABLE ssh_data ADD COLUMN rdp_port INTEGER DEFAULT 3389" },
+    { column: "vnc_port", sql: "ALTER TABLE ssh_data ADD COLUMN vnc_port INTEGER DEFAULT 5900" },
+    { column: "telnet_port", sql: "ALTER TABLE ssh_data ADD COLUMN telnet_port INTEGER DEFAULT 23" },
+    { column: "rdp_user", sql: "ALTER TABLE ssh_data ADD COLUMN rdp_user TEXT" },
+    { column: "rdp_password", sql: "ALTER TABLE ssh_data ADD COLUMN rdp_password TEXT" },
+    { column: "rdp_domain", sql: "ALTER TABLE ssh_data ADD COLUMN rdp_domain TEXT" },
+    { column: "rdp_security", sql: "ALTER TABLE ssh_data ADD COLUMN rdp_security TEXT" },
+    { column: "rdp_ignore_cert", sql: "ALTER TABLE ssh_data ADD COLUMN rdp_ignore_cert INTEGER DEFAULT 0" },
+    { column: "vnc_password", sql: "ALTER TABLE ssh_data ADD COLUMN vnc_password TEXT" },
+    { column: "vnc_user", sql: "ALTER TABLE ssh_data ADD COLUMN vnc_user TEXT" },
+    { column: "telnet_user", sql: "ALTER TABLE ssh_data ADD COLUMN telnet_user TEXT" },
+    { column: "telnet_password", sql: "ALTER TABLE ssh_data ADD COLUMN telnet_password TEXT" },
+  ];
+
+  for (const migration of sshDataMigrations) {
+    try {
+      sqlite.prepare(`SELECT ${migration.column} FROM ssh_data LIMIT 1`).get();
+    } catch {
+      try {
+        sqlite.exec(migration.sql);
+      } catch (alterError) {
+        databaseLogger.warn(`Failed to add ${migration.column} column`, {
+          operation: "schema_migration",
+          error: alterError,
+        });
+      }
+    }
+  }
+
+  try {
+    applyMachineIdSchema(sqlite);
+  } catch (machineIdError) {
+    databaseLogger.warn("Failed to apply machine_id schema", {
+      operation: "schema_migration",
+      error: machineIdError,
+    });
+  }
+
+  // Copy unencrypted username/domain into protocol-specific columns for old guac hosts.
+  // Passwords are handled via the legacy field name fallback in lazy-field-encryption.ts.
+  const usernameDomainBackfills = [
+    {
+      protocol: "rdp",
+      sql: "UPDATE ssh_data SET rdp_user = username, rdp_password = password, rdp_domain = domain WHERE connection_type = 'rdp' AND rdp_user IS NULL AND rdp_password IS NULL",
+    },
+    {
+      protocol: "vnc",
+      sql: "UPDATE ssh_data SET vnc_user = username, vnc_password = password WHERE connection_type = 'vnc' AND vnc_user IS NULL AND vnc_password IS NULL",
+    },
+    {
+      protocol: "telnet",
+      sql: "UPDATE ssh_data SET telnet_user = username, telnet_password = password WHERE connection_type = 'telnet' AND telnet_user IS NULL AND telnet_password IS NULL",
+    },
+  ];
+  for (const backfill of usernameDomainBackfills) {
+    try {
+      const result = sqlite.prepare(backfill.sql).run();
+      if (result.changes > 0) {
+        databaseLogger.info(
+          `Backfilled ${result.changes} ${backfill.protocol} host credential(s)`,
+          { operation: "guac_credential_backfill" },
+        );
+      }
+    } catch (e) {
+      databaseLogger.warn(`Failed to backfill ${backfill.protocol} host credentials`, {
+        operation: "guac_credential_backfill",
+        error: e,
+      });
+    }
+  }
+
+  try {
+    sqlite.prepare("SELECT id FROM roles LIMIT 1").get();
+  } catch {
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS roles (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL UNIQUE,
+          display_name TEXT NOT NULL,
+          description TEXT,
+          is_system INTEGER NOT NULL DEFAULT 0,
+          permissions TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+    } catch (createError) {
+      databaseLogger.warn("Failed to create roles table", {
+        operation: "schema_migration",
+        error: createError,
+      });
+    }
+  }
+
+  try {
+    sqlite.prepare("SELECT id FROM user_roles LIMIT 1").get();
+  } catch {
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS user_roles (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL,
+          role_id INTEGER NOT NULL,
+          granted_by TEXT,
+          granted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(user_id, role_id),
+          FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+          FOREIGN KEY (role_id) REFERENCES roles (id) ON DELETE CASCADE,
+          FOREIGN KEY (granted_by) REFERENCES users (id) ON DELETE SET NULL
+        );
+      `);
+    } catch (createError) {
+      databaseLogger.warn("Failed to create user_roles table", {
+        operation: "schema_migration",
+        error: createError,
+      });
+    }
+  }
+
+  try {
+    sqlite.prepare("SELECT id FROM audit_logs LIMIT 1").get();
+  } catch {
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS audit_logs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL,
+          username TEXT NOT NULL,
+          action TEXT NOT NULL,
+          resource_type TEXT NOT NULL,
+          resource_id TEXT,
+          resource_name TEXT,
+          details TEXT,
+          ip_address TEXT,
+          user_agent TEXT,
+          success INTEGER NOT NULL,
+          error_message TEXT,
+          timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+        );
+      `);
+    } catch (createError) {
+      databaseLogger.warn("Failed to create audit_logs table", {
+        operation: "schema_migration",
+        error: createError,
+      });
+    }
+  }
+
+  try {
+    sqlite.prepare("SELECT id FROM session_recordings LIMIT 1").get();
+  } catch {
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS session_recordings (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          host_id INTEGER NOT NULL,
+          user_id TEXT NOT NULL,
+          access_id INTEGER,
+          started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          ended_at TEXT,
+          duration INTEGER,
+          commands TEXT,
+          dangerous_actions TEXT,
+          recording_path TEXT,
+          terminated_by_owner INTEGER DEFAULT 0,
+          termination_reason TEXT,
+          FOREIGN KEY (host_id) REFERENCES ssh_data (id) ON DELETE CASCADE,
+          FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+          FOREIGN KEY (access_id) REFERENCES host_access (id) ON DELETE SET NULL
+        );
+      `);
+    } catch (createError) {
+      databaseLogger.warn("Failed to create session_recordings table", {
+        operation: "schema_migration",
+        error: createError,
+      });
+    }
+  }
+
+  try {
+    sqlite.prepare("SELECT id FROM shared_credentials LIMIT 1").get();
+  } catch {
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS shared_credentials (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          host_access_id INTEGER NOT NULL,
+          original_credential_id INTEGER NOT NULL,
+          target_user_id TEXT NOT NULL,
+          encrypted_username TEXT NOT NULL,
+          encrypted_auth_type TEXT NOT NULL,
+          encrypted_password TEXT,
+          encrypted_key TEXT,
+          encrypted_key_password TEXT,
+          encrypted_key_type TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          needs_re_encryption INTEGER NOT NULL DEFAULT 0,
+          FOREIGN KEY (host_access_id) REFERENCES host_access (id) ON DELETE CASCADE,
+          FOREIGN KEY (original_credential_id) REFERENCES ssh_credentials (id) ON DELETE CASCADE,
+          FOREIGN KEY (target_user_id) REFERENCES users (id) ON DELETE CASCADE
+        );
+      `);
+    } catch (createError) {
+      databaseLogger.warn("Failed to create shared_credentials table", {
+        operation: "schema_migration",
+        error: createError,
+      });
+    }
+  }
+
+  try {
+    sqlite.prepare("SELECT id FROM opkssh_tokens LIMIT 1").get();
+  } catch {
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS opkssh_tokens (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL,
+          host_id INTEGER NOT NULL,
+          ssh_cert TEXT NOT NULL,
+          private_key TEXT NOT NULL,
+          email TEXT,
+          sub TEXT,
+          issuer TEXT,
+          audience TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          expires_at TEXT NOT NULL,
+          last_used TEXT,
+          UNIQUE(user_id, host_id),
+          FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+          FOREIGN KEY (host_id) REFERENCES ssh_data (id) ON DELETE CASCADE
+        );
+      `);
+    } catch (createError) {
+      databaseLogger.warn("Failed to create opkssh_tokens table", {
+        operation: "schema_migration",
+        error: createError,
+      });
+    }
+  }
+
+  try {
+    sqlite.prepare("SELECT id FROM api_keys LIMIT 1").get();
+  } catch {
+    try {
+      sqlite.exec(`
+        CREATE TABLE IF NOT EXISTS api_keys (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          name TEXT NOT NULL,
+          token_hash TEXT NOT NULL,
+          token_prefix TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          expires_at TEXT,
+          last_used_at TEXT,
+          is_active INTEGER NOT NULL DEFAULT 1,
+          FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+        );
+      `);
+    } catch (createError) {
+      databaseLogger.warn("Failed to create api_keys table", {
+        operation: "schema_migration",
+        error: createError,
+      });
+    }
+  }
+
+  try {
+    const existingRoles = sqlite.prepare("SELECT name, is_system FROM roles").all() as Array<{ name: string; is_system: number }>;
+
+    try {
+      const validSystemRoles = ['admin', 'user'];
+      const unwantedRoleNames = ['superAdmin', 'powerUser', 'readonly', 'member'];
+      const deleteByName = sqlite.prepare("DELETE FROM roles WHERE name = ?");
+      for (const roleName of unwantedRoleNames) {
+        deleteByName.run(roleName);
+      }
+
+      const deleteOldSystemRole = sqlite.prepare("DELETE FROM roles WHERE name = ? AND is_system = 1");
+      for (const role of existingRoles) {
+        if (role.is_system === 1 && !validSystemRoles.includes(role.name) && !unwantedRoleNames.includes(role.name)) {
+          deleteOldSystemRole.run(role.name);
+        }
+      }
+    } catch (cleanupError) {
+      databaseLogger.warn("Failed to clean up old system roles", {
+        operation: "schema_migration",
+        error: cleanupError,
+      });
+    }
+
+    const systemRoles = [
+      {
+        name: "admin",
+        displayName: "rbac.roles.admin",
+        description: "Administrator with full access",
+        permissions: null,
+      },
+      {
+        name: "user",
+        displayName: "rbac.roles.user",
+        description: "Regular user",
+        permissions: null,
+      },
+    ];
+
+    for (const role of systemRoles) {
+      const existingRole = sqlite.prepare("SELECT id FROM roles WHERE name = ?").get(role.name);
+      if (!existingRole) {
+        try {
+          sqlite.prepare(`
+            INSERT INTO roles (name, display_name, description, is_system, permissions)
+            VALUES (?, ?, ?, 1, ?)
+          `).run(role.name, role.displayName, role.description, role.permissions);
+        } catch (insertError) {
+          databaseLogger.warn(`Failed to create system role: ${role.name}`, {
+            operation: "schema_migration",
+            error: insertError,
+          });
+        }
+      }
+    }
+
+    try {
+      const adminUsers = sqlite.prepare("SELECT id FROM users WHERE is_admin = 1").all() as { id: string }[];
+      const normalUsers = sqlite.prepare("SELECT id FROM users WHERE is_admin = 0").all() as { id: string }[];
+
+      const adminRole = sqlite.prepare("SELECT id FROM roles WHERE name = 'admin'").get() as { id: number } | undefined;
+      const userRole = sqlite.prepare("SELECT id FROM roles WHERE name = 'user'").get() as { id: number } | undefined;
+
+      if (adminRole) {
+        const insertUserRole = sqlite.prepare(`
+          INSERT OR IGNORE INTO user_roles (user_id, role_id, granted_at)
+          VALUES (?, ?, CURRENT_TIMESTAMP)
+        `);
+
+        for (const admin of adminUsers) {
+          try {
+            insertUserRole.run(admin.id, adminRole.id);
+          } catch {
+            // Ignore duplicate errors
+          }
+        }
+      }
+
+      if (userRole) {
+        const insertUserRole = sqlite.prepare(`
+          INSERT OR IGNORE INTO user_roles (user_id, role_id, granted_at)
+          VALUES (?, ?, CURRENT_TIMESTAMP)
+        `);
+
+        for (const user of normalUsers) {
+          try {
+            insertUserRole.run(user.id, userRole.id);
+          } catch {
+            // Ignore duplicate errors
+          }
+        }
+      }
+    } catch (migrationError) {
+      databaseLogger.warn("Failed to migrate existing users to roles", {
+        operation: "schema_migration",
+        error: migrationError,
+      });
+    }
+  } catch (seedError) {
+    databaseLogger.warn("Failed to seed system roles", {
+      operation: "schema_migration",
+      error: seedError,
+    });
+  }
+
+  // Phase 85 (D-01, D-02): persist the identity_send_log schema mutation to
+  // the encrypted disk file. The CREATE TABLE IF NOT EXISTS block above only
+  // mutates the in-RAM SQLite; DatabaseSaveTrigger.forceSave flushes to
+  // ciphertext so the new table survives non-graceful shutdown. Mirrors the
+  // phase-72-add-runs-fleet-substrate pattern: non-fatal on save failure
+  // (CREATE TABLE IF NOT EXISTS is idempotent — next boot retries the
+  // create-plus-save together).
+  try {
+    await DatabaseSaveTrigger.forceSave("phase-85-create-identity-send-log");
+  } catch (saveError) {
+    databaseLogger.warn(
+      "[phase-85] forceSave failed post-create (non-fatal — CREATE TABLE IF NOT EXISTS is idempotent, next boot retries)",
+      {
+        operation: "schema_migration_force_save_post_create",
+        reason: "phase-85-create-identity-send-log",
+        error: saveError,
+      },
+    );
+  }
+
+  databaseLogger.success("Schema migration completed", {
+    operation: "schema_migration",
+  });
+};
+
+async function saveMemoryDatabaseToFile(): Promise<void> {
+  if (!memoryDatabase) return;
+
+  try {
+    const buffer = memoryDatabase.serialize();
+
+    if (!fs.existsSync(dataDir)) {
+      fs.mkdirSync(dataDir, { recursive: true });
+    }
+
+    try {
+      memoryDatabase
+        .prepare("SELECT COUNT(*) as count FROM sessions")
+        .get() as { count: number };
+    } catch {
+      // expected - sessions table may not exist yet
+    }
+
+    if (enableFileEncryption) {
+      await DatabaseFileEncryption.encryptDatabaseFromBuffer(
+        buffer,
+        encryptedDbPath,
+      );
+    } else {
+      fs.writeFileSync(dbPath, buffer);
+    }
+
+    DatabaseSaveTrigger.markClean();
+  } catch (error) {
+    databaseLogger.error("Failed to save in-memory database", error, {
+      operation: "memory_db_save_failed",
+      enableFileEncryption,
+    });
+  }
+}
+
+async function handlePostInitFileEncryption() {
+  if (!enableFileEncryption) return;
+
+  try {
+    if (memoryDatabase) {
+      await saveMemoryDatabaseToFile();
+
+      setInterval(() => {
+        if (DatabaseSaveTrigger.isDirty) {
+          saveMemoryDatabaseToFile();
+        }
+      }, 5 * 60 * 1000);
+
+      DatabaseSaveTrigger.initialize(saveMemoryDatabaseToFile);
+    }
+
+    try {
+      const migration = new DatabaseMigration(dataDir);
+      migration.cleanupOldBackups();
+    } catch (cleanupError) {
+      databaseLogger.warn("Failed to cleanup old migration files", {
+        operation: "migration_cleanup_startup_failed",
+        error:
+          cleanupError instanceof Error
+            ? cleanupError.message
+            : "Unknown error",
+      });
+    }
+  } catch (error) {
+    databaseLogger.error(
+      "Failed to handle database file encryption setup",
+      error,
+      {
+        operation: "db_encrypt_setup_failed",
+      },
+    );
+  }
+}
+
+async function initializeDatabase(): Promise<void> {
+  await initializeCompleteDatabase();
+  await handlePostInitFileEncryption();
+}
+
+export { initializeDatabase };
+
+async function cleanupDatabase() {
+  if (memoryDatabase) {
+    try {
+      await saveMemoryDatabaseToFile();
+    } catch (error) {
+      databaseLogger.error(
+        "Failed to save in-memory database before shutdown",
+        error,
+        {
+          operation: "shutdown_save_failed",
+        },
+      );
+    }
+  }
+
+  try {
+    if (sqlite) {
+      sqlite.close();
+    }
+  } catch (error) {
+    databaseLogger.warn("Error closing database connection", {
+      operation: "db_close_error",
+      error: error instanceof Error ? error.message : "Unknown error",
+    });
+  }
+
+  try {
+    const tempDir = path.join(dataDir, ".temp");
+    if (fs.existsSync(tempDir)) {
+      const files = fs.readdirSync(tempDir);
+      for (const file of files) {
+        try {
+          fs.unlinkSync(path.join(tempDir, file));
+        } catch {
+          // expected - file cleanup best effort
+        }
+      }
+
+      try {
+        fs.rmdirSync(tempDir);
+      } catch {
+        // expected - dir cleanup best effort
+      }
+    }
+  } catch {
+    // expected - temp dir cleanup best effort
+  }
+}
+
+process.on("exit", () => {
+  if (sqlite) {
+    try {
+      sqlite.close();
+    } catch {
+      // expected - database may already be closed
+    }
+  }
+});
+
+process.on("SIGINT", async () => {
+  databaseLogger.info("Received SIGINT, cleaning up...", {
+    operation: "shutdown",
+  });
+  await cleanupDatabase();
+  process.exit(0);
+});
+
+process.on("SIGTERM", async () => {
+  databaseLogger.info("Received SIGTERM, cleaning up...", {
+    operation: "shutdown",
+  });
+  await cleanupDatabase();
+  process.exit(0);
+});
+
+let db: ReturnType<typeof drizzle<typeof schema>>;
+
+export function getDb(): ReturnType<typeof drizzle<typeof schema>> {
+  if (!db) {
+    throw new Error(
+      "Database not initialized. Ensure initializeDatabase() is called before accessing db.",
+    );
+  }
+  return db;
+}
+
+export function getSqlite(): Database.Database {
+  if (!sqlite) {
+    throw new Error(
+      "SQLite not initialized. Ensure initializeDatabase() is called before accessing sqlite.",
+    );
+  }
+  return sqlite;
+}
+
+export { db };
+export { DatabaseFileEncryption };
+export const databasePaths = {
+  main: actualDbPath,
+  encrypted: encryptedDbPath,
+  directory: dbDir,
+  inMemory: true,
+};
+
+export { saveMemoryDatabaseToFile };
+
+export { DatabaseSaveTrigger };

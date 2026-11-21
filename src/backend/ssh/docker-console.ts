@@ -1,0 +1,825 @@
+import { Client as SSHClient } from "ssh2";
+import { SSH_ALGORITHMS } from "../utils/ssh-algorithms.js";
+import { WebSocketServer, WebSocket } from "ws";
+import { AuthManager } from "../utils/auth-manager.js";
+import { hosts, sshCredentials } from "../database/db/schema.js";
+import { and, eq } from "drizzle-orm";
+import { getDb } from "../database/db/index.js";
+import { SimpleDBOps } from "../utils/simple-db-ops.js";
+import { systemLogger } from "../utils/logger.js";
+import { rejectServeSubdomain } from "../utils/ws-origin-guard.js";
+// Phase 111 SKEW-07: WS handshake gate — shared helper + server build-id
+// getter (module-load capture per D-16). SERVER_BUILD_ID is read once at
+// module load below; the gate runs before any JWT auth work.
+import { extractSkewTag } from "../utils/skew-tag.js";
+import { getServerBuildId } from "../config/server-build-id.js";
+import type { SSHHost } from "../../types/index.js";
+
+const sshLogger = systemLogger;
+
+// Phase 111 SKEW-07: module-load capture of the server build id — parallel
+// to D-16 read-once contract. Used by the handshake gate below (Task 2) and
+// by sendFrame's outbound piggyback (Task 3).
+const SERVER_BUILD_ID = getServerBuildId();
+
+interface SSHSession {
+  client: SSHClient;
+  stream: import("ssh2").ClientChannel | null;
+  isConnected: boolean;
+  containerId?: string;
+  shell?: string;
+  hostId?: number;
+}
+
+const activeSessions = new Map<string, SSHSession>();
+
+const wss = new WebSocketServer({
+  host: "0.0.0.0",
+  port: 30009,
+  // Phase 103 D-08: reject WS upgrades from *.serve.<domain> origins at
+  // the handshake layer — WS complement to Plan 02's CORS reject.
+  verifyClient: (info, done) => {
+    if (rejectServeSubdomain(info.req)) {
+      sshLogger.warn("ws-origin-guard: rejected serve subdomain", {
+        operation: "ws_origin_guard_reject",
+        origin: info.req.headers.origin,
+        wss: "docker-console",
+      });
+      return done(false, 403, "Serve subdomain origin not permitted");
+    }
+    return done(true);
+  },
+});
+
+async function detectShell(
+  session: SSHSession,
+  containerId: string,
+): Promise<string> {
+  const shells = ["bash", "sh", "ash"];
+
+  for (const shell of shells) {
+    try {
+      await new Promise<void>((resolve, reject) => {
+        session.client.exec(
+          `docker exec ${containerId} which ${shell}`,
+          (err, stream) => {
+            if (err) return reject(err);
+
+            let output = "";
+            stream.on("data", (data: Buffer) => {
+              output += data.toString();
+            });
+
+            stream.on("close", (code: number) => {
+              if (code === 0 && output.trim()) {
+                resolve();
+              } else {
+                reject(new Error(`Shell ${shell} not found`));
+              }
+            });
+
+            stream.stderr.on("data", () => {});
+            stream.stderr.on("error", () => {});
+            stream.on("error", (streamErr) => {
+              reject(streamErr);
+            });
+          },
+        );
+      });
+
+      return shell;
+    } catch {
+      continue;
+    }
+  }
+
+  return "sh";
+}
+
+async function createJumpHostChain(
+  jumpHosts: Array<{ hostId: number }>,
+  userId: string,
+): Promise<SSHClient | null> {
+  if (!jumpHosts || jumpHosts.length === 0) {
+    return null;
+  }
+
+  let currentClient: SSHClient | null = null;
+
+  for (let i = 0; i < jumpHosts.length; i++) {
+    const jumpHostId = jumpHosts[i].hostId;
+
+    const jumpHostData = await SimpleDBOps.select(
+      getDb()
+        .select()
+        .from(hosts)
+        .where(and(eq(hosts.id, jumpHostId), eq(hosts.userId, userId))),
+      "ssh_data",
+      userId,
+    );
+
+    if (jumpHostData.length === 0) {
+      throw new Error(`Jump host ${jumpHostId} not found`);
+    }
+
+    const jumpHost = jumpHostData[0] as unknown as SSHHost;
+    if (typeof jumpHost.jumpHosts === "string" && jumpHost.jumpHosts) {
+      try {
+        jumpHost.jumpHosts = JSON.parse(jumpHost.jumpHosts);
+      } catch (e) {
+        sshLogger.error("Failed to parse jump hosts", e, {
+          hostId: jumpHost.id,
+        });
+        jumpHost.jumpHosts = [];
+      }
+    }
+
+    let resolvedCredentials: {
+      password?: string;
+      sshKey?: string;
+      keyPassword?: string;
+      authType?: string;
+    } = {
+      password: jumpHost.password,
+      sshKey: jumpHost.key,
+      keyPassword: jumpHost.keyPassword,
+      authType: jumpHost.authType,
+    };
+
+    if (jumpHost.credentialId) {
+      const credentials = await SimpleDBOps.select(
+        getDb()
+          .select()
+          .from(sshCredentials)
+          .where(
+            and(
+              eq(sshCredentials.id, jumpHost.credentialId as number),
+              eq(sshCredentials.userId, userId),
+            ),
+          ),
+        "ssh_credentials",
+        userId,
+      );
+
+      if (credentials.length > 0) {
+        const credential = credentials[0];
+        resolvedCredentials = {
+          password: credential.password as string | undefined,
+          sshKey: (credential.key || credential.privateKey) as
+            | string
+            | undefined,
+          keyPassword: credential.keyPassword as string | undefined,
+          authType: credential.authType as string | undefined,
+        };
+      }
+    }
+
+    const client = new SSHClient();
+
+    const config: Record<string, unknown> = {
+      host: jumpHost.ip?.replace(/^\[|\]$/g, "") || jumpHost.ip,
+      port: jumpHost.port || 22,
+      username: jumpHost.username,
+      tryKeyboard: resolvedCredentials.authType !== "none",
+      readyTimeout: 60000,
+      keepaliveInterval: 30000,
+      keepaliveCountMax: 120,
+      tcpKeepAlive: true,
+      tcpKeepAliveInitialDelay: 30000,
+      algorithms: {
+        kex: [
+          "curve25519-sha256",
+          "curve25519-sha256@libssh.org",
+          "ecdh-sha2-nistp521",
+          "ecdh-sha2-nistp384",
+          "ecdh-sha2-nistp256",
+          "diffie-hellman-group-exchange-sha256",
+          "diffie-hellman-group18-sha512",
+          "diffie-hellman-group17-sha512",
+          "diffie-hellman-group16-sha512",
+          "diffie-hellman-group15-sha512",
+          "diffie-hellman-group14-sha256",
+          "diffie-hellman-group14-sha1",
+          "diffie-hellman-group-exchange-sha1",
+          "diffie-hellman-group1-sha1",
+        ],
+        serverHostKey: [
+          "ssh-ed25519",
+          "ecdsa-sha2-nistp521",
+          "ecdsa-sha2-nistp384",
+          "ecdsa-sha2-nistp256",
+          "rsa-sha2-512",
+          "rsa-sha2-256",
+          "ssh-rsa",
+          "ssh-dss",
+        ],
+        cipher: SSH_ALGORITHMS.cipher,
+        hmac: [
+          "hmac-sha2-512-etm@openssh.com",
+          "hmac-sha2-256-etm@openssh.com",
+          "hmac-sha2-512",
+          "hmac-sha2-256",
+          "hmac-sha1",
+          "hmac-md5",
+        ],
+        compress: ["none", "zlib@openssh.com", "zlib"],
+      },
+    };
+
+    if (
+      resolvedCredentials.authType === "password" &&
+      resolvedCredentials.password
+    ) {
+      config.password = resolvedCredentials.password;
+    } else if (
+      resolvedCredentials.authType === "key" &&
+      resolvedCredentials.sshKey
+    ) {
+      const cleanKey = resolvedCredentials.sshKey
+        .trim()
+        .replace(/\r\n/g, "\n")
+        .replace(/\r/g, "\n");
+      config.privateKey = Buffer.from(cleanKey, "utf8");
+      if (resolvedCredentials.keyPassword) {
+        config.passphrase = resolvedCredentials.keyPassword;
+      }
+    }
+
+    client.on(
+      "keyboard-interactive",
+      (
+        _name: string,
+        _instructions: string,
+        _lang: string,
+        prompts: Array<{ prompt: string; echo: boolean }>,
+        finish: (responses: string[]) => void,
+      ) => {
+        const responses = prompts.map((p) => {
+          if (/password/i.test(p.prompt) && resolvedCredentials.password) {
+            return resolvedCredentials.password as string;
+          }
+          return "";
+        });
+        finish(responses);
+      },
+    );
+
+    if (currentClient) {
+      await new Promise<void>((resolve, reject) => {
+        currentClient!.forwardOut(
+          "127.0.0.1",
+          0,
+          jumpHost.ip,
+          jumpHost.port || 22,
+          (err, stream) => {
+            if (err) return reject(err);
+            config.sock = stream;
+            resolve();
+          },
+        );
+      });
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      client.on("ready", () => resolve());
+      client.on("error", reject);
+      client.connect(config);
+    });
+
+    currentClient = client;
+  }
+
+  return currentClient;
+}
+
+wss.on("connection", async (ws: WebSocket, req) => {
+  // Phase 111 SKEW-07: WS handshake gate. Version tag arrives as `?build=<sha>`
+  // query param on the upgrade URL. Absence AND mismatch both close with 4409
+  // (unlike HTTP lane's D-06 mismatch-only — browsers are the only legit WS
+  // clients, so absence is inherently suspicious for WS).
+  const clientBuild = extractSkewTag(req);
+  if (!clientBuild || clientBuild !== SERVER_BUILD_ID) {
+    ws.close(4409, "stale_client");
+    return;
+  }
+
+  // Phase 111 SKEW-08: sendFrame wraps ws.send with build-id piggyback.
+  // D-09: every outbound JSON-envelope message from server → client
+  // carries `build:<sha>`. Client's onmessage handler checks parsed.build
+  // vs its baked-in CLIENT_BUILD_ID and fires lockSkewedSession on
+  // mismatch.
+  //
+  // Implementation: monkey-patch ws.send at connection scope so the ~15
+  // multi-line ws.send(JSON.stringify(...)) sites in this file don't
+  // need per-site rewrites. Every outbound string that parses as a JSON
+  // object gets a `build` field injected top-level; anything else
+  // passes through untouched. sendFrame is exposed as the canonical
+  // helper for future callers.
+  const originalSend = ws.send.bind(ws);
+  const sendFrame = (frame: object): void => {
+    try {
+      originalSend(JSON.stringify({ ...frame, build: SERVER_BUILD_ID }));
+    } catch {
+      /* ws mid-close — swallow silently */
+    }
+  };
+  const patchedSend = function (this: WebSocket, data: unknown, ...rest: unknown[]): void {
+    if (typeof data === "string" && data.length > 0 && data.charCodeAt(0) === 123 /* { */) {
+      try {
+        const parsed = JSON.parse(data);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          originalSend(
+            JSON.stringify({ ...parsed, build: SERVER_BUILD_ID }),
+            ...(rest as []),
+          );
+          return;
+        }
+      } catch {
+        /* not a JSON object envelope — fall through to raw send */
+      }
+    }
+    originalSend(data as never, ...(rest as []));
+  };
+  (ws as unknown as { send: typeof patchedSend }).send = patchedSend;
+  void sendFrame; // reserved for future direct callers; keeps helper live
+
+  let token: string | undefined;
+
+  const cookieHeader = req.headers.cookie;
+  if (cookieHeader) {
+    const match = cookieHeader.match(/(?:^|;\s*)jwt=([^;]+)/);
+    if (match) token = decodeURIComponent(match[1]);
+  }
+
+  if (!token) {
+    const authHeader = req.headers.authorization;
+    if (authHeader?.startsWith("Bearer ")) {
+      token = authHeader.slice("Bearer ".length);
+    }
+  }
+
+  if (!token) {
+    const urlObj = new URL(req.url || "", "http://localhost");
+    const qp = urlObj.searchParams.get("token");
+    if (qp) token = qp;
+  }
+
+  if (!token) {
+    ws.close(1008, "Authentication required");
+    return;
+  }
+
+  const authManagerInstance = AuthManager.getInstance();
+  const payload = await authManagerInstance.verifyJWTToken(token);
+  if (!payload?.userId || payload.pendingTOTP) {
+    ws.close(1008, "Authentication required");
+    return;
+  }
+
+  const userId = payload.userId;
+  const sessionId = `docker-console-${Date.now()}-${Math.random()}`;
+  sshLogger.info("Docker console WebSocket connected", {
+    operation: "docker_console_connect",
+    sessionId,
+    userId,
+  });
+
+  let sshSession: SSHSession | null = null;
+
+  const wsPingInterval = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.ping();
+    }
+  }, 30000);
+
+  ws.on("message", async (data) => {
+    try {
+      const message = JSON.parse(data.toString());
+
+      switch (message.type) {
+        case "connect": {
+          const { hostConfig, containerId, shell, cols, rows } =
+            message.data as {
+              hostConfig: SSHHost;
+              containerId: string;
+              shell?: string;
+              cols?: number;
+              rows?: number;
+            };
+
+          const hostId = hostConfig?.id;
+
+          if (!hostId || !containerId) {
+            ws.send(
+              JSON.stringify({
+                type: "error",
+                message: "Host configuration and container ID are required",
+              }),
+            );
+            return;
+          }
+
+          if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(containerId)) {
+            ws.send(
+              JSON.stringify({
+                type: "error",
+                message: "Invalid container ID",
+              }),
+            );
+            return;
+          }
+
+          const allowedShells = ["bash", "sh", "ash", "zsh"];
+          if (shell && !allowedShells.includes(shell)) {
+            ws.send(
+              JSON.stringify({
+                type: "error",
+                message: "Invalid shell",
+              }),
+            );
+            return;
+          }
+
+          if (!hostConfig.enableDocker) {
+            ws.send(
+              JSON.stringify({
+                type: "error",
+                message: "Docker is not enabled on this host",
+              }),
+            );
+            return;
+          }
+
+          try {
+            // Resolve host with credentials server-side
+            const { resolveHostById } = await import("./host-resolver.js");
+            const resolvedHost = await resolveHostById(hostId, userId);
+
+            if (!resolvedHost) {
+              ws.send(
+                JSON.stringify({
+                  type: "error",
+                  message: "Host not found",
+                }),
+              );
+              return;
+            }
+
+            if (!resolvedHost.enableDocker) {
+              ws.send(
+                JSON.stringify({
+                  type: "error",
+                  message:
+                    "Docker is not enabled for this host. Enable it in Host Settings.",
+                }),
+              );
+              return;
+            }
+
+            const client = new SSHClient();
+
+            const config: Record<string, unknown> = {
+              host: resolvedHost.ip?.replace(/^\[|\]$/g, "") || resolvedHost.ip,
+              port: resolvedHost.port || 22,
+              username: resolvedHost.username,
+              tryKeyboard: true,
+              readyTimeout: 60000,
+              keepaliveInterval: 30000,
+              keepaliveCountMax: 120,
+              tcpKeepAlive: true,
+              tcpKeepAliveInitialDelay: 30000,
+            };
+
+            if (resolvedHost.authType === "password" && resolvedHost.password) {
+              config.password = resolvedHost.password;
+            } else if (resolvedHost.authType === "key" && resolvedHost.key) {
+              const cleanKey = resolvedHost.key
+                .trim()
+                .replace(/\r\n/g, "\n")
+                .replace(/\r/g, "\n");
+              config.privateKey = Buffer.from(cleanKey, "utf8");
+              if (resolvedHost.keyPassword) {
+                config.passphrase = resolvedHost.keyPassword;
+              }
+            }
+
+            if (resolvedHost.jumpHosts && resolvedHost.jumpHosts.length > 0) {
+              const jumpClient = await createJumpHostChain(
+                resolvedHost.jumpHosts,
+                userId,
+              );
+              if (jumpClient) {
+                const stream = await new Promise<import("ssh2").ClientChannel>(
+                  (resolve, reject) => {
+                    jumpClient.forwardOut(
+                      "127.0.0.1",
+                      0,
+                      resolvedHost.ip,
+                      resolvedHost.port || 22,
+                      (err, stream) => {
+                        if (err) return reject(err);
+                        resolve(stream);
+                      },
+                    );
+                  },
+                );
+                config.sock = stream;
+              }
+            }
+
+            await new Promise<void>((resolve, reject) => {
+              client.on("ready", () => resolve());
+              client.on("error", reject);
+              client.connect(config);
+            });
+
+            sshSession = {
+              client,
+              stream: null,
+              isConnected: true,
+              containerId,
+              hostId: resolvedHost.id,
+            };
+
+            activeSessions.set(sessionId, sshSession);
+
+            let shellToUse = shell || "bash";
+
+            if (shell) {
+              try {
+                await new Promise<void>((resolve, reject) => {
+                  client.exec(
+                    `docker exec ${containerId} which ${shell}`,
+                    (err, stream) => {
+                      if (err) return reject(err);
+
+                      let output = "";
+                      stream.on("data", (data: Buffer) => {
+                        output += data.toString();
+                      });
+
+                      stream.on("close", (code: number) => {
+                        if (code === 0 && output.trim()) {
+                          resolve();
+                        } else {
+                          reject(new Error(`Shell ${shell} not available`));
+                        }
+                      });
+
+                      stream.stderr.on("data", () => {});
+                      stream.stderr.on("error", () => {});
+                      stream.on("error", (streamErr) => {
+                        reject(streamErr);
+                      });
+                    },
+                  );
+                });
+              } catch {
+                sshLogger.warn(
+                  `Requested shell ${shell} not found, detecting available shell`,
+                  {
+                    operation: "shell_validation",
+                    sessionId,
+                    containerId,
+                    requestedShell: shell,
+                  },
+                );
+                shellToUse = await detectShell(sshSession, containerId);
+              }
+            } else {
+              shellToUse = await detectShell(sshSession, containerId);
+            }
+
+            sshSession.shell = shellToUse;
+
+            const execCommand = `docker exec -it ${containerId} /bin/${shellToUse}`;
+            sshLogger.info("Attaching to Docker container", {
+              operation: "docker_attach",
+              sessionId,
+              userId,
+              hostId: resolvedHost.id,
+              containerId,
+            });
+
+            client.exec(
+              execCommand,
+              {
+                pty: {
+                  term: "xterm-256color",
+                  cols: cols || 80,
+                  rows: rows || 24,
+                },
+              },
+              (err, stream) => {
+                if (err) {
+                  sshLogger.error("Failed to create docker exec", err, {
+                    operation: "docker_exec",
+                    sessionId,
+                    containerId,
+                  });
+
+                  ws.send(
+                    JSON.stringify({
+                      type: "error",
+                      message: `Failed to start console: ${err.message}`,
+                    }),
+                  );
+                  return;
+                }
+
+                sshSession!.stream = stream;
+                sshLogger.success("Docker container attached", {
+                  operation: "docker_attach_success",
+                  sessionId,
+                  userId,
+                  hostId: resolvedHost.id,
+                  containerId,
+                });
+
+                stream.on("data", (data: Buffer) => {
+                  if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(
+                      JSON.stringify({
+                        type: "output",
+                        data: data.toString("utf8"),
+                      }),
+                    );
+                  }
+                });
+
+                stream.stderr.on("data", () => {});
+                stream.stderr.on("error", () => {});
+
+                stream.on("error", (streamErr) => {
+                  sshLogger.error("Docker console stream error", streamErr, {
+                    operation: "docker_console_stream_error",
+                    sessionId,
+                    containerId,
+                  });
+                  if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(
+                      JSON.stringify({
+                        type: "error",
+                        message: `Console error: ${streamErr.message}`,
+                      }),
+                    );
+                  }
+                });
+
+                stream.on("close", () => {
+                  if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(
+                      JSON.stringify({
+                        type: "disconnected",
+                        message: "Console session ended",
+                      }),
+                    );
+                  }
+
+                  if (sshSession) {
+                    sshSession.client.end();
+                    activeSessions.delete(sessionId);
+                  }
+                });
+
+                ws.send(
+                  JSON.stringify({
+                    type: "connected",
+                    data: {
+                      shell: shellToUse,
+                      requestedShell: shell,
+                      shellChanged: shell && shell !== shellToUse,
+                    },
+                  }),
+                );
+              },
+            );
+          } catch (error) {
+            sshLogger.error("Failed to connect to container", error, {
+              operation: "console_connect",
+              sessionId,
+              containerId: message.data.containerId,
+            });
+
+            ws.send(
+              JSON.stringify({
+                type: "error",
+                message:
+                  error instanceof Error
+                    ? error.message
+                    : "Failed to connect to container",
+              }),
+            );
+          }
+          break;
+        }
+
+        case "input": {
+          if (sshSession && sshSession.stream) {
+            sshSession.stream.write(message.data);
+          }
+          break;
+        }
+
+        case "resize": {
+          if (sshSession && sshSession.stream) {
+            const { cols, rows } = message.data;
+            sshSession.stream.setWindow(rows, cols, rows, cols);
+          }
+          break;
+        }
+
+        case "disconnect": {
+          if (sshSession) {
+            if (sshSession.stream) {
+              sshSession.stream.end();
+            }
+            sshSession.client.end();
+            activeSessions.delete(sessionId);
+
+            ws.send(
+              JSON.stringify({
+                type: "disconnected",
+                message: "Disconnected from container",
+              }),
+            );
+          }
+          break;
+        }
+
+        case "ping": {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "pong" }));
+          }
+          break;
+        }
+
+        default:
+          sshLogger.warn("Unknown message type", {
+            operation: "ws_message",
+            type: message.type,
+          });
+      }
+    } catch (error) {
+      sshLogger.error("WebSocket message error", error, {
+        operation: "ws_message",
+        sessionId,
+      });
+
+      ws.send(
+        JSON.stringify({
+          type: "error",
+          message: error instanceof Error ? error.message : "An error occurred",
+        }),
+      );
+    }
+  });
+
+  ws.on("close", () => {
+    clearInterval(wsPingInterval);
+    sshLogger.info("Docker console disconnected", {
+      operation: "docker_console_disconnect",
+      sessionId,
+      userId,
+      hostId: sshSession?.hostId,
+      containerId: sshSession?.containerId,
+    });
+    if (sshSession) {
+      if (sshSession.stream) {
+        sshSession.stream.end();
+      }
+      sshSession.client.end();
+      activeSessions.delete(sessionId);
+    }
+  });
+
+  ws.on("error", (error) => {
+    sshLogger.error("WebSocket error", error, {
+      operation: "ws_error",
+      sessionId,
+    });
+
+    if (sshSession) {
+      if (sshSession.stream) {
+        sshSession.stream.end();
+      }
+      sshSession.client.end();
+      activeSessions.delete(sessionId);
+    }
+  });
+});
+
+process.on("SIGTERM", () => {
+  activeSessions.forEach((session) => {
+    if (session.stream) {
+      session.stream.end();
+    }
+    session.client.end();
+  });
+
+  activeSessions.clear();
+
+  wss.close(() => {
+    process.exit(0);
+  });
+});

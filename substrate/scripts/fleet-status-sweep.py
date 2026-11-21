@@ -1,0 +1,1974 @@
+#!/usr/bin/env python3
+"""fleet-status-sweep.py — server-side batch emitter for the app's fleet-status poller.
+
+Phase 92 Plan 02. Replaces the O(hosts × identities × sentinels) per-poll SSH
+exec fan-out (~200+ `channel.exec` calls per cycle on a busy box) with
+ONE exec-per-host-per-cycle that emits all per-identity + per-live-PID state
+as a JSONL blob on stdout. See:
+    .planning/phases/92-fleet-status-poller-batch-sweep-one-exec-per-host-not-one-pe/
+        92-CONTEXT.md   — locked design decisions
+        92-RESEARCH.md  — full exec inventory (A0..A12, B0..B5; B5 since retired)
+        92-01-PLAN.md   — schema module (parser + version constant)
+        92-02-PLAN.md   — THIS script's spec
+
+Wire contract (canonical): src/backend/fleet-status/sweep-schema.ts.
+    - SWEEP_SCHEMA_VERSION == 1 lives on every emitted line.
+    - `line_kind` discriminator is either "identity" or "pid".
+    - Field names + types below must be BYTE-IDENTICAL to the TypeScript.
+    - Every field described in SWEEP_FIELD_PARITY on the schema module is
+      accounted for below with the same key name.
+
+Invocation (production):
+    ~/.local/bin/fleet-status-sweep      # no args, no stdin, reads env $HOME
+
+Distribution: this file is git-committed with the execute bit set. The substrate
+distributor bundles substrate/scripts/*.* into the container at
+/app/fleet-substrate/scripts/, and the Phase 75 startup-sweep pushes it to
+~/.local/bin/fleet-status-sweep on every runs_fleet_substrate:true host once
+the Plan 03 catalog row lands. The distributor's computeInstallMode mirrors
+`fs.statSync().mode & 0o777` — a mode-drift bug that stripped the execute bit
+on THIS file would ship a non-executable script to every managed box and
+permanently pin the fleet on the legacy fallback path.
+
+Stdout contract — VERY LOAD-BEARING:
+    * stdout is JSONL emission ONLY. One JSON object per line, compact
+      (no whitespace via json.dumps(..., separators=(",", ":"))).
+    * ANY unhandled exception at the top level logs to stderr and returns
+      exit 0 with empty stdout. The backend caller (Plan 04) treats
+      `channel.exec` returning `null` OR schema-version-mismatch as
+      "fall back to legacy per-identity plumbing this cycle". A stderr diag
+      + exit 0 + empty stdout is a clean, non-noisy signal that means the
+      SAME thing (parser sees zero lines → falls back). Never emit tracebacks
+      or error strings on stdout — the caller's parser would attempt JSON on
+      them and, worse, on a schema-1-looking substring they might parse.
+
+Exec-site → emission mapping (parity with RESEARCH.md § "Current per-identity
+/ per-host exec inventory"):
+
+    A0  ls sessions/*.json                       → PID enumeration (this script)
+    A1  cat sessions/<pid>.json                  → SweepPidLine.session_json
+    A2  cat /proc/<pid>/stat                     → SweepPidLine.stat_result
+    A3  cat last-stop-payload.json               → NOT emitted (legacy, RESEARCH G9)
+    A4  cat /proc/<pid>/environ                  → folded → SweepPidLine.identity
+    A5  tmux display-message                     → folded → SweepPidLine.identity
+    A6  stat -c %Y stop-<sid>.json               → SweepPidLine.per_session_stop_mtime_ms
+    A7  stat -c %Y hooks/<sid>/activity          → SweepPidLine.activity_mtime_ms
+    A8  stat -c %Y hooks/<sid>/stopped           → SweepPidLine.stopped_mtime_ms
+    A9  cat stop-<sid>.json                      → SweepPidLine.per_session_stop_payload
+    A10 stat identities/<name>/.dormant  (A)     → SweepPidLine.dormant_a
+    A11 discover JSONL path per PID              → folded (reused from B4)
+    A12 tail -c 262144 <jsonlPath>               → SweepPidLine.jsonl_tail
+    B0  find identities/                         → identity enumeration (this script)
+    B1  stat identities/<name>/.dormant  (B)     → SweepIdentityLine.dormant
+    B2  stat identities/<name>/.compact-requested → SweepIdentityLine.compact_requested
+    B3  stat identities/<name>/.compacting       → SweepIdentityLine.compacting
+                                                   (B2 || B3 = the agent is condensing:
+                                                   a compaction is queued or in flight,
+                                                   see agent-supervisor.sh handle_compaction)
+    B4  Phase 32 discovery script                → SweepIdentityLine.jsonl_path
+
+Ports verbatim (behavioral parity required — Plan 05 has a regression test):
+    * __matchesIdentityFirstTurnForTests + delimiter guard
+                                  — claude-session/discover-identity-session-file.ts
+                                    L109 (DELIMITER_SET) + L134–L158 (predicate).
+                                    Load-bearing: partial-match rejection ("tiff"
+                                    must NOT match "tiffany" — the delimiter check
+                                    is the load-bearing correctness property).
+
+Constraints:
+    * Python 3.6+ stdlib ONLY (no pip installs). Mirrors
+      wakeup-scheduler.py precedent — every managed box already has Python 3.
+    * Exit 0 ALWAYS. Never nonzero. `channel.exec` returning null must indicate
+      SSH transport failure, never our own failure.
+    * G6 safe-char guard on identity names + sessionIds (defense-in-depth;
+      caller re-applies in Plan 04 belt-and-suspenders).
+"""
+
+import glob
+import hashlib
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+import traceback
+
+# ---------------------------------------------------------------------------
+# Schema version — MUST match SWEEP_SCHEMA_VERSION in sweep-schema.ts.
+# ---------------------------------------------------------------------------
+
+SCHEMA_VERSION = 1
+
+# ---------------------------------------------------------------------------
+# G6 safe-char regex — mirrors ssh-poll-orchestrator.ts L1333 et al.
+# ---------------------------------------------------------------------------
+
+# Matches ssh-poll-orchestrator.ts's /^[a-zA-Z0-9_-]+$/ character class. Applied
+# server-side to (a) identity folder names before per-identity emission, and
+# (b) sessionId strings before any per-session stat/cat under
+# ~/.claude/fleet-status/**. Both loci reject non-safe values by emitting
+# nulls (or skipping) — this matches the caller's fail-open contract for
+# path-traversal defense.
+SAFE_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+# Role name validation — mirrors ambient-monitor.py's _ROLE_NAME_OK and the
+# path-traversal guard in src/backend/claude-session/identity-artifact-reader.ts.
+# A valid role name is all-lowercase alphanumeric with hyphens/underscores.
+# This regex is applied BEFORE any os.path.join using the role name so a
+# malformed role like `../../tmp` is rejected rather than becoming a path
+# traversal (T-111-01).
+ROLE_NAME_OK = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+# Project slug validation — mirrors PROJECT_SLUG_RE at
+# src/backend/claude-session/identity-artifact-reader.ts:193
+# (Phase 117 D-05 identity carrier). Applied BEFORE emitting a `project`
+# frontmatter value so a malformed slug never reaches identity_cosmetics.
+PROJECT_SLUG_RE = re.compile(r"^[a-z0-9-]{1,64}$")
+
+# ---------------------------------------------------------------------------
+# Phase 32 discovery — mirrors discover-identity-session-file.ts.
+# ---------------------------------------------------------------------------
+
+# The four delimiter characters that MAY appear immediately after the identity
+# name inside `<command-args>` (see DELIMITER_SET in discover-identity-session-
+# file.ts:109 + the end-of-line case at :155). Load-bearing: partial-name
+# matches like "tiff" against "tiffany" are REJECTED because the char at
+# nameEnd is "a" (not in this set and not end-of-line).
+DISCOVERY_DELIMITER_SET = frozenset(("<", " ", "\r"))
+
+# Bound the head-read at the same cap the shell lookup uses
+# (HISTORY_HEAD_BYTES in agent-history-file.ts) so both pick the same file.
+# Hook attachments written ahead of the /id load push it several KB in.
+DISCOVERY_HEAD_BYTES = 65536
+
+# Cap for frontmatter head-reads. Identity files are ~5-7 KB but role files
+# reach 44,642 bytes (box-maintainer.md) while containing only ~4 lines of
+# frontmatter. Reading at most this many characters (text-mode, NOT bytes)
+# avoids buffering whole files. A file whose closing `---` fence falls beyond
+# 4096 chars is treated as having no frontmatter → None → plain row. That
+# fail-closed behaviour is intentional, not a bug (T-111-03).
+FRONTMATTER_HEAD_BYTES = 4096
+# Project files carry an auto-maintained `members:` list, so their frontmatter
+# runs longer than identity/role cosmetics; read further so `users`/`parent`
+# never drop out (and flip the sidebar) when a project grows.
+PROJECT_FRONTMATTER_HEAD_BYTES = 65536
+
+# ---------------------------------------------------------------------------
+# JSONL tail width — mirrors the A12 exec site in ssh-poll-orchestrator.ts.
+# ---------------------------------------------------------------------------
+
+TAIL_BYTES = 262144  # 256 KB — same window as `tail -c 262144`.
+
+# ---------------------------------------------------------------------------
+# Subprocess timeout for the tmux display-message call.
+# ---------------------------------------------------------------------------
+
+# The TS side has no explicit timeout on the tmux exec (it runs inside the
+# semaphore-bounded exec wrapper). We add a short local timeout so a hung
+# `tmux display-message` on a wedged tmux server can't block the entire sweep.
+# 1.5s is well above the local IPC round-trip (~<10ms typical) but small enough
+# that a single bad PID can't push us anywhere near the sweep-script-caller's
+# ~5s Promise.race wrapper on the app's side.
+TMUX_TIMEOUT_SEC = 1.5
+
+# ---------------------------------------------------------------------------
+# Phase 118 — app enumeration constants (source C: ~/fleet/apps/*).
+# ---------------------------------------------------------------------------
+
+# App slug regex — mirrors the kebab-case pattern in substrate/skills/app-
+# development/create-app.sh:32. Applied when reading the on-disk unit filename
+# to reject anything that would traverse or otherwise not correspond to a
+# legitimate app-<slug>.service filename.
+APP_SLUG_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+
+# Maximum slug length. Mirrors the [:40] clamps used in _log calls elsewhere;
+# rejects abusively-long folder names before they reach the filesystem layer
+# or a systemd unit name.
+APP_SLUG_MAX_LEN = 40
+
+# TCP loopback probe timeout for app health. A listening socket on 127.0.0.1
+# = "app is up." 300 ms is enough for the local kernel accept path (no
+# handshake beyond SYN/SYN-ACK) and comfortably inside the 8s exec budget
+# even with APP_ENUM_CAP=50 apps × 300 ms serial = 15 s worst-case — but in
+# practice healthy apps accept synchronously, and unhealthy ones ECONNREFUSE
+# immediately, so total wall-time hovers under 1 s for realistic app counts.
+APP_PORT_PROBE_TIMEOUT_SEC = 0.3
+
+# `Environment=PORT=<n>` extractor for the user's systemd unit body. Anchored
+# to a whole-word PORT= so we don't collide with `HTTP_PORT=` or similar.
+APP_UNIT_ENV_PORT_RE = re.compile(r"^\s*Environment\s*=.*?\bPORT=(\d+)\b", re.MULTILINE)
+# convo-scoped apps: current-style apps keep their PUBLIC port on a socket unit
+# (app-<slug>.socket, ListenStream=127.0.0.1:<port>); the app itself listens on
+# a private port (public + APP_PRIVATE_PORT_OFFSET) behind a relay. Old-style
+# apps have no socket unit and keep the public port in the service's PORT=.
+APP_SOCKET_LISTEN_RE = re.compile(r"^\s*ListenStream\s*=\s*127\.0\.0\.1:(\d+)\s*$", re.MULTILINE)
+APP_PRIVATE_PORT_OFFSET = 10000
+APP_SYSTEMCTL_TIMEOUT_SEC = 3.0
+
+# Phase 118 code-review MEDIUM-4 (fix pass 2026-09-18): DoS-hardening caps on
+# the source-C app enumeration in _enumerate_apps. Prior shape iterated
+# os.scandir(~/fleet/apps) with no upper bound; a malicious folder-creator or
+# a bug spawning 100+ directories could each incur a ~1.5s systemctl call and
+# dwarf the 8s exec ceiling. the user's design ceiling is ~10 apps per box
+# (D-15 discussion, RESEARCH § Q6); 50 leaves 5× headroom.
+APP_ENUM_CAP = 100
+# Cumulative wall-clock budget for _enumerate_apps. If the app loop passes
+# this threshold, bail with a structured warn and keep whatever we've built
+# so far — the sweep still emits its identity + pid lines and the caller
+# still gets a valid (partial) JSONL blob for this tick.
+APP_ENUM_WALLCLOCK_BUDGET_SEC = 3.0
+
+# ---------------------------------------------------------------------------
+# Small logging helper — stderr only. Every op is grep-able.
+# ---------------------------------------------------------------------------
+
+
+def _log(op, **fields):
+    """Emit ONE stderr line in a rough loose-JSON-with-op shape.
+
+    Uses stderr because stdout is the JSONL wire and MUST remain silent when
+    there is nothing to emit. Never raise from here — if json.dumps chokes
+    (should not, we only feed it primitives), we fall back to a repr line.
+    """
+    try:
+        parts = [f"op={op}"]
+        for k, v in fields.items():
+            parts.append(f"{k}={json.dumps(v)}")
+        sys.stderr.write("[fleet-status-sweep] " + " ".join(parts) + "\n")
+    except Exception:
+        sys.stderr.write(f"[fleet-status-sweep] op={op} fields={fields!r}\n")
+
+
+# ---------------------------------------------------------------------------
+# Section — port of __matchesIdentityFirstTurnForTests (discover-identity-
+# session-file.ts L134–L158).
+# ---------------------------------------------------------------------------
+
+
+def _matches_identity_first_turn(line, identity_name):
+    """Byte-pattern predicate: is `line` a real /id <identity_name> first turn?
+
+    Verbatim port of `__matchesIdentityFirstTurnForTests` in
+    discover-identity-session-file.ts. Load-bearing checks (in order):
+      1. Line contains `"type":"user"` AND does NOT contain `"tool_result"`.
+      2. Line contains `<command-name>/id</command-name>` (literal).
+      3. Line contains `<command-args><identity_name>` where the char
+         immediately after identity_name is in DISCOVERY_DELIMITER_SET or is
+         end-of-line.
+
+    Partial-match rejection is the load-bearing correctness property: given
+    identity_name="tiff", a line with `<command-args>tiffany<...` MUST return
+    False (char at nameEnd is "a", not in the delimiter set).
+    """
+    if '"type":"user"' not in line:
+        return False
+    if '"tool_result"' in line:
+        return False
+    if "<command-name>/id</command-name>" not in line:
+        return False
+    args_tag = "<command-args>"
+    args_idx = line.find(args_tag)
+    if args_idx == -1:
+        return False
+    name_start = args_idx + len(args_tag)
+    name_end = name_start + len(identity_name)
+    if line[name_start:name_end] != identity_name:
+        return False
+    # end-of-line case: nothing exists at position name_end
+    if name_end >= len(line):
+        return True
+    return line[name_end] in DISCOVERY_DELIMITER_SET
+
+
+# ---------------------------------------------------------------------------
+# Section — Phase 32 discovery, server-side (answers open question #3).
+# ---------------------------------------------------------------------------
+
+
+def discover_all_identity_jsonl_paths(identity_names, home):
+    """{name: path_or_None} for every name — one folder read per agent
+    (discover_identity_jsonl_path), never a walk of the whole projects tree."""
+    return {name: discover_identity_jsonl_path(name, home) for name in identity_names}
+
+
+def agent_history_folder(identity_name, home):
+    """The agent's own history folder. Claude Code names each project folder
+    after its launch directory's real path (every non-alphanumeric char -> '-'), and every
+    identity is launched in ~/fleet/identities/<name>/workspace/ — so the
+    folder is known from the name alone, and survives archiving (which moves
+    the identity, not its transcripts). Mirrors agent-history-file.ts."""
+    # Claude names the folder after the launch dir's REAL path on the HOST.
+    # Inside the Skynet container (local-host poll) HOME is the bind mount
+    # (HOME_HOST_DIR), so name from the host home (SKYNET_HOME_MOUNT_SRC);
+    # otherwise resolve a symlinked home (e.g. Bazzite's /home -> /var/home).
+    mount_src = os.environ.get("SKYNET_HOME_MOUNT_SRC")
+    mount_dst = os.environ.get("HOME_HOST_DIR")
+    if mount_src and mount_dst and os.path.normpath(home) == os.path.normpath(mount_dst):
+        real_home = mount_src
+    else:
+        real_home = os.path.realpath(home)
+    launch_dir = "%s/fleet/identities/%s/workspace" % (real_home.rstrip("/"), identity_name)
+    return os.path.join(home, ".claude", "projects", re.sub(r"[^a-zA-Z0-9]", "-", launch_dir))
+
+
+def discover_identity_jsonl_path(identity_name, home):
+    """The agent's history file: the NEWEST .jsonl in its own history folder
+    whose first "role":"user" line (within DISCOVERY_HEAD_BYTES) is its
+    `/id <identity_name>` load. Files started some other way (a bare claude
+    run in the workspace) are skipped. No machine-wide scan, no fallback.
+    Returns an absolute path or None. Fail-safe: OSError on a file skips it."""
+    folder = agent_history_folder(identity_name, home)
+    candidates = []
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return None
+    for fname in names:
+        if not fname.endswith(".jsonl"):
+            continue
+        fpath = os.path.join(folder, fname)
+        try:
+            # Regular files only, never symlinks — same as the shell lookup's
+            # `find -type f`, so every implementation sees the same candidates.
+            if os.path.islink(fpath) or not os.path.isfile(fpath):
+                continue
+            candidates.append((os.stat(fpath).st_mtime, fpath))
+        except OSError:
+            continue
+    candidates.sort(key=lambda t: (-t[0], t[1]))
+    for _mtime, fpath in candidates:
+        try:
+            with open(fpath, "rb") as fh:
+                text = fh.read(DISCOVERY_HEAD_BYTES).decode("utf-8", errors="replace")
+        except OSError:
+            continue
+        for candidate_line in text.split("\n"):
+            if '"role":"user"' in candidate_line:
+                if _matches_identity_first_turn(candidate_line, identity_name):
+                    return fpath
+                break
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Section — helper: read the last TAIL_BYTES of a file safely.
+# ---------------------------------------------------------------------------
+
+
+def _read_tail_bytes(path):
+    """Read the last TAIL_BYTES bytes of `path` (or the whole file if smaller).
+
+    Returns a str (decoded utf-8 with errors="replace"), or None on any
+    OSError. Deliberately mirrors `tail -c 262144 <path> 2>/dev/null`.
+    """
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            start = max(0, size - TAIL_BYTES)
+            fh.seek(start, os.SEEK_SET)
+            data = fh.read()
+        return data.decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Section — helper: extract TMUX_PANE + TMUX from /proc/<pid>/environ.
+# ---------------------------------------------------------------------------
+
+
+# Mirrors isValidTmuxPaneId in pid-to-tmux.ts:82 — must be % followed by digits.
+_PANE_ID_RE = re.compile(r"^%\d+$")
+
+
+def _read_pid_environ(pid):
+    """Read /proc/<pid>/environ. Returns bytes or None."""
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def _extract_env_from_environ(environ_bytes, key):
+    """Extract the value of KEY from NUL-separated environ bytes.
+
+    Returns str or None. Mirrors extractTmuxPaneFromEnviron in pid-to-tmux.ts —
+    strict startsWith so "TMUX_PANE_SOMETHING=" does not match "TMUX_PANE=".
+    """
+    if environ_bytes is None:
+        return None
+    try:
+        text = environ_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+    prefix = key + "="
+    for entry in text.split("\0"):
+        if entry.startswith(prefix):
+            value = entry[len(prefix):]
+            return value if len(value) > 0 else None
+    return None
+
+
+def _resolve_pid_to_tmux_session(pid):
+    """PID → tmux session name (identity name on this fleet). None on failure.
+
+    Server-side port of resolvePidToTmuxSession (pid-to-tmux.ts). Steps:
+      1. Read /proc/<pid>/environ. Missing → None.
+      2. Extract TMUX_PANE. Missing → None.
+      3. Validate pane id against ^%\\d+$ (SECURITY GATE — defense-in-depth
+         against garbage environ writes even though we do NOT interpolate
+         the pane into a shell string here; subprocess.run's arg list is
+         inherently safe from shell metacharacters).
+      4. Extract TMUX socket path (defensive: sets TMUX env for the tmux call
+         so we hit the right server if the box runs multiple tmux sockets).
+      5. Run `tmux display-message -p -t %N '#{session_name}'`. On non-zero
+         exit / timeout → None. On success → stripped stdout.
+    """
+    environ = _read_pid_environ(pid)
+    if environ is None:
+        return None
+    pane = _extract_env_from_environ(environ, "TMUX_PANE")
+    if pane is None:
+        return None
+    if not _PANE_ID_RE.match(pane):
+        _log("tmux_pane_invalid", pid=pid, pane=pane[:40])
+        return None
+    tmux_env = _extract_env_from_environ(environ, "TMUX")
+    # Build a minimal env for the subprocess. Preserve PATH and HOME so tmux
+    # itself resolves; set TMUX if we found one (harmless if absent — tmux
+    # will fall back to the default socket at /tmp/tmux-<uid>/default).
+    child_env = dict(os.environ)
+    if tmux_env:
+        child_env["TMUX"] = tmux_env
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", pane, "#{session_name}"],
+            capture_output=True,
+            text=True,
+            timeout=TMUX_TIMEOUT_SEC,
+            env=child_env,
+        )
+    except subprocess.TimeoutExpired:
+        _log("tmux_timeout", pid=pid, pane=pane)
+        return None
+    except Exception:
+        _log("tmux_exec_failed", pid=pid, pane=pane,
+             err=traceback.format_exc(limit=1).strip())
+        return None
+    if result.returncode != 0:
+        return None
+    name = result.stdout.strip()
+    return name if name else None
+
+
+# ---------------------------------------------------------------------------
+# Phase 118 (revised 2026-09-19) — filesystem-only app inspection helpers.
+#
+# Prior shape (Phase 118 ship): a `systemctl --user show app-<slug>.service`
+# call gave existence (LoadState=loaded), health (ActiveState=active), and
+# port (Environment=PORT=<n>) in one round-trip. That broke on the app's
+# self-poll (hostId 6) once peer's isLocalHostId acquireLocalChannel fix
+# ran the sweep from inside the container: the container is uid 0 with no
+# /run/user/1000 mount and no dbus session, so every `systemctl --user`
+# call transport-failed → sweep dropped every app-line silently.
+#
+# Fix: the source of truth for existence + port is the unit file on disk
+# under ~/.config/systemd/user/app-<slug>.service — the same file systemd
+# itself reads. Health becomes a TCP loopback probe on 127.0.0.1:<port>.
+# Filesystem-only, matches the identities path (which also reads sentinels
+# rather than asking systemd), works uniformly across every host including
+# the container self-poll.
+#
+# The port-probe health signal is weaker than ActiveState=active (a wedged
+# app returning 500s still probes green), but the sidebar tile only needs
+# "is this reachable" — the full-app view surfaces detail. The old signal
+# was also imperfect (systemd-active with a hung request loop probes green
+# the same way).
+# ---------------------------------------------------------------------------
+
+
+def _read_app_unit_file(slug, home):
+    """Return unit-file text or None if the file doesn't exist / can't be read.
+
+    Existence of ~/.config/systemd/user/app-<slug>.service is the source of
+    truth for "this app is registered on this box" — same file `systemctl
+    --user daemon-reload` reads, no systemd round-trip required.
+    """
+    path = os.path.join(home, ".config", "systemd", "user", f"app-{slug}.service")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return fh.read()
+    except (FileNotFoundError, PermissionError, OSError):
+        return None
+
+
+def _probe_app_port(port):
+    """Return True if 127.0.0.1:<port> accepts a TCP connect within the timeout.
+
+    A listening socket on loopback = "the app is up." Not a full HTTP health
+    check — an app returning 500s or wedged mid-request would still pass, and
+    an app that binds only to a non-loopback interface would falsely fail.
+    For the sidebar tile that's a reasonable tradeoff; the frontend surfaces
+    a probe-fail as "not running" and the user can drill into the full-app
+    view for detail.
+    """
+    if not isinstance(port, int) or port <= 0 or port > 65535:
+        return False
+    try:
+        with socket.create_connection(
+            ("127.0.0.1", port), timeout=APP_PORT_PROBE_TIMEOUT_SEC
+        ):
+            return True
+    except (OSError, socket.timeout):
+        return False
+
+
+def _read_app_socket_file(slug, home):
+    """Return app-<slug>.socket text (current-style apps) or None."""
+    path = os.path.join(home, ".config", "systemd", "user", f"app-{slug}.socket")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return fh.read()
+    except (FileNotFoundError, PermissionError, OSError):
+        return None
+
+
+def _loopback_listening_ports():
+    """Return the set of TCP ports in LISTEN state on 127.0.0.1 (or None).
+
+    Read from /proc/net/tcp — looking, not knocking. A connect() probe on a
+    current-style app's public port would make systemd start the relay and
+    wake a sleeping app, so its health is read from the kernel's socket table
+    instead: the public port LISTENing means the box is holding the app's
+    address; the private port LISTENing means the app itself is awake.
+    """
+    try:
+        with open("/proc/net/tcp", "r", encoding="ascii") as fh:
+            lines = fh.read().splitlines()[1:]
+    except OSError:
+        return None
+    ports = set()
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 4 or parts[3] != "0A":   # 0A = TCP_LISTEN
+            continue
+        addr, _, port_hex = parts[1].partition(":")
+        if addr not in ("0100007F", "00000000"):  # 127.0.0.1 / 0.0.0.0
+            continue
+        try:
+            ports.add(int(port_hex, 16))
+        except ValueError:
+            continue
+    return ports
+
+
+def _failed_app_units(slugs):
+    """Return the subset of slugs whose app-<slug>.service is in the failed state.
+
+    One `systemctl --user show` call for all current-style apps per sweep. A
+    failed unit is one systemd gave up restarting (crash loop) — the only app
+    state the socket table can't tell apart from "asleep". Any error → empty
+    set (fail open: report asleep rather than broken).
+    """
+    if not slugs:
+        return set()
+    units = [f"app-{s}.service" for s in slugs]
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "show", "-p", "Id", "-p", "ActiveState", "--", *units],
+            capture_output=True, text=True, timeout=APP_SYSTEMCTL_TIMEOUT_SEC,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    failed = set()
+    current = None
+    for line in result.stdout.splitlines():
+        if line.startswith("Id=app-") and line.endswith(".service"):
+            current = line[len("Id=app-"):-len(".service")]
+        elif line == "ActiveState=failed" and current:
+            failed.add(current)
+    return failed
+
+
+# ---------------------------------------------------------------------------
+# Section — helper: mtime → ms int (or None on ENOENT).
+# ---------------------------------------------------------------------------
+
+
+def _mtime_ms(path):
+    """Return int(st_mtime * 1000) or None on ENOENT / OSError."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return int(st.st_mtime * 1000)
+
+
+def _read_text_file(path):
+    """Read whole file as decoded str (errors=replace) or None on OSError."""
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return None
+    return data.decode("utf-8", errors="replace")
+
+
+def _unquote_task_value(val):
+    """Strip one pair of matching YAML quotes from a `task:` value.
+
+    Agents are told to quote `task:` (an unquoted `: ` breaks YAML for every
+    other reader), so `task: "a: b"` must render as `a: b`, not with the
+    quotes. Double-quoted: undo the `\\"` and `\\\\` escapes a writer would
+    emit. Single-quoted: undo YAML's `''` escape. Unquoted values pass through.
+    """
+    if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+        inner = val[1:-1]
+        if val[0] == '"':
+            return re.sub(r'\\(["\\])', r"\1", inner)
+        return inner.replace("''", "'")
+    return val
+
+
+def _yaml_parent_value(line):
+    """(matched, slug_or_None) for one frontmatter line, read the way the
+    backend's YAML 1.2 parser reads a top-level `parent:` key: a space may
+    precede the colon, `#` starts a comment only after whitespace, quotes make
+    a string, and unquoted null / ~ / true / false / numbers (including -1
+    and 1e3) are not strings. A line that isn't a `parent:` key → (False,
+    None). The last `parent:` line wins, valid or not, as in the parser."""
+    m = re.match(r"^parent\s*:(\s.*|)$", line.rstrip("\n").rstrip("\r"))
+    if not m:
+        return False, None
+    raw = m.group(1).strip()
+    quoted = raw[:1] in ("'", '"')
+    if quoted:
+        end = raw.find(raw[0], 1)
+        if end == -1:
+            return True, None
+        val = raw[1:end].strip()
+    else:
+        if raw.startswith("#"):
+            raw = ""
+        c = re.search(r"\s#", raw)
+        val = (raw[: c.start()] if c else raw).strip()
+    if not quoted and (
+        val in ("", "-", "~", "null", "true", "false")
+        or re.fullmatch(r"-?[0-9]+([eE]-?[0-9]+)?|0o[0-7]+|0x[0-9a-f]+", val)
+    ):
+        return True, None
+    return True, (val if PROJECT_SLUG_RE.match(val) else None)
+
+
+def _read_frontmatter_cosmetics(path, allowed_keys, head_bytes=FRONTMATTER_HEAD_BYTES):
+    """Return (cosmetics_dict_or_None, role_or_None) from a markdown file's YAML frontmatter.
+
+    Reads at most FRONTMATTER_HEAD_BYTES characters (text-mode, utf-8-sig to
+    strip BOM) and scans line-by-line between the first two `---` fence lines.
+    Returns (None, None) on any read error or if no valid frontmatter block is
+    found. Returns ({}, None) if frontmatter was found but no cosmetic keys or
+    single role were present — the caller can distinguish "file missing / no
+    frontmatter" from "file read, frontmatter present but empty".
+
+    The returned role is derived from the `roles:` list (see
+    `_parse_roles_frontmatter`, a copy of
+    tests/fixtures/roles_frontmatter_reference.py): exactly one listed role →
+    that role, otherwise None. The singular `role:` key is NOT read.
+
+    Security: role names are validated against the slug regex BEFORE they are
+    ever used in an os.path.join. A malformed role like `../../tmp` is
+    rejected here, never reaching path construction (T-111-01).
+
+    Encoding: text mode with `utf-8-sig` so a UTF-8 BOM (Windows-style) does
+    not silently prevent the first `---` fence from matching (mirrors
+    ambient-monitor.py:257).
+
+    Cap behaviour: if the closing `---` fence falls beyond FRONTMATTER_HEAD_BYTES
+    characters, the capped read produces fewer than two fences → returns
+    (None, None). This is the intended fail-closed behaviour, not a bug: the
+    cap bounds the read of large role files (44 KB measured) and frontmatter
+    that does not fit in 4096 chars is assumed absent.
+
+    `task` values are free-form user prose and are the single most likely field
+    to contain a `:` or a `#`. Because this is a line-oriented fence scan, not
+    a YAML parser, `task` takes everything after the FIRST `:` and strips only
+    trailing whitespace. Trailing `#...` comments are NOT stripped from `task`
+    since a `#` inside prose is legitimate. All other fields DO have trailing
+    YAML comments stripped. This asymmetry is intentional and documented here
+    so it is not "fixed" by a future reader.
+
+    `allowed_keys` governs which cosmetic keys are extracted (e.g. identity
+    files allow `task` and `coordinator`; role files do not). The role is always
+    derived regardless of `allowed_keys`.
+    """
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            raw = fh.read(head_bytes)
+    except OSError:
+        return None, None
+    except UnicodeDecodeError:
+        # A binary file in an identity folder must not raise.
+        return None, None
+
+    lines = raw.split("\n")
+    fences = [i for i, ln in enumerate(lines) if ln.strip() == "---"]
+    if len(fences) < 2:
+        return None, None
+
+    cosmetics = {}
+    # The single `role` (whose cosmetics an identity inherits) comes from the
+    # `roles:` list: exactly one role → that role; several or none → None
+    # (multi-role identities inherit no look). Slugs are validated by the
+    # parser before any path use. Role files carry no `roles:` key → None.
+    roles = _parse_roles_frontmatter(raw)
+    role = roles[0] if len(roles) == 1 else None
+
+    # Line-oriented scanner with a one-way lookahead cursor for multi-line YAML
+    # constructs (currently only the block-style `users:` list). All existing
+    # per-line branches remain single-line — the `skip_until_idx` gate lets a
+    # branch consume N following lines by advancing the cursor. The scanner
+    # never rewinds; index bookkeeping is monotonic.
+    body_lines = lines[fences[0] + 1: fences[1]]
+    skip_until_idx = -1  # inclusive — indices ≤ this were already consumed
+
+    for line_idx, line in enumerate(body_lines):
+        if line_idx <= skip_until_idx:
+            continue
+
+        # Skip full-line comments (col-0-anchored check via lstrip).
+        if line.lstrip().startswith("#"):
+            continue
+
+        # `roles:` (and its block items) match none of the branches below and
+        # fall through; the role is derived from the full list above.
+
+        # --- coordinator: true (only true is ever emitted; absence = false) ---
+        if "coordinator" in allowed_keys:
+            if re.match(r"^coordinator:\s*true\s*(#.*)?$", line.rstrip("\n")):
+                cosmetics["coordinator"] = True
+                continue
+
+        # --- task: free-form prose (no trailing comment strip; # is legitimate) ---
+        if "task" in allowed_keys:
+            m_task = re.match(r"^task:\s*(.+)$", line.rstrip("\n"))
+            if m_task:
+                val = _unquote_task_value(m_task.group(1).rstrip())
+                if val:
+                    cosmetics["task"] = val
+                continue
+
+        # --- project: kebab-case slug, validated against PROJECT_SLUG_RE
+        # (Phase 117 D-05 identity carrier). Per-identity, same discipline as
+        # `task` — a role file's project: is NOT extracted (allowed_keys gate
+        # controls that). Strip surrounding matching quotes so both bare
+        # (`project: trip-planning`) and quoted (`project: "trip-planning"`)
+        # forms survive. Malformed slugs are silently dropped — a garbage
+        # frontmatter value must not paint the identity into a bogus section.
+        if "project" in allowed_keys:
+            m_proj = re.match(
+                r"^project:\s*(.+?)\s*(#.*)?$", line.rstrip("\n")
+            )
+            if m_proj:
+                raw_proj = m_proj.group(1).strip().strip('"').strip("'").strip()
+                if PROJECT_SLUG_RE.match(raw_proj):
+                    cosmetics["project"] = raw_proj
+                continue
+
+        # --- parent: a project.md's parent project slug (nested projects).
+        # Read like the backend's YAML parse (see _yaml_parent_value); only
+        # project files pass "parent" in allowed_keys. The last `parent:`
+        # line wins; an invalid one reads as top level.
+        if "parent" in allowed_keys:
+            matched, parent_val = _yaml_parent_value(line)
+            if matched:
+                if parent_val is None:
+                    cosmetics.pop("parent", None)
+                else:
+                    cosmetics["parent"] = parent_val
+                continue
+
+
+        # --- colorHue: int, must be in 0..359 (mirrors identity-artifact-reader.ts) ---
+        # Accept bare (`324`) OR single/double-quoted (`'324'` / `"324"`) forms.
+        # MDXEditor's frontmatter dialog emits the quoted form on save, and
+        # the app's writers now standardize on it too, so both shapes appear
+        # on disk. Strip surrounding matching quotes before int() so the
+        # sweeper doesn't silently drop the field on a quoted value.
+        if "colorHue" in allowed_keys:
+            m_hue = re.match(r"^colorHue:\s*([^\s#]+)\s*(#.*)?$", line.rstrip("\n"))
+            if m_hue:
+                raw_hue = m_hue.group(1)
+                if len(raw_hue) >= 2 and raw_hue[0] == raw_hue[-1] and raw_hue[0] in ("'", '"'):
+                    raw_hue = raw_hue[1:-1]
+                try:
+                    hue_val = int(raw_hue)
+                    if 0 <= hue_val <= 359:
+                        cosmetics["colorHue"] = hue_val
+                except ValueError:
+                    pass
+                continue
+
+        # --- users: per-user visibility gate list ---
+        # Mirrors extractCosmeticsFromFrontmatter's Array.isArray narrowing in
+        # identity-artifact-reader.ts L2641: array of non-empty strings; empty
+        # or absent → key omitted from cosmetics (absent-⇒-omit fallback per
+        # D-3 zero-migration invariant). Applied on BOTH identity and role
+        # sides — the gate helper intersects the two lists at apply time.
+        #
+        # Two supported YAML shapes, matching real on-disk usage:
+        #   1. Flow style, single line:  users: [alice, bob]
+        #      (the operator convention; also what MDXEditor's string-only
+        #       frontmatterPlugin round-trips as a quoted string that ends up
+        #       looking like a bracket list.)
+        #   2. Block style, multi-line:  users:
+        #                                  - alice
+        #                                  - bob
+        #      (What yaml.dump / hand-typed frontmatter produces by default.)
+        #
+        # Block style advances `skip_until_idx` past every consumed dash-item
+        # line, so subsequent parser branches don't see them. A malformed
+        # entry (empty after strip, or a non-string that couldn't have matched
+        # the dash regex anyway) is silently dropped — matches every other
+        # narrower's discipline in this function.
+        if "users" in allowed_keys:
+            m_flow = re.match(
+                r"^users:\s*\[(.*)\]\s*(#.*)?$", line.rstrip("\n")
+            )
+            if m_flow:
+                items = [
+                    x.strip().strip('"').strip("'").strip()
+                    for x in m_flow.group(1).split(",")
+                ]
+                items = [x for x in items if x]
+                if items:
+                    cosmetics["users"] = items
+                continue
+
+            m_block_hdr = re.match(
+                r"^users:\s*(#.*)?$", line.rstrip("\n")
+            )
+            if m_block_hdr:
+                collected = []
+                look_idx = line_idx + 1
+                last_consumed = line_idx
+                while look_idx < len(body_lines):
+                    nxt = body_lines[look_idx].rstrip("\n")
+                    m_item = re.match(
+                        r"^\s+-\s*(.+?)\s*(#.*)?$", nxt
+                    )
+                    if m_item:
+                        val = m_item.group(1).strip().strip('"').strip("'").strip()
+                        if val:
+                            collected.append(val)
+                        last_consumed = look_idx
+                        look_idx += 1
+                        continue
+                    if nxt.strip() == "":
+                        # Blank line inside the block — YAML tolerates it;
+                        # keep scanning, but do NOT count it as consumed
+                        # (a following non-item line still ends the block).
+                        look_idx += 1
+                        continue
+                    if nxt.lstrip().startswith("#"):
+                        # Comment line inside the block — same treatment as
+                        # blank. Load-bearing on the SECURITY side of the
+                        # gate: without this branch, a role file with
+                        #   users:
+                        #     # operator team
+                        #     - alice
+                        #     - bob
+                        # would break here, hand '- alice' / '- bob' to
+                        # the outer for-loop (which has no dash-item
+                        # branch), silently drop both, and land users=[]
+                        # → falls open per D-3 → gate leaks the role to
+                        # every user. Skip comments uniformly.
+                        look_idx += 1
+                        continue
+                    # Non-item, non-blank, non-comment → block ends before
+                    # this line.
+                    break
+                if collected:
+                    cosmetics["users"] = collected
+                skip_until_idx = last_consumed
+                continue
+
+        # --- string fields: displayName, title, voice, avatar ---
+        for key in ("displayName", "title", "voice", "avatar"):
+            if key not in allowed_keys:
+                continue
+            m_str = re.match(
+                r"^" + re.escape(key) + r":\s*(.+?)\s*(#.*)?$",
+                line.rstrip("\n"),
+            )
+            if m_str:
+                val = m_str.group(1).strip().strip('"').strip("'").strip()
+                if val:
+                    cosmetics[key] = val
+                break
+
+    return cosmetics, role
+
+
+# Canonical `roles:` frontmatter parser — a verbatim copy of
+# substrate/scripts/tests/fixtures/roles_frontmatter_reference.py; keep in sync
+# (tests/roles-frontmatter-conformance.test.sh runs every case against it).
+# The singular `role:` key is NOT read.
+_ROLES_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+def _parse_roles_frontmatter(text):
+    lines = text.lstrip("\ufeff").replace("\r\n", "\n").split("\n")
+    if not lines or lines[0].strip() != "---":
+        return []
+    end = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            end = i
+            break
+    if end is None:
+        return []
+
+    def clean(s):
+        s = re.sub(r"\s+#.*$", "", s).strip()
+        return s.strip("\"'").strip()
+
+    raw = []
+    for i in range(1, end):
+        m = re.match(r"^roles:(.*)$", lines[i])
+        if not m:
+            continue
+        inline = re.sub(r"(^|\s)#.*$", "", m.group(1)).strip()
+        if inline in ("~", "null", "Null", "NULL"):
+            break  # YAML null (`roles: ~` / `roles: null`): zero roles
+        if inline:
+            if inline.startswith("[") and inline.endswith("]"):
+                inline = inline[1:-1]
+            raw = [clean(p) for p in inline.split(",")]
+        else:
+            for j in range(i + 1, end):
+                s = lines[j].strip()
+                if not s or s.startswith("#"):
+                    continue
+                m2 = re.match(r"^-\s*(.*)$", s)
+                if not m2:
+                    break
+                raw.append(clean(m2.group(1)))
+        break
+
+    out = []
+    for r in raw:
+        if r and _ROLES_SLUG_RE.match(r) and r not in out:
+            out.append(r)
+    return out
+
+
+def _read_identity_roles(path):
+    """Return every role named in an identity file's `roles:` frontmatter.
+
+    Parsing is `_parse_roles_frontmatter` (reference copy, see above): scalar,
+    quoted, flow, bare-comma and block forms; invalid slugs dropped (they're
+    later used in os.path.join); duplicates collapsed keeping order. The
+    singular `role:` key is not read. Returns [] on any read error or when
+    there's no valid role.
+    """
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            raw = fh.read(FRONTMATTER_HEAD_BYTES)
+    except (OSError, UnicodeDecodeError):
+        return []
+    return _parse_roles_frontmatter(raw)
+
+
+def _read_role_cosmetics(role, home, role_memo):
+    """Return role cosmetics dict or None for `role`, memoizing the result.
+
+    Returns None immediately when `role` is None (nothing to resolve).
+
+    Uses `in role_memo` membership test (not .get()) so a memoized None is a
+    cache HIT that prevents a second read — the "at most once per host per
+    tick" requirement (D-02) must hold for missing role files just as strictly
+    as for files that read fine.
+
+    Builds the role file path as ~/fleet/roles/<role>/<role>.md. `role` has
+    already passed slug validation in _parse_roles_frontmatter, so
+    no path traversal is possible.
+
+    Logs a single _log line to stderr when the role file cannot be read — a
+    role file that does not exist is a real configuration fact, not a silent
+    no-op.
+    """
+    if role is None:
+        return None
+    if role in role_memo:
+        return role_memo[role]
+    role_path = os.path.join(home, "fleet", "roles", role, role + ".md")
+    cosmetics, _ignored_role = _read_frontmatter_cosmetics(
+        role_path,
+        ("title", "displayName", "colorHue", "voice", "avatar", "users"),
+    )
+    if cosmetics is None:
+        _log("role_cosmetics_unreadable", role=role[:40])
+    role_memo[role] = cosmetics
+    return cosmetics
+
+
+# ---------------------------------------------------------------------------
+# Section — helper: per-PID /proc/<pid>/stat read producing SweepStatResult.
+# ---------------------------------------------------------------------------
+
+
+def _read_proc_stat(pid):
+    """Return SweepStatResult dict shape for /proc/<pid>/stat.
+
+    Discriminated union matching SweepStatResult in sweep-schema.ts:
+        { "ok": True,  "content": str }
+        { "ok": False, "reason": "enoent" }
+        { "ok": False, "reason": "transport" }
+
+    /proc/<pid>/stat is virtual and can vanish between checks; we use
+    os.open + os.read (not `with open()`) so a race where the PID dies mid-
+    read is surfaced deterministically as ENOENT rather than as a partial
+    read of stale content. Any OSError that is NOT ENOENT is classified as
+    "transport" to keep the caller's fail-open path (Bounty 9c8d4a72) intact.
+    """
+    path = f"/proc/{pid}/stat"
+    fd = None
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        chunks = []
+        while True:
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        raw = b"".join(chunks).decode("utf-8", errors="replace")
+        return {"ok": True, "content": raw}
+    except FileNotFoundError:
+        return {"ok": False, "reason": "enoent"}
+    except OSError as e:
+        # Any non-ENOENT OSError → transport. Near-zero probability in-process,
+        # but keep the shape so the caller's isStaleFromStat code path is
+        # untouched.
+        _log("proc_stat_transport_error", pid=pid, errno=e.errno)
+        return {"ok": False, "reason": "transport"}
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Emission phase — build SweepIdentityLine and SweepPidLine dicts.
+# ---------------------------------------------------------------------------
+
+
+AVATAR_SIBLING_EXTS = ("webp", "png", "jpg", "gif", "svg")
+AVATAR_FILENAME_OK = re.compile(r"^[a-z0-9-]+\.(webp|png|jpg|gif|svg)$")
+
+
+def _stat_token(path):
+    """`<mtime_ns>:<size>` for path, or "-" when it can't be stat'd."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return "-"
+    return "%d:%d" % (st.st_mtime_ns, st.st_size)
+
+
+def _avatar_version(name, home, own_avatar, role_avatars):
+    """Short digest that changes whenever the avatar GET /identities/:key/avatar
+    would serve changes.
+
+    Covers a superset of what the route can resolve: every canonical sibling
+    `<name>.<ext>` in the identity folder, plus each role's frontmatter
+    `avatar:` filename and that file's stat. The backend bakes this into
+    avatarUrl as `&v=`, which lets browsers cache the bytes as immutable — so
+    under-covering here would pin a stale avatar; over-covering only costs a
+    refetch.
+
+    `own_avatar` is the identity's own frontmatter `avatar:` value (or None):
+    the route uses it to choose between sibling files, so repointing it must
+    change the version even when no file changed.
+    `role_avatars` is a list of (role, avatar_filename_or_None).
+    """
+    parts = ["own=" + (own_avatar if isinstance(own_avatar, str) else "")]
+    ident_dir = os.path.join(home, "fleet", "identities", name)
+    for ext in AVATAR_SIBLING_EXTS:
+        parts.append(_stat_token(os.path.join(ident_dir, name + "." + ext)))
+    for role_name, avatar in role_avatars:
+        if isinstance(avatar, str) and AVATAR_FILENAME_OK.match(avatar):
+            parts.append(
+                role_name + "/" + avatar + ":"
+                + _stat_token(os.path.join(home, "fleet", "roles", role_name, avatar))
+            )
+    return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def _desktop_running(name, home):
+    """True while the identity's agent-desktop X server is alive.
+
+    agent-desktop records the identity's display number in
+    ~/fleet/identities/<name>/desktop/display; the X server for display :N
+    writes its pid to /tmp/.XN-lock and removes it on clean exit. Running =
+    that lock is ours, names a live X server process, and the server's
+    socket exists. Pure file reads — cheap enough for every
+    tick. Any read failure reads as not running (fail-closed: the app must
+    never advertise a desktop that isn't there).
+    """
+    try:
+        with open(os.path.join(home, "fleet", "identities", name, "desktop", "display")) as f:
+            n = f.read().strip()
+        if not n.isdigit():
+            return False
+        lock = "/tmp/.X%s-lock" % n
+        # Ours only: /tmp is shared, and another user's desktop can hold the
+        # display number this identity used before its desktop stopped.
+        if os.stat(lock).st_uid != os.getuid():
+            return False
+        # The server's socket appears once it is accepting clients — closer
+        # to agent-desktop's own "ready" than the lock alone.
+        if not os.path.exists("/tmp/.X11-unix/X%s" % n):
+            return False
+        with open(lock) as f:
+            pid = f.read().strip()
+        if not pid.isdigit():
+            return False
+        # A hard-killed server leaves its lock behind; make sure the pid is
+        # still an X server, not an unrelated process that reused the pid.
+        with open("/proc/%s/comm" % pid) as f:
+            comm = f.read().strip()
+        return comm.startswith("X")
+    except OSError:
+        return False
+
+
+def _build_identity_line(name, home, sentinels, jsonl_path, role_cosmetics_memo):
+    """Assemble a SweepIdentityLine dict.
+
+    `jsonl_path` is computed once per tick by discover_all_identity_jsonl_paths
+    and shared with per-PID emission (A11 folded into B4). The identity line
+    does NOT read the JSONL tail — only PID lines carry it (A12), so the
+    256 KB read happens only for identities with a live PID.
+
+    New parameter `role_cosmetics_memo` (Phase 111-01): a per-tick dict shared
+    across all identity lines so each role file is read at most once per tick
+    (D-02). Pass {} for first call; the same dict must be reused across all
+    _build_identity_line calls in a single tick.
+
+    Fail-closed appearance contract: an unreadable identity or role file yields
+    null cosmetics and the identity line is STILL emitted. Membership (the line
+    being present) must never depend on appearance reads succeeding (T-111-04).
+    """
+    # ---- Phase 111-01: appearance block. ----
+    # Outer try/except is a belt: the helpers already swallow OSError, but this
+    # guarantees that no unforeseen path error inside the appearance block can
+    # prevent the identity line from being emitted (T-111-04).
+    identity_cosmetics = None
+    role = None
+    role_cosmetics = None
+    roles = []
+    roles_cosmetics = None
+    avatar_version = None
+    try:
+        identity_path = os.path.join(home, "fleet", "identities", name, name + ".md")
+        identity_cosmetics, role = _read_frontmatter_cosmetics(
+            identity_path,
+            # Phase 117 M6 follow-up: `project` extracted so DnD assignments
+            # written by /identities/:key/project (session-project-write.ts)
+            # propagate through the fleet-status pulse's identity_cosmetics
+            # channel. Same discipline as `task` — per-identity, NOT
+            # inherited from the role.
+            #
+            # `users` (visibility-gate list) is extracted on BOTH identity and
+            # role sides; identity_visibility-gate.ts intersects the two lists
+            # at apply time. Absent-⇒-omit on either side falls open (D-3).
+            (
+                "displayName", "title", "colorHue", "voice",
+                "task", "coordinator", "project", "users",
+            ),
+        )
+        if identity_cosmetics is None:
+            _log("identity_cosmetics_unreadable", identity=name[:40])
+        role_cosmetics = _read_role_cosmetics(role, home, role_cosmetics_memo)
+        # Multi-role: `role`/`role_cosmetics` stay None (no inherited look),
+        # but every role's cosmetics ride along for the visibility gate, which
+        # must pass each role's `users:` list.
+        roles = _read_identity_roles(identity_path)
+        if len(roles) > 1:
+            roles_cosmetics = [
+                _read_role_cosmetics(r, home, role_cosmetics_memo) for r in roles
+            ]
+        role_avatars = []
+        for r in roles or ([role] if role else []):
+            cos = _read_role_cosmetics(r, home, role_cosmetics_memo)
+            role_avatars.append((r, cos.get("avatar") if isinstance(cos, dict) else None))
+        own_cos, _ignored = _read_frontmatter_cosmetics(identity_path, ("avatar",))
+        own_avatar = own_cos.get("avatar") if isinstance(own_cos, dict) else None
+        avatar_version = _avatar_version(name, home, own_avatar, role_avatars)
+    except OSError:
+        identity_cosmetics = None
+        role = None
+        role_cosmetics = None
+        roles = []
+        roles_cosmetics = None
+
+    line = {
+        "line_kind": "identity",
+        "schema_version": SCHEMA_VERSION,
+        "identity": name,
+        "dormant": sentinels["dormant"],
+        "compact_requested": sentinels["compact_requested"],
+        "compacting": sentinels["compacting"],
+        "jsonl_path": jsonl_path,
+        "role": role,
+        "identity_cosmetics": identity_cosmetics,
+        "role_cosmetics": role_cosmetics,
+        "roles": roles,
+        "pinned": sentinels["pinned"],
+        "avatar_version": avatar_version,
+        # The pane's desktop button: shown while the agent's desktop runs.
+        "desktop_running": _desktop_running(name, home),
+        # Phase 115 Plan 115-05 archived axis retired in the Phase 122 shape
+        # follow-up. Field kept in the emit so peers running older sweep
+        # schemas still see the expected key (always False now — the archive
+        # tree is no longer walked).
+        "archived": sentinels.get("archived", False),
+    }
+    if roles_cosmetics is not None:
+        line["roles_cosmetics"] = roles_cosmetics
+    return line
+
+
+def _build_pid_line(pid, identity, home, identity_jsonl_paths, jsonl_tail_cache):
+    """Assemble a SweepPidLine dict.
+
+    Fields match SweepPidLine in sweep-schema.ts. Per G6, if the sessionId
+    fails the safe-char regex, the four per-session reads emit null.
+    """
+    session_json_path = os.path.join(home, ".claude", "sessions", f"{pid}.json")
+    session_json = _read_text_file(session_json_path)
+
+    stat_result = _read_proc_stat(pid)
+
+    # Extract sessionId from session JSON — the sole server-side JSON parse
+    # of per-PID payload we need to gate per-session reads.
+    session_id = None
+    if session_json is not None:
+        try:
+            sj_obj = json.loads(session_json)
+            if isinstance(sj_obj, dict):
+                candidate = sj_obj.get("sessionId")
+                if isinstance(candidate, str) and SAFE_NAME_RE.match(candidate):
+                    session_id = candidate
+        except Exception:
+            session_id = None
+
+    if session_id is not None:
+        stop_mtime_ms = _mtime_ms(os.path.join(
+            home, ".claude", "fleet-status", f"stop-{session_id}.json",
+        ))
+        activity_mtime_ms = _mtime_ms(os.path.join(
+            home, ".claude", "fleet-status", "hooks", session_id, "activity",
+        ))
+        stopped_mtime_ms = _mtime_ms(os.path.join(
+            home, ".claude", "fleet-status", "hooks", session_id, "stopped",
+        ))
+        per_session_stop_payload = _read_text_file(os.path.join(
+            home, ".claude", "fleet-status", f"stop-{session_id}.json",
+        ))
+    else:
+        # G6 defense-in-depth — null out the four per-session reads.
+        stop_mtime_ms = None
+        activity_mtime_ms = None
+        stopped_mtime_ms = None
+        per_session_stop_payload = None
+
+    # A10: dormant-A read for this identity. Even though it's byte-identical
+    # to SweepIdentityLine.dormant in the common case (RESEARCH G7), the
+    # caller's dual-frame code path in Plan 04 consumes them as distinct
+    # fields, so we emit both.
+    if identity is not None and SAFE_NAME_RE.match(identity):
+        dormant_a = os.path.exists(os.path.join(
+            home, "fleet", "identities", identity, ".dormant",
+        ))
+    else:
+        dormant_a = False
+
+    # A12: jsonl_tail — read at most once per identity per tick (several
+    # PIDs can share an identity), memoized in `jsonl_tail_cache`. If the
+    # identity had no discovered path OR the tail read failed, emit None.
+    jsonl_tail = None
+    if identity is not None:
+        if identity not in jsonl_tail_cache:
+            fallback_path = identity_jsonl_paths.get(identity)
+            if fallback_path is None:
+                # Identity not in the per-tick discovery map (rare — e.g. a
+                # live PID whose folder is missing under ~/fleet/identities/).
+                # Discover just for this PID's identity so the ai-title scan
+                # still has fresh input.
+                fallback_path = discover_identity_jsonl_path(identity, home)
+                identity_jsonl_paths[identity] = fallback_path
+            if fallback_path is not None:
+                jsonl_tail_cache[identity] = _read_tail_bytes(fallback_path)
+            else:
+                jsonl_tail_cache[identity] = None
+        jsonl_tail = jsonl_tail_cache[identity]
+
+    return {
+        "line_kind": "pid",
+        "schema_version": SCHEMA_VERSION,
+        "identity": identity if identity is not None else "",
+        "pid": pid,
+        "session_json": session_json,
+        "stat_result": stat_result,
+        "per_session_stop_mtime_ms": stop_mtime_ms,
+        "activity_mtime_ms": activity_mtime_ms,
+        "stopped_mtime_ms": stopped_mtime_ms,
+        "per_session_stop_payload": per_session_stop_payload,
+        "dormant_a": dormant_a,
+        "jsonl_tail": jsonl_tail,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Enumeration + orchestration.
+# ---------------------------------------------------------------------------
+
+
+def _enumerate_identities(home):
+    """Return list of dicts {name, dormant, compact_requested, compacting, pinned, archived}.
+
+    Walks ~/fleet/identities/ only. Skips entries whose name fails the
+    safe-char regex (G6 server-side belt). On FileNotFoundError, returns [] —
+    a fresh host with no live tree yet is a valid fail-open shape.
+
+    (Phase 115 Plan 115-02 removed the `.hidden` probe alongside the schema-
+    side retirement per D-21. Phase 115 Plan 115-05 added an archive-tree
+    walk emitting `archived: true` for archive-tree rows; the walk retired in
+    the Phase 122 shape follow-up alongside the sidebar Archived section +
+    wire pump. `archived` is still emitted for wire-shape stability with
+    peer hosts still running older sweep schemas — always False now.)
+
+    This function is a pure sentinel walk — it does NOT read frontmatter.
+    Per-identity frontmatter reads happen inside _build_identity_line where
+    the per-identity try/except can contain any read failure without aborting
+    the whole host sweep.
+    """
+    out = []
+    root = os.path.join(home, "fleet", "identities")
+    try:
+        with os.scandir(root) as it:
+            for entry in it:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                name = entry.name
+                if not SAFE_NAME_RE.match(name):
+                    _log("identity_name_skipped", name=name[:40])
+                    continue
+                dormant = os.path.exists(os.path.join(entry.path, ".dormant"))
+                # Condense: the agent or the app drops .compact-requested;
+                # the supervisor holds .compacting while /compact runs.
+                compact_requested = os.path.exists(
+                    os.path.join(entry.path, ".compact-requested"),
+                )
+                compacting = os.path.exists(
+                    os.path.join(entry.path, ".compacting"),
+                )
+                pinned = os.path.exists(os.path.join(entry.path, ".pinned"))
+                out.append({
+                    "name": name,
+                    "dormant": dormant,
+                    "compact_requested": compact_requested,
+                    "compacting": compacting,
+                    "pinned": pinned,
+                    "archived": False,
+                })
+    except FileNotFoundError:
+        # Live tree may not exist yet on a fresh host — return empty.
+        pass
+    except OSError as e:
+        _log("identities_scandir_failed", errno=e.errno, root=root)
+    return out
+
+
+def _enumerate_pids(home):
+    """Return list of (pid_int, session_json_path_str) tuples.
+
+    Iterates ~/.claude/sessions/*.json. On non-numeric basename, skip. On no
+    matches, return [].
+    """
+    sessions_glob = os.path.join(home, ".claude", "sessions", "*.json")
+    out = []
+    for path in glob.glob(sessions_glob):
+        base = os.path.basename(path)
+        stem = base[:-len(".json")] if base.endswith(".json") else base
+        try:
+            pid = int(stem)
+        except ValueError:
+            continue
+        out.append((pid, path))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Phase 118 — source C: ~/fleet/apps/* enumeration + line builder.
+# ---------------------------------------------------------------------------
+
+
+def _build_app_line(slug, folder_path, home, owner=None, listening=None, failed=None,
+                    project=None, project_audience=None):
+    """Assemble a SweepAppLine dict, or return None if D-01 excludes it.
+
+    D-01 checks (both must pass for inclusion):
+      (a) folder contains a readable app.json that parses as JSON
+      (b) a corresponding systemd --user unit FILE exists on disk at
+          ~/.config/systemd/user/app-<slug>.service
+
+    D-02 carve-out: if (a) + (b) pass but the port probe fails (or no PORT is
+    declared in the unit body), still emit with is_healthy=false +
+    health_message. Silent removal of a definitely-was-an-app is worse than
+    surfacing the diagnostic.
+
+    Returns a dict with the D-05 emit shape (line_kind, schema_version, slug,
+    title, description, port, has_icon, created_at_ms, is_healthy,
+    health_message) or None when D-01 (a) or (b) fails.
+    """
+    # (a) app.json parses. MEMBERSHIP gate per RESEARCH § Q8 — a bad card
+    # means the app is NOT in the picture; return None, do NOT emit with
+    # null title.
+    app_json_path = os.path.join(folder_path, "app.json")
+    try:
+        with open(app_json_path, "r", encoding="utf-8") as fh:
+            metadata = json.loads(fh.read())
+    except (OSError, json.JSONDecodeError):
+        _log("app_json_missing_or_malformed", slug=slug[:APP_SLUG_MAX_LEN])
+        return None
+
+    title = metadata.get("title") if isinstance(metadata, dict) else None
+    description = (
+        metadata.get("description") if isinstance(metadata, dict) else None
+    )
+    if not isinstance(title, str) or not isinstance(description, str):
+        _log("app_json_bad_shape", slug=slug[:APP_SLUG_MAX_LEN])
+        return None
+
+    # Phase 130: users list for the per-user visibility gate. Optional key on
+    # app.json; the substrate/skills/app-development README (added Phase 130)
+    # tells agents on multi-user boxes to add
+    # this list when creating an app. Missing / non-list / mixed-type values
+    # fall back to None (falls open per D-3 — every user with host access
+    # sees the app; zero-migration invariant for existing app.json files
+    # across the fleet).
+    raw_users = metadata.get("users") if isinstance(metadata, dict) else None
+    if isinstance(raw_users, list) and all(
+        isinstance(u, str) for u in raw_users
+    ):
+        users = raw_users
+    else:
+        users = None
+    # project-scoped apps: a project app has no list of its own — whoever can
+    # see its project sees it, so it carries the project's audience instead.
+    if project is not None:
+        users = project_audience
+
+    # (b) unit file exists on disk. Reading the file directly replaces the
+    # pre-2026-09-19 `systemctl --user show LoadState` check — see the
+    # module docblock above _read_app_unit_file for why.
+    unit_text = _read_app_unit_file(slug, home)
+    if unit_text is None:
+        # D-01 check (b) fails — no unit file for this slug. Silent (not a
+        # transport error, not a bad card; just "no unit registered").
+        return None
+
+    # convo-scoped apps: a socket unit marks a current-style app. Its public
+    # port lives there; the service's PORT= is the app's private port.
+    socket_text = _read_app_socket_file(slug, home)
+    asleep = None
+    if socket_text is not None:
+        m = APP_SOCKET_LISTEN_RE.search(socket_text)
+        port = int(m.group(1)) if m else None
+    else:
+        # Port from Environment=PORT=<n> in the unit body (D-07). None if the
+        # unit doesn't declare a PORT — D-05 allows nullable port.
+        m = APP_UNIT_ENV_PORT_RE.search(unit_text)
+        port = int(m.group(1)) if m else None
+
+    # Health via loopback probe (D-02 carve-out). Two special cases:
+    #
+    #   1. No PORT declaration → can't probe. Emit as unhealthy with a
+    #      diagnostic so the frontend surfaces the misconfiguration.
+    #
+    #   2. Running inside the app container's constrained namespace (the
+    #      isLocalHostId acquireLocalChannel path — see starter.ts). The
+    #      container's 127.0.0.1 is not the host's 127.0.0.1 (network
+    #      namespaces don't share loopback) so the probe would always fail
+    #      even for a healthy host-loopback-bound app. Same gotcha the
+    #      app-pane proxy tunnels through — see pane-target-resolver.ts D-10
+    #      resolution. In this path, trust the unit-file presence as the
+    #      health signal: the sweep runs against the same host that owns
+    #      the file, and the click-through path uses the SSH tunnel which
+    #      IS namespace-crossing. Signal: `HOME_HOST_DIR` env is set only
+    #      by the app's compose config, so this branch is not reachable
+    #      on peer hosts (where the sweep runs in the user's real shell).
+    if port is None:
+        is_healthy = False
+        health_message = (
+            "port not declared in systemd unit — ask an agent to fix "
+            "app-" + slug[:APP_SLUG_MAX_LEN] + ".service"
+        )
+    elif os.environ.get("HOME_HOST_DIR"):
+        is_healthy = True
+        health_message = None
+    elif socket_text is not None:
+        # Current-style app: never knock (that would wake it). Read the
+        # kernel's socket table and systemd's failed state instead.
+        if listening is None:
+            listening = _loopback_listening_ports() or set()
+        if failed is None:
+            failed = _failed_app_units([slug])
+        if slug in failed:
+            is_healthy = False
+            health_message = "keeps crashing — ask an agent to check on it"
+        elif port not in listening:
+            is_healthy = False
+            health_message = "not running — ask an agent to check on it"
+        else:
+            is_healthy = True
+            health_message = None
+            asleep = (port + APP_PRIVATE_PORT_OFFSET) not in listening
+    else:
+        is_healthy = _probe_app_port(port)
+        if is_healthy:
+            health_message = None
+        else:
+            # D-03: backend authors the ready-to-render string. Literal
+            # phrasing matches the user's steer during the /open grill
+            # 2026-09-18.
+            health_message = "not running — ask an agent to check on it"
+
+    # D-06: has_icon is a boolean, not a URL. Shape 4 owns the serving path.
+    icon_path = os.path.join(folder_path, "icon.webp")
+    has_icon = os.path.exists(icon_path)
+    # Digest of the icon's stat; the backend bakes it into the icon URL as
+    # `?v=` so browsers can cache the bytes as immutable (same scheme as
+    # avatar_version). None when there is no icon.
+    icon_version = (
+        hashlib.sha1(_stat_token(icon_path).encode("utf-8")).hexdigest()[:16]
+        if has_icon
+        else None
+    )
+
+    # D-08: createdAt is folder mtime, not a stored field.
+    try:
+        folder_mtime_ms = int(os.stat(folder_path).st_mtime * 1000)
+    except OSError:
+        # Improbable — the scandir just succeeded. Fall back to 0 rather
+        # than raising so the per-app try/except in the enumerator doesn't
+        # trip on a stat race.
+        folder_mtime_ms = 0
+
+    # D-05 emit shape — exactly these keys, in this order. Byte-name parity
+    # with the TS SweepAppLine interface (snake_case on the wire; the wire-
+    # protocol frontend-facing shape does camelCase remapping).
+    #
+    # Phase 130: `users` added as an OPTIONAL emit field. Older TS parsers
+    # (pre-130) simply ignore unknown fields on the incoming object — the
+    # SweepAppLine widening is additive per RESEARCH.md § Pitfall 6 (same
+    # discipline that added `has_icon` etc.). Rolling-deploy safe.
+    return {
+        "line_kind": "app",
+        "schema_version": SCHEMA_VERSION,
+        "slug": slug,
+        "title": title,
+        "description": description,
+        "port": port,
+        "has_icon": has_icon,
+        "icon_version": icon_version,
+        "created_at_ms": folder_mtime_ms,
+        "is_healthy": is_healthy,
+        "health_message": health_message,
+        "users": users,
+        # convo-scoped apps: owning identity for a conversation app (None for
+        # sidebar apps), and whether a current-style app is asleep right now
+        # (None when unknown / not applicable). Additive fields.
+        "owner": owner,
+        "asleep": asleep,
+        # project-scoped apps: the project a project app belongs to (None for
+        # sidebar and conversation apps). Additive field.
+        "project": project,
+    }
+
+
+# A username no one can have (control character): the audience of a project
+# app nobody can see.
+PROJECT_APP_NOBODY = "\u0000nobody"
+
+
+def _project_audience(projects, slug):
+    """Who can see project `slug`: the intersection of every non-empty `users`
+    list along its parent chain (cut at a hand-edited loop the way the sidebar
+    draws it), or None when nothing in the chain restricts it. Mirrors
+    effectiveProjectAudience in project-visibility-gate.ts."""
+    by_slug = {p["slug"]: p for p in projects}
+    chain, seen_at, node = [], {}, slug
+    while isinstance(node, str) and node in by_slug:
+        if node in seen_at:
+            del chain[seen_at[node] + 1:]
+            break
+        seen_at[node] = len(chain)
+        chain.append(node)
+        node = by_slug[node].get("parent")
+    audience = None
+    for s in chain:
+        users = by_slug[s].get("users")
+        if isinstance(users, list) and users:
+            audience = set(users) if audience is None else audience & set(users)
+    if audience is None:
+        return None
+    # Lists that don't overlap leave nobody — but an empty list means "no
+    # limit" to the visibility gate, so name someone who can't exist.
+    return sorted(audience) or [PROJECT_APP_NOBODY]
+
+
+def _enumerate_apps(home, projects=None):
+    """Return list of SweepAppLine dicts for ~/fleet/apps/*/, conversation apps
+    and project apps.
+
+    convo-scoped apps: also walks ~/fleet/identities/<name>/apps/*/ and emits
+    those apps with `owner` = <name>. project-scoped apps: also walks
+    ~/fleet/projects/<slug>/apps/*/ for every live project in `projects` (the
+    project-list entries) and emits those apps with `project` = <slug> and the
+    project's audience as `users`. All roots share the caps below.
+
+    Fail-open per D-18: an absent ~/fleet/apps/ dir yields []; a broken
+    per-app entry is skipped (with a stderr log) but does not affect other
+    apps or the identity/pid enumeration.
+
+    Slug validation via APP_SLUG_RE + APP_SLUG_MAX_LEN happens BEFORE any
+    subprocess call (T-118-01-SL defense-in-depth). Symlinks are rejected
+    at scandir time (follow_symlinks=False) to prevent path-traversal
+    outside ~/fleet/apps/ (T-118-01-PT).
+
+    Phase 118 code-review MEDIUM-4 (fix pass 2026-09-18): TWO DoS caps
+    apply before any subprocess call:
+      1. APP_ENUM_CAP folder-count cap: after APP_ENUM_CAP valid slugs
+         have been processed, stop enumerating. Emit fleet_status_apps_
+         cap_hit with the observed folder count so operators see the
+         signal.
+      2. APP_ENUM_WALLCLOCK_BUDGET_SEC cumulative wall-clock cap: if the
+         time spent inside the loop crosses this threshold, bail and
+         return whatever we've built. Same warn shape (kind: "wallclock").
+    Both caps preserve fail-open discipline — the sweep still emits its
+    identity + pid lines, and the caller gets a valid partial JSONL blob.
+    """
+    out = []
+    state = {"total_seen": 0, "started": time.monotonic(), "stop": False}
+
+    # Health inputs shared by every current-style app this sweep: one read of
+    # the kernel socket table and one systemctl call, not one per app.
+    unit_dir = os.path.join(home, ".config", "systemd", "user")
+    try:
+        sockets = [n[len("app-"):-len(".socket")] for n in os.listdir(unit_dir)
+                   if n.startswith("app-") and n.endswith(".socket")]
+    except OSError:
+        sockets = []
+    sockets = [s for s in sockets if APP_SLUG_RE.match(s) and len(s) <= APP_SLUG_MAX_LEN]
+    in_container = bool(os.environ.get("HOME_HOST_DIR"))
+    listening = None if in_container or not sockets else (_loopback_listening_ports() or set())
+    failed = set() if in_container else _failed_app_units(sockets)
+
+    _scan_app_root(os.path.join(home, "fleet", "apps"), home, None, out, state, listening, failed)
+
+    identities_root = os.path.join(home, "fleet", "identities")
+    try:
+        with os.scandir(identities_root) as it:
+            names = sorted(e.name for e in it
+                           if e.is_dir(follow_symlinks=False) and SAFE_NAME_RE.match(e.name))
+    except OSError:
+        names = []
+    for name in names:
+        if state["stop"]:
+            break
+        _scan_app_root(os.path.join(identities_root, name, "apps"), home, name, out, state, listening, failed)
+
+    projects_root = os.path.join(home, "fleet", "projects")
+    for project in projects or []:
+        if state["stop"]:
+            break
+        slug = project.get("slug")
+        if not isinstance(slug, str) or slug == "archive" or not PROJECT_SLUG_RE.match(slug):
+            continue
+        _scan_app_root(os.path.join(projects_root, slug, "apps"), home, None, out, state, listening, failed,
+                       project=slug, project_audience=_project_audience(projects, slug))
+    return out
+
+
+def _scan_app_root(root, home, owner, out, state, listening, failed, project=None, project_audience=None):
+    """Append SweepAppLine dicts for every app folder directly under root."""
+    try:
+        with os.scandir(root) as it:
+            for entry in it:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                state["total_seen"] += 1
+                # MEDIUM-4 folder-count cap. Count BEFORE slug validation so
+                # `total_seen` reflects folders actually present on disk (not
+                # just the ones that passed the regex). The cap fires on the
+                # (N+1)th valid folder, so `out` may hold up to APP_ENUM_CAP
+                # entries when we break here.
+                if len(out) >= APP_ENUM_CAP:
+                    _log(
+                        "fleet_status_apps_cap_hit",
+                        kind="count",
+                        cap=APP_ENUM_CAP,
+                        observed=state["total_seen"],
+                    )
+                    state["stop"] = True
+                    break
+                # MEDIUM-4 wall-clock budget. Check BEFORE each iteration's
+                # subprocess call so we bail before eating another 1.5s.
+                elapsed = time.monotonic() - state["started"]
+                if elapsed > APP_ENUM_WALLCLOCK_BUDGET_SEC:
+                    _log(
+                        "fleet_status_apps_cap_hit",
+                        kind="wallclock",
+                        budget_sec=APP_ENUM_WALLCLOCK_BUDGET_SEC,
+                        elapsed_sec=round(elapsed, 3),
+                        observed=state["total_seen"],
+                        emitted=len(out),
+                    )
+                    state["stop"] = True
+                    break
+                slug = entry.name
+                if (
+                    not APP_SLUG_RE.match(slug)
+                    or len(slug) > APP_SLUG_MAX_LEN
+                ):
+                    _log("app_slug_skipped", slug=slug[:APP_SLUG_MAX_LEN])
+                    continue
+                try:
+                    line = _build_app_line(slug, entry.path, home, owner, listening, failed,
+                                           project=project, project_audience=project_audience)
+                except Exception:
+                    # Belt-and-braces per RESEARCH § Q8: any unexpected raise
+                    # inside _build_app_line is contained here so other apps
+                    # (and identities/pids) still emit this tick.
+                    _log("app_build_failed", slug=slug[:APP_SLUG_MAX_LEN],
+                         err=traceback.format_exc(limit=1).strip())
+                    continue
+                if line is not None:
+                    out.append(line)
+    except FileNotFoundError:
+        # An absent apps folder is a valid empty state (fresh box, or an
+        # identity with no conversation apps) — D-19 fail-open, not an error.
+        return
+    except OSError as e:
+        _log("apps_scandir_failed", errno=e.errno)
+
+
+# ---------------------------------------------------------------------------
+# Source E: ~/fleet/projects/* enumeration — ONE `project-list` line per tick.
+# ---------------------------------------------------------------------------
+#
+# Projects created straight on disk (an agent doing mkdir + write project.md,
+# as the id skill permits) never went through the /projects HTTP route, so no
+# project-list-changed frame ever fired and open clients never learned of the
+# project until reload. Emitting the full list every tick lets the orchestrator
+# publish it; the registry's per-host deep-equal skip keeps steady state silent.
+#
+# A single line carrying the whole array (not one line per project) so the
+# backend can tell "zero projects" (line present, empty array) from "older
+# sweep that doesn't enumerate projects" (line absent) — the latter must never
+# be read as "every project on this host vanished".
+#
+# Parity with listProjects in identity-artifact-reader.ts: non-archive dirs
+# matching PROJECT_SLUG_RE, sorted by slug; displayName falls back to the slug;
+# users is a list of strings or null; parent is a slug or null.
+PROJECT_ENUM_CAP = 500
+
+
+def _enumerate_projects(home):
+    """Return the `project-list` line dict, or None if enumeration failed.
+
+    An absent ~/fleet/projects/ is a valid empty state → line with []. Any
+    other scandir failure → None (emit nothing; the backend keeps its last
+    picture rather than publishing a bogus empty list).
+    """
+    root = os.path.join(home, "fleet", "projects")
+    slugs = []
+    try:
+        with os.scandir(root) as it:
+            for entry in it:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                if entry.name == "archive" or not PROJECT_SLUG_RE.match(entry.name):
+                    continue
+                slugs.append(entry.name)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        _log("projects_scandir_failed", errno=e.errno)
+        return None
+    # Cap AFTER sorting, so the cut is deterministic (scandir order is not)
+    # and the same projects survive every sweep — a parent must not drop out
+    # one sweep and come back the next.
+    slugs.sort()
+    if len(slugs) > PROJECT_ENUM_CAP:
+        _log("fleet_status_projects_cap_hit", cap=PROJECT_ENUM_CAP)
+        slugs = slugs[:PROJECT_ENUM_CAP]
+
+    projects = []
+    for slug in sorted(slugs):
+        cosmetics, _role = _read_frontmatter_cosmetics(
+            os.path.join(root, slug, "project.md"),
+            ("displayName", "users", "parent"),
+            head_bytes=PROJECT_FRONTMATTER_HEAD_BYTES,
+        )
+        cosmetics = cosmetics or {}
+        display_name = cosmetics.get("displayName") or slug
+        users = cosmetics.get("users")
+        if not (isinstance(users, list) and all(isinstance(u, str) for u in users)):
+            users = None
+        # A project naming itself as parent is treated as top level.
+        parent = cosmetics.get("parent")
+        if parent == slug:
+            parent = None
+        projects.append({
+            "slug": slug,
+            "display_name": display_name,
+            "users": users,
+            "parent": parent,
+        })
+
+    return {
+        "line_kind": "project-list",
+        "schema_version": SCHEMA_VERSION,
+        "projects": projects,
+    }
+
+
+def _emit(record):
+    """Write one JSON line to stdout — compact, terminated with \\n."""
+    sys.stdout.write(json.dumps(record, separators=(",", ":")))
+    sys.stdout.write("\n")
+
+
+def main():
+    home = os.environ.get("HOME")
+    if not home:
+        _log("no_home_env")
+        return 0
+
+    # ---- Enumerate identities from folder + PIDs from sessions dir. ----
+    identity_records = _enumerate_identities(home)
+    pid_records = _enumerate_pids(home)
+
+    # ---- Phase 118: enumerate ~/fleet/apps/*/ (source C). Sequential per
+    #      RESEARCH § Q6 — the user's ~10-app ceiling makes threading complexity
+    #      unnecessary at 1.5s/call and <10ms typical systemctl latency. ----
+    # Source E is read first: project apps carry their project's audience.
+    project_list_line = _enumerate_projects(home)
+    app_records = _enumerate_apps(
+        home, project_list_line["projects"] if project_list_line is not None else None
+    )
+
+    # ---- Resolve PID → identity via /proc/<pid>/environ + tmux. ----
+    resolved_pids = []  # list of (pid, identity_or_None)
+    for pid, _path in pid_records:
+        identity = _resolve_pid_to_tmux_session(pid)
+        resolved_pids.append((pid, identity))
+
+    # ---- Union: any resolved identity NOT in the folder scan gets a synthetic
+    #      identity record with sentinels false (RESEARCH.md G7 corner —
+    #      defensive; should not happen but the caller's dual-frame path
+    #      relies on IdentityLine existing for every identity that has a
+    #      PidLine). ----
+    known_names = {r["name"] for r in identity_records}
+    for _pid, identity in resolved_pids:
+        if identity is None:
+            continue
+        if identity in known_names:
+            continue
+        if not SAFE_NAME_RE.match(identity):
+            _log("resolved_identity_name_unsafe", name=identity[:40])
+            continue
+        identity_records.append({
+            "name": identity,
+            "dormant": False,
+            "compact_requested": False,
+            "compacting": False,
+            "pinned": False,
+            # Synthetic records (identity known only via /proc/<pid>/environ)
+            # are always LIVE — a PID cannot be running for an identity whose
+            # folder is under identities-archive/ (retire always kills the
+            # harness before moving the folder). archived: false is correct.
+            "archived": False,
+        })
+        known_names.add(identity)
+
+    # ---- Discovery: identity → jsonl_path, one history-folder read per agent. ----
+    identity_jsonl_paths = discover_all_identity_jsonl_paths(
+        [rec["name"] for rec in identity_records], home,
+    )
+
+    # ---- Emit identity lines first. ----
+    role_cosmetics_memo = {}  # role -> dict | None (at most one read per role per tick)
+    for rec in identity_records:
+        line = _build_identity_line(
+            rec["name"],
+            home,
+            {
+                "dormant": rec["dormant"],
+                "compact_requested": rec["compact_requested"],
+                "compacting": rec["compacting"],
+                "pinned": rec["pinned"],
+                "archived": rec["archived"],
+            },
+            identity_jsonl_paths.get(rec["name"]),
+            role_cosmetics_memo,
+        )
+        _emit(line)
+
+    # ---- Emit pid lines. Skip PIDs with no resolved identity — matches
+    #      today's "no tmuxSession → no source-A frame" path. ----
+    jsonl_tail_cache = {}  # name -> str | None (A12 tail, one read per identity)
+    for pid, identity in resolved_pids:
+        if identity is None:
+            continue
+        line = _build_pid_line(
+            pid, identity, home, identity_jsonl_paths, jsonl_tail_cache,
+        )
+        _emit(line)
+
+    # ---- Phase 118: emit app lines. Additive per D-14; each line has already
+    #      been through the D-01/D-02 filter inside _build_app_line. ----
+    for line in app_records:
+        _emit(line)
+
+    # ---- Source E: one project-list line (absent only on scandir failure).
+    if project_list_line is not None:
+        _emit(project_list_line)
+
+    sys.stdout.flush()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        rc = main()
+    except Exception:
+        # LOAD-BEARING: any unhandled exception → stderr diag + exit 0 with
+        # (possibly partial, possibly empty) stdout. The backend caller's
+        # parser will silently discard anything that's not a valid schema-v1
+        # JSONL line, so a truncated final line is harmless. What is NOT
+        # acceptable is a nonzero exit or a traceback on stdout.
+        sys.stderr.write("[fleet-status-sweep] op=unhandled_top_level_error\n")
+        traceback.print_exc(file=sys.stderr)
+        rc = 0
+    sys.exit(rc if isinstance(rc, int) else 0)

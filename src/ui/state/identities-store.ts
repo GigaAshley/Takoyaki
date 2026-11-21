@@ -1,0 +1,1278 @@
+import { useEffect, useState } from "react";
+import { listIdentities, type Identity } from "@/api/identities-api";
+import {
+  getCurrentUser,
+  readUserScopedCache,
+  writeUserScopedCache,
+} from "@/state/user-scoped-cache";
+// Phase 66 Plan 05 (W4): import sessionMatchKey DIRECTLY from its authoritative
+// source (session-hue), NOT re-exported through conversation-store. This mirrors
+// conversation-store.ts:54's own direct import — session-hue is the canonical
+// home; adding a re-export elsewhere would create a second import path and
+// risk a circular-dep loop if session-hue ever imports from conversation-store.
+import { sessionMatchKey } from "@/features/terminal/session-hue";
+import {
+  getFleetSessionsSnapshot,
+  hydratePinnedIdsFromServer,
+  subscribeConversationStore,
+  type FleetSession,
+} from "./conversation-store";
+
+type State = {
+  identities: Identity[];
+  byKey: Map<string, Identity>;
+  /** quick-260912-0t4: hostId-scoped composite-key map. Key format
+   *  `${hostId}::${identityKey.toLowerCase()}`. Cosmetics consumers that
+   *  render a row/pane belonging to a specific host MUST read from here so
+   *  cross-host name collisions (e.g. two identities named "willow" on
+   *  different fleet hosts) don't collide on lookup. `byKey` above is
+   *  preserved additively for existence-check consumers whose semantics are
+   *  "is there ANY identity by this name?" (AppShell pane discriminator,
+   *  IdentityBadge, tabUtils, IdentitySessionPane, conversation-store role
+   *  fallback, relay-mxid-resolve) — see quick-260912-0t4 rationale. */
+  byHostKey: Map<string, Identity>;
+  loaded: boolean;
+};
+
+// Storage key for the per-identity appearance cache read at module load and
+// written on every state-change notify(). Bump the version suffix on any
+// schema change to the cached fields (avoids reading a stale-shape cache into
+// an incompatible reader).
+// Phase 115 Plan 115-02: bumped v1 → v2 to invalidate any cached identity
+// records that carry the retired `hidden` field. Cached v1 records without
+// `hidden` still parse fine, but bumping the key wipes the surface entirely
+// on cold refresh — cheaper than a per-field migration for one deprecated axis.
+//
+// Bumped v2 → v3 to add the owner-tag wrapper. Pre-v3 payloads were a bare
+// Identity[] with no owner tag, which allowed user A's identity list
+// (backend-filtered by host-access grants) to flash in user B's sidebar
+// during a logout → login-as-different-user flow on the same browser.
+// The owner check runs on every read via readUserScopedCache, so it covers
+// explicit logout AND auth-expiry / browser-close paths equally.
+const APPEARANCE_CACHE_KEY = "skynet:identities-appearance-cache:v3";
+const APPEARANCE_CACHE_LEGACY_KEYS = [
+  "skynet:identities-appearance-cache:v1",
+  "skynet:identities-appearance-cache:v2",
+];
+
+// Module-load seed from localStorage: paint dressed rows on cold refresh
+// BEFORE the fleet-status WS first-frame arrives. Carries loaded:false — the
+// fuller GET /identities request remains the sole owner of loaded:true
+// (D-10). Empty / missing / malformed cache falls back to the empty initial
+// state; readAppearanceCache is silent by contract.
+let state: State = (() => {
+  const cached = readAppearanceCache();
+  const empty: State = {
+    identities: [],
+    byKey: new Map(),
+    byHostKey: new Map(),
+    loaded: false,
+  };
+  if (cached.length === 0) return empty;
+  return { ...reindex(cached), loaded: false };
+})();
+let inflight: Promise<void> | null = null;
+const listeners = new Set<() => void>();
+
+// Hosts whose identities the store holds from a fan-out fetch (one that
+// returns every identity on each host it names). The fleet subscription
+// re-fetches whenever fleetSessions mentions a host outside this set — the
+// fleet snapshot fills in host by host on a cold boot, so a single re-fetch
+// on the first non-empty snapshot can cover only the first host to report.
+// Keyed on hosts, not identities, so steady session churn never re-fetches.
+let coveredHostIds = new Set<number>();
+let hasSubscribedToFleet = false;
+
+function hostIdsOf(identityHosts: Record<string, number>): Set<number> {
+  return new Set(Object.values(identityHosts));
+}
+
+// A requested host can come back with no identities even on a 200 — the
+// backend swallows per-host fan-out failures (SSH timeout, breaker open) and
+// returns [] for that host. Such a host stays uncovered and is retried on this
+// schedule (delay after the 1st, 2nd, … empty attempt); past the end it is
+// given up on until a later refresh happens to include it and it answers.
+// Also paces whole-request failures, so a failing backend is not re-hit on
+// every conversation-store notification.
+const UNCOVERED_HOST_RETRY_DELAYS_MS = [0, 2_000, 4_000, 8_000, 16_000, 32_000];
+let uncoveredHostRetries = new Map<
+  number,
+  { attempts: number; nextAt: number; gaveUp: boolean }
+>();
+let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+// Responses can land out of order (fetchOnce vs a subscriber refresh vs a
+// caller's refreshIdentities). Each replaces the whole list, so an older
+// response landing after a newer one would roll the store back. Apply only
+// responses issued after the last one applied.
+let fetchSeq = 0;
+let lastAppliedFetchSeq = 0;
+
+/**
+ * Apply a fan-out response (or record its failure) and update host coverage.
+ * Returns false when the response was superseded by a newer one already
+ * applied — the caller must then leave the store alone.
+ */
+function recordFetchOutcome(
+  seq: number,
+  identityHosts: Record<string, number>,
+  list: Identity[] | null,
+): boolean {
+  if (list !== null) {
+    if (seq < lastAppliedFetchSeq) return false;
+    lastAppliedFetchSeq = seq;
+    setIdentities(list);
+    const answered = new Set<number>();
+    for (const i of list) if (typeof i.hostId === "number") answered.add(i.hostId);
+    coveredHostIds = answered;
+  }
+  const now = Date.now();
+  for (const hostId of hostIdsOf(identityHosts)) {
+    if (coveredHostIds.has(hostId)) {
+      uncoveredHostRetries.delete(hostId);
+      continue;
+    }
+    const attempts = (uncoveredHostRetries.get(hostId)?.attempts ?? 0) + 1;
+    const gaveUp = attempts > UNCOVERED_HOST_RETRY_DELAYS_MS.length;
+    uncoveredHostRetries.set(hostId, {
+      attempts,
+      nextAt: gaveUp ? Infinity : now + UNCOVERED_HOST_RETRY_DELAYS_MS[attempts - 1],
+      gaveUp,
+    });
+    if (gaveUp && attempts === UNCOVERED_HOST_RETRY_DELAYS_MS.length + 1) {
+      console.warn(
+        `identities-store: host returned no identities after ${attempts - 1} attempts — giving up until a later refresh covers it [hostId:${hostId}]`,
+      );
+    }
+  }
+  return true;
+}
+
+function notify() {
+  // Single-authority cache write: every state change that reaches listeners
+  // also schedules a localStorage cache write so the next cold paint has the
+  // freshest appearance to seed from. Silent on write failure by contract
+  // (mirrors writeFleetSessionsCache — losing the cache is not user-visible).
+  // The write is coalesced (see scheduleAppearanceCacheWrite) rather than
+  // done synchronously here: serializing the whole identities array on every
+  // appearance pulse was a measurable main-thread cost on mobile WebKit.
+  scheduleAppearanceCacheWrite();
+  for (const l of listeners) l();
+}
+
+// ─── Coalesced appearance-cache persistence ─────────────────────────────────
+// One write per burst of changes, at most APPEARANCE_CACHE_WRITE_DELAY_MS
+// after the first change, always with the latest state. Flushed early on
+// pagehide / visibilitychange→hidden so a tab close or app switch doesn't
+// lose the last burst. The owner captured at schedule time must still be the
+// logged-in user at flush time, so a logout (or user switch) inside the
+// window can never write one user's identities under another's tag.
+const APPEARANCE_CACHE_WRITE_DELAY_MS = 1000;
+let pendingCacheWrite: { timer: ReturnType<typeof setTimeout>; owner: string | null } | null = null;
+
+function scheduleAppearanceCacheWrite(): void {
+  const owner = getCurrentUser();
+  if (pendingCacheWrite !== null) {
+    if (pendingCacheWrite.owner === owner) return;
+    // The logged-in user changed since the write was scheduled — restart the
+    // window under the new owner (the flush-time check below drops it if the
+    // user changes again before it fires).
+    clearTimeout(pendingCacheWrite.timer);
+  }
+  pendingCacheWrite = {
+    timer: setTimeout(flushAppearanceCacheWrite, APPEARANCE_CACHE_WRITE_DELAY_MS),
+    owner,
+  };
+}
+
+/** Write any pending appearance-cache update now. Exported for tests. */
+export function flushAppearanceCacheWrite(): void {
+  const pending = pendingCacheWrite;
+  if (pending === null) return;
+  pendingCacheWrite = null;
+  clearTimeout(pending.timer);
+  if (getCurrentUser() !== pending.owner) return;
+  writeAppearanceCache(state.identities);
+}
+
+if (typeof window !== "undefined" && typeof document !== "undefined") {
+  window.addEventListener("pagehide", flushAppearanceCacheWrite);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") flushAppearanceCacheWrite();
+  });
+}
+
+// displayName is display-only (identityKey is the canonical id); normalize
+// to first-letter-capitalized at store-load time so every consumer — sidebar
+// rows, chat headers, badges, modals — reads a consistent shape regardless
+// of whether the row was birthed with a capitalized or lowercase name.
+function withDisplayCap(i: Identity): Identity {
+  if (!i.displayName || i.displayName.length === 0) return i;
+  const first = i.displayName.charAt(0);
+  const capped = first.toUpperCase();
+  if (capped === first) return i;
+  return { ...i, displayName: capped + i.displayName.slice(1) };
+}
+
+/**
+ * Phase 111 Plan 04 — shared normalization + index-rebuild tail used by BOTH
+ * `setIdentities` (the full-replacement door) and `mergeIdentityAppearance`
+ * (the additive-merge door). Keeping both doors in sync means one place to
+ * audit for correctness: normalization, the composite-key guard, and the
+ * `byKey`/`byHostKey` dual build all live here.
+ *
+ * Returns a new `{ identities, byKey, byHostKey }` triple; the caller decides
+ * the value of `loaded` and spreads accordingly. This is what satisfies D-09's
+ * "one normalization tail" while satisfying D-10's "the pulse must not set
+ * loaded": setIdentities spreads `loaded: true`; mergeIdentityAppearance
+ * spreads `loaded: state.loaded`.
+ */
+function reindex(
+  list: Identity[],
+): Pick<State, "identities" | "byKey" | "byHostKey"> {
+  const identities = list.map(withDisplayCap);
+  // byKey is bare-name — retained additively for existence-check consumers
+  // (AppShell pane discriminator, IdentityBadge, tabUtils, IdentitySessionPane,
+  // conversation-store role fallback, relay-mxid-resolve). With the backend
+  // now returning multiple rows for the same name across hosts, byKey.set
+  // collides on name — last wire-order wins for the bare-name map, which is
+  // fine because those consumers only ask `.has(name)` / `.get(name)` to
+  // check "does ANY identity by this name exist?". Cosmetics consumers MUST
+  // use byHostKey — see quick-260912-0t4 rationale.
+  const byKey = new Map<string, Identity>();
+  const byHostKey = new Map<string, Identity>();
+  for (const i of identities) {
+    const nameLc = i.identityKey.toLowerCase();
+    byKey.set(nameLc, i);
+    // Only index rows that carry a hostId — pre-quick-260912-0t4 fixtures
+    // (test mocks) may omit it; skip those in the composite map rather than
+    // seeding a `undefined::name` bucket that would silently mis-serve
+    // production lookups.
+    if (typeof i.hostId === "number" && Number.isFinite(i.hostId)) {
+      byHostKey.set(`${i.hostId}::${nameLc}`, i);
+    }
+  }
+  return { identities, byKey, byHostKey };
+}
+
+// Field-wise equality for two identity records. Nested values (roles array,
+// roleDefaults object) are compared by JSON; everything else by ===.
+function identityEqual(a: Identity, b: Identity): boolean {
+  if (a === b) return true;
+  const aKeys = Object.keys(a) as (keyof Identity)[];
+  if (aKeys.length !== Object.keys(b).length) return false;
+  for (const k of aKeys) {
+    if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
+    const av = a[k];
+    const bv = b[k];
+    if (av === bv) continue;
+    if (
+      typeof av === "object" &&
+      av !== null &&
+      typeof bv === "object" &&
+      bv !== null &&
+      JSON.stringify(av) === JSON.stringify(bv)
+    ) {
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Structural sharing for a full-list replacement: every incoming identity
+ * that is field-equal to the one already in the store (same position, or
+ * same (hostId, identityKey)) is replaced by the existing object, so
+ * consumers that memo on an identity's reference (sidebar rows) don't
+ * re-render. Returns `prev` itself when nothing changed at all.
+ */
+function shareIdentities(prev: Identity[], next: Identity[]): Identity[] {
+  const keyOf = (i: Identity) => `${i.hostId ?? ""}::${i.identityKey.toLowerCase()}`;
+  let byKey: Map<string, Identity> | null = null;
+  let allSame = prev.length === next.length;
+  const out = next.map((n, idx) => {
+    const atIdx = prev[idx];
+    if (atIdx !== undefined && keyOf(atIdx) === keyOf(n) && identityEqual(atIdx, n)) {
+      return atIdx;
+    }
+    allSame = false;
+    if (byKey === null) {
+      byKey = new Map();
+      for (const p of prev) if (!byKey.has(keyOf(p))) byKey.set(keyOf(p), p);
+    }
+    const old = byKey.get(keyOf(n));
+    return old !== undefined && identityEqual(old, n) ? old : n;
+  });
+  return allSame ? prev : out;
+}
+
+function setIdentities(list: Identity[]) {
+  const shared = shareIdentities(state.identities, list.map(withDisplayCap));
+  // A refresh that returned exactly what we already hold changes nothing a
+  // consumer can see — skip the notify (and the re-render of every
+  // useIdentities() consumer it would trigger).
+  if (shared === state.identities && state.loaded) return;
+  state = { ...reindex(shared), loaded: true };
+  notify();
+}
+
+/**
+ * Phase 66 Plan 05 — build the caller-scoped identityHosts map from
+ * conversation-store's fleet-sessions snapshot.
+ *
+ * Algorithm: iterate fleetSessions in order; for each session, compute
+ * identityKey = sessionMatchKey(sessionName) (lowercased); if the key is
+ * non-null AND not yet in the map, assign session.hostId. First-wins matches
+ * the "one identity, one home box" invariant from the phase shape file — the
+ * fleet-sessions snapshot may contain duplicate identity entries across boxes
+ * during a transition/migration window; we honor the first occurrence.
+ *
+ * Empty input → empty map. The backend (Plan 03) treats identities NOT in
+ * the map as "cosmetics safe-defaults" without SSH fanout, so an empty map
+ * is a valid transition-window state, not an error.
+ */
+export function buildIdentityHostsFromFleet(
+  fleetSessions: FleetSession[],
+): Record<string, number> {
+  const map: Record<string, number> = {};
+  for (const session of fleetSessions) {
+    const identityKey = sessionMatchKey(session.sessionName);
+    if (identityKey === null) continue;
+    if (map[identityKey] !== undefined) continue; // first-wins
+    map[identityKey] = session.hostId;
+  }
+  return map;
+}
+
+/**
+ * Phase 92 Plan 04 (D-04) — project each identity's `pinned: boolean` field
+ * (populated from disk by the backend at request time per D-03) into the
+ * conversation-row id space (`fleet::<hostId>::<sessionName>`). Called by the
+ * panel's hydrate effect (PrettyConversationsPanel.tsx L475+) as the
+ * replacement for the retired getPinnedIds() /user-preferences fetch.
+ *
+ * H2 invariant: the `identityHosts` argument MUST be constructed via the
+ * existing `buildIdentityHostsFromFleet(fleetSessions)` helper exported from
+ * this same module (L74-85), which uses `sessionMatchKey(session.sessionName)`
+ * from src/ui/features/terminal/session-hue.ts. That helper's null-return on
+ * empty/undefined sessionName is what filters relay-room sessions and other
+ * non-identity sessions out of the map. Callers MUST NOT construct
+ * identityHosts by iterating fleetSessions with a naive
+ * `session.sessionName.toLowerCase()` pattern — that crashes on the relay-
+ * room `sessionName === undefined` case (per conversation-store.ts L710-731)
+ * and diverges from the semantics the /identities fetch already uses.
+ *
+ * Fail-closed on missing `pinned` field: an identity object without the
+ * field is treated as unpinned (matches backend Plan 02 fail-closed contract
+ * where identityFileExists throws → pinned:false).
+ *
+ * Identity keys not present in identityHosts are filtered out — an identity
+ * we don't have a host mapping for cannot render as a pinned row anyway
+ * (no row to render), so including it in state.pinnedIds would produce an
+ * inert entry.
+ *
+ * H3 invariant (from Plan 92-02): identity.identityKey is emitted verbatim
+ * from listIdentityKeysOnHost's raw folder-name output — ALREADY lowercase
+ * because identity-artifact-reader.ts IDENTITY_KEY_RE forbids uppercase.
+ * The `.toLowerCase()` below is defense-in-depth belt-and-suspenders against
+ * a future backend change that ever emitted a capitalized key. The emitted
+ * `fleet::${hostId}::${lookupKey}` shape uses the lowercased key
+ * deliberately: it matches conversation-store.ts:740
+ * `fleetRowId(session.hostId, session.sessionName)` because session.sessionName
+ * from the fleet-status wire is the lowercase identity name (id-skill uses
+ * the same regex on the target host).
+ */
+export function deriveDiskPinnedIds(
+  identityHosts: Record<string, number>,
+): string[] {
+  const out: string[] = [];
+  for (const identity of state.identities) {
+    // Fail-closed: `pinned !== true` treats undefined / false / any non-true
+    // value as unpinned. Matches the backend's fail-closed contract at
+    // identities.ts L282+ where an exists() throw catches to false.
+    if (identity.pinned !== true) continue;
+    const lookupKey = identity.identityKey.toLowerCase();
+    const hostId = identityHosts[lookupKey];
+    if (typeof hostId !== "number") continue;
+    out.push(`fleet::${hostId}::${lookupKey}`);
+  }
+  return out;
+}
+
+// (Phase 115 Plan 115-02: the sibling `deriveDiskHiddenIds` function
+//  was retired per D-21 alongside the backend .hidden fanout removal.)
+
+// Re-fetch whenever fleetSessions names a host the store hasn't fetched yet.
+// The subscription is installed lazily inside fetchOnce so a test that
+// imports the module without ever calling fetchOnce doesn't leak a live
+// subscription.
+//
+// A host counts as covered only once a response actually carries identities
+// for it, so a failed refresh — or a host whose fan-out failed inside a 200 —
+// is retried (paced by UNCOVERED_HOST_RETRY_DELAYS_MS) instead of leaving
+// rows on safe-default cosmetics for the life of the tab. An inflight guard keeps a
+// burst of store notifications from stacking duplicate fetches; when the
+// fetch lands, coverage is re-checked at once because hosts that reported
+// while it was in the air are not in it.
+//
+// The previous one-shot latch spent its only re-fetch on the first non-empty
+// snapshot. On a browser with no cached fleet snapshot that snapshot can hold
+// a single host's sessions (observed: {"jarvis-2":3}), so every other host's
+// identities stayed undressed — no title, avatar or project section.
+let refreshForNewHostsInflight = false;
+
+function refreshIfFleetHasNewHosts(): void {
+  if (refreshForNewHostsInflight) return;
+  const fleetHosts = hostIdsOf(
+    buildIdentityHostsFromFleet(getFleetSessionsSnapshot()),
+  );
+  if (fleetHosts.size === 0) return; // still empty — wait for the load flip
+  const now = Date.now();
+  let soonestRetry = Infinity;
+  const missing = [...fleetHosts].filter((h) => {
+    if (coveredHostIds.has(h)) return false;
+    const retry = uncoveredHostRetries.get(h);
+    if (retry === undefined) return true;
+    if (retry.nextAt <= now) return true;
+    soonestRetry = Math.min(soonestRetry, retry.nextAt);
+    return false;
+  });
+  if (missing.length === 0) {
+    // Only backed-off hosts are uncovered — come back when the soonest is
+    // due rather than relying on another store notification arriving.
+    if (soonestRetry !== Infinity && retryTimer === null) {
+      retryTimer = setTimeout(() => {
+        retryTimer = null;
+        refreshIfFleetHasNewHosts();
+      }, soonestRetry - now);
+    }
+    return;
+  }
+  refreshForNewHostsInflight = true;
+  console.info(
+    `identities-store: fleet names uncovered hosts — refreshing [hosts:${missing.join(",")},covered:${[...coveredHostIds].join(",")}]`,
+  );
+  void refreshIdentities().then((ok) => {
+    refreshForNewHostsInflight = false;
+    if (ok) refreshIfFleetHasNewHosts();
+  });
+}
+
+function ensureFleetSubscription(): void {
+  if (hasSubscribedToFleet) return;
+  hasSubscribedToFleet = true;
+  subscribeConversationStore(refreshIfFleetHasNewHosts);
+}
+
+async function fetchOnce(): Promise<void> {
+  ensureFleetSubscription();
+  if (state.loaded || inflight) return inflight ?? Promise.resolve();
+  // 2026-09-08 (user): on cold reload, fleetSessions is empty until the WS
+  // fleet-status frame arrives, so buildIdentityHostsFromFleet returns {}.
+  // With Phase 69's disk-fanout backend, GET /identities?identityHosts={}
+  // returns []; that response flips state.loaded=true with byKey=empty,
+  // which sabotages TerminalOrIdentitySessionPane's hydration-race guard
+  // in tabUtils.tsx (byKey.has(k) || !loaded evaluates to false → Terminal
+  // component mounts for identity-shape panes during the ms window before
+  // the fleet-status subscription fires refreshIdentities). Terminal boots
+  // an xterm + real SSH WS + then unmounts when the discriminator flips,
+  // leaking listeners (bounty: terminal-first-flash-on-reload-plus-listener-
+  // leak). Skip the empty-map fetch entirely — stay loaded=false and let
+  // ensureFleetSubscription's fleet-arrival callback fire the first real
+  // fetch when it has non-empty identityHosts. Safe fallback if fleet-status
+  // never arrives: loaded stays false forever, discriminator keeps assuming
+  // identity, PVs render fine (they read tab props, not identity metadata —
+  // see d4d87217 rationale).
+  const identityHostsPrecheck = buildIdentityHostsFromFleet(
+    getFleetSessionsSnapshot(),
+  );
+  if (Object.keys(identityHostsPrecheck).length === 0) return;
+  inflight = (async () => {
+    try {
+      // Phase 66 Plan 05 — construct the identityHosts wire parameter from
+      // conversation-store's fleet-sessions snapshot BEFORE calling
+      // listIdentities. Skip guard above ensures this is non-empty; the
+      // subscription re-runs the fetch if fleetSessions changes later.
+      const identityHosts = buildIdentityHostsFromFleet(
+        getFleetSessionsSnapshot(),
+      );
+      const seq = ++fetchSeq;
+      let list: Identity[];
+      try {
+        list = await listIdentities(identityHosts);
+      } catch (err) {
+        recordFetchOutcome(seq, identityHosts, null);
+        throw err;
+      }
+      recordFetchOutcome(seq, identityHosts, list);
+    } catch (err) {
+      console.warn("identities-store: initial identities fetch failed", err);
+      state = { ...state, loaded: true };
+      notify();
+    } finally {
+      inflight = null;
+    }
+  })();
+  return inflight;
+}
+
+/**
+ * @param extraIdentityHosts Additional `{ identityKey: hostId }` entries to
+ *   union into the map derived from fleetSessions. Needed by the birth flow: a
+ *   just-born identity has no tmux session yet (the agent-supervisor opens it
+ *   on its next reconcile tick, per Phase 106 D-01), so it is absent from
+ *   fleetSessions and buildIdentityHostsFromFleet cannot see it. Without an
+ *   entry naming its host, the backend fans out to zero hosts for that name and
+ *   the identity comes back in no response at all — leaving byKey without it,
+ *   which makes AppShell mount a raw terminal instead of PrettyView and
+ *   PrettyConversationRow render with no avatar/title. Worst on a host that has
+ *   never birthed an identity, where the map may be empty entirely.
+ */
+export function refreshIdentities(
+  extraIdentityHosts: Record<string, number> = {},
+): Promise<boolean> {
+  // Force a fresh fetch even if the initial fetchOnce is still inflight.
+  //
+  // 2026-09-01 user regression: the first fetchOnce fires from
+  // useIdentities().useEffect immediately after component mount, when
+  // conversation-store's fleetSessions is still empty (WS hasn't returned
+  // fleet-status yet). It runs with an empty identityHosts map and the
+  // backend returns safe-default cosmetics for every identity.
+  //
+  // Milliseconds later the WS fleet-status arrives; the subscription in
+  // ensureFleetSubscription() fires the one-shot re-fetch via this
+  // function. Under the previous shape (`state.loaded = false; return
+  // fetchOnce();`), fetchOnce's guard `if (state.loaded || inflight)
+  // return inflight` short-circuited back to the STILL-INFLIGHT initial
+  // fetch. That fetch's promise resolves with the safe-default results
+  // and never re-runs — so cosmetics stay null forever and every identity
+  // renders as its blue-hue safe-default.
+  //
+  // Fix: bypass fetchOnce's guards. Do the fetch directly with the
+  // now-populated identityHosts map. Any concurrent inflight remains
+  // outstanding but its result is superseded by setIdentities from THIS
+  // path — since setIdentities atomically replaces the identities array,
+  // whichever call runs last wins, and the fresh (populated) call is what
+  // the user wants regardless.
+  ensureFleetSubscription();
+  const p = (async () => {
+    try {
+      const identityHosts = {
+        ...buildIdentityHostsFromFleet(getFleetSessionsSnapshot()),
+        ...extraIdentityHosts,
+      };
+      const seq = ++fetchSeq;
+      let list: Identity[];
+      try {
+        list = await listIdentities(identityHosts);
+      } catch (err) {
+        recordFetchOutcome(seq, identityHosts, null);
+        throw err;
+      }
+      recordFetchOutcome(seq, identityHosts, list);
+      return true;
+    } catch (err) {
+      // Never rejects — callers rely on that. But the failure is reported both
+      // to the caller (so the post-fleet-load latch can retry) and to the
+      // console: silently keeping the safe-default render is what made a
+      // colourless conversation list undiagnosable.
+      console.warn("identities-store: refreshIdentities failed", err);
+      return false;
+    }
+  })();
+  return p;
+}
+
+/**
+ * Fetch ONE identity from its host and upsert it into the store. Used by the
+ * birth flow so the newborn is in byKey (PrettyView routing, avatar, title)
+ * before its tab opens — without the fleet-wide fanout refreshIdentities does,
+ * which reads every identity file on every host and held the new tab back by
+ * several seconds. Never rejects; resolves false if the identity didn't load.
+ */
+export async function refreshOneIdentity(
+  identityKey: string,
+  hostId: number,
+): Promise<boolean> {
+  ensureFleetSubscription();
+  try {
+    const list = await listIdentities(
+      { [identityKey]: hostId },
+      { onlyNamed: true },
+    );
+    const keyLc = identityKey.toLowerCase();
+    const row = list.find((i) => i.identityKey.toLowerCase() === keyLc);
+    if (!row) return false;
+    applyIdentityChange(row);
+    return true;
+  } catch (err) {
+    console.warn("identities-store: refreshOneIdentity failed", err);
+    return false;
+  }
+}
+
+export function applyIdentityChange(
+  next: Identity | null,
+  removedKey?: string,
+  /** quick-260912-0t4: optional hostId scoping for the remove/update path. When
+   *  provided, the match narrows to the ROW whose (hostId, identityKey) tuple
+   *  matches — necessary now that the backend returns per-(hostId, identityKey)
+   *  rows and two identities can share a name across hosts. Absent → falls
+   *  back to bare-name match (pre-quick-260912-0t4 semantics; matches first
+   *  row in list — a caveat for existing callers that don't yet thread hostId
+   *  through delete flows, but not a regression). */
+  removedHostId?: number,
+): void {
+  let list = state.identities.slice();
+  if (removedKey) {
+    const removedKeyLc = removedKey.toLowerCase();
+    if (typeof removedHostId === "number" && Number.isFinite(removedHostId)) {
+      list = list.filter(
+        (i) =>
+          !(
+            i.identityKey.toLowerCase() === removedKeyLc &&
+            i.hostId === removedHostId
+          ),
+      );
+    } else {
+      // Bare-name filter — pre-existing behavior. When two identities share a
+      // name across hosts, this removes ALL of them; when only one exists, it
+      // removes that one. Caller should thread removedHostId once available.
+      list = list.filter((i) => i.identityKey.toLowerCase() !== removedKeyLc);
+    }
+  } else if (next) {
+    const nextKeyLc = next.identityKey.toLowerCase();
+    // Widen the match to (hostId, identityKey) when both sides have hostId so
+    // the correct per-host row is replaced on cross-host name collisions.
+    // Falls back to bare-name findIndex when next.hostId is absent
+    // (pre-quick-260912-0t4 test fixtures).
+    const idx =
+      typeof next.hostId === "number" && Number.isFinite(next.hostId)
+        ? list.findIndex(
+            (i) =>
+              i.identityKey.toLowerCase() === nextKeyLc &&
+              i.hostId === next.hostId,
+          )
+        : list.findIndex((i) => i.identityKey.toLowerCase() === nextKeyLc);
+    if (idx >= 0) {
+      // An update that carries no pin state (updateIdentity's echo) keeps the
+      // row's current one.
+      list[idx] =
+        next.pinned === undefined && list[idx].pinned !== undefined
+          ? { ...next, pinned: list[idx].pinned }
+          : next;
+    } else list.push(next);
+  }
+  setIdentities(list);
+}
+
+/**
+ * Patch the `pinned` boolean sentinel field on a single identity in the local
+ * store to reflect a write that just succeeded server-side.
+ *
+ * Without this, pinConversation optimistically mutates conversation-store's
+ * `pinnedIds` but leaves identities-store's per-identity `pinned` STALE. The
+ * next PrettyConversationsPanel remount re-runs its hydrate effect,
+ * deriveDiskPinnedIds reads the stale identities snapshot, and
+ * hydratePinnedIdsFromServer overwrites the just-set local set — the pin
+ * silently reverts on mobile navigate-away-and-back (list→session→list
+ * unmounts the panel per AppShell.tsx L2632).
+ *
+ * (Phase 115 Plan 115-02: this helper previously took `"pinned" | "hidden"`.
+ * The `.hidden` axis was retired per D-21 alongside the backend .hidden
+ * fanout removal, so the union collapses to a single-value literal.)
+ *
+ * Match by (hostId, identityKey) — falls back to bare-name match when hostId
+ * is absent (pre-quick-260912-0t4 fixtures + relay-room callers without a
+ * fleet hostId). No-op when the field is already the target value (idempotent
+ * on double-clicks and hydrate-echo).
+ */
+export function patchIdentityFlag(
+  identityKey: string,
+  hostId: number | null,
+  field: "pinned",
+  value: boolean,
+): void {
+  const keyLc = identityKey.toLowerCase();
+  let changed = false;
+  const nextList = state.identities.map((i) => {
+    const keyMatches = i.identityKey.toLowerCase() === keyLc;
+    if (!keyMatches) return i;
+    const hostMatches =
+      hostId === null ||
+      typeof i.hostId !== "number" ||
+      i.hostId === hostId;
+    if (!hostMatches) return i;
+    if (i[field] === value) return i;
+    changed = true;
+    return { ...i, [field]: value };
+  });
+  if (!changed) return;
+  setIdentities(nextList);
+}
+
+/**
+ * Patch a single identity's `project` field in place — consumed by the
+ * `session-project-changed` frame handler in AppShell. Distinct from
+ * patchIdentityFlag: `project` is `string | null`, not boolean, so the
+ * shared generic doesn't fit. Match semantics mirror patchIdentityFlag —
+ * (identityKey, hostId) tuple identifies the row; no-op if not found or
+ * value unchanged.
+ *
+ * hostId is a required non-null number here (unlike patchIdentityFlag's
+ * nullable variant) because the wire frame always carries it. If the row
+ * isn't yet loaded (WS frame arrived before the /identities REST fetch
+ * landed), this is a silent no-op — the subsequent fetch will read the
+ * current on-disk project field directly.
+ */
+export function setIdentityProject(
+  identityKey: string,
+  hostId: number,
+  project: string | null,
+): void {
+  const keyLc = identityKey.toLowerCase();
+  let changed = false;
+  const nextList = state.identities.map((i) => {
+    if (i.identityKey.toLowerCase() !== keyLc) return i;
+    if (typeof i.hostId !== "number" || i.hostId !== hostId) return i;
+    if (i.project === project) return i;
+    changed = true;
+    return { ...i, project };
+  });
+  if (!changed) return;
+  setIdentities(nextList);
+}
+
+// ─── Private helper: sorted-key JSON serialization for roleDefaults ──────────
+// Used by mergeIdentityAppearance to compare roleDefaults structurally rather
+// than by reference. Mirrors the sorted-key serialization the backend's
+// appearanceFingerprintSegment (Plan 111-03) uses for the wire fingerprint —
+// same determinism requirement.
+function sortedKeyJson(obj: Record<string, unknown> | null | undefined): string {
+  if (obj == null) return "null";
+  const keys = Object.keys(obj).sort();
+  const sorted: Record<string, unknown> = {};
+  for (const k of keys) sorted[k] = obj[k];
+  return JSON.stringify(sorted);
+}
+
+// ─── Private helper: re-project pinned into conversation-store rows ───
+/**
+ * Phase 111 Plan 04 — re-project each identity's `pinned` field into the
+ * conversation-row id space. Called by `mergeIdentityAppearance` ONLY when
+ * `pinned` actually changed, to move a row without touching
+ * PrettyConversationsPanel.tsx.
+ *
+ * (Phase 115 Plan 115-02: the sibling `.hidden` re-projection was retired
+ * per D-21 alongside the deriveDiskHiddenIds function.)
+ *
+ * Mirrors the panel's own hydrate effect body exactly, so the two paths
+ * are always in sync: buildIdentityHostsFromFleet → deriveDiskPinnedIds →
+ * hydratePinnedIdsFromServer.
+ *
+ * GATED on state.loaded — see quick-260912-5q2. Before the `GET /identities`
+ * fetch has landed, state.identities is a partial picture. hydratePinnedIdsFromServer
+ * REPLACES the row-id set wholesale — projecting from a partial store would wipe
+ * pins for every identity not yet fetched.
+ *
+ * Uses buildIdentityHostsFromFleet, never a hand-rolled iteration. Its H2
+ * invariant (sessionMatchKey null-return filters relay rooms + undefined
+ * sessionName) is exactly the protection against crashes on relay-room sessions.
+ */
+function reprojectDiskPinIntoRows(): void {
+  // quick-260912-5q2: a partial store projection wipes pins for every identity
+  // not yet in state.identities. Only re-project once the full picture is live.
+  if (!state.loaded) return;
+  const identityHosts = buildIdentityHostsFromFleet(getFleetSessionsSnapshot());
+  hydratePinnedIdsFromServer(deriveDiskPinnedIds(identityHosts));
+}
+
+/**
+ * Phase 111 Plan 04 — additive-merge door for the fleet-status pulse.
+ *
+ * PURPOSE + WHY A NEW DOOR IS NEEDED (D-10, bounty terminal-first-flash-on-
+ * reload-plus-listener-leak):
+ *   `identities-store` answers TWO questions with one piece of data: "what does
+ *   this identity look like?" AND "is this an agent at all?" The second drives
+ *   `isIdentityPane` in `tabUtils.tsx` — the expression
+ *   `identitiesByKey.has(identityKey) || !identitiesLoaded`. If `loaded` flips
+ *   true while `byKey` is missing any key, every other identity pane hits
+ *   `false && true` → the false-Terminal branch → N xterms + N real SSH WS
+ *   connections boot and unmount, leaking listeners. The 2026-09-08 comment
+ *   block in fetchOnce exists solely to document this; the empty-map skip-guard
+ *   below it exists solely to prevent it.
+ *
+ *   This function MUST NOT write `state.loaded`. The word `loaded` does not
+ *   appear in this function's body except as `loaded: state.loaded` (carry-
+ *   forward). `setIdentities` is never called from here.
+ *
+ * D-09 — ADDITIVE MERGE:
+ *   An answer that knows less must never blank one that knew more. Both
+ *   `undefined` AND `null` incoming fields are SKIPPED (never written). This
+ *   means a title genuinely cleared on disk will not disappear from the list
+ *   until the next `GET /identities` — the correct side to err on: a stale-
+ *   but-dressed row is invisible to the user, while an undressed row is the
+ *   bug this phase exists to remove.
+ *
+ * D-09 — ABSENT KEY IS NO-OP, NOT STAGING MAP:
+ *   A side map would be a second place appearance lives — a second authority.
+ *   The no-op is correct because `GET /identities` reads the same disk
+ *   frontmatter through `publicIdentity()`, which calls the same merge
+ *   authority (`identity-appearance.ts`), so the row arrives fully dressed
+ *   from the fetch. The pulse's job is keeping it current, not bootstrapping.
+ *
+ * FIELD SET:
+ *   Exactly the ten the wire carries: displayName, title, colorHue, voice,
+ *   task, coordinator, role, roleDefaults, avatarUrl, pinned.
+ *   (Phase 115 Plan 115-02: prior eleventh field `hidden` retired per D-21.)
+ *   NOT avatarMime or avatarEtag (sweep has no source for them).
+ *   NOT identityKey or hostId (those identify the row, not its appearance).
+ *
+ * pinned:
+ *   This IS written on a true→false transition. It is a membership and
+ *   position axis, not a cosmetic — a `false` here is a real sentinel-probe
+ *   fact, not an absence. The fail-closed handling already happened server-
+ *   side (=== true in Plan 111-03), so the value arriving here is a definite
+ *   boolean.
+ */
+export function mergeIdentityAppearance(
+  hostId: number,
+  identityKey: string,
+  appearance: Partial<
+    Pick<
+      Identity,
+      | "displayName"
+      | "title"
+      | "colorHue"
+      | "voice"
+      | "task"
+      | "coordinator"
+      | "role"
+      | "roles"
+      | "roleDefaults"
+      | "avatarUrl"
+      | "pinned"
+    >
+  >,
+): void {
+  // 1. Guard inputs. A non-finite hostId cannot key byHostKey and would
+  //    silently mis-serve lookups.
+  if (!Number.isFinite(hostId) || !identityKey) return;
+
+  const keyLc = identityKey.toLowerCase();
+
+  // 2. Locate by composite key ONLY — never bare byKey. byKey collides by
+  //    design (last wire-order wins) and is only safe for existence checks.
+  //    A bare-name lookup here would serve host A's appearance to a same-named
+  //    identity on host B. Copy the findIndex composite shape from
+  //    applyIdentityChange's locate half — but NOT its bare-name fallback and
+  //    NOT anything after the locate.
+  const idx = state.identities.findIndex(
+    (i) => i.identityKey.toLowerCase() === keyLc && i.hostId === hostId,
+  );
+
+  // 3. Absent → APPEND (Phase 111 hotfix, 2026-09-16). The original guard here
+  //    returned early on idx === -1 out of fear of the D-10 bug (partial row
+  //    poisons byKey while loaded is true, causing every other identity pane
+  //    to hit the false-Terminal branch in isIdentityPane and boot N xterms +
+  //    N real SSH WS connections that then unmount and leak listeners — see
+  //    the 2026-09-08 block in fetchOnce).
+  //
+  //    That fear was wrong for THIS function: D-10 fires only when `loaded`
+  //    is TRUE and byKey is missing an expected identity — the discriminator
+  //    `byKey.has(k) || !loaded` collapses to false and the wrong branch
+  //    fires. `mergeIdentityAppearance` never touches `loaded`; carrying it
+  //    forward from `state.loaded` means an append here happens with loaded
+  //    still false (cold boot before /identities lands) and the discriminator
+  //    stays true regardless of byKey contents. Appending is safe.
+  //
+  //    The user-visible bug the old guard caused: on cold reload, `state.
+  //    identities` is empty. The pulse arrives with appearance for every
+  //    running identity, every lookup returns -1, every update is dropped,
+  //    and the list renders undressed for ~8 seconds until GET /identities
+  //    lands. That defeats Phase 111's stated goal ("list arrives complete
+  //    on first paint"). This append restores it.
+  if (idx === -1) {
+    const displayNameSafe =
+      typeof appearance.displayName === "string" && appearance.displayName.length > 0
+        ? appearance.displayName
+        : identityKey.charAt(0).toUpperCase() + identityKey.slice(1);
+    const appended: Identity = {
+      identityKey: keyLc,
+      hostId,
+      displayName: displayNameSafe,
+      title: typeof appearance.title === "string" ? appearance.title : null,
+      colorHue: typeof appearance.colorHue === "number" ? appearance.colorHue : null,
+      voice: typeof appearance.voice === "string" ? appearance.voice : null,
+      role: typeof appearance.role === "string" ? appearance.role : null,
+      ...(Array.isArray(appearance.roles) ? { roles: appearance.roles } : {}),
+      avatarMime: "",
+      avatarUrl:
+        typeof appearance.avatarUrl === "string"
+          ? appearance.avatarUrl
+          : `/identities/${keyLc}/avatar?hostId=${hostId}`,
+      avatarEtag: "",
+      coordinator: appearance.coordinator === true,
+      task: typeof appearance.task === "string" ? appearance.task : null,
+      // Phase 117 M6 fix (2026-09-18): `project` is now carried by
+      // IdentityAppearanceSchema (nullable+optional). The source-B pulse
+      // therefore delivers the identity's current project frontmatter on
+      // every tick, and we pipe it through here instead of hardcoding null.
+      // `appearance.project` can be:
+      //   - string → identity has a project frontmatter field
+      //   - null   → identity file has no project frontmatter
+      //   - undefined → older publisher not yet emitting the field (back-compat)
+      // We coalesce undefined and null to null so the frontend consumer sees
+      // a stable string|null shape.
+      project:
+        typeof appearance.project === "string" ? appearance.project : null,
+      roleDefaults: appearance.roleDefaults ?? null,
+      pinned: appearance.pinned === true,
+    };
+    const nextList = state.identities.concat(appended);
+    // Reindex byKey/byHostKey from the new list; carry `loaded` forward so
+    // this append CANNOT flip false→true (D-10 guard preserved). The
+    // reindex helper is the SAME one setIdentities uses — no divergence.
+    state = { ...reindex(nextList), loaded: state.loaded };
+    notify();
+    return;
+  }
+
+  // 4. Additive field-wise merge. Per-field equality check before assignment.
+  const existing = state.identities[idx];
+  let changed = false;
+  let next = { ...existing };
+
+  // null is skipped, not written (D-09). `identityAppearance.title === null`
+  // means "this identity has no title right now", but it also arrives when the
+  // identity file could not be read this tick — the two are indistinguishable
+  // at this boundary. Skipping means a row never undresses. Tradeoff: a title
+  // genuinely CLEARED on disk will not disappear from the list until the next
+  // GET /identities. That is the correct side to err on.
+
+  if (appearance.displayName !== undefined && appearance.displayName !== null) {
+    if (next.displayName !== appearance.displayName) {
+      next.displayName = appearance.displayName;
+      changed = true;
+    }
+  }
+  if (appearance.title !== undefined && appearance.title !== null) {
+    if (next.title !== appearance.title) {
+      next.title = appearance.title;
+      changed = true;
+    }
+  }
+  if (appearance.colorHue !== undefined && appearance.colorHue !== null) {
+    if (next.colorHue !== appearance.colorHue) {
+      next.colorHue = appearance.colorHue;
+      changed = true;
+    }
+  }
+  if (appearance.voice !== undefined && appearance.voice !== null) {
+    if (next.voice !== appearance.voice) {
+      next.voice = appearance.voice;
+      changed = true;
+    }
+  }
+  if (appearance.task !== undefined && appearance.task !== null) {
+    if (next.task !== appearance.task) {
+      next.task = appearance.task;
+      changed = true;
+    }
+  }
+  if (appearance.coordinator !== undefined && appearance.coordinator !== null) {
+    if (next.coordinator !== appearance.coordinator) {
+      next.coordinator = appearance.coordinator;
+      changed = true;
+    }
+  }
+  if (appearance.role !== undefined && appearance.role !== null) {
+    if (next.role !== appearance.role) {
+      next.role = appearance.role;
+      changed = true;
+    }
+  }
+  if (Array.isArray(appearance.roles)) {
+    if (JSON.stringify(next.roles ?? null) !== JSON.stringify(appearance.roles)) {
+      next.roles = appearance.roles;
+      changed = true;
+    }
+  }
+  // roleDefaults is an object — compare by sorted-key serialization for
+  // deterministic structural equality, matching the backend fingerprint's
+  // discipline (Plan 111-03 appearanceFingerprintSegment). A redundant
+  // reference-unequal but structurally-equal re-merge must NOT notify.
+  if (appearance.roleDefaults !== undefined && appearance.roleDefaults !== null) {
+    if (sortedKeyJson(appearance.roleDefaults as Record<string, unknown>) !== sortedKeyJson(next.roleDefaults as Record<string, unknown> | null | undefined)) {
+      next.roleDefaults = appearance.roleDefaults;
+      changed = true;
+    }
+  }
+  if (appearance.avatarUrl !== undefined && appearance.avatarUrl !== null) {
+    if (next.avatarUrl !== appearance.avatarUrl) {
+      next.avatarUrl = appearance.avatarUrl;
+      changed = true;
+    }
+  }
+  // pinned is a membership axis, not a cosmetic. A `false` here is a real
+  // fact from a sentinel probe — not an absence. DO write on true→false
+  // transitions. The `undefined || null` skip only prevents "no data this tick"
+  // from blanking "known data from before".
+  // (Phase 115 Plan 115-02: sibling `hidden` axis retired per D-21.)
+  let pinChanged = false;
+  if (appearance.pinned !== undefined && appearance.pinned !== null) {
+    if (next.pinned !== appearance.pinned) {
+      next.pinned = appearance.pinned;
+      changed = true;
+      pinChanged = true;
+    }
+  }
+  // Phase 117 M6 fix (2026-09-18): project is a membership axis (D-05
+  // identity carrier). Like pinned, a `null` here is a REAL fact — the
+  // identity file's frontmatter has no project field — not an absence.
+  // DO write on string→null transitions (the "clear project" gesture on
+  // the frontend must round-trip through this path). Only skip on
+  // undefined (older publisher not emitting the field yet).
+  if (appearance.project !== undefined) {
+    if (next.project !== appearance.project) {
+      next.project = appearance.project;
+      changed = true;
+    }
+  }
+
+  // 5. No-op suppression — copy patchIdentityFlag's shape. No state write,
+  //    no notify when nothing changed.
+  if (!changed) return;
+
+  // 6. Write state WITHOUT setIdentities. Use reindex to normalize and rebuild
+  //    both maps. Carry loaded forward — NEVER set it here.
+  const nextList = state.identities.slice();
+  nextList[idx] = next;
+  state = { ...reindex(nextList), loaded: state.loaded };
+  notify();
+
+  // 7. Re-project pinned into conversation-store row-id sets only when the
+  //    sentinel actually moved. Cosmetics-only merges must not pay the cost
+  //    of a set rebuild. Gate is in reprojectDiskPinIntoRows itself (gated
+  //    on state.loaded per quick-260912-5q2).
+  if (pinChanged) {
+    reprojectDiskPinIntoRows();
+  }
+}
+
+export function useIdentities(): {
+  identities: Identity[];
+  byKey: Map<string, Identity>;
+  /** quick-260912-0t4: hostId-scoped composite-key map for cosmetics consumers.
+   *  Key: `${hostId}::${identityKey.toLowerCase()}`. See State.byHostKey JSDoc
+   *  for the additive-vs-rename rationale. */
+  byHostKey: Map<string, Identity>;
+  loaded: boolean;
+  refresh: () => Promise<void>;
+} {
+  const [, force] = useState(0);
+  useEffect(() => {
+    const cb = () => force((n) => n + 1);
+    listeners.add(cb);
+    void fetchOnce();
+    return () => {
+      listeners.delete(cb);
+    };
+  }, []);
+  return {
+    identities: state.identities,
+    byKey: state.byKey,
+    byHostKey: state.byHostKey,
+    loaded: state.loaded,
+    refresh: refreshIdentities,
+  };
+}
+
+// ─── Test-only helpers ───────────────────────────────────────────────────────
+// Phase 66 Plan 05 — reset the module-scoped state (identities snapshot +
+// inflight promise + refresh-after-fleet-load guard) for identities-store
+// enrichment tests. Not part of the public API; keeps prior test's state from
+// leaking into the next test in the same vitest worker.
+export function __subscribeIdentitiesForTest(cb: () => void): () => void {
+  listeners.add(cb);
+  return () => {
+    listeners.delete(cb);
+  };
+}
+
+export function __resetIdentitiesStoreForTest(): void {
+  state = {
+    identities: [],
+    byKey: new Map(),
+    byHostKey: new Map(),
+    loaded: false,
+  };
+  inflight = null;
+  coveredHostIds = new Set();
+  refreshForNewHostsInflight = false;
+  uncoveredHostRetries = new Map();
+  if (retryTimer !== null) clearTimeout(retryTimer);
+  retryTimer = null;
+  fetchSeq = 0;
+  lastAppliedFetchSeq = 0;
+  notify();
+}
+
+// Phase 111 Plan 04 — read-only snapshot of the module-scoped state for
+// identities-store enrichment tests. Exposes `loaded`, `identities`, `byKey`,
+// and `byHostKey` so tests can assert D-10/D-09 invariants without going
+// through the React hook (which needs a component + act()). Not part of the
+// public API.
+export function __getIdentitiesStoreSnapshotForTest(): {
+  loaded: boolean;
+  identities: Identity[];
+  byKey: Map<string, Identity>;
+  byHostKey: Map<string, Identity>;
+} {
+  return {
+    loaded: state.loaded,
+    identities: state.identities,
+    byKey: state.byKey,
+    byHostKey: state.byHostKey,
+  };
+}
+
+// Phase 111 Plan 04 — seed identities WITHOUT setting loaded=true, for testing
+// that mergeIdentityAppearance's loaded:state.loaded carry-forward is the ONLY
+// thing preventing the D-10 violation when a merge fires before GET /identities
+// has returned. Only used by the D-10 load-bearing breakage proof in Case 1.
+// Not part of the public API.
+export function __seedIdentitiesLoadedFalseForTest(list: Identity[]): void {
+  state = { ...reindex(list), loaded: false };
+  notify();
+}
+
+// ─── Appearance cache ────────────────────────────────────────────────────────
+// Persist per-identity appearance to localStorage on every notify(), read on
+// module load. Mirrors readFleetSessionsCache / writeFleetSessionsCache in
+// conversation-store — same silent-write-fail contract, same defensive
+// per-item shape validation on read, same bumped-storage-key policy for
+// schema changes.
+//
+// Purpose: on cold refresh, paint dressed rows (colour, avatar, name, title,
+// task) INSTANTLY from cache rather than waiting ~1s for the fleet-status WS
+// first-frame to arrive and dress them via mergeIdentityAppearance. Kills the
+// Phase 111 post-ship "1s undressed flash" while preserving D-10 (the seed
+// carries loaded:false — the fuller GET /identities remains the sole owner of
+// loaded:true).
+
+// Structural type-guard for cached rows. Only enforces fields the cache
+// writer emits; a stray field on disk is ignored, a missing required field
+// drops the row. Silent by contract — a malformed cache never throws.
+function isCachedIdentity(x: unknown): x is Identity {
+  if (typeof x !== "object" || x === null) return false;
+  const r = x as Record<string, unknown>;
+  if (typeof r.identityKey !== "string") return false;
+  if (typeof r.displayName !== "string") return false;
+  // hostId is optional in the Identity type (pre-quick-260912-0t4 fixtures
+  // may omit it) but production always includes it; either is acceptable
+  // here, matching the type's own tolerance.
+  if (r.hostId !== undefined && typeof r.hostId !== "number") return false;
+  if (r.title !== null && typeof r.title !== "string") return false;
+  if (r.colorHue !== null && typeof r.colorHue !== "number") return false;
+  if (r.voice !== null && typeof r.voice !== "string") return false;
+  if (r.role !== null && typeof r.role !== "string") return false;
+  if (typeof r.avatarMime !== "string") return false;
+  if (typeof r.avatarUrl !== "string") return false;
+  if (typeof r.avatarEtag !== "string") return false;
+  if (typeof r.coordinator !== "boolean") return false;
+  if (r.task !== null && typeof r.task !== "string") return false;
+  return true;
+}
+
+export function readAppearanceCache(): Identity[] {
+  try {
+    // v3: owner-tagged — mismatch returns null + clears the key.
+    const parsed = readUserScopedCache<unknown>(
+      APPEARANCE_CACHE_KEY,
+      APPEARANCE_CACHE_LEGACY_KEYS,
+    );
+    if (!Array.isArray(parsed)) return [];
+    const valid: Identity[] = [];
+    for (const item of parsed) {
+      if (isCachedIdentity(item)) {
+        // Defensive per-field pick — only canonical fields make it back into
+        // memory even if a future writer accidentally serialized more.
+        valid.push({
+          identityKey: item.identityKey,
+          hostId: item.hostId,
+          displayName: item.displayName,
+          title: item.title,
+          colorHue: item.colorHue,
+          voice: item.voice,
+          role: item.role,
+          ...(Array.isArray(item.roles) ? { roles: item.roles } : {}),
+          avatarMime: item.avatarMime,
+          avatarUrl: item.avatarUrl,
+          avatarEtag: item.avatarEtag,
+          coordinator: item.coordinator,
+          task: item.task,
+          // Phase 117 Plan 117-07 (D-05 identity carrier): project field
+          // survives cache round-trip. Older cache entries that predate the
+          // field deserialize as `undefined` → coerce to null so the Identity
+          // type's `project: string | null` invariant holds.
+          project: typeof item.project === "string" ? item.project : null,
+          pinned: item.pinned === true,
+          roleDefaults: item.roleDefaults ?? null,
+        });
+      }
+    }
+    return valid;
+  } catch {
+    return [];
+  }
+}
+
+export function writeAppearanceCache(list: Identity[]): void {
+  try {
+    if (typeof localStorage === "undefined") return;
+    // Persist the exact field set that mergeIdentityAppearance's cold-boot
+    // append and setIdentities populate — mirrors mergeIdentityAppearance's
+    // append branch so a round-trip through cache produces the same shape a
+    // fresh pulse would.
+    const canonical = list.map((i) => ({
+      identityKey: i.identityKey,
+      hostId: i.hostId,
+      displayName: i.displayName,
+      title: i.title,
+      colorHue: i.colorHue,
+      voice: i.voice,
+      role: i.role,
+      roles: i.roles,
+      avatarMime: i.avatarMime,
+      avatarUrl: i.avatarUrl,
+      avatarEtag: i.avatarEtag,
+      coordinator: i.coordinator,
+      task: i.task,
+      // Phase 117 Plan 117-07 (D-05 identity carrier): persist project field
+      // through the cache round-trip so a page refresh doesn't temporarily
+      // drop the identity's project assignment before the first GET
+      // /identities completes.
+      project: i.project,
+      pinned: i.pinned === true,
+      roleDefaults: i.roleDefaults ?? null,
+    }));
+    writeUserScopedCache(APPEARANCE_CACHE_KEY, canonical);
+  } catch {
+    // Silent — cache write failure is non-fatal.
+  }
+}
+
+// Test-only: re-run the module-load cache seed after tests have populated
+// localStorage. Production callers rely on the IIFE at module init; tests
+// can't easily control that timing (module loads once per file), so this
+// helper exposes the same seed logic on demand. Preserves the D-10
+// invariant — loaded is carried forward from state.loaded, never flipped
+// true.
+export function __seedFromCacheForTest(): void {
+  const cached = readAppearanceCache();
+  if (cached.length === 0) return;
+  state = { ...reindex(cached), loaded: state.loaded };
+  notify();
+}

@@ -1,0 +1,284 @@
+/**
+ * Phase 14 (plain-language-translation-asides) Wave 4 —
+ * ComposeBox aside morph BODY consumption tests.
+ *
+ * Wave 3 landed the ComposeBoxProps interface extension (asideActive?,
+ * onAsideDismiss?) plus PrettyView prop plumbing. Wave 4 (this test file)
+ * covers the BODY consumption:
+ *
+ *   Task 1: aux button `disabled` predicates extended with `|| asideActive === true`
+ *     - paperclip button — disabled when asideActive
+ *     - thumbs-up (Send 'thumbs up') — not offered while an aside is up
+ *       (shape-conversation-view: the main button is Resume then)
+ *     - textarea's own `disabled` prop is NOT extended (per CONTEXT.md § ComposeBox morph:
+ *       "Textarea remains editable. Any partial draft text is preserved verbatim")
+ *
+ *   Task 2: inside-textarea Send button morphs on asideActive
+ *     - icon: paper-plane inline SVG ↔ lucide X
+ *     - aria-label + title: "Send" ↔ "Resume"
+ *     - onClick: handleSend ↔ onAsideDismiss?.()
+ *     - disabled: sendDisabled ↔ false (always clickable when morphed)
+ *     - data-action: send ↔ resume (always the neutral main button —
+ *       shape-conversation-view: controls never borrow the agent's colour)
+ *
+ * Zero-regression contract: when asideActive is undefined/false, ComposeBox
+ * behavior is byte-preserved.
+ */
+
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { render, screen, fireEvent } from "@testing-library/react";
+
+vi.mock("@/api/compose-drafts-api", () => ({
+  getComposeDraft: vi.fn().mockResolvedValue({ body: "" }),
+  putComposeDraft: vi.fn().mockResolvedValue(undefined),
+  flushComposeDraftKeepalive: vi.fn(),
+}));
+
+import { ComposeBox, type ComposeBoxProps } from "./ComposeBox";
+
+function baseProps(overrides: Partial<ComposeBoxProps> = {}): ComposeBoxProps {
+  return {
+    onSend: vi.fn(() => true),
+    hostId: 1,
+    tmuxSession: "s1",
+    canSend: true,
+    ...overrides,
+  };
+}
+
+describe("ComposeBox — Phase 14 Wave 4 aside morph (Task 1: aux button disable)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localStorage.clear();
+  });
+
+  it("Task 1 Test 3: paperclip button becomes disabled when asideActive=true", () => {
+    render(
+      <ComposeBox
+        {...baseProps({
+          asideActive: true,
+          showPaperclip: true,
+          onAttachFiles: vi.fn(),
+        })}
+      />,
+    );
+    const paperclipBtn = screen.getByLabelText(/attach file/i);
+    expect((paperclipBtn as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("Task 1 Test 4: thumbs-up (thumbs up) is not offered when asideActive=true — Resume is the main button", () => {
+    render(
+      <ComposeBox
+        {...baseProps({
+          asideActive: true,
+        })}
+      />,
+    );
+    expect(screen.queryByLabelText(/send 'thumbs up'/i)).toBeNull();
+    expect(screen.getByRole("button", { name: "Resume" }).getAttribute("data-main")).toBe("true");
+  });
+
+  it("Task 1 Test 5 (Vehicle C): aux-row Queue button is REMOVED — per-textarea arm-idle replaces it", () => {
+    render(
+      <ComposeBox
+        {...baseProps({
+          asideActive: true,
+        })}
+      />,
+    );
+    expect(screen.queryByLabelText(/queue send for when session goes idle/i)).toBeNull();
+  });
+
+  it("Task 1 Test 6: textarea REMAINS editable when asideActive=true (locked per CONTEXT.md § ComposeBox morph)", () => {
+    render(
+      <ComposeBox
+        {...baseProps({
+          asideActive: true,
+        })}
+      />,
+    );
+    const textarea = screen.getByRole("textbox");
+    expect((textarea as HTMLTextAreaElement).disabled).toBe(false);
+  });
+
+  // Task 1 Test 7 REMOVED (Vehicle B strip, quick 260801-62m): the /bounty
+  // (Target) prefix-send button no longer exists — superseded by the
+  // natural-language "bounty bounty" voice trigger shipped as patch #241
+  // (composeIntentTransform). Removal-assertion coverage now lives in
+  // ComposeBox.test.tsx under the "Vehicle B strip" describe block.
+  //
+  // Task 1 Test 8 REMOVED (Vehicle B strip, quick 260801-62m): the /queue
+  // (ListPlus prefix-send) button no longer exists — superseded by the
+  // queued-message textareas managed by the "Queue a message" Plus-glyph
+  // pebble-notch tab (quick 260909-cdi retired the aux-row ListPlus button
+  // and moved the affordance onto the topmost textarea's top edge).
+  // Removal-assertion coverage now lives in ComposeBox.test.tsx under the
+  // "Vehicle B strip" describe block.
+});
+
+describe("ComposeBox — Phase 14 Wave 4 aside morph (Task 2: Send button morph)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localStorage.clear();
+  });
+
+  it("Task 2 Test 1: Send button aria-label reads 'Send' when asideActive is undefined", () => {
+    render(
+      <ComposeBox {...baseProps({})} />,
+    );
+    // shape-conversation-view: Send renders once there's something to send.
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "hi" } });
+    // The main Send button (paper-plane) — pre-morph identity.
+    const sendBtn = screen.getByRole("button", { name: "Send" });
+    expect(sendBtn).toBeTruthy();
+  });
+
+  it("Task 2 Test 2: Send button aria-label reads 'Resume' when asideActive=true", () => {
+    render(
+      <ComposeBox
+        {...baseProps({
+          asideActive: true,
+        })}
+      />,
+    );
+    const resumeBtn = screen.getByRole("button", { name: "Resume" });
+    expect(resumeBtn).toBeTruthy();
+    // AND the pre-morph "Send" name should NOT be present on any button (morph is a
+    // rename, not an addition of a second button).
+    expect(screen.queryByRole("button", { name: "Send" })).toBeNull();
+  });
+
+  it("Task 2 Test 3: title attribute mirrors aria-label — 'Resume' when asideActive=true", () => {
+    render(
+      <ComposeBox
+        {...baseProps({
+          asideActive: true,
+        })}
+      />,
+    );
+    const resumeBtn = screen.getByRole("button", { name: "Resume" });
+    expect(resumeBtn.getAttribute("title")).toBe("Resume");
+  });
+
+  it("Task 2 Test 4: Send button short-tap routes to handleSend when asideActive is undefined", async () => {
+    // The send button's click routes to the parent's onSend. mediaDevices is
+    // stubbed so the mic beside it can render (jsdom has none).
+    const originalNavigator = globalThis.navigator;
+    const getUserMediaMock = vi.fn(() => new Promise(() => {}));
+    Object.defineProperty(globalThis, "navigator", {
+      value: { mediaDevices: { getUserMedia: getUserMediaMock } },
+      writable: true,
+      configurable: true,
+    });
+    try {
+      const onSend = vi.fn(() => true);
+      render(
+        <ComposeBox {...baseProps({ onSend })} />,
+      );
+      const textarea = screen.getByRole("textbox");
+      fireEvent.change(textarea, { target: { value: "hello" } });
+      const sendBtn = screen.getByRole("button", { name: "Send" });
+      // Quick 260814-1hz: Send button reverted to plain onClick (hold gesture
+      // moved to MicButton). Click fires handleSend directly.
+      fireEvent.click(sendBtn);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      // Phase 50 D-18: onSend widened to (text, mqid?).
+      expect(onSend).toHaveBeenCalledWith("hello", expect.stringMatching(/^pv-optim-/));
+    } finally {
+      Object.defineProperty(globalThis, "navigator", {
+        value: originalNavigator,
+        writable: true,
+        configurable: true,
+      });
+    }
+  });
+
+  it("Task 2 Test 5: Send button click routes to onAsideDismiss when asideActive=true, NOT handleSend", () => {
+    const onSend = vi.fn(() => true);
+    const onAsideDismiss = vi.fn();
+    render(
+      <ComposeBox
+        {...baseProps({
+          onSend,
+          asideActive: true,
+          onAsideDismiss,
+        })}
+      />,
+    );
+    // Even with text in the textarea, clicking the morphed X should dismiss NOT send.
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "partial draft" } });
+    const resumeBtn = screen.getByRole("button", { name: "Resume" });
+    fireEvent.click(resumeBtn);
+    expect(onAsideDismiss).toHaveBeenCalledTimes(1);
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("Task 2 Test 6: Send button is ALWAYS clickable (disabled=false) when asideActive=true, even with empty textarea", () => {
+    const onAsideDismiss = vi.fn();
+    render(
+      <ComposeBox
+        {...baseProps({
+          asideActive: true,
+          onAsideDismiss,
+        })}
+      />,
+    );
+    const resumeBtn = screen.getByRole("button", { name: "Resume" });
+    expect((resumeBtn as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(resumeBtn);
+    expect(onAsideDismiss).toHaveBeenCalledTimes(1);
+  });
+
+  it("Task 2 Test 7: the main button reports the resume action when asideActive=true", () => {
+    render(
+      <ComposeBox
+        {...baseProps({
+          asideActive: true,
+        })}
+      />,
+    );
+    const resumeBtn = screen.getByRole("button", { name: "Resume" });
+    // Same neutral main button; the icon (and data-action) says what it does.
+    expect(resumeBtn.getAttribute("data-action")).toBe("resume");
+    expect(resumeBtn.getAttribute("data-main")).toBe("true");
+  });
+
+  it("Task 2 Test 8: Send button renders an X icon (SVG) when asideActive=true", () => {
+    const { container } = render(
+      <ComposeBox
+        {...baseProps({
+          asideActive: true,
+        })}
+      />,
+    );
+    const resumeBtn = screen.getByRole("button", { name: "Resume" });
+    // lucide X renders as an <svg> with lucide-x class or lucide class.
+    const svg = resumeBtn.querySelector("svg");
+    expect(svg).not.toBeNull();
+    // lucide-react's X icon carries a `lucide-x` class (or similar) — assert
+    // it's NOT the paper-plane path.
+    const path = svg?.querySelector("path");
+    // Paper-plane path starts with M14.536 21.686. lucide X has two <line> children
+    // (or two <path> — depends on lucide version) but definitely NOT that d attribute.
+    expect(path?.getAttribute("d")).not.toContain("M14.536 21.686");
+    // Assert containing SVG present in test container as sanity.
+    expect(container.querySelector("svg")).toBeTruthy();
+  });
+
+  it("Task 2 Test 9: onAsideDismiss undefined is safe — no crash when asideActive=true and callback is absent", () => {
+    render(
+      <ComposeBox
+        {...baseProps({
+          asideActive: true,
+          // onAsideDismiss intentionally omitted
+        })}
+      />,
+    );
+    const resumeBtn = screen.getByRole("button", { name: "Resume" });
+    // Should not throw.
+    expect(() => fireEvent.click(resumeBtn)).not.toThrow();
+  });
+});
