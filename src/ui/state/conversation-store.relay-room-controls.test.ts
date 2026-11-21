@@ -59,6 +59,23 @@ describe("relay-room rows", () => {
     expect(row?.roomOthersCount).toBe(3);
   });
 
+  it("a list that couldn't read a room's members keeps the faces already known", () => {
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    updateFleetSessions([room("!a:hs", "Plans", { roomFaces: FACES, roomOthersCount: 3 })]);
+    updateFleetSessions([room("!a:hs", "Plans renamed"), room("!b:hs", "New")]);
+    const a = allRows().find((r) => r.roomId === "!a:hs");
+    expect(a?.roomFaces).toEqual(FACES);
+    expect(a?.roomOthersCount).toBe(3);
+    expect(allRows().find((r) => r.roomId === "!b:hs")?.roomFaces).toBeUndefined();
+    expect(getFleetSessionsSnapshot().find((s) => s.roomId === "!a:hs")?.roomTitle).toBe("Plans renamed");
+  });
+
+  it("a room whose members were read fresh takes the new faces", () => {
+    updateFleetSessions([room("!a:hs", "Plans", { roomFaces: FACES, roomOthersCount: 3 })]);
+    updateFleetSessions([room("!a:hs", "Plans", { roomFaces: [FACES[0]], roomOthersCount: 1 })]);
+    expect(allRows().find((r) => r.roomId === "!a:hs")?.roomFaces).toEqual([FACES[0]]);
+  });
+
   it("an open room's row carries the faces too", () => {
     updateFleetSessions([room("!a:hs", "Plans", { roomFaces: FACES, roomOthersCount: 2 })]);
     updateOpenTabs([

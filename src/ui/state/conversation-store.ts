@@ -1925,6 +1925,39 @@ export function reconcileFleetSessionsFromList(
 // polling-thrash-guard lives upstream at the AppShell memoization layer).
 // Test 27 asserts both the ref-equal no-op and the different-ref-same-
 // content DOES-fire semantics.
+/**
+ * A room row arrives without faces when the server couldn't read the room's
+ * members just then (e.g. the chat server still starting after a deploy).
+ * Keep the faces already known for that room rather than blanking them.
+ */
+function keepKnownRoomFaces(
+  incoming: FleetSession[],
+  previous: FleetSession[],
+): FleetSession[] {
+  let known: Map<string, FleetSession> | null = null;
+  let carried = 0;
+  const out = incoming.map((s) => {
+    if (s.kind !== "relay-room" || !s.roomId || Array.isArray(s.roomFaces)) return s;
+    if (known === null) {
+      known = new Map();
+      for (const p of previous) {
+        if (p.kind === "relay-room" && p.roomId && Array.isArray(p.roomFaces)) known.set(p.roomId, p);
+      }
+    }
+    const prev = known.get(s.roomId);
+    if (!prev) return s;
+    carried++;
+    return { ...s, roomFaces: prev.roomFaces, roomOthersCount: prev.roomOthersCount };
+  });
+  if (carried > 0) {
+    console.info("[conversation-store] room faces missing from list — kept known faces", {
+      op: "room_faces_carried_forward",
+      rooms: carried,
+    });
+  }
+  return out;
+}
+
 export function updateFleetSessions(sessions: FleetSession[]): void {
   // Pending-archive filter (companion to the Guard 4 in upsertFleetSession).
   // Any (hostId, sessionName) currently in pendingArchiveKeys was optimistically
@@ -1974,7 +2007,7 @@ export function updateFleetSessions(sessions: FleetSession[]): void {
     sessions.length === 0 && state.fleetSessions.length > 0;
   const nextSessions = sessionsShallowEqual || preservePulseRows
     ? state.fleetSessions
-    : sessions;
+    : keepKnownRoomFaces(sessions, state.fleetSessions);
   state = {
     ...state,
     fleetSessions: nextSessions,
