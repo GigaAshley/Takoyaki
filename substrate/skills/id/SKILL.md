@@ -958,8 +958,8 @@ not something agents drive.
     *Agent-side: none.*
   - **Rename…** — asks for a new title and sets it as the conversation's
     row title and task line. On a relay room it renames the room itself, for
-    every member (the user is given the right to, when an agent made the
-    room).
+    every member (the user is quietly given the right to, when one of
+    their own agents made the room).
     *Agent-side:* it writes the identity's `task:` frontmatter — the same
     field you keep current yourself, but a user-set title stands
     (§ Loading an existing identity). For a room, it's the room's name.
