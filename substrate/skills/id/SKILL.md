@@ -936,9 +936,6 @@ not something agents drive.
   place ("Notified you") means the agent notified the user (§ Notifying the
   user); an **amber disc** on the
   picture means the agent has local work not pushed anywhere.
-  A **relay room's** row shows two other members' faces overlapping in the
-  picture's place, with "+N" when there are more (a room with just one
-  other person shows only their face).
   Only admins ever see a plain terminal row; for anyone else, an agent
   whose machine can't be reached drops out of the sidebar until the
   machine is back.
@@ -957,12 +954,10 @@ not something agents drive.
     (a separate client instance; desktop only).
     *Agent-side: none.*
   - **Rename…** — asks for a new title and sets it as the conversation's
-    row title and task line. On a relay room it renames the room itself, for
-    every member (the user is quietly given the right to, when one of
-    their own agents made the room).
+    row title and task line. Shown for agent conversations only.
     *Agent-side:* it writes the identity's `task:` frontmatter — the same
     field you keep current yourself, but a user-set title stands
-    (§ Loading an existing identity). For a room, it's the room's name.
+    (§ Loading an existing identity).
   - **Move to** — drill-in submenu listing **Pinned** first, then every
     project (sub-projects indented under their parent, as in the sidebar),
     with a checkmark on wherever the row is now (at most one —
@@ -983,8 +978,6 @@ not something agents drive.
     for good with it — and points at scheduled conversations for work that should
     carry on; it opens at once, with its Archive button greyed out for the
     moment that check takes. See § On `/id archive`.
-  - **Leave** — relay rooms only: after a confirm, the user leaves the room;
-    it leaves their sidebar and its open panes close.
 
   Much the same menu appears on the conversation's **task pill** in the
   open conversation view (top-center) — its own ⋯ button, or right-click —
@@ -1083,7 +1076,7 @@ not something agents drive.
   same for that file: it opens in a new **file pane** (each drag opens
   another, even for a file already open). Dragging the green **monitor**
   button beside a conversation's task pill does the same for that agent's
-  virtual desktop: it opens in a new **desktop pane**. Each open conversation pane has a **task pill** (relay rooms: a **room pill**), each
+  virtual desktop: it opens in a new **desktop pane**. Each open conversation pane has a **task pill** (relay rooms: a **badge** per participant), each
   open app pane its **app bar**, each remote-desktop pane its
   **remote-desktop bar**, each file pane its **file bar**, and each desktop
   pane its **desktop bar** (all below); dragging it to a different spot in
@@ -1538,14 +1531,8 @@ crown, then gear.
   where holding the pill opens the menu instead. Hovering
   shows the full task line, then the agent's name, roles and project. On a phone the round **back to
   conversations** (←) button floats level with it at the top left, in the
-  same solid dark look. (A relay room has a **room pill** instead: its
-  faces and name, hovering shows the full name and who's in it, a tap does
-  nothing; it drags like a task pill, and its ⋯ / right-click menu has Move
-  to new tab, Rename…, Move to, Leave and Close. Beside it, a badge for every
-  other member — people first, with their picture or initial, then agents,
-  each agent's with its memory pie under it; they drop to a line under the
-  pill when there's no room beside it, and to just pictures when they don't
-  fit — hovering or press-and-hold shows the name.)
+  same solid dark look. (Relay rooms show a badge per participant instead;
+  each agent's badge has its memory pie under it.)
   *Agent-side:* keep `task:` current, silently. Rules already covered.
 
 - **Round buttons beside the task pill.** Just to the right of the pill,
@@ -1709,9 +1696,7 @@ crown, then gear.
   one and briefly rings it, instead of the bottom. Messages **between agents** show as quiet grey cards, folded:
   the sender's picture, "Finch → Bilbo" and a one-line preview; tap to
   read. In a **relay room** the user opened, each agent's messages are
-  bubbles in its colour with its name on top. Files and pictures anyone
-  posts in the room show as file chips (pictures inline) that open, edit and
-  drag like any other; one that can't be opened shows its name with a note.
+  bubbles in its colour with its name on top.
   **Quoting:** selecting words in any bubble brings up a small **Quote**
   button beside them; tapping it adds them to the end of the compose box as
   quoted lines for the user to reply under.
@@ -1741,9 +1726,7 @@ crown, then gear.
   happened. Notify me also brings up the browser's Allow prompt when nothing
   else reaches the user outside the app. There is no Stop in the
   composer — the working orb is the Stop (§ Stop below). In a relay room
-  only the paperclip, the mic and Send show; files attached there go into
-  the room as file posts, and one too big for the room's chat server is
-  held at attach until removed.
+  only the mic and Send show.
 
 - **Agent memory (the pie in the task pill, just before the ⋯).** Shows how
   full the agent's context window by colour alone, no number: grey while
