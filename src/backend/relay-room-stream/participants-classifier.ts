@@ -66,6 +66,8 @@ export interface HumanParticipant {
   mxid: string;
   displayName: string;
   userId: string;
+  /** Their uploaded picture's file name, or null for none (initial shown). */
+  avatarPath: string | null;
 }
 
 /**
@@ -87,7 +89,7 @@ export interface ClassifyParticipantsDeps {
    * Return a map from mxid → {displayName, userId} for every user row
    * that has a non-null mxid. Called once per classification.
    */
-  lookupHumans: () => Promise<Map<string, { displayName: string; userId: string }>>;
+  lookupHumans: () => Promise<Map<string, { displayName: string; userId: string; avatarPath?: string | null }>>;
 }
 
 /**
@@ -131,6 +133,7 @@ export async function classifyParticipants(
         mxid,
         displayName: humanRow.displayName,
         userId: humanRow.userId,
+        avatarPath: humanRow.avatarPath ?? null,
       });
     } else {
       agents.push({
@@ -171,7 +174,7 @@ export async function classifyParticipants(
 const HUMANS_LOOKUP_TTL_MS = 30_000;
 
 interface HumansLookupCache {
-  value: Map<string, { displayName: string; userId: string }>;
+  value: Map<string, { displayName: string; userId: string; avatarPath?: string | null }>;
   expiresAt: number;
 }
 
@@ -193,7 +196,7 @@ export function __resetHumansLookupCacheForTests(): void {
  * otherwise fire 15x more DB reads than needed).
  */
 export async function lookupHumansFromUsersTable(): Promise<
-  Map<string, { displayName: string; userId: string }>
+  Map<string, { displayName: string; userId: string; avatarPath?: string | null }>
 > {
   const now = Date.now();
   if (humansLookupCache !== null && humansLookupCache.expiresAt > now) {
@@ -205,21 +208,23 @@ export async function lookupHumansFromUsersTable(): Promise<
         id: users.id,
         username: users.username,
         mxid: users.mxid,
+        avatarPath: users.avatarPath,
       })
       .from(users)) as Array<{
       id: string;
       username: string | null;
       mxid: string | null;
+      avatarPath?: string | null;
     }>;
 
-    const map = new Map<string, { displayName: string; userId: string }>();
+    const map = new Map<string, { displayName: string; userId: string; avatarPath?: string | null }>();
     for (const row of rows) {
       if (typeof row.mxid !== "string" || row.mxid.length === 0) continue;
       const displayName =
         typeof row.username === "string" && row.username.length > 0
           ? row.username
           : row.mxid;
-      map.set(row.mxid, { displayName, userId: row.id });
+      map.set(row.mxid, { displayName, userId: row.id, avatarPath: row.avatarPath ?? null });
     }
     humansLookupCache = { value: map, expiresAt: now + HUMANS_LOOKUP_TTL_MS };
     return map;

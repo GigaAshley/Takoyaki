@@ -222,7 +222,7 @@ export function IdentityBadge({
         style={{ position: "relative", zIndex: 1 }}
       >
         <span
-          className="font-semibold truncate leading-tight text-[color:var(--k-t1)]"
+          className="pv-badge-name font-semibold truncate leading-tight text-[color:var(--k-t1)]"
           style={{ fontSize: 13.5 }}
           title={[roleLine, projectDisplayName].filter(Boolean).join(" · ") || undefined}
         >

@@ -119,14 +119,15 @@ describe("lookupHumansFromUsersTable (M4 fixup — 30s TTL cache)", () => {
   it("Test M4a: happy-path DB read builds mxid → {displayName, userId} map", async () => {
     dbFromMock.mockResolvedValueOnce([
       { id: "u-1", username: "user", mxid: OWNER_MXID },
-      { id: "u-2", username: "zebra", mxid: OTHER_HUMAN_MXID },
+      { id: "u-2", username: "zebra", mxid: OTHER_HUMAN_MXID, avatarPath: "zebra.webp" },
     ]);
     const map = await lookupHumansFromUsersTable();
     expect(map.size).toBe(2);
-    expect(map.get(OWNER_MXID)).toEqual({ displayName: "user", userId: "u-1" });
+    expect(map.get(OWNER_MXID)).toEqual({ displayName: "user", userId: "u-1", avatarPath: null });
     expect(map.get(OTHER_HUMAN_MXID)).toEqual({
       displayName: "zebra",
       userId: "u-2",
+      avatarPath: "zebra.webp",
     });
   });
 

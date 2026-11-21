@@ -24,9 +24,11 @@
 //
 // ## Per-role rendering (D-02)
 //
-// - HUMAN (D-09): plain IdentityBadge wrapped in a `relative` positioning
-//   cell (IdentityBadge's own `absolute` positioning scoped to the cell so
-//   it doesn't collapse against the page). NO meter appendage.
+// - HUMAN: a person badge (RoomPersonBadge) — the same pill as an agent's,
+//   with the person's own picture or initial on a neutral ring. NO meter
+//   appendage. A member that can't be drawn as an agent gets one too.
+// - TIGHT ROW: when the badges don't fit across the pane, every badge drops
+//   its name (pictures only); hover / press-and-hold shows the name.
 // - AGENT (D-02/D-08): AgentBadgeWithMeter (Task 1 port) — plain badge
 //   PLUS the memory pie. It reads via Wave 0 useSessionContextPct; its
 //   Compact conversation request is INTERNAL to AgentBadgeWithMeter.
@@ -52,12 +54,14 @@
 // AgentBadgeWithMeter whose badge is inert (the memory pie is separately
 // clickable). No IdentityModal, no navigation.
 
-import { useEffect } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { cn } from "@/lib/utils";
 import { IdentityBadge } from "@/features/terminal/IdentityBadge";
 import { useIdentities } from "@/state/identities-store";
 import { resolveMxidToIdentity } from "@/features/pretty-view/relay-mxid-resolve";
 import { AgentBadgeWithMeter } from "./AgentBadgeWithMeter";
+import { RoomPersonBadge, personAvatarUrl } from "./RoomPersonBadge";
+import { HOLD_MS, MOVE_SLOP, isCoarsePointer } from "@/features/pretty-conversations/row-touch-gestures";
 // Phase 93 Slice 4 (D-04): types re-homed to pretty-view/sources/ as part
 // of the standalone relay-source tree retirement. Byte-identical shape
 // (Slice 3 Task 1 verbatim port of the wire types).
@@ -132,51 +136,126 @@ function extractLocalpart(mxid: string): string {
   return mxid.slice(1, colon).toLowerCase();
 }
 
-/**
- * A single human's badge cell. Renders the plain IdentityBadge with NO
- * appendage (D-02/D-09). Wrapped in a `relative` positioning cell so
- * IdentityBadge's absolute positioning is scoped to this cell rather than
- * the page (IdentityBadge.tsx:110 bakes `absolute top-4 right-5 z-[101]`
- * into its own rootClassName).
- */
+/** A single person's badge cell: their picture (or initial) and name. */
+function roomDragDescriptor(relayRoomId?: string, relayRoomTitle?: string | null) {
+  return typeof relayRoomId === "string" && relayRoomId.length > 0
+    ? {
+        tabType: "terminal" as const,
+        sessionKind: "relay-room" as const,
+        relayRoomId,
+        relayRoomTitle: relayRoomTitle ?? null,
+      }
+    : undefined;
+}
+
 function HumanBadgeCell({
   human,
+  tight,
   tabId,
   relayRoomId,
   relayRoomTitle,
 }: {
   human: HumanParticipant;
+  tight: boolean;
   tabId?: string;
   relayRoomId?: string;
   relayRoomTitle?: string | null;
 }) {
-  const { byKey } = useIdentities();
-  const resolution = resolveMxidToIdentity(human.mxid, byKey);
-  const identityKey =
-    resolution.identity !== null
-      ? resolution.identity.identityKey
-      : extractLocalpart(human.mxid);
-  const dragDescriptor =
-    typeof relayRoomId === "string" && relayRoomId.length > 0
-      ? {
-          tabType: "terminal" as const,
-          sessionKind: "relay-room" as const,
-          relayRoomId,
-          relayRoomTitle: relayRoomTitle ?? null,
-        }
-      : undefined;
+  return (
+    <ParticipantCell role="human" mxid={human.mxid} name={human.displayName} tight={tight}>
+      <RoomPersonBadge
+        name={human.displayName}
+        avatarUrl={personAvatarUrl(human.userId, human.avatarPath)}
+        tabId={tabId}
+        dragKey={extractLocalpart(human.mxid)}
+        dragDescriptor={roomDragDescriptor(relayRoomId, relayRoomTitle)}
+      />
+    </ParticipantCell>
+  );
+}
+
+/**
+ * The cell every badge sits in. When the row is tight and names are hidden,
+ * hovering shows the name (native tooltip) and a press-and-hold on a touch
+ * screen shows it in a small label under the badge. A tap does nothing.
+ */
+function ParticipantCell({
+  role,
+  mxid,
+  name,
+  tight,
+  children,
+}: {
+  role: "human" | "agent";
+  mxid: string;
+  name: string;
+  tight: boolean;
+  children: ReactNode;
+}) {
+  const [held, setHeld] = useState(false);
+  const hold = useRef<{ timer: ReturnType<typeof setTimeout> | null; x: number; y: number }>({ timer: null, x: 0, y: 0 });
+  const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cancel = () => {
+    if (hold.current.timer !== null) clearTimeout(hold.current.timer);
+    hold.current.timer = null;
+  };
+  useEffect(
+    () => () => {
+      cancel();
+      if (hideTimer.current !== null) clearTimeout(hideTimer.current);
+    },
+    [],
+  );
+  const touchHandlers = tight
+    ? {
+        onPointerDown: (e: React.PointerEvent) => {
+          if (e.pointerType === "mouse" && !isCoarsePointer()) return;
+          cancel();
+          hold.current = {
+            x: e.clientX,
+            y: e.clientY,
+            timer: setTimeout(() => {
+              hold.current.timer = null;
+              setHeld(true);
+              if (hideTimer.current !== null) clearTimeout(hideTimer.current);
+              hideTimer.current = setTimeout(() => setHeld(false), 2000);
+            }, HOLD_MS),
+          };
+        },
+        onPointerMove: (e: React.PointerEvent) => {
+          if (
+            Math.abs(e.clientX - hold.current.x) > MOVE_SLOP ||
+            Math.abs(e.clientY - hold.current.y) > MOVE_SLOP
+          ) {
+            cancel();
+          }
+        },
+        onPointerUp: cancel,
+        onPointerCancel: cancel,
+        onContextMenu: (e: React.MouseEvent) => {
+          if (isCoarsePointer()) e.preventDefault();
+        },
+      }
+    : {};
   return (
     <div
       data-testid="relay-room-participant"
-      data-role="human"
-      data-mxid={human.mxid}
+      data-role={role}
+      data-mxid={mxid}
       className={CELL_BASE_CLASS}
+      title={tight ? name : undefined}
+      {...touchHandlers}
     >
-      <IdentityBadge
-        identityKey={identityKey}
-        tabId={tabId}
-        dragDescriptor={dragDescriptor}
-      />
+      {children}
+      {tight && held && (
+        <span
+          data-testid="relay-room-participant-name"
+          role="tooltip"
+          className="pv-float absolute top-full mt-1 whitespace-nowrap rounded-md px-2 py-1 text-xs font-semibold text-[color:var(--k-t1)] pointer-events-none z-[102]"
+        >
+          {name}
+        </span>
+      )}
     </div>
   );
 }
@@ -193,13 +272,17 @@ function AgentBadgeCell({
   tabId,
   relayRoomId,
   relayRoomTitle,
+  tight,
 }: {
   agent: AgentParticipant;
   fleetIdentityHosts: Record<string, number>;
   tabId?: string;
   relayRoomId?: string;
   relayRoomTitle?: string | null;
+  tight: boolean;
 }) {
+  const { byKey } = useIdentities();
+  const known = resolveMxidToIdentity(agent.mxid, byKey).identity ?? byKey.get(agent.identityKey.toLowerCase()) ?? null;
   const identityKey = agent.identityKey;
   const hostId = fleetIdentityHosts[identityKey];
   const dragDescriptor =
@@ -225,32 +308,38 @@ function AgentBadgeCell({
       identityKey,
     });
   }, [identityKey, hostId]);
+  const name = known?.displayName ?? identityKey;
+  if (known === null) {
+    // A member the app can't draw as an agent (not one of this user's
+    // agents, or not loaded yet): a plain badge with their name, never blank.
+    return (
+      <ParticipantCell role="agent" mxid={agent.mxid} name={name} tight={tight}>
+        <RoomPersonBadge
+          name={name}
+          avatarUrl={null}
+          tabId={tabId}
+          dragKey={identityKey}
+          dragDescriptor={dragDescriptor}
+        />
+      </ParticipantCell>
+    );
+  }
   if (hostId === undefined) {
     // Defensive edge case — agent identity known but no live fleet mapping.
     // Graceful degradation: render the plain badge without appendage. The
     // structured warn above fires from a useEffect so re-renders don't spam.
     return (
-      <div
-        data-testid="relay-room-participant"
-        data-role="agent"
-        data-mxid={agent.mxid}
-        className={CELL_BASE_CLASS}
-      >
+      <ParticipantCell role="agent" mxid={agent.mxid} name={name} tight={tight}>
         <IdentityBadge
           identityKey={identityKey}
           tabId={tabId}
           dragDescriptor={dragDescriptor}
         />
-      </div>
+      </ParticipantCell>
     );
   }
   return (
-    <div
-      data-testid="relay-room-participant"
-      data-role="agent"
-      data-mxid={agent.mxid}
-      className={CELL_BASE_CLASS}
-    >
+    <ParticipantCell role="agent" mxid={agent.mxid} name={name} tight={tight}>
       <AgentBadgeWithMeter
         identityKey={identityKey}
         mxid={agent.mxid}
@@ -262,7 +351,7 @@ function AgentBadgeCell({
         relayRoomId={relayRoomId}
         relayRoomTitle={relayRoomTitle}
       />
-    </div>
+    </ParticipantCell>
   );
 }
 
@@ -279,6 +368,15 @@ function AgentBadgeCell({
 // per user's live-snippet tasting.
 const ROOT_ANCHOR_CLASS =
   "absolute top-3 right-5 z-[101] flex flex-row-reverse items-start gap-2";
+
+/** Pictures only: names hidden, pills shrink to the picture, closer gaps. */
+const TIGHT_CLASS =
+  "!gap-1 [&_.pv-badge-name]:hidden [&_.pv-identity-badge]:!p-[4px]";
+
+/** Room kept clear at the pane's left edge (the phone's back button). */
+const ROW_LEFT_RESERVE_PX = 72;
+/** The row's own distance from the pane's right edge (right-5). */
+const ROW_RIGHT_OFFSET_PX = 20;
 
 // Phase 97 Finding 4/5 UAT follow-up (2026-09-10): the participant cell
 // wrappers were `h-[N] w-[220px]` with `IdentityBadge` absolute-positioned
@@ -318,6 +416,54 @@ export function MultiBadgeAnchor({
 
   const totalCells = humansOther.length + agentsSorted.length;
 
+  // Tight row: when every badge at full size won't fit across the pane,
+  // every badge drops its name and the pictures sit closer, so everyone
+  // stays on screen. The full-size width is measured whenever the members
+  // change, and the row goes back to names once the pane is wide enough.
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const [tight, setTight] = useState(false);
+  const fullWidth = useRef(0);
+  const memberKey = [...humansOther.map((h) => h.mxid), ...agentsSorted.map((a) => a.mxid)].join("|");
+  useLayoutEffect(() => {
+    setTight(false);
+    fullWidth.current = 0;
+  }, [memberKey]);
+  useLayoutEffect(() => {
+    const root = rootRef.current;
+    const pane = root?.offsetParent as HTMLElement | null | undefined;
+    if (!root || !pane) return;
+    const check = () => {
+      const available = pane.clientWidth - ROW_LEFT_RESERVE_PX - ROW_RIGHT_OFFSET_PX;
+      if (!tight) {
+        // The row grows leftward, where overflow isn't always counted in
+        // its scroll width — so also add up the badges themselves.
+        const cells = Array.from(root.children) as HTMLElement[];
+        const gap = parseFloat(getComputedStyle(root).columnGap || "0") || 0;
+        const summed =
+          cells.reduce((w, c) => w + c.getBoundingClientRect().width, 0) +
+          gap * Math.max(0, cells.length - 1);
+        fullWidth.current = Math.max(root.scrollWidth, summed);
+        if (fullWidth.current > available) {
+          // eslint-disable-next-line no-console
+          console.info({
+            operation: "relay_room_badges_tight",
+            members: totalCells,
+            fullWidth: fullWidth.current,
+            available,
+          });
+          setTight(true);
+        }
+      } else if (fullWidth.current > 0 && fullWidth.current <= available) {
+        setTight(false);
+      }
+    };
+    check();
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(check);
+    ro.observe(pane);
+    return () => ro.disconnect();
+  }, [tight, memberKey, totalCells, isReady]);
+
   // Warning 2: loading discrimination. `isReady={false}` renders a subtle
   // placeholder so the relay tab does not appear empty during the
   // WS-connecting window. Anchor root class stays identical so the loading
@@ -354,8 +500,10 @@ export function MultiBadgeAnchor({
   // reading left-to-right).
   return (
     <div
+      ref={rootRef}
       data-testid="multi-badge-anchor"
-      className={cn(ROOT_ANCHOR_CLASS, className)}
+      data-tight={tight ? "true" : "false"}
+      className={cn(ROOT_ANCHOR_CLASS, tight && TIGHT_CLASS, className)}
     >
       {agentsSorted.map((a) => (
         <AgentBadgeCell
@@ -365,12 +513,14 @@ export function MultiBadgeAnchor({
           tabId={tabId}
           relayRoomId={relayRoomId}
           relayRoomTitle={relayRoomTitle}
+          tight={tight}
         />
       ))}
       {humansOther.map((h) => (
         <HumanBadgeCell
           key={h.mxid}
           human={h}
+          tight={tight}
           tabId={tabId}
           relayRoomId={relayRoomId}
           relayRoomTitle={relayRoomTitle}

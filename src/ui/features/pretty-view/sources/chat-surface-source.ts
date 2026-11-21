@@ -48,6 +48,9 @@ export type ChatSurfaceMessage =
 export interface HumanParticipant {
   mxid: string;
   displayName: string;
+  userId: string;
+  /** Their uploaded picture's file name; null/absent = show their initial. */
+  avatarPath?: string | null;
 }
 
 export interface AgentParticipant {

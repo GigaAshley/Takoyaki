@@ -177,11 +177,13 @@ describe("MultiBadgeAnchor — Phase 97 Plan 06 tabId drag-source threading", ()
     const badges = Array.from(
       container.querySelectorAll('[data-testid="identity-badge-spy"]'),
     );
-    // 1 human + 3 agents = 4 badges rendered.
-    expect(badges.length).toBe(4);
+    // 3 agents draw as agent badges; the person draws as a person badge.
+    expect(badges.length).toBe(3);
     for (const badge of badges) {
       expect(badge.getAttribute("data-tabid")).toBe(TAB_ID);
     }
+    const person = container.querySelector('[data-testid="relay-room-person-badge"]');
+    expect(person?.getAttribute("draggable")).toBe("true");
   });
 
   it("Test 2: without tabId prop, IdentityBadges receive no tabId (pre-plan regression floor)", () => {
@@ -200,11 +202,13 @@ describe("MultiBadgeAnchor — Phase 97 Plan 06 tabId drag-source threading", ()
     const badges = Array.from(
       container.querySelectorAll('[data-testid="identity-badge-spy"]'),
     );
-    expect(badges.length).toBe(4);
+    expect(badges.length).toBe(3);
     for (const badge of badges) {
       // Undefined tabId is rendered as an empty data attribute.
       expect(badge.getAttribute("data-tabid")).toBe("");
     }
+    const person = container.querySelector('[data-testid="relay-room-person-badge"]');
+    expect(person?.getAttribute("draggable")).toBe("false");
   });
 
   it("Test 3: mixed participant list — HumanBadgeCell + AgentBadgeCell fallback + AgentBadgeWithMeter branches all receive tabId", () => {
@@ -220,16 +224,14 @@ describe("MultiBadgeAnchor — Phase 97 Plan 06 tabId drag-source threading", ()
         tabId={TAB_ID}
       />,
     );
-    // Human cell (Riley) — plain IdentityBadge, HumanBadgeCell branch.
+    // Human cell (Riley) — a person badge that drags the room.
     const humanCell = container.querySelector(
       '[data-testid="relay-room-participant"][data-role="human"]',
     );
     expect(humanCell).not.toBeNull();
-    const humanBadge = humanCell?.querySelector(
-      '[data-testid="identity-badge-spy"]',
-    );
-    expect(humanBadge?.getAttribute("data-tabid")).toBe(TAB_ID);
-    expect(humanBadge?.getAttribute("data-identity-key")).toBe("riley");
+    const humanBadge = humanCell?.querySelector('[data-testid="relay-room-person-badge"]');
+    expect(humanBadge?.getAttribute("draggable")).toBe("true");
+    expect(humanBadge?.textContent).toContain("Riley");
 
     // bare-agent cell — plain IdentityBadge inside AgentBadgeCell fallback
     // branch (no host mapping). Identify via data-mxid.
@@ -275,7 +277,7 @@ describe("MultiBadgeAnchor — Phase 97 Plan 06 tabId drag-source threading", ()
     const badges = Array.from(
       container.querySelectorAll('[data-testid="identity-badge-spy"]'),
     );
-    expect(badges.length).toBe(4);
+    expect(badges.length).toBe(3);
     for (const badge of badges) {
       // D-18: click contract stays inert in the relay case.
       expect(badge.getAttribute("data-has-onclick")).toBe("false");

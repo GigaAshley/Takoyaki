@@ -1538,8 +1538,10 @@ crown, then gear.
   where holding the pill opens the menu instead. Hovering
   shows the full task line, then the agent's name, roles and project. On a phone the round **back to
   conversations** (←) button floats level with it at the top left, in the
-  same solid dark look. (Relay rooms show a badge per participant instead;
-  each agent's badge has its memory pie under it.)
+  same solid dark look. (Relay rooms show a badge for every other member
+  instead — people first, with their picture or initial, then agents, each
+  agent's with its memory pie under it. When they don't all fit, every badge
+  drops to just its picture; hovering or press-and-hold shows the name.)
   *Agent-side:* keep `task:` current, silently. Rules already covered.
 
 - **Round buttons beside the task pill.** Just to the right of the pill,
