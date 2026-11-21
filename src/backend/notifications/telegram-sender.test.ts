@@ -93,6 +93,10 @@ describe("formatting", () => {
   it("builds an absolute Open URL, or none without an https public URL", () => {
     expect(buildOpenUrl(payload)).toBe("https://skynet.example.com/?openHarness=%40mitzi%3Ahs&host=3");
     expect(buildOpenUrl({ ...payload, agentHostId: null })).toBeNull();
+    // A person's post in a relay room opens the room.
+    expect(buildOpenUrl({ ...payload, agentHostId: null, relayRoomId: "!garden:hs" })).toBe(
+      "https://skynet.example.com/?openRelayRoom=%21garden%3Ahs",
+    );
     publicUrl = "";
     expect(buildOpenUrl(payload)).toBeNull();
   });

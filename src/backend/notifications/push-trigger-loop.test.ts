@@ -937,3 +937,199 @@ describe("createPushTriggerLoop — scheduler", () => {
     expect(loop.__getPerUserStateForTests().size).toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// runPushTriggerTick — relay rooms (rooms that show in the user's sidebar)
+// ---------------------------------------------------------------------------
+
+describe("runPushTriggerTick — relay rooms", () => {
+  const PERSON_MXID = "@robin:server";
+  const roomDeps = (events: unknown[], overrides: Partial<PushTriggerLoopDeps> = {}) =>
+    makeDeps({
+      fetchLive: vi.fn(async () => ({
+        ok: true as const,
+        events: events as never,
+        nextSinceToken: "cursor-2",
+      })),
+      getRoomJoinedMembers: vi.fn(async () => ({
+        ok: true as const,
+        memberMxids: [USER_A_MXID, PERSON_MXID, AGENT_MXID],
+        total: 3,
+      })),
+      classifyRoom: vi.fn(() => ({ decision: "materialize" as const, reason: "group_room" })),
+      recordRoomPost: vi.fn(),
+      recordOwnRoomPost: vi.fn(),
+      publishRoomToTabs: vi.fn(),
+      resolveRoomLabel: vi.fn(async () => ({ senderName: "robin", roomName: "Garden" })),
+      deriveRoomPreviewText: vi.fn(() => "sent a picture"),
+      ...overrides,
+    });
+
+  it("a person's post lights the dot and envelope and notifies, opening the room", async () => {
+    const deps = roomDeps([makeEvent({ sender: PERSON_MXID, origin_server_ts: 1_700_000_500_000 })]);
+    const result = await runPushTriggerTick(USER_A, makeStateWithWarmCursor(USER_A_MXID), deps);
+    expect(result).toEqual({ ok: true, roomsScanned: 1, eventsFired: 1 });
+    expect(deps.recordRoomPost).toHaveBeenCalledWith(USER_A, ROOM_ID, 1_700_000_500_000, true);
+    expect(deps.publishRoomToTabs).toHaveBeenCalledWith(USER_A, {
+      notificationId: "$evt1:server",
+      roomId: ROOM_ID,
+      title: "robin · Garden",
+      body: "sent a picture",
+    });
+    expect(deps.sendPushToUser).toHaveBeenCalledWith(USER_A, {
+      title: "robin · Garden",
+      subtitle: null,
+      body: "sent a picture",
+      agentMxid: PERSON_MXID,
+      agentHostId: null,
+      relayRoomId: ROOM_ID,
+    });
+    // Rooms never touch the agent DM mark.
+    expect(deps.recordDm).not.toHaveBeenCalled();
+  });
+
+  it("a room with no name is titled with just the poster", async () => {
+    const deps = roomDeps([makeEvent({ sender: PERSON_MXID })], {
+      resolveRoomLabel: vi.fn(async () => ({ senderName: "robin", roomName: null })),
+    });
+    await runPushTriggerTick(USER_A, makeStateWithWarmCursor(USER_A_MXID), deps);
+    expect(deps.sendPushToUser).toHaveBeenCalledWith(USER_A, expect.objectContaining({ title: "robin" }));
+  });
+
+  it("an agent's post lights only the dot — no envelope, no notification", async () => {
+    const deps = roomDeps([makeEvent({ sender: AGENT_MXID, origin_server_ts: 1_700_000_600_000 })]);
+    const result = await runPushTriggerTick(USER_A, makeStateWithWarmCursor(USER_A_MXID), deps);
+    expect(result).toEqual({ ok: true, roomsScanned: 1, eventsFired: 0 });
+    expect(deps.recordRoomPost).toHaveBeenCalledWith(USER_A, ROOM_ID, 1_700_000_600_000, false);
+    expect(deps.sendPushToUser).not.toHaveBeenCalled();
+    expect(deps.publishRoomToTabs).not.toHaveBeenCalled();
+  });
+
+  it("an agent that has since left the room still counts as an agent", async () => {
+    const departed = "@gone-agent:server";
+    const deps = roomDeps([makeEvent({ sender: departed })], {
+      resolveAgentHostId: vi.fn(async () => 7),
+    });
+    await runPushTriggerTick(USER_A, makeStateWithWarmCursor(USER_A_MXID), deps);
+    expect(deps.recordRoomPost).toHaveBeenCalledWith(USER_A, ROOM_ID, expect.any(Number), false);
+    expect(deps.sendPushToUser).not.toHaveBeenCalled();
+  });
+
+  it("the user's own post marks the room seen and notifies nobody", async () => {
+    const deps = roomDeps([makeEvent({ sender: USER_A_MXID, origin_server_ts: 1_700_000_700_000 })]);
+    await runPushTriggerTick(USER_A, makeStateWithWarmCursor(USER_A_MXID), deps);
+    expect(deps.recordOwnRoomPost).toHaveBeenCalledWith(USER_A, ROOM_ID, 1_700_000_700_000);
+    expect(deps.recordRoomPost).not.toHaveBeenCalled();
+    expect(deps.sendPushToUser).not.toHaveBeenCalled();
+  });
+
+  it("edits mark nothing and notify nobody", async () => {
+    const edit = makeEvent({
+      sender: PERSON_MXID,
+      content: { msgtype: "m.text", body: "x", "m.relates_to": { rel_type: "m.replace", event_id: "$o" } },
+    });
+    const deps = roomDeps([edit]);
+    await runPushTriggerTick(USER_A, makeStateWithWarmCursor(USER_A_MXID), deps);
+    expect(deps.recordRoomPost).not.toHaveBeenCalled();
+    expect(deps.sendPushToUser).not.toHaveBeenCalled();
+  });
+
+  it("a recordRoomPost failure never blocks the notification", async () => {
+    const deps = roomDeps([makeEvent({ sender: PERSON_MXID })], {
+      recordRoomPost: vi.fn(() => {
+        throw new Error("db gone");
+      }),
+    });
+    await runPushTriggerTick(USER_A, makeStateWithWarmCursor(USER_A_MXID), deps);
+    expect(deps.sendPushToUser).toHaveBeenCalledTimes(1);
+  });
+
+  it("a notification failure doesn't lose the room's marks or stop the tick", async () => {
+    const deps = roomDeps([makeEvent({ sender: PERSON_MXID })], {
+      sendPushToUser: vi.fn(async () => {
+        throw new Error("telegram down");
+      }),
+    });
+    const state = makeStateWithWarmCursor(USER_A_MXID);
+    const result = await runPushTriggerTick(USER_A, state, deps);
+    expect(result.ok).toBe(true);
+    expect(deps.recordRoomPost).toHaveBeenCalledTimes(1);
+    expect(state.cursorByRoom.get(ROOM_ID)).toBe("cursor-2");
+  });
+
+  it("a two-person room with another person works the same way", async () => {
+    const deps = roomDeps([makeEvent({ sender: PERSON_MXID })], {
+      getRoomJoinedMembers: vi.fn(async () => ({
+        ok: true as const,
+        memberMxids: [USER_A_MXID, PERSON_MXID],
+        total: 2,
+      })),
+      classifyRoom: vi.fn(() => ({ decision: "materialize" as const, reason: "two_party_non_agent" })),
+    });
+    await runPushTriggerTick(USER_A, makeStateWithWarmCursor(USER_A_MXID), deps);
+    expect(deps.recordRoomPost).toHaveBeenCalledWith(USER_A, ROOM_ID, expect.any(Number), true);
+    expect(deps.sendPushToUser).toHaveBeenCalledTimes(1);
+  });
+
+  it("when the agents can't be looked up, the tick is deferred — no room is touched, nothing notifies", async () => {
+    const deps = roomDeps([makeEvent({ sender: AGENT_MXID })], {
+      getRegistryMembers: vi.fn(async () => {
+        throw new Error("synapse hiccup");
+      }),
+    });
+    const state = makeStateWithWarmCursor(USER_A_MXID);
+    const result = await runPushTriggerTick(USER_A, state, deps);
+    expect(result).toEqual({ ok: false, reason: "agents_registry_unknown" });
+    expect(deps.fetchLive).not.toHaveBeenCalled();
+    expect(deps.recordRoomPost).not.toHaveBeenCalled();
+    expect(deps.sendPushToUser).not.toHaveBeenCalled();
+    expect(state.cursorByRoom.get(ROOM_ID)).toBe("cursor-warm");
+  });
+
+  it("a registry lookup that throws defers the tick too", async () => {
+    const deps = roomDeps([makeEvent({ sender: PERSON_MXID })], {
+      getAgentsRegistryRoomId: vi.fn(async () => {
+        throw new Error("db");
+      }),
+    });
+    const result = await runPushTriggerTick(USER_A, makeStateWithWarmCursor(USER_A_MXID), deps);
+    expect(result).toEqual({ ok: false, reason: "agents_registry_unknown" });
+    expect(deps.sendPushToUser).not.toHaveBeenCalled();
+  });
+
+  it("a room the user left forgets its cursor, so a rejoin starts from the head", async () => {
+    const deps = roomDeps([], { getUserJoinedRooms: vi.fn(async () => ({ ok: true as const, roomIds: [] })) });
+    const state = makeStateWithWarmCursor(USER_A_MXID);
+    await runPushTriggerTick(USER_A, state, deps);
+    expect(state.cursorByRoom.has(ROOM_ID)).toBe(false);
+  });
+
+  it("a room's first read only counts posts from after the user joined", async () => {
+    const before = makeEvent({ sender: PERSON_MXID, event_id: "$before", origin_server_ts: COLD_START_CUTOFF_MS + 1_000 });
+    const after = makeEvent({ sender: PERSON_MXID, event_id: "$after", origin_server_ts: COLD_START_CUTOFF_MS + 5_000 });
+    const deps = roomDeps([], {
+      // dir=b order: newest first.
+      fetchInitialCursor: vi.fn(async () => ({ ok: true as const, sinceToken: "head", events: [after, before] as never })),
+      getUserJoinedAt: vi.fn(async () => COLD_START_CUTOFF_MS + 3_000),
+    });
+    const state = { ...makeStateWithWarmCursor(USER_A_MXID), cursorByRoom: new Map<string, string>() };
+    await runPushTriggerTick(USER_A, state, deps);
+    expect(deps.getUserJoinedAt).toHaveBeenCalledTimes(1);
+    expect(deps.recordRoomPost).toHaveBeenCalledTimes(1);
+    expect(deps.recordRoomPost).toHaveBeenCalledWith(USER_A, ROOM_ID, COLD_START_CUTOFF_MS + 5_000, true);
+    expect(deps.sendPushToUser).toHaveBeenCalledTimes(1);
+  });
+
+  it("on a first read, an unknown join time counts nothing", async () => {
+    const post = makeEvent({ sender: PERSON_MXID, origin_server_ts: COLD_START_CUTOFF_MS + 5_000 });
+    const deps = roomDeps([], {
+      fetchInitialCursor: vi.fn(async () => ({ ok: true as const, sinceToken: "head", events: [post] as never })),
+      getUserJoinedAt: vi.fn(async () => null),
+    });
+    const state = { ...makeStateWithWarmCursor(USER_A_MXID), cursorByRoom: new Map<string, string>() };
+    await runPushTriggerTick(USER_A, state, deps);
+    expect(deps.recordRoomPost).not.toHaveBeenCalled();
+    expect(deps.sendPushToUser).not.toHaveBeenCalled();
+    expect(state.cursorByRoom.get(ROOM_ID)).toBe("head");
+  });
+});

@@ -1903,3 +1903,44 @@ export async function getRoomMembershipOf(
     return { ok: false, status: 502, error: ERR_PROXY };
   }
 }
+
+// ---------------------------------------------------------------------------
+// getUserJoinedAt — GET /_synapse/admin/v1/rooms/{roomId}/state
+// ---------------------------------------------------------------------------
+//
+// When `mxid` joined the room (the server time of their current join
+// event), or null when they aren't joined or the room can't be read.
+
+export async function getUserJoinedAt(roomId: string, mxid: string): Promise<number | null> {
+  const creds = await getMatrixAdminCreds();
+  if (!creds) return null;
+  const url = `${creds.homeserverBase}/_synapse/admin/v1/rooms/${encodeURIComponent(roomId)}/state`;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${creds.accessToken}`, "Content-Type": "application/json" },
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    if (!response.ok) return null;
+    const parsed = (await response.json()) as { state?: unknown };
+    const events = Array.isArray(parsed.state) ? parsed.state : [];
+    for (const ev of events as Array<Record<string, unknown>>) {
+      if (ev?.type !== "m.room.member" || ev.state_key !== mxid) continue;
+      const membership = (ev.content as { membership?: unknown } | undefined)?.membership;
+      const ts = ev.origin_server_ts;
+      return membership === "join" && typeof ts === "number" && Number.isFinite(ts) ? ts : null;
+    }
+    return null;
+  } catch (err: unknown) {
+    clearTimeout(timeoutId);
+    databaseLogger.warn("matrix admin join-time read failed", {
+      operation: "matrix_admin_get_user_joined_at",
+      roomId,
+      error: err instanceof Error ? err.message : "unknown",
+    });
+    return null;
+  }
+}

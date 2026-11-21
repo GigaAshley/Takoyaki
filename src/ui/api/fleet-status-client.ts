@@ -54,8 +54,8 @@ import {
   lockSkewedSession,
   getSkewLockedSnapshot,
 } from "@/state/skew-lock-store";
-import { applyRemoteDm, applyRemoteSeen, loadReadState, publishLastFinishAt } from "@/state/attention-store";
-import { handleAgentNotified } from "@/features/notifications/browser-notifications";
+import { applyRemoteDm, applyRemoteRoom, applyRemoteSeen, loadReadState, publishLastFinishAt } from "@/state/attention-store";
+import { handleAgentNotified, handleRoomNotified } from "@/features/notifications/browser-notifications";
 
 // ---------------------------------------------------------------------------
 // Constants — mirror patch #148 backoff schedule verbatim
@@ -424,6 +424,46 @@ export function createFleetStatusClient(
             projectCount: parsed.projects.length,
           });
           onProjectListChanged?.(parsed.hostId, parsed.projects);
+          break;
+        case "relay-room-attention-changed":
+          // Someone posted in one of this user's rooms, or they saw it on
+          // another tab or device. Raises or clears the room's dot / envelope.
+          if (
+            typeof parsed.roomId !== "string" ||
+            typeof parsed.lastMessageAt !== "number" ||
+            typeof parsed.seenMessageAt !== "number" ||
+            typeof parsed.lastDmAt !== "number" ||
+            typeof parsed.seenDmAt !== "number"
+          ) {
+            console.warn({ operation: "fleet_status_client_room_attention_malformed", url });
+            break;
+          }
+          applyRemoteRoom({
+            roomId: parsed.roomId,
+            lastMessageAt: parsed.lastMessageAt,
+            seenMessageAt: parsed.seenMessageAt,
+            lastDmAt: parsed.lastDmAt,
+            seenDmAt: parsed.seenDmAt,
+          });
+          break;
+        case "relay-room-notified":
+          // A person posted in one of this user's rooms — maybe show it as a
+          // browser notification (browser-notifications.ts decides).
+          if (
+            typeof parsed.notificationId !== "string" ||
+            typeof parsed.roomId !== "string" ||
+            typeof parsed.title !== "string" ||
+            typeof parsed.body !== "string"
+          ) {
+            console.warn({ operation: "fleet_status_client_room_notified_malformed", url });
+            break;
+          }
+          handleRoomNotified({
+            notificationId: parsed.notificationId,
+            roomId: parsed.roomId,
+            title: parsed.title,
+            body: parsed.body,
+          });
           break;
         case "relay-rooms-changed":
           console.info({ operation: "fleet_status_client_relay_rooms_changed", url });

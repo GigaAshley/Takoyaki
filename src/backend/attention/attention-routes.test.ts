@@ -34,6 +34,15 @@ vi.mock("./read-state-store.js", () => ({
   isValidIdentityName: (n: unknown) => typeof n === "string" && n.length > 0 && n.length <= 256,
 }));
 
+const roomStore = {
+  getForUser: vi.fn((): unknown[] => []),
+  markSeen: vi.fn(),
+};
+vi.mock("./room-attention-store.js", () => ({
+  getRoomAttentionStore: () => roomStore,
+  isValidRoomId: (r: unknown) => typeof r === "string" && r.startsWith("!") && r.includes(":"),
+}));
+
 const publishToUser = vi.fn();
 let registryPresent = true;
 vi.mock("../fleet-status/registry-holder.js", () => ({
@@ -82,6 +91,7 @@ beforeEach(async () => {
   store.getForUser.mockReset();
   store.markSeen.mockReset();
   store.markDmSeen.mockReset();
+  roomStore.markSeen.mockReset();
   publishToUser.mockReset();
   const app = express();
   app.use(express.json());
@@ -98,8 +108,18 @@ describe("GET /attention/read-state", () => {
     store.getForUser.mockReturnValue({ baselineAt: 10, seen: [{ hostId: "h1", identityName: "a", seenFinishAt: 5 }], dms: [] });
     const res = await request(server, "GET", "/attention/read-state");
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ baselineAt: 10, seen: [{ hostId: "h1", identityName: "a", seenFinishAt: 5 }], dms: [] });
+    expect(res.body).toEqual({ baselineAt: 10, seen: [{ hostId: "h1", identityName: "a", seenFinishAt: 5 }], dms: [], rooms: [] });
     expect(store.getForUser).toHaveBeenCalledWith("u1");
+  });
+
+  it("includes the caller's relay-room marks", async () => {
+    store.getForUser.mockReturnValue({ baselineAt: 10, seen: [], dms: [] });
+    const room = { roomId: "!r:hs", lastMessageAt: 50, seenMessageAt: 40, lastDmAt: 50, seenDmAt: 0 };
+    roomStore.getForUser.mockReturnValueOnce([room]);
+    const res = await request(server, "GET", "/attention/read-state");
+    expect(res.status).toBe(200);
+    expect((res.body as { rooms: unknown[] }).rooms).toEqual([room]);
+    expect(roomStore.getForUser).toHaveBeenCalledWith("u1");
   });
 
   it("401s without auth", async () => {
@@ -191,5 +211,49 @@ describe("POST /attention/dm-seen", () => {
     const res = await request(server, "POST", "/attention/dm-seen", body);
     expect(res.status).toBe(400);
     expect(store.markDmSeen).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /attention/room-seen", () => {
+  const entry = { roomId: "!r:hs", lastMessageAt: 1000, seenMessageAt: 1000, lastDmAt: 900, seenDmAt: 900 };
+
+  it("advances the room's seen marks and pushes them to the caller's own tabs", async () => {
+    roomStore.markSeen.mockReturnValue(entry);
+    const res = await request(server, "POST", "/attention/room-seen", { roomId: "!r:hs", seenMessageAt: 1000 });
+    expect(res.status).toBe(204);
+    expect(roomStore.markSeen).toHaveBeenCalledWith("u1", "!r:hs", 1000, null);
+    expect(publishToUser).toHaveBeenCalledWith("u1", { schemaVersion: 1, type: "relay-room-attention-changed", ...entry });
+  });
+
+  it("takes a seen envelope on its own", async () => {
+    roomStore.markSeen.mockReturnValue(entry);
+    const res = await request(server, "POST", "/attention/room-seen", { roomId: "!r:hs", seenDmAt: 900 });
+    expect(res.status).toBe(204);
+    expect(roomStore.markSeen).toHaveBeenCalledWith("u1", "!r:hs", null, 900);
+  });
+
+  it("does not push when nothing advanced", async () => {
+    roomStore.markSeen.mockReturnValue(null);
+    const res = await request(server, "POST", "/attention/room-seen", { roomId: "!r:hs", seenMessageAt: 1000 });
+    expect(res.status).toBe(204);
+    expect(publishToUser).not.toHaveBeenCalled();
+  });
+
+  it("401s without auth", async () => {
+    mockUserId = null;
+    const res = await request(server, "POST", "/attention/room-seen", { roomId: "!r:hs", seenMessageAt: 1 });
+    expect(res.status).toBe(401);
+  });
+
+  it.each([
+    [{ seenMessageAt: 1 }],
+    [{ roomId: "not-a-room", seenMessageAt: 1 }],
+    [{ roomId: "!r:hs" }],
+    [{ roomId: "!r:hs", seenMessageAt: -5 }],
+    [{ roomId: "!r:hs", seenDmAt: "x" }],
+  ])("400s on bad body %j", async (body) => {
+    const res = await request(server, "POST", "/attention/room-seen", body);
+    expect(res.status).toBe(400);
+    expect(roomStore.markSeen).not.toHaveBeenCalled();
   });
 });

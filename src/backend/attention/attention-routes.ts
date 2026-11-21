@@ -10,6 +10,13 @@
  *   POST /attention/dm-seen { hostId, identityName, seenDmAt } → 204
  *        Advances the user's seen DM (monotonic, never past the recorded DM)
  *        and, when it moved, pushes dm-state-changed to that user's tabs.
+ *   POST /attention/room-seen { roomId, seenMessageAt?, seenDmAt? } → 204
+ *        Advances the user's seen marks for one relay room (monotonic, never
+ *        past what was recorded) and, when they moved, pushes
+ *        relay-room-attention-changed to that user's tabs.
+ *
+ * The read state also lists `rooms`: [{roomId, lastMessageAt, seenMessageAt,
+ * lastDmAt, seenDmAt}] for every relay room with a recorded post.
  *
  * Read state is the caller's own, so the only gate is authentication.
  */
@@ -21,6 +28,8 @@ import { getRegistry } from "../fleet-status/registry-holder.js";
 import { FRAME_SCHEMA_VERSION } from "../fleet-status/wire-protocol.js";
 import { getReadStateStore, isValidIdentityName } from "./read-state-store.js";
 import { publishDmState } from "./dm-recorder.js";
+import { getRoomAttentionStore, isValidRoomId } from "./room-attention-store.js";
+import { publishRoomAttention } from "./room-attention-recorder.js";
 
 const router = express.Router();
 const authManager = AuthManager.getInstance();
@@ -33,14 +42,25 @@ router.get("/read-state", authenticateJWT, (req: Request, res: Response) => {
   const userId = (req as AuthenticatedRequest).userId;
   try {
     const state = getReadStateStore().getForUser(userId);
+    // A room-marks failure never takes the agent marks down with it.
+    let rooms: ReturnType<ReturnType<typeof getRoomAttentionStore>["getForUser"]> = [];
+    try {
+      rooms = getRoomAttentionStore().getForUser(userId);
+    } catch (err) {
+      systemLogger.error("attention room marks read failed", err, {
+        operation: "attention_read_state_rooms",
+        userId,
+      });
+    }
     systemLogger.info("attention read-state served", {
       operation: "attention_read_state_get",
       userId,
       baselineAt: state.baselineAt,
       seenCount: state.seen.length,
       dmCount: state.dms.length,
+      roomCount: rooms.length,
     });
-    return res.json(state);
+    return res.json({ ...state, rooms });
   } catch (err) {
     systemLogger.error("attention read-state read failed", err, {
       operation: "attention_read_state_get",
@@ -156,6 +176,53 @@ router.post("/dm-seen", authenticateJWT, (req: Request, res: Response) => {
   });
 
   if (entry) publishDmState(userId, entry);
+  return res.status(204).end();
+});
+
+router.post("/room-seen", authenticateJWT, (req: Request, res: Response) => {
+  const userId = (req as AuthenticatedRequest).userId;
+  const body = (req.body ?? {}) as {
+    roomId?: unknown;
+    seenMessageAt?: unknown;
+    seenDmAt?: unknown;
+  };
+  const { roomId } = body;
+  if (!isValidRoomId(roomId)) {
+    return res.status(400).json({ error: "invalid roomId" });
+  }
+  const asTime = (t: unknown): number | null | "bad" => {
+    if (t === undefined || t === null) return null;
+    return typeof t === "number" && Number.isFinite(t) && t > 0 ? t : "bad";
+  };
+  const seenMessageAt = asTime(body.seenMessageAt);
+  const seenDmAt = asTime(body.seenDmAt);
+  if (seenMessageAt === "bad" || seenDmAt === "bad" || (seenMessageAt === null && seenDmAt === null)) {
+    return res.status(400).json({ error: "invalid seen times" });
+  }
+
+  let entry: ReturnType<ReturnType<typeof getRoomAttentionStore>["markSeen"]>;
+  try {
+    entry = getRoomAttentionStore().markSeen(userId, roomId, seenMessageAt, seenDmAt);
+  } catch (err) {
+    systemLogger.error("attention mark-room-seen failed", err, {
+      operation: "attention_mark_room_seen",
+      userId,
+      roomId,
+      resultStatus: 500,
+    });
+    return res.status(500).json({ error: "failed to mark room seen" });
+  }
+
+  systemLogger.info("attention mark-room-seen", {
+    operation: "attention_mark_room_seen",
+    userId,
+    roomId,
+    seenMessageAt,
+    seenDmAt,
+    advanced: entry !== null,
+  });
+
+  if (entry) publishRoomAttention(userId, entry);
   return res.status(204).end();
 });
 

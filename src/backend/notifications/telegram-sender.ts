@@ -17,7 +17,7 @@
 
 import { databaseLogger } from "../utils/logger.js";
 import { userCanUseNotifications } from "./notifications-access.js";
-import { buildClickUrl, type PushPayload } from "./notification-payload.js";
+import { buildClickUrl, buildRoomClickUrl, type PushPayload } from "./notification-payload.js";
 import { callTelegram, getSkynetPublicUrl } from "./telegram-api.js";
 import { getBot, unlinkChat } from "./telegram-bots.js";
 import { getAppName } from "./app-name.js";
@@ -72,15 +72,16 @@ export function buildTelegramText(payload: PushPayload, titleOnly: boolean): str
 
 /**
  * Absolute "Open in <app name>" URL, or null when there's nothing to open:
- * system notifications (agentHostId null, e.g. the test send) have no
- * conversation, and a SKYNET_PUBLIC_URL that isn't https can't be used
+ * system notifications (agentHostId null and no relay room, e.g. the test
+ * send) have no conversation, and a SKYNET_PUBLIC_URL that isn't https can't be used
  * (Telegram rejects relative and non-http button URLs, and a bad button
  * would fail the whole send).
  */
 export function buildOpenUrl(payload: PushPayload): string | null {
-  if (payload.agentHostId === null) return null;
+  if (payload.agentHostId === null && !payload.relayRoomId) return null;
   const base = getSkynetPublicUrl();
   if (!base.startsWith("https://")) return null;
+  if (payload.relayRoomId) return base + buildRoomClickUrl(payload.relayRoomId);
   return base + buildClickUrl(payload.agentMxid, payload.agentHostId);
 }
 

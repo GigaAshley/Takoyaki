@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildClickUrl } from "./notification-payload.js";
+import { buildClickUrl, buildRoomClickUrl } from "./notification-payload.js";
 
 describe("buildClickUrl", () => {
   it("omits host= when agentHostId is null", () => {
@@ -15,5 +15,11 @@ describe("buildClickUrl", () => {
 
   it("omits host= for an empty string", () => {
     expect(buildClickUrl("@agent:skynet", "")).not.toContain("host=");
+  });
+});
+
+describe("buildRoomClickUrl", () => {
+  it("links to the room", () => {
+    expect(buildRoomClickUrl("!garden:hs")).toBe("/?openRelayRoom=%21garden%3Ahs");
   });
 });

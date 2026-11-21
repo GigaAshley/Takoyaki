@@ -18,10 +18,12 @@
  *     changes, so every tab already knows before a notification arrives.
  *
  * Clicking a notification focuses the tab that showed it and opens the
- * conversation (requestOpenConversation → AppShell's openHarness path).
+ * conversation (requestOpenConversation → AppShell's openHarness path), or
+ * for a person's post in a relay room, the room.
  */
 
 import { isTouchDeviceNow } from "@/hooks/use-is-touch-device";
+import { RELAY_ROOM_ATTENTION_HOST } from "@/state/attention-store";
 
 const ENABLED_KEY = "browser-notifications-enabled";
 const LOCK_NAME = "agent-notifications-leader";
@@ -38,9 +40,19 @@ export interface AgentNotification {
   agentMxid: string;
   title: string;
   body: string;
+  /** Set for a person's post in a relay room: clicking opens the room. */
+  roomId?: string;
 }
 
-export type OpenConversationRequest = { mxid: string; hostId: number };
+/** A person's post in one of the user's relay rooms (`relay-room-notified` frame). */
+export interface RoomNotification {
+  notificationId: string;
+  roomId: string;
+  title: string;
+  body: string;
+}
+
+export type OpenConversationRequest = { mxid: string; hostId: number } | { roomId: string };
 
 export type BrowserNotificationsState =
   | "unsupported" // no Notifications API, or a touch device
@@ -298,7 +310,9 @@ function show(n: AgentNotification): void {
       } catch {
         // focus is best-effort
       }
-      if (Number.isInteger(hostId) && hostId > 0) {
+      if (n.roomId) {
+        requestOpenConversation({ roomId: n.roomId });
+      } else if (Number.isInteger(hostId) && hostId > 0) {
         requestOpenConversation({ mxid: n.agentMxid, hostId });
       }
       shown.close();
@@ -319,6 +333,24 @@ export function handleAgentNotified(n: AgentNotification): void {
   // tab never got it.
   if (!locksAvailable || isLeader) show(n);
   else window.setTimeout(() => show(n), FALLBACK_WAIT_MS);
+}
+
+/**
+ * A person posted in one of the user's relay rooms. Shown exactly like an
+ * agent's notification — same tab choice, quiet while the user is looking at
+ * the room — and clicking it opens the room.
+ */
+export function handleRoomNotified(n: RoomNotification): void {
+  handleAgentNotified({
+    notificationId: n.notificationId,
+    // The room's key in the seen tracker (attention-store's relay-room host).
+    hostId: RELAY_ROOM_ATTENTION_HOST,
+    identityName: n.roomId,
+    agentMxid: "",
+    title: n.title,
+    body: n.body,
+    roomId: n.roomId,
+  });
 }
 
 /** Preferences' "Send a test notification". */

@@ -85,6 +85,7 @@ vi.mock("../relay-sessions/registry-rooms.js", () => ({
 }));
 
 vi.mock("../matrix/matrix-admin-client.js", () => ({
+  getUserJoinedAt: vi.fn(async () => 1),
   getUserJoinedRooms: vi.fn(async () => ({ ok: true, roomIds: [] })),
   getRoomJoinedMembers: vi.fn(async () => ({
     ok: true,
@@ -103,6 +104,17 @@ vi.mock("./notify-user.js", () => ({
 
 vi.mock("./preview-text.js", () => ({
   derivePreviewText: vi.fn(() => "body"),
+  deriveRoomPreviewText: vi.fn(() => "body"),
+}));
+
+vi.mock("./resolve-room-label.js", () => ({
+  resolveRoomLabel: vi.fn(async () => ({ senderName: "Person", roomName: null })),
+}));
+
+vi.mock("../attention/room-attention-recorder.js", () => ({
+  recordRoomPost: vi.fn(),
+  recordOwnRoomPost: vi.fn(),
+  publishRoomNotification: vi.fn(),
 }));
 
 vi.mock("./resolve-agent-label.js", () => ({

@@ -30,6 +30,10 @@
  * - D-04 only new agent-originated messages: four-step filter pipeline
  *   rejects (a) non-m.room.message events, (b) self-sent, (c) edits
  *   (m.relates_to.rel_type === "m.replace"), (d) non-harness_dm rooms.
+ * - Relay rooms (rooms the classifier materializes into the sidebar) take
+ *   the same first three filters, then mark the room for the user: any post
+ *   lights its unread dot, a person's (not an agent's) also its envelope and
+ *   a notification. The user's own post marks the room seen.
  * - D-05 honored-by-absence: this loop does NOT check whether the app is
  *   currently displaying the target room. D-05 explicitly marks that as
  *   best-effort/soft-signal; no plan implements it in v1.
@@ -303,7 +307,9 @@ export interface PushTriggerLoopDeps {
       subtitle: string | null;
       body: string;
       agentMxid: string;
-      agentHostId: number;
+      agentHostId: number | null;
+      /** Set for a post in a relay room: the notification opens the room. */
+      relayRoomId?: string;
     },
   ): Promise<void>;
   /**
@@ -324,6 +330,39 @@ export interface PushTriggerLoopDeps {
   ): void;
   /** Compute the lock-screen preview body (D-07). Pure function. */
   derivePreviewText(event: MatrixMessageEvent): string;
+  /**
+   * Relay rooms (rooms that show in the user's sidebar). Someone else posted:
+   * the room's unread dot, plus its envelope when `fromPerson` (a person, not
+   * an agent). Synchronous; a throw is caught at the call site.
+   */
+  recordRoomPost?(userId: string, roomId: string, at: number, fromPerson: boolean): void;
+  /**
+   * The user posted in a room (from any app): everything up to then is seen.
+   * Called for every room; a room without marks is left alone. Synchronous.
+   */
+  recordOwnRoomPost?(userId: string, roomId: string, at: number): void;
+  /** Tell the user's open tabs a person posted in a room (browser notification). */
+  publishRoomToTabs?(
+    userId: string,
+    n: { notificationId: string; roomId: string; title: string; body: string },
+  ): void;
+  /**
+   * The words for a room notification: the poster's name and the room's
+   * name (null when it has none). Never-throws.
+   */
+  resolveRoomLabel?(
+    roomId: string,
+    senderMxid: string,
+    userId: string,
+  ): Promise<{ senderName: string; roomName: string | null }>;
+  /**
+   * When the user joined the room (server time), or null when unknown. Used
+   * on a room's first read, whose history can reach back before the user
+   * was in it.
+   */
+  getUserJoinedAt?(roomId: string, userMxid: string): Promise<number | null>;
+  /** Preview body for a post in a room ("sent a picture", a file's name, the text). */
+  deriveRoomPreviewText?(event: MatrixMessageEvent): string;
   /**
    * Resolve the agent's name + role names for the notification, from the
    * box it lives on. Never-throws — falls back to the mxid local-part.
@@ -368,7 +407,8 @@ export type PushTriggerTickResult =
  *   1. event.type === "m.room.message"                     (D-04)
  *   2. event.sender !== userMxid                           (D-04 no self-push)
  *   3. content["m.relates_to"]?.rel_type !== "m.replace"   (D-04 no edits)
- *   4. classifyRoom → decision === "exclude"
+ *   4. classifyRoom → "materialize" (a relay room): handleRoomPost;
+ *      otherwise must be decision === "exclude"
  *      AND reason === "harness_dm"                          (D-02, D-01, D-03)
  *
  * Cold-start policy (M-1 review-fix): on the FIRST tick for a room (no
@@ -414,12 +454,18 @@ export async function runPushTriggerTick(
     // every room, and these lookups are shared across all rooms this
     // user has joined.
     const adminRoomIds = new Set<string>(await safeListAdminRooms(deps));
-    const agentsRegistryRoomId = await safeGetAgentsRegistryRoomId(deps);
+    const registryLookup = await safeGetAgentsRegistryRoomId(deps);
+    const agentsRegistryRoomId = registryLookup.ok ? registryLookup.roomId : null;
     let agentsInRegistry: Set<string> = new Set();
+    // Whether we know who the agents are. Without that, every agent would
+    // look like a person in a relay room (and notify), so the tick stops
+    // before touching any room and retries — nothing is skipped past.
+    let agentsKnown = registryLookup.ok;
     if (agentsRegistryRoomId !== null) {
       try {
         agentsInRegistry = await deps.getRegistryMembers(agentsRegistryRoomId);
       } catch (err) {
+        agentsKnown = false;
         databaseLogger.warn(
           "[phase-128] push-trigger tick — getRegistryMembers failed, classifier will see empty registry",
           {
@@ -430,6 +476,21 @@ export async function runPushTriggerTick(
         );
         agentsInRegistry = new Set();
       }
+    }
+
+    if (!agentsKnown) {
+      databaseLogger.warn("push-trigger tick — agents unknown, tick deferred", {
+        operation: "push_trigger_tick_agents_unknown",
+        userId,
+      });
+      return { ok: false, reason: "agents_registry_unknown" };
+    }
+
+    // A room the user is no longer in forgets its cursor, so a rejoin starts
+    // from the room's head instead of replaying what was posted meanwhile.
+    const joinedSet = new Set(joinedRoomIds);
+    for (const roomId of [...state.cursorByRoom.keys()]) {
+      if (!joinedSet.has(roomId)) state.cursorByRoom.delete(roomId);
     }
 
     // Step 3: for each joined room, fetchLive from the cursor, filter, dispatch.
@@ -536,6 +597,10 @@ export async function runPushTriggerTick(
         membersResult = await deps.getRoomJoinedMembers(roomId);
       }
 
+      // When the user joined this room — read once, only if a first read of
+      // a relay room has posts to judge (see the room branch below).
+      let joinedAt: number | null | undefined;
+
       for (const event of events) {
         // ─── Filter Step 1: type === "m.room.message" ─────────────────
         // Defense-in-depth: fetchRoomHistory already filters, but a
@@ -547,6 +612,20 @@ export async function runPushTriggerTick(
         // D-04 no self-push: the user's own outbound (from any device)
         // never fires a push to their phone.
         if (event.sender === userMxid) {
+          // ...but the user's own post in a room means they've seen it.
+          if (deps.recordOwnRoomPost && typeof event.origin_server_ts === "number") {
+            try {
+              deps.recordOwnRoomPost(userId, roomId, event.origin_server_ts);
+            } catch (err) {
+              databaseLogger.warn("push-trigger tick — recordOwnRoomPost failed", {
+                operation: "push_trigger_tick_record_own_room_post_failed",
+                userId,
+                roomId,
+                eventId: event.event_id,
+                error: err instanceof Error ? err.message : "unknown",
+              });
+            }
+          }
           continue;
         }
         // ─── Filter Step 3: not an edit ───────────────────────────────
@@ -618,6 +697,36 @@ export async function runPushTriggerTick(
                 agentsInRegistry: new Set([...agentsInRegistry, event.sender]),
               },
         );
+        // A room that shows in the user's sidebar: the dot for any post,
+        // and a notification for a person's.
+        if (decision.decision === "materialize") {
+          // A room's first read can reach back before the user joined it
+          // (e.g. they were just added): only posts since they joined count.
+          if (isColdStart) {
+            if (joinedAt === undefined) {
+              try {
+                joinedAt = deps.getUserJoinedAt ? await deps.getUserJoinedAt(roomId, userMxid) : null;
+              } catch {
+                joinedAt = null;
+              }
+            }
+            const ts = event.origin_server_ts;
+            if (joinedAt === null || typeof ts !== "number" || ts < joinedAt) {
+              databaseLogger.debug("push-trigger tick — room post from before the user joined, skipped", {
+                operation: "push_trigger_tick_room_post_before_join",
+                userId,
+                roomId,
+                eventId: event.event_id,
+                joinedAt,
+              });
+              continue;
+            }
+          }
+          const fromPerson =
+            departedSenderHostId === null && !agentsInRegistry.has(event.sender);
+          if (await handleRoomPost(userId, roomId, event, fromPerson, deps)) eventsFired++;
+          continue;
+        }
         if (decision.decision !== "exclude" || decision.reason !== "harness_dm") {
           databaseLogger.debug(
             "[phase-128] push-trigger tick — event excluded by classifier",
@@ -750,6 +859,81 @@ export async function runPushTriggerTick(
 }
 
 // ---------------------------------------------------------------------------
+// Relay rooms — a post in a room that shows in the user's sidebar
+// ---------------------------------------------------------------------------
+
+/**
+ * Mark the room for the user and, for a person's post, notify them (the
+ * envelope, the browser notification and Telegram). Returns true iff a
+ * notification went out. Never throws.
+ */
+async function handleRoomPost(
+  userId: string,
+  roomId: string,
+  event: MatrixMessageEvent,
+  fromPerson: boolean,
+  deps: PushTriggerLoopDeps,
+): Promise<boolean> {
+  const at = typeof event.origin_server_ts === "number" ? event.origin_server_ts : deps.now();
+  try {
+    deps.recordRoomPost?.(userId, roomId, at, fromPerson);
+  } catch (err) {
+    databaseLogger.warn("push-trigger tick — recordRoomPost failed, room mark not set", {
+      operation: "push_trigger_tick_record_room_post_failed",
+      userId,
+      roomId,
+      eventId: event.event_id,
+      error: err instanceof Error ? err.message : "unknown",
+    });
+  }
+  if (!fromPerson) return false;
+  try {
+    const label = deps.resolveRoomLabel
+      ? await deps.resolveRoomLabel(roomId, event.sender, userId)
+      : { senderName: event.sender, roomName: null };
+    const title = label.roomName ? `${label.senderName} · ${label.roomName}` : label.senderName;
+    const body = (deps.deriveRoomPreviewText ?? deps.derivePreviewText)(event);
+    const notificationId = event.event_id ?? `${roomId}:${String(at)}`;
+    try {
+      deps.publishRoomToTabs?.(userId, { notificationId, roomId, title, body });
+    } catch (err) {
+      databaseLogger.warn("push-trigger tick — publishRoomToTabs failed, no browser notification", {
+        operation: "push_trigger_tick_publish_room_tabs_failed",
+        userId,
+        roomId,
+        eventId: event.event_id,
+        error: err instanceof Error ? err.message : "unknown",
+      });
+    }
+    await deps.sendPushToUser(userId, {
+      title,
+      subtitle: null,
+      body,
+      agentMxid: event.sender,
+      agentHostId: null,
+      relayRoomId: roomId,
+    });
+    databaseLogger.info("push-trigger tick — room post notified", {
+      operation: "push_trigger_tick_room_notified",
+      userId,
+      roomId,
+      eventId: event.event_id,
+      senderMxid: event.sender,
+    });
+    return true;
+  } catch (err) {
+    databaseLogger.warn("push-trigger tick — room notification failed, event dropped", {
+      operation: "push_trigger_tick_room_notify_failed",
+      userId,
+      roomId,
+      eventId: event.event_id,
+      error: err instanceof Error ? err.message : "unknown",
+    });
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers — best-effort classifier prerequisites
 // ---------------------------------------------------------------------------
 
@@ -770,9 +954,9 @@ async function safeListAdminRooms(deps: PushTriggerLoopDeps): Promise<string[]> 
 
 async function safeGetAgentsRegistryRoomId(
   deps: PushTriggerLoopDeps,
-): Promise<string | null> {
+): Promise<{ ok: true; roomId: string | null } | { ok: false }> {
   try {
-    return await deps.getAgentsRegistryRoomId();
+    return { ok: true, roomId: await deps.getAgentsRegistryRoomId() };
   } catch (err) {
     databaseLogger.warn(
       "[phase-128] push-trigger tick — getAgentsRegistryRoomId failed",
@@ -781,7 +965,7 @@ async function safeGetAgentsRegistryRoomId(
         error: err instanceof Error ? err.message : "unknown",
       },
     );
-    return null;
+    return { ok: false };
   }
 }
 

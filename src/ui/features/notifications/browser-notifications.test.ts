@@ -12,12 +12,14 @@ import {
   _resetBrowserNotificationsForTests,
   getBrowserNotificationsState,
   handleAgentNotified,
+  handleRoomNotified,
   setBrowserNotificationsEnabled,
   setLookingAtConversations,
   showTestNotification,
   startBrowserNotifications,
   subscribeOpenConversationRequests,
 } from "./browser-notifications";
+import { RELAY_ROOM_ATTENTION_HOST } from "@/state/attention-store";
 
 type Shown = { title: string; options: NotificationOptions; onclick: (() => void) | null; close: ReturnType<typeof vi.fn> };
 let shown: Shown[] = [];
@@ -249,6 +251,35 @@ describe("showing a notification", () => {
     expect(focus).toHaveBeenCalled();
     expect(opened).toEqual([{ mxid: "@aspen:harbor.example", hostId: 7 }]);
     expect(shown[0].close).toHaveBeenCalled();
+  });
+});
+
+describe("a person's post in a relay room", () => {
+  const R = { notificationId: "$room-ev1", roomId: "!garden:hs", title: "Robin · Garden", body: "dinner at 7?" };
+
+  it("shows the poster, the room and the words", async () => {
+    await turnOn();
+    handleRoomNotified(R);
+    expect(shown).toHaveLength(1);
+    expect(shown[0].title).toBe("Robin · Garden");
+    expect(shown[0].options).toMatchObject({ body: "dinner at 7?", tag: "$room-ev1" });
+  });
+
+  it("stays quiet while this tab is focused on that room", async () => {
+    await turnOn();
+    setLookingAtConversations([{ hostId: RELAY_ROOM_ATTENTION_HOST, identityName: "!garden:hs" }]);
+    handleRoomNotified(R);
+    expect(shown).toHaveLength(0);
+  });
+
+  it("clicking opens the room", async () => {
+    await turnOn();
+    vi.spyOn(window, "focus").mockImplementation(() => {});
+    const opened: unknown[] = [];
+    subscribeOpenConversationRequests((r) => opened.push(r));
+    handleRoomNotified(R);
+    shown[0].onclick!();
+    expect(opened).toEqual([{ roomId: "!garden:hs" }]);
   });
 });
 

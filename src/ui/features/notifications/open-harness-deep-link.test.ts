@@ -18,7 +18,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { parseAndOpenHarnessFromUrl } from "./open-harness-deep-link";
+import { parseAndOpenHarnessFromUrl, parseOpenRelayRoomFromUrl } from "./open-harness-deep-link";
 
 describe("open-harness-deep-link", () => {
   let originalLocation: Location;
@@ -66,6 +66,31 @@ describe("open-harness-deep-link", () => {
     });
     expect(replaceState).toHaveBeenCalledTimes(1);
     expect(replaceState.mock.calls[0][2]).toBe("/");
+  });
+
+  it("openRelayRoom: a room link opens the room and is stripped from the URL", () => {
+    setLocation("/app/", "?openRelayRoom=%21garden%3Ahs");
+    const openRoom = vi.fn();
+    const replaceState = vi.fn();
+    window.history.replaceState = replaceState;
+    parseOpenRelayRoomFromUrl(openRoom);
+    expect(openRoom).toHaveBeenCalledWith("!garden:hs");
+    expect(replaceState.mock.calls[0][2]).toBe("/app/");
+  });
+
+  it("openRelayRoom: no param or a malformed room id does nothing", () => {
+    const openRoom = vi.fn();
+    const replaceState = vi.fn();
+    window.history.replaceState = replaceState;
+    setLocation("/", "?openHarness=%40fanny%3Aserver&host=42");
+    parseOpenRelayRoomFromUrl(openRoom);
+    setLocation("/", "?openRelayRoom=garden");
+    parseOpenRelayRoomFromUrl(openRoom);
+    setLocation("/", "?openRelayRoom=%20");
+    parseOpenRelayRoomFromUrl(openRoom);
+    expect(openRoom).not.toHaveBeenCalled();
+    expect(replaceState).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledTimes(1);
   });
 
   it("Case 2: no openHarness param → callback not called, URL untouched", () => {

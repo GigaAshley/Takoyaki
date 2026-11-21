@@ -57,12 +57,19 @@ import { classifyRoom } from "../relay-sessions/observation-loop-classifier.js";
 import { listAdminRooms } from "../relay-sessions/admin-rooms-ignore-list.js";
 import { getAgentsRegistryRoomId } from "../relay-sessions/registry-rooms.js";
 import {
+  getUserJoinedAt,
   getUserJoinedRooms,
   getRoomJoinedMembers,
 } from "../matrix/matrix-admin-client.js";
 import { fetchRoomHistory } from "../relay-room-stream/matrix-message-fetch.js";
 import { sendNotificationToUser } from "./notify-user.js";
-import { derivePreviewText } from "./preview-text.js";
+import { derivePreviewText, deriveRoomPreviewText } from "./preview-text.js";
+import { resolveRoomLabel } from "./resolve-room-label.js";
+import {
+  publishRoomNotification,
+  recordOwnRoomPost,
+  recordRoomPost,
+} from "../attention/room-attention-recorder.js";
 import { resolveAgentLabel } from "./resolve-agent-label.js";
 import { resolveAgentHostId } from "./resolve-agent-host-id.js";
 import { resolveRemoteAgentHostId } from "./resolve-remote-agent-host-id.js";
@@ -205,10 +212,10 @@ export async function startPushTriggerLoopOnBoot(): Promise<StartPushTriggerLoop
       getRegistryMembers: async (agentsRegistryRoomId: string) => {
         const result = await getRoomJoinedMembers(agentsRegistryRoomId);
         if (!result.ok) {
-          // Return an empty set — classifier will decline every room
-          // (no agents match) so no false-positive pushes fire while
-          // the registry is unreachable.
-          return new Set();
+          // Unknown, not empty: with no agents known every agent would
+          // look like a person in a relay room and notify. The loop
+          // defers the tick and retries.
+          throw new Error("agents registry members fetch failed");
         }
         return new Set(result.memberMxids);
       },
@@ -217,6 +224,13 @@ export async function startPushTriggerLoopOnBoot(): Promise<StartPushTriggerLoop
       recordDm: recordAgentDm,
       publishToTabs: publishAgentNotification,
       derivePreviewText,
+      // Relay rooms: the dot, the envelope and room notifications.
+      recordRoomPost,
+      recordOwnRoomPost,
+      publishRoomToTabs: publishRoomNotification,
+      resolveRoomLabel,
+      deriveRoomPreviewText,
+      getUserJoinedAt,
       resolveAgentLabel,
       // Local probe first (cheap fs lstat), then peer boxes over SSH for
       // agents whose identity folder lives on another fleet host.

@@ -106,3 +106,45 @@ export function parseAndOpenHarnessFromUrl(
     // already open, the URL just retains the params.
   }
 }
+
+/**
+ * Relay-room counterpart: reads `?openRelayRoom=<roomId>` (the "Open in"
+ * link on a notification for a person's post in a room), fires
+ * `openRoom(roomId)`, then strips the param. Malformed input is ignored with
+ * one console.warn line.
+ */
+const ROOM_ID_SHAPE = /^!.+:.+/;
+
+export function parseOpenRelayRoomFromUrl(openRoom: (roomId: string) => void): void {
+  let search: string;
+  let pathname: string;
+  try {
+    search = window.location.search;
+    pathname = window.location.pathname;
+  } catch {
+    return;
+  }
+  const raw = new URLSearchParams(search).get("openRelayRoom");
+  if (raw === null) return;
+  const roomId = raw.trim();
+  if (roomId === "") return;
+  if (!ROOM_ID_SHAPE.test(roomId)) {
+    console.warn(
+      `[openRelayRoom] ignored malformed room id in URL param: ${JSON.stringify(roomId).slice(0, 100)}`,
+    );
+    return;
+  }
+  try {
+    openRoom(roomId);
+  } catch (err) {
+    console.warn(
+      `[openRelayRoom] open-callback threw for roomId=${roomId}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return;
+  }
+  try {
+    window.history.replaceState(null, "", pathname);
+  } catch {
+    // replaceState can throw in sandboxed frames — the room is open anyway.
+  }
+}

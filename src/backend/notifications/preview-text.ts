@@ -168,3 +168,22 @@ function uncappedPreview(event: MatrixMessageEvent): string {
       return body || EMPTY_FALLBACK;
   }
 }
+
+/**
+ * Preview for a person's post in a relay room: their words, "sent a picture"
+ * for a picture, or the file's name for any other file.
+ */
+export function deriveRoomPreviewText(event: MatrixMessageEvent): string {
+  const msgtype = event.content?.msgtype;
+  const name = event.content?.filename || event.content?.body || "";
+  switch (msgtype) {
+    case "m.image":
+      return "sent a picture";
+    case "m.audio":
+    case "m.video":
+    case "m.file":
+      return capPreview(name || PREVIEW_LABELS.file);
+    default:
+      return derivePreviewText(event);
+  }
+}

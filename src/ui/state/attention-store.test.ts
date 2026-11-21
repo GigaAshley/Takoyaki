@@ -5,7 +5,12 @@ vi.mock("@/main-axios", () => ({ authApi: api }));
 
 import {
   applyReadState,
+  applyRemoteRoom,
+  attentionKey,
+  isDmd,
   isUnread,
+  RELAY_ROOM_ATTENTION_HOST,
+  roomAttentionKey,
   loadReadState,
   markSeen,
   publishLastFinishAt,
@@ -78,5 +83,50 @@ describe("attention-store", () => {
     expect(isUnread("1:ash")).toBe(true);
     applyReadState({ baselineAt: 1_000, seen: [{ hostId: "1", identityName: "ash", seenFinishAt: 3_000 }] });
     expect(isUnread("1:ash")).toBe(false);
+  });
+});
+
+describe("attention-store — relay rooms", () => {
+  const ROOM = "!garden:hs";
+  const k = () => roomAttentionKey(ROOM);
+
+  it("a room is unread / notified from the server's marks, like a conversation", () => {
+    applyReadState({
+      baselineAt: 1_000,
+      seen: [],
+      rooms: [{ roomId: ROOM, lastMessageAt: 2_000, seenMessageAt: 0, lastDmAt: 2_000, seenDmAt: 0 }],
+    });
+    expect(isUnread(k())).toBe(true);
+    expect(isDmd(k())).toBe(true);
+  });
+
+  it("an agent's post only marks the room unread", () => {
+    applyReadState({ baselineAt: 1_000, seen: [] });
+    applyRemoteRoom({ roomId: ROOM, lastMessageAt: 2_000, seenMessageAt: 0, lastDmAt: 0, seenDmAt: 0 });
+    expect(isUnread(k())).toBe(true);
+    expect(isDmd(k())).toBe(false);
+  });
+
+  it("looking at the room clears both, and tells the server through room-seen", () => {
+    api.post.mockResolvedValue({});
+    applyReadState({ baselineAt: 1_000, seen: [] });
+    applyRemoteRoom({ roomId: ROOM, lastMessageAt: 3_000, seenMessageAt: 0, lastDmAt: 2_500, seenDmAt: 0 });
+    markSeen(RELAY_ROOM_ATTENTION_HOST, ROOM);
+    expect(isUnread(k())).toBe(false);
+    expect(isDmd(k())).toBe(false);
+    expect(api.post).toHaveBeenCalledWith("/attention/room-seen", { roomId: ROOM, seenDmAt: 2_500 });
+    expect(api.post).toHaveBeenCalledWith("/attention/room-seen", { roomId: ROOM, seenMessageAt: 3_000 });
+  });
+
+  it("seen on another device (or by the user's own post) clears it here", () => {
+    applyReadState({ baselineAt: 1_000, seen: [] });
+    applyRemoteRoom({ roomId: ROOM, lastMessageAt: 3_000, seenMessageAt: 0, lastDmAt: 3_000, seenDmAt: 0 });
+    applyRemoteRoom({ roomId: ROOM, lastMessageAt: 3_000, seenMessageAt: 3_000, lastDmAt: 3_000, seenDmAt: 3_000 });
+    expect(isUnread(k())).toBe(false);
+    expect(isDmd(k())).toBe(false);
+  });
+
+  it("a room's key never collides with an agent conversation's", () => {
+    expect(roomAttentionKey("!a:hs")).not.toBe(attentionKey("1", "!a:hs"));
   });
 });

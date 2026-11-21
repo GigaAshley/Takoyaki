@@ -141,6 +141,7 @@ import {
 } from "@/state/conversation-store";
 import type { ProjectRow } from "@/state/conversation-store";
 import { onScreenConversationIds, useSeenTracker, type SeenTarget } from "@/state/use-seen-tracker";
+import { RELAY_ROOM_ATTENTION_HOST } from "@/state/attention-store";
 // Cold-boot paint hint for the host tree — seeds hostsFlat so
 // projectForRow() resolves identity carriers on first render and
 // sidebar project sections + RDP rows paint immediately. See module
@@ -257,6 +258,7 @@ import {
 // deep-link).
 import {
   parseAndOpenHarnessFromUrl,
+  parseOpenRelayRoomFromUrl,
   type HarnessOpenTarget,
 } from "@/features/notifications/open-harness-deep-link";
 import { OPEN_APP_EVENT, type OpenAppDetail } from "./features/apps/app-link";
@@ -1359,7 +1361,7 @@ export function AppShell({
     return activeTabId;
   }, [selectedConversationId, activeTabId, tabs]);
 
-  // Unread marks: which agent conversations are on screen right now. With a
+  // Unread marks: which agent conversations and relay rooms are on screen right now. With a
   // split on desktop that's every pane leaf — unless the selected conversation
   // isn't one of them and is drawn over the split; otherwise (single view, or
   // any phone layout) the one selected conversation. They only count while the
@@ -1375,8 +1377,15 @@ export function AppShell({
     const out: SeenTarget[] = [];
     for (const t of tabs) {
       if (!ids.has(t.id)) continue;
+      // Relay rooms count as seen like any conversation, under their own key.
+      if (t.sessionKind === "relay-room") {
+        if (t.relayRoomId) {
+          out.push({ id: t.id, hostId: RELAY_ROOM_ATTENTION_HOST, identityName: t.relayRoomId });
+        }
+        continue;
+      }
       // Archived conversations are never unread.
-      if (t.sessionKind === "relay-room" || t.sessionKind === "archived" || !t.host || !t.targetTmuxSession) continue;
+      if (t.sessionKind === "archived" || !t.host || !t.targetTmuxSession) continue;
       out.push({ id: t.id, hostId: String(t.host.id), identityName: t.targetTmuxSession });
     }
     return out;
@@ -2480,11 +2489,18 @@ export function AppShell({
   const openHarnessCapturedRef = useRef(false);
   const openHarnessDispatchedRef = useRef(false);
 
+  // A relay room to open, from a room notification's link or click — the
+  // same capture / dispatch split as the harness target.
+  const [pendingRoomTarget, setPendingRoomTarget] = useState<{ roomId: string } | null>(null);
+
   useEffect(() => {
     if (openHarnessCapturedRef.current) return;
     openHarnessCapturedRef.current = true;
     parseAndOpenHarnessFromUrl((target) => {
       setPendingHarnessTarget(target);
+    });
+    parseOpenRelayRoomFromUrl((roomId) => {
+      setPendingRoomTarget({ roomId });
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -2496,10 +2512,43 @@ export function AppShell({
   useEffect(() => {
     startBrowserNotifications();
     return subscribeOpenConversationRequests((target) => {
+      if ("roomId" in target) {
+        setPendingRoomTarget({ roomId: target.roomId });
+        return;
+      }
       openHarnessDispatchedRef.current = false;
       setPendingHarnessTarget({ mxid: target.mxid, hostId: target.hostId });
     });
   }, []);
+
+  // Open the pending relay room once the restored tabs are in: go to its
+  // open tab, or open one (its name fills in from the sidebar list).
+  useEffect(() => {
+    if (pendingRoomTarget === null || !tabsReady) return;
+    const { roomId } = pendingRoomTarget;
+    setPendingRoomTarget(null);
+    const existing = tabs.find((t) => t.sessionKind === "relay-room" && t.relayRoomId === roomId);
+    if (existing) {
+      console.info({ operation: "relay_room_open_request_reuse", roomId, tabId: existing.id });
+      selectConversationDeferred(existing.id);
+      return;
+    }
+    const title = relayRoomTitles.get(roomId) ?? null;
+    try {
+      const newTabId = openTab(null, "terminal", undefined, {
+        sessionKind: "relay-room",
+        relayRoomId: roomId,
+        relayRoomTitle: title,
+        label: title ?? "Relay room",
+        allowCreateTmux: false,
+      });
+      console.info({ operation: "relay_room_open_request_opened", roomId, tabId: newTabId });
+      selectConversationDeferred(newTabId);
+    } catch (err) {
+      console.warn({ operation: "relay_room_open_request_failed", roomId, error: err instanceof Error ? err.message : String(err) });
+      toast.error("Couldn't open the room");
+    }
+  }, [pendingRoomTarget, tabsReady, tabs, relayRoomTitles, openTab, selectConversationDeferred]);
 
   useEffect(() => {
     if (pendingHarnessTarget === null) return;

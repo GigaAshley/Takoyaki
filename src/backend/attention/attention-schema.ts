@@ -27,6 +27,13 @@
  *                             is an echo of last_dm_at, never a clock. Only
  *                             DMs the push-trigger loop observes after it
  *                             starts are recorded, so launch day has none.
+ *   relay_room_attention    — per (user, relay room): when someone else last
+ *                             posted in the room and when a person (not an
+ *                             agent) last did (Matrix server times,
+ *                             max-wins), with the newest of each that user
+ *                             has seen. Only posts the push-trigger loop
+ *                             observes after it starts are recorded, so a
+ *                             new deploy starts every room read.
  *
  * No imports: db/index.ts execs this at boot and tests exec it against an
  * in-memory database.
@@ -60,6 +67,16 @@ export const ATTENTION_TABLES_SQL = `
       last_dm_at INTEGER NOT NULL,
       seen_dm_at INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (user_id, host_id, identity_name),
+      FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+  );
+  CREATE TABLE IF NOT EXISTS relay_room_attention (
+      user_id TEXT NOT NULL,
+      room_id TEXT NOT NULL,
+      last_message_at INTEGER NOT NULL DEFAULT 0,
+      seen_message_at INTEGER NOT NULL DEFAULT 0,
+      last_dm_at INTEGER NOT NULL DEFAULT 0,
+      seen_dm_at INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (user_id, room_id),
       FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
   );
   CREATE TABLE IF NOT EXISTS user_read_baseline (

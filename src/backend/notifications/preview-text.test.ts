@@ -22,7 +22,7 @@
 
 import { describe, it, expect } from "vitest";
 
-import { derivePreviewText, PREVIEW_MAX_BODY_LEN } from "./preview-text.js";
+import { derivePreviewText, deriveRoomPreviewText, PREVIEW_MAX_BODY_LEN } from "./preview-text.js";
 
 describe("derivePreviewText", () => {
   // ─── m.text / undefined msgtype ─────────────────────────────────────────
@@ -161,5 +161,20 @@ describe("derivePreviewText", () => {
     });
     expect(result).toBe("(message)");
     expect(result.length).toBeGreaterThan(0);
+  });
+});
+
+describe("deriveRoomPreviewText", () => {
+  it("a picture reads 'sent a picture'", () => {
+    expect(deriveRoomPreviewText({ content: { msgtype: "m.image", body: "IMG_1.png" } })).toBe("sent a picture");
+  });
+  it("any other file reads as its name", () => {
+    expect(deriveRoomPreviewText({ content: { msgtype: "m.file", body: "notes.pdf" } })).toBe("notes.pdf");
+    expect(deriveRoomPreviewText({ content: { msgtype: "m.file", body: "x", filename: "plan.docx" } })).toBe("plan.docx");
+    expect(deriveRoomPreviewText({ content: { msgtype: "m.audio", body: "memo.m4a" } })).toBe("memo.m4a");
+    expect(deriveRoomPreviewText({ content: { msgtype: "m.video" } })).toBe("file 📎");
+  });
+  it("words read as the words", () => {
+    expect(deriveRoomPreviewText({ content: { msgtype: "m.text", body: "dinner at 7?" } })).toBe("dinner at 7?");
   });
 });

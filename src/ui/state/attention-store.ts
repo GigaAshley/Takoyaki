@@ -28,6 +28,13 @@
 // only: unread dots and DM envelopes still wait for the server, so a mark
 // cleared on another device never flashes.
 //
+// Relay rooms use the same maps under a key of their own
+// (roomAttentionKey): the server records, per user, when someone else last
+// posted (the room's "finish") and when a person last did (its "DM"), with
+// what the user has seen of each (relay-room-attention-changed frames, plus
+// the rooms list in the read state). Seen marks go back through
+// POST /attention/room-seen.
+//
 // DM marks work the same way. When an agent DMs this user the server records
 // the DM's time (lastDmAt) and pushes it here (dm-state-changed frames, plus
 // the dms list in the read state). Looking at the conversation echoes that
@@ -58,6 +65,13 @@ const unsyncedDm = new Map<Key, { hostId: string; identityName: string }>();
 
 export function attentionKey(hostId: string | number, identityName: string): Key {
   return `${hostId}:${identityName}`;
+}
+
+/** The host part of a relay room's key — never a real host id (those are numbers). */
+export const RELAY_ROOM_ATTENTION_HOST = ".relay-room";
+
+export function roomAttentionKey(roomId: string): Key {
+  return attentionKey(RELAY_ROOM_ATTENTION_HOST, roomId);
 }
 
 function notify(): void {
@@ -278,10 +292,49 @@ export function applyRemoteDm(entry: DmEntry): void {
 
 type DmEntry = { hostId: string; identityName: string; lastDmAt: number; seenDmAt: number };
 
+export type RoomEntry = {
+  roomId: string;
+  lastMessageAt: number;
+  seenMessageAt: number;
+  lastDmAt: number;
+  seenDmAt: number;
+};
+
+function applyRoomEntry(e: RoomEntry): boolean {
+  if (!e || typeof e.roomId !== "string" || e.roomId.length === 0) return false;
+  const k = roomAttentionKey(e.roomId);
+  let changed = false;
+  if (e.lastMessageAt > 0 && advanceMax(finishes, k, e.lastMessageAt)) changed = true;
+  if (e.seenMessageAt > 0 && advanceSeen(k, e.seenMessageAt)) changed = true;
+  if (e.lastDmAt > 0 && advanceMax(dms, k, e.lastDmAt)) changed = true;
+  if (e.seenDmAt > 0 && advanceMax(dmSeen, k, e.seenDmAt)) changed = true;
+  return changed;
+}
+
+/**
+ * A relay-room-attention-changed frame: someone posted in one of this user's
+ * rooms, or they saw it / posted there (the echo of this tab's own seen mark
+ * is a max-wins no-op).
+ */
+export function applyRemoteRoom(entry: RoomEntry): void {
+  if (applyRoomEntry(entry)) {
+    console.info({
+      operation: "attention_remote_room_applied",
+      roomId: entry.roomId,
+      lastMessageAt: entry.lastMessageAt,
+      seenMessageAt: entry.seenMessageAt,
+      lastDmAt: entry.lastDmAt,
+      seenDmAt: entry.seenDmAt,
+    });
+    notify();
+  }
+}
+
 export function applyReadState(state: {
   baselineAt: number;
   seen: Array<{ hostId: string; identityName: string; seenFinishAt: number }>;
   dms?: DmEntry[];
+  rooms?: RoomEntry[];
 }): void {
   let changed = false;
   if (typeof state.baselineAt === "number" && baselineAt !== state.baselineAt) {
@@ -293,6 +346,9 @@ export function applyReadState(state: {
   }
   for (const e of state.dms ?? []) {
     if (applyDmEntry(e)) changed = true;
+  }
+  for (const e of state.rooms ?? []) {
+    if (applyRoomEntry(e)) changed = true;
   }
   if (changed) notify();
 }
@@ -315,6 +371,7 @@ export function loadReadState(): Promise<void> {
         baselineAt: number;
         seen: Array<{ hostId: string; identityName: string; seenFinishAt: number }>;
         dms?: DmEntry[];
+        rooms?: RoomEntry[];
       };
       applyReadState(data);
       console.info({
@@ -322,6 +379,7 @@ export function loadReadState(): Promise<void> {
         baselineAt: data.baselineAt,
         seenCount: data.seen?.length ?? 0,
         dmCount: data.dms?.length ?? 0,
+        roomCount: data.rooms?.length ?? 0,
         resending: unsynced.size + unsyncedDm.size,
       });
       for (const [k, t] of [...unsynced]) {
@@ -348,8 +406,27 @@ export function loadReadState(): Promise<void> {
   return loadInFlight;
 }
 
+/** Where a seen mark goes: a relay room's to /attention/room-seen. */
+function seenRequest(
+  hostId: string,
+  identityName: string,
+  field: "seen" | "dm",
+  at: number,
+): { url: string; body: Record<string, unknown> } {
+  if (hostId === RELAY_ROOM_ATTENTION_HOST) {
+    return {
+      url: "/attention/room-seen",
+      body: field === "seen" ? { roomId: identityName, seenMessageAt: at } : { roomId: identityName, seenDmAt: at },
+    };
+  }
+  return field === "seen"
+    ? { url: "/attention/seen", body: { hostId, identityName, seenFinishAt: at } }
+    : { url: "/attention/dm-seen", body: { hostId, identityName, seenDmAt: at } };
+}
+
 function postSeen(k: Key, hostId: string, identityName: string, seenFinishAt: number): void {
-  const body = { hostId, identityName, seenFinishAt };
+  const req = seenRequest(hostId, identityName, "seen", seenFinishAt);
+  const body = req.body;
   const failed = (err: unknown, operation: string) => {
     unsynced.set(k, { hostId, identityName });
     console.warn({
@@ -360,7 +437,7 @@ function postSeen(k: Key, hostId: string, identityName: string, seenFinishAt: nu
   };
   try {
     authApi
-      .post("/attention/seen", body)
+      .post(req.url, body)
       .then(() => {
         if (seen.get(k) === seenFinishAt) unsynced.delete(k);
       })
@@ -371,7 +448,8 @@ function postSeen(k: Key, hostId: string, identityName: string, seenFinishAt: nu
 }
 
 function postDmSeen(k: Key, hostId: string, identityName: string, seenDmAt: number): void {
-  const body = { hostId, identityName, seenDmAt };
+  const req = seenRequest(hostId, identityName, "dm", seenDmAt);
+  const body = req.body;
   const failed = (err: unknown, operation: string) => {
     unsyncedDm.set(k, { hostId, identityName });
     console.warn({
@@ -382,7 +460,7 @@ function postDmSeen(k: Key, hostId: string, identityName: string, seenDmAt: numb
   };
   try {
     authApi
-      .post("/attention/dm-seen", body)
+      .post(req.url, body)
       .then(() => {
         if (dmSeen.get(k) === seenDmAt) unsyncedDm.delete(k);
       })

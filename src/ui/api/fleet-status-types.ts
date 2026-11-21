@@ -485,6 +485,32 @@ export interface FrontendRelayRoomsChangedFrame {
   type: "relay-rooms-changed";
 }
 
+// relay-room-attention-changed — someone posted in one of this user's relay
+// rooms, or they saw it / posted there. Unread while lastMessageAt >
+// seenMessageAt; notified while lastDmAt > seenDmAt. Mirrors wire-protocol.ts
+// FrontendRelayRoomAttentionChangedFrameSchema.
+export interface FrontendRelayRoomAttentionChangedFrame {
+  schemaVersion: typeof FRAME_SCHEMA_VERSION;
+  type: "relay-room-attention-changed";
+  roomId: string;
+  lastMessageAt: number;
+  seenMessageAt: number;
+  lastDmAt: number;
+  seenDmAt: number;
+}
+
+// relay-room-notified — a person just posted in one of this user's relay
+// rooms; carries the words for a browser notification. Mirrors wire-protocol.ts
+// FrontendRelayRoomNotifiedFrameSchema.
+export interface FrontendRelayRoomNotifiedFrame {
+  schemaVersion: typeof FRAME_SCHEMA_VERSION;
+  type: "relay-room-notified";
+  notificationId: string;
+  roomId: string;
+  title: string;
+  body: string;
+}
+
 export type FrontendOutboundFrame =
   | FrontendSnapshotFrame
   | FrontendUpdateFrame
@@ -496,6 +522,8 @@ export type FrontendOutboundFrame =
   | FrontendDmStateChangedFrame
   | FrontendAgentNotifiedFrame
   | FrontendRelayRoomsChangedFrame
+  | FrontendRelayRoomAttentionChangedFrame
+  | FrontendRelayRoomNotifiedFrame
   | FrontendAppSnapshotFrame
   | FrontendAppUpdateFrame
   | FrontendAppGoneFrame;

@@ -9,6 +9,8 @@
  *   body:         preview text (from preview-text.ts)
  *   agentMxid:    sender mxid (for the deep link's openHarness param)
  *   agentHostId:  fleet hostId (for the deep link's host param) — null → host param omitted
+ *   relayRoomId:  set for a post in a relay room (agentMxid is then the poster):
+ *                 the notification opens the room instead
  */
 export interface PushPayload {
   title: string;
@@ -16,6 +18,7 @@ export interface PushPayload {
   body: string;
   agentMxid: string;
   agentHostId: number | null;
+  relayRoomId?: string;
 }
 
 /**
@@ -33,5 +36,12 @@ export function buildClickUrl(
   if (agentHostId !== null && agentHostId !== undefined && String(agentHostId) !== "") {
     params.set("host", String(agentHostId));
   }
+  return "/?" + params.toString();
+}
+
+/** Relative deep link to a relay room: `/?openRelayRoom=<roomId>`. */
+export function buildRoomClickUrl(roomId: string): string {
+  const params = new URLSearchParams();
+  params.set("openRelayRoom", roomId);
   return "/?" + params.toString();
 }

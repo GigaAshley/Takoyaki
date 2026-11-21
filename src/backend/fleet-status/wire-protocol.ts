@@ -834,6 +834,40 @@ export const FrontendRelayRoomsChangedFrameSchema = z.object({
   type: z.literal("relay-rooms-changed"),
 });
 
+// ---------------------------------------------------------------------------
+// relay-room-attention-changed — someone posted in one of the user's relay
+// rooms, or the user saw it / posted there. Sent ONLY to that user's own
+// subscribers. The room is unread while lastMessageAt > seenMessageAt, and
+// notified (a person posted) while lastDmAt > seenDmAt — all Matrix server
+// times, 0 when none. Additive — FRAME_SCHEMA_VERSION stays at 1.
+// ---------------------------------------------------------------------------
+
+export const FrontendRelayRoomAttentionChangedFrameSchema = z.object({
+  schemaVersion: z.literal(FRAME_SCHEMA_VERSION),
+  type: z.literal("relay-room-attention-changed"),
+  roomId: z.string(),
+  lastMessageAt: z.number(),
+  seenMessageAt: z.number(),
+  lastDmAt: z.number(),
+  seenDmAt: z.number(),
+});
+
+// ---------------------------------------------------------------------------
+// relay-room-notified — a person just posted in one of the user's relay rooms
+// (the same event that sends their Telegram notification), so an open tab can
+// show it as a browser notification. `notificationId` is the Matrix event id.
+// Additive — FRAME_SCHEMA_VERSION stays at 1.
+// ---------------------------------------------------------------------------
+
+export const FrontendRelayRoomNotifiedFrameSchema = z.object({
+  schemaVersion: z.literal(FRAME_SCHEMA_VERSION),
+  type: z.literal("relay-room-notified"),
+  notificationId: z.string(),
+  roomId: z.string(),
+  title: z.string(),
+  body: z.string(),
+});
+
 export const FrontendOutboundFrame = z.discriminatedUnion("type", [
   FrontendSnapshotFrameSchema,
   FrontendUpdateFrameSchema,
@@ -845,6 +879,8 @@ export const FrontendOutboundFrame = z.discriminatedUnion("type", [
   FrontendDmStateChangedFrameSchema,
   FrontendAgentNotifiedFrameSchema,
   FrontendRelayRoomsChangedFrameSchema,
+  FrontendRelayRoomAttentionChangedFrameSchema,
+  FrontendRelayRoomNotifiedFrameSchema,
   AppSnapshotFrameSchema,
   AppUpdateFrameSchema,
   AppGoneFrameSchema,

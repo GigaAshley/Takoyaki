@@ -88,6 +88,7 @@ import {
   getUnseenDmAtForSort,
   isUnread,
   isUnreadForSort,
+  roomAttentionKey,
   subscribeAttention,
 } from "./attention-store";
 
@@ -177,11 +178,12 @@ export type ConversationRow = {
   // Relay-room rows: stacked faces + members besides the viewer (the "+N").
   roomFaces?: RelayRoomFace[];
   roomOthersCount?: number;
-  // Sidebar unread mark: the agent finished a turn this user hasn't seen
-  // (attention-store). Set on agent rows at snapshot time; absent otherwise.
+  // Sidebar unread mark: the agent finished a turn this user hasn't seen, or
+  // (relay rooms) someone posted that they haven't seen (attention-store).
+  // Absent otherwise.
   unread?: boolean;
-  // Sidebar DM mark: the agent DM'd this user and they haven't seen the
-  // conversation since. `dmAt` is that DM's time, the recency key within the
+  // Sidebar DM mark: the agent DM'd this user (relay rooms: a person posted)
+  // and they haven't seen the conversation since. `dmAt` is that DM's time, the recency key within the
   // DM'd tier. Both absent otherwise.
   dm?: boolean;
   dmAt?: number;
@@ -934,7 +936,10 @@ const heldRows = new Map<string, RowHold>();
 let visibleConversationIds: ReadonlySet<string> = new Set();
 
 function attentionKeyForRow(row: ConversationRow): string | null {
-  if (row.rdpHostRow === true || row.kind === "relay-room" || row.roomId !== undefined) return null;
+  if (row.rdpHostRow === true) return null;
+  if (row.kind === "relay-room" || row.roomId !== undefined) {
+    return row.roomId ? roomAttentionKey(row.roomId) : null;
+  }
   if (!row.targetTmuxSession) return null;
   return sessionWorkingKeyForRow(row.host, row.targetTmuxSession);
 }
