@@ -118,6 +118,8 @@ interface PendingSend {
   timer: ReturnType<typeof setTimeout> | null;
   /** A file being sent (content is its name). */
   file?: { filename: string; size: number; mimetype: string };
+  /** File batches: the room it's going into (marks show only there). */
+  room?: string;
 }
 
 function newMqid(): string {
@@ -250,11 +252,12 @@ export function useRelayAdapter(
   const [error, setError] = useState<RelayRoomError>(null);
   const [pendingSends, setPendingSends] = useState<PendingSend[]>([]);
   // Files being sent (and the text waiting behind them). Kept apart from
-  // pendingSends so a reconnect or hiding the pane never wipes their
-  // sending / not-sent marks; cleared only when the room changes.
+  // pendingSends so a reconnect, hiding the pane or a move to another room
+  // never wipes their sending / not-sent marks (each shows in its own room).
   const [fileSends, setFileSends] = useState<PendingSend[]>([]);
-  // Batches run one after another, so two quick sends never interleave.
-  const batchChainRef = useRef<Promise<void>>(Promise.resolve());
+  // Each room's batches run one after another, so two quick sends never
+  // interleave.
+  const batchChainsRef = useRef<Map<string, Promise<void>>>(new Map());
   const [hasOlder, setHasOlder] = useState<boolean>(false);
   const [loadOlderStatus, setLoadOlderStatus] = useState<
     "idle" | "loading" | "error"
@@ -435,13 +438,14 @@ export function useRelayAdapter(
         );
       };
 
+      // A batch carries on even if this pane moves to another room: its
+      // files go to the room they were sent in, and its marks show there.
       for (let i = 0; i < fileEntries.length; i++) {
         const entry = fileEntries[i];
-        if (roomIdRef.current !== room) return;
         try {
           const sent = await sendRelayRoomFile(room, entry.source, entry.mqid);
-          if (roomIdRef.current !== room) return;
           setFileSends((prev) => prev.filter((p) => p.mqid !== entry.mqid));
+          if (roomIdRef.current !== room) continue;
           const synth: MatrixEvent = {
             event_id: sent.eventId,
             type: "m.room.message",
@@ -473,9 +477,15 @@ export function useRelayAdapter(
       const deadline = Date.now() + PENDING_SEND_TIMEOUT_MS_NORMAL;
       let ws = wsRef.current;
       while ((ws === null || ws.readyState !== WebSocket.OPEN) && Date.now() < deadline) {
+        if (roomIdRef.current !== room) break;
         await new Promise((r) => setTimeout(r, 250));
-        if (roomIdRef.current !== room) return;
         ws = wsRef.current;
+      }
+      // The connection belongs to whichever room the pane shows now; the
+      // text never goes into a different room — it's marked not sent there.
+      if (roomIdRef.current !== room) {
+        failFrom(fileEntries.length, "room_changed");
+        return;
       }
       if (ws === null || ws.readyState !== WebSocket.OPEN) {
         failFrom(fileEntries.length, "ws_not_open");
@@ -510,27 +520,27 @@ export function useRelayAdapter(
         state: "sending",
         timer: null,
         file: { filename: f.name, size: f.size, mimetype: f.type || "application/octet-stream" },
+        room,
         source: f,
       }));
       const text = caption.trim().length > 0 ? caption : null;
       const textEntry: PendingSend | null = text
-        ? { mqid: newMqid(), content: text, sentAt: base + files.length, state: "sending", timer: null }
+        ? { mqid: newMqid(), content: text, sentAt: base + files.length, state: "sending", timer: null, room }
         : null;
       const seeded: PendingSend[] = fileEntries.map(({ source: _s, ...p }) => p);
       if (textEntry) seeded.push(textEntry);
       setFileSends((prev) => [...prev, ...seeded]);
-      const run = batchChainRef.current.then(() => runFileBatch(room, fileEntries, textEntry));
-      batchChainRef.current = run.catch(() => {});
+      const prior = batchChainsRef.current.get(room) ?? Promise.resolve();
+      const run = prior.then(() => runFileBatch(room, fileEntries, textEntry));
+      const settled = run.catch(() => {});
+      batchChainsRef.current.set(room, settled);
+      void settled.then(() => {
+        if (batchChainsRef.current.get(room) === settled) batchChainsRef.current.delete(room);
+      });
       return run;
     },
     [runFileBatch],
   );
-
-  // A different room starts with nothing in flight.
-  useEffect(() => {
-    setFileSends([]);
-    batchChainRef.current = Promise.resolve();
-  }, [roomId]);
 
   // ── fetchOlder — Promise-returning wrapper (adapter contract) ────────────
   // The adapter contract signature is `() => Promise<void>` (no argument).
@@ -883,7 +893,7 @@ export function useRelayAdapter(
     // event — no double-render window because both setState calls batch.
     // If the pending times out or fails, its `state` flips to "failed"
     // but it stays in pendingSends so the failure bubble persists (D-14).
-    for (const p of [...pendingSends, ...fileSends]) {
+    for (const p of [...pendingSends, ...fileSends.filter((f) => f.room === roomId)]) {
       out.push({
         type: "message",
         role: "user",
@@ -912,7 +922,7 @@ export function useRelayAdapter(
     out.sort((a, b) => (a.ts ?? 0) - (b.ts ?? 0));
     return out;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [history, pendingSends, fileSends]);
+  }, [history, pendingSends, fileSends, roomId]);
 
   // Memoize the returned object so consumers checking reference equality
   // (React.memo, useCallback deps that include the adapter object) don't see

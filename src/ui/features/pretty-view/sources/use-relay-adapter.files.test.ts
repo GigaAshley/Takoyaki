@@ -305,4 +305,40 @@ describe("relay room files — sendFiles", () => {
     const failed = result.current.messages.filter((m) => m.type === "message" && m.pendingState === "failed");
     expect(failed).toHaveLength(2);
   });
+
+  it("moving the pane to another room mid-send: files still go to their room, the text is marked not sent there", async () => {
+    let release!: () => void;
+    sendRelayRoomFile.mockImplementation(async (_room: string, f: File) => {
+      await new Promise<void>((r) => { release = r; });
+      return { eventId: `$${f.name}`, content: { msgtype: "m.file", body: f.name, url: "mxc://hs/x" } };
+    });
+    let src = SOURCE;
+    const { result, rerender } = renderHook(() => useRelayAdapter(src, true));
+    act(() => {
+      instances[0].simulateOpen();
+      instances[0].simulateFrame({ type: "history_batch", events: [], hasMore: false });
+    });
+    let done!: Promise<void>;
+    act(() => {
+      done = result.current.sendFiles!([file("a.txt")], "caption");
+    });
+    await act(async () => {
+      await flush();
+    });
+    src = { kind: "relay" as const, roomId: "!other:matrix.example.com", roomTitle: "Other" };
+    rerender();
+    // The other room shows none of the first room's marks.
+    expect(result.current.messages.filter((m) => m.type === "message")).toHaveLength(0);
+    await act(async () => {
+      release();
+      await done;
+    });
+    expect(sendRelayRoomFile.mock.calls[0][0]).toBe(ROOM_ID);
+    expect(instances.flatMap((w) => w.sent).some((x) => x.includes("send_message"))).toBe(false);
+    // Back in the first room: the text shows as not sent.
+    src = SOURCE;
+    rerender();
+    const failed = result.current.messages.filter((m) => m.type === "message" && m.pendingState === "failed");
+    expect(failed.map((m) => (m.type === "message" ? m.content : ""))).toEqual(["caption"]);
+  });
 });
