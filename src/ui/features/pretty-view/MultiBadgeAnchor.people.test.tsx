@@ -206,4 +206,29 @@ describe("MultiBadgeAnchor — people in the room", () => {
     expect(container.querySelector('[data-testid="relay-room-participant-name"]')).toBeNull();
     vi.useRealTimers();
   });
+
+  it("a very crowded row wraps its pictures within the space instead of running off", () => {
+    stubLayout(390, 900);
+    const { container } = renderRow();
+    const row = container.querySelector('[data-testid="multi-badge-anchor"]') as HTMLElement;
+    expect(row.getAttribute("data-tight")).toBe("true");
+    expect(row.className).toContain("flex-wrap");
+    expect(row.style.maxWidth).toBe(`${390 - 72 - 20}px`);
+  });
+
+  it("a touch hold never opens the system menu, even when the main pointer is a mouse", () => {
+    stubLayout(390, 520);
+    const { container } = renderRow();
+    const zoey = container.querySelector('[data-mxid="@zoey:hs"]')!;
+    fireEvent.pointerDown(zoey, { pointerType: "touch", clientX: 5, clientY: 5 });
+    const menu = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
+    zoey.dispatchEvent(menu);
+    expect(menu.defaultPrevented).toBe(true);
+  });
+
+  it("screen readers hear every member's name", () => {
+    const { container } = renderRow();
+    const names = Array.from(container.querySelectorAll(".sr-only")).map((n) => n.textContent);
+    expect(names).toEqual(expect.arrayContaining(["Zoey", "Sam", "Nelly"]));
+  });
 });

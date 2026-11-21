@@ -193,6 +193,10 @@ function ParticipantCell({
   children: ReactNode;
 }) {
   const [held, setHeld] = useState(false);
+  // The label opens toward the middle of the pane so a long name never runs
+  // off either edge.
+  const [labelSide, setLabelSide] = useState<"left" | "right">("right");
+  const lastPointer = useRef<string>("mouse");
   const hold = useRef<{ timer: ReturnType<typeof setTimeout> | null; x: number; y: number }>({ timer: null, x: 0, y: 0 });
   const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const cancel = () => {
@@ -209,8 +213,14 @@ function ParticipantCell({
   const touchHandlers = tight
     ? {
         onPointerDown: (e: React.PointerEvent) => {
+          lastPointer.current = e.pointerType;
           if (e.pointerType === "mouse" && !isCoarsePointer()) return;
           cancel();
+          const cell = e.currentTarget as HTMLElement;
+          const pane = ((cell.offsetParent as HTMLElement | null)?.offsetParent as HTMLElement | null) ?? null;
+          const r = cell.getBoundingClientRect();
+          const p = pane?.getBoundingClientRect();
+          setLabelSide(p && r.left - p.left < p.width / 2 ? "left" : "right");
           hold.current = {
             x: e.clientX,
             y: e.clientY,
@@ -233,7 +243,9 @@ function ParticipantCell({
         onPointerUp: cancel,
         onPointerCancel: cancel,
         onContextMenu: (e: React.MouseEvent) => {
-          if (isCoarsePointer()) e.preventDefault();
+          // A touch hold shows the name, never the system's own menu — even
+          // on a touch laptop whose main pointer is a mouse.
+          if (lastPointer.current !== "mouse" || isCoarsePointer()) e.preventDefault();
         },
       }
     : {};
@@ -246,12 +258,17 @@ function ParticipantCell({
       title={tight ? name : undefined}
       {...touchHandlers}
     >
+      <span className="sr-only">{name}</span>
       {children}
       {tight && held && (
         <span
           data-testid="relay-room-participant-name"
           role="tooltip"
-          className="pv-float absolute top-full mt-1 whitespace-nowrap rounded-md px-2 py-1 text-xs font-semibold text-[color:var(--k-t1)] pointer-events-none z-[102]"
+          className={cn(
+            "pv-float absolute top-full mt-1 max-w-[180px]",
+            labelSide === "left" ? "left-0" : "right-0",
+            "truncate whitespace-nowrap rounded-md px-2 py-1 text-xs font-semibold text-[color:var(--k-t1)] pointer-events-none z-[102]",
+          )}
         >
           {name}
         </span>
@@ -371,7 +388,7 @@ const ROOT_ANCHOR_CLASS =
 
 /** Pictures only: names hidden, pills shrink to the picture, closer gaps. */
 const TIGHT_CLASS =
-  "!gap-1 [&_.pv-badge-name]:hidden [&_.pv-identity-badge]:!p-[4px]";
+  "!gap-1 flex-wrap [&_.pv-badge-name]:hidden [&_.pv-identity-badge]:!p-[4px] [&_.pv-identity-badge]:!gap-0";
 
 /** Room kept clear at the pane's left edge (the phone's back button). */
 const ROW_LEFT_RESERVE_PX = 72;
@@ -422,12 +439,24 @@ export function MultiBadgeAnchor({
   // change, and the row goes back to names once the pane is wide enough.
   const rootRef = useRef<HTMLDivElement | null>(null);
   const [tight, setTight] = useState(false);
+  const [rowMaxWidth, setRowMaxWidth] = useState<number | null>(null);
   const fullWidth = useRef(0);
+  const { byKey } = useIdentities();
   const memberKey = [...humansOther.map((h) => h.mxid), ...agentsSorted.map((a) => a.mxid)].join("|");
+  // How each badge will draw (an agent's loaded name, whether it has a pie,
+  // a person's name): when any of that changes, the full-size width does too.
+  const drawKey = [
+    ...humansOther.map((h) => h.displayName),
+    ...agentsSorted.map((a) => {
+      const known = byKey.get(a.identityKey.toLowerCase());
+      return `${known?.displayName ?? "?"}:${fleetIdentityHosts[a.identityKey] ?? "-"}`;
+    }),
+  ].join("|");
   useLayoutEffect(() => {
     setTight(false);
+    setRowMaxWidth(null);
     fullWidth.current = 0;
-  }, [memberKey]);
+  }, [memberKey, drawKey]);
   useLayoutEffect(() => {
     const root = rootRef.current;
     const pane = root?.offsetParent as HTMLElement | null | undefined;
@@ -451,18 +480,26 @@ export function MultiBadgeAnchor({
             fullWidth: fullWidth.current,
             available,
           });
+          setRowMaxWidth(Math.max(0, available));
           setTight(true);
         }
       } else if (fullWidth.current > 0 && fullWidth.current <= available) {
+        setRowMaxWidth(null);
         setTight(false);
+      } else {
+        // Still tight: pictures wrap onto another line rather than run off.
+        setRowMaxWidth(Math.max(0, available));
       }
     };
     check();
     if (typeof ResizeObserver === "undefined") return;
     const ro = new ResizeObserver(check);
     ro.observe(pane);
+    // While names show, a badge changing size (a font or picture loading)
+    // can make the row overflow — watch the badges themselves too.
+    if (!tight) for (const c of Array.from(root.children)) ro.observe(c);
     return () => ro.disconnect();
-  }, [tight, memberKey, totalCells, isReady]);
+  }, [tight, memberKey, drawKey, isReady]);
 
   // Warning 2: loading discrimination. `isReady={false}` renders a subtle
   // placeholder so the relay tab does not appear empty during the
@@ -504,6 +541,7 @@ export function MultiBadgeAnchor({
       data-testid="multi-badge-anchor"
       data-tight={tight ? "true" : "false"}
       className={cn(ROOT_ANCHOR_CLASS, tight && TIGHT_CLASS, className)}
+      style={tight && rowMaxWidth !== null ? { maxWidth: rowMaxWidth } : undefined}
     >
       {agentsSorted.map((a) => (
         <AgentBadgeCell
