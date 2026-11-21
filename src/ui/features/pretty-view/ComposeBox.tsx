@@ -296,6 +296,12 @@ export interface ComposeBoxProps {
    * per D-12. Default "harness" preserves today's behavior at every call site.
    */
   mode?: "harness" | "relay";
+  /**
+   * Relay rooms that can take files: shows the paperclip in relay mode too.
+   * A staged file that can't go (status "error" — e.g. too big for the
+   * room) holds Send until it's removed.
+   */
+  relayFiles?: boolean;
   // Gates the Row 1 top-row min-h between `min-h-[44px]` (touch, WCAG
   // 2.5.5 touch-target compliance) and `min-h-8` (desktop compact).
   // Sourced from PrettyView's useIsTouchDevice() call (patch #102 — the
@@ -621,6 +627,7 @@ export function ComposeBox({
   stagedAttachments,
   onRemoveAttachment,
   showPaperclip,
+  relayFiles = false,
   mode = "harness",
   isTouchDevice,
   onAttachFiles,
@@ -677,6 +684,8 @@ export function ComposeBox({
 
   // Phase 05 — derived state for the Send-routing decision + Retry button.
   const hasAttachments = (stagedAttachments?.length ?? 0) > 0;
+  const relaySendBlocked =
+    mode === "relay" && (stagedAttachments ?? []).some((a) => a.status === "error");
   const hasErroredChip = !!stagedAttachments?.some((a) => a.status === "error");
   const [text, setText] = useState("");
   // Phase 50 D-03 failure-path repopulate surface. Warning #6 (checker
@@ -1489,6 +1498,13 @@ export function ComposeBox({
     // derive from current text state (normal typed-send path).
     const trimmed = overridePayload !== undefined ? overridePayload.trim() : text.trim();
 
+    // A relay room's staged file that can't be sent (too big for the room)
+    // holds the whole send until the user removes it — nothing is skipped.
+    if (relaySendBlocked) {
+      console.info(`[compose] send-held reason=attachment_cannot_send trigger=${trigger} attachmentCount=${stagedAttachments?.length ?? 0}`);
+      return;
+    }
+
     // The text area only carries Skynet's own commands; a refused message
     // never leaves and the words stay in the box. (Dictation is checked before
     // it lands in the box — see handleVoiceSend.) Relay rooms carry chat text
@@ -1749,6 +1765,7 @@ export function ComposeBox({
   //     this file (see `disabled={canSend === false}` on the aux-row buttons).
   //   - text.trim() === "" && !hasAttachments → disabled (nothing to send).
   const sendDisabled =
+    relaySendBlocked ||
     reconnectingActive === true ||
     (canSend === false && !hasAttachments) ||
     (text.trim() === "" && !hasAttachments);
@@ -1998,7 +2015,7 @@ export function ComposeBox({
         )}
       </div>
       <div className="pv-compose-row" data-testid="compose-row">
-        {harness && showPaperclip && (
+        {showPaperclip && (harness || relayFiles) && (
           <button
             type="button"
             className="pv-cbtn"

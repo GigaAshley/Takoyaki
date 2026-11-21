@@ -70,6 +70,7 @@ import type { Host, HostFolder } from "@/types/ui-types";
 // stay). Slice 4 retires the redundant legacy props post-cleanup.
 import type { ChatSurfaceSource } from "./sources/chat-surface-source";
 import { useChatSurfaceAdapter } from "./sources/use-chat-surface-adapter";
+import { useRelayRoomUploads } from "./use-relay-room-uploads";
 // Phase 93 Slice 2 (D-01/D-02/D-03): MultiBadgeAnchor extends the badge
 // anchor with the relay-case multi-participant row. Only mounted when
 // `source.kind === "relay"`. Pure render — takes participants +
@@ -2643,6 +2644,20 @@ export function PrettyView({
     getBufferedAmount: () => uploadWs?.bufferedAmount ?? 0,
   });
 
+  // Relay rooms stage files here instead (the room's own upload limit; sent
+  // by the relay adapter, not over the harness upload socket). Every staging
+  // path — paperclip, paste, drop, Save from the file window — goes through
+  // stageFiles so it lands in whichever one this conversation uses.
+  const relayUploads = useRelayRoomUploads(source.kind === "relay" ? source.roomId : null);
+  const isRelaySource = source.kind === "relay";
+  const stageFiles = useCallback(
+    (target: string, items: File[] | DataTransferItemList | FileList) => {
+      if (isRelaySource) relayUploads.stageAttachments(target, items);
+      else uploads.stageAttachments(target, items);
+    },
+    [isRelaySource, relayUploads, uploads],
+  );
+
   // shape-interrupt-button: ComposeBox put a cancelled send's words in
   // `target` (always the primary box); stage its attachments (already fetched
   // back from the agent's machine) on the same box, then retire the request so a remounted
@@ -2865,9 +2880,9 @@ export function PrettyView({
     (filename: string, content: string | Uint8Array) => {
       const type = guessMimeFromFilename(filename) ?? "text/plain";
       const file = new File([content as BlobPart], filename, { type });
-      uploads.stageAttachments("primary", [file]);
+      stageFiles("primary", [file]);
     },
-    [uploads],
+    [stageFiles],
   );
 
   // Phase 30 (PS30-04 + PS30-06): derive wsTransportState for the trivial
@@ -4771,9 +4786,9 @@ export function PrettyView({
         if (items && items.length > 0) {
           // Quick 260802-wxy: primary target — drag/drop lands in the main
           // composebox's chip strip.
-          uploads.stageAttachments("primary", items);
+          stageFiles("primary", items);
         } else if (files.length > 0) {
-          uploads.stageAttachments("primary", files);
+          stageFiles("primary", files);
         }
       }}
       className={cn(
@@ -5130,6 +5145,9 @@ export function PrettyView({
                   eventId={m.eventId}
                   fallbackVoice={userPrefs.fallbackVoice ?? null}
                   selfIdentity={pvIdentity}
+                  roomFile={m.roomFile}
+                  onOpenEditor={handleOpenEditor}
+                  fileDragOrigin={fileDragOrigin}
                 />
               ) : m.type === "malformed_line" ? (
                 <MalformedBubble bytes={m.bytes} ts={m.ts} />
@@ -5170,6 +5188,8 @@ export function PrettyView({
                   // relay-source failed bubbles render red consistently
                   // with the harness pending pattern.
                   pendingState={m.pendingState ?? null}
+                  roomFile={m.roomFile}
+                  attachments={m.pendingFile ? [m.pendingFile] : undefined}
                 />
               )}
             </div>
@@ -5519,14 +5539,15 @@ export function PrettyView({
             // useIsTouchDevice() hook (patch #102) is still the sole
             // mobile-vs-desktop discriminator, just no longer conflated
             // with paperclip visibility.
-            stagedAttachments={uploads.stagedAttachments}
-            onRemoveAttachment={uploads.removeAttachment}
+            stagedAttachments={isRelaySource ? relayUploads.stagedAttachments : uploads.stagedAttachments}
+            onRemoveAttachment={isRelaySource ? relayUploads.removeAttachment : uploads.removeAttachment}
             showPaperclip={true}
+            relayFiles={isRelaySource}
             isTouchDevice={isTouchDevice}
             // Quick 260802-wxy: wrap the target-aware hook API in a
             // ComposeBox-compatible (files-only) callback that always targets
             // "primary" — the paperclip picker and paste path both stage there.
-            onAttachFiles={(files) => uploads.stageAttachments("primary", files)}
+            onAttachFiles={(files) => stageFiles("primary", files)}
             // Phase 14 quick-task 260726-vbd: widened asideActive predicate
             // covers both the GENERATION phase (asidePending=true, from /btw
             // submit through aside_ready arrival) and the DISPLAY phase
@@ -5537,6 +5558,16 @@ export function PrettyView({
             asideActive={asideText !== null || asidePending}
             onAsideDismiss={handleAsideDismiss}
             onSendWithAttachments={async (caption, textArea) => {
+              if (isRelaySource) {
+                // Relay room: every file (then the text) shows on the user's
+                // side at once and is sent in order; failures are marked on
+                // the bubbles, so the composer clears straight away.
+                const files = relayUploads.stagedAttachments.map((a) => a.file);
+                relayUploads.clearStaged();
+                void chatSurfaceAdapter.sendFiles?.(files, caption);
+                jumpToBottom();
+                return { ok: true as const };
+              }
               batchTextAreaRef.current = textArea;
               // quick-260823-8ji: Promise-returning — ComposeBox awaits this
               // outcome to gate the textarea + attachment-chip clear on a

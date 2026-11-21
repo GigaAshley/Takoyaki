@@ -49,6 +49,13 @@ vi.mock("../../relay-sessions/relay-room-actions.js", () => ({
   renameRelayRoom: vi.fn(),
 }));
 
+const files = vi.hoisted(() => ({
+  checkRoomFile: vi.fn(),
+  getRoomUploadLimit: vi.fn(),
+  sendRoomFile: vi.fn(),
+}));
+vi.mock("../../relay-sessions/relay-room-files.js", () => files);
+
 // eslint-disable-next-line import/first
 import routes from "./relay-room-actions.js";
 // eslint-disable-next-line import/first
@@ -74,6 +81,8 @@ describe("relay room Leave / Rename routes", () => {
     __activeRow = { id: "s-1" };
     mockLeave.mockReset();
     mockRename.mockReset();
+    for (const f of Object.values(files)) f.mockReset();
+    files.getRoomUploadLimit.mockResolvedValue({ ok: true, maxUploadBytes: 8 });
     const app = express();
     app.use(express.json());
     app.use("/relay-room", routes);
@@ -137,5 +146,54 @@ describe("relay room Leave / Rename routes", () => {
     expect((await post("rename", { name: "   " })).status).toBe(400);
     expect((await post("rename", { name: "x".repeat(256) })).status).toBe(400);
     expect(mockRename).not.toHaveBeenCalled();
+  });
+
+  it("upload-limit answers the chat server's limit", async () => {
+    const res = await fetch(`${base}/relay-room/${ROOM}/upload-limit`);
+    expect(await res.json()).toEqual({ maxUploadBytes: 8 });
+  });
+
+  it("files: sends the body's bytes with the name, type and txn id", async () => {
+    files.sendRoomFile.mockResolvedValue({ ok: true, sent: { eventId: "$e", content: { msgtype: "m.file" } } });
+    const res = await fetch(
+      `${base}/relay-room/${ROOM}/files?filename=a.txt&type=text%2Fplain&txnId=t1`,
+      { method: "POST", headers: { "Content-Type": "application/x-relay-room-file" }, body: "hello" },
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ eventId: "$e", content: { msgtype: "m.file" } });
+    const [userId, roomId, f] = files.sendRoomFile.mock.calls[0];
+    expect(userId).toBe("user-1");
+    expect(roomId).toBe("!room:hs");
+    expect(f.bytes.toString()).toBe("hello");
+    expect(f).toMatchObject({ filename: "a.txt", contentType: "text/plain", txnId: "t1" });
+  });
+
+  it("files: a body past the room's limit is 413 and never sent", async () => {
+    const res = await fetch(`${base}/relay-room/${ROOM}/files?filename=a.txt&txnId=t1`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-relay-room-file" },
+      body: "123456789",
+    });
+    expect(res.status).toBe(413);
+    expect(await res.json()).toEqual({ error: "too_large" });
+    expect(files.sendRoomFile).not.toHaveBeenCalled();
+  });
+
+  it("files: rooms the user isn't active in are 404", async () => {
+    __activeRow = undefined;
+    const res = await fetch(`${base}/relay-room/${ROOM}/files?filename=a.txt&txnId=t1`, {
+      method: "POST",
+      body: "x",
+    });
+    expect(res.status).toBe(404);
+    expect(files.sendRoomFile).not.toHaveBeenCalled();
+  });
+
+  it("file status passes the reason a file can't be opened", async () => {
+    files.checkRoomFile.mockResolvedValue({ ok: false, errorClass: "not_found", status: 404 });
+    const res = await fetch(`${base}/relay-room/${ROOM}/files/${encodeURIComponent("$e:hs")}/status`);
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: "not_found" });
+    expect(files.checkRoomFile).toHaveBeenCalledWith("user-1", { roomId: "!room:hs", eventId: "$e:hs" });
   });
 });

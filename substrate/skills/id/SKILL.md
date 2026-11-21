@@ -1703,7 +1703,9 @@ crown, then gear.
   one and briefly rings it, instead of the bottom. Messages **between agents** show as quiet grey cards, folded:
   the sender's picture, "Finch → Bilbo" and a one-line preview; tap to
   read. In a **relay room** the user opened, each agent's messages are
-  bubbles in its colour with its name on top.
+  bubbles in its colour with its name on top. Files and pictures anyone
+  posts in the room show as file chips (pictures inline) that open, edit and
+  drag like any other; one that can't be opened shows its name with a note.
   **Quoting:** selecting words in any bubble brings up a small **Quote**
   button beside them; tapping it adds them to the end of the compose box as
   quoted lines for the user to reply under.
@@ -1733,7 +1735,9 @@ crown, then gear.
   happened. Notify me also brings up the browser's Allow prompt when nothing
   else reaches the user outside the app. There is no Stop in the
   composer — the working orb is the Stop (§ Stop below). In a relay room
-  only the mic and Send show.
+  only the paperclip, the mic and Send show; files attached there go into
+  the room as file posts, and one too big for the room's chat server is
+  held at attach until removed.
 
 - **Agent memory (the pie in the task pill, just before the ⋯).** Shows how
   full the agent's context window by colour alone, no number: grey while

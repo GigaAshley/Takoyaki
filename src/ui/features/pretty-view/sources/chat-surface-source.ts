@@ -72,6 +72,12 @@ export interface ChatSurfaceAdapterState {
   messages: ChatSurfaceMessage[];
   participants: ChatSurfaceParticipants | null;
   sendMessage: (body: string, mqid: string) => Promise<boolean>;
+  /**
+   * Relay rooms: send files, then the typed text, into the room. Each shows
+   * on the user's side at once; the first failure marks that file and all
+   * that follow it not sent. Absent on harness conversations.
+   */
+  sendFiles?: (files: File[], caption: string) => Promise<void>;
   error: string | null;
   isReady: boolean;
   /**

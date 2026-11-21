@@ -10,6 +10,8 @@ import { useSpeakPlayback } from "./useSpeakPlayback";
 import { addressingFor, mxidLocalpart, partyForMxid, previewLine } from "./relay-addressing";
 import { useRelayRoomMembers } from "./relay-room-members";
 import { RelayChatBubble, RelayDmCard } from "./RelayBubbleParts";
+import { RoomFileChip } from "./RoomFileChip";
+import type { RoomFileRef } from "@/api/claude-session-api";
 
 // RelayInboundBubble — a relay message this pane's agent received (harness
 // view, folded RelayDmCard: "Tina → Aster [DM]"), or a message from someone
@@ -48,6 +50,12 @@ export type RelayInboundBubbleProps = Pick<
   eventId?: string;
   /** The pane's own agent — the receiver of this message in harness view. */
   selfIdentity?: Identity | null;
+  /** A file or picture post: shown as a file chip instead of text. */
+  roomFile?: RoomFileRef;
+  /** Opens a file chip's file window. */
+  onOpenEditor?: (args: { messageEventId: string; url: string; filename: string }) => void;
+  /** Encoded tab spec of this conversation, for file-chip drags. */
+  fileDragOrigin?: string | null;
 };
 
 export function RelayInboundBubble({
@@ -59,6 +67,9 @@ export function RelayInboundBubble({
   alwaysExpanded = false,
   fallbackVoice = null,
   selfIdentity = null,
+  roomFile,
+  onOpenEditor,
+  fileDragOrigin = null,
 }: RelayInboundBubbleProps) {
   const { byKey } = useIdentities();
   const { identity } = resolveMxidToIdentity(sender, byKey);
@@ -81,7 +92,7 @@ export function RelayInboundBubble({
       : null,
   );
 
-  const pointer = detectFilePointer(body);
+  const pointer = roomFile ? null : detectFilePointer(body);
   const [fetchState, setFetchState] = useState<FetchState>({ kind: "idle" });
 
   useEffect(() => {
@@ -116,7 +127,9 @@ export function RelayInboundBubble({
     getText: () => fullText,
   });
 
-  const content = pointer ? (
+  const content = roomFile ? (
+    <RoomFileChip file={roomFile} onOpenEditor={onOpenEditor} dragOrigin={fileDragOrigin} />
+  ) : pointer ? (
     fetchState.kind === "done" ? (
       fetchState.text
     ) : fetchState.kind === "error" ? (

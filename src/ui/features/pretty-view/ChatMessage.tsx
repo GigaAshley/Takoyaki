@@ -19,6 +19,8 @@ import { useSpeakPlayback } from "./useSpeakPlayback";
 import { readSpeakableText } from "./speakable-text";
 import { handleCleanCopy } from "./clean-copy";
 import { FileChip } from "./FileChip";
+import { RoomFileChip } from "./RoomFileChip";
+import type { RoomFileRef } from "@/api/claude-session-api";
 import { AppChip } from "./AppChip";
 import { parseSkynetAppUrl } from "../apps/app-link";
 import { AskMarker, AnswerBubbleBody } from "./ask/AskBubbleParts";
@@ -91,6 +93,7 @@ export const ChatMessage = React.memo(function ChatMessage({
   hostName,
   askTray = true,
   quoteName = null,
+  roomFile,
 }: {
   role: "user" | "assistant";
   content: string;
@@ -155,6 +158,8 @@ export const ChatMessage = React.memo(function ChatMessage({
     size: number;
     mimetype: string;
   }>;
+  /** Relay rooms: this bubble is the user's own file post. */
+  roomFile?: RoomFileRef;
 }) {
   const isUser = role === "user";
   // Voice-mode sends carry a trailing label for the agent, and messages sent
@@ -434,7 +439,9 @@ export const ChatMessage = React.memo(function ChatMessage({
           "prose-th:min-w-[4.5em] prose-td:min-w-[4.5em] prose-th:whitespace-nowrap",
         )}
       >
-        {isQuickReply ? (
+        {roomFile ? (
+          <RoomFileChip file={roomFile} onOpenEditor={onOpenEditor} dragOrigin={fileDragOrigin} />
+        ) : isQuickReply ? (
           <ThumbsUp className="size-6" aria-label="quick reply" />
         ) : answer && !injected && !(attachments && attachments.length > 0) ? (
           <AnswerBubbleBody answer={answer} />

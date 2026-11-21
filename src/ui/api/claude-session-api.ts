@@ -173,6 +173,22 @@ export type DormantSessionMetaEvent = {
   totalLines: number;
 };
 
+/**
+ * A file or picture posted in a relay room (a Matrix file / image / audio /
+ * video message). `url` is its Skynet file address
+ * (`/file/.relay-room/<roomId>/<eventId>/<name>`), or null when the post's
+ * file can't be opened at all (encrypted, or no file in it).
+ */
+export type RoomFileRef = {
+  roomId: string;
+  eventId: string;
+  name: string;
+  size: number | null;
+  mimetype: string | null;
+  url: string | null;
+  unavailable?: "encrypted" | "missing";
+};
+
 export type MessageEvent = {
   type: "message";
   role: "user" | "assistant";
@@ -201,6 +217,13 @@ export type MessageEvent = {
    * the same semantics, so PrettyView threads this field through unchanged.
    */
   pendingState?: "sending" | "failed" | null;
+  /** Relay rooms: this message is a file post (the user's own). */
+  roomFile?: RoomFileRef;
+  /**
+   * Relay rooms: a file the user is sending, shown on their side while it
+   * goes (and after, if it failed).
+   */
+  pendingFile?: { filename: string; size: number; mimetype: string };
   /**
    * shape-interrupt-button: the harness's "[Request interrupted by user]"
    * marker, delivered as an assistant-role "Interrupted" message. When it is
@@ -420,6 +443,8 @@ export type RelayInboundEvent = {
   raw: string;
   eventId: string;
   ts: number;
+  /** Relay rooms: this message is a file post. */
+  roomFile?: RoomFileRef;
   /**
    * Phase 47 (load-more button): 1-indexed JSONL line-number this frame was
    * parsed from. Populated by Phase 47+ backends for both streaming-tail

@@ -87,6 +87,8 @@ import { connectOneShot } from "../../ssh/ssh-one-shot.js";
 import { resolveHostByName } from "../../ssh/host-resolver.js";
 import type { SSHHost } from "../../../types/index.js";
 import type { Client as SSHClientType } from "ssh2";
+import { RELAY_ROOM_FILE_HOST } from "../../relay-sessions/relay-room-files.js";
+import { serveRoomFileGet, serveRoomFilePost } from "./relay-room-file-serve.js";
 
 /* ------------------------------------------------------------------------ */
 /*  Constants                                                               */
@@ -409,6 +411,21 @@ async function postHandler(req: Request, res: Response): Promise<void> {
   };
   const userId = (req as Request & { userId: string }).userId;
 
+  // A relay room's file — fetched from the room's chat server, not a machine.
+  if (hostname === RELAY_ROOM_FILE_HOST) {
+    try {
+      await serveRoomFilePost(res, userId, absolutePath, MAX_BYTES_POST);
+    } catch (err) {
+      sshLogger.warn("pretty-view proxy: room file error", {
+        operation: "pretty_view_fetch_room_file",
+        errorMessage: err instanceof Error ? err.message : String(err),
+        duration: Date.now() - startEpoch,
+      });
+      if (!res.headersSent) res.status(502).json({ error: "host_unreachable" });
+    }
+    return;
+  }
+
   try {
     const { bytes } = await fetchHostFileBytes(userId, hostname, absolutePath);
     const filename = absolutePath.split("/").pop() ?? "";
@@ -495,6 +512,21 @@ async function getHandler(req: Request, res: Response): Promise<void> {
   }
   const absolutePath = "/" + segments.join("/");
   const userId = (req as Request & { userId: string }).userId;
+
+  // A relay room's file — fetched from the room's chat server, not a machine.
+  if (hostname === RELAY_ROOM_FILE_HOST) {
+    try {
+      await serveRoomFileGet(req, res, userId, absolutePath);
+    } catch (err) {
+      sshLogger.warn("pretty-view proxy: room file error (GET)", {
+        operation: "pretty_view_fetch_room_file_get",
+        errorMessage: err instanceof Error ? err.message : String(err),
+        duration: Date.now() - startEpoch,
+      });
+      if (!res.headersSent) sendErrorText(res, 502, "host_unreachable");
+    }
+    return;
+  }
 
   // Pre-SSH synchronous validation — same shape as fetchHostFileBytes, but
   // we short-circuit BEFORE grabbing an SSH pool slot on obvious rejects.

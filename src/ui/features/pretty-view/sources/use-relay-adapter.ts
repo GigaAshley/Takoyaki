@@ -87,6 +87,8 @@ import type {
   ChatSurfaceParticipants,
 } from "./chat-surface-source";
 import { useViewingUserMxid, useViewingUserId } from "@/state/viewing-user-store";
+import { sendRelayRoomFile, RelayRoomFileSendError } from "@/api/relay-room-files-api";
+import { isRoomFileMsgtype, roomFileFromContent } from "../room-file";
 import { getSkewLockedSnapshot } from "@/state/skew-lock-store";
 
 // ─── Constants (mirror source hook + PrettyView pending-send + reconnect) ────
@@ -114,6 +116,14 @@ interface PendingSend {
   sentAt: number;
   state: "sending" | "failed";
   timer: ReturnType<typeof setTimeout> | null;
+  /** A file being sent (content is its name). */
+  file?: { filename: string; size: number; mimetype: string };
+}
+
+function newMqid(): string {
+  return typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
 // ─── Empty-state singleton (Warning 2: participants never null when active) ──
@@ -158,11 +168,39 @@ function matrixEventToStreamEvent(
   // m.room.redaction, etc.) are silently skipped from the message list —
   // participants frames + inactive frames carry the semantics we care about.
   const msgtype = event.content["msgtype"];
+  const isSelf = event.sender === viewingUserMxid;
+
+  // A file or picture post: shown as a file chip (pictures inline).
+  if (isRoomFileMsgtype(msgtype)) {
+    const roomFile = roomFileFromContent(event.content, roomId, event.event_id);
+    if (roomFile === null) return null;
+    if (isSelf) {
+      return {
+        type: "message",
+        role: "user",
+        content: roomFile.name,
+        eventId: event.event_id,
+        ts: event.origin_server_ts,
+        roomFile,
+      };
+    }
+    return {
+      type: "relay_inbound",
+      room: roomId,
+      sender: event.sender,
+      matrixEventId: event.event_id,
+      body: roomFile.name,
+      raw: roomFile.name,
+      eventId: event.event_id,
+      ts: event.origin_server_ts,
+      roomFile,
+    };
+  }
+
   const body = event.content["body"];
   if (typeof body !== "string") return null;
   if (msgtype !== "m.text" && msgtype !== undefined) return null;
 
-  const isSelf = event.sender === viewingUserMxid;
   if (isSelf) {
     // Phase 97 UAT follow-up 4 (2026-09-10): render the sender's own
     // messages as normal user ChatMessage bubbles (blue, right-aligned)
@@ -367,6 +405,101 @@ export function useRelayAdapter(
       return true;
     },
     [flipToFailed, viewingUserId],
+  );
+
+  // ── sendFiles — files (then the typed text) into the room ───────────────
+  // Every file and the text show on the user's side at once as sending.
+  // Files go one at a time, in order; the text only goes once every file
+  // has. The first failure marks that file and everything after it — later
+  // files and the text — not sent, so nothing arrives out of order or
+  // without its files.
+  const sendFiles = useCallback(
+    async (files: File[], caption: string): Promise<void> => {
+      const room = roomIdRef.current;
+      const base = Date.now();
+      const fileEntries: Array<PendingSend & { source: File }> = files.map((f, i) => ({
+        mqid: newMqid(),
+        content: f.name,
+        sentAt: base + i,
+        state: "sending",
+        timer: null,
+        file: { filename: f.name, size: f.size, mimetype: f.type || "application/octet-stream" },
+        source: f,
+      }));
+      const text = caption.trim().length > 0 ? caption : null;
+      const textEntry: PendingSend | null = text
+        ? { mqid: newMqid(), content: text, sentAt: base + files.length, state: "sending", timer: null }
+        : null;
+      const seeded: PendingSend[] = fileEntries.map(({ source: _s, ...p }) => p);
+      if (textEntry) seeded.push(textEntry);
+      setPendingSends((prev) => [...prev, ...seeded]);
+
+      const failFrom = (index: number, reason: string) => {
+        const doomed = new Set<string>(fileEntries.slice(index).map((e) => e.mqid));
+        if (textEntry) doomed.add(textEntry.mqid);
+        // eslint-disable-next-line no-console
+        console.info({ operation: "relay_room_send_files_failed", roomId: room, failedAt: index, reason });
+        setPendingSends((prev) =>
+          prev.map((p) => (doomed.has(p.mqid) ? { ...p, state: "failed", timer: null } : p)),
+        );
+      };
+
+      for (let i = 0; i < fileEntries.length; i++) {
+        const entry = fileEntries[i];
+        try {
+          const sent = await sendRelayRoomFile(room, entry.source, entry.mqid);
+          setPendingSends((prev) => prev.filter((p) => p.mqid !== entry.mqid));
+          const viewingMxid = viewingUserMxidRef.current;
+          const synth: MatrixEvent = {
+            event_id: sent.eventId,
+            type: "m.room.message",
+            sender: viewingMxid,
+            origin_server_ts: entry.sentAt,
+            content: sent.content,
+            unsigned: { transaction_id: entry.mqid },
+          };
+          setHistory((prev) =>
+            prev.some((h) => h.event_id === sent.eventId) ? prev : [...prev, synth],
+          );
+          // eslint-disable-next-line no-console
+          console.info({
+            operation: "relay_room_send_file",
+            roomId: room,
+            mqid: entry.mqid,
+            eventId: sent.eventId,
+            size: entry.source.size,
+          });
+        } catch (err) {
+          failFrom(i, err instanceof RelayRoomFileSendError ? err.reason : "unknown");
+          return;
+        }
+      }
+
+      if (textEntry === null) return;
+      const ws = wsRef.current;
+      if (ws === null || ws.readyState !== WebSocket.OPEN) {
+        failFrom(fileEntries.length, "ws_not_open");
+        return;
+      }
+      const payload: SendMessagePayload = { type: "send_message", body: textEntry.content, txnId: textEntry.mqid };
+      try {
+        ws.send(JSON.stringify(payload));
+      } catch {
+        failFrom(fileEntries.length, "ws_send_threw");
+        return;
+      }
+      const timerHandle = setTimeout(
+        () => flipToFailed(textEntry.mqid, "timeout"),
+        PENDING_SEND_TIMEOUT_MS_NORMAL,
+      );
+      setPendingSends((prev) => {
+        const present = prev.some((p) => p.mqid === textEntry.mqid);
+        return present
+          ? prev.map((p) => (p.mqid === textEntry.mqid ? { ...p, timer: timerHandle } : p))
+          : [...prev, { ...textEntry, timer: timerHandle }];
+      });
+    },
+    [flipToFailed],
   );
 
   // ── fetchOlder — Promise-returning wrapper (adapter contract) ────────────
@@ -736,6 +869,7 @@ export function useRelayAdapter(
         // The threaded prop is consumed at PrettyView's ChatMessage
         // render site.
         pendingState: p.state === "failed" ? "failed" : "sending",
+        ...(p.file ? { content: "", pendingFile: p.file } : {}),
       });
     }
     // Phase 97 UAT follow-up 2 (2026-09-10): sort chronologically by ts
@@ -758,6 +892,7 @@ export function useRelayAdapter(
     messages,
     participants,
     sendMessage,
+    sendFiles,
     error,
     isReady,
     // Phase 97 Finding 1: added to BOTH the returned object AND the deps
@@ -772,6 +907,7 @@ export function useRelayAdapter(
     messages,
     participants,
     sendMessage,
+    sendFiles,
     error,
     isReady,
     isMessagesLoaded,

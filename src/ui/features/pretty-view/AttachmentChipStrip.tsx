@@ -166,7 +166,7 @@ function Chip({
             aria-label="Upload failed"
           />
           {error && (
-            <span className="max-w-[160px] truncate text-[10px] opacity-80">
+            <span className="max-w-[260px] truncate text-[10px] opacity-80">
               {error}
             </span>
           )}
