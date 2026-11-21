@@ -882,8 +882,18 @@ export async function runLiveEventTick(
     // Transient failure — preserve the cursor so the next tick retries.
     return { nextSinceToken: sinceToken, events: [] };
   }
+  // Caught up: the chat server leaves out `end` when there's nothing past
+  // the cursor. Keep polling from where we are — a null here would stop
+  // the room's live messages until it's reopened.
+  if (result.nextSinceToken === null) {
+    databaseLogger.debug("relay_room_stream live cursor kept (caught up)", {
+      operation: "relay_room_stream_live_cursor_kept",
+      roomId,
+      eventCount: result.events.length,
+    });
+  }
   return {
-    nextSinceToken: result.nextSinceToken,
+    nextSinceToken: result.nextSinceToken ?? sinceToken,
     events: result.events,
   };
 }

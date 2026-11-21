@@ -782,6 +782,15 @@ describe("runLiveEventTick (H1 fixup — inbound message subscription)", () => {
     expect(result.nextSinceToken).toBe("cursor-after");
   });
 
+  it("caught up (server gives no new cursor) keeps the current cursor so polling goes on", async () => {
+    const deps: LiveEventTickDeps = {
+      fetchLive: vi.fn().mockResolvedValue({ ok: true, events: [], nextSinceToken: null }),
+    };
+    const result = await runLiveEventTick(ROOM_ID, "cursor-now", deps);
+    expect(result.events).toEqual([]);
+    expect(result.nextSinceToken).toBe("cursor-now");
+  });
+
   it("Test LE-3: fetch failure preserves the previous cursor (transient-fail discipline)", async () => {
     const deps: LiveEventTickDeps = {
       fetchLive: vi.fn().mockResolvedValue({
