@@ -1936,3 +1936,28 @@ describe("fleet-status-client: unread marks plumbing", () => {
     expect(attention.applyRemoteDm).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("fleet-status-client: relay-rooms-changed dispatch", () => {
+  beforeEach(() => {
+    __disposeAllClientsForTest();
+    MockWebSocket.instances = [];
+  });
+
+  it("calls onRelayRoomsChanged once per frame", () => {
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    const onRelayRoomsChanged = vi.fn();
+    createFleetStatusClient({
+      url: "ws://localhost/fleet-status/ws",
+      onSnapshot: vi.fn(),
+      onUpdate: vi.fn(),
+      onGone: vi.fn(),
+      onRelayRoomsChanged,
+    });
+    const ws = latestWs();
+    ws.onopen?.();
+    ws.onmessage?.({
+      data: JSON.stringify({ schemaVersion: FRAME_SCHEMA_VERSION, type: "relay-rooms-changed" }),
+    });
+    expect(onRelayRoomsChanged).toHaveBeenCalledTimes(1);
+  });
+});

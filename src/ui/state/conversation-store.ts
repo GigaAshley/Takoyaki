@@ -1261,8 +1261,14 @@ function computeSnapshot(): ConversationList {
   const middleRows: ConversationRow[] = [];
   const middleInsertionOrder = new WeakMap<ConversationRow, number>();
   let middlePushIndex = 0;
+  // One row per relay room, however many tabs of it are open.
+  const emittedRelayRoomIds = new Set<string>();
   for (const tab of conversationTabs) {
     if (emittedIds.has(tab.id)) continue; // already in pinned tier
+    if (tab.sessionKind === "relay-room" && tab.relayRoomId) {
+      if (emittedRelayRoomIds.has(tab.relayRoomId)) continue;
+      emittedRelayRoomIds.add(tab.relayRoomId);
+    }
     // Phase 91 UAT fix 2026-09-09: relay-room tabs are host-less by design;
     // they were admitted by isConversationTab and MUST NOT be filtered out
     // here. Harness tabs still require a host.

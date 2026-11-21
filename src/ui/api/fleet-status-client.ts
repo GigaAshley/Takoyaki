@@ -126,6 +126,8 @@ export interface FleetStatusClientOptions {
   onAppSnapshot?: (apps: AppState[]) => void;
   onAppUpdate?: (app: AppState) => void;
   onAppGone?: (hostId: string, slug: string) => void;
+  /** This user's relay rooms changed (added, left, renamed): re-read the list. */
+  onRelayRoomsChanged?: () => void;
 }
 
 export interface FleetStatusClient {
@@ -154,6 +156,7 @@ export function createFleetStatusClient(
     onAppSnapshot,
     onAppUpdate,
     onAppGone,
+    onRelayRoomsChanged,
   } = opts;
 
   // Phase 111 SKEW-09 (D-08): append `?build=<CLIENT_BUILD_ID>` to the WS URL
@@ -421,6 +424,10 @@ export function createFleetStatusClient(
             projectCount: parsed.projects.length,
           });
           onProjectListChanged?.(parsed.hostId, parsed.projects);
+          break;
+        case "relay-rooms-changed":
+          console.info({ operation: "fleet_status_client_relay_rooms_changed", url });
+          onRelayRoomsChanged?.();
           break;
         case "session-project-changed":
           // Per-identity delta from backend session-project-write. The frame

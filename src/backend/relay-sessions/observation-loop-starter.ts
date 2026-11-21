@@ -64,6 +64,8 @@ import {
   refreshRelayRoomLastActivity,
   listActiveRelayRoomSessions,
 } from "./relay-room-sessions-store.js";
+import { getRegistry } from "../fleet-status/registry-holder.js";
+import { FRAME_SCHEMA_VERSION } from "../fleet-status/wire-protocol.js";
 import { listAdminRooms } from "./admin-rooms-ignore-list.js";
 import {
   getUserJoinedRooms,
@@ -161,6 +163,12 @@ export async function startObservationLoopOnBoot(): Promise<StartObservationLoop
     listActiveRelayRoomSessions,
     listAdminRooms,
     getAgentsRegistryRoomId,
+    notifyRelayRoomsChanged: (userId) => {
+      getRegistry()?.publishToUser(userId, {
+        schemaVersion: FRAME_SCHEMA_VERSION,
+        type: "relay-rooms-changed",
+      });
+    },
   });
   loop.start(users);
   loopScheduler = loop;

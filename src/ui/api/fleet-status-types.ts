@@ -477,6 +477,14 @@ export interface FrontendAgentNotifiedFrame {
   body: string;
 }
 
+// relay-rooms-changed — this user was added to a relay room, left one, or one
+// was renamed; the tab re-reads its sidebar list. Mirrors wire-protocol.ts
+// FrontendRelayRoomsChangedFrameSchema.
+export interface FrontendRelayRoomsChangedFrame {
+  schemaVersion: typeof FRAME_SCHEMA_VERSION;
+  type: "relay-rooms-changed";
+}
+
 export type FrontendOutboundFrame =
   | FrontendSnapshotFrame
   | FrontendUpdateFrame
@@ -487,6 +495,7 @@ export type FrontendOutboundFrame =
   | FrontendReadStateChangedFrame
   | FrontendDmStateChangedFrame
   | FrontendAgentNotifiedFrame
+  | FrontendRelayRoomsChangedFrame
   | FrontendAppSnapshotFrame
   | FrontendAppUpdateFrame
   | FrontendAppGoneFrame;

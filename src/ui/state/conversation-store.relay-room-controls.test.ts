@@ -75,6 +75,22 @@ describe("relay-room rows", () => {
     expect(row?.roomFaces).toEqual(FACES);
   });
 
+  it("two open tabs of one room still make one row", () => {
+    updateFleetSessions([room("!a:hs", "Plans")]);
+    const tab = (id: string) =>
+      ({
+        id,
+        type: "terminal",
+        label: "Plans",
+        sessionKind: "relay-room",
+        relayRoomId: "!a:hs",
+        relayRoomTitle: "Plans",
+      }) as unknown as Tab;
+    updateOpenTabs([tab("tab-1"), tab("tab-2")]);
+    const rows = allRows().filter((r) => r.roomId === "!a:hs");
+    expect(rows.map((r) => r.id)).toEqual(["tab-1"]);
+  });
+
   it("removeRelayRoomSession drops just that room", () => {
     updateFleetSessions([room("!a:hs", "Plans"), room("!b:hs", "Other")]);
     removeRelayRoomSession("!a:hs");

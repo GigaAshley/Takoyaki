@@ -856,3 +856,82 @@ describe("createObservationLoop", () => {
     vi.useRealTimers();
   });
 });
+
+describe("telling the user's tabs their room list changed", () => {
+  const joined = (roomIds: string[]) =>
+    vi.fn(async () => ({ ok: true as const, roomIds }));
+  const members = vi.fn(async () => ({
+    ok: true as const,
+    memberMxids: [USER_A_MXID, "@x:s", "@y:s"],
+    total: 3,
+  }));
+  const active = (rows: Array<[string, string | null]>) =>
+    vi.fn(async () =>
+      rows.map(([roomId, roomTitle]) => ({
+        id: `id-${roomId}`,
+        roomId,
+        roomTitle,
+        lastActivityAt: null,
+        createdAt: "",
+        updatedAt: "",
+      })),
+    );
+
+  it("notifies when a new room appears", async () => {
+    const notify = vi.fn();
+    const deps = makeDeps({
+      getUserJoinedRooms: joined(["!old:s", "!new:s"]),
+      getRoomJoinedMembers: members,
+      getRoomName: vi.fn(async (roomId: string) => ({ ok: true as const, name: roomId === "!old:s" ? "Old" : "New" })),
+      listActiveRelayRoomSessions: active([["!old:s", "Old"]]),
+      notifyRelayRoomsChanged: notify,
+    });
+    await runObservationTick(USER_A, USER_A_MXID, deps);
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify).toHaveBeenCalledWith(USER_A);
+  });
+
+  it("notifies when a room is renamed or left", async () => {
+    const renamed = vi.fn();
+    await runObservationTick(
+      USER_A,
+      USER_A_MXID,
+      makeDeps({
+        getUserJoinedRooms: joined(["!a:s"]),
+        getRoomJoinedMembers: members,
+        getRoomName: vi.fn(async () => ({ ok: true as const, name: "Renamed" })),
+        listActiveRelayRoomSessions: active([["!a:s", "Before"]]),
+        notifyRelayRoomsChanged: renamed,
+      }),
+    );
+    expect(renamed).toHaveBeenCalledTimes(1);
+
+    const left = vi.fn();
+    await runObservationTick(
+      USER_A,
+      USER_A_MXID,
+      makeDeps({
+        getUserJoinedRooms: joined([]),
+        listActiveRelayRoomSessions: active([["!gone:s", "Gone"]]),
+        notifyRelayRoomsChanged: left,
+      }),
+    );
+    expect(left).toHaveBeenCalledTimes(1);
+  });
+
+  it("stays quiet when nothing the sidebar shows changed", async () => {
+    const notify = vi.fn();
+    await runObservationTick(
+      USER_A,
+      USER_A_MXID,
+      makeDeps({
+        getUserJoinedRooms: joined(["!a:s"]),
+        getRoomJoinedMembers: members,
+        getRoomName: vi.fn(async () => ({ ok: true as const, name: "Same" })),
+        listActiveRelayRoomSessions: active([["!a:s", "Same"]]),
+        notifyRelayRoomsChanged: notify,
+      }),
+    );
+    expect(notify).not.toHaveBeenCalled();
+  });
+});

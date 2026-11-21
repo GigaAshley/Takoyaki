@@ -823,6 +823,17 @@ export const FrontendAgentNotifiedFrameSchema = z.object({
   body: z.string(),
 });
 
+// ---------------------------------------------------------------------------
+// relay-rooms-changed — the user was added to a relay room, left one, or one
+// of theirs was renamed. Sent ONLY to that user's own subscribers; the tab
+// re-reads its sidebar list. Additive — FRAME_SCHEMA_VERSION stays at 1.
+// ---------------------------------------------------------------------------
+
+export const FrontendRelayRoomsChangedFrameSchema = z.object({
+  schemaVersion: z.literal(FRAME_SCHEMA_VERSION),
+  type: z.literal("relay-rooms-changed"),
+});
+
 export const FrontendOutboundFrame = z.discriminatedUnion("type", [
   FrontendSnapshotFrameSchema,
   FrontendUpdateFrameSchema,
@@ -833,6 +844,7 @@ export const FrontendOutboundFrame = z.discriminatedUnion("type", [
   FrontendReadStateChangedFrameSchema,
   FrontendDmStateChangedFrameSchema,
   FrontendAgentNotifiedFrameSchema,
+  FrontendRelayRoomsChangedFrameSchema,
   AppSnapshotFrameSchema,
   AppUpdateFrameSchema,
   AppGoneFrameSchema,

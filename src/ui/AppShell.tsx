@@ -863,6 +863,11 @@ export function AppShell({
       // massaging is required at the adapter boundary.
       onProjectListChanged: (hostId, projects) =>
         mergeProjectsForHost(hostId, projects),
+      // A relay room appeared, was left or renamed — re-read the list so
+      // the sidebar shows it without a refresh.
+      onRelayRoomsChanged: () => {
+        void fetchFleetSessionsRef.current?.({ isColdStart: false });
+      },
       // Per-identity project delta from the backend's session-project write
       // path — patch the affected row's `project` field in place so the
       // sidebar reflects the new bucket without a full /identities refetch.
@@ -4059,6 +4064,22 @@ export function AppShell({
               console.warn("relay-room row missing roomId at AppShell", {
                 rowId: row.id,
               });
+              return;
+            }
+            // Already open: go to it instead of opening another copy.
+            const existing = tabsRef.current.find(
+              (t) => t.sessionKind === "relay-room" && t.relayRoomId === row.roomId,
+            );
+            if (existing) {
+              systemLogger.info(`[relay-room] row click reuses open tab tabId=${existing.id}`, {
+                operation: "relay_room_row_click_reuse",
+                tabId: existing.id,
+                roomId: row.roomId,
+              });
+              selectConversationDeferred(existing.id);
+              if (isTouchDevice) navigateToView();
+              if (isMobile) setSidebarOpen(false);
+              sidebarPeek.close("item-opened");
               return;
             }
             const newTabId = openTab(null, "terminal", undefined, {

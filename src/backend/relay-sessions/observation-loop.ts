@@ -188,6 +188,11 @@ export interface ObservationTickDeps {
   // admin-rooms-ignore-list + registry-rooms primitives (Plans 01/02)
   listAdminRooms(): Promise<string[]>;
   getAgentsRegistryRoomId(): Promise<string | null>;
+  /**
+   * Tell the user's open tabs their room list changed (a room appeared,
+   * left, or was renamed). Optional so tests can omit it.
+   */
+  notifyRelayRoomsChanged?(userId: string): void;
 }
 
 /**
@@ -264,6 +269,17 @@ export async function runObservationTick(
         userId,
       );
     }
+
+    // What the sidebar had before this tick — to tell the user's tabs only
+    // when something they'd see changed. null = unknown (no notify).
+    let priorTitles: Map<string, string | null> | null = null;
+    try {
+      const prior = await deps.listActiveRelayRoomSessions(userId);
+      priorTitles = new Map(prior.map((r) => [r.roomId, r.roomTitle]));
+    } catch {
+      priorTitles = null;
+    }
+    const materializedTitles = new Map<string, string | null>();
 
     // Step 3: for each joined room (bounded parallelism), fetch members +
     // latest-event-ts, classify, and materialize when applicable. Track
@@ -367,6 +383,7 @@ export async function runObservationTick(
           await deps.materializeRelayRoomSession(userId, roomId, roomTitle);
           materialized++;
           materializedRoomIds.add(roomId);
+          materializedTitles.set(roomId, roomTitle);
         } catch (err) {
           databaseLogger.warn(
             "[phase-89] observation tick — materializeRelayRoomSession failed",
@@ -467,6 +484,33 @@ export async function runObservationTick(
           error: err instanceof Error ? err.message : "unknown",
         },
       );
+    }
+
+    if (priorTitles !== null && deps.notifyRelayRoomsChanged) {
+      let added = 0;
+      let renamed = 0;
+      for (const [roomId, title] of materializedTitles) {
+        if (!priorTitles.has(roomId)) added++;
+        else if (title !== null && priorTitles.get(roomId) !== title) renamed++;
+      }
+      if (added > 0 || renamed > 0 || markedInactive > 0) {
+        databaseLogger.info("[relay-rooms] room list changed, telling the user's tabs", {
+          operation: "relay_observation_rooms_changed",
+          userId,
+          added,
+          renamed,
+          removed: markedInactive,
+        });
+        try {
+          deps.notifyRelayRoomsChanged(userId);
+        } catch (err) {
+          databaseLogger.warn("[relay-rooms] notifying tabs failed", {
+            operation: "relay_observation_rooms_changed_notify_failed",
+            userId,
+            error: err instanceof Error ? err.message : "unknown",
+          });
+        }
+      }
     }
 
     databaseLogger.debug("[phase-89] observation tick complete", {
