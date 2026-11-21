@@ -1850,10 +1850,8 @@ crown, then gear.
   user had said is kept and never sent by the pause, and replies wait.
   Tapping it again carries on where it was. A phone call (or anything else
   that takes the phone's mic or sound) pauses voice mode the same way, with
-  everything kept. When the call ends and the phone gives the sound back,
-  voice mode carries on by itself a few seconds later; tapping play does it
-  sooner. If the mic still isn't available it stays paused and the compose
-  box says so. A pause the user made never carries on by itself. Each voice-mode
+  everything kept; tapping play carries on, and if the mic still isn't
+  available it stays paused and the compose box says so. Each voice-mode
   session starts unpaused. The pill's ✕ — or ending a sentence
   with "stop voice mode" — ends voice mode and throws away anything not yet
   sent. Replies are spoken in the agent's voice —
