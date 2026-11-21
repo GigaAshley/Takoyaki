@@ -189,13 +189,20 @@ export async function updateProjectFile(
  */
 export async function listRelayRoomProjectTags(
   hostId: number,
-): Promise<{ assignments: Array<{ roomId: string; slug: string }> }> {
+): Promise<{ assignments: Array<{ roomId: string; slug: string }>; pinned: string[]; unknown: string[] }> {
   try {
     const url = `/relay-rooms/project-tags?hostId=${encodeURIComponent(String(hostId))}`;
     const response = await authApi.get(url);
-    return response.data as {
+    const data = response.data as {
       assignments: Array<{ roomId: string; slug: string }>;
+      pinned?: unknown;
+      unknown?: unknown;
     };
+    const ids = (x: unknown): string[] =>
+      Array.isArray(x) ? x.filter((id): id is string => typeof id === "string") : [];
+    // `pinned` = rooms the user has pinned; `unknown` = rooms whose tags
+    // couldn't be read this time (keep what's already known for them).
+    return { assignments: data.assignments, pinned: ids(data.pinned), unknown: ids(data.unknown) };
   } catch (error) {
     handleApiError(error, "list relay-room project tags");
   }

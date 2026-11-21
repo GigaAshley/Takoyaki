@@ -156,26 +156,48 @@ export async function getRoomTags(
 }
 
 /**
+ * A room's pin in the sidebar: the favourite key in the room's `m.tag`
+ * account data — the same per-user blob that carries the project tag. Synapse
+ * keeps that blob apart from its own tag store (the /tags endpoints), so other
+ * chat apps don't see it as a favourite.
+ */
+export const FAVOURITE_TAG = "m.favourite";
+
+/** What a room-tag write left on the room: its project (if any) and its pin. */
+export type RoomPlacement = { project: string | null; pinned: boolean };
+export type RoomTagWriteOk = { ok: true } & RoomPlacement;
+
+/** Read the placement out of a room's tags (project outranks pin). */
+export function placementOf(tags: Record<string, unknown>): RoomPlacement {
+  const projectKey = Object.keys(tags).find((k) => PROJECT_TAG_RE.test(k) && k.length > PROJECT_TAG_PREFIX.length);
+  return {
+    project: projectKey ? projectKey.slice(PROJECT_TAG_PREFIX.length) : null,
+    pinned: Object.prototype.hasOwnProperty.call(tags, FAVOURITE_TAG),
+  };
+}
+
+const PROJECT_TAG_PREFIX = "u.project.";
+const PROJECT_TAG_RE = /^u\.project\./;
+
+/**
  * D-05a read-modify-write cycle for the `u.project.<slug>` tag on a room.
  *
  * PUT /_matrix/client/v3/user/{userId}/rooms/{roomId}/account_data/m.tag
  *
  * The 5-step protocol per CONTEXT.md § D-05a:
  *   1. GET the room's existing `m.tag` blob via getRoomTags.
- *   2. Preserve every non-project key (favorites, low-priority, other u.* tags).
+ *   2. Preserve every non-project key (low-priority, other u.* tags).
  *   3. Strip EVERY key matching /^u\.project\./ (D-06 single-project invariant —
  *      defensively removes any pre-existing multi-tag state, not just the one
  *      the caller may know about).
- *   4. If projectSlug is not null, set `newTags["u.project." + projectSlug] = {}`.
+ *   4. Drop the favourite tag (any project write unpins — pinned and
+ *      in-a-project are exclusive), then if projectSlug is not null set
+ *      `newTags["u.project." + projectSlug] = {}`.
  *   5. PUT the merged blob.
  *
  * Invalid slug throws BEFORE any HTTP call (T-117-02-03) — a bad slug is a
  * caller programming error, not a runtime failure. The route layer (Plan
  * 117-05) converts this to a 400 for the client.
- *
- * Uses the SAME per-user token as getRoomTags — no separate mint. The token
- * TTL (1 hour, matrix-admin-client.ts:1226) far exceeds the time between GET
- * and PUT, so re-minting between steps 1 and 5 is not necessary.
  *
  * CRITICAL (T-117-02-01): uses per-user token, NOT admin token. Same
  * rationale as getRoomTags — m.tag is a per-user event.
@@ -184,49 +206,91 @@ export async function setRoomProjectTag(
   userMxid: string,
   roomId: string,
   projectSlug: string | null,
-): Promise<{ ok: true } | AdminErr> {
+): Promise<RoomTagWriteOk | AdminErr> {
   // T-117-02-03: validate slug BEFORE any HTTP call. Throws (not AdminErr)
   // because a malformed slug is a programming error at the call site — the
   // route layer catches and returns 400.
   if (projectSlug !== null && !PROJECT_SLUG_RE.test(projectSlug)) {
     throw new Error(`invalid project slug: ${projectSlug}`);
   }
+  return writeRoomTags(userMxid, roomId, "matrix_room_tag_put", (current) => {
+    const next: Record<string, unknown> = Object.fromEntries(
+      Object.entries(current).filter(([k]) => !PROJECT_TAG_RE.test(k)),
+    );
+    // Any project write leaves the room unpinned: filing it takes it out of
+    // Pinned, and "Remove from project" on a room that somehow carries both
+    // lands it in Conversations — the same as an agent conversation.
+    delete next[FAVOURITE_TAG];
+    if (projectSlug !== null) {
+      next["u.project." + projectSlug] = {};
+    }
+    return next;
+  });
+}
 
+/**
+ * Resolves with the placement the write left (project + pin).
+ *
+ * Pin (favourite) or unpin a room for one user — same read-modify-write as
+ * setRoomProjectTag. Pinning strips every project tag in the same write, so
+ * the room is never left both pinned and in a project; unpinning removes only
+ * the favourite tag. An existing favourite's content (e.g. another app's
+ * `order`) is kept.
+ */
+export async function setRoomPinned(
+  userMxid: string,
+  roomId: string,
+  pinned: boolean,
+): Promise<RoomTagWriteOk | AdminErr> {
+  return writeRoomTags(userMxid, roomId, "matrix_room_tag_pin", (current) => {
+    const next: Record<string, unknown> = { ...current };
+    if (pinned) {
+      for (const k of Object.keys(next)) {
+        if (PROJECT_TAG_RE.test(k)) delete next[k];
+      }
+      const prior = next[FAVOURITE_TAG];
+      next[FAVOURITE_TAG] =
+        prior !== null && typeof prior === "object" && !Array.isArray(prior) ? prior : {};
+    } else {
+      delete next[FAVOURITE_TAG];
+    }
+    return next;
+  });
+}
+
+/**
+ * GET the room's tags as the user, apply `mutate`, PUT the result back.
+ * Every tag `mutate` doesn't touch round-trips unchanged.
+ */
+async function writeRoomTags(
+  userMxid: string,
+  roomId: string,
+  operation: string,
+  mutate: (current: Record<string, unknown>) => Record<string, unknown>,
+): Promise<RoomTagWriteOk | AdminErr> {
   const creds = await getMatrixAdminCreds();
   if (!creds) {
     return { ok: false, status: 500, error: ERR_CREDS_MISSING };
   }
 
-  // Step 1: GET current m.tag blob. Failures propagate verbatim — the
-  // caller sees a uniform AdminErr surface whether the GET failed due to
-  // creds, ensureUserToken, timeout, or Synapse non-2xx.
+  // GET current m.tag blob. Failures propagate verbatim — the caller sees a
+  // uniform AdminErr surface whether the GET failed due to creds,
+  // ensureUserToken, timeout, or Synapse non-2xx.
   const current = await getRoomTags(userMxid, roomId);
-  if (!current.ok) {
+  if (current.ok === false) {
     return current;
   }
 
   // Mint (or reuse cached) per-user token for the PUT. ensureUserToken is
-  // idempotent + cached; on a fresh call the cached entry from the GET is
-  // returned without a second loginAsUser round-trip.
+  // idempotent + cached; the entry minted for the GET is reused.
   const tokenResult = await ensureUserToken(userMxid);
   if (!tokenResult.ok) {
     assertAdminErr(tokenResult);
     return tokenResult;
   }
 
-  // Steps 2 + 3: preserve non-project keys, strip ALL u.project.* (D-06
-  // single-project invariant). Using Object.entries + filter is O(n) in the
-  // number of tags — the number of tags per room is small in practice.
-  const newTags: Record<string, unknown> = Object.fromEntries(
-    Object.entries(current.tags).filter(([k]) => !/^u\.project\./.test(k)),
-  );
+  const newTags = mutate(current.tags);
 
-  // Step 4: add the new u.project.<slug> tag, or skip if we're clearing.
-  if (projectSlug !== null) {
-    newTags["u.project." + projectSlug] = {};
-  }
-
-  // Step 5: PUT the merged blob.
   const url =
     creds.homeserverBase +
     "/_matrix/client/v3/user/" +
@@ -251,14 +315,14 @@ export async function setRoomProjectTag(
     if (!response.ok) {
       return { ok: false, status: response.status, error: ERR_NON_2XX };
     }
-    return { ok: true };
+    return { ok: true, ...placementOf(newTags) };
   } catch (err: unknown) {
     clearTimeout(timeoutId);
     if (err instanceof DOMException && err.name === "AbortError") {
       return { ok: false, status: 504, error: ERR_TIMEOUT };
     }
     databaseLogger.error("matrix room tag proxy error", err, {
-      operation: "matrix_room_tag_put",
+      operation,
     });
     return { ok: false, status: 502, error: ERR_PROXY };
   }

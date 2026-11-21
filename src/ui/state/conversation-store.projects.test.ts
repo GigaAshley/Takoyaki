@@ -795,11 +795,13 @@ describe("conversation-store (projects cache): cold-boot seed + write-on-setter"
       ],
       identityProjectAssignments: new Map([["1::morpheus", "a"]]),
       roomProjectAssignments: new Map([["!r:s", "a"]]),
+      roomPinnedIds: new Set(["!p:s"]),
     });
     const cached = readProjectsCache();
     expect(cached.projects[0].slug).toBe("a");
     expect(cached.identityProjectAssignments.get("1::morpheus")).toBe("a");
     expect(cached.roomProjectAssignments.get("!r:s")).toBe("a");
+    expect([...cached.roomPinnedIds]).toEqual(["!p:s"]);
   });
 
   it("nested projects: the cache keeps each project's parent (no flat flash on reload)", () => {
@@ -810,6 +812,7 @@ describe("conversation-store (projects cache): cold-boot seed + write-on-setter"
       ],
       identityProjectAssignments: new Map(),
       roomProjectAssignments: new Map(),
+      roomPinnedIds: new Set(),
     });
     const cached = readProjectsCache();
     expect(cached.projects.map((p) => [p.slug, p.parent])).toEqual([

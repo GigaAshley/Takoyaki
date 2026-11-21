@@ -50,3 +50,19 @@ export async function setRelayRoomProject(
     handleApiError(error, "set relay room project");
   }
 }
+
+// Pin (the chat server's favourite tag) or unpin a relay room for the user.
+// Pinning takes the room out of its project in the same write.
+export async function setRelayRoomPinned(
+  roomId: string,
+  userMxid: string,
+  pinned: boolean,
+): Promise<{ ok: true }> {
+  try {
+    const url = `/relay-rooms/${encodeURIComponent(roomId)}/pin`;
+    const response = await authApi.post(url, { userMxid, pinned });
+    return response.data as { ok: true };
+  } catch (error) {
+    handleApiError(error, "set relay room pin");
+  }
+}

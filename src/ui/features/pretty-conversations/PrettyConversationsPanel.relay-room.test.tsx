@@ -141,6 +141,8 @@ let mockFleetSessionsLoaded = false;
 vi.mock("@/state/conversation-store", () => ({
   upsertFleetSession: () => {},
   patchRoomProjectAssignment: () => () => {},
+  patchRoomPinned: () => () => {},
+  useRoomPinnedIds: () => new Set<string>(),
   useConversations: () => ({
     activeSet: snapshot.activeSet,
     pinned: snapshot.pinned,
@@ -180,6 +182,7 @@ vi.mock("@/state/use-collapsed-project-slugs", () => ({
 vi.mock("@/api/session-project-api", () => ({
   setSessionProject: vi.fn(async () => ({ ok: true })),
   setRelayRoomProject: vi.fn(async () => ({ ok: true })),
+  setRelayRoomPinned: vi.fn(async () => ({ ok: true })),
 }));
 
 vi.mock("@/api/user-preferences-api", () => ({

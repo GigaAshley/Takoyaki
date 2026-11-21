@@ -10,7 +10,7 @@
  * the hydration gap — the frontend calls it once per managed host at boot
  * and populates `state.roomProjectAssignments` before the first render.
  *
- * Response: `{ assignments: Array<{ roomId: string, slug: string }> }`
+ * Response: `{ assignments: Array<{ roomId: string, slug: string }>, pinned: string[], unknown: string[] }`
  *
  * Failure discipline:
  *   - resolveHostById returns null (unknown host / cross-user) → 404.
@@ -39,7 +39,7 @@ import { users } from "../db/schema.js";
 import { AuthManager } from "../../utils/auth-manager.js";
 import { databaseLogger } from "../../utils/logger.js";
 import { resolveHostById } from "../../ssh/host-resolver.js";
-import { getRoomTags } from "../../matrix/matrix-room-tag-client.js";
+import { getRoomTags, FAVOURITE_TAG } from "../../matrix/matrix-room-tag-client.js";
 import { getUserJoinedRooms } from "../../matrix/matrix-admin-client.js";
 
 const router = express.Router();
@@ -140,13 +140,24 @@ router.get(
     // scan). Better to return the rooms that succeeded than to fail-closed
     // on any single Matrix hiccup.
     const assignments: Array<{ roomId: string; slug: string }> = [];
+    // Rooms the user has pinned (the chat server's favourite tag). A room
+    // that also has a project tag is listed in both; the sidebar shows it in
+    // its project (project outranks pin).
+    const pinned: string[] = [];
+    // Rooms whose tags couldn't be read this time — the client keeps what it
+    // last knew for them rather than treating them as untagged.
+    const unknown: string[] = [];
     for (const roomId of joinedResult.roomIds) {
       const tagsResult = await getRoomTags(callerMxid, roomId);
       if (tagsResult.ok === false) {
         databaseLogger.warn(
           `relay-room-project-tags-list: getRoomTags skipped roomId=${roomId} status=${tagsResult.status} error=${tagsResult.error}`,
         );
+        unknown.push(roomId);
         continue;
+      }
+      if (Object.prototype.hasOwnProperty.call(tagsResult.tags, FAVOURITE_TAG)) {
+        pinned.push(roomId);
       }
       // 6. Filter for u.project.<slug> tags. Matrix's tag namespace guarantees
       // one project-tag per room via D-05a read-modify-write, but we
@@ -163,10 +174,10 @@ router.get(
     }
 
     databaseLogger.info(
-      `relay-room-project-tags-list: userId=${userId} mxid=${callerMxid} hostId=${hostId} roomsScanned=${joinedResult.roomIds.length} assignments=${assignments.length}`,
+      `relay-room-project-tags-list: userId=${userId} mxid=${callerMxid} hostId=${hostId} roomsScanned=${joinedResult.roomIds.length} assignments=${assignments.length} pinned=${pinned.length} unknown=${unknown.length}`,
     );
 
-    res.json({ assignments });
+    res.json({ assignments, pinned, unknown });
     return;
   },
 );

@@ -23,6 +23,8 @@ const attention = vi.hoisted(() => ({
   loadReadState: vi.fn(() => Promise.resolve()),
 }));
 vi.mock("@/state/attention-store", () => attention);
+const conversationStore = vi.hoisted(() => ({ applyRoomPlacement: vi.fn() }));
+vi.mock("@/state/conversation-store", () => conversationStore);
 
 // ---------------------------------------------------------------------------
 // Minimal WS stub matching the browser WebSocket API surface used by the client
@@ -1934,6 +1936,42 @@ describe("fleet-status-client: unread marks plumbing", () => {
       }),
     });
     expect(attention.applyRemoteDm).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("fleet-status-client: relay-room-placement-changed dispatch", () => {
+  beforeEach(() => {
+    __disposeAllClientsForTest();
+    MockWebSocket.instances = [];
+    conversationStore.applyRoomPlacement.mockClear();
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+
+  it("puts the room where the user put it on another tab; malformed frames are dropped", () => {
+    createFleetStatusClient({
+      url: "ws://localhost/fleet-status/ws",
+      onSnapshot: vi.fn(),
+      onUpdate: vi.fn(),
+      onGone: vi.fn(),
+    });
+    const ws = latestWs();
+    ws.onopen?.();
+    const frame = (extra: Record<string, unknown>) => ({
+      data: JSON.stringify({
+        schemaVersion: FRAME_SCHEMA_VERSION,
+        type: "relay-room-placement-changed",
+        roomId: "!r:hs",
+        ...extra,
+      }),
+    });
+    ws.onmessage?.(frame({ project: null, pinned: true }));
+    expect(conversationStore.applyRoomPlacement).toHaveBeenCalledWith("!r:hs", null, true);
+    ws.onmessage?.(frame({ project: "alpha", pinned: false }));
+    expect(conversationStore.applyRoomPlacement).toHaveBeenCalledWith("!r:hs", "alpha", false);
+    ws.onmessage?.(frame({ project: null }));
+    ws.onmessage?.(frame({ project: 7, pinned: false }));
+    expect(conversationStore.applyRoomPlacement).toHaveBeenCalledTimes(2);
   });
 });
 

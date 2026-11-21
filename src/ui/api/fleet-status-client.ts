@@ -56,6 +56,7 @@ import {
 } from "@/state/skew-lock-store";
 import { applyRemoteDm, applyRemoteRoom, applyRemoteSeen, loadReadState, publishLastFinishAt } from "@/state/attention-store";
 import { handleAgentNotified, handleRoomNotified } from "@/features/notifications/browser-notifications";
+import { applyRoomPlacement } from "@/state/conversation-store";
 
 // ---------------------------------------------------------------------------
 // Constants — mirror patch #148 backoff schedule verbatim
@@ -464,6 +465,25 @@ export function createFleetStatusClient(
             title: parsed.title,
             body: parsed.body,
           });
+          break;
+        case "relay-room-placement-changed":
+          // The user pinned, unpinned or moved a room on another tab or device.
+          if (
+            typeof parsed.roomId !== "string" ||
+            (parsed.project !== null && typeof parsed.project !== "string") ||
+            typeof parsed.pinned !== "boolean"
+          ) {
+            console.warn({ operation: "fleet_status_client_room_placement_malformed", url });
+            break;
+          }
+          console.info({
+            operation: "fleet_status_client_room_placement_changed",
+            url,
+            roomId: parsed.roomId,
+            project: parsed.project,
+            pinned: parsed.pinned,
+          });
+          applyRoomPlacement(parsed.roomId, parsed.project, parsed.pinned);
           break;
         case "relay-rooms-changed":
           console.info({ operation: "fleet_status_client_relay_rooms_changed", url });

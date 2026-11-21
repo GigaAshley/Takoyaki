@@ -122,6 +122,8 @@ import {
   // supervisor's ~15s retire tick.
   removeFleetSession,
   patchRoomProjectAssignment,
+  patchRoomPinned,
+  useRoomPinnedIds,
   markPendingArchive,
   clearPendingArchive,
   mergeProjectsForHost,
@@ -144,7 +146,7 @@ import { projectKey } from "@/state/project-tree";
 // Phase 117 Plan 117-08 (D-22): project drop-handler API surface. Landed by
 // 117-06 as thin authApi wrappers; called fire-and-forget from the panel's
 // handleProjectDrop / handleFlatMiddleDrop.
-import { setSessionProject, setRelayRoomProject } from "@/api/session-project-api";
+import { setSessionProject, setRelayRoomProject, setRelayRoomPinned } from "@/api/session-project-api";
 // Phase 117 Plan 117-09 Task 2 (D-28, D-29, D-30) — archive-project cascade.
 // handleArchiveProject collects the section's members, presents the D-29
 // verbatim confirmation, fires Promise.allSettled across archiveIdentity +
@@ -592,6 +594,11 @@ const PrettyConversationRowLive = memo(function PrettyConversationRowLive(props:
   );
 });
 
+// A relay room's sidebar row (it carries the Matrix room id).
+function isRelayRoomRow(row: { roomId?: string | null }): boolean {
+  return typeof row.roomId === "string" && row.roomId.length > 0;
+}
+
 // Module-scoped scrollTop cache for the conversation-list scroll region.
 // On mobile the panel unmounts when the user opens a conversation (only the
 // list-screen wrapper mounts it — the view-screen path doesn't), so React
@@ -859,6 +866,8 @@ export function PrettyConversationsPanel({
   const viewingUserMxid = useViewingUserMxid();
   const selectedId = useSelectedConversationId();
   const pinnedIds = usePinnedIds();
+  // Relay rooms the user has pinned (the chat server's favourite tag).
+  const roomPinnedIds = useRoomPinnedIds();
   // (Phase 115 Plan 115-02: prior useHiddenIds subscription retired per D-21.
   //  115-06 introduces an archived-tree subscription driven off the sweep,
   //  not off a hiddenIds set.)
@@ -1900,7 +1909,26 @@ export function PrettyConversationsPanel({
   // The row's onTogglePin (built in PrettyConversationRowLive) then calls
   // handleSetPinned(row, !shownPinned).
   const pinModeFor = (row: ConversationRowShape): "toggle" | "none" =>
-    isIdentityRow(row) || isRowPinned(row) ? "toggle" : "none";
+    isRelayRoomRow(row) || isIdentityRow(row) || isRowPinned(row) ? "toggle" : "none";
+
+  // Relay rooms pin through the favourite tag on the user's own account.
+  // Pinning takes the room out of its project in the same write; the store
+  // patch shows it at once and the rollback undoes it if the write fails.
+  const setRoomPin = (roomId: string, wantPinned: boolean) => {
+    if (!viewingUserMxid) {
+      console.warn(`[pin] skipping relay-room pin — viewing user mxid not yet resolved (roomId=${roomId})`);
+      return;
+    }
+    console.info(`[pin] relay-room roomId=${roomId} pinned=${wantPinned}`);
+    const rollback = patchRoomPinned(roomId, wantPinned);
+    setRelayRoomPinned(roomId, viewingUserMxid, wantPinned).catch((err: unknown) => {
+      rollback();
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[pin] setRelayRoomPinned failed roomId=${roomId}: ${msg}`);
+    });
+  };
+  const setRoomPinRef = useRef(setRoomPin);
+  setRoomPinRef.current = setRoomPin;
 
   // Pinned and in-a-project are mutually exclusive. Pinning a project member
   // takes it out of the project: the backend pin route clears `project:` and
@@ -1908,6 +1936,10 @@ export function PrettyConversationsPanel({
   // pin, pinConversation is a no-op and the PUT never fires — clear the
   // project directly instead.
   const handleSetPinned = (row: ConversationRowShape, wantPinned: boolean) => {
+    if (isRelayRoomRow(row)) {
+      setRoomPin(row.roomId as string, wantPinned);
+      return;
+    }
     const shadowFleetId =
       row.host && row.targetTmuxSession
         ? fleetRowId(parseInt(row.host.id, 10), row.targetTmuxSession)
@@ -2181,6 +2213,7 @@ export function PrettyConversationsPanel({
   // active-set + grouped rows render "Unpin" when the pin was persisted
   // under the fleet-synthetic id shape.
   const isRowPinned = (row: ConversationRowShape): boolean => {
+    if (isRelayRoomRow(row)) return roomPinnedIds.has(row.roomId as string);
     const shadowFleetId =
       row.host && row.targetTmuxSession
         ? fleetRowId(parseInt(row.host.id, 10), row.targetTmuxSession)
@@ -2887,6 +2920,15 @@ export function PrettyConversationsPanel({
         p.host && typeof p.host.id === "string" && p.targetTmuxSession
           ? fleetRowId(parseInt(p.host.id, 10), p.targetTmuxSession)
           : null;
+      const roomId =
+        typeof p.matrixRoomId === "string" && p.matrixRoomId.length > 0 ? p.matrixRoomId : null;
+      if (roomId !== null && roomPinnedIds.has(roomId) && !inProject) {
+        e.preventDefault();
+        e.stopPropagation();
+        console.info(`[pin-drop] unpin relay-room from Other roomId=${roomId}`);
+        setRoomPinRef.current(roomId, false);
+        return;
+      }
       const openTabPinned = pinnedIds.has(p.id);
       const shadowPinned = shadowFleetId !== null && pinnedIds.has(shadowFleetId);
       const isPinned = openTabPinned || shadowPinned;
@@ -2932,7 +2974,7 @@ export function PrettyConversationsPanel({
         console.error(`[project-drop] setSessionProject(null) failed: ${msg}`);
       });
     },
-    [rowIdToProjectSlug, viewingUserMxid, pinnedIds, releaseFlatMiddlePreview, readSidebarDrop],
+    [rowIdToProjectSlug, viewingUserMxid, pinnedIds, roomPinnedIds, releaseFlatMiddlePreview, readSidebarDrop],
   );
 
   // Pinned-zone drop lane — mirror of the flat-middle machinery. Drop a row
@@ -3029,10 +3071,21 @@ export function PrettyConversationsPanel({
         id?: string;
         host?: { id: string } | null;
         targetTmuxSession?: string | null;
+        matrixRoomId?: string | null;
         rdpHostRow?: boolean;
       };
       if (typeof p.id !== "string" || p.id.length === 0) return;
       if (p.rdpHostRow === true) return; // D-08 defense
+      if (typeof p.matrixRoomId === "string" && p.matrixRoomId.length > 0) {
+        const roomId = p.matrixRoomId;
+        // Already pinned and not in a project — nothing to change.
+        if (roomPinnedIds.has(roomId) && !rowIdToProjectSlug.has(p.id)) return;
+        e.preventDefault();
+        e.stopPropagation();
+        console.info(`[pin-drop] pin relay-room roomId=${roomId}`);
+        setRoomPinRef.current(roomId, true);
+        return;
+      }
       const shadowFleetId =
         p.host && typeof p.host.id === "string" && p.targetTmuxSession
           ? fleetRowId(parseInt(p.host.id, 10), p.targetTmuxSession)
@@ -3058,7 +3111,7 @@ export function PrettyConversationsPanel({
       console.info(`[pin-drop] pin id=${targetId} (from rowId=${p.id})`);
       pinConversation(targetId);
     },
-    [pinnedIds, releasePinnedPreview, rowIdToProjectSlug, projectSections, readSidebarDrop],
+    [pinnedIds, roomPinnedIds, releasePinnedPreview, rowIdToProjectSlug, projectSections, readSidebarDrop],
   );
 
   // Phase 117 M-F follow-up (2026-09-18): the section's SquarePen opens the

@@ -77,6 +77,14 @@ vi.mock("../../utils/logger.js", () => ({
 
 vi.mock("../../matrix/matrix-room-tag-client.js", () => ({
   setRoomProjectTag: vi.fn(),
+  setRoomPinned: vi.fn(),
+}));
+
+// The user's other tabs learn where a room now sits.
+const mockPublishToUser = vi.fn();
+let mockRegistryReady = true;
+vi.mock("../../fleet-status/registry-holder.js", () => ({
+  getRegistry: () => (mockRegistryReady ? { publishToUser: mockPublishToUser } : null),
 }));
 
 vi.mock("../../claude-session/identity-artifact-reader.js", () => ({
@@ -133,7 +141,7 @@ vi.mock("drizzle-orm", () => ({
 // Import mocked modules AFTER vi.mock() declarations
 // ---------------------------------------------------------------------------
 
-import { setRoomProjectTag } from "../../matrix/matrix-room-tag-client.js";
+import { setRoomProjectTag, setRoomPinned } from "../../matrix/matrix-room-tag-client.js";
 
 // ---------------------------------------------------------------------------
 // HTTP request helper
@@ -210,8 +218,18 @@ beforeEach(() => {
   // Default: user "1" has mxid = CALLER_MXID.
   mockUserMxidByUserId.set("1", CALLER_MXID);
 
-  // Default: setRoomProjectTag succeeds.
-  (setRoomProjectTag as Mock).mockResolvedValue({ ok: true });
+  // Default: setRoomProjectTag / setRoomPinned succeed.
+  (setRoomProjectTag as Mock).mockImplementation(async (_m: string, _r: string, slug: string | null) => ({
+    ok: true,
+    project: slug,
+    pinned: false,
+  }));
+  (setRoomPinned as Mock).mockImplementation(async (_m: string, _r: string, pinned: boolean) => ({
+    ok: true,
+    project: null,
+    pinned,
+  }));
+  mockRegistryReady = true;
 
   // Rebuild app per test.
   const app = express();
@@ -431,5 +449,93 @@ describe("POST /relay-rooms/:roomId/project", () => {
       /userMxid does not match/i,
     );
     expect(setRoomProjectTag).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /relay-rooms/:roomId/pin", () => {
+  const pin = (body: unknown, roomId = ROOM_ID) =>
+    httpRequest(server, {
+      method: "POST",
+      path: `/relay-rooms/${encodeURIComponent(roomId)}/pin`,
+      body,
+    });
+
+  it("pin → 200; setRoomPinned(mxid, roomId, true); tells only this user's tabs it's pinned and out of any project", async () => {
+    const res = await pin({ userMxid: CALLER_MXID, pinned: true });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true });
+    expect(setRoomPinned).toHaveBeenCalledWith(CALLER_MXID, ROOM_ID, true);
+    expect(mockPublishToUser).toHaveBeenCalledTimes(1);
+    expect(mockPublishToUser).toHaveBeenCalledWith("1", {
+      schemaVersion: 1,
+      type: "relay-room-placement-changed",
+      roomId: ROOM_ID,
+      project: null,
+      pinned: true,
+    });
+  });
+
+  it("unpin → 200; publishes pinned:false", async () => {
+    const res = await pin({ userMxid: CALLER_MXID, pinned: false });
+    expect(res.status).toBe(200);
+    expect(setRoomPinned).toHaveBeenCalledWith(CALLER_MXID, ROOM_ID, false);
+    expect(mockPublishToUser.mock.calls[0][1]).toMatchObject({ project: null, pinned: false });
+  });
+
+  it("pinned missing or not a boolean → 400; nothing written", async () => {
+    expect((await pin({ userMxid: CALLER_MXID })).status).toBe(400);
+    expect((await pin({ userMxid: CALLER_MXID, pinned: "yes" })).status).toBe(400);
+    expect(setRoomPinned).not.toHaveBeenCalled();
+  });
+
+  it("bad roomId or missing userMxid → 400", async () => {
+    expect((await pin({ userMxid: CALLER_MXID, pinned: true }, "not-a-room")).status).toBe(400);
+    expect((await pin({ pinned: true })).status).toBe(400);
+    expect(setRoomPinned).not.toHaveBeenCalled();
+  });
+
+  it("someone else's mxid → 403; nothing written", async () => {
+    const res = await pin({ userMxid: "@other:harbor.example-tailnet.ts.net", pinned: true });
+    expect(res.status).toBe(403);
+    expect(setRoomPinned).not.toHaveBeenCalled();
+    expect(mockPublishToUser).not.toHaveBeenCalled();
+  });
+
+  it("chat server write fails → 502 with the code; nothing published", async () => {
+    (setRoomPinned as Mock).mockResolvedValue({ ok: false, status: 502, error: "matrix_room_tag_non_2xx" });
+    const res = await pin({ userMxid: CALLER_MXID, pinned: true });
+    expect(res.status).toBe(502);
+    expect(res.body).toEqual({ error: "matrix write failed", code: "matrix_room_tag_non_2xx" });
+    expect(mockPublishToUser).not.toHaveBeenCalled();
+  });
+
+  it("publishes what the write left, not what was asked — an unpin that kept a project says so", async () => {
+    (setRoomPinned as Mock).mockResolvedValue({ ok: true, project: "alpha", pinned: false });
+    await pin({ userMxid: CALLER_MXID, pinned: false });
+    expect(mockPublishToUser.mock.calls[0][1]).toMatchObject({ project: "alpha", pinned: false });
+  });
+
+  it("registry not ready → still 200 (the write landed)", async () => {
+    mockRegistryReady = false;
+    const res = await pin({ userMxid: CALLER_MXID, pinned: true });
+    expect(res.status).toBe(200);
+  });
+});
+
+describe("POST /relay-rooms/:roomId/project — placement frame", () => {
+  it("filing a room tells this user's tabs its project (and that it's unpinned)", async () => {
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: `/relay-rooms/${encodeURIComponent(ROOM_ID)}/project`,
+      body: { userMxid: CALLER_MXID, project: "alpha" },
+    });
+    expect(res.status).toBe(200);
+    expect(mockPublishToUser).toHaveBeenCalledWith("1", {
+      schemaVersion: 1,
+      type: "relay-room-placement-changed",
+      roomId: ROOM_ID,
+      project: "alpha",
+      pinned: false,
+    });
   });
 });

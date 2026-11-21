@@ -347,6 +347,8 @@ let mockFleetSessionsSnapshot: unknown[] = [];
 vi.mock("@/state/conversation-store", () => ({
   upsertFleetSession: (session: unknown) => upsertFleetSessionSpy(session),
   patchRoomProjectAssignment: () => () => {},
+  patchRoomPinned: () => () => {},
+  useRoomPinnedIds: () => new Set<string>(),
   useConversations: () => ({
     activeSet: snapshot.activeSet,
     pinned: snapshot.pinned,

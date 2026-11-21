@@ -4,25 +4,27 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { renderHook, act } from "@testing-library/react";
 
-const pinned = new Set<string>();
+let roomPinned = false;
 let assigned: string | null = null;
 vi.mock("@/state/conversation-store", () => ({
-  usePinnedIds: () => pinned,
+  useRoomPinned: () => roomPinned,
   useProjects: () => [
     { slug: "plans", displayName: "Plans", hostId: "1", archived: false },
     { slug: "old", displayName: "Old", hostId: "1", archived: true },
   ],
   useRoomProjectSlug: () => assigned,
   useHostTree: () => null,
-  pinConversation: vi.fn((id: string) => pinned.add(id)),
-  unpinConversation: vi.fn((id: string) => pinned.delete(id)),
   patchRoomProjectAssignment: vi.fn(() => () => {}),
+  patchRoomPinned: vi.fn(() => () => {}),
 }));
 vi.mock("@/state/project-tree", () => ({
   orderProjectsAsTree: (ps: Array<{ slug: string }>) => ps.map((project) => ({ project, depth: 0 })),
 }));
 vi.mock("@/state/viewing-user-store", () => ({ useViewingUserMxid: () => "@viewer:hs" }));
-vi.mock("@/api/session-project-api", () => ({ setRelayRoomProject: vi.fn(() => Promise.resolve()) }));
+vi.mock("@/api/session-project-api", () => ({
+  setRelayRoomProject: vi.fn(() => Promise.resolve()),
+  setRelayRoomPinned: vi.fn(() => Promise.resolve()),
+}));
 vi.mock("@/features/pretty-conversations/relay-room-row-actions", () => ({
   confirmAndLeaveRelayRoom: vi.fn(),
   promptAndRenameRelayRoom: vi.fn(),
@@ -32,9 +34,9 @@ let mobile = false;
 vi.mock("@/hooks/use-mobile", () => ({ useIsMobile: () => mobile }));
 
 import { useRelayRoomPaneMenu } from "./relay-room-pane-menu";
-import { setRelayRoomProject } from "@/api/session-project-api";
+import { setRelayRoomPinned, setRelayRoomProject } from "@/api/session-project-api";
 import { confirmAndLeaveRelayRoom, promptAndRenameRelayRoom } from "@/features/pretty-conversations/relay-room-row-actions";
-import { pinConversation, unpinConversation } from "@/state/conversation-store";
+import { patchRoomPinned } from "@/state/conversation-store";
 
 const ROOM = "!room:hs";
 
@@ -46,7 +48,7 @@ function menu(onCloseTab = vi.fn()) {
 }
 
 beforeEach(() => {
-  pinned.clear();
+  roomPinned = false;
   assigned = null;
   mobile = false;
   vi.clearAllMocks();
@@ -74,21 +76,42 @@ describe("room pill menu", () => {
     expect(confirmAndLeaveRelayRoom).toHaveBeenCalledWith({ roomId: ROOM, title: "Plans room" });
   });
 
-  it("Move to offers the live projects and New project… (no Pinned, as on the room's sidebar menu) and files the room", () => {
+  it("Move to offers Pinned, the live projects and New project…, as on the room's sidebar menu, and files the room", () => {
     const moveTo = menu().items.find((i) => i.label === "Move to")!;
     const sub = moveTo.submenu!;
-    expect(sub.map((s) => s.label)).toEqual(["Plans", "New project…"]);
+    expect(sub.map((s) => s.label)).toEqual(["Pinned", "Plans", "New project…"]);
+    expect(sub.find((s) => s.label === "Pinned")!.checked).toBe(false);
     act(() => sub.find((s) => s.label === "Plans")!.onClick!());
     expect(setRelayRoomProject).toHaveBeenCalledWith(ROOM, "@viewer:hs", "plans");
-    expect(pinConversation).not.toHaveBeenCalled();
+    expect(setRelayRoomPinned).not.toHaveBeenCalled();
   });
 
-  it("a leftover local pin is dropped when the room is moved, so it lands where it was put", () => {
-    pinned.add("tab-r");
+  it("Pinned pins the room as the user", () => {
+    const sub = menu().items.find((i) => i.label === "Move to")!.submenu!;
+    act(() => sub.find((s) => s.label === "Pinned")!.onClick!());
+    expect(patchRoomPinned).toHaveBeenCalledWith(ROOM, true);
+    expect(setRelayRoomPinned).toHaveBeenCalledWith(ROOM, "@viewer:hs", true);
+  });
+
+  it("a pinned room shows Pinned checked and offers Unpin", () => {
+    roomPinned = true;
+    const sub = menu().items.find((i) => i.label === "Move to")!.submenu!;
+    expect(sub.map((s) => s.label)).toEqual(["Pinned", "Plans", "New project…", "Unpin"]);
+    expect(sub.find((s) => s.label === "Pinned")!.checked).toBe(true);
+    act(() => sub.find((s) => s.label === "Pinned")!.onClick!());
+    expect(setRelayRoomPinned).not.toHaveBeenCalled();
+    act(() => sub.find((s) => s.label === "Unpin")!.onClick!());
+    expect(setRelayRoomPinned).toHaveBeenCalledWith(ROOM, "@viewer:hs", false);
+  });
+
+  it("a room both favourited and in a project shows in its project: Pinned unchecked, Remove from project offered", () => {
+    roomPinned = true;
     assigned = "plans";
     const sub = menu().items.find((i) => i.label === "Move to")!.submenu!;
-    act(() => sub.find((s) => s.label === "Remove from project")!.onClick!());
-    expect(unpinConversation).toHaveBeenCalledWith("tab-r");
+    expect(sub.find((s) => s.label === "Pinned")!.checked).toBe(false);
+    expect(sub.find((s) => s.label === "Plans")!.checked).toBe(true);
+    expect(sub.map((s) => s.label)).toContain("Remove from project");
+    expect(sub.map((s) => s.label)).not.toContain("Unpin");
   });
 
   it("never names the room by its id before its name is known", () => {

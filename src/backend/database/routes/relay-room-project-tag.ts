@@ -59,9 +59,11 @@ import { db } from "../db/index.js";
 import { users } from "../db/schema.js";
 import { AuthManager } from "../../utils/auth-manager.js";
 import { databaseLogger } from "../../utils/logger.js";
-import { setRoomProjectTag } from "../../matrix/matrix-room-tag-client.js";
+import { setRoomProjectTag, setRoomPinned } from "../../matrix/matrix-room-tag-client.js";
 import { assertAdminErr } from "../../matrix/matrix-admin-narrow.js";
 import { PROJECT_SLUG_RE } from "../../claude-session/identity-artifact-reader.js";
+import { getRegistry } from "../../fleet-status/registry-holder.js";
+import { FRAME_SCHEMA_VERSION } from "../../fleet-status/wire-protocol.js";
 // Phase 117 H2 fix (2026-09-18): getSubscriptionRegistry import removed —
 // this route no longer publishes anything after a room-tag write (see the
 // intentionally-omitted publish block below for the full rationale).
@@ -266,8 +268,109 @@ router.post(
     databaseLogger.info(
       `relay-room project tag written: userId=${userId} userMxid=${userMxid} roomId=${roomId} project=${project ?? "null"}`,
     );
+    // The user's other tabs and devices learn the move from this frame —
+    // what the write actually left on the room (it always unpins).
+    publishRoomPlacement(userId, roomId, result.project, result.pinned);
     res.json({ ok: true });
     return;
+  },
+);
+
+/**
+ * Tell every open tab of `userId` where one of their rooms now sits — in a
+ * project, pinned, or neither (never both). Sent only to that user.
+ */
+function publishRoomPlacement(
+  userId: string,
+  roomId: string,
+  project: string | null,
+  pinned: boolean,
+): void {
+  const registry = getRegistry();
+  if (!registry) {
+    databaseLogger.warn(
+      `relay-room placement: registry not ready, tabs not told userId=${userId} roomId=${roomId}`,
+    );
+    return;
+  }
+  registry.publishToUser(userId, {
+    schemaVersion: FRAME_SCHEMA_VERSION,
+    type: "relay-room-placement-changed",
+    roomId,
+    project,
+    pinned,
+  });
+}
+
+/**
+ * POST /:roomId/pin  body: { userMxid: string, pinned: boolean }
+ *
+ * Pins (the chat server's favourite tag) or unpins the room for the acting
+ * user. Pinning takes the room out of its project in the same write.
+ *
+ * Errors mirror POST /:roomId/project:
+ *   - 400 invalid_room_id / userMxid is required / pinned must be a boolean
+ *   - 403 userMxid does not match authenticated user
+ *   - 500 failed to set room pin
+ *   - 502 matrix write failed
+ */
+router.post(
+  "/:roomId/pin",
+  authenticateJWT,
+  async (req: Request, res: Response): Promise<void> => {
+    const userId = (req as AuthenticatedRequest).userId;
+    const roomId = String(req.params.roomId ?? "");
+    if (!roomId || !MATRIX_ROOM_ID_RE.test(roomId)) {
+      res.status(400).json({ error: "invalid_room_id" });
+      return;
+    }
+    const body = (req.body ?? {}) as { userMxid?: unknown; pinned?: unknown };
+    const userMxid = body.userMxid;
+    if (typeof userMxid !== "string" || !MXID_RE.test(userMxid)) {
+      res.status(400).json({ error: "userMxid is required" });
+      return;
+    }
+    if (typeof body.pinned !== "boolean") {
+      res.status(400).json({ error: "pinned must be a boolean" });
+      return;
+    }
+    const pinned = body.pinned;
+    const callerMxid = await lookupCallerMxid(userId);
+    if (callerMxid === null || callerMxid !== userMxid) {
+      res
+        .status(403)
+        .json({ error: "userMxid does not match authenticated user" });
+      return;
+    }
+
+    let result: Awaited<ReturnType<typeof setRoomPinned>>;
+    try {
+      result = await setRoomPinned(userMxid, roomId, pinned);
+    } catch (err) {
+      databaseLogger.error(
+        `failed to set room pin userMxid=${userMxid} roomId=${roomId} pinned=${pinned}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      res.status(500).json({ error: "failed to set room pin" });
+      return;
+    }
+    if (!result.ok) {
+      assertAdminErr(result);
+      databaseLogger.warn(
+        `matrix room pin write failed userMxid=${userMxid} roomId=${roomId} pinned=${pinned} status=${result.status} error=${result.error}`,
+      );
+      res.status(502).json({ error: "matrix write failed", code: result.error });
+      return;
+    }
+
+    databaseLogger.info(
+      `relay-room pin written: userId=${userId} userMxid=${userMxid} roomId=${roomId} pinned=${pinned}`,
+    );
+    // What the write actually left: pinning clears the project; unpinning
+    // keeps any project the room has.
+    publishRoomPlacement(userId, roomId, result.project, result.pinned);
+    res.json({ ok: true });
   },
 );
 

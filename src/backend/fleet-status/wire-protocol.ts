@@ -868,6 +868,22 @@ export const FrontendRelayRoomNotifiedFrameSchema = z.object({
   body: z.string(),
 });
 
+// ---------------------------------------------------------------------------
+// relay-room-placement-changed — the user pinned, unpinned or moved one of
+// their relay rooms (pinned and in a project are exclusive: `project` is null
+// whenever `pinned` is true). Sent ONLY to that user's own subscribers, so
+// their other tabs and devices follow. Additive — FRAME_SCHEMA_VERSION stays
+// at 1.
+// ---------------------------------------------------------------------------
+
+export const FrontendRelayRoomPlacementChangedFrameSchema = z.object({
+  schemaVersion: z.literal(FRAME_SCHEMA_VERSION),
+  type: z.literal("relay-room-placement-changed"),
+  roomId: z.string(),
+  project: z.string().nullable(),
+  pinned: z.boolean(),
+});
+
 export const FrontendOutboundFrame = z.discriminatedUnion("type", [
   FrontendSnapshotFrameSchema,
   FrontendUpdateFrameSchema,
@@ -881,6 +897,7 @@ export const FrontendOutboundFrame = z.discriminatedUnion("type", [
   FrontendRelayRoomsChangedFrameSchema,
   FrontendRelayRoomAttentionChangedFrameSchema,
   FrontendRelayRoomNotifiedFrameSchema,
+  FrontendRelayRoomPlacementChangedFrameSchema,
   AppSnapshotFrameSchema,
   AppUpdateFrameSchema,
   AppGoneFrameSchema,

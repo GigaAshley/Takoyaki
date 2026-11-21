@@ -511,6 +511,18 @@ export interface FrontendRelayRoomNotifiedFrame {
   body: string;
 }
 
+// relay-room-placement-changed — the user pinned, unpinned or moved one of
+// their relay rooms on another tab or device. `project` is null whenever
+// `pinned` is true. Mirrors wire-protocol.ts
+// FrontendRelayRoomPlacementChangedFrameSchema.
+export interface FrontendRelayRoomPlacementChangedFrame {
+  schemaVersion: typeof FRAME_SCHEMA_VERSION;
+  type: "relay-room-placement-changed";
+  roomId: string;
+  project: string | null;
+  pinned: boolean;
+}
+
 export type FrontendOutboundFrame =
   | FrontendSnapshotFrame
   | FrontendUpdateFrame
@@ -524,6 +536,7 @@ export type FrontendOutboundFrame =
   | FrontendRelayRoomsChangedFrame
   | FrontendRelayRoomAttentionChangedFrame
   | FrontendRelayRoomNotifiedFrame
+  | FrontendRelayRoomPlacementChangedFrame
   | FrontendAppSnapshotFrame
   | FrontendAppUpdateFrame
   | FrontendAppGoneFrame;

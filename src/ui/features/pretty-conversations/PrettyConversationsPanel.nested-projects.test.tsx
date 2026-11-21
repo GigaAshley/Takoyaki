@@ -224,6 +224,8 @@ let mockFleetSessionsLoaded = true;
 vi.mock("@/state/conversation-store", () => ({
   upsertFleetSession: () => {},
   patchRoomProjectAssignment: () => () => {},
+  patchRoomPinned: () => () => {},
+  useRoomPinnedIds: () => new Set<string>(),
   markPendingArchive: () => {},
   clearPendingArchive: () => {},
   removeFleetSession: () => {},

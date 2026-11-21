@@ -231,10 +231,17 @@ const hydratePinnedIdsFromServerSpy = vi.fn();
 
 let mockActiveSet: ReadonlySet<string> = new Set();
 let mockFleetSessionsLoaded = true;
+const patchRoomPinnedSpy = vi.fn<(roomId: string, pinned: boolean) => void>();
+let mockRoomPinnedIds: ReadonlySet<string> = new Set();
 
 vi.mock("@/state/conversation-store", () => ({
   upsertFleetSession: () => {},
   patchRoomProjectAssignment: () => () => {},
+  patchRoomPinned: (roomId: string, pinned: boolean) => {
+    patchRoomPinnedSpy(roomId, pinned);
+    return () => {};
+  },
+  useRoomPinnedIds: () => mockRoomPinnedIds,
   markPendingArchive: () => {},
   clearPendingArchive: () => {},
   removeFleetSession: () => {},
@@ -281,6 +288,9 @@ vi.mock("@/state/use-collapsed-project-slugs", () => ({
 const setSessionProjectSpy = vi.fn<
   (hostId: number, key: string, slug: string | null) => Promise<{ ok: true }>
 >(async () => ({ ok: true as const }));
+const setRelayRoomPinnedSpy = vi.fn<
+  (roomId: string, mxid: string, pinned: boolean) => Promise<{ ok: true }>
+>(async () => ({ ok: true as const }));
 const setRelayRoomProjectSpy = vi.fn<
   (roomId: string, mxid: string, slug: string | null) => Promise<{ ok: true }>
 >(async () => ({ ok: true as const }));
@@ -289,6 +299,8 @@ vi.mock("@/api/session-project-api", () => ({
     setSessionProjectSpy(hostId, key, slug),
   setRelayRoomProject: (roomId: string, mxid: string, slug: string | null) =>
     setRelayRoomProjectSpy(roomId, mxid, slug),
+  setRelayRoomPinned: (roomId: string, mxid: string, pinned: boolean) =>
+    setRelayRoomPinnedSpy(roomId, mxid, pinned),
 }));
 
 // Phase 117 Plan 117-09 — project-list-api mock. The CreateProjectModal
@@ -567,6 +579,7 @@ beforeEach(() => {
   mockCollapsed = new Set();
   mockProjects = [];
   mockActiveSet = new Set();
+  mockRoomPinnedIds = new Set();
   mockFleetSessionsLoaded = true;
   localStorage.removeItem("pv-projects-section-collapsed");
 });
@@ -3178,5 +3191,112 @@ describe("PrettyConversationsPanel (shape-sidebar): section headings", () => {
     const empty = container.querySelector('[data-testid="pv-flat-middle-empty"]') as HTMLElement;
     expect(empty).not.toBeNull();
     expect(empty.textContent).toBe("Start a conversation with the pencil at the top.");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pinning relay rooms — the favourite tag on the user's own account
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("PrettyConversationsPanel: pinning relay rooms", () => {
+  const ROOM_ID = "!room-p:matrix.example";
+  const roomRow = (): MockRow => ({
+    id: "relay-row-p",
+    type: "terminal",
+    label: "Room P",
+    host: undefined,
+    targetTmuxSession: null,
+    kind: "relay-room",
+    roomId: ROOM_ID,
+    roomTitle: "Room P",
+  });
+  const renderPanel = () =>
+    render(
+      <PrettyConversationsPanel isAdmin
+        variant="desktop"
+        hostTree={HOST_TREE}
+        onCreateSession={() => {}}
+        onDeactivateRow={() => {}}
+      />,
+    );
+  const openMoveTo = async (container: HTMLElement) => {
+    const rowWrapper = container.querySelector(
+      '[data-conversation-id="relay-row-p"]',
+    ) as HTMLElement;
+    const body = rowWrapper.querySelector('[role="button"]') as HTMLElement;
+    await openRowKebabInBody(body);
+    await userEvent.setup().click(
+      within(screen.getByRole("menu")).getByRole("menuitem", { name: /^move to$/i }),
+    );
+  };
+
+  it("Move to → Pinned pins the room as the user", async () => {
+    setSnapshot({ middle: [roomRow()] });
+    const { container } = renderPanel();
+    await openMoveTo(container);
+    await userEvent.setup().click(screen.getByTestId("pv-row-kebab-item-move-to-pinned"));
+    expect(patchRoomPinnedSpy).toHaveBeenCalledWith(ROOM_ID, true);
+    expect(setRelayRoomPinnedSpy).toHaveBeenCalledWith(ROOM_ID, "@user:matrix.example", true);
+    expect(pinConversationSpy).not.toHaveBeenCalled();
+  });
+
+  it("a pinned room's Move to shows Pinned checked and offers Unpin", async () => {
+    mockRoomPinnedIds = new Set([ROOM_ID]);
+    setSnapshot({ pinned: [roomRow()], pinnedUnassigned: [roomRow()] });
+    const { container } = renderPanel();
+    await openMoveTo(container);
+    await userEvent.setup().click(screen.getByTestId("pv-row-kebab-item-unpin"));
+    expect(patchRoomPinnedSpy).toHaveBeenCalledWith(ROOM_ID, false);
+    expect(setRelayRoomPinnedSpy).toHaveBeenCalledWith(ROOM_ID, "@user:matrix.example", false);
+    expect(unpinConversationSpy).not.toHaveBeenCalled();
+  });
+
+  it("a room in a project: Move to → Pinned pins it (the backend takes it out of the project)", async () => {
+    mockProjects = [
+      { slug: "alpha", displayName: "Alpha", hostId: "1", hostname: "hostA", archived: false },
+    ];
+    setSnapshot({
+      projectSections: [{ slug: "alpha", displayName: "Alpha", rows: [roomRow()] }],
+    });
+    const { container } = renderPanel();
+    await openMoveTo(container);
+    await userEvent.setup().click(screen.getByTestId("pv-row-kebab-item-move-to-pinned"));
+    expect(setRelayRoomPinnedSpy).toHaveBeenCalledWith(ROOM_ID, "@user:matrix.example", true);
+    expect(setRelayRoomProjectSpy).not.toHaveBeenCalled();
+  });
+
+  it("dropping a room on Pinned pins it", () => {
+    setSnapshot({ middle: [roomRow()] });
+    const { container } = renderPanel();
+    const zone = container.querySelector('[data-pinned-group="true"]') as HTMLElement;
+    const dt = makeDataTransferStub({
+      "application/x-skynet-row": JSON.stringify({
+        id: "relay-row-p",
+        matrixRoomId: ROOM_ID,
+        rdpHostRow: false,
+      }),
+    });
+    dispatchDragOverAt(zone, 10, 10, dt);
+    dispatchDrop(zone, dt);
+    expect(setRelayRoomPinnedSpy).toHaveBeenCalledWith(ROOM_ID, "@user:matrix.example", true);
+    expect(pinConversationSpy).not.toHaveBeenCalled();
+  });
+
+  it("dropping a pinned room on Conversations unpins it", () => {
+    mockRoomPinnedIds = new Set([ROOM_ID]);
+    setSnapshot({ pinned: [roomRow()], pinnedUnassigned: [roomRow()] });
+    const { container } = renderPanel();
+    const zone = container.querySelector('[data-testid="pv-panel-flat-middle"]') as HTMLElement;
+    const dt = makeDataTransferStub({
+      "application/x-skynet-row": JSON.stringify({
+        id: "relay-row-p",
+        matrixRoomId: ROOM_ID,
+        rdpHostRow: false,
+      }),
+    });
+    dispatchDragOverAt(zone, 10, 10, dt);
+    dispatchDrop(zone, dt);
+    expect(setRelayRoomPinnedSpy).toHaveBeenCalledWith(ROOM_ID, "@user:matrix.example", false);
+    expect(setRelayRoomProjectSpy).not.toHaveBeenCalled();
   });
 });

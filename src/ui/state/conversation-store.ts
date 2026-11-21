@@ -5,7 +5,7 @@
 // amended Phase 44 Plan 04 to flip Rule 1 to null-to-bottom):
 //   - Three-zone conversation list: pinned (top, stable), middle (flat, recency-
 //     desc with null-to-bottom), rdpGroup (bottom, stable).
-//   - Pinned zone + activeSet + RDP zone use `compareByHostRoleLabel`
+//   - Pinned zone sorts by name alone (agents and rooms mixed); activeSet + RDP zone use `compareByHostRoleLabel`
 //     — (host outer, role middle, label inner), case-insensitive, null-role
 //     sorts last. Pre-Phase-41 the middle also used this comparator; Phase 41
 //     flipped the middle to `compareByRecencyDesc` (freshest activity first;
@@ -497,6 +497,10 @@ type State = {
   // (117-07 relay-room-project-tags-list route) — D-05 relay-room carrier is
   // the u.project.<slug> Matrix account_data tag.
   roomProjectAssignments: Map<string, string>;
+  // Relay rooms the user has pinned, by roomId — the chat server's favourite
+  // tag on the user's own account. Hydrated alongside roomProjectAssignments;
+  // a room in both shows in its project (project outranks pin).
+  roomPinnedIds: Set<string>;
 };
 
 /**
@@ -563,6 +567,7 @@ let state: State = {
   projects: _cachedProjects.projects,
   identityProjectAssignments: _cachedProjects.identityProjectAssignments,
   roomProjectAssignments: _cachedProjects.roomProjectAssignments,
+  roomPinnedIds: _cachedProjects.roomPinnedIds,
 };
 
 // Plan 06-04 race defense (T-06-04-04): openTab's setTabs is batched — the
@@ -1204,7 +1209,18 @@ function computeSnapshot(): ConversationList {
   // Patch #149 B: previously iterated only conversationTabs; now ALSO iterates
   // fleetSyntheticRows so fleet-derived pinned rows surface at the top.
   const pinned: ConversationRow[] = [];
+  // Pinned relay rooms (the favourite tag), one row each however many tabs
+  // of the room are open; the middle tier below skips these rooms.
+  const pinnedRelayRoomIds = new Set<string>();
   for (const tab of conversationTabs) {
+    if (tab.sessionKind === "relay-room" && tab.relayRoomId) {
+      if (!state.roomPinnedIds.has(tab.relayRoomId)) continue;
+      if (pinnedRelayRoomIds.has(tab.relayRoomId)) continue;
+      pinnedRelayRoomIds.add(tab.relayRoomId);
+      pinned.push(rowFromTab(tab, sessionRoleByKey));
+      emittedIds.add(tab.id);
+      continue;
+    }
     // patch #230 B: a URL-restored (or freshly-opened) tab has a
     // dynamic openTab id (`hostname-terminal-${Date.now()}-${counter}`,
     // AppShell.openTab L1033) that never matches the fleet-format id
@@ -1236,13 +1252,34 @@ function computeSnapshot(): ConversationList {
     emittedIds.add(tab.id);
   }
   for (const { row } of fleetSyntheticRows) {
+    if (row.kind === "relay-room" && row.roomId !== undefined) {
+      if (!state.roomPinnedIds.has(row.roomId)) continue;
+      if (pinnedRelayRoomIds.has(row.roomId)) continue;
+      pinnedRelayRoomIds.add(row.roomId);
+      pinned.push(row);
+      emittedIds.add(row.id);
+      continue;
+    }
     if (!state.pinnedIds.has(row.id)) continue;
     // Defensive dedup — see comment above.
     if (emittedIds.has(row.id)) continue;
     pinned.push(row);
     emittedIds.add(row.id);
   }
-  pinned.sort(compareByHostRoleLabel);
+  // Pinned sorts by name alone — agents by their name, rooms by the room's
+  // name — mixed together, compared the way a project section compares names.
+  // Equal names fall back to the row id so they never swap places.
+  const pinnedName = (row: ConversationRow): string => {
+    if (row.roomId !== undefined) return row.roomTitle ?? row.label ?? "";
+    const matchKey = row.targetTmuxSession ? sessionMatchKey(row.targetTmuxSession) : null;
+    const identity = matchKey ? state.identitiesByKey.get(matchKey) : undefined;
+    return identity?.displayName || row.label || "";
+  };
+  pinned.sort(
+    (a, b) =>
+      pinnedName(a).localeCompare(pinnedName(b), undefined, { sensitivity: "base" }) ||
+      (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+  );
   for (const row of pinned) decorateAttention(row);
 
   // ── Middle zone (Phase 41 Plan 01): FLAT list of non-pinned / non-RDP
@@ -1273,6 +1310,7 @@ function computeSnapshot(): ConversationList {
   for (const tab of conversationTabs) {
     if (emittedIds.has(tab.id)) continue; // already in pinned tier
     if (tab.sessionKind === "relay-room" && tab.relayRoomId) {
+      if (pinnedRelayRoomIds.has(tab.relayRoomId)) continue;
       if (emittedRelayRoomIds.has(tab.relayRoomId)) continue;
       emittedRelayRoomIds.add(tab.relayRoomId);
     }
@@ -1288,6 +1326,7 @@ function computeSnapshot(): ConversationList {
   }
   for (const { row } of fleetSyntheticRows) {
     if (emittedIds.has(row.id)) continue; // already in pinned tier
+    if (row.roomId !== undefined && pinnedRelayRoomIds.has(row.roomId)) continue;
     middleRows.push(row);
     middleInsertionOrder.set(row, middlePushIndex++);
   }
@@ -2440,6 +2479,7 @@ type CachedProjectsSlice = {
   projects: ProjectRow[];
   identityProjectAssignments: Map<string, string>;
   roomProjectAssignments: Map<string, string>;
+  roomPinnedIds: Set<string>;
 };
 
 function isProjectRow(x: unknown): x is ProjectRow {
@@ -2472,6 +2512,7 @@ export function readProjectsCache(): CachedProjectsSlice {
     projects: [],
     identityProjectAssignments: new Map(),
     roomProjectAssignments: new Map(),
+    roomPinnedIds: new Set(),
   };
   try {
     // v2: owner-tagged — mismatch returns null + clears the key.
@@ -2508,7 +2549,13 @@ export function readProjectsCache(): CachedProjectsSlice {
         roomProjectAssignments.set(k, v);
       }
     }
-    return { projects, identityProjectAssignments, roomProjectAssignments };
+    const roomPinnedIds = new Set<string>();
+    if (Array.isArray(p.roomPinnedIds)) {
+      for (const id of p.roomPinnedIds) {
+        if (typeof id === "string" && id.length > 0) roomPinnedIds.add(id);
+      }
+    }
+    return { projects, identityProjectAssignments, roomProjectAssignments, roomPinnedIds };
   } catch {
     return empty;
   }
@@ -2534,6 +2581,7 @@ export function writeProjectsCache(slice: CachedProjectsSlice): void {
       roomProjectAssignments: Array.from(
         slice.roomProjectAssignments.entries(),
       ),
+      roomPinnedIds: Array.from(slice.roomPinnedIds),
     };
     writeUserScopedCache(PROJECTS_CACHE_KEY, payload);
   } catch {
@@ -2552,6 +2600,7 @@ function persistProjectsSlice(): void {
     projects: state.projects,
     identityProjectAssignments: state.identityProjectAssignments,
     roomProjectAssignments: state.roomProjectAssignments,
+    roomPinnedIds: state.roomPinnedIds,
   });
 }
 
@@ -3107,21 +3156,135 @@ export function setRoomProjectAssignments(
 // remove never showed until reload. Returns a rollback for the caller's
 // failure path — it restores the previous slug only if the assignment still
 // holds the value this call set (a newer move wins).
+// Any project write also unpins the room (the backend drops the favourite
+// tag in the same write) — filing it, or "Remove from project" on a room that
+// somehow carried both. The rollback puts the pin back too.
 export function patchRoomProjectAssignment(
   roomId: string,
   slug: string | null,
 ): () => void {
   const prev = state.roomProjectAssignments.get(roomId) ?? null;
-  const apply = (value: string | null): void => {
-    const next = new Map(state.roomProjectAssignments);
-    if (value === null) next.delete(roomId);
-    else next.set(roomId, value);
-    setRoomProjectAssignments(next);
-  };
-  apply(slug);
+  const prevPinned = state.roomPinnedIds.has(roomId);
+  applyRoomPlacement(roomId, slug, false);
   return () => {
-    if ((state.roomProjectAssignments.get(roomId) ?? null) === slug) apply(prev);
+    if (
+      (state.roomProjectAssignments.get(roomId) ?? null) === slug &&
+      !state.roomPinnedIds.has(roomId)
+    ) {
+      applyRoomPlacement(roomId, prev, prevPinned);
+    }
   };
+}
+
+/**
+ * Replace the set of pinned relay rooms (the chat server's favourite tag).
+ * Called by AppShell's boot-time hydration alongside the room → project map.
+ */
+export function setRoomPinnedIds(ids: Iterable<string>): void {
+  const next = new Set(ids);
+  const cur = state.roomPinnedIds;
+  if (next.size === cur.size && [...next].every((id) => cur.has(id))) return;
+  state = { ...state, roomPinnedIds: next };
+  persistProjectsSlice();
+  notify();
+}
+
+// Optimistic single-room pin / unpin. Pinning also takes the room out of its
+// project (the backend does both in one write). Returns a rollback that
+// restores the previous pin and project only if nothing newer changed them.
+export function patchRoomPinned(roomId: string, pinned: boolean): () => void {
+  const prevPinned = state.roomPinnedIds.has(roomId);
+  const prevSlug = state.roomProjectAssignments.get(roomId) ?? null;
+  applyRoomPlacement(roomId, pinned ? null : prevSlug, pinned);
+  return () => {
+    if (
+      state.roomPinnedIds.has(roomId) === pinned &&
+      (state.roomProjectAssignments.get(roomId) ?? null) === (pinned ? null : prevSlug)
+    ) {
+      applyRoomPlacement(roomId, prevSlug, prevPinned);
+    }
+  };
+}
+
+// Each room's last local placement change (optimistic write or live frame),
+// numbered, so a slower server reload started before it doesn't undo it.
+let roomPlacementSeq = 0;
+const roomPlacementChangedAt = new Map<string, number>();
+
+/** A marker taken before a room-tag reload starts; pass it to mergeRoomPlacementsFromServer. */
+export function roomPlacementMark(): number {
+  return roomPlacementSeq;
+}
+
+/**
+ * Apply a server reload of every room's project and pin. Rooms placed locally
+ * since `mark` was taken, and rooms the server couldn't read (`unknown`),
+ * keep what the sidebar already shows.
+ */
+export function mergeRoomPlacementsFromServer(args: {
+  mark: number;
+  assignments: ReadonlyMap<string, string>;
+  pinned: ReadonlySet<string>;
+  unknown: ReadonlySet<string>;
+}): void {
+  const keep = (roomId: string): boolean =>
+    args.unknown.has(roomId) || (roomPlacementChangedAt.get(roomId) ?? 0) > args.mark;
+  const nextAssignments = new Map<string, string>();
+  for (const [roomId, slug] of args.assignments) {
+    if (!keep(roomId)) nextAssignments.set(roomId, slug);
+  }
+  for (const [roomId, slug] of state.roomProjectAssignments) {
+    if (keep(roomId)) nextAssignments.set(roomId, slug);
+  }
+  const nextPinned = new Set<string>();
+  for (const roomId of args.pinned) if (!keep(roomId)) nextPinned.add(roomId);
+  for (const roomId of state.roomPinnedIds) if (keep(roomId)) nextPinned.add(roomId);
+  setRoomProjectAssignments(nextAssignments);
+  setRoomPinnedIds(nextPinned);
+}
+
+/**
+ * Put one room where the user just put it — pinned, in a project, or neither.
+ * Used by the optimistic writes above and by the relay-room-placement-changed
+ * frame the user's other tabs and devices receive.
+ */
+export function applyRoomPlacement(
+  roomId: string,
+  project: string | null,
+  pinned: boolean,
+): void {
+  roomPlacementSeq += 1;
+  roomPlacementChangedAt.set(roomId, roomPlacementSeq);
+  const curSlug = state.roomProjectAssignments.get(roomId) ?? null;
+  const curPinned = state.roomPinnedIds.has(roomId);
+  if (curSlug === project && curPinned === pinned) return;
+  const assignments = new Map(state.roomProjectAssignments);
+  if (project === null) assignments.delete(roomId);
+  else assignments.set(roomId, project);
+  const pinnedIds = new Set(state.roomPinnedIds);
+  if (pinned) pinnedIds.add(roomId);
+  else pinnedIds.delete(roomId);
+  state = { ...state, roomProjectAssignments: assignments, roomPinnedIds: pinnedIds };
+  persistProjectsSlice();
+  notify();
+}
+
+/** Every relay room the user has pinned, by roomId. */
+export function useRoomPinnedIds(): ReadonlySet<string> {
+  return useSyncExternalStore(
+    subscribe,
+    () => state.roomPinnedIds,
+    () => state.roomPinnedIds,
+  );
+}
+
+/** Whether the user has pinned this relay room (shown pinned only when it isn't in a project). */
+export function useRoomPinned(roomId: string | null | undefined): boolean {
+  return useSyncExternalStore(
+    subscribe,
+    () => (roomId ? state.roomPinnedIds.has(roomId) : false),
+    () => (roomId ? state.roomPinnedIds.has(roomId) : false),
+  );
 }
 
 // Test-only reset — same shape as __resetPinnedIdsForTest et al. Also clears
@@ -3139,6 +3302,7 @@ export function __resetProjectsForTest(): void {
     projects: [],
     identityProjectAssignments: new Map<string, string>(),
     roomProjectAssignments: new Map<string, string>(),
+    roomPinnedIds: new Set<string>(),
   };
   notify();
 }

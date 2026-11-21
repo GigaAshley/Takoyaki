@@ -132,6 +132,8 @@ import {
   setProjects,
   mergeProjectsForHost,
   setRoomProjectAssignments,
+  mergeRoomPlacementsFromServer,
+  roomPlacementMark,
   // Phase 117 H1 fix (2026-09-18): identity-project map setter fed by an
   // AppShell effect that derives the Map from useIdentities() on every
   // identities-store change. Closes the loop between the identity carrier
@@ -1726,26 +1728,32 @@ export function AppShell({
       // hosts — we dedupe on roomId with last-write-wins semantics (all
       // hosts should agree on the assignment, so any consistent choice is
       // fine).
+      // Pinned rooms come back on the same call. A host that failed gives
+      // null so a blip can't unpin or un-file every room; rooms moved while
+      // this ran, or that couldn't be read, keep what the sidebar shows.
+      const placementMark = roomPlacementMark();
       const tagResults = await Promise.all(
         allHosts.map(async (h) => {
           try {
-            const { assignments } = await listRelayRoomProjectTags(
-              parseInt(h.id, 10),
-            );
-            return assignments;
+            return await listRelayRoomProjectTags(parseInt(h.id, 10));
           } catch {
-            return [] as Array<{ roomId: string; slug: string }>;
+            return null;
           }
         }),
       );
       if (cancelled) return;
-      const roomMap = new Map<string, string>();
-      for (const list of tagResults) {
-        for (const { roomId, slug } of list) {
-          roomMap.set(roomId, slug);
+      const answered = tagResults.filter((r) => r !== null);
+      if (answered.length > 0) {
+        const roomMap = new Map<string, string>();
+        const pinned = new Set<string>();
+        const unknown = new Set<string>();
+        for (const r of answered) {
+          for (const { roomId, slug } of r.assignments ?? []) roomMap.set(roomId, slug);
+          for (const roomId of r.pinned ?? []) pinned.add(roomId);
+          for (const roomId of r.unknown ?? []) unknown.add(roomId);
         }
+        mergeRoomPlacementsFromServer({ mark: placementMark, assignments: roomMap, pinned, unknown });
       }
-      setRoomProjectAssignments(roomMap);
     })();
 
     return () => {

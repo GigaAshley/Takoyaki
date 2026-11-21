@@ -75,6 +75,7 @@ vi.mock("../../utils/logger.js", () => ({
 
 vi.mock("../../matrix/matrix-room-tag-client.js", () => ({
   getRoomTags: vi.fn(),
+  FAVOURITE_TAG: "m.favourite",
 }));
 
 vi.mock("../../matrix/matrix-admin-client.js", () => ({
@@ -225,9 +226,29 @@ describe("GET /relay-rooms/project-tags", () => {
     });
 
     expect(res.status).toBe(200);
+    // ROOM_A is favourited too: listed in both; the sidebar shows it in
+    // its project.
     expect(res.body).toEqual({
       assignments: [{ roomId: ROOM_A, slug: "alpha" }],
+      pinned: [ROOM_A],
+      unknown: [],
     });
+  });
+
+  it("lists pinned rooms (the favourite tag) with no project", async () => {
+    (getUserJoinedRooms as Mock).mockResolvedValue({
+      ok: true,
+      roomIds: [ROOM_A, ROOM_B],
+    });
+    (getRoomTags as Mock).mockImplementation(async (_mxid: string, roomId: string) =>
+      roomId === ROOM_B ? { ok: true, tags: { "m.favourite": {} } } : { ok: true, tags: {} },
+    );
+    const res = await httpRequest(server, {
+      method: "GET",
+      path: "/relay-rooms/project-tags?hostId=1",
+    });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ assignments: [], pinned: [ROOM_B], unknown: [] });
   });
 
   // Test 2: empty rooms
@@ -240,7 +261,7 @@ describe("GET /relay-rooms/project-tags", () => {
     });
 
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ assignments: [] });
+    expect(res.body).toEqual({ assignments: [], pinned: [], unknown: [] });
     // No per-room tag fetches when no rooms.
     expect(getRoomTags).not.toHaveBeenCalled();
   });
@@ -280,6 +301,9 @@ describe("GET /relay-rooms/project-tags", () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({
       assignments: [{ roomId: ROOM_B, slug: "beta" }],
+      pinned: [],
+      // The room whose read failed is reported, so the client keeps what it knew.
+      unknown: [ROOM_A],
     });
   });
 

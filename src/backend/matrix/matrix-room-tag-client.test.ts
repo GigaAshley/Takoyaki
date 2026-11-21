@@ -36,7 +36,7 @@ vi.mock("../utils/logger.js", () => ({
   },
 }));
 
-import { getRoomTags, setRoomProjectTag } from "./matrix-room-tag-client.js";
+import { getRoomTags, setRoomProjectTag, setRoomPinned } from "./matrix-room-tag-client.js";
 import { getMatrixAdminCreds } from "./matrix-admin-creds-store.js";
 import { ensureUserToken } from "./matrix-admin-client.js";
 
@@ -195,7 +195,7 @@ describe("getRoomTags", () => {
 // ---------------------------------------------------------------------------
 
 describe("setRoomProjectTag", () => {
-  it("Test 7: assign — read-modify-write preserves non-project tags + adds new u.project.<slug>", async () => {
+  it("Test 7: assign — read-modify-write preserves other tags, adds u.project.<slug>, and unpins (drops m.favourite)", async () => {
     const currentTags = { "m.favourite": {}, "m.lowpriority": {} };
     // First call GET, second call PUT.
     const fetchMock = vi.fn(async (_url, opts) => {
@@ -208,7 +208,8 @@ describe("setRoomProjectTag", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const result = await setRoomProjectTag(USER_MXID, ROOM_ID, "alpha");
-    expect(result.ok).toBe(true);
+    // Resolves with what the write left on the room.
+    expect(result).toEqual({ ok: true, project: "alpha", pinned: false });
 
     // Exactly one GET and one PUT.
     expect(fetchMock).toHaveBeenCalledTimes(2);
@@ -217,19 +218,19 @@ describe("setRoomProjectTag", () => {
     expect((getCall[1] as RequestInit).method).toBe("GET");
     expect((putCall[1] as RequestInit).method).toBe("PUT");
 
-    // PUT body preserves both non-project tags AND adds the new one.
+    // PUT body keeps the other tag, adds the project, and drops the pin —
+    // pinned and in-a-project are exclusive.
     const putBody = JSON.parse((putCall[1] as RequestInit).body as string);
     expect(putBody).toEqual({
       tags: {
-        "m.favourite": {},
         "m.lowpriority": {},
         "u.project.alpha": {},
       },
     });
   });
 
-  it("Test 8: rewrite — strips existing u.project.old and keeps m.favourite", async () => {
-    const currentTags = { "m.favourite": {}, "u.project.old": {} };
+  it("Test 8: rewrite — strips existing u.project.old, keeps other tags", async () => {
+    const currentTags = { "m.lowpriority": {}, "u.project.old": {} };
     const fetchMock = vi.fn(async (_url, opts) => {
       const method = (opts as RequestInit | undefined)?.method ?? "GET";
       if (method === "GET") {
@@ -246,7 +247,7 @@ describe("setRoomProjectTag", () => {
     const putBody = JSON.parse((putCall[1] as RequestInit).body as string);
     expect(putBody).toEqual({
       tags: {
-        "m.favourite": {},
+        "m.lowpriority": {},
         "u.project.new": {},
       },
     });
@@ -258,7 +259,7 @@ describe("setRoomProjectTag", () => {
     const currentTags = {
       "u.project.a": {},
       "u.project.b": {},
-      "m.favourite": {},
+      "m.lowpriority": {},
     };
     const fetchMock = vi.fn(async (_url, opts) => {
       const method = (opts as RequestInit | undefined)?.method ?? "GET";
@@ -280,12 +281,12 @@ describe("setRoomProjectTag", () => {
       /^u\.project\./.test(k),
     );
     expect(projectKeys).toEqual(["u.project.c"]);
-    // Plus m.favourite survives.
-    expect(putBody.tags["m.favourite"]).toEqual({});
+    // Plus the other tag survives.
+    expect(putBody.tags["m.lowpriority"]).toEqual({});
   });
 
-  it("Test 10: clear (slug=null) — removes u.project.old, keeps m.favourite, adds nothing", async () => {
-    const currentTags = { "m.favourite": {}, "u.project.old": {} };
+  it("Test 10: clear (slug=null) — removes u.project.old and any stray pin, keeps other tags, adds nothing", async () => {
+    const currentTags = { "m.favourite": {}, "u.project.old": {}, "m.lowpriority": {} };
     const fetchMock = vi.fn(async (_url, opts) => {
       const method = (opts as RequestInit | undefined)?.method ?? "GET";
       if (method === "GET") {
@@ -296,11 +297,11 @@ describe("setRoomProjectTag", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const result = await setRoomProjectTag(USER_MXID, ROOM_ID, null);
-    expect(result.ok).toBe(true);
+    expect(result).toEqual({ ok: true, project: null, pinned: false });
 
     const putCall = fetchMock.mock.calls[1];
     const putBody = JSON.parse((putCall[1] as RequestInit).body as string);
-    expect(putBody).toEqual({ tags: { "m.favourite": {} } });
+    expect(putBody).toEqual({ tags: { "m.lowpriority": {} } });
   });
 
   it("Test 11: clear on already-empty (404 GET) — PUT {tags:{}} for byte-consistency", async () => {
@@ -413,5 +414,69 @@ describe("setRoomProjectTag", () => {
     expect(url).toContain("%2F");
     // No raw /../ path-traversal pattern survives.
     expect(url).not.toContain("/../");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// setRoomPinned — the sidebar pin is the chat server's favourite tag
+// ---------------------------------------------------------------------------
+
+describe("setRoomPinned", () => {
+  function stubTags(currentTags: Record<string, unknown> | null) {
+    const fetchMock = vi.fn(async (_url, opts) => {
+      const method = (opts as RequestInit | undefined)?.method ?? "GET";
+      if (method === "GET") {
+        return currentTags === null
+          ? mockFetchResponse(404, { errcode: "M_NOT_FOUND" })
+          : mockFetchResponse(200, { tags: currentTags });
+      }
+      return mockFetchResponse(200, {});
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  }
+  const putBodyOf = (fetchMock: ReturnType<typeof vi.fn>) =>
+    JSON.parse((fetchMock.mock.calls[1][1] as RequestInit).body as string);
+
+  it("pin: adds m.favourite, strips every project tag, keeps other tags — as the user", async () => {
+    const fetchMock = stubTags({ "u.project.a": {}, "u.project.b": {}, "m.lowpriority": {} });
+    const result = await setRoomPinned(USER_MXID, ROOM_ID, true);
+    expect(result).toEqual({ ok: true, project: null, pinned: true });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect((fetchMock.mock.calls[1][1] as RequestInit).method).toBe("PUT");
+    expect(String(fetchMock.mock.calls[1][0])).toContain("/account_data/m.tag");
+    expect(putBodyOf(fetchMock)).toEqual({ tags: { "m.lowpriority": {}, "m.favourite": {} } });
+  });
+
+  it("pin on a room with no tags yet (404) writes just the favourite", async () => {
+    const fetchMock = stubTags(null);
+    await setRoomPinned(USER_MXID, ROOM_ID, true);
+    expect(putBodyOf(fetchMock)).toEqual({ tags: { "m.favourite": {} } });
+  });
+
+  it("pin keeps an existing favourite's content (another app's order)", async () => {
+    const fetchMock = stubTags({ "m.favourite": { order: 0.25 } });
+    await setRoomPinned(USER_MXID, ROOM_ID, true);
+    expect(putBodyOf(fetchMock)).toEqual({ tags: { "m.favourite": { order: 0.25 } } });
+  });
+
+  it("unpin: removes only m.favourite", async () => {
+    const fetchMock = stubTags({ "m.favourite": {}, "m.lowpriority": {}, "u.other": {} });
+    await setRoomPinned(USER_MXID, ROOM_ID, false);
+    expect(putBodyOf(fetchMock)).toEqual({ tags: { "m.lowpriority": {}, "u.other": {} } });
+  });
+
+  it("unpin on a room that somehow also has a project reports the project it kept", async () => {
+    stubTags({ "m.favourite": {}, "u.project.alpha": {} });
+    const result = await setRoomPinned(USER_MXID, ROOM_ID, false);
+    expect(result).toEqual({ ok: true, project: "alpha", pinned: false });
+  });
+
+  it("a failed read writes nothing", async () => {
+    const fetchMock = vi.fn(async () => mockFetchResponse(500, {}));
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await setRoomPinned(USER_MXID, ROOM_ID, true);
+    expect(result.ok).toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
