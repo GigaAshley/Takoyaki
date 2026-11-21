@@ -108,7 +108,11 @@ router.post("/:roomId/leave", authenticateJWT, async (req: Request, res: Respons
 
 router.post("/:roomId/rename", authenticateJWT, async (req: Request, res: Response) => {
   const rawName = (req.body as { name?: unknown } | undefined)?.name;
-  const name = typeof rawName === "string" ? rawName.trim() : "";
+  // One line: control characters and runs of whitespace become one space.
+  const name =
+    typeof rawName === "string"
+      ? rawName.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim()
+      : "";
   if (name.length === 0 || name.length > MAX_ROOM_NAME_LENGTH) {
     res.status(400).json({ error: "invalid_name" });
     return;

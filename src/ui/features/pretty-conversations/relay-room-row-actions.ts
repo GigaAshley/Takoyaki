@@ -67,7 +67,8 @@ export function promptAndRenameRelayRoom(args: { roomId: string; currentTitle: s
             : null,
     });
     if (raw === null) return;
-    const next = raw.trim();
+    // One line, as the server stores it.
+    const next = raw.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
     if (next.length === 0 || next === currentTitle || next.length > RELAY_ROOM_NAME_MAX_LENGTH) return;
     try {
       const result = await renameRelayRoom(roomId, next);

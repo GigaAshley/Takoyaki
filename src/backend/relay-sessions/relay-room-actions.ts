@@ -8,10 +8,11 @@
  *
  * Rename: sets the room's real name (m.room.name) as the user, so every
  * member sees it. Rooms an agent created give invitees no right to change
- * the name; when the name change is refused for that reason, the agent that
- * controls the room grants the user just the level needed to rename, and
- * the rename is tried again. If another PERSON controls the room, nothing
- * is granted — the user gets "you can't rename this room".
+ * the name; when the name change is refused, an agent that controls the room
+ * — one on a machine the user has access to — grants the user the right to
+ * rename (and nothing more, see planRenameGrant), and the rename is tried
+ * again. If another PERSON controls the room, or no agent of the user's
+ * does, nothing is granted — the user gets "you can't rename this room".
  *
  * Every Matrix call goes through matrix-room-actions-client; the decision of
  * who may grant is a pure function so it tests without I/O. (The sidebar's
@@ -20,6 +21,7 @@
 
 import { databaseLogger } from "../utils/logger.js";
 import { invalidateRoomMembers, joinedMembersInJoinOrder } from "./relay-room-faces.js";
+import { userCanActAsAgent } from "./agent-access.js";
 import {
   getRoomStateAdmin,
   leaveRoomAsUser,
@@ -44,19 +46,37 @@ function num(v: unknown, fallback: number): number {
 }
 
 export type RenameGrantPlan =
-  | { kind: "grant"; granterMxid: string; content: Record<string, unknown> }
+  | {
+      kind: "grant";
+      /** Agents that could make the grant, strongest first. The caller
+       * picks the first one the user is allowed to act through. */
+      granterCandidates: string[];
+      content: Record<string, unknown>;
+    }
   | { kind: "refuse"; reason: string };
 
 /**
- * Decide whether the user can be quietly granted the right to rename.
- * `isHuman` says whether an mxid belongs to a person (a user of this
- * instance) rather than an agent.
+ * Decide whether the user can be quietly given the right to rename, and
+ * what the room's permission levels become.
+ *
+ * The grant is the right to rename and nothing more: when the level renaming
+ * needs would also let the user remove or ban members (as it does in a
+ * standard private room, where both sit at the same level), the user is
+ * raised just one step above the room's default instead and the room's
+ * name-change requirement is lowered to meet them.
+ *
+ * Refused when the user isn't joined, when another person controls the
+ * room, or when no agent present could make the grant. `isHuman` says
+ * whether an mxid belongs to a person (a user of this instance).
  */
 export function planRenameGrant(
   events: readonly RoomStateEvent[],
   userMxid: string,
   isHuman: (mxid: string) => boolean,
 ): RenameGrantPlan {
+  const joined = joinedMembersInJoinOrder(events);
+  if (!joined.includes(userMxid)) return { kind: "refuse", reason: "user_not_joined" };
+
   const plEvent = events.find(
     (e) => e.type === "m.room.power_levels" && (e.state_key ?? "") === "",
   );
@@ -75,25 +95,35 @@ export function planRenameGrant(
   const needed = num(eventsMap["m.room.name"], stateDefault);
   const editLevel = num(eventsMap["m.room.power_levels"], stateDefault);
   const level = (m: string) => num(usersMap[m], usersDefault);
+  const current = level(userMxid);
 
-  if (level(userMxid) >= needed) return { kind: "refuse", reason: "already_allowed" };
+  if (current >= needed) return { kind: "refuse", reason: "already_allowed" };
 
-  const joined = joinedMembersInJoinOrder(events).filter((m) => m !== userMxid);
-  const controllers = joined.filter((m) => level(m) >= editLevel);
+  // The user's new level, and the name-change requirement after the grant.
+  // One step above the default only ever adds powers that sit exactly there.
+  const oneStep = usersDefault + 1;
+  const target = needed <= oneStep ? needed : Math.max(current, oneStep);
+  const nameLevel = Math.min(needed, target);
+
+  const others = joined.filter((m) => m !== userMxid);
+  const controllers = others.filter((m) => level(m) >= editLevel);
   if (controllers.some(isHuman)) return { kind: "refuse", reason: "person_controls_room" };
 
-  // A granter can't hand out a level above its own.
-  const granters = controllers
-    .filter((m) => level(m) >= needed)
+  // A granter must be able to edit levels, can't hand out more than it holds,
+  // and must reach the requirement it is changing.
+  const granterCandidates = controllers
+    .filter((m) => level(m) >= Math.max(needed, target))
     .sort((a, b) => level(b) - level(a));
-  const granterMxid = granters[0];
-  if (granterMxid === undefined) return { kind: "refuse", reason: "no_agent_controls_room" };
+  if (granterCandidates.length === 0) return { kind: "refuse", reason: "no_agent_controls_room" };
 
-  return {
-    kind: "grant",
-    granterMxid,
-    content: { ...pl, users: { ...usersMap, [userMxid]: needed } },
+  const content: Record<string, unknown> = {
+    ...pl,
+    users: { ...usersMap, [userMxid]: target },
   };
+  if (nameLevel !== needed) {
+    content.events = { ...eventsMap, "m.room.name": nameLevel };
+  }
+  return { kind: "grant", granterCandidates, content };
 }
 
 // ---------------------------------------------------------------------------
@@ -109,6 +139,9 @@ export interface RoomActionDeps {
   getRoomStateAdmin: typeof getRoomStateAdmin;
   markRelayRoomSessionInactive: typeof markRelayRoomSessionInactive;
   materializeRelayRoomSession: typeof materializeRelayRoomSession;
+  /** Whether this user may act through this agent: the agent lives on a
+   * machine the user has access to. */
+  userCanActAsAgent: (userId: string, agentMxid: string) => Promise<boolean>;
 }
 
 const defaultDeps: RoomActionDeps = {
@@ -118,6 +151,7 @@ const defaultDeps: RoomActionDeps = {
   getRoomStateAdmin,
   markRelayRoomSessionInactive,
   materializeRelayRoomSession,
+  userCanActAsAgent,
 };
 
 export async function leaveRelayRoom(
@@ -199,23 +233,43 @@ export async function renameRelayRoom(
     });
     return { ok: false, reason: "not_allowed" };
   }
-  const grant = await deps.putPowerLevelsAs(plan.granterMxid, roomId, plan.content);
+  let granterMxid: string | undefined;
+  for (const candidate of plan.granterCandidates) {
+    if (await deps.userCanActAsAgent(userId, candidate)) {
+      granterMxid = candidate;
+      break;
+    }
+  }
+  if (granterMxid === undefined) {
+    databaseLogger.info("relay room rename refused", {
+      operation: "relay_room_rename_refused",
+      userId,
+      roomId,
+      reason: "no_agent_of_users",
+    });
+    return { ok: false, reason: "not_allowed" };
+  }
+  const grant = await deps.putPowerLevelsAs(granterMxid, roomId, plan.content);
   if (grant.ok === false) {
     databaseLogger.warn("relay room rename: grant failed", {
       operation: "relay_room_rename_grant_failed",
       userId,
       roomId,
-      granterMxid: plan.granterMxid,
+      granterMxid,
       status: grant.status,
       error: grant.error,
     });
-    return { ok: false, reason: "not_allowed" };
+    // Refused by the homeserver → not allowed; anything else (outage,
+    // timeout) is a failure, not a statement about who controls the room.
+    return grant.status === 403
+      ? { ok: false, reason: "not_allowed" }
+      : { ok: false, reason: "failed", status: grant.status, error: grant.error };
   }
   databaseLogger.info("relay room rename right granted", {
     operation: "relay_room_rename_granted",
     userId,
     roomId,
-    granterMxid: plan.granterMxid,
+    granterMxid,
   });
   const second = await deps.setRoomNameAsUser(userMxid, roomId, name);
   if (second.ok === false) {

@@ -115,6 +115,12 @@ describe("relay room Leave / Rename routes", () => {
     expect(isHuman("@finch:hs")).toBe(false);
   });
 
+  it("rename keeps a name to one line", async () => {
+    mockRename.mockResolvedValue({ ok: true, granted: false });
+    await post("rename", { name: "Launch\n\tplans\u0007 now" });
+    expect(mockRename.mock.calls[0][3]).toBe("Launch plans now");
+  });
+
   it("rename refused → 403 not_allowed", async () => {
     mockRename.mockResolvedValue({ ok: false, reason: "not_allowed" });
     const res = await post("rename", { name: "Plans" });

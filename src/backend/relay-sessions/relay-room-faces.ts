@@ -60,12 +60,30 @@ function replacedEventId(e: RoomStateEvent): string | undefined {
   return typeof r === "string" && r.length > 0 ? r : undefined;
 }
 
+/** How many lookups one room runs at once, and how many rooms refresh at once. */
+const LOOKUP_CONCURRENCY = 4;
+const ROOM_REFRESH_CONCURRENCY = 4;
+
+/** Run `fn` over `items`, at most `limit` at a time. */
+async function forEachLimited<T>(items: readonly T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> {
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const item = items[next++];
+      await fn(item);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+}
+
 /**
  * When each joined member really joined: walk back from their current
  * membership event through the events it replaced while those were still
- * "join" (profile changes), and take the earliest join's time. Each event's
- * answer is remembered, so a room is walked once, not on every refresh. A
- * lookup that fails just stops the walk at what's known.
+ * "join" (profile changes), and take the earliest join's time. A finished
+ * walk's answer is remembered, so a room is walked once, not on every
+ * refresh. A walk cut short (a lookup failed, or the step cap was reached)
+ * uses what it found this time but isn't remembered, so the next refresh
+ * tries again.
  */
 export async function resolveJoinTimes(
   events: readonly RoomStateEvent[],
@@ -78,36 +96,43 @@ export async function resolveJoinTimes(
       typeof e.state_key === "string" &&
       e.content?.membership === "join",
   );
-  await Promise.all(
-    joins.map(async (current) => {
-      const mxid = current.state_key as string;
-      const startId = current.event_id;
-      if (startId && joinTsByEventId.has(startId)) {
-        out.set(mxid, joinTsByEventId.get(startId) as number);
-        return;
+  await forEachLimited(joins, LOOKUP_CONCURRENCY, async (current) => {
+    const mxid = current.state_key as string;
+    const startId = current.event_id;
+    if (startId && joinTsByEventId.has(startId)) {
+      out.set(mxid, joinTsByEventId.get(startId) as number);
+      return;
+    }
+    let ts = num(current.origin_server_ts, Number.MAX_SAFE_INTEGER);
+    let prevId = replacedEventId(current);
+    let finished = false;
+    for (let n = 0; n < MAX_PROFILE_CHANGES_FOLLOWED; n++) {
+      if (!prevId) {
+        finished = true;
+        break;
       }
-      let ts = num(current.origin_server_ts, Number.MAX_SAFE_INTEGER);
-      let prevId = replacedEventId(current);
-      for (let n = 0; prevId && n < MAX_PROFILE_CHANGES_FOLLOWED; n++) {
-        const memo = joinTsByEventId.get(prevId);
-        if (memo !== undefined) {
-          ts = Math.min(ts, memo);
-          break;
-        }
-        const r = await fetchEvent(prevId);
-        if (r.ok === false) break;
-        const prev = r.event;
-        if (prev.type !== "m.room.member" || prev.content?.membership !== "join") break;
-        ts = Math.min(ts, num(prev.origin_server_ts, ts));
-        prevId = replacedEventId(prev);
+      const memo = joinTsByEventId.get(prevId);
+      if (memo !== undefined) {
+        ts = Math.min(ts, memo);
+        finished = true;
+        break;
       }
-      if (startId) {
-        if (joinTsByEventId.size >= JOIN_TS_MEMO_CAP) joinTsByEventId.clear();
-        joinTsByEventId.set(startId, ts);
+      const r = await fetchEvent(prevId);
+      if (r.ok === false) break;
+      const prev = r.event;
+      if (prev.type !== "m.room.member" || prev.content?.membership !== "join") {
+        finished = true;
+        break;
       }
-      out.set(mxid, ts);
-    }),
-  );
+      ts = Math.min(ts, num(prev.origin_server_ts, ts));
+      prevId = replacedEventId(prev);
+    }
+    if (startId && finished) {
+      if (joinTsByEventId.size >= JOIN_TS_MEMO_CAP) joinTsByEventId.clear();
+      joinTsByEventId.set(startId, ts);
+    }
+    out.set(mxid, ts);
+  });
   return out;
 }
 
@@ -175,53 +200,77 @@ export function __resetRoomMembersCacheForTests(): void {
   joinTsByEventId.clear();
 }
 
+/** Mark a room's members out of date (after Leave): the next read refreshes it. */
 export function invalidateRoomMembers(roomId: string): void {
-  membersCache.delete(roomId);
+  const cached = membersCache.get(roomId);
+  if (cached) cached.expiresAt = 0;
 }
 
-/**
- * The room's joined members in join order, or null when the room state
- * couldn't be read (the row then shows no faces, never an error). A stale
- * entry is served on a failed refresh.
- */
-export async function getRoomMembersInJoinOrder(
-  roomId: string,
-  deps: { getRoomState: typeof getRoomStateAdmin; fetchEvent: typeof fetchEventAdmin } = {
-    getRoomState: getRoomStateAdmin,
-    fetchEvent: fetchEventAdmin,
-  },
-): Promise<string[] | null> {
-  const now = Date.now();
-  const cached = membersCache.get(roomId);
-  if (cached && cached.expiresAt > now) return cached.members;
+// Rooms refreshing right now, capped at ROOM_REFRESH_CONCURRENCY; the rest wait.
+let refreshesRunning = 0;
+const refreshQueue: Array<() => void> = [];
+async function withRefreshSlot<T>(fn: () => Promise<T>): Promise<T> {
+  if (refreshesRunning >= ROOM_REFRESH_CONCURRENCY) {
+    await new Promise<void>((resolve) => refreshQueue.push(resolve));
+  }
+  refreshesRunning++;
+  try {
+    return await fn();
+  } finally {
+    refreshesRunning--;
+    refreshQueue.shift()?.();
+  }
+}
+
+type MembersDeps = { getRoomState: typeof getRoomStateAdmin; fetchEvent: typeof fetchEventAdmin };
+
+function refreshRoomMembers(roomId: string, deps: MembersDeps): Promise<string[] | null> {
   const pending = membersInFlight.get(roomId);
   if (pending) return pending;
-  const p = (async () => {
-    try {
-      const state = await deps.getRoomState(roomId);
-      if (state.ok === false) {
-        databaseLogger.debug("relay room faces: state read failed", {
-          operation: "relay_room_faces_state_failed",
-          roomId,
-          status: state.status,
-          error: state.error,
-        });
-        return cached?.members ?? null;
-      }
-      const joinTs = await resolveJoinTimes(state.events, deps.fetchEvent);
-      const members = joinedMembersInJoinOrder(state.events, joinTs);
-      membersCache.set(roomId, { members, expiresAt: Date.now() + ROOM_MEMBERS_CACHE_TTL_MS });
-      return members;
-    } finally {
-      membersInFlight.delete(roomId);
+  const p = withRefreshSlot(async () => {
+    const state = await deps.getRoomState(roomId);
+    if (state.ok === false) {
+      databaseLogger.debug("relay room faces: state read failed", {
+        operation: "relay_room_faces_state_failed",
+        roomId,
+        status: state.status,
+        error: state.error,
+      });
+      return membersCache.get(roomId)?.members ?? null;
     }
-  })();
+    const joinTs = await resolveJoinTimes(state.events, deps.fetchEvent);
+    const members = joinedMembersInJoinOrder(state.events, joinTs);
+    membersCache.set(roomId, { members, expiresAt: Date.now() + ROOM_MEMBERS_CACHE_TTL_MS });
+    return members;
+  }).finally(() => membersInFlight.delete(roomId));
   membersInFlight.set(roomId, p);
   return p;
 }
 
-/** Longest the sidebar load waits on faces before sending rows without. */
-export const ROOM_FACES_BUDGET_MS = 3_000;
+/**
+ * The room's joined members in join order, or null when the room has never
+ * been read successfully (the row then shows no faces, never an error).
+ * Once a room has been read, its last known members are answered at once
+ * and an out-of-date entry is refreshed in the background — the sidebar
+ * only ever waits for a room it has never seen.
+ */
+export async function getRoomMembersInJoinOrder(
+  roomId: string,
+  deps: MembersDeps = { getRoomState: getRoomStateAdmin, fetchEvent: fetchEventAdmin },
+): Promise<string[] | null> {
+  const cached = membersCache.get(roomId);
+  if (cached) {
+    if (cached.expiresAt <= Date.now()) {
+      void refreshRoomMembers(roomId, deps).catch(() => {});
+    }
+    return cached.members;
+  }
+  return refreshRoomMembers(roomId, deps);
+}
+
+/** Longest the sidebar load waits on rooms it has never read before sending
+ * their rows without faces (they fill in on a later load). */
+export const ROOM_FACES_BUDGET_MS = 1_500;
 
 interface HumanRow {
   displayName: string;

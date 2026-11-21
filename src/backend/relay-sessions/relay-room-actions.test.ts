@@ -12,6 +12,7 @@ vi.mock("../matrix/matrix-room-actions-client.js", () => ({
 }));
 vi.mock("../database/db/index.js", () => ({ db: {} }));
 vi.mock("../database/db/schema.js", () => ({ users: {} }));
+vi.mock("./agent-access.js", () => ({ userCanActAsAgent: vi.fn() }));
 vi.mock("./relay-room-sessions-store.js", () => ({
   markRelayRoomSessionInactive: vi.fn(),
   materializeRelayRoomSession: vi.fn(),
@@ -63,6 +64,7 @@ function makeDeps(over: Partial<RoomActionDeps> = {}): RoomActionDeps {
     getRoomStateAdmin: vi.fn().mockResolvedValue({ ok: true, events: agentRoom() }),
     markRelayRoomSessionInactive: vi.fn().mockResolvedValue(undefined),
     materializeRelayRoomSession: vi.fn().mockResolvedValue(undefined),
+    userCanActAsAgent: vi.fn().mockResolvedValue(true),
     ...over,
   };
 }
@@ -82,29 +84,55 @@ describe("joinedMembersInJoinOrder", () => {
 });
 
 describe("planRenameGrant", () => {
-  it("grants via the agent that controls an agent-created room, at the level renaming needs", () => {
+  it("grants just the right to rename: one step above the default, name requirement lowered to meet it", () => {
+    // Standard private room: renaming needs 50, which is also the level for
+    // removing and banning — the user must not get that.
     const plan = planRenameGrant(agentRoom(), ME, isHuman);
     expect(plan).toEqual({
       kind: "grant",
-      granterMxid: AGENT,
+      granterCandidates: [AGENT],
       content: expect.objectContaining({
-        users: { [AGENT]: 100, [ME]: 50 },
+        users: { [AGENT]: 100, [ME]: 1 },
+        events: { "m.room.name": 1 },
         state_default: 50,
       }),
     });
   });
 
-  it("uses the room's own m.room.name level when it sets one", () => {
+  it("when renaming already sits one step above the default, raises the user to it and leaves the rule alone", () => {
     const events = [
       member(AGENT, 1),
       member(ME, 2),
-      powerLevels({ users: { [AGENT]: 100 }, events: { "m.room.name": 20 } }),
+      powerLevels({ users: { [AGENT]: 100 }, events: { "m.room.name": 1 } }),
     ];
     const plan = planRenameGrant(events, ME, isHuman);
     expect(plan.kind).toBe("grant");
     if (plan.kind === "grant") {
-      expect((plan.content.users as Record<string, number>)[ME]).toBe(20);
+      expect((plan.content.users as Record<string, number>)[ME]).toBe(1);
+      expect(plan.content.events).toEqual({ "m.room.name": 1 });
     }
+  });
+
+  it("keeps a user's existing higher level", () => {
+    const events = [
+      member(AGENT, 1),
+      member(ME, 2),
+      powerLevels({ users: { [AGENT]: 100, [ME]: 10 } }),
+    ];
+    const plan = planRenameGrant(events, ME, isHuman);
+    expect(plan.kind === "grant" && plan.content).toMatchObject({
+      users: { [ME]: 10 },
+      events: { "m.room.name": 10 },
+    });
+  });
+
+  it("refuses when the user isn't joined (removed, banned, only invited)", () => {
+    const events = [
+      member(AGENT, 1),
+      member(ME, 2, "leave"),
+      powerLevels({ users: { [AGENT]: 100 } }),
+    ];
+    expect(planRenameGrant(events, ME, isHuman)).toEqual({ kind: "refuse", reason: "user_not_joined" });
   });
 
   it("refuses when another person controls the room", () => {
@@ -125,7 +153,7 @@ describe("planRenameGrant", () => {
     expect(planRenameGrant(events, ME, isHuman).kind).toBe("refuse");
   });
 
-  it("picks the strongest agent as granter", () => {
+  it("lists possible granters strongest first", () => {
     const events = [
       member(AGENT2, 1),
       member(AGENT, 2),
@@ -133,7 +161,7 @@ describe("planRenameGrant", () => {
       powerLevels({ users: { [AGENT2]: 60, [AGENT]: 100 } }),
     ];
     const plan = planRenameGrant(events, ME, isHuman);
-    expect(plan.kind === "grant" && plan.granterMxid).toBe(AGENT);
+    expect(plan.kind === "grant" && plan.granterCandidates).toEqual([AGENT, AGENT2]);
   });
 });
 
@@ -193,9 +221,41 @@ describe("getRoomMembersInJoinOrder", () => {
     expect(fetchEvent).toHaveBeenCalledTimes(3);
     // Answers are remembered: a later refresh of the room fetches nothing new.
     invalidateRoomMembers("!p:hs");
-    expect(await getRoomMembersInJoinOrder("!p:hs", { getRoomState, fetchEvent })).toEqual([AGENT, ME]);
+    await getRoomMembersInJoinOrder("!p:hs", { getRoomState, fetchEvent });
+    await new Promise((r) => setTimeout(r, 0));
     expect(getRoomState).toHaveBeenCalledTimes(2);
     expect(fetchEvent).toHaveBeenCalledTimes(3);
+  });
+
+  it("answers an out-of-date room at once and refreshes it in the background", async () => {
+    const getRoomState = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, events: agentRoom() })
+      .mockResolvedValueOnce({ ok: true, events: [...agentRoom(), member(PERSON, 300)] });
+    expect(await getRoomMembersInJoinOrder("!s:hs", { getRoomState, fetchEvent: noFetch })).toEqual([AGENT, ME]);
+    invalidateRoomMembers("!s:hs");
+    // Out of date: the last known members come back straight away...
+    expect(await getRoomMembersInJoinOrder("!s:hs", { getRoomState, fetchEvent: noFetch })).toEqual([AGENT, ME]);
+    await new Promise((r) => setTimeout(r, 0));
+    // ...and the background refresh has landed for the next read.
+    expect(await getRoomMembersInJoinOrder("!s:hs", { getRoomState, fetchEvent: noFetch })).toEqual([AGENT, ME, PERSON]);
+  });
+
+  it("a walk cut short by a failed lookup isn't remembered", async () => {
+    const events: RoomStateEvent[] = [
+      { ...member(AGENT, 900), event_id: "$a2", unsigned: { replaces_state: "$a1" } },
+      { ...member(ME, 200), event_id: "$m1" },
+    ];
+    const fetchEvent = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: false, status: 502, error: "blip" })
+      .mockResolvedValueOnce({ ok: true, event: member(AGENT, 100) });
+    const getRoomState = vi.fn().mockResolvedValue({ ok: true, events });
+    expect(await getRoomMembersInJoinOrder("!w:hs", { getRoomState, fetchEvent })).toEqual([ME, AGENT]);
+    invalidateRoomMembers("!w:hs");
+    await getRoomMembersInJoinOrder("!w:hs", { getRoomState, fetchEvent });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(await getRoomMembersInJoinOrder("!w:hs", { getRoomState, fetchEvent })).toEqual([AGENT, ME]);
   });
 
   it("returns null when the room can't be read", async () => {
@@ -242,12 +302,36 @@ describe("renameRelayRoom", () => {
       ok: true,
       granted: true,
     });
+    expect(deps.userCanActAsAgent).toHaveBeenCalledWith("u-me", AGENT);
     expect(deps.putPowerLevelsAs).toHaveBeenCalledWith(
       AGENT,
       "!r:hs",
-      expect.objectContaining({ users: { [AGENT]: 100, [ME]: 50 } }),
+      expect.objectContaining({ users: { [AGENT]: 100, [ME]: 1 } }),
     );
     expect(setName).toHaveBeenCalledTimes(2);
+  });
+
+  it("never acts through an agent that isn't the user's", async () => {
+    const deps = makeDeps({
+      setRoomNameAsUser: vi.fn().mockResolvedValue({ ok: false, status: 403, error: "forbidden" }),
+      userCanActAsAgent: vi.fn().mockResolvedValue(false),
+    });
+    expect(await renameRelayRoom("u-me", ME, "!r:hs", "Plans", isHuman, deps)).toEqual({
+      ok: false,
+      reason: "not_allowed",
+    });
+    expect(deps.putPowerLevelsAs).not.toHaveBeenCalled();
+  });
+
+  it("a grant that fails for an outage is a failure, not 'not allowed'", async () => {
+    const deps = makeDeps({
+      setRoomNameAsUser: vi.fn().mockResolvedValue({ ok: false, status: 403, error: "forbidden" }),
+      putPowerLevelsAs: vi.fn().mockResolvedValue({ ok: false, status: 504, error: "timeout" }),
+    });
+    expect(await renameRelayRoom("u-me", ME, "!r:hs", "Plans", isHuman, deps)).toMatchObject({
+      ok: false,
+      reason: "failed",
+    });
   });
 
   it("says not allowed when a person controls the room, granting nothing", async () => {
