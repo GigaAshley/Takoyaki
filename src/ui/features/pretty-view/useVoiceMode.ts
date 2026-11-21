@@ -62,9 +62,12 @@
  *     plays "your turn".
  *   - The phone taking the audio (a call: the mic is muted or ended, or the
  *     AudioContext goes "interrupted"; or exact-zero sound for DEAD_SOUND_MS)
- *     is the same pause, and the mic is let go. The play tap takes the mic
- *     back inside the gesture (the phone allows it only then); if that fails
- *     again, it stays paused and says so.
+ *     is the same pause, and the mic is let go. When the phone gives the
+ *     sound back (the interrupted context runs again — the call watch nudges
+ *     it), voice mode carries on by itself: iOS hands the mic back without a
+ *     tap then. The play tap does the same at any time, inside the gesture.
+ *     If taking the mic back fails, it stays paused and says so. A pause the
+ *     user made never carries on by itself.
  *   - Holds a screen wake lock: mobile browsers suspend the page (and kill the
  *     mic) when the screen locks, so "phone in pocket" needs the screen kept on.
  *
@@ -156,12 +159,9 @@ const NOISE_MULTIPLIER = 3;
 export const DEAD_SOUND_MS = 1500;
 /** How long the play tap's mic request may take before voice mode stays paused and says so. */
 export const RECOVER_MIC_TIMEOUT_MS = 6000;
-/** Call watch (diagnostics while paused by the phone): how often it looks, and for how long. */
+/** Call watch (while paused by the phone): how often it looks, and for how long. */
 export const CALL_WATCH_TICK_MS = 2000;
 export const CALL_WATCH_MAX_MS = 15 * 60_000;
-/** Call watch mic checks once the phone gives the sound back: how many, how far apart. */
-const CALL_WATCH_MIC_CHECKS = 3;
-const CALL_WATCH_MIC_GAP_MS = 6000;
 
 /** Why the mic is being asked for: voice mode starting, after the manual mic, or the play tap after an interruption. */
 type MicRequestKind = "start" | "reacquire" | "recover";
@@ -509,6 +509,8 @@ export function useVoiceMode(args: UseVoiceModeArgs): UseVoiceModeReturn {
   const acquiringRef = useRef(false); // getUserMedia in flight
   /** The phone took the audio: the mic was let go, and the play tap takes it back. */
   const micLostRef = useRef(false);
+  /** The current pause was made by the phone taking the audio, not by the user. */
+  const pausedByPhoneRef = useRef(false);
   /** Set by that tap until real sound arrives — failing again now gets a note. */
   const recoveringRef = useRef(false);
   const interruptRef = useRef<(reason: string, failedRetake?: boolean) => void>(() => {});
@@ -972,13 +974,13 @@ export function useVoiceMode(args: UseVoiceModeArgs): UseVoiceModeReturn {
   }, []);
 
   /**
-   * Call watch — diagnostics only, while paused because the phone took the
-   * audio. Logs what the phone reports during and after the call (sound
-   * context state, page visible/focused, devices), nudges the sound context
-   * the way coming back to the page already does, and once a context the
-   * phone interrupted runs again, takes the mic for a moment and lets go.
-   * Nothing the user sees changes; it answers whether voice mode could
-   * carry on by itself after a call.
+   * Call watch — while paused because the phone took the audio. Logs what
+   * the phone reports during and after the call (sound context state, page
+   * visible/focused, devices) and nudges the sound context the way coming
+   * back to the page does; the phone refuses that while the call holds the
+   * audio. Once a context the phone interrupted has run again for a tick
+   * (the call is over), voice mode carries on by itself — unless the user
+   * paused it themselves.
    */
   const callWatchRef = useRef<{
     timer: ReturnType<typeof setInterval>;
@@ -988,9 +990,6 @@ export function useVoiceMode(args: UseVoiceModeArgs): UseVoiceModeReturn {
     lastResume: string;
     sawNotRunning: boolean;
     backAt: number | null;
-    micChecks: number;
-    micCheckAt: number;
-    micOk: boolean;
     detach: () => void;
   } | null>(null);
   const describePage = () =>
@@ -1008,32 +1007,11 @@ export function useVoiceMode(args: UseVoiceModeArgs): UseVoiceModeReturn {
       log(
         `call-watch-stop why=${why} watchedMs=${Math.round(now - w.startedAt)} ` +
           `contextBackAfterMs=${w.backAt === null ? "never" : Math.round(w.backAt - w.startedAt)} ` +
-          `sinceContextBackMs=${w.backAt === null ? "n/a" : Math.round(now - w.backAt)} ` +
-          `micChecks=${w.micChecks} micOk=${w.micOk}`,
+          `sinceContextBackMs=${w.backAt === null ? "n/a" : Math.round(now - w.backAt)}`,
       );
     },
     [log],
   );
-
-  const callWatchMicCheck = (n: number) => {
-    const t0 = performance.now();
-    log(`call-watch-mic-check n=${n} ${describePage()}`);
-    navigator.mediaDevices.getUserMedia({ audio: true }).then(
-      (stream) => {
-        const tracks = stream.getAudioTracks();
-        const ok = tracks.length > 0 && tracks.every((t) => t.readyState !== "ended" && !t.muted);
-        log(`call-watch-mic-check-result n=${n} ok=${ok} tookMs=${Math.round(performance.now() - t0)} ${describeTracks(stream)}`);
-        stream.getTracks().forEach((t) => t.stop());
-        const w = callWatchRef.current;
-        if (w && ok) w.micOk = true;
-      },
-      (err: unknown) => {
-        const name = err instanceof Error ? err.name : "unknown";
-        const msg = err instanceof Error ? err.message : String(err);
-        log(`call-watch-mic-check-failed n=${n} tookMs=${Math.round(performance.now() - t0)} errName=${name} errMessage="${msg}"`);
-      },
-    );
-  };
 
   const callWatchTick = () => {
     const w = callWatchRef.current;
@@ -1072,11 +1050,19 @@ export function useVoiceMode(args: UseVoiceModeArgs): UseVoiceModeReturn {
         w.backAt = now;
         log(`call-watch-context-back afterMs=${Math.round(now - w.startedAt)} ${describePage()}`);
       }
-      if (!w.micOk && w.micChecks < CALL_WATCH_MIC_CHECKS && now - w.micCheckAt >= CALL_WATCH_MIC_GAP_MS) {
-        w.micChecks += 1;
-        w.micCheckAt = now;
-        callWatchMicCheck(w.micChecks);
+      // One more tick of running before carrying on: the phone may still be
+      // moving the audio back (e.g. to earbuds).
+      if (now - w.backAt < CALL_WATCH_TICK_MS) return;
+      if (!pausedRef.current || !micLostRef.current) {
+        stopCallWatch("not-paused");
+        return;
       }
+      if (!pausedByPhoneRef.current) {
+        stopCallWatch("user-paused");
+        return;
+      }
+      stopCallWatch("context-back");
+      resumeRef.current("auto");
     }
   };
 
@@ -1095,11 +1081,9 @@ export function useVoiceMode(args: UseVoiceModeArgs): UseVoiceModeReturn {
       reason,
       lastLine: "",
       lastResume: "",
-      sawNotRunning: false,
+      // Interrupted already as the watch starts (the call took the sound).
+      sawNotRunning: !!ctxRef.current && ctxRef.current.state !== "running",
       backAt: null,
-      micChecks: 0,
-      micCheckAt: -Infinity,
-      micOk: false,
       detach: () => {
         winEvents.forEach((t) => window.removeEventListener(t, onEvent));
         document.removeEventListener("visibilitychange", onEvent);
@@ -1647,7 +1631,10 @@ export function useVoiceMode(args: UseVoiceModeArgs): UseVoiceModeReturn {
     if (!activeRef.current || failingRef.current) return;
     recoveringRef.current = false;
     log(`interrupted reason=${reason} wasPaused=${pausedRef.current} failedRetake=${failedRetake} ${describeTracks(streamRef.current)}`);
-    if (!pausedRef.current) pauseRef.current();
+    if (!pausedRef.current) {
+      pauseRef.current();
+      pausedByPhoneRef.current = true;
+    }
     // Let go of the mic while the phone holds it, including one still being
     // asked for; the play tap takes it back.
     cancelMicRequest();
@@ -1773,6 +1760,7 @@ export function useVoiceMode(args: UseVoiceModeArgs): UseVoiceModeReturn {
       micLostRef.current = true;
     }
     recoveringRef.current = false;
+    pausedByPhoneRef.current = false;
     pausedRef.current = true;
     pausedAtRef.current = performance.now();
     setPaused(true);
@@ -1801,29 +1789,34 @@ export function useVoiceMode(args: UseVoiceModeArgs): UseVoiceModeReturn {
     );
   };
 
-  const resume = () => {
+  /** "tap" = the play tap (a user gesture); "auto" = the phone gave the sound back after a call. */
+  const resume = (by: "tap" | "auto" = "tap") => {
     pausedRef.current = false;
+    pausedByPhoneRef.current = false;
     setPaused(false);
     const pausedMs = performance.now() - pausedAtRef.current;
     // The timed turn end picks up where it was when the pause began.
     lastSpeechAtRef.current += pausedMs;
     for (const track of streamRef.current?.getAudioTracks() ?? []) track.enabled = true;
-    // After an interruption: take the mic and sound back inside this tap —
-    // the phone only allows it from a tap.
+    // After an interruption: take the mic (and, from a tap, the sound) back.
     if (micLostRef.current) {
-      stopCallWatch("play");
+      stopCallWatch(by === "tap" ? "play" : "auto");
       micLostRef.current = false;
       recoveringRef.current = true;
       setErrorMessage(null);
       dropStream();
-      // A fresh sound context too: the old one may be what the phone broke
-      // (starting voice mode afresh is what was seen to fix it).
-      const oldCues = cuesRef.current;
-      const oldCtx = ctxRef.current;
-      oldCues?.stopTicking();
-      oldCues?.dispose();
-      void oldCtx?.close().catch(() => {});
-      openAudioRef.current();
+      // From a tap, a fresh sound context too: the old one may be what the
+      // phone broke (starting voice mode afresh is what was seen to fix it).
+      // Carrying on by itself, the old one is already running again — and a
+      // new one made outside a tap would start suspended.
+      if (by === "tap") {
+        const oldCues = cuesRef.current;
+        const oldCtx = ctxRef.current;
+        oldCues?.stopTicking();
+        oldCues?.dispose();
+        void oldCtx?.close().catch(() => {});
+        openAudioRef.current();
+      }
       requestMicRef.current("recover");
     }
     const held = heldRef.current;
@@ -1837,7 +1830,7 @@ export function useVoiceMode(args: UseVoiceModeArgs): UseVoiceModeReturn {
     } else if (held?.kind === "button" && resumeButtonSpeech(held.owner)) {
       carried = "button"; // the button's state change re-runs the pump
     }
-    log(`resumed carried=${carried} pausedMs=${Math.round(pausedMs)} queued=${queueRef.current.length}`);
+    log(`resumed by=${by} carried=${carried} pausedMs=${Math.round(pausedMs)} queued=${queueRef.current.length}`);
     if (carried !== "none") return;
     const wasListening = vadTimerRef.current !== null;
     pumpRef.current();

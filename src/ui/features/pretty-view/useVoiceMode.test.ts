@@ -1711,40 +1711,107 @@ describe("useVoiceMode — interruptions", () => {
     expect(result.current.paused).toBe(false);
   });
 
-  it("call watch: while the phone holds the sound it only nudges the context; once it's back, one quick mic check is let go and voice mode stays paused", async () => {
+  it("after a call, voice mode carries on by itself once the phone gives the sound back", async () => {
+    const send = vi.fn(() => true);
+    const { result } = await startVoiceMode(baseArgs({ send }));
+    transcribeReturns("before the call");
+    setLevel(0.2);
+    await flush(600);
+    const ctx = MockAudioContext.instances[0];
+    ctx.state = "interrupted";
+    act(() => ctx.onstatechange?.());
+    setLevel(0);
+    await flush();
+    expect(result.current.paused).toBe(true);
+    ctx.resume.mockClear();
+    // During the call: the context is only nudged; the mic is left to the phone.
+    await flush(CALL_WATCH_TICK_MS * 3);
+    expect(ctx.resume).toHaveBeenCalled();
+    expect(getUserMedia).toHaveBeenCalledTimes(1);
+    expect(result.current.paused).toBe(true);
+
+    // The call ends: the phone gives the sound back.
+    cuesPlayed.length = 0;
+    ctx.state = "running";
+    const mic = freshMic();
+    await flush(CALL_WATCH_TICK_MS * 2);
+    expect(getUserMedia).toHaveBeenCalledTimes(2);
+    expect(result.current.paused).toBe(false);
+    expect(result.current.errorMessage).toBeNull();
+    expect(mic.stop).not.toHaveBeenCalled();
+    expect(mic.enabled).toBe(true);
+    // The same (running) context is kept: none made outside a tap.
+    expect(MockAudioContext.instances).toHaveLength(1);
+    expect(cuesPlayed).toContain("yourTurn");
+    transcribeReturns("after the call");
+    await sayUtterance();
+    expect(send).toHaveBeenCalledWith("before the call after the call", expect.any(String));
+    // Nothing more is asked of the mic.
+    await flush(CALL_WATCH_TICK_MS * 10);
+    expect(getUserMedia).toHaveBeenCalledTimes(2);
+  });
+
+  it("a reply held mid-sentence by a call carries on by itself when the call ends", async () => {
+    const { result, rerender } = await startVoiceMode();
+    rerender(baseArgs({ messages: [reply("first", "a1")] }));
+    await flush();
+    act(() => players[0].opts.onCanPlay?.());
+    const ctx = MockAudioContext.instances[0];
+    ctx.state = "interrupted";
+    act(() => ctx.onstatechange?.());
+    await flush();
+    expect(players[0].pause).toHaveBeenCalledTimes(1);
+    ctx.state = "running";
+    freshMic();
+    await flush(CALL_WATCH_TICK_MS * 2);
+    expect(result.current.paused).toBe(false);
+    expect(players[0].resume).toHaveBeenCalledTimes(1);
+    expect(players[0].stop).not.toHaveBeenCalled();
+    expect(result.current.phase).toBe("speaking");
+  });
+
+  it("a pause the user made before the call does not carry on by itself", async () => {
+    const { result } = await startVoiceMode();
+    act(() => result.current.togglePause());
+    await flush();
+    const ctx = MockAudioContext.instances[0];
+    ctx.state = "interrupted";
+    act(() => ctx.onstatechange?.());
+    await flush(CALL_WATCH_TICK_MS);
+    ctx.state = "running";
+    await flush(CALL_WATCH_TICK_MS * 10);
+    expect(result.current.paused).toBe(true);
+    expect(getUserMedia).toHaveBeenCalledTimes(1);
+    // Play still takes the mic back.
+    freshMic();
+    act(() => result.current.togglePause());
+    await flush();
+    expect(result.current.paused).toBe(false);
+    expect(getUserMedia).toHaveBeenCalledTimes(2);
+  });
+
+  it("if the mic is still taken when it carries on by itself, it stays paused and says so", async () => {
     const { result } = await startVoiceMode();
     const ctx = MockAudioContext.instances[0];
     ctx.state = "interrupted";
     act(() => ctx.onstatechange?.());
     await flush();
-    expect(result.current.paused).toBe(true);
-    ctx.resume.mockClear();
-    await flush(CALL_WATCH_TICK_MS * 3);
-    expect(ctx.resume).toHaveBeenCalled();
-    expect(getUserMedia).toHaveBeenCalledTimes(1);
-
-    // The call ends: the phone gives the sound back.
     ctx.state = "running";
-    const check = freshMic();
-    await flush(CALL_WATCH_TICK_MS);
-    expect(getUserMedia).toHaveBeenCalledTimes(2);
-    expect(check.stop).toHaveBeenCalled();
+    freshMic({ muted: true });
+    await flush(CALL_WATCH_TICK_MS * 2);
+    expect(result.current.paused).toBe(true);
+    expect(result.current.errorMessage).toMatch(/still in use/);
+    // It doesn't keep retrying by itself; play does.
     await flush(CALL_WATCH_TICK_MS * 10);
     expect(getUserMedia).toHaveBeenCalledTimes(2);
-    expect(result.current.paused).toBe(true);
-    expect(result.current.phase).toBe("paused");
-
-    // Play still takes the mic back, and the watch is over.
-    const mic = freshMic();
+    freshMic();
     act(() => result.current.togglePause());
     await flush();
-    expect(getUserMedia).toHaveBeenCalledTimes(3);
-    expect(mic.stop).not.toHaveBeenCalled();
-    await flush(CALL_WATCH_TICK_MS * 10);
-    expect(getUserMedia).toHaveBeenCalledTimes(3);
+    expect(result.current.paused).toBe(false);
+    expect(result.current.errorMessage).toBeNull();
   });
 
-  it("call watch: a muted mic with the sound context never interrupted takes no mic check", async () => {
+  it("a call that only mutes the mic (the sound context never interrupted) waits for play", async () => {
     const { result } = await startVoiceMode();
     act(() => track.onmute?.());
     await flush(CALL_WATCH_TICK_MS * 10);
