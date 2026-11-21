@@ -3236,9 +3236,10 @@ export function useRelayRoomTitles(): ReadonlyMap<string, string> {
 
 /** A relay room's entry in the session list (title, faces), if it has one. */
 export function useRelayRoomSession(roomId: string | null | undefined): FleetSession | undefined {
-  const sessions = useSyncExternalStore(subscribe, getFleetSessionsSnapshot, getFleetSessionsSnapshot);
-  if (!roomId) return undefined;
-  return sessions.find((s) => s.kind === "relay-room" && s.roomId === roomId);
+  // Only this room's entry — panes don't re-render on unrelated list changes.
+  const pick = () =>
+    roomId ? state.fleetSessions.find((s) => s.kind === "relay-room" && s.roomId === roomId) : undefined;
+  return useSyncExternalStore(subscribe, pick, pick);
 }
 
 /** The project a relay room is filed in (slug), or null. */

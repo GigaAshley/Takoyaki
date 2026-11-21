@@ -34,7 +34,7 @@ vi.mock("@/hooks/use-mobile", () => ({ useIsMobile: () => mobile }));
 import { useRelayRoomPaneMenu } from "./relay-room-pane-menu";
 import { setRelayRoomProject } from "@/api/session-project-api";
 import { confirmAndLeaveRelayRoom, promptAndRenameRelayRoom } from "@/features/pretty-conversations/relay-room-row-actions";
-import { pinConversation } from "@/state/conversation-store";
+import { pinConversation, unpinConversation } from "@/state/conversation-store";
 
 const ROOM = "!room:hs";
 
@@ -74,14 +74,29 @@ describe("room pill menu", () => {
     expect(confirmAndLeaveRelayRoom).toHaveBeenCalledWith({ roomId: ROOM, title: "Plans room" });
   });
 
-  it("Move to offers Pinned, live projects and New project…, and files the room", () => {
+  it("Move to offers the live projects and New project… (no Pinned, as on the room's sidebar menu) and files the room", () => {
     const moveTo = menu().items.find((i) => i.label === "Move to")!;
     const sub = moveTo.submenu!;
-    expect(sub.map((s) => s.label)).toEqual(["Pinned", "Plans", "New project…"]);
+    expect(sub.map((s) => s.label)).toEqual(["Plans", "New project…"]);
     act(() => sub.find((s) => s.label === "Plans")!.onClick!());
     expect(setRelayRoomProject).toHaveBeenCalledWith(ROOM, "@ashley:hs", "plans");
-    act(() => sub.find((s) => s.label === "Pinned")!.onClick!());
-    expect(pinConversation).toHaveBeenCalledWith("tab-r");
+    expect(pinConversation).not.toHaveBeenCalled();
+  });
+
+  it("a leftover local pin is dropped when the room is moved, so it lands where it was put", () => {
+    pinned.add("tab-r");
+    assigned = "plans";
+    const sub = menu().items.find((i) => i.label === "Move to")!.submenu!;
+    act(() => sub.find((s) => s.label === "Remove from project")!.onClick!());
+    expect(unpinConversation).toHaveBeenCalledWith("tab-r");
+  });
+
+  it("never names the room by its id before its name is known", () => {
+    const { result } = renderHook(() =>
+      useRelayRoomPaneMenu({ tabId: "tab-r", roomId: ROOM, title: null, onCloseTab: vi.fn() }),
+    );
+    result.current.items.find((i) => i.label === "Leave")!.onClick!();
+    expect(confirmAndLeaveRelayRoom).toHaveBeenCalledWith({ roomId: ROOM, title: "this room" });
   });
 
   it("a room in a project shows the check there and offers Remove from project", () => {

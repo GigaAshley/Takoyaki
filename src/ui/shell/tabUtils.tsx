@@ -49,6 +49,7 @@ import { DesktopPane } from "./DesktopPane";
 import { FilePane } from "./FilePane";
 import { RemotePane } from "./RemotePane";
 import { useRelayRoomPaneMenu } from "./relay-room-pane-menu";
+import { useRelayRoomSession } from "@/state/conversation-store";
 
 function hostToSSHHost(h: Host): SSHHost {
   return {
@@ -194,10 +195,12 @@ function RelayRoomPane({
   isVisible: boolean;
   onCloseTab?: (id: string) => void;
 }) {
+  // The room's name as the pill shows it: the session list's, then the tab's.
+  const session = useRelayRoomSession(roomId);
   const menu = useRelayRoomPaneMenu({
     tabId: tab.id,
     roomId,
-    title: tab.relayRoomTitle ?? null,
+    title: session?.roomTitle || tab.relayRoomTitle || null,
     onCloseTab,
   });
   return (

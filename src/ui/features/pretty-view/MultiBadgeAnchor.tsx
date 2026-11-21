@@ -104,14 +104,8 @@ export interface MultiBadgeAnchorProps {
   /** Optional wrapper class override. */
   className?: string;
   /**
-   * Phase 97 Finding 2: the enclosing relay tab's tabId. Threaded to every
-   * per-participant IdentityBadge child so each badge becomes a drag SOURCE
-   * carrying the ROOM tab's tabId (dragging any badge drags the whole room
-   * tab, per D-05). Undefined → badges are not drag-sourceable (parity with
-   * pre-Phase-97 behavior). D-18 preserved: onClick is separately
-   * not-supplied by MultiBadgeAnchor, so click remains inert; only
-   * drag-source is enabled by tabId presence. The isMobile gate at
-   * IdentityBadge.tsx:82 still applies (mobile stays non-draggable).
+   * Ignored: member badges are never drag handles — the room pill is the
+   * room's handle. Kept so older callers still type-check.
    */
   tabId?: string;
   /**
@@ -426,7 +420,6 @@ export function MultiBadgeAnchor({
   fleetIdentityHosts,
   isReady,
   className,
-  tabId,
   relayRoomId,
   relayRoomTitle,
 }: MultiBadgeAnchorProps) {
@@ -524,7 +517,7 @@ export function MultiBadgeAnchor({
     // can make the row overflow — watch the badges themselves too.
     if (!tight) for (const c of Array.from(root.children)) ro.observe(c);
     return () => ro.disconnect();
-  }, [tight, memberKey, drawKey, isReady, avoidEl]);
+  }, [tight, memberKey, drawKey, isReady, avoidEl, totalCells]);
 
   // Warning 2: loading discrimination. `isReady={false}` renders a subtle
   // placeholder so the relay tab does not appear empty during the

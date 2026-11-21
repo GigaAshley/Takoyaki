@@ -8,7 +8,6 @@ import { useIsMobile } from "@/hooks/use-mobile";
 import { specForTab, encodeWorkspaceSpec } from "@/lib/tab-url";
 import {
   patchRoomProjectAssignment,
-  pinConversation,
   unpinConversation,
   useHostTree,
   usePinnedIds,
@@ -28,6 +27,33 @@ import type {
 } from "@/features/pretty-conversations/RowKebabMenu";
 import { CreateProjectModal } from "@/features/pretty-conversations/CreateProjectModal";
 
+/** File a room in a project (or take it out), as the sidebar does. */
+function moveRoomToProject(a: {
+  roomId: string;
+  tabId: string;
+  slug: string | null;
+  viewingUserMxid: string | null;
+  pinnedIds: ReadonlySet<string>;
+}): void {
+  const { roomId, tabId, slug, viewingUserMxid, pinnedIds } = a;
+  if (!viewingUserMxid) {
+    console.warn(`[room-pill-menu] skipping move — viewing user mxid not yet resolved (roomId=${roomId})`);
+    return;
+  }
+  console.info(`[room-pill-menu] move slug=${slug ?? "(null)"} roomId=${roomId}`);
+  // Rooms can't be pinned (nothing to save a room's pin to — the sidebar
+  // never offers it); drop any leftover local pin so the room lands where
+  // it was moved, not in Pinned.
+  if (pinnedIds.has(tabId)) unpinConversation(tabId);
+  const rollback = patchRoomProjectAssignment(roomId, slug);
+  setRelayRoomProject(roomId, viewingUserMxid, slug).catch((err: unknown) => {
+    rollback();
+    console.error(
+      `[room-pill-menu] setRelayRoomProject failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  });
+}
+
 export function useRelayRoomPaneMenu(args: {
   tabId: string;
   roomId: string;
@@ -43,12 +69,11 @@ export function useRelayRoomPaneMenu(args: {
   const hostTree = useHostTree();
   const [newProjectOpen, setNewProjectOpen] = useState(false);
 
-  const shownTitle = title && title.length > 0 ? title : roomId;
+  // Never the room's id: before its name is known, "this room".
+  const shownTitle = title && title.length > 0 ? title : "this room";
   const live = useMemo(() => projects.filter((p) => !p.archived), [projects]);
   // A tag naming no known project doesn't count — same as the sidebar.
   const currentProjectSlug = assigned !== null && live.some((p) => p.slug === assigned) ? assigned : null;
-  const isPinned = pinnedIds.has(tabId);
-  const shownPinned = isPinned && currentProjectSlug === null;
 
   const items = useMemo<RowKebabMenuItem[]>(() => {
     const out: RowKebabMenuItem[] = [];
@@ -73,33 +98,11 @@ export function useRelayRoomPaneMenu(args: {
       onClick: () => promptAndRenameRelayRoom({ roomId, currentTitle: shownTitle }),
     });
 
-    const setProject = (slug: string | null) => {
-      if (!viewingUserMxid) {
-        console.warn(`[room-pill-menu] skipping move — viewing user mxid not yet resolved (roomId=${roomId})`);
-        return;
-      }
-      console.info(`[room-pill-menu] move slug=${slug ?? "(null)"} roomId=${roomId}`);
-      if (slug !== null && pinnedIds.has(tabId)) unpinConversation(tabId);
-      const rollback = patchRoomProjectAssignment(roomId, slug);
-      setRelayRoomProject(roomId, viewingUserMxid, slug).catch((err: unknown) => {
-        rollback();
-        console.error(
-          `[room-pill-menu] setRelayRoomProject failed: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      });
-    };
-    const submenu: RowKebabSubmenuItem[] = [
-      {
-        label: "Pinned",
-        checked: shownPinned,
-        onClick: () => {
-          if (shownPinned) return;
-          // Pinned and in-a-project are exclusive: pinning leaves the project.
-          if (currentProjectSlug !== null) setProject(null);
-          if (!isPinned) pinConversation(tabId);
-        },
-      },
-    ];
+    const setProject = (slug: string | null) =>
+      moveRoomToProject({ roomId, tabId, slug, viewingUserMxid, pinnedIds });
+    // Same entries as the room's sidebar menu: projects, New project…,
+    // Remove from project — no Pinned (rooms can't be pinned).
+    const submenu: RowKebabSubmenuItem[] = [];
     for (const { project: p, depth } of orderProjectsAsTree(live)) {
       const isCurrent = p.slug === currentProjectSlug;
       submenu.push({
@@ -112,9 +115,7 @@ export function useRelayRoomPaneMenu(args: {
       });
     }
     submenu.push({ label: "New project…", onClick: () => setNewProjectOpen(true) });
-    if (shownPinned) {
-      submenu.push({ label: "Unpin", onClick: () => unpinConversation(tabId) });
-    } else if (currentProjectSlug !== null) {
+    if (currentProjectSlug !== null) {
       submenu.push({ label: "Remove from project", onClick: () => setProject(null) });
     }
     out.push({ label: "Move to", submenu });
@@ -139,8 +140,6 @@ export function useRelayRoomPaneMenu(args: {
     pinnedIds,
     live,
     currentProjectSlug,
-    shownPinned,
-    isPinned,
   ]);
 
   const modals = (
@@ -149,10 +148,7 @@ export function useRelayRoomPaneMenu(args: {
       onOpenChange={setNewProjectOpen}
       onCreated={({ slug }) => {
         console.info({ operation: "room_pill_new_project_created", roomId, slug });
-        if (!viewingUserMxid) return;
-        if (pinnedIds.has(tabId)) unpinConversation(tabId);
-        const rollback = patchRoomProjectAssignment(roomId, slug);
-        setRelayRoomProject(roomId, viewingUserMxid, slug).catch(() => rollback());
+        moveRoomToProject({ roomId, tabId, slug, viewingUserMxid, pinnedIds });
       }}
       hostTree={hostTree}
     />

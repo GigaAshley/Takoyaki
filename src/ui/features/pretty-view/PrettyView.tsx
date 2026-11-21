@@ -82,7 +82,7 @@ import {
   popIdentityModalOpen,
   pushIdentityModalOpen,
 } from "@/state/identity-modal-open-store";
-import { buildIdentityHostsFromFleet } from "@/state/identities-store";
+import { buildIdentityHostsFromFleet, useIdentities } from "@/state/identities-store";
 import {
   getFleetSessionsSnapshot,
   subscribeConversationStore,
@@ -837,11 +837,13 @@ export function PrettyView({
   // and the live member list (hover names; faces until the entry loads).
   const relayRoomSession = useRelayRoomSession(source.kind === "relay" ? source.roomId : null);
   const [roomPillEl, setRoomPillEl] = useState<HTMLDivElement | null>(null);
+  const { byKey: identitiesForRoomPill } = useIdentities();
   // The room pill's faces come from the room's sidebar entry (join order, as
   // on its row); until that loads, from the live member list.
   const roomPillOthers = useMemo(() => {
     const p = chatSurfaceAdapter.participants;
-    if (!p) return [] as RelayRoomFace[];
+    // Until the viewer is known, the list could include them — wait.
+    if (!p || !viewingUserMxid) return [] as RelayRoomFace[];
     return [
       ...p.humans
         .filter((h) => h.mxid !== viewingUserMxid)
@@ -852,9 +854,13 @@ export function PrettyView({
           userId: h.userId,
           avatarPath: h.avatarPath ?? null,
         })),
-      ...p.agents.map((a): RelayRoomFace => ({ mxid: a.mxid, kind: "agent", name: a.identityKey })),
+      ...p.agents.map((a): RelayRoomFace => ({
+        mxid: a.mxid,
+        kind: "agent",
+        name: identitiesForRoomPill.get(a.identityKey.toLowerCase())?.displayName ?? a.identityKey,
+      })),
     ];
-  }, [chatSurfaceAdapter.participants, viewingUserMxid]);
+  }, [chatSurfaceAdapter.participants, viewingUserMxid, identitiesForRoomPill]);
   const roomPillFaces: readonly RelayRoomFace[] =
     relayRoomSession?.roomFaces && relayRoomSession.roomFaces.length > 0
       ? relayRoomSession.roomFaces
@@ -4916,7 +4922,6 @@ export function PrettyView({
           viewingUserMxid={viewingUserMxid ?? ""}
           fleetIdentityHosts={fleetIdentityHosts}
           isReady={chatSurfaceAdapter.isReady}
-          tabId={tabId}
           relayRoomId={source.kind === "relay" ? source.roomId : undefined}
           relayRoomTitle={source.kind === "relay" ? source.roomTitle : undefined}
         />
