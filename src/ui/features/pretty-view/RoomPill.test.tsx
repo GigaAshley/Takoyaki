@@ -83,6 +83,11 @@ describe("RoomPill", () => {
     expect(screen.getByTestId("pv-room-pill-label").textContent).toBe("Relay room");
   });
 
+  it("shows the pointer cursor over the pill, like a conversation's pill", () => {
+    renderPill();
+    expect(screen.getByTestId("pv-room-pill").className).toContain("cursor-pointer");
+  });
+
   it("has no memory pie and no round buttons", () => {
     renderPill();
     expect(screen.queryByTestId("pv-task-pill-memory")).toBeNull();

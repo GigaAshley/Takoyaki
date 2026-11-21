@@ -83,7 +83,8 @@ export const RoomPill = forwardRef<HTMLDivElement, RoomPillProps>(function RoomP
         {...contextMenu.holdProps}
         draggable={isDragSource}
         onDragStart={onDragStart}
-        className="pv-float relative flex flex-row items-center gap-0.5 h-10 min-w-0 max-w-full rounded-full pl-1 pr-1 select-none [-webkit-touch-callout:none]"
+        // The pointer says "this is the pane's handle", as on a conversation's pill.
+        className="pv-float relative flex flex-row items-center gap-0.5 h-10 min-w-0 max-w-full rounded-full pl-1 pr-1 cursor-pointer select-none [-webkit-touch-callout:none]"
       >
         <div className="flex flex-row items-center gap-[9px] h-8 min-w-0 pl-0.5 pr-2">
           {faces.length > 0 && (
