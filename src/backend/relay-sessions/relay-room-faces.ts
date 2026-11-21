@@ -12,6 +12,7 @@ import { db } from "../database/db/index.js";
 import { users } from "../database/db/schema.js";
 import { databaseLogger } from "../utils/logger.js";
 import {
+  fetchEventAdmin,
   getRoomStateAdmin,
   type RoomStateEvent,
 } from "../matrix/matrix-room-actions-client.js";
@@ -20,8 +21,16 @@ function num(v: unknown, fallback: number): number {
   return typeof v === "number" && Number.isFinite(v) ? v : fallback;
 }
 
-/** Joined members, oldest join first (ties keep the server's order). */
-export function joinedMembersInJoinOrder(events: readonly RoomStateEvent[]): string[] {
+/**
+ * Joined members, oldest join first (ties keep the server's order).
+ * `joinTs` overrides a member's time with when they really joined — a
+ * profile change (new name or picture) is a fresh membership event, so the
+ * current event's own time can be much later than the join.
+ */
+export function joinedMembersInJoinOrder(
+  events: readonly RoomStateEvent[],
+  joinTs?: ReadonlyMap<string, number>,
+): string[] {
   return events
     .map((e, i) => ({ e, i }))
     .filter(
@@ -31,12 +40,75 @@ export function joinedMembersInJoinOrder(events: readonly RoomStateEvent[]): str
         e.state_key.length > 0 &&
         e.content?.membership === "join",
     )
-    .sort(
-      (a, b) =>
-        num(a.e.origin_server_ts, Number.MAX_SAFE_INTEGER) -
-          num(b.e.origin_server_ts, Number.MAX_SAFE_INTEGER) || a.i - b.i,
-    )
-    .map(({ e }) => e.state_key as string);
+    .map(({ e, i }) => ({
+      mxid: e.state_key as string,
+      ts: joinTs?.get(e.state_key as string) ?? num(e.origin_server_ts, Number.MAX_SAFE_INTEGER),
+      i,
+    }))
+    .sort((a, b) => a.ts - b.ts || a.i - b.i)
+    .map(({ mxid }) => mxid);
+}
+
+/** How far back one member's chain of profile changes is followed. */
+const MAX_PROFILE_CHANGES_FOLLOWED = 10;
+/** Resolved join times by member-event id. Events never change, so this only grows; cleared past the cap. */
+const JOIN_TS_MEMO_CAP = 5_000;
+const joinTsByEventId = new Map<string, number>();
+
+function replacedEventId(e: RoomStateEvent): string | undefined {
+  const r = e.replaces_state ?? e.unsigned?.replaces_state;
+  return typeof r === "string" && r.length > 0 ? r : undefined;
+}
+
+/**
+ * When each joined member really joined: walk back from their current
+ * membership event through the events it replaced while those were still
+ * "join" (profile changes), and take the earliest join's time. Each event's
+ * answer is remembered, so a room is walked once, not on every refresh. A
+ * lookup that fails just stops the walk at what's known.
+ */
+export async function resolveJoinTimes(
+  events: readonly RoomStateEvent[],
+  fetchEvent: typeof fetchEventAdmin,
+): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  const joins = events.filter(
+    (e) =>
+      e.type === "m.room.member" &&
+      typeof e.state_key === "string" &&
+      e.content?.membership === "join",
+  );
+  await Promise.all(
+    joins.map(async (current) => {
+      const mxid = current.state_key as string;
+      const startId = current.event_id;
+      if (startId && joinTsByEventId.has(startId)) {
+        out.set(mxid, joinTsByEventId.get(startId) as number);
+        return;
+      }
+      let ts = num(current.origin_server_ts, Number.MAX_SAFE_INTEGER);
+      let prevId = replacedEventId(current);
+      for (let n = 0; prevId && n < MAX_PROFILE_CHANGES_FOLLOWED; n++) {
+        const memo = joinTsByEventId.get(prevId);
+        if (memo !== undefined) {
+          ts = Math.min(ts, memo);
+          break;
+        }
+        const r = await fetchEvent(prevId);
+        if (r.ok === false) break;
+        const prev = r.event;
+        if (prev.type !== "m.room.member" || prev.content?.membership !== "join") break;
+        ts = Math.min(ts, num(prev.origin_server_ts, ts));
+        prevId = replacedEventId(prev);
+      }
+      if (startId) {
+        if (joinTsByEventId.size >= JOIN_TS_MEMO_CAP) joinTsByEventId.clear();
+        joinTsByEventId.set(startId, ts);
+      }
+      out.set(mxid, ts);
+    }),
+  );
+  return out;
 }
 
 export interface RoomFace {
@@ -100,6 +172,7 @@ const membersInFlight = new Map<string, Promise<string[] | null>>();
 export function __resetRoomMembersCacheForTests(): void {
   membersCache.clear();
   membersInFlight.clear();
+  joinTsByEventId.clear();
 }
 
 export function invalidateRoomMembers(roomId: string): void {
@@ -113,7 +186,10 @@ export function invalidateRoomMembers(roomId: string): void {
  */
 export async function getRoomMembersInJoinOrder(
   roomId: string,
-  deps: { getRoomState: typeof getRoomStateAdmin } = { getRoomState: getRoomStateAdmin },
+  deps: { getRoomState: typeof getRoomStateAdmin; fetchEvent: typeof fetchEventAdmin } = {
+    getRoomState: getRoomStateAdmin,
+    fetchEvent: fetchEventAdmin,
+  },
 ): Promise<string[] | null> {
   const now = Date.now();
   const cached = membersCache.get(roomId);
@@ -132,7 +208,8 @@ export async function getRoomMembersInJoinOrder(
         });
         return cached?.members ?? null;
       }
-      const members = joinedMembersInJoinOrder(state.events);
+      const joinTs = await resolveJoinTimes(state.events, deps.fetchEvent);
+      const members = joinedMembersInJoinOrder(state.events, joinTs);
       membersCache.set(roomId, { members, expiresAt: Date.now() + ROOM_MEMBERS_CACHE_TTL_MS });
       return members;
     } finally {

@@ -5,6 +5,7 @@ vi.mock("../utils/logger.js", () => ({
 }));
 vi.mock("../matrix/matrix-room-actions-client.js", () => ({
   getRoomStateAdmin: vi.fn(),
+  fetchEventAdmin: vi.fn(),
   leaveRoomAsUser: vi.fn(),
   putPowerLevelsAs: vi.fn(),
   setRoomNameAsUser: vi.fn(),
@@ -25,6 +26,7 @@ import {
 import {
   __resetRoomMembersCacheForTests,
   getRoomMembersInJoinOrder,
+  invalidateRoomMembers,
   joinedMembersInJoinOrder,
   pickRoomFaces,
 } from "./relay-room-faces.js";
@@ -157,24 +159,48 @@ describe("pickRoomFaces", () => {
   });
 });
 
+const noFetch = vi.fn().mockResolvedValue({ ok: false, status: 404, error: "none" });
+
 describe("getRoomMembersInJoinOrder", () => {
   beforeEach(() => __resetRoomMembersCacheForTests());
 
   it("reads the room once per TTL and shares in-flight reads", async () => {
     const getRoomState = vi.fn().mockResolvedValue({ ok: true, events: agentRoom() });
     const [a, b] = await Promise.all([
-      getRoomMembersInJoinOrder("!r:hs", { getRoomState }),
-      getRoomMembersInJoinOrder("!r:hs", { getRoomState }),
+      getRoomMembersInJoinOrder("!r:hs", { getRoomState, fetchEvent: noFetch }),
+      getRoomMembersInJoinOrder("!r:hs", { getRoomState, fetchEvent: noFetch }),
     ]);
     expect(a).toEqual([AGENT, ME]);
     expect(b).toEqual([AGENT, ME]);
-    await getRoomMembersInJoinOrder("!r:hs", { getRoomState });
+    await getRoomMembersInJoinOrder("!r:hs", { getRoomState, fetchEvent: noFetch });
     expect(getRoomState).toHaveBeenCalledTimes(1);
+  });
+
+  it("orders by when members really joined, not their latest profile change", async () => {
+    // AGENT joined at 100 then changed its name at 900; ME joined at 200.
+    const events: RoomStateEvent[] = [
+      { ...member(AGENT, 900), event_id: "$agent-rename", unsigned: { replaces_state: "$agent-join" } },
+      { ...member(ME, 200), event_id: "$me-join", unsigned: { replaces_state: "$me-invite" } },
+    ];
+    const fetchEvent = vi.fn(async (id: string) => {
+      if (id === "$agent-join") return { ok: true as const, event: { ...member(AGENT, 100), unsigned: { replaces_state: "$agent-invite" } } };
+      if (id === "$agent-invite") return { ok: true as const, event: member(AGENT, 50, "invite") };
+      if (id === "$me-invite") return { ok: true as const, event: member(ME, 150, "invite") };
+      return { ok: false as const, status: 404, error: "none" };
+    });
+    const getRoomState = vi.fn().mockResolvedValue({ ok: true, events });
+    expect(await getRoomMembersInJoinOrder("!p:hs", { getRoomState, fetchEvent })).toEqual([AGENT, ME]);
+    expect(fetchEvent).toHaveBeenCalledTimes(3);
+    // Answers are remembered: a later refresh of the room fetches nothing new.
+    invalidateRoomMembers("!p:hs");
+    expect(await getRoomMembersInJoinOrder("!p:hs", { getRoomState, fetchEvent })).toEqual([AGENT, ME]);
+    expect(getRoomState).toHaveBeenCalledTimes(2);
+    expect(fetchEvent).toHaveBeenCalledTimes(3);
   });
 
   it("returns null when the room can't be read", async () => {
     const getRoomState = vi.fn().mockResolvedValue({ ok: false, status: 502, error: "x" });
-    expect(await getRoomMembersInJoinOrder("!r:hs", { getRoomState })).toBeNull();
+    expect(await getRoomMembersInJoinOrder("!r:hs", { getRoomState, fetchEvent: noFetch })).toBeNull();
   });
 });
 

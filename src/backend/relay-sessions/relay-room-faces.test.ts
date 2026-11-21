@@ -7,6 +7,7 @@ vi.mock("../database/db/index.js", () => ({ db: {} }));
 vi.mock("../database/db/schema.js", () => ({ users: {} }));
 vi.mock("../matrix/matrix-room-actions-client.js", () => ({
   getRoomStateAdmin: vi.fn(),
+  fetchEventAdmin: vi.fn(),
 }));
 
 import { loadRoomFacesForViewer } from "./relay-room-faces.js";

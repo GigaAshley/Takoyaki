@@ -40,6 +40,10 @@ export interface RoomStateEvent {
   sender?: string;
   origin_server_ts?: number;
   content?: Record<string, unknown>;
+  event_id?: string;
+  /** The state event this one replaced (top level or under `unsigned`). */
+  replaces_state?: string;
+  unsigned?: { replaces_state?: string };
 }
 
 async function timedFetch(
@@ -189,6 +193,37 @@ export async function getRoomStateAdmin(
         e !== null && typeof e === "object" && typeof (e as { type?: unknown }).type === "string",
     );
     return { ok: true, events };
+  } catch {
+    return { ok: false, status: 502, error: ERR_MALFORMED };
+  }
+}
+
+/**
+ * GET /_synapse/admin/v1/fetch_event/{eventId} — one event by id, whether or
+ * not the admin account is in its room. Older homeservers without this
+ * endpoint answer non-2xx; callers treat that as "unknown".
+ */
+export async function fetchEventAdmin(
+  eventId: string,
+): Promise<{ ok: true; event: RoomStateEvent } | RoomActionErr> {
+  const creds = await getMatrixAdminCreds();
+  if (!creds) return { ok: false, status: 500, error: ERR_CREDS_MISSING };
+  const res = await timedFetch(
+    `${creds.homeserverBase}/_synapse/admin/v1/fetch_event/${encodeURIComponent(eventId)}`,
+    { method: "GET", token: creds.accessToken },
+    "matrix_fetch_event_admin",
+  );
+  if (res.ok === false) return res;
+  if (!res.response.ok) {
+    return { ok: false, status: res.response.status, error: ERR_NON_2XX };
+  }
+  try {
+    const parsed = (await res.response.json()) as { event?: unknown };
+    const ev = parsed.event;
+    if (ev === null || typeof ev !== "object" || typeof (ev as { type?: unknown }).type !== "string") {
+      return { ok: false, status: 502, error: ERR_MALFORMED };
+    }
+    return { ok: true, event: ev as RoomStateEvent };
   } catch {
     return { ok: false, status: 502, error: ERR_MALFORMED };
   }
