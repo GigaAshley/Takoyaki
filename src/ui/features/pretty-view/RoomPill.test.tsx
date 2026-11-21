@@ -56,7 +56,7 @@ function renderPill(overrides: Partial<React.ComponentProps<typeof RoomPill>> = 
   render(
     <RoomPill
       roomId={ROOM}
-      title="ashley-zoey-vector"
+      title="garden-room"
       faces={FACES}
       othersCount={2}
       memberNames={["Zoey", "vector"]}
@@ -73,9 +73,9 @@ beforeEach(() => setMobileViewport(false));
 describe("RoomPill", () => {
   it("shows the room's faces and name, and hovers with the full name and members", () => {
     renderPill();
-    expect(screen.getByTestId("pv-room-pill-label").textContent).toBe("ashley-zoey-vector");
+    expect(screen.getByTestId("pv-room-pill-label").textContent).toBe("garden-room");
     expect(screen.getByTestId("pv-room-pill-faces").querySelectorAll('[data-testid="pv-room-face"]').length).toBe(2);
-    expect(screen.getByTestId("pv-room-pill").getAttribute("title")).toBe("ashley-zoey-vector · Zoey, vector");
+    expect(screen.getByTestId("pv-room-pill").getAttribute("title")).toBe("garden-room · Zoey, vector");
   });
 
   it("never shows a room id as its name", () => {

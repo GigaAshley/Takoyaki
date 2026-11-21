@@ -21,7 +21,7 @@ vi.mock("@/state/conversation-store", () => ({
 vi.mock("@/state/project-tree", () => ({
   orderProjectsAsTree: (ps: Array<{ slug: string }>) => ps.map((project) => ({ project, depth: 0 })),
 }));
-vi.mock("@/state/viewing-user-store", () => ({ useViewingUserMxid: () => "@ashley:hs" }));
+vi.mock("@/state/viewing-user-store", () => ({ useViewingUserMxid: () => "@viewer:hs" }));
 vi.mock("@/api/session-project-api", () => ({ setRelayRoomProject: vi.fn(() => Promise.resolve()) }));
 vi.mock("@/features/pretty-conversations/relay-room-row-actions", () => ({
   confirmAndLeaveRelayRoom: vi.fn(),
@@ -79,7 +79,7 @@ describe("room pill menu", () => {
     const sub = moveTo.submenu!;
     expect(sub.map((s) => s.label)).toEqual(["Plans", "New project…"]);
     act(() => sub.find((s) => s.label === "Plans")!.onClick!());
-    expect(setRelayRoomProject).toHaveBeenCalledWith(ROOM, "@ashley:hs", "plans");
+    expect(setRelayRoomProject).toHaveBeenCalledWith(ROOM, "@viewer:hs", "plans");
     expect(pinConversation).not.toHaveBeenCalled();
   });
 
@@ -105,6 +105,6 @@ describe("room pill menu", () => {
     expect(sub.find((s) => s.label === "Plans")!.checked).toBe(true);
     const remove = sub.find((s) => s.label === "Remove from project")!;
     act(() => remove.onClick!());
-    expect(setRelayRoomProject).toHaveBeenCalledWith(ROOM, "@ashley:hs", null);
+    expect(setRelayRoomProject).toHaveBeenCalledWith(ROOM, "@viewer:hs", null);
   });
 });
