@@ -1740,8 +1740,10 @@ describe("useVoiceMode — interruptions", () => {
     expect(result.current.errorMessage).toBeNull();
     expect(mic.stop).not.toHaveBeenCalled();
     expect(mic.enabled).toBe(true);
-    // The same (running) context is kept: none made outside a tap.
-    expect(MockAudioContext.instances).toHaveLength(1);
+    // A fresh sound context replaces the one the call interrupted.
+    expect(MockAudioContext.instances).toHaveLength(2);
+    expect(MockAudioContext.instances[0].close).toHaveBeenCalled();
+    expect(MockAudioContext.instances[1].close).not.toHaveBeenCalled();
     expect(cuesPlayed).toContain("yourTurn");
     transcribeReturns("after the call");
     await sayUtterance();
@@ -1768,6 +1770,57 @@ describe("useVoiceMode — interruptions", () => {
     expect(players[0].resume).toHaveBeenCalledTimes(1);
     expect(players[0].stop).not.toHaveBeenCalled();
     expect(result.current.phase).toBe("speaking");
+  });
+
+  it("carrying on by itself keeps the old sound context when a fresh one won't start", async () => {
+    const { result } = await startVoiceMode();
+    const ctx = MockAudioContext.instances[0];
+    ctx.state = "interrupted";
+    act(() => ctx.onstatechange?.());
+    await flush();
+    ctx.state = "running";
+    freshMic();
+    // The next context made stays suspended.
+    const origPush = MockAudioContext.instances.push.bind(MockAudioContext.instances);
+    MockAudioContext.instances.push = (c: MockAudioContext) => {
+      c.state = "suspended";
+      c.resume = vi.fn(() => new Promise<undefined>(() => {}));
+      return origPush(c);
+    };
+    try {
+      await flush(CALL_WATCH_TICK_MS * 2);
+      await flush(1100);
+    } finally {
+      MockAudioContext.instances.push = origPush;
+    }
+    expect(MockAudioContext.instances).toHaveLength(2);
+    expect(MockAudioContext.instances[1].close).toHaveBeenCalled();
+    expect(ctx.close).not.toHaveBeenCalled();
+    expect(result.current.paused).toBe(false);
+    expect(getUserMedia).toHaveBeenCalledTimes(2);
+  });
+
+  it("turning voice mode off while it carries on by itself leaves nothing open", async () => {
+    const { result } = await startVoiceMode();
+    const ctx = MockAudioContext.instances[0];
+    ctx.state = "interrupted";
+    act(() => ctx.onstatechange?.());
+    await flush();
+    ctx.state = "running";
+    const origPush = MockAudioContext.instances.push.bind(MockAudioContext.instances);
+    MockAudioContext.instances.push = (c: MockAudioContext) => {
+      c.resume = vi.fn(() => new Promise<undefined>(() => {}));
+      return origPush(c);
+    };
+    try {
+      await flush(CALL_WATCH_TICK_MS * 2);
+      act(() => result.current.stop());
+      await flush(1100);
+    } finally {
+      MockAudioContext.instances.push = origPush;
+    }
+    expect(ctx.close).toHaveBeenCalled();
+    expect(getUserMedia).toHaveBeenCalledTimes(1);
   });
 
   it("a pause the user made before the call does not carry on by itself", async () => {

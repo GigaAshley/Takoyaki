@@ -162,6 +162,8 @@ export const RECOVER_MIC_TIMEOUT_MS = 6000;
 /** Call watch (while paused by the phone): how often it looks, and for how long. */
 export const CALL_WATCH_TICK_MS = 2000;
 export const CALL_WATCH_MAX_MS = 15 * 60_000;
+/** Carrying on by itself: how long a fresh sound context may take to start. */
+const FRESH_CONTEXT_WAIT_MS = 1000;
 
 /** Why the mic is being asked for: voice mode starting, after the manual mic, or the play tap after an interruption. */
 type MicRequestKind = "start" | "reacquire" | "recover";
@@ -1805,19 +1807,65 @@ export function useVoiceMode(args: UseVoiceModeArgs): UseVoiceModeReturn {
       recoveringRef.current = true;
       setErrorMessage(null);
       dropStream();
-      // From a tap, a fresh sound context too: the old one may be what the
-      // phone broke (starting voice mode afresh is what was seen to fix it).
-      // Carrying on by itself, the old one is already running again — and a
-      // new one made outside a tap would start suspended.
-      if (by === "tap") {
-        const oldCues = cuesRef.current;
-        const oldCtx = ctxRef.current;
+      // A fresh sound context too: the one the phone interrupted gives only
+      // silence from a new mic, even once it runs again (seen on a real
+      // call). From a tap the fresh one always starts.
+      const oldCues = cuesRef.current;
+      const oldCtx = ctxRef.current;
+      const dropOld = () => {
         oldCues?.stopTicking();
         oldCues?.dispose();
         void oldCtx?.close().catch(() => {});
+      };
+      if (by === "tap") {
+        dropOld();
         openAudioRef.current();
+        requestMicRef.current("recover");
+      } else {
+        // Carrying on by itself, outside a tap: use the fresh one only if the
+        // phone lets it run; otherwise keep the old one. The mic counts as
+        // being asked for meanwhile, so listening doesn't ask on its own.
+        acquiringRef.current = true;
+        const gen = acquireGenRef.current;
+        openAudioRef.current();
+        const fresh = ctxRef.current;
+        const freshCues = cuesRef.current;
+        const settled =
+          fresh && fresh !== oldCtx
+            ? Promise.race([
+                fresh.resume().catch(() => {}),
+                new Promise<void>((r) => setTimeout(r, FRESH_CONTEXT_WAIT_MS)),
+              ])
+            : Promise.resolve();
+        void settled.then(() => {
+          // Turned off meanwhile: the teardown closed the fresh one.
+          if (!activeRef.current) {
+            dropOld();
+            return;
+          }
+          // Overtaken (a pause dropped the request, or a tap took over).
+          const overtaken = gen !== acquireGenRef.current;
+          const running = !!fresh && fresh !== oldCtx && fresh.state === "running";
+          log(`auto-resume-context fresh=${fresh?.state ?? "none"} using=${running ? "fresh" : "old"}`);
+          if (running) dropOld();
+          else if (fresh && fresh !== oldCtx && ctxRef.current === fresh) {
+            freshCues?.dispose();
+            void fresh.close().catch(() => {});
+            ctxRef.current = oldCtx;
+            cuesRef.current = oldCues;
+          }
+          // Paused again meanwhile: leave the mic for the next resume.
+          if (overtaken || pausedRef.current) {
+            if (!overtaken) acquiringRef.current = false;
+            if (pausedRef.current) {
+              micLostRef.current = true;
+              recoveringRef.current = false;
+            }
+            return;
+          }
+          requestMicRef.current("recover");
+        });
       }
-      requestMicRef.current("recover");
     }
     const held = heldRef.current;
     heldRef.current = null;
