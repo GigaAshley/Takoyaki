@@ -13,7 +13,7 @@
  */
 
 import type { Request, Response } from "express";
-import { Readable } from "node:stream";
+import { Readable, Transform } from "node:stream";
 import type { ReadableStream as NodeWebReadableStream } from "node:stream/web";
 import { classifyByExtension } from "../../utils/editable-file-whitelist.js";
 import { sniffTextBytes } from "../../utils/editable-file-byte-sniff.js";
@@ -22,6 +22,7 @@ import {
   COMMON_RESPONSE_HEADERS,
   dispatchByExtensionOnly,
   extractExtension,
+  parseRangeHeader,
   type DispatchResult,
 } from "../../utils/sftp-file-response.js";
 import { databaseLogger } from "../../utils/logger.js";
@@ -45,6 +46,21 @@ export function dispatchRoomFile(name: string, mimetype: string | null): Dispatc
     };
   }
   return { contentType: "application/octet-stream", disposition: "attachment" };
+}
+
+/** Pass through only bytes start..end (inclusive) of a stream. */
+export function byteSlice(start: number, end: number): Transform {
+  let pos = 0;
+  return new Transform({
+    transform(chunk: Buffer, _enc, cb) {
+      const from = Math.max(start - pos, 0);
+      const to = Math.min(end - pos + 1, chunk.byteLength);
+      pos += chunk.byteLength;
+      if (from < to) this.push(chunk.subarray(from, to));
+      if (pos > end) this.push(null);
+      cb();
+    },
+  });
 }
 
 function sendErrorText(res: Response, status: number, errorClass: string): void {
@@ -77,19 +93,44 @@ export async function serveRoomFileGet(
     "accept-ranges": "bytes",
   };
   const len = upstream.headers.get("content-length");
-  if (len) headers["content-length"] = len;
   const contentRange = upstream.headers.get("content-range");
-  if (upstream.status === 206 && contentRange) headers["content-range"] = contentRange;
+  // Chat servers may answer a ranged request with the whole file. Media
+  // players (Safari especially) need a real partial answer to play and
+  // scrub, so cut the asked-for bytes out here.
+  let slice: { start: number; end: number } | null = null;
+  const total = Number(len);
+  if (range && upstream.status === 200 && len && Number.isFinite(total)) {
+    const spec = parseRangeHeader(range, total);
+    if (spec === "unsatisfiable") {
+      void upstream.body?.cancel().catch(() => {});
+      res.set({ ...COMMON_RESPONSE_HEADERS, "content-type": "text/plain; charset=utf-8", "content-range": `bytes */${total}` });
+      res.status(416).send("range_not_satisfiable");
+      return;
+    }
+    if (spec) slice = spec;
+  }
+  if (slice) {
+    headers["content-length"] = String(slice.end - slice.start + 1);
+    headers["content-range"] = `bytes ${slice.start}-${slice.end}/${total}`;
+  } else {
+    if (len) headers["content-length"] = len;
+    if (upstream.status === 206 && contentRange) headers["content-range"] = contentRange;
+  }
   if (dispatch.disposition === "attachment") {
     headers["content-disposition"] = attachmentDisposition(opened.post.name);
   }
   res.set(headers);
-  res.status(upstream.status === 206 ? 206 : 200);
+  res.status(upstream.status === 206 || slice ? 206 : 200);
   if (!upstream.body) {
     res.end();
     return;
   }
-  const body = Readable.fromWeb(upstream.body as unknown as NodeWebReadableStream);
+  const whole = Readable.fromWeb(upstream.body as unknown as NodeWebReadableStream);
+  const body = slice ? whole.pipe(byteSlice(slice.start, slice.end)) : whole;
+  if (slice) {
+    body.on("end", () => whole.destroy());
+    whole.on("error", (err) => body.destroy(err));
+  }
   await new Promise<void>((resolve) => {
     const finish = () => resolve();
     res.on("close", () => {

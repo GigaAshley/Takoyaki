@@ -90,7 +90,7 @@ describe("serving a room file", () => {
       (req, res) => void serveRoomFileGet(req, res, "u1", PATH),
       async (base) => {
         const res = await fetch(`${base}/x`, { headers: { Range: "bytes=0-2" } });
-        expect(res.status).toBe(200);
+        expect(res.status).toBe(206);
         expect(res.headers.get("content-type")).toBe("image/png");
         expect(res.headers.get("x-content-type-options")).toBe("nosniff");
         expect(res.headers.get("cache-control")).toBe("no-store");
@@ -112,6 +112,23 @@ describe("serving a room file", () => {
         const res = await fetch(`${base}/x`, { headers: { Range: "bytes=0-1" } });
         expect(res.status).toBe(206);
         expect(res.headers.get("content-range")).toBe("bytes 0-1/10");
+      },
+    );
+  });
+
+  it("cuts the asked-for bytes out when the chat server sends the whole file", async () => {
+    files.openRoomFile.mockResolvedValue({
+      ok: true,
+      post: { name: "v.mp4", mimetype: "video/mp4", size: 10, mxc: "mxc://hs/v", encrypted: false },
+      response: new Response("0123456789", { status: 200, headers: { "content-length": "10" } }),
+    });
+    await serve(
+      (req, res) => void serveRoomFileGet(req, res, "u1", PATH),
+      async (base) => {
+        const res = await fetch(`${base}/x`, { headers: { Range: "bytes=2-5" } });
+        expect(res.status).toBe(206);
+        expect(res.headers.get("content-range")).toBe("bytes 2-5/10");
+        expect(await res.text()).toBe("2345");
       },
     );
   });
