@@ -2633,6 +2633,47 @@ describe("PrettyConversationsPanel: Phase 115 Plan 115-06 handleArchive", () => 
     expectArchiveConfirm(kitConfirms(dialogs)[0], "wren");
   });
 
+  // A5c: a row with no agent behind it (a plain shell, or an agent whose
+  //      identity hasn't loaded yet) has nothing to archive —
+  //      its menu offers Kill, not Archive.
+  it("A5c: shell row with no identity → menu has Kill but no Archive", async () => {
+    const hostA = makeHost("1", "hostA");
+    mockIdentitiesByKey = new Map([
+      ["wren", { identityKey: "wren", displayName: "wren", title: null }],
+    ]);
+    setSnapshot({
+      activeSet: [],
+      pinned: [],
+      middle: [
+        makeConversationRow({
+          id: "shell-row-1",
+          label: "Untitled shell",
+          host: hostA,
+          targetTmuxSession: "shell-1",
+        }),
+      ],
+      rdpGroup: null,
+    });
+
+    const { container } = render(
+      <PrettyConversationsPanel isAdmin
+        variant="desktop"
+        onDeactivateRow={() => {}}
+        onKillRow={() => {}}
+      />,
+    );
+
+    const rowEl = container.querySelector(
+      '[data-conversation-id="shell-row-1"]',
+    ) as HTMLElement | null;
+    expect(rowEl).toBeTruthy();
+    const body = rowEl!.querySelector('[role="button"]') as HTMLElement;
+    await openRowKebabInBody(body);
+    const menu = screen.getByRole("menu");
+    expect(within(menu).getByRole("menuitem", { name: /kill/i })).toBeTruthy();
+    expect(within(menu).queryByRole("menuitem", { name: "Archive" })).toBeNull();
+  });
+
   // A5b: identity has task → confirmation copy uses task instead of displayName,
   //      mirroring the sidebar row's task-primary label preference.
   it("A5b: identity with task → confirm uses task string, not displayName", async () => {
@@ -2772,48 +2813,6 @@ describe("PrettyConversationsPanel: Phase 115 Plan 115-06 handleArchive", () => 
     await flushKit();
     expect(archiveIdentitySpy).toHaveBeenCalledTimes(1);
     expect(archiveIdentitySpy).toHaveBeenCalledWith(42, "wren");
-  });
-
-  // A8: identity-key fallback — if the identity hasn't yet resolved, the
-  //     confirmation copy uses the identity key as displayName.
-  it("A8: identity not yet resolved → confirmation uses identityKey as displayName", async () => {
-    const hostA = makeHost("1", "hostA");
-    // No identity seeded — mockIdentitiesByKey stays empty from beforeEach.
-    setSnapshot({
-      activeSet: [],
-      pinned: [],
-      middle: [
-        makeConversationRow({
-          id: "arch-row-4",
-          label: "wren",
-          host: hostA,
-          targetTmuxSession: "wren",
-        }),
-      ],
-      rdpGroup: null,
-    });
-
-    const dialogs = autoAnswerKitDialogs({ confirm: false });
-
-    const { container } = render(
-      <PrettyConversationsPanel isAdmin
-        variant="desktop"
-        onDeactivateRow={() => {}}
-      />,
-    );
-
-    const rowEl = container.querySelector(
-      '[data-conversation-id="arch-row-4"]',
-    ) as HTMLElement | null;
-    const body = rowEl!.querySelector('[role="button"]') as HTMLElement;
-    await openRowKebabInBody(body);
-    const menu = screen.getByRole("menu");
-    const archiveItem = within(menu).getByRole("menuitem", { name: "Archive" });
-    fireEvent.click(archiveItem);
-
-    // Fallback: displayName resolves to the identityKey (targetTmuxSession).
-    await waitFor(() => expect(kitConfirms(dialogs)).toHaveLength(1));
-    expectArchiveConfirm(kitConfirms(dialogs)[0], "wren");
   });
 
   // A9: RDP host row → Archive item NOT in menu (affordance-narrowing preserved).

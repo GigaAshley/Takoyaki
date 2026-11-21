@@ -512,7 +512,7 @@ const noopTogglePin = () => {};
 // exact presence/absence semantics the row's menu builder gates on:
 //   - pinMode "toggle" → onTogglePin flips the shown pin state; "noop" → a
 //     no-op handler (RDP rows); "none" → omitted (row can't be pinned).
-//   - archivable → onArchive only for rows canonicalArchiveIdForRow accepts.
+//   - archivable → onArchive only for agent rows canonicalArchiveIdForRow accepts.
 //   - projectActions → onMoveToProject (non-RDP, this host has projects) and
 //     onCreateProject (non-RDP, relay room or row with a host).
 //
@@ -550,6 +550,9 @@ const PrettyConversationRowLive = memo(function PrettyConversationRowLive(props:
   const aiTitle = useSessionAiTitle(sessionKey);
   const isRdp = row.rdpHostRow === true;
   const isRelayRoom = typeof row.roomId === "string" && row.roomId.length > 0;
+  // Archive retires an agent, so only rows with one behind them offer it — a
+  // plain shell has nothing to archive (Kill is its way out).
+  const canArchive = archivable && props.identity !== null && canonicalArchiveIdForRow(row) !== null;
   return (
     <PrettyConversationRowView
       row={row}
@@ -567,16 +570,8 @@ const PrettyConversationRowLive = memo(function PrettyConversationRowLive(props:
       }
       onDeactivate={() => actions.deactivate(row)}
       onKill={() => actions.kill(row)}
-      onArchive={
-        archivable && canonicalArchiveIdForRow(row) !== null
-          ? () => actions.archive(row)
-          : undefined
-      }
-      onSwipeArchive={
-        archivable && canonicalArchiveIdForRow(row) !== null
-          ? () => actions.swipeArchive(row)
-          : undefined
-      }
+      onArchive={canArchive ? () => actions.archive(row) : undefined}
+      onSwipeArchive={canArchive ? () => actions.swipeArchive(row) : undefined}
       onMoveToProject={
         projectActions && !isRdp && (projects?.length ?? 0) > 0
           ? (slug: string | null) => actions.moveToProject(row, slug)
