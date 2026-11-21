@@ -27,4 +27,8 @@ describe("AppShell — relay room rows", () => {
   it("relay-rooms-changed re-reads the session list", () => {
     expect(src).toMatch(/onRelayRoomsChanged: \(\) => \{\s*void fetchFleetSessionsRef\.current\?\.\(\{ isColdStart: false \}\);/);
   });
+
+  it("room tab names are fixed up when a tab opens, not only when the names change", () => {
+    expect(src).toContain("}, [relayRoomTitles, relayTabsKey]);");
+  });
 });

@@ -741,12 +741,14 @@ function rowFromTab(tab: Tab, sessionRoleByKey: Map<string, string | null>): Con
     return {
       id: tab.id,
       type: tab.type,
-      label: tab.label,
+      // The room's real name when the session list has it: a tab reopened
+      // after a reload starts out labelled with the room's id.
+      label: matchingSession?.roomTitle || tab.label,
       host: undefined,
       targetTmuxSession: null,
       kind: "relay-room",
       roomId: tab.relayRoomId,
-      roomTitle: tab.relayRoomTitle ?? null,
+      roomTitle: matchingSession?.roomTitle || tab.relayRoomTitle || null,
       ...relayRoomFacesFields(matchingSession),
       ...(fleetLastActivityAt !== undefined && fleetLastActivityAt !== null
         ? { lastMessageAt: new Date(fleetLastActivityAt).getTime() }

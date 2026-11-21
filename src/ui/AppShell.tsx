@@ -1315,6 +1315,10 @@ export function AppShell({
   // hit a TDZ ReferenceError at first render (fleet regression 2026-09-10:
   // exactly this happened; app failed to boot with "Cannot access 'He'
   // before initialization" in minified AppShell).
+  const relayTabsKey = tabs
+    .filter((t) => t.sessionKind === "relay-room")
+    .map((t) => `${t.id}:${t.label}`)
+    .join("|");
   useEffect(() => {
     if (relayRoomTitles.size === 0) return;
     setTabs((prev) => {
@@ -1335,7 +1339,9 @@ export function AppShell({
       });
       return changed ? next : prev;
     });
-  }, [relayRoomTitles]);
+    // Also when a room tab opens (or reopens after a reload) after the
+    // names have already loaded — otherwise it keeps the room's id as its name.
+  }, [relayRoomTitles, relayTabsKey]);
 
   // The "effective active-inline" id is whatever drives the currently-visible
   // conversation view. For session-type tabs (those the conversation-store
