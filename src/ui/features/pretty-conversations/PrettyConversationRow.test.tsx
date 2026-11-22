@@ -62,8 +62,8 @@
 // Test 10 were rewritten; Test 7b augmented with an RDP no-onContextMenu
 // guard; four new tests appended (18c/18d/18e/18f).
 //
-// Fixture pattern lifted from src/ui/sidebar/NewSessionDialog.test.tsx lines
-// 14-35 verbatim: mock react-i18next passthrough, mock session-hue helpers
+// Fixture pattern lifted from the (now retired) new-conversation dialog's
+// tests: mock react-i18next passthrough, mock session-hue helpers
 // and identities-store to per-test-controllable outputs.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";

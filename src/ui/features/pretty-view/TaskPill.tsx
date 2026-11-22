@@ -26,7 +26,7 @@
 // not they show, and the pill's width reserves room for all three so it never
 // resizes when one appears.
 
-import { useCallback, useEffect, useState, type DragEvent as ReactDragEvent } from "react";
+import { type DragEvent as ReactDragEvent } from "react";
 import { AppWindow, GitPullRequestDraft, Monitor } from "lucide-react";
 import { useIdentities } from "@/state/identities-store";
 import type { Identity } from "@/api/identities-api";
@@ -42,16 +42,12 @@ import {
   NEUTRAL_HUE,
 } from "@/lib/identity-roles";
 import { AvatarImage } from "@/components/avatar-image";
-import { KitScopeContext, type KitScopeValue } from "@/components/kit/scope";
 import { writeBadgeDragData, type BadgeDragSource } from "@/shell/badge-drag";
 import { desktopOpensFullScreen, requestDesktopPane, writeDesktopDragData } from "@/shell/desktop-drag";
-import {
-  RowKebabMenu,
-  useRowKebabContextMenu,
-  type RowKebabMenuItem,
-} from "@/features/pretty-conversations/RowKebabMenu";
+import type { RowKebabMenuItem } from "@/features/pretty-conversations/RowKebabMenu";
 import { isCoarsePointer } from "@/features/pretty-conversations/row-touch-gestures";
 import { MemoryGauge } from "./MemoryGauge";
+import { PILL_SIDE_BUTTON_PX, PillFrame } from "./PillFrame";
 import { useAgentCondense } from "./use-agent-condense";
 import { conversationAppsFor } from "./AppsTab";
 import { requestOpenApp, writeAppDragData } from "../apps/app-link";
@@ -77,18 +73,6 @@ export interface TaskPillProps {
   identity?: Identity;
 }
 
-// Each side keeps the pane margin plus room for all three round buttons, so
-// the pill can use the rest of the width and stay centered.
-const SIDE_BUTTON_PX = 40;
-const SIDE_RESERVE_PX = 16 + 8 + SIDE_BUTTON_PX + 8 + SIDE_BUTTON_PX + 8 + SIDE_BUTTON_PX;
-
-// The pill's ⋯ menu takes the kit look, like the sidebar's and pane bars'.
-// Below this much room for the pill, "Compacting…" doesn't fit beside the
-// task: the pie says it by pulsing instead (a phone, a narrow split pane).
-const NARROW_PILL_PX = 280;
-
-const PILL_KIT_SCOPE: KitScopeValue = { hue: 220 };
-
 export function TaskPill({
   identityKey,
   hostId,
@@ -110,28 +94,10 @@ export function TaskPill({
   const isMobile = useIsMobile();
   // Touch screens drag nothing — a press-and-hold there opens the menu.
   const isDragSource = !!tabId && !isMobile && !isCoarsePointer();
-  const contextMenu = useRowKebabContextMenu(menuItems);
   const trappedWork = useTrappedWork(identityKey, hostId);
   const desktopRunning = useSessionDesktopRunning(hostId, tmuxSession);
   const memory = useAgentCondense(hostId, identityKey, tmuxSession, hostName);
   const allApps = useAppTiles();
-  // The room the pill may take is the pane's width less the side reserves.
-  const [paneEl, setPaneEl] = useState<HTMLElement | null>(null);
-  const anchorRef = useCallback((el: HTMLDivElement | null) => setPaneEl(el?.parentElement ?? null), []);
-  const [narrow, setNarrow] = useState(false);
-  useEffect(() => {
-    if (!paneEl) return;
-    // 0 = not laid out yet; keep the full word until there's a real width.
-    const measure = () => {
-      const w = paneEl.clientWidth;
-      setNarrow(w > 0 && w - SIDE_RESERVE_PX * 2 < NARROW_PILL_PX);
-    };
-    measure();
-    if (typeof ResizeObserver === "undefined") return;
-    const ro = new ResizeObserver(measure);
-    ro.observe(paneEl);
-    return () => ro.disconnect();
-  }, [paneEl]);
   const projects = useProjects();
 
   if (!identity) return null;
@@ -231,65 +197,38 @@ export function TaskPill({
   };
 
   return (
-    <div
-      ref={anchorRef}
-      data-testid="pv-task-pill-anchor"
-      // inset-x-0 + mx-auto + w-fit centers it while letting it grow up to
-      // maxWidth (a left:50% anchor would cap it at half the pane).
-      className="absolute top-3 inset-x-0 mx-auto w-fit z-[101] flex"
-      style={{ maxWidth: `calc(100% - ${SIDE_RESERVE_PX * 2}px)` }}
-    >
-      <div
-        data-testid="pv-task-pill"
-        title={tooltip}
-        onClick={() => open()}
-        onContextMenu={contextMenu.onContextMenu}
-        {...contextMenu.holdProps}
-        draggable={isDragSource}
-        onDragStart={onDragStart}
-        // Solid and neutral (shape-conversation-view), no blur — it floats
-        // over the scrolling chat. The agent's colour is the ring on its
-        // picture; the menu is the kit's ⋯.
-        className="pv-float relative flex flex-row items-center gap-0.5 h-10 min-w-0 max-w-full rounded-full pl-1 pr-1 cursor-pointer select-none [-webkit-touch-callout:none]"
-      >
-        {/* The pill's primary control for keyboard / screen readers; its
-            click bubbles to the pill root, which owns the open. A sibling of
-            the kebab, never its ancestor. */}
-        <button
-          type="button"
-          aria-label="Open agent info"
-          data-testid="pv-task-pill-open"
-          className="flex flex-row items-center gap-[9px] h-8 min-w-0 pl-0.5 pr-2 text-left cursor-pointer rounded-full hover:bg-white/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50"
-        >
-          <AvatarImage
-            src={identity.avatarUrl}
-            name={identity.displayName}
-            className="shrink-0 object-cover"
-            style={{
-              width: 26,
-              height: 26,
-              borderRadius: "50%",
-              boxShadow: `0 0 0 1.5px ${tint(60, 60, 0.55)}`,
-            }}
-            initialClassName="shrink-0 inline-flex items-center justify-center font-semibold"
-            initialStyle={{
-              width: 26,
-              height: 26,
-              borderRadius: "50%",
-              fontSize: 12,
-              background: tint(45, 35, 0.9),
-              boxShadow: `0 0 0 1.5px ${tint(60, 60, 0.55)}`,
-            }}
-          />
-          <span
-            data-testid="pv-task-pill-label"
-            className="truncate min-w-0 text-[color:var(--k-t1)]"
-            style={{ fontSize: 13.5, fontWeight: 600, letterSpacing: "-0.005em" }}
-          >
-            {label}
-          </span>
-        </button>
-        {!archivedIdentity && (
+    <PillFrame
+      tooltip={tooltip}
+      onOpen={() => open()}
+      openAriaLabel="Open agent info"
+      menuItems={menuItems}
+      menuAriaLabel="Agent menu"
+      onDragStart={onDragStart}
+      picture={
+        <AvatarImage
+          src={identity.avatarUrl}
+          name={identity.displayName}
+          className="shrink-0 object-cover"
+          style={{
+            width: 26,
+            height: 26,
+            borderRadius: "50%",
+            boxShadow: `0 0 0 1.5px ${tint(60, 60, 0.55)}`,
+          }}
+          initialClassName="shrink-0 inline-flex items-center justify-center font-semibold"
+          initialStyle={{
+            width: 26,
+            height: 26,
+            borderRadius: "50%",
+            fontSize: 12,
+            background: tint(45, 35, 0.9),
+            boxShadow: `0 0 0 1.5px ${tint(60, 60, 0.55)}`,
+          }}
+        />
+      }
+      label={label}
+      beforeMenu={(narrow) =>
+        !archivedIdentity && (
           // The memory pie keeps its own taps: a click (or one inside its
           // pop-over, which bubbles here through the portal) never opens the
           // agent window, a hold never opens the pill's menu, and a
@@ -319,30 +258,10 @@ export function TaskPill({
               }}
             />
           </span>
-        )}
-        {menuItems.length > 0 && (
-          // Its own (cancelled) drag source so a press-and-move starting on
-          // the ⋮ doesn't drag the pane.
-          <span
-            className="shrink-0 inline-flex"
-            draggable
-            onDragStart={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-            }}
-          >
-            <KitScopeContext.Provider value={PILL_KIT_SCOPE}>
-              <RowKebabMenu
-                items={menuItems}
-                ariaLabel="Agent menu"
-                testId="pv-task-pill-kebab-trigger"
-                triggerClassName="rounded-full"
-              />
-            </KitScopeContext.Provider>
-          </span>
-        )}
-      </div>
-      {!archivedIdentity && (desktopRunning || apps.length > 0 || hasUnpushed) && (
+        )
+      }
+      side={
+        !archivedIdentity && (desktopRunning || apps.length > 0 || hasUnpushed) && (
         <div
           data-testid="pv-task-pill-side"
           className="absolute top-1/2 -translate-y-1/2 flex flex-row gap-2"
@@ -391,9 +310,9 @@ export function TaskPill({
             </SideButton>
           )}
         </div>
-      )}
-      {contextMenu.menu}
-    </div>
+      )
+      }
+    />
   );
 }
 
@@ -431,8 +350,8 @@ function SideButton({
       style={
         {
           "--pv-side-hue": hue,
-          width: SIDE_BUTTON_PX,
-          height: SIDE_BUTTON_PX,
+          width: PILL_SIDE_BUTTON_PX,
+          height: PILL_SIDE_BUTTON_PX,
           borderRadius: "50%",
           color: "#f4fff8",
           background: `linear-gradient(160deg, hsla(${hue}, 50%, 32%, 0.88), hsla(${hue}, 45%, 20%, 0.92))`,

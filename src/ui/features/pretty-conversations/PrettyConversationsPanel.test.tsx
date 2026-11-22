@@ -4,8 +4,9 @@
 //   2)  Pinned rows render at top, grouped rows below (DOM order)
 //   3)  NO "Pinned" section header; NO per-host semibold header
 //   4)  RDP-sentinel HostGroup renders at bottom with "Remote desktop" divider
-//   5)  Header pencil opens NewSessionDialog
-//   6)  Header pencil NOT rendered when onCreateSession undefined
+//   5)  Header pencil asks for a new-conversation pane (onNewConversation); it
+//       is also a drag source; it precedes the rows in DOM order
+//   6)  Header pencil NOT rendered when onNewConversation undefined
 //   7)  Desktop header shows SKYNET brand lockup (inline SVG logo + wordmark img) — patch #257
 //   8)  Mobile header shows SKYNET brand lockup (same shape as desktop) — patch #257
 //   9)  Desktop gear renders when onRailClick provided
@@ -16,7 +17,7 @@
 //  14)  Row click on plain row calls selectConversation
 //  15)  onConversationSelected fires after every dispatcher branch
 //
-// Mock pattern lifted from NewSessionDialog.test.tsx §mocks (lines 14-35):
+// Mock pattern lifted from the old new-conversation dialog's tests §mocks (lines 14-35):
 // react-i18next passthrough, session-hue / identities-store / touch-device
 // inert stubs so PrettyConversationRow's renders are deterministic.
 //
@@ -37,6 +38,7 @@ import {
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { Host, HostFolder } from "@/types/ui-types";
+import { NEW_CONVERSATION_DRAG_MIME } from "@/shell/new-conversation-drag";
 import {
   autoAnswerKitDialogs,
   __resetKitDialogsForTests,
@@ -1593,53 +1595,113 @@ describe("PrettyConversationsPanel: RDP sentinel at bottom", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Test 5 — Header pencil opens NewSessionDialog
+// Test 5 — Header pencil asks for a new-conversation pane
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe("PrettyConversationsPanel: header New agent button opens NewSessionDialog", () => {
-  it("Test 5 (quick-260914-liu repoint): clicking the dedicated pv-header-new-agent-button opens the NewSessionDialog (title 'Create a new agent conversation') in one step; button carries pv-pencil class, aria-label and title 'New conversation'", async () => {
-    // quick-260914-liu: New agent is now a dedicated header icon button.
-    // The flow is one step: click pv-header-new-agent-button → NewSessionDialog opens.
+describe("PrettyConversationsPanel: header New conversation button", () => {
+  it("Test 5: clicking pv-header-new-agent-button calls onNewConversation(null, 'pencil') and opens no dialog; button carries pv-pencil class, aria-label and title 'New conversation'", () => {
+    const onNewConversation = vi.fn();
     const { getByTestId } = render(
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={ONE_HOST_TREE}
-        onCreateSession={vi.fn()}
+        onNewConversation={onNewConversation}
         onDeactivateRow={() => {}}
       />,
     );
 
-    // New conversation header button exists with correct chrome.
     const newAgentBtn = getByTestId("pv-header-new-agent-button");
     expect(newAgentBtn.className).toContain("pv-pencil");
     expect(newAgentBtn.getAttribute("aria-label")).toBe("New conversation");
     expect(newAgentBtn.getAttribute("title")).toBe("New conversation");
 
-    // Click opens the NewSessionDialog.
     fireEvent.click(newAgentBtn);
 
-    // NewSessionDialog uses shadcn Dialog which renders inside a portal.
-    const dialog = document.querySelector('[role="dialog"]') as HTMLElement | null;
-    expect(dialog).toBeTruthy();
-    // Title reads "New conversation" (renamed 2026-09-29 as part of the
-    // modal-look-unification arc; the paired NewConversationModal is now
-    // "New group conversation" so the two flows are properly disambiguated).
-    // Target dialog-title specifically to avoid false-positive matches
-    // against other portal DOM text.
-    const dialogTitle = dialog!.querySelector(
-      '[data-slot="dialog-title"]',
-    ) as HTMLElement | null;
-    expect(dialogTitle).toBeTruthy();
-    expect(dialogTitle!.textContent).toMatch(/^\s*new conversation\s*$/i);
+    expect(onNewConversation).toHaveBeenCalledTimes(1);
+    expect(onNewConversation).toHaveBeenCalledWith(null, "pencil");
+    // The panel no longer mounts a dialog of its own — AppShell opens a pane.
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+  });
+
+  it("Test 5b: the pencil is draggable and its drag writes the new-conversation MIME (copy), not a badge drag", () => {
+    const onNewConversation = vi.fn();
+    const { getByTestId } = render(
+      <PrettyConversationsPanel isAdmin
+        variant="desktop"
+        hostTree={ONE_HOST_TREE}
+        onNewConversation={onNewConversation}
+        onDeactivateRow={() => {}}
+      />,
+    );
+    const pencil = getByTestId("pv-header-new-agent-button");
+    expect(pencil.getAttribute("draggable")).toBe("true");
+
+    const data: Record<string, string> = {};
+    const dataTransfer = {
+      setData: vi.fn((type: string, value: string) => {
+        data[type] = value;
+      }),
+      getData: (type: string) => data[type] ?? "",
+      effectAllowed: "all",
+      dropEffect: "none",
+      types: [] as string[],
+      setDragImage: vi.fn(),
+    };
+    fireEvent.dragStart(pencil, { dataTransfer });
+
+    expect(data[NEW_CONVERSATION_DRAG_MIME]).toBe("{}");
+    expect(dataTransfer.effectAllowed).toBe("copy");
+    expect(Object.keys(data)).toEqual([NEW_CONVERSATION_DRAG_MIME]);
+    // A drag isn't a click.
+    expect(onNewConversation).not.toHaveBeenCalled();
+  });
+
+  it("Test 10: header pencil appears BEFORE conversation rows in DOM order (top-of-scroller mount)", () => {
+    const hostA = makeHost("h1", "hostA");
+    setSnapshot({
+      pinned: [],
+      grouped: [
+        {
+          hostId: "h1",
+          hostName: "hostA",
+          rows: [
+            makeConversationRow({ id: "t1", label: "session-1", host: hostA }),
+            makeConversationRow({ id: "t2", label: "session-2", host: hostA }),
+          ],
+        },
+      ],
+    });
+
+    const { container } = render(
+      <PrettyConversationsPanel isAdmin
+        variant="desktop"
+        hostTree={{ name: "root", children: [hostA] }}
+        onNewConversation={vi.fn()}
+        onDeactivateRow={() => {}}
+      />,
+    );
+
+    const button = container.querySelector('button[data-testid="pv-header-new-agent-button"]') as HTMLElement | null;
+    const row1 = container.querySelector('[data-conversation-id="t1"]') as HTMLElement | null;
+    const row2 = container.querySelector('[data-conversation-id="t2"]') as HTMLElement | null;
+    expect(button).toBeTruthy();
+    expect(row1).toBeTruthy();
+    expect(row2).toBeTruthy();
+
+    const all = Array.from(container.querySelectorAll("*")) as HTMLElement[];
+    const btnIdx = all.indexOf(button!);
+    expect(btnIdx).toBeGreaterThanOrEqual(0);
+    expect(all.indexOf(row1!)).toBeGreaterThan(btnIdx);
+    expect(all.indexOf(row2!)).toBeGreaterThan(btnIdx);
   });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Test 6 — Header pencil NOT rendered when onCreateSession is undefined
+// Test 6 — Header pencil NOT rendered when onNewConversation is undefined
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe("PrettyConversationsPanel: create + manage buttons gated on onCreateSession", () => {
-  it("Test 6: the header pencil and the footer Scheduled / Roles / Skills buttons are absent when onCreateSession is undefined; footer gear stays visible", () => {
+describe("PrettyConversationsPanel: create + manage buttons gated on onNewConversation", () => {
+  it("Test 6: the header pencil and the footer Scheduled / Roles / Skills buttons are absent when onNewConversation is undefined; footer gear stays visible", () => {
     // The header pencil and the footer manage buttons share one
     // showPencilButton guard. The gear is NOT gated — it renders regardless.
     const { container } = render(
@@ -1694,7 +1756,7 @@ describe("PrettyConversationsPanel: mobile header title (patch #144)", () => {
       <PrettyConversationsPanel isAdmin
         variant="mobile"
         hostTree={ONE_HOST_TREE}
-        onCreateSession={vi.fn()}
+        onNewConversation={vi.fn()}
         onDeactivateRow={() => {}}
       />,
     );
@@ -3570,7 +3632,7 @@ describe("PrettyConversationsPanel: Phase 58 Plan 02 — Test I (integration): I
 describe("PrettyConversationsPanel: header strip + footer manage buttons", () => {
   function renderPanel() {
     return render(
-      <PrettyConversationsPanel variant="desktop" onCreateSession={vi.fn()} onDeactivateRow={() => {}} />,
+      <PrettyConversationsPanel variant="desktop" onNewConversation={vi.fn()} onDeactivateRow={() => {}} />,
     );
   }
 
@@ -4038,7 +4100,7 @@ describe("PrettyConversationsPanel (shape-sidebar-search-inline): sidebar-search
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         onDeactivateRow={() => {}}
-        onCreateSession={vi.fn()}
+        onNewConversation={vi.fn()}
       />,
     );
 
@@ -4073,7 +4135,7 @@ describe("PrettyConversationsPanel (shape-sidebar-search-inline): sidebar-search
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         onDeactivateRow={() => {}}
-        onCreateSession={vi.fn()}
+        onNewConversation={vi.fn()}
       />,
     );
 
@@ -4095,7 +4157,7 @@ describe("PrettyConversationsPanel (shape-sidebar-search-inline): sidebar-search
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         onDeactivateRow={() => {}}
-        onCreateSession={vi.fn()}
+        onNewConversation={vi.fn()}
       />,
     );
 
@@ -4125,7 +4187,7 @@ describe("PrettyConversationsPanel (shape-sidebar-search-inline): sidebar-search
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         onDeactivateRow={() => {}}
-        onCreateSession={vi.fn()}
+        onNewConversation={vi.fn()}
       />,
     );
 

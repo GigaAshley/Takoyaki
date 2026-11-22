@@ -36,7 +36,12 @@ export const EDGE_STRIP_ATTR = "data-sidebar-peek-edge";
 
 // Drags that open into a pane. Project-header drags stay in the sidebar, so
 // they keep the peek open.
-const PANE_DRAG_MIMES = ["application/x-skynet-row", "application/x-skynet-app-tile"];
+const PANE_DRAG_MIMES = [
+  "application/x-skynet-row",
+  "application/x-skynet-app-tile",
+  // The pencil — a fresh new-conversation pane (new-conversation-drag.ts).
+  "application/x-skynet-new-conversation",
+];
 
 export type SidebarPeekState = "closed" | "open" | "closing" | "drag-open" | "dragging";
 

@@ -198,12 +198,12 @@ beforeEach(() => {
 });
 
 describe("PrettyConversationsPanel: Roles footer button", () => {
-  it("Test 21a: pv-footer-roles-button exists with footer chrome when onCreateSession is wired; no header kebab", () => {
+  it("Test 21a: pv-footer-roles-button exists with footer chrome when onNewConversation is wired; no header kebab", () => {
     render(
       <PrettyConversationsPanel
         variant="desktop"
         hostTree={ONE_HOST_TREE}
-        onCreateSession={vi.fn()}
+        onNewConversation={vi.fn()}
         onDeactivateRow={() => {}}
       />,
     );
@@ -219,9 +219,9 @@ describe("PrettyConversationsPanel: Roles footer button", () => {
     expect(screen.queryByTestId("pv-header-menu-button")).toBeNull();
   });
 
-  it("Test 21b (quick-260914-liu extend): all four header buttons absent when onCreateSession is undefined — they share one showPencilButton guard", () => {
+  it("Test 21b (quick-260914-liu extend): all four header buttons absent when onNewConversation is undefined — they share one showPencilButton guard", () => {
     // Phase 23 gate carries over unchanged — the whole menu vanishes when
-    // the panel has no onCreateSession callback wired. quick-260914-liu: three
+    // the panel has no onNewConversation callback wired. quick-260914-liu: three
     // new header buttons join the kebab under the same guard.
     render(
       <PrettyConversationsPanel
@@ -245,7 +245,7 @@ describe("PrettyConversationsPanel: Roles footer button", () => {
       <PrettyConversationsPanel
         variant="desktop"
         hostTree={ONE_HOST_TREE}
-        onCreateSession={vi.fn()}
+        onNewConversation={vi.fn()}
         onDeactivateRow={() => {}}
       />,
     );

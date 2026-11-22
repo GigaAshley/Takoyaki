@@ -8,10 +8,10 @@
 //   (b) Button is ABSENT from the DOM (not disabled, not hidden-via-CSS)
 //       when useFeedbackEnabled() returns false.
 //   (c) Clicking the button fires onOpenFeedback exactly once.
-//   (d) Independent-gate assertion: render WITHOUT onCreateSession;
+//   (d) Independent-gate assertion: render WITHOUT onNewConversation;
 //       assert the header showPencilButton siblings are absent AND the
 //       feedback CTA is present — the CTA is gated on feedbackEnabled
-//       alone, not on onCreateSession.
+//       alone, not on onNewConversation.
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, fireEvent, screen } from "@testing-library/react";
@@ -211,7 +211,7 @@ describe("PrettyConversationsPanel: Send feedback CTA (above-footer, feedbackEna
       <PrettyConversationsPanel
         variant="desktop"
         hostTree={ONE_HOST_TREE}
-        onCreateSession={vi.fn()}
+        onNewConversation={vi.fn()}
         onDeactivateRow={() => {}}
         onOpenFeedback={vi.fn()}
       />,
@@ -236,7 +236,7 @@ describe("PrettyConversationsPanel: Send feedback CTA (above-footer, feedbackEna
       <PrettyConversationsPanel
         variant="desktop"
         hostTree={ONE_HOST_TREE}
-        onCreateSession={vi.fn()}
+        onNewConversation={vi.fn()}
         onDeactivateRow={() => {}}
         onOpenFeedback={vi.fn()}
       />,
@@ -253,7 +253,7 @@ describe("PrettyConversationsPanel: Send feedback CTA (above-footer, feedbackEna
       <PrettyConversationsPanel
         variant="desktop"
         hostTree={ONE_HOST_TREE}
-        onCreateSession={vi.fn()}
+        onNewConversation={vi.fn()}
         onDeactivateRow={() => {}}
         onOpenFeedback={onOpenFeedback}
       />,
@@ -265,12 +265,12 @@ describe("PrettyConversationsPanel: Send feedback CTA (above-footer, feedbackEna
     expect(onOpenFeedback).toHaveBeenCalledWith();
   });
 
-  it("Test 4: pv-footer-send-feedback-button renders even when onCreateSession is undefined — gate is independent of showPencilButton", () => {
+  it("Test 4: pv-footer-send-feedback-button renders even when onNewConversation is undefined — gate is independent of showPencilButton", () => {
     vi.mocked(useFeedbackEnabled).mockReturnValue(true);
     render(
       <PrettyConversationsPanel
         variant="desktop"
-        // onCreateSession INTENTIONALLY OMITTED — the showPencilButton
+        // onNewConversation INTENTIONALLY OMITTED — the showPencilButton
         // siblings hide because showPencilButton === false. The feedback
         // CTA must still render because its gate is `feedbackEnabled`
         // INDEPENDENTLY.

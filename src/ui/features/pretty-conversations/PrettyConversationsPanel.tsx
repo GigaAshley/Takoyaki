@@ -25,7 +25,8 @@
 //   - Header carries a `variant` prop-driven layout:
 //       * variant="mobile"  → pencil icon ONLY (right-aligned); no title
 //       * variant="desktop" → title "Conversations" (left) + pencil (right)
-//   - Pencil opens the existing NewSessionDialog VERBATIM (no dialog redesign)
+//   - Pencil opens a new-conversation pane (AppShell's onNewConversation);
+//     it can also be dragged into the content area like a row
 //   - Gear (shadcn dropdown) removed in patch #133 — panel is now
 //     shadcn-free.
 //   - settingsRowSlot prop retired in Phase 11 (user's "no settings" lock —
@@ -74,14 +75,8 @@ import PreferencesModal from "@/features/pretty-view/PreferencesModal";
 // only rendered for admins.
 import AdminModal from "@/features/admin/AdminModal";
 // The roles window (library → role → runbook, new role, archived) — opened
-// from the footer's Roles button and from the new-conversation dialog's
-// "New role…".
+// from the footer's Roles button.
 import { RolesWindow, type RolesWindowStart } from "@/features/pretty-view/roles-window/RolesWindow";
-import {
-  NEW_CONVERSATION_REQUEST_EVENT,
-  takeNewConversationRequest,
-  type NewConversationRequest,
-} from "@/lib/new-conversation-request";
 import { useTranslation } from "react-i18next";
 import { isCoarsePointer } from "./row-touch-gestures";
 import { useDragPreviewClaim } from "@/shell/drag-preview-session";
@@ -256,13 +251,13 @@ import {
 } from "@/state/identities-store";
 import { startTrappedWorkPoller } from "@/state/trapped-work-store";
 import { sessionMatchKey } from "@/features/terminal/session-hue";
-import { NewSessionDialog, type NewSessionOnCreateOpts } from "@/sidebar/NewSessionDialog";
+import { writeNewConversationDragData } from "@/shell/new-conversation-drag";
 // Phase 92 Plan 04: getPinnedIds is retired. The panel projects the pin state
 // from the identities-store's `pinned: boolean` field via deriveDiskPinnedIds
 // (imported above).
 // (Phase 115 Plan 115-02: the Phase 107 `.hidden` hydrate + deriveDiskHiddenIds
 //  path was retired per D-21 alongside the backend .hidden fanout removal.)
-import type { Host, HostFolder } from "@/types/ui-types";
+import type { Host, HostFolder, NewConversationPicks } from "@/types/ui-types";
 
 import { PrettyConversationRowView, resolveRowIdentity } from "./PrettyConversationRow";
 import type { Identity } from "@/api/identities-api";
@@ -612,7 +607,7 @@ export function PrettyConversationsPanel({
   variant,
   onConversationSelected,
   hostTree,
-  onCreateSession,
+  onNewConversation,
   onDetachedRowClick,
   onRdpRowClick,
   onRelayRoomRowClick,
@@ -642,14 +637,14 @@ export function PrettyConversationsPanel({
   onConversationSelected?: (id: string) => void;
   // Phase 11 Plan 03: settingsRowSlot prop RETIRED (SettingsRow deleted
   // alongside AppRail per user's "no settings" lock).
-  // Host tree fed into the NewSessionDialog's host picker. Optional so
-  // tests can render the panel without wiring the picker.
+  // Host tree for the roles window and the projects' machine lookups.
+  // Optional so tests can render the panel without it.
   hostTree?: HostFolder | null;
-  // Fired when the user completes the NewSessionDialog. The pencil-icon
-  // header button is only mounted when this callback is provided (matches
-  // the ConversationsPanel gate that used to be on the old inline
-  // new-session button affordance).
-  onCreateSession?: (opts: NewSessionOnCreateOpts) => void;
+  // Open a new-conversation pane — the pencil (start null), or a project's
+  // "New conversation in this project" (start: that project and its
+  // machine). The pencil and the rest of the header cluster only mount when
+  // this is provided.
+  onNewConversation?: (start: NewConversationPicks | null, source: "pencil" | "project") => void;
   // Detached-fleet-row click (Plan 07-01, TG-14) — same contract as
   // ConversationsPanel: fired instead of selectConversation when the row
   // is fleet-only. When omitted, fleet-only rows fall through to
@@ -1087,38 +1082,11 @@ export function PrettyConversationsPanel({
   // Quick 260727-tb1 identity:bounty-priority-updated piggyback comment
   // RETIRED in Phase 104 Plan 03 alongside the bounty-count wire deletion.
 
-  // Local state: NewSessionDialog open/closed toggle (opened by pencil).
-  const [newSessionDialogOpen, setNewSessionDialogOpen] = useState(false);
-  // The roles window: open + where it starts. `hop` marks the
-  // new-conversation dialog's "New role…" (back and create return there).
-  const [rolesWindow, setRolesWindow] = useState<{ open: boolean; start: RolesWindowStart; hop: boolean }>({
+  // The roles window: open + where it starts.
+  const [rolesWindow, setRolesWindow] = useState<{ open: boolean; start: RolesWindowStart }>({
     open: false,
     start: { view: "library" },
-    hop: false,
   });
-  // Phase 22 (SRIC-05): chain-into-create-identity pre-fill payload. Set when
-  // the roles window's new-role hop creates a role ({role, host}); consumed by
-  // the NewSessionDialog mount as its initialHost + initialRole props. Cleared
-  // when NewSessionDialog closes (either via successful submit or user cancel)
-  // so subsequent manual opens via the pencil don't inherit stale chain state
-  // (regression gate — Test 13).
-  const [chainPrefill, setChainPrefill] = useState<{
-    role?: string;
-    roles?: string[];
-    name?: string | null;
-    host: Host | null;
-    description?: string;
-  } | null>(null);
-  // "New role…" hop from the new-agent dialog's Roles dropdown: the dialog is
-  // swapped for the roles window's new-role form, and this remembers what to
-  // restore when the user comes back (role created → picks + new role;
-  // backed out → picks as they were).
-  // The pending project slug/hostId state is deliberately left untouched
-  // across the hop so a per-project new-agent flow keeps its project.
-  // `host` is null when the hop starts before any role is picked (the
-  // new-agent dialog has no host step; the host follows the roles).
-  const newRoleHopRef = useRef<{ host: Host | null; roles: string[]; name: string | null } | null>(null);
-  const [createRoleInitialHost, setCreateRoleInitialHost] = useState<Host | null>(null);
 
   // Scroll region ref for save/restore across unmount — see savedListScrollTop
   // at module scope for why. Attached to the .pv-panel-scroll div below.
@@ -1187,60 +1155,7 @@ export function PrettyConversationsPanel({
   const [preferencesModalOpen, setPreferencesModalOpen] = useState(false);
   // AdminModal open/closed toggle (sidebar footer shield button, admins only).
   const [adminModalOpen, setAdminModalOpen] = useState(false);
-  // Phase 117 M-F follow-up (2026-09-18): the per-project SquarePen new-conv
-  // button opens the NEW-AGENT dialog with a pending project slug that gets
-  // applied to the freshly-minted identity via setSessionProject after
-  // onCreate resolves.
-  const [newSessionPendingProjectSlug, setNewSessionPendingProjectSlug] =
-    useState<string | null>(null);
-  // Phase 117 M-I follow-up (2026-09-19): also stash the project's hostId
-  // so the NewSessionDialog mount can pass a filtered single-host hostTree
-  // — the picker auto-hides in project context because the destination
-  // host is implied (projects live on a specific host; agents-in-project
-  // must be born on the same host to appear under the section).
-  const [newSessionPendingProjectHostId, setNewSessionPendingProjectHostId] =
-    useState<number | null>(null);
-  // Phase 117 M-I follow-up: when the new-agent dialog is opened via the
-  // per-project SquarePen, it gets a synthetic single-host tree so its
-  // auto-hide-when-single-host logic kicks in — the destination host is
-  // implied (project lives on one host; agent must be born there to appear
-  // under the section). Header pencil (pendingProjectHostId===null) gets the
-  // full tree. Memoized: the dialog's open effect keys on this tree, so a
-  // fresh object every render re-fires it.
-  // "Start a conversation" from a role (the roles window, wherever it was
-  // opened): the new-conversation dialog opens with that role picked.
-  useEffect(() => {
-    const answer = (req: NewConversationRequest): void => {
-      const { hostId: reqHostId, role } = req;
-      const host = hostTree
-        ? (collectHostsFromFolder(hostTree).find((h) => parseInt(h.id, 10) === reqHostId) ?? null)
-        : null;
-      console.log(`[new-conversation-request] role=${role} hostId=${reqHostId} hostFound=${host !== null}`);
-      setNewSessionPendingProjectSlug(null);
-      setNewSessionPendingProjectHostId(null);
-      setChainPrefill({ host, role, roles: [role] });
-      setNewSessionDialogOpen(true);
-    };
-    const onRequest = (): void => {
-      // Hold it until the machines are known, so the dialog opens on the
-      // asked-for machine (this re-runs when the tree arrives).
-      if (!hostTree) return;
-      const req = takeNewConversationRequest();
-      if (req) answer(req);
-    };
-    onRequest(); // asked while this list wasn't mounted
-    window.addEventListener(NEW_CONVERSATION_REQUEST_EVENT, onRequest);
-    return () => window.removeEventListener(NEW_CONVERSATION_REQUEST_EVENT, onRequest);
-  }, [hostTree]);
-  const newSessionHostTree = useMemo(() => {
-    const fullTree = hostTree ?? null;
-    if (newSessionPendingProjectHostId === null || !fullTree) return fullTree;
-    const projectHost = collectHostsFromFolder(fullTree).find(
-      (h) => parseInt(h.id, 10) === newSessionPendingProjectHostId,
-    );
-    if (!projectHost) return fullTree; // fall back to full tree if not found
-    return { name: fullTree.name, children: [projectHost] };
-  }, [hostTree, newSessionPendingProjectHostId]);
+
   // Phase 143 D-09: ArchivedAppsModal open/closed toggle. Opened by the
   // archived-box icon-button on the Apps section header (see header edit below).
   const [archivedAppsModalOpen, setArchivedAppsModalOpen] = useState(false);
@@ -1621,7 +1536,7 @@ export function PrettyConversationsPanel({
   // swipe state machine. Mobile now uses long-press → PrettyConversation
   // ContextMenu; there is no row open-state to coordinate.
 
-  const showPencilButton = typeof onCreateSession === "function";
+  const showPencilButton = typeof onNewConversation === "function";
   // Project sections the sidebar actually renders: during an active search,
   // searchProjectSections already dropped the ones with nothing to show.
   const visibleProjectSections = searchedProjectSections;
@@ -3114,31 +3029,20 @@ export function PrettyConversationsPanel({
     [pinnedIds, roomPinnedIds, releasePinnedPreview, rowIdToProjectSlug, projectSections, readSidebarDrop],
   );
 
-  // Phase 117 M-F follow-up (2026-09-18): the section's SquarePen opens the
-  // NEW-AGENT dialog (NewSessionDialog) with a pending project slug. After
-  // the identity is born, the NewSessionDialog's onCreate wrapper below
-  // fires setSessionProject(host, identityKey, slug) as a fire-and-forget
-  // call so the newborn identity's frontmatter carries `project:` from the
-  // first sweep tick. Was: opened NewConversationModal (relay-room path) —
-  // that flow rejected by the user 2026-09-18 in favor of "new agent mode".
-  //
-  // Phase 117 M-I follow-up (2026-09-19): also stash the project's hostId
-  // so the dialog renders with a single-host tree (picker auto-hides).
+  // A project section's "New conversation in this project": a
+  // new-conversation pane born into the project, on the project's machine
+  // (an agent in a project lives where the project does).
   const handleNewConversationInProject = useCallback(
     (slug: string, hostId?: string) => {
-      setNewSessionPendingProjectSlug(slug);
-      // Resolve the project's home host (projects live per-host; the newborn
-      // agent must be born on the SAME host to appear under the section).
       const proj = findProject(slug, hostId);
       const projHostIdNum = proj ? parseInt(proj.hostId, 10) : NaN;
-      setNewSessionPendingProjectHostId(
-        Number.isFinite(projHostIdNum) && projHostIdNum > 0
-          ? projHostIdNum
-          : null,
-      );
-      setNewSessionDialogOpen(true);
+      if (!Number.isFinite(projHostIdNum) || projHostIdNum <= 0) {
+        console.warn(`[new-conversation] project not found slug=${slug} hostId=${hostId ?? "-"}`);
+        return;
+      }
+      onNewConversation?.({ project: { slug, hostId: projHostIdNum }, hostId: projHostIdNum }, "project");
     },
-    [findProject],
+    [findProject, onNewConversation],
   );
 
   // Phase 117 Plan 117-09 Task 2 (D-28, D-29, D-30 + Fix 3) — archive
@@ -3632,14 +3536,14 @@ export function PrettyConversationsPanel({
                   aria-label="New conversation"
                   title="New conversation"
                   data-testid="pv-header-new-agent-button"
-                  onClick={() => {
-                    // A plain new conversation: no project or chain left over
-                    // from an earlier open that didn't close through the dialog.
-                    setNewSessionPendingProjectSlug(null);
-                    setNewSessionPendingProjectHostId(null);
-                    setChainPrefill(null);
-                    setNewSessionDialogOpen(true);
+                  // Dragged into the content area it drops a fresh
+                  // new-conversation pane, like a row (not on touch).
+                  draggable={!isCoarsePointer()}
+                  onDragStart={(e) => {
+                    writeNewConversationDragData(e.dataTransfer);
+                    console.info("[new-conversation-drag] pencil drag start");
                   }}
+                  onClick={() => onNewConversation?.(null, "pencil")}
                 >
                   <SquarePen size={18} />
                 </button>
@@ -4463,7 +4367,7 @@ export function PrettyConversationsPanel({
                 aria-label="Roles"
                 title="Roles"
                 data-testid="pv-footer-roles-button"
-                onClick={() => setRolesWindow({ open: true, start: { view: "library" }, hop: false })}
+                onClick={() => setRolesWindow({ open: true, start: { view: "library" } })}
               >
                 <Drama size={18} />
               </button>
@@ -4511,150 +4415,14 @@ export function PrettyConversationsPanel({
         </div>
       </div>
 
-      {/* NewSessionDialog VERBATIM from ConversationsPanel.tsx lines
-          358-368. Portal-mounted; DOM sibling position doesn't drive
-          layout. Only mounted when onCreateSession is wired — same gate
-          as the pencil button. */}
-      {/* Phase 117 M-F follow-up (2026-09-18): wrapper node with a data
-          attribute so tests can observe the pending project slug wired
-          through the panel (mirrors the pv-new-conv-modal-wrapper pattern
-          above). The slug is applied via setSessionProject inside onCreate
-          below, then cleared on close/create. */}
-      <div
-        data-testid="pv-new-session-dialog-wrapper"
-        data-pending-project-slug={newSessionPendingProjectSlug ?? ""}
-        hidden
-      />
-      {showPencilButton && (
-        <NewSessionDialog
-          open={newSessionDialogOpen}
-          project={newSessionPendingProjectSlug}
-          onClose={() => {
-            setNewSessionDialogOpen(false);
-            // Phase 22 SRIC-05: clear chainPrefill on close so a subsequent
-            // manual open (via pencil) does NOT inherit stale chain state.
-            setChainPrefill(null);
-            // Phase 117 M-F/M-I: clear pending project slug + hostId so a
-            // subsequent header-pencil open does NOT inherit stale project
-            // context.
-            setNewSessionPendingProjectSlug(null);
-            setNewSessionPendingProjectHostId(null);
-          }}
-          // Single-host tree when opened from a project — see newSessionHostTree.
-          hostTree={newSessionHostTree}
-          onCreate={(opts) => {
-            onCreateSession!(opts);
-            // Phase 117 M-F: if this dialog was opened via the per-project
-            // SquarePen, apply the pending project slug to the newborn
-            // identity via setSessionProject. identityMode:
-            // false is a plain tmux session — no identity to tag; skip.
-            //
-            // Phase 117 M-H (2026-09-19): chain refreshIdentities AFTER the
-            // write so the store observes the fresh `project:` field. The
-            // birth flow's built-in refresh runs BEFORE onCreate fires, so
-            // without this re-fetch the store carries project=null and the
-            // sidebar derivation never buckets the newborn under its
-            // section (visible symptom: agent opens as a tab but does NOT
-            // appear under the project section until the next full page
-            // reload).
-            const slug = newSessionPendingProjectSlug;
-            if (slug !== null) {
-              const identityKey =
-                opts.identityMode === true ? opts.name : null;
-              if (identityKey !== null) {
-                const hostIdNum = parseInt(opts.host.id, 10);
-                if (Number.isFinite(hostIdNum) && hostIdNum > 0) {
-                  setSessionProject(hostIdNum, identityKey, slug)
-                    .then(() =>
-                      refreshIdentities({ [identityKey]: hostIdNum }),
-                    )
-                    .catch((err: unknown) => {
-                      const msg =
-                        err instanceof Error ? err.message : String(err);
-                      // eslint-disable-next-line no-console
-                      console.error(
-                        `[project-new-session] setSessionProject failed hostId=${hostIdNum} key=${identityKey} slug=${slug}: ${msg}`,
-                      );
-                    });
-                }
-              }
-            }
-            setNewSessionDialogOpen(false);
-            // Also clear on successful submit path (matches close semantics).
-            setChainPrefill(null);
-            setNewSessionPendingProjectSlug(null);
-            setNewSessionPendingProjectHostId(null);
-          }}
-          // Phase 22 SRIC-05: chain pre-fill props. Null when chainPrefill
-          // has not been set (fresh manual pencil open); populated when
-          // the roles window's new-role hop created a role.
-          initialHost={chainPrefill?.host ?? null}
-          initialRole={chainPrefill?.role ?? null}
-          initialRoles={chainPrefill?.roles ?? null}
-          initialName={chainPrefill?.name ?? null}
-          initialBrief={chainPrefill?.description ?? null}
-          onNewRole={({ host, roles, name }) => {
-            newRoleHopRef.current = { host, roles, name };
-            setNewSessionDialogOpen(false);
-            setChainPrefill(null);
-            setCreateRoleInitialHost(host);
-            setRolesWindow({ open: true, start: { view: "new", host }, hop: true });
-          }}
-          // Phase 88: forward admin-gate to NewSessionDialog for Path field + shell checkbox visibility (see 88-CONTEXT.md §isAdmin prop plumbing).
-          isAdmin={isAdmin}
-        />
-      )}
-      {/* The roles window. On the new-conversation dialog's "New role…" hop
-          its back/cancel and create go back to that dialog. */}
+      {/* The roles window (footer drama masks). */}
       <RolesWindow
         open={rolesWindow.open}
         onOpenChange={(o) => {
-          if (o) return;
-          setRolesWindow((w) => ({ ...w, open: false }));
-          // Closed out of a hop with the X: drop the remembered picks.
-          if (rolesWindow.hop) {
-            newRoleHopRef.current = null;
-            setCreateRoleInitialHost(null);
-            setNewSessionPendingProjectSlug(null);
-            setNewSessionPendingProjectHostId(null);
-          }
+          if (!o) setRolesWindow((w) => ({ ...w, open: false }));
         }}
         start={rolesWindow.start}
-        // A per-project hop locks role creation to the project's host (the
-        // same single-host tree the new-agent dialog got) so the role — and
-        // the agent born with it — can't land on a host the project isn't on.
-        hostTree={rolesWindow.hop && createRoleInitialHost ? newSessionHostTree : (hostTree ?? null)}
-        newRoleHop={
-          rolesWindow.hop
-            ? {
-                onBack: () => {
-                  setRolesWindow((w) => ({ ...w, open: false }));
-                  setCreateRoleInitialHost(null);
-                  const hop = newRoleHopRef.current;
-                  newRoleHopRef.current = null;
-                  console.log(`[new-role-hop] cancelled — restoring new-agent dialog hostId=${hop?.host?.id ?? "-"}`);
-                  if (hop) setChainPrefill({ host: hop.host, roles: hop.roles, name: hop.name });
-                  setNewSessionDialogOpen(true);
-                },
-                onCreated: ({ role, host, description }) => {
-                  const hop = newRoleHopRef.current;
-                  newRoleHopRef.current = null;
-                  setRolesWindow((w) => ({ ...w, open: false }));
-                  setCreateRoleInitialHost(null);
-                  // Back from a hop on the same host: keep the earlier picks and add
-                  // the new role. A different host invalidates the earlier picks. A
-                  // hop with no host had no picks, so only its name carries over.
-                  const sameHost = hop !== null && (hop.host === null || hop.host.id === host.id);
-                  const roles = sameHost ? [...hop.roles.filter((r) => r !== role), role] : undefined;
-                  console.log(
-                    `[new-role-hop] role created role=${role} hostId=${host.id} fromHop=${hop !== null} roles=${roles?.join(",") ?? role}`,
-                  );
-                  setChainPrefill({ role, roles, name: sameHost ? hop.name : null, host, description });
-                  setNewSessionDialogOpen(true);
-                },
-              }
-            : null
-        }
+        hostTree={hostTree ?? null}
       />
       {/* Phase 137 D-29: GlobalFilesModal retired — About-you pane in
           PreferencesModal is the sole remaining entry for global-files editing. */}

@@ -729,12 +729,18 @@ beside the gear (§ Sidebar footer); new projects are made from the
 **Projects** super-header (§ Sidebar content). There is no three-dots
 menu in the header and no "new group conversation" control in the app.
 
-- **✏️ Pencil-on-paper — new conversation.** Opens the **New
-  conversation** dialog. Admins first see an **Agent / Shell** switch at
+- **✏️ Pencil-on-paper — new conversation.** Opens a **new
+  conversation** in the content area: a conversation that hasn't started
+  yet, taking over the view the way clicking a conversation does (clicking
+  the pencil again while one is showing alone does nothing). It has a
+  conversation's pill and compose box; where the messages would be are the
+  choices. Dragging the pencil into the content area drops a fresh one at
+  that spot instead, like dragging a row. Clicking away closes it, without
+  asking. Admins first see an **Agent / Shell** switch at
   the top (anyone else never does, and has no way to open a plain shell);
   Shell shows the machine list with a search box (no list when there's
   only one machine), an optional name and a path. For an agent:
-  - **Roles** is a list right in the dialog: each role's picture, name
+  - **Roles** is a list right in the pane: each role's picture, name
     ("· on every host" for a role kept on every host), its one-line
     description and a check when picked. It's grouped by machine —
     the machine's name as a heading only when the user has more than one
@@ -747,24 +753,24 @@ menu in the header and no "new group conversation" control in the app.
     unticking the last role falls back to "No roles" on that machine. The
     agent is born on the machine whose entry was picked; picking from a
     different machine replaces the earlier picks. A search box appears
-    once there are more than eight roles. **New role…** at the bottom
+    above the list. **New role…** at the bottom
     opens the roles window (drama masks) straight on its new-role form
     (on the machine of the roles already picked, if any) and, once the
     role is made, comes back with the earlier picks plus the new role;
     backing out (back or Cancel) comes back as the user left it; closing
     the roles window with its ✕ drops the picks instead.
-  - **Name** is always shown, already filled with a suggested name
+  - **Name** is a field at the top, already filled with a suggested name
     ("Suggested — change it if you like."); typing replaces it, and a
-    name that's taken on that machine or anywhere in the client says so. A roleless
-    agent is visible only to the user who made it and is suggested just
-    the word as its name (e.g. "duet", "duet-2").
-  - **Cancel** and **Create** at the foot; Create waits until roles or
-    **No roles** are picked, shows "Creating…" while the agent is made
-    (nothing closes meanwhile), and the new conversation opens
-    automatically.
-  *Agent-side:* see § Spawning another agent — the same mechanism, but
-  the agent-side lets you seed the newborn with an initial prompt, which
-  the button cannot. User-gated.
+    name that's taken on that machine or anywhere in the client says so.
+    A roleless agent is visible only to the user who made it and is
+    suggested just the word as its name (e.g. "duet", "duet-2").
+  - **Send** in the compose box starts it, once roles or **No roles**
+    are picked; anything typed goes to the new agent as the user's first
+    message. The pane becomes the new conversation in place. If it can't
+    be made, the pane stays with its picks and says so.
+  *Agent-side:* see § Spawning another agent — the same mechanism; the
+  agent-side lets you seed the newborn's own first instructions, which
+  arrive with its load rather than as a user message. User-gated.
 
 ### The sidebar search input
 
@@ -1033,8 +1039,8 @@ not something agents drive.
   hover; also opened by right-clicking the header, or holding it on a touch
   screen) with:
   - **Edit project** — opens the **project modal** (§ Conversation view).
-  - **New conversation in this project** — auto-assigns the spawned
-    agent to this project.
+  - **New conversation in this project** — a new conversation born into
+    this project, on its machine.
   - **New sub-project** — the new-project dialog with an "Inside <parent
     › …>" line and no machine choice, creating the project inside this
     one (on its machine).
@@ -1076,7 +1082,8 @@ not something agents drive.
   same for that file: it opens in a new **file pane** (each drag opens
   another, even for a file already open). Dragging the green **monitor**
   button beside a conversation's task pill does the same for that agent's
-  virtual desktop: it opens in a new **desktop pane**. Each open conversation pane has a **task pill** (relay rooms: a **badge** per participant), each
+  virtual desktop: it opens in a new **desktop pane**. Dragging the ✏️
+  pencil opens a fresh **new conversation** there. Each open conversation pane has a **task pill** (relay rooms: a **badge** per participant), each
   open app pane its **app bar**, each remote-desktop pane its
   **remote-desktop bar**, each file pane its **file bar**, and each desktop
   pane its **desktop bar** (all below); dragging it to a different spot in
@@ -1281,8 +1288,8 @@ crown, then gear.
     description, and opens the new skill), **Files** (everything in the role folder
     `~/fleet/roles/<slug>/` except the role file itself, which has its own
     tab) and **Git** when the folder holds a repo. The **⋯** menu has
-    **Start a conversation** (opens the new-conversation dialog with this
-    role picked), for admins **Make instance-wide…** / **Delete from every host…**,
+    **Start a conversation** (opens a new conversation with this role
+    picked), for admins **Make instance-wide…** / **Delete from every host…**,
     and **Archive role…** — one confirm naming the agents that hold it,
     which are archived with it (and which of them have scheduled wake-ups that would
     stop); greyed out on a shared role, which is
@@ -1433,8 +1440,8 @@ crown, then gear.
   account card, the sections, About), tapping an item opens it full screen
   with a back arrow (‹ Preferences) to return.
 
-- **Small modals on a phone are sheets.** Short dialogs — new
-  conversation, new project, the feedback form,
+- **Small modals on a phone are sheets.** Short dialogs — new project,
+  the feedback form,
   and every confirm / "name it" / notice dialog — slide up from the bottom
   of a phone, only as tall as their content, with a grab bar on top and the
   app dimmed above, their buttons stacked full-width with the main one on
@@ -2286,9 +2293,9 @@ See also: **§ On /id archive** for the archive-direction pattern.
 
 The agent-side counterpart to the user's new-conversation button (see
 § The app's user interface). Where the button gives the user a role
-picker and a suggested name, the file-drop mechanism below lets
-you spawn with a full initial prompt attached — which the button cannot
-do.
+picker, a suggested name and a first message, the file-drop mechanism
+below lets you spawn with a full initial prompt attached — the newborn's
+own instructions, delivered with its load.
 
 ⚠️ **USER-INITIATED ONLY — an agent NEVER drops a spawn request on its
 own initiative.** Same rule as `/id archive`. If you

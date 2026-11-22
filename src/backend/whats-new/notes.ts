@@ -39,6 +39,10 @@ export const WHATS_NEW_NOTES: readonly WhatsNewNote[] = [
     id: "voice-pause-button",
     text: "Voice mode and dictation now have a pause button instead of mute. Pausing voice mode holds everything — a reply being read stops mid-sentence and picks up where it left off — and tapping the voice-mode chip no longer skips a reply.",
   },
+  {
+    id: "new-conversation-pane",
+    text: "New conversations now open in place, as a conversation that hasn't started yet: pick roles, check the name, type what you'd like done and press send. You can also drag the ✏️ pencil into a split.",
+  },
 ];
 
 // Ids of withdrawn notes. Never reuse one: people who saw the old note would

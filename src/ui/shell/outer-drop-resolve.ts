@@ -79,7 +79,7 @@ export function isSplittableActiveTab(
 ): boolean {
   if (tab == null) return false;
   if (tab.sessionKind === "relay-room" || tab.sessionKind === "archived") return true;
-  if (tab.type === "app" || tab.type === "file" || tab.type === "desktop") return true;
+  if (tab.type === "app" || tab.type === "file" || tab.type === "desktop" || tab.type === "new-conversation") return true;
   return (
     tab.type === "terminal" &&
     tab.targetTmuxSession != null &&

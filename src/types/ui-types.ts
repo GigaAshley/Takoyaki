@@ -165,7 +165,30 @@ export type TabType =
   | "telnet"
   | "app" // Phase 120 D-01 — app content type
   | "file" // a file shown read-only in its own pane
-  | "desktop"; // an agent's virtual desktop in its own pane
+  | "desktop" // an agent's virtual desktop in its own pane
+  | "new-conversation"; // a conversation that hasn't started yet
+
+// What a new-conversation pane has picked so far — kept on its tab (and so in
+// the URL) so a reload, a move to another window, or a trip to the roles
+// window brings the pane back as it was. Everything is optional: an empty
+// object is a fresh pane.
+export type NewConversationPicks = {
+  /** An admin's plain shell instead of an agent. */
+  shell?: boolean;
+  /** The machine — the agent's (where its roles come from), or the shell's. */
+  hostId?: number;
+  /** Roles, in pick order. */
+  roles?: string[];
+  /** "No roles" picked (never alongside roles). */
+  noRoles?: boolean;
+  /** A name the user typed. A suggested name isn't kept; a fresh one is
+   *  suggested on the way back. */
+  name?: string;
+  /** The project the agent is born into, and the machine it lives on. */
+  project?: { slug: string; hostId: number };
+  /** The shell's folder. */
+  path?: string;
+};
 
 export type TunnelStatusValue =
   | "CONNECTED"
@@ -264,6 +287,14 @@ export type Tab = {
   // the host it lives on. REQUIRED whenever `type === "desktop"`; absent
   // otherwise — same discipline as `app` / `file`.
   desktop?: { hostId: number; identityKey: string };
+
+  // New-conversation leaf: its picks so far. REQUIRED whenever
+  // `type === "new-conversation"`; absent otherwise. `newConversationSeed`
+  // changes when the picks are replaced from outside the pane (a project or
+  // role entry switching it, a return from the roles window) — the pane
+  // starts over from the picks then, rather than keeping its own.
+  newConversation?: NewConversationPicks;
+  newConversationSeed?: number;
 };
 
 // Phase 120 D-02 — narrowing predicate. Returns true when the tab is an app
@@ -282,6 +313,13 @@ export function isFileTab(
   tab: Tab,
 ): tab is Tab & { file: { host: string; path: string; origin?: string | null } } {
   return tab.type === "file" && tab.file !== undefined;
+}
+
+// Narrowing predicate for new-conversation leaves (see `Tab.newConversation`).
+export function isNewConversationTab(
+  tab: Tab,
+): tab is Tab & { newConversation: NewConversationPicks } {
+  return tab.type === "new-conversation" && tab.newConversation !== undefined;
 }
 
 // Narrowing predicate for desktop leaves (see `Tab.desktop`).

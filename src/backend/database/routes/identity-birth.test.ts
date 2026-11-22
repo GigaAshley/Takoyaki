@@ -80,6 +80,12 @@ vi.mock("../../claude-session/identity-artifact-reader.js", () => ({
   listProjects: mockListProjects,
 }));
 
+// The first message is dropped in the newborn's inbox.
+const { mockDropInbox } = vi.hoisted(() => ({ mockDropInbox: vi.fn(async () => "20261122T190000000-abcdef12.msg") }));
+vi.mock("../../claude-session/per-identity-file.js", () => ({
+  dropIdentityInboxMessage: mockDropInbox,
+}));
+
 vi.mock("../../sharing/host-conn.js", () => ({
   HttpError: class extends Error {},
   withHost: async (_h: number, _u: string, fn: (c: null) => Promise<unknown>) => fn(null),
@@ -260,7 +266,8 @@ const mockSshLoggerWarn = sshLogger.warn as unknown as Mock;
 
 function makeServer(): { app: express.Express; server: http.Server } {
   const app = express();
-  app.use(express.json());
+  // Production parses bodies app-wide with a 1gb limit (database.ts).
+  app.use(express.json({ limit: "1gb" }));
   app.use("/identities/birth", identityBirthRoutes);
   const server = http.createServer(app);
   return { app, server };
@@ -2086,4 +2093,117 @@ it("born inside a project on a single-user machine → nothing about sharing cha
   await httpPost(port, "/identities/birth", { ...VALID_BODY, project: "ops" });
   expect(mockListProjects).not.toHaveBeenCalled();
   expect((capturedOpts as Record<string, unknown>).users).toBeUndefined();
+});
+
+// ---------------------------------------------------------------------------
+// First message — what was typed in the new conversation's compose box.
+// ---------------------------------------------------------------------------
+
+describe("first message", () => {
+  beforeEach(() => {
+    mockDropInbox.mockClear();
+    mockDropInbox.mockResolvedValue("20261122T190000000-abcdef12.msg");
+  });
+
+  type Deps = { onCommitted?: (name: string) => void };
+  const succeed = () =>
+    mockBirthIdentity.mockImplementation(async (_opts: unknown, emit: (e: unknown) => void, deps: Deps) => {
+      deps.onCommitted?.("alicia-box-maintainer");
+      emit({ type: "ended", ok: true, identityId: "alicia", sessionName: "alicia-box-maintainer" });
+    });
+
+  it("is dropped in the newborn's inbox (under its folder name) once the folder is committed", async () => {
+    succeed();
+    const result = await httpPost(port, "/identities/birth", {
+      ...VALID_BODY,
+      firstMessage: "Sketch three ideas\r\nfor a card game",
+    });
+    expect(result.status).toBe(200);
+    await vi.waitFor(() => expect(mockDropInbox).toHaveBeenCalledTimes(1));
+    expect(mockDropInbox).toHaveBeenCalledWith(
+      "alicia-box-maintainer",
+      "Sketch three ideas\nfor a card game",
+      { hostId: 7, conn: null },
+    );
+    await vi.waitFor(() =>
+      expect(mockSshLoggerInfo).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ operation: "identity_birth_first_message_delivered", identityName: "alicia-box-maintainer" }),
+      ),
+    );
+  });
+
+  it("is not delivered when the birth fails before the folder is committed", async () => {
+    mockBirthIdentity.mockImplementation(async (_opts: unknown, emit: (e: unknown) => void) => {
+      emit({ type: "ended", ok: false, reason: "nope" });
+    });
+    const result = await httpPost(port, "/identities/birth", { ...VALID_BODY, firstMessage: "hello" });
+    expect(result.status).toBe(200);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(mockDropInbox).not.toHaveBeenCalled();
+  });
+
+  it("is still delivered when the folder is committed but the start is never confirmed (closed tab, wait timeout)", async () => {
+    mockBirthIdentity.mockImplementation(async (_opts: unknown, emit: (e: unknown) => void, deps: Deps) => {
+      deps.onCommitted?.("alicia-box-maintainer");
+      emit({ type: "ended", ok: false, reason: "supervisor_wait_timeout" });
+    });
+    const result = await httpPost(port, "/identities/birth", { ...VALID_BODY, firstMessage: "hello" });
+    expect(result.status).toBe(200);
+    await vi.waitFor(() => expect(mockDropInbox).toHaveBeenCalledTimes(1));
+    expect(mockDropInbox).toHaveBeenCalledWith("alicia-box-maintainer", "hello", { hostId: 7, conn: null });
+  });
+
+  it("no first message → no hook is handed to the orchestrator", async () => {
+    let seenDeps: Deps | undefined;
+    mockBirthIdentity.mockImplementation(async (_opts: unknown, emit: (e: unknown) => void, deps: Deps) => {
+      seenDeps = deps;
+      emit({ type: "ended", ok: true, identityId: "alicia", sessionName: "alicia" });
+    });
+    await httpPost(port, "/identities/birth", VALID_BODY);
+    expect(seenDeps?.onCommitted).toBeUndefined();
+  });
+
+  it("absent, empty or blank → nothing is delivered", async () => {
+    succeed();
+    for (const firstMessage of [undefined, null, "", "   \n "]) {
+      const body = firstMessage === undefined ? VALID_BODY : { ...VALID_BODY, firstMessage };
+      const result = await httpPost(port, "/identities/birth", body);
+      expect(result.status).toBe(200);
+    }
+    await new Promise((r) => setTimeout(r, 20));
+    expect(mockDropInbox).not.toHaveBeenCalled();
+  });
+
+  it("a blocked command is refused before anything is born", async () => {
+    succeed();
+    mockBirthIdentity.mockClear();
+    const result = await httpPost(port, "/identities/birth", { ...VALID_BODY, firstMessage: "/login" });
+    expect(result.status).toBe(400);
+    expect(mockBirthIdentity).not.toHaveBeenCalled();
+    expect(mockDropInbox).not.toHaveBeenCalled();
+  });
+
+  it("a non-string or oversized first message → 400", async () => {
+    mockBirthIdentity.mockClear();
+    const notString = await httpPost(port, "/identities/birth", { ...VALID_BODY, firstMessage: 42 });
+    expect(notString.status).toBe(400);
+    const tooBig = await httpPost(port, "/identities/birth", { ...VALID_BODY, firstMessage: "x".repeat(256 * 1024 + 1) });
+    expect(tooBig.status).toBe(400);
+    expect(mockBirthIdentity).not.toHaveBeenCalled();
+  });
+
+  it("a failed delivery is logged, not surfaced — the birth already succeeded", async () => {
+    succeed();
+    mockDropInbox.mockRejectedValueOnce(new Error("identity folder not found: alicia-box-maintainer"));
+    const result = await httpPost(port, "/identities/birth", { ...VALID_BODY, firstMessage: "hello" });
+    expect(result.status).toBe(200);
+    expect(result.body).toContain('"ok":true');
+    await vi.waitFor(() =>
+      expect(mockSshLoggerWarn).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ operation: "identity_birth_first_message_failed" }),
+      ),
+    );
+  });
 });

@@ -409,6 +409,23 @@ export interface ComposeBoxProps {
   // Target host name — the tray resolves picture / file options given as paths.
   hostName?: string;
   onOpenAskFile?: (url: string, filename: string) => void;
+  /**
+   * A conversation that hasn't started yet (the new-conversation pane). The
+   * box then starts the conversation instead of sending into one: Send (or
+   * Enter, a dictation, a skill) calls `onStart` with whatever is typed —
+   * empty is fine — and the text stays in the box (the pane goes away on
+   * success, and keeps it for a retry on failure). Send is the main button
+   * throughout; it waits for `canStart` and shows a spinner while `busy`.
+   * Nothing is saved as a draft.
+   */
+  starter?: {
+    placeholder: string;
+    /** False → nothing can be typed (what's typed would go nowhere). */
+    allowText?: boolean;
+    canStart: boolean;
+    busy: boolean;
+    onStart: (text: string) => void;
+  };
 }
 
 // ============================================================================
@@ -642,7 +659,11 @@ export function ComposeBox({
   openAsk = null,
   hostName,
   onOpenAskFile,
+  starter,
 }: ComposeBoxProps) {
+  // Drafts are kept per conversation; a relay room or a conversation that
+  // hasn't started yet has none to keep them under.
+  const keepsDraft = mode !== "relay" && starter === undefined;
   // Phase 05 — hidden file input driven by the paperclip button. When the
   // input's change event fires, we normalize the FileList to a plain array
   // and hand it to onAttachFiles (which the parent hook's stageAttachments
@@ -709,7 +730,11 @@ export function ComposeBox({
   // pops it open). Escape, a click away, or the caret leaving the word
   // dismisses it until the text changes. Only where the lightning-bolt menu
   // lives (never relay) and only while the box can send.
-  const slashSkills = useSkillActions(hostId, mode !== "relay");
+  // Skills belong to a machine; a conversation not started yet has one only
+  // once something is picked.
+  const skillsHere =
+    mode !== "relay" && (starter === undefined || (hostId > 0 && starter.allowText !== false));
+  const slashSkills = useSkillActions(hostId, skillsHere);
   const [slashCaret, setSlashCaret] = useState<{ start: number; end: number } | null>(null);
   const [slashTypedText, setSlashTypedText] = useState<string | null>(null);
   const [slashDismissedText, setSlashDismissedText] = useState<string | null>(null);
@@ -720,7 +745,7 @@ export function ComposeBox({
   const slashToken = text.startsWith("/") ? text.slice(0, /\s/.exec(text)?.index ?? text.length) : null;
   const slashQuery = slashToken?.slice(1) ?? "";
   const slashEligible =
-    mode !== "relay" &&
+    skillsHere &&
     canSend !== false &&
     asideActive !== true &&
     reconnectingActive !== true &&
@@ -952,7 +977,7 @@ export function ComposeBox({
     // "hostId is required". Skip the persist attempt in relay mode; clear
     // the dirty flag so we don't accumulate. (Relay-source drafts, if
     // needed, would use a separate storage key — separate design.)
-    if (mode === "relay") {
+    if (!keepsDraft) {
       dirtyBodyRef.current = null;
       return;
     }
@@ -977,10 +1002,11 @@ export function ComposeBox({
       // optimistic bubbles live on PrettyView per Phase 50 D-01.
       dirtyBodyRef.current = latestBodyRef.current;
     }
-  }, [hostId, tmuxSessionKey, mode]);
+  }, [hostId, tmuxSessionKey, keepsDraft]);
 
   const scheduleAutosave = useCallback(
     (nextBody: string) => {
+      if (!keepsDraft) return;
       dirtyBodyRef.current = nextBody;
       // Patch #119 — draft-loss belt-and-suspenders: mirror every
       // keystroke to localStorage as a {body} payload so the draft
@@ -994,7 +1020,7 @@ export function ComposeBox({
         void flushDirty();
       }, DEBOUNCE_MS);
     },
-    [clearDebounce, flushDirty, hostId, tmuxSessionKey],
+    [clearDebounce, flushDirty, hostId, tmuxSessionKey, keepsDraft],
   );
 
   // shape-interrupt-button: give a cancelled send's words back. Applied once
@@ -1041,7 +1067,7 @@ export function ComposeBox({
     clearDebounce();
     dirtyBodyRef.current = null;
     latestBodyRef.current = "";
-    quotesBeforeLoadRef.current = mode === "relay" ? null : [];
+    quotesBeforeLoadRef.current = keepsDraft ? [] : null;
 
     // Phase 97 UAT follow-up (2026-09-10): relay-source panes have no
     // hostId + no tmuxSession, so a compose-drafts fetch always 400s with
@@ -1049,7 +1075,7 @@ export function ComposeBox({
     // in relay mode — relay-source panes don't have per-tmux draft
     // persistence today (if that becomes a requirement, it'd be a
     // separate design with its own storage key, not this endpoint).
-    if (mode === "relay") {
+    if (!keepsDraft) {
       return;
     }
 
@@ -1141,7 +1167,7 @@ export function ComposeBox({
       cancelled = true;
       // Phase 97 UAT follow-up: skip keepalive in relay mode — the
       // endpoint requires hostId which is 0 for relay panes.
-      if (mode !== "relay" && dirtyBodyRef.current !== null) {
+      if (keepsDraft && dirtyBodyRef.current !== null) {
         flushComposeDraftKeepalive(hostId, tmuxSessionKey, dirtyBodyRef.current, []);
         dirtyBodyRef.current = null;
       }
@@ -1181,7 +1207,7 @@ export function ComposeBox({
       // Phase 97 UAT follow-up: skip keepalive in relay mode — the
       // endpoint requires hostId which is 0 for relay panes. Same
       // rationale as the load-on-mount + flushDirty early-returns.
-      if (mode === "relay") return;
+      if (!keepsDraft) return;
       if (dirtyBodyRef.current !== null) {
         flushComposeDraftKeepalive(hostId, tmuxSessionKey, dirtyBodyRef.current, []);
         dirtyBodyRef.current = null;
@@ -1346,6 +1372,7 @@ export function ComposeBox({
     clearDebounce();
     dirtyBodyRef.current = null;
     latestBodyRef.current = "";
+    if (!keepsDraft) return;
     try {
       localStorage.setItem(composeDraftLsKey(hostId, tmuxSessionKey), JSON.stringify({ body: "" }));
     } catch {}
@@ -1353,7 +1380,7 @@ export function ComposeBox({
       // Best-effort; on failure the next flushDirty tick will re-try
       // once the user types again OR the next 10s tick fires.
     });
-  }, [clearDebounce, hostId, tmuxSessionKey]);
+  }, [clearDebounce, hostId, tmuxSessionKey, keepsDraft]);
 
   const funnel = useComposeSend({ hostId, tmuxSession, identityName, onSend, onOptimisticSend });
   // shape-interactive-responses: every send while a question is open — typed,
@@ -1516,6 +1543,15 @@ export function ComposeBox({
         setErrorMessage(COMMAND_REFUSED_MESSAGE);
         return;
       }
+    }
+
+    // Not started yet: the words start the conversation (empty is fine).
+    if (starter) {
+      if (!starter.canStart || starter.busy) return;
+      setErrorMessage(null);
+      console.info(`[compose] start hostId=${hostId} bodyLen=${trimmed.length} trigger=${trigger}`);
+      starter.onStart(normalizeNewlinesForSend(trimmed));
+      return;
     }
 
     // Phase 05 — attachment path: Send routes to onSendWithAttachments
@@ -1698,6 +1734,13 @@ export function ComposeBox({
   // dispatch leaves both intact.
   function handleQuickSend(rawQuickText: string, options?: { bubbleTextOverride?: string }) {
     setErrorMessage(null);
+    // Not started yet: a skill starts the conversation with it.
+    if (starter) {
+      if (!starter.canStart || starter.busy) return;
+      console.info(`[compose] start hostId=${hostId} quick=${rawQuickText.split(/\s/, 1)[0]}`);
+      starter.onStart(rawQuickText);
+      return;
+    }
     const quickText = rawQuickText;
     // Phase 68 Plan 02: route through the funnel so quick-replies carry an
     // mqid (D-03 invariant) and seed an optimistic bubble (D-01). The
@@ -1764,8 +1807,9 @@ export function ComposeBox({
   //     as "not sendable" would over-disable. Matches every other button in
   //     this file (see `disabled={canSend === false}` on the aux-row buttons).
   //   - text.trim() === "" && !hasAttachments → disabled (nothing to send).
-  const sendDisabled =
-    relaySendBlocked ||
+  const sendDisabled = starter
+    ? !starter.canStart || starter.busy
+    : relaySendBlocked ||
     reconnectingActive === true ||
     (canSend === false && !hasAttachments) ||
     (text.trim() === "" && !hasAttachments);
@@ -1864,7 +1908,8 @@ export function ComposeBox({
     !recordingHere &&
     !isPrimaryTranscribing &&
     !voiceModeHere &&
-    !asideActive;
+    !asideActive &&
+    starter?.allowText !== false;
 
   // Phase 16: merge voice.errorMessage into the existing displayError. The error
   // display block renders only one message at a time; voice errors are transient
@@ -1890,7 +1935,7 @@ export function ComposeBox({
   const quickDisabled = asideActive === true || reconnectingActive === true;
   const mainAction: "resume" | "send" | "bell" | "thumbs" = asideActive
     ? "resume"
-    : hasDraft || !harness || recordingHere
+    : hasDraft || !harness || recordingHere || starter
       ? "send"
       : agentWorking
         ? "bell"
@@ -1993,7 +2038,8 @@ export function ComposeBox({
           onKeyDown={handleKeyDown}
           onPaste={handlePaste}
           enterKeyHint={isTouchDevice === true ? "enter" : "send"}
-          placeholder="Write a message…"
+          placeholder={starter?.placeholder ?? "Write a message…"}
+          disabled={starter?.allowText === false}
           rows={1}
           style={chipStripHeight > 0 ? { paddingTop: `${chipStripHeight + 12}px` } : undefined}
           className="pv-compose-text"
@@ -2032,7 +2078,7 @@ export function ComposeBox({
             have skills; never in relay panes. */}
         <SkillActionsButton
           hostId={hostId}
-          enabled={harness}
+          enabled={harness && skillsHere}
           disabled={quickDisabled}
           onFire={(skillName) => { onGoodToGo?.(); handleQuickSend(`/${skillName}`); }}
           buttonClassName="pv-cbtn"
@@ -2121,12 +2167,12 @@ export function ComposeBox({
                   ? voice.state !== "recording" || reconnectingActive === true
                   : (sendDisabled || showTranscribingSend)
             }
-            aria-label={asideActive ? "Resume" : "Send"}
-            title={asideActive ? "Resume" : "Send"}
+            aria-label={asideActive ? "Resume" : starter ? (starter.busy ? "Starting the conversation" : "Start the conversation") : "Send"}
+            title={asideActive ? "Resume" : starter ? "Start the conversation" : "Send"}
           >
             {asideActive ? (
               <X strokeWidth={2.25} aria-hidden="true" />
-            ) : showTranscribingSend ? (
+            ) : showTranscribingSend || starter?.busy ? (
               // Twin 90° arcs 180° apart — rotationally symmetric, so the
               // spinner doesn't wobble.
               <svg

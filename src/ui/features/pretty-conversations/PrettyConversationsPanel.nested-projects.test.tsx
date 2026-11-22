@@ -379,87 +379,6 @@ vi.mock("@/features/pretty-view/roles-window/RolesWindow", () => ({
   RolesWindow: () => null,
 }));
 
-// Phase 117 M-F: NewSessionDialog stub — exposes buttons that fire onCreate
-// with controlled opts so tests can observe the panel's setSessionProject
-// wire without SSE / birth plumbing. Only renders when open=true. The
-// synthetic-fire buttons carry testids that map 1:1 to the two
-// NewSessionOnCreateOpts variants (identityMode false / true).
-vi.mock("@/sidebar/NewSessionDialog", () => ({
-  NewSessionDialog: (props: {
-    open: boolean;
-    onCreate: (opts: unknown) => void;
-    onClose: () => void;
-    // M-I: expose the incoming hostTree to tests so they can assert the
-    // panel-side filter (single-host tree in project context).
-    hostTree: { name: string; children: unknown[] } | null;
-  }) => {
-    if (!props.open) return null;
-    // Count top-level hosts (folders skipped for simplicity — the panel
-    // passes a flat single-host list in project context, not a nested tree).
-    const treeChildCount = props.hostTree?.children?.length ?? 0;
-    const host = {
-      id: "1",
-      name: "hostA",
-      username: "u",
-      ip: "1.1.1.1",
-      port: 22,
-      folder: "",
-      online: true,
-      cpu: null,
-      ram: null,
-      lastAccess: "",
-      authType: "password",
-      enableTerminal: true,
-      enableTunnel: false,
-      serverTunnels: [],
-      enableFileManager: false,
-      enableDocker: false,
-      enableSsh: true,
-      enableRdp: false,
-      pin: "",
-      protocol: "ssh",
-      publicKey: "",
-      externalUrl: "",
-      description: "",
-      isPublic: false,
-      autostart: false,
-      autostartTimeout: 60,
-    };
-    return (
-      <div
-        data-testid="pv-mock-new-session-dialog"
-        data-hosttree-child-count={String(treeChildCount)}
-      >
-        <button
-          data-testid="pv-mock-nsd-fire-birth"
-          onClick={() =>
-            props.onCreate({
-              host,
-              identityMode: true,
-              name: "wren",
-              path: "/home/u",
-            })
-          }
-        >
-          fire birth
-        </button>
-        <button
-          data-testid="pv-mock-nsd-fire-plain"
-          onClick={() =>
-            props.onCreate({
-              host,
-              identityMode: false,
-              path: "/home/u",
-            })
-          }
-        >
-          fire plain
-        </button>
-      </div>
-    );
-  },
-}));
-
 vi.mock("@/api/global-files-api", () => ({
   listGlobalFiles: vi.fn().mockResolvedValue([]),
   readGlobalFile: vi.fn().mockResolvedValue({ content: "", mtime: 0, size: 0 }),
@@ -630,7 +549,7 @@ function renderPanel(variant: "desktop" | "mobile" = "desktop") {
     <PrettyConversationsPanel isAdmin
       variant={variant}
       hostTree={HOST_TREE}
-      onCreateSession={() => {}}
+      onNewConversation={() => {}}
       onDeactivateRow={() => {}}
     />,
   );

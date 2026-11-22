@@ -50,8 +50,18 @@ import type {
   HostFolder,
   ThemeId,
   FontSizeId,
+  NewConversationPicks,
 } from "@/types/ui-types";
-import { isAppTab, isDesktopTab, isFileTab } from "@/types/ui-types";
+import { isAppTab, isDesktopTab, isFileTab, isNewConversationTab } from "@/types/ui-types";
+import {
+  NewConversationHostContext,
+  type NewConversationHost,
+  type NewConversationStarted,
+} from "@/features/new-conversation/new-conversation-context";
+import { picksFromWire, samePicks } from "@/lib/new-conversation-picks";
+import { decideNewConversationOpen } from "@/lib/new-conversation-open";
+import { NEW_CONVERSATION_DRAG_MIME, hasNewConversationDragMime } from "@/shell/new-conversation-drag";
+import { setSessionProject } from "@/api/session-project-api";
 import { usePhoneDesktop } from "@/shell/use-phone-desktop";
 import { applyAccentColor, applyFontSize } from "@/lib/theme";
 import { useTheme } from "@/components/theme-provider";
@@ -204,6 +214,7 @@ import {
   useIdentities,
   mergeIdentityAppearance,
   setIdentityProject,
+  refreshIdentities,
 } from "@/state/identities-store";
 // Phase 34 Plan 06: fleet-status control WebSocket — boot-time singleton
 import { createFleetStatusClient } from "@/api/fleet-status-client";
@@ -266,7 +277,10 @@ import {
 import { OPEN_APP_EVENT, type OpenAppDetail } from "./features/apps/app-link";
 import { kitAlert } from "@/components/kit";
 import "@/features/pretty-view/conversation.css";
-import { NEW_CONVERSATION_REQUEST_EVENT } from "@/lib/new-conversation-request";
+import {
+  NEW_CONVERSATION_REQUEST_EVENT,
+  takeNewConversationRequest,
+} from "@/lib/new-conversation-request";
 import { RequestedSkillsEditor } from "@/features/pretty-view/RequestedSkillsEditor";
 import type { SignOutReason } from "@/auth/reload-to-sign-in";
 // Phase 11 Plan 03 (user "no settings" lock): SettingsRow import RETIRED
@@ -447,6 +461,8 @@ export function AppShell({
     readHostTreeCache().map(sshHostToHost),
   );
   const [isAdmin, setIsAdmin] = useState(false);
+  // Whether isAdmin has been answered yet — a restored shell pane waits for it.
+  const [adminKnown, setAdminKnown] = useState(false);
   // Sidebar-footer "you" anchor: current username from /users/me. Held here
   // alongside isAdmin because both come from the same fetch and both feed
   // PrettyConversationsPanel. Null until the fetch resolves (footer's anchor
@@ -590,26 +606,18 @@ export function AppShell({
     }
   }, [isMobile, isTouchDevice]);
 
-  // "Start a conversation" from a role is answered by the conversation list.
-  // In a narrow mouse window the list lives in a slide-out that isn't mounted
-  // while closed — open it; the list takes the held request as it mounts.
-  useEffect(() => {
-    if (isTouchDevice || !isMobile) return;
-    const onRequest = (): void => setSidebarOpen(true);
-    window.addEventListener(NEW_CONVERSATION_REQUEST_EVENT, onRequest);
-    return () => window.removeEventListener(NEW_CONVERSATION_REQUEST_EVENT, onRequest);
-  }, [isMobile, isTouchDevice]);
-
   useEffect(() => {
     getUserInfo()
       .then((info) => {
         setIsAdmin(info.is_admin);
+        setAdminKnown(true);
         setMeUsername(info.username || null);
         setMeUserId(info.userId ?? null);           // Phase 137 D-30
         setMeAvatarPath(info.avatarPath ?? null);   // Phase 137 D-30
       })
       .catch(() => {
         setIsAdmin(false);
+        setAdminKnown(true);
         setMeUsername(null);
         setMeUserId(null);           // Phase 137 D-30
         setMeAvatarPath(null);       // Phase 137 D-30
@@ -1495,6 +1503,7 @@ export function AppShell({
         app: t.app,
         file: t.file,
         desktop: t.desktop,
+        newConversation: t.newConversation,
       });
       if (!spec) continue;
       if (t.id === activeTabId) activeIndex = tabSpecs.length;
@@ -1534,6 +1543,7 @@ export function AppShell({
         app: t.app,
         file: t.file,
         desktop: t.desktop,
+        newConversation: t.newConversation,
       });
     });
     writeWorkspaceToUrl(
@@ -1894,6 +1904,16 @@ export function AppShell({
             // File leaf — always a fresh tab per spec (duplicates of the
             // same file are allowed, each its own pane).
             // Desktop leaf — like a file leaf, a fresh tab per spec.
+            if (spec.protocol === "new") {
+              const newId = openTab(null, "new-conversation", undefined, {
+                newConversation: spec.picks,
+                newConversationSeed: 0,
+                label: "New conversation",
+                allowCreateTmux: false,
+              });
+              if (newId) openedIds.push(newId);
+              continue; // skip host-required logic below
+            }
             if (spec.protocol === "desktop") {
               const newId = openTab(null, "desktop", undefined, {
                 desktop: {
@@ -2075,7 +2095,7 @@ export function AppShell({
           {
             let openedIdx = 0;
             for (const spec of pending.tabs) {
-              if (spec.protocol === "file" || spec.protocol === "desktop") {
+              if (spec.protocol === "file" || spec.protocol === "desktop" || spec.protocol === "new") {
                 const key = encodeTabSpec(spec);
                 const id = openedIds[openedIdx];
                 if (id) fileSpecToTabIds.set(key, [...(fileSpecToTabIds.get(key) ?? []), id]);
@@ -2144,6 +2164,29 @@ export function AppShell({
                   !claimedFileTabIds.has(t.id) &&
                   t.file.host === spec.fileHost &&
                   t.file.path === spec.path
+                ) {
+                  claimedFileTabIds.add(t.id);
+                  return t.id;
+                }
+              }
+              return null;
+            }
+            // New-conversation leaves share the same queue (two can carry the
+            // same picks — each is its own pane).
+            if (spec.protocol === "new") {
+              const queued = fileSpecToTabIds.get(encodeTabSpec(spec));
+              while (queued && queued.length > 0) {
+                const id = queued.shift()!;
+                if (!claimedFileTabIds.has(id)) {
+                  claimedFileTabIds.add(id);
+                  return id;
+                }
+              }
+              for (const t of [...restoredTabs, ...tabs]) {
+                if (
+                  isNewConversationTab(t) &&
+                  !claimedFileTabIds.has(t.id) &&
+                  samePicks(t.newConversation, spec.picks)
                 ) {
                   claimedFileTabIds.add(t.id);
                   return t.id;
@@ -2316,6 +2359,9 @@ export function AppShell({
       file?: { host: string; path: string; origin?: string | null };
       // Desktop leaf: present only when type === "desktop" (see Tab.desktop).
       desktop?: { hostId: number; identityKey: string };
+      // New-conversation leaf: present only when type === "new-conversation".
+      newConversation?: NewConversationPicks;
+      newConversationSeed?: number;
     },
   ): string {
     // Patch #35: append a monotonic counter suffix so multiple openTab
@@ -2327,7 +2373,8 @@ export function AppShell({
     // prefix — the id shape stays greppable in logs even for host-less
     // relay-room tabs. `host` is null for relay-room tabs.
     const hostNameForId =
-      host?.name ?? (type === "file" || type === "desktop" ? type : "relay-room");
+      host?.name ??
+      (type === "file" || type === "desktop" || type === "new-conversation" ? type : "relay-room");
     const tabId = `${hostNameForId}-${type}-${Date.now()}-${openTabCounter.current++}`;
     const instanceId =
       restore?.instanceId ??
@@ -2357,6 +2404,8 @@ export function AppShell({
     const appTuple = options?.app;
     const fileAddress = options?.file;
     const desktopAddress = options?.desktop;
+    const newConversationPicks = options?.newConversation;
+    const newConversationSeed = options?.newConversationSeed;
 
     // Fallback label when host is null and no custom label supplied — use
     // the room title (if any) so the tab title reads meaningfully; else the
@@ -2393,6 +2442,9 @@ export function AppShell({
             ...(appTuple !== undefined ? { app: appTuple } : {}),
             ...(fileAddress !== undefined ? { file: fileAddress } : {}),
             ...(desktopAddress !== undefined ? { desktop: desktopAddress } : {}),
+            ...(newConversationPicks !== undefined
+              ? { newConversation: newConversationPicks, newConversationSeed: newConversationSeed ?? 0 }
+              : {}),
           },
         ];
       }
@@ -2431,6 +2483,9 @@ export function AppShell({
           ...(appTuple !== undefined ? { app: appTuple } : {}),
           ...(fileAddress !== undefined ? { file: fileAddress } : {}),
           ...(desktopAddress !== undefined ? { desktop: desktopAddress } : {}),
+          ...(newConversationPicks !== undefined
+            ? { newConversation: newConversationPicks, newConversationSeed: newConversationSeed ?? 0 }
+            : {}),
         },
       ];
     });
@@ -3005,6 +3060,7 @@ export function AppShell({
         app?: { hostId?: number; slug?: string } | null;
         file?: { host?: string; path?: string; origin?: string | null } | null;
         desktop?: { hostId?: number; identityKey?: string } | null;
+        newConversation?: unknown;
         label?: string | null;
       } | null;
     }): string | null => {
@@ -3038,6 +3094,16 @@ export function AppShell({
       // routes' own host-access check gates what this window can show.
       // Desktop leaf: hostless, keyed by (hostId, identityKey). The desktop
       // routes' own host-access check gates what this window can show.
+      // New-conversation leaf: hostless; its picks travel along (checked
+      // field by field — anything that doesn't fit is dropped).
+      if (descriptor.tabType === "new-conversation") {
+        return openTab(null, "new-conversation", undefined, {
+          newConversation: picksFromWire(descriptor.newConversation),
+          newConversationSeed: 0,
+          label: "New conversation",
+          allowCreateTmux: false,
+        });
+      }
       if (descriptor.tabType === "desktop") {
         const leaf = desktopLeafFromDescriptor(descriptor);
         if (leaf === null) return null;
@@ -3200,6 +3266,13 @@ export function AppShell({
     doCloseTabRef.current = doCloseTab;
   });
 
+  // New-conversation panes whose conversation is being created right now.
+  // They stay (out of sight) when the user clicks away, so the conversation
+  // can still take their place when it's made.
+  const [startingNewConversations, setStartingNewConversations] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+
   // A file or desktop pane has no sidebar row to bring it back: once it has
   // left the layout (replaced by a center drop, or the user moved on from it
   // shown alone) and isn't the tab on screen, nothing can reach it again.
@@ -3211,8 +3284,17 @@ export function AppShell({
     const inTree = new Set(collectTabIds(splitTree));
     for (const t of tabs) {
       // Archived conversations have no sidebar row either (search opens them).
-      if (t.type !== "file" && t.type !== "desktop" && t.sessionKind !== "archived") continue;
+      // A new-conversation pane goes the same way: clicking away from one is
+      // leaving it (the pencil starts a fresh one).
+      if (
+        t.type !== "file" &&
+        t.type !== "desktop" &&
+        t.type !== "new-conversation" &&
+        t.sessionKind !== "archived"
+      )
+        continue;
       if (inTree.has(t.id) || t.id === activeTabId || t.id === selectedConversationId) continue;
+      if (startingNewConversations.has(t.id)) continue;
       systemLogger.info(`[${t.type}-pane] closing unreachable ${t.type} pane`, {
         operation: `${t.type}_pane_close_unreachable`,
         tabId: t.id,
@@ -3223,7 +3305,7 @@ export function AppShell({
       });
       doCloseTabRef.current(t.id);
     }
-  }, [tabsReady, tabs, splitTree, activeTabId, selectedConversationId]);
+  }, [tabsReady, tabs, splitTree, activeTabId, selectedConversationId, startingNewConversations]);
   // Same ref pattern as doCloseTabRef: the fleet-status effect (~L657)
   // subscribes ONCE at mount, so its `gone`-frame handler can't close
   // over `tabs` state directly. Refreshed every render so the handler
@@ -3692,6 +3774,238 @@ export function AppShell({
     [openDesktopTab, replaceInTree],
   );
 
+  // ─── New conversation — a conversation that hasn't started yet ─────────
+  // The pencil, a project's "New conversation in this project" and a role's
+  // "Start a conversation" all come through openNewConversation. A fresh
+  // pane opens and shows the way a conversation click does (over a split
+  // too) — unless the view already is a lone new-conversation pane: then the
+  // pencil does nothing, and a project or role switches that pane to its
+  // starting point. Dragging the pencil always adds a fresh pane.
+  const newConversationSeedRef = useRef(0);
+  // What was on screen when each pane opened — Close brings it back.
+  const newConversationPrevRef = useRef(new Map<string, string>());
+  const openNewConversationTab = useCallback(
+    (picks: NewConversationPicks) =>
+      openTab(null, "new-conversation", undefined, {
+        newConversation: picks,
+        newConversationSeed: ++newConversationSeedRef.current,
+        label: "New conversation",
+        allowCreateTmux: false,
+      }),
+    [openTab],
+  );
+  const openNewConversationRef = useRef<(start: NewConversationPicks | null, source: string) => void>(() => {});
+  openNewConversationRef.current = (start, source) => {
+    const shown = tabs.find((t) => t.id === effectiveSelectedTabId);
+    const decision = decideNewConversationOpen({
+      shown,
+      splitTree,
+      isMobile,
+      shownIsStarting: shown !== undefined && startingNewConversations.has(shown.id),
+    });
+    if (decision.kind === "reuse" && shown !== undefined) {
+      systemLogger.info("[new-conversation] lone pane already shown", {
+        operation: "new_conversation_open_lone",
+        source,
+        tabId: shown.id,
+        switched: start !== null,
+      });
+      if (start !== null) {
+        const seed = ++newConversationSeedRef.current;
+        setTabs((prev) =>
+          prev.map((t) =>
+            t.id === shown.id ? { ...t, newConversation: start, newConversationSeed: seed } : t,
+          ),
+        );
+      }
+      if (isTouchDevice) navigateToView();
+      if (isMobile) setSidebarOpen(false);
+      return;
+    }
+    const newTabId = openNewConversationTab(start ?? {});
+    if (shown !== undefined) newConversationPrevRef.current.set(newTabId, shown.id);
+    systemLogger.info("[new-conversation] open", {
+      operation: "new_conversation_open",
+      source,
+      tabId: newTabId,
+      project: start?.project?.slug ?? null,
+      roles: start?.roles?.join(",") ?? null,
+      hadSplitTree: splitTree !== null,
+    });
+    selectConversationDeferred(newTabId);
+    if (isTouchDevice) navigateToView();
+    if (isMobile) setSidebarOpen(false);
+    sidebarPeek.close("item-opened");
+  };
+
+  // "Start a conversation" from a role (the roles window, wherever it was
+  // opened) — held until the machines are known.
+  useEffect(() => {
+    const onRequest = (): void => {
+      if (!realHostTree) return;
+      const req = takeNewConversationRequest();
+      if (req) openNewConversationRef.current({ hostId: req.hostId, roles: [req.role] }, "role");
+    };
+    onRequest(); // asked before the machines were known
+    window.addEventListener(NEW_CONVERSATION_REQUEST_EVENT, onRequest);
+    return () => window.removeEventListener(NEW_CONVERSATION_REQUEST_EVENT, onRequest);
+  }, [realHostTree]);
+
+  // Pencil drops — a copy gesture: every drop opens a fresh pane.
+  const onDropNewConversationInTree = useCallback(
+    (path: SplitPath, edge: DropEdge) => {
+      systemLogger.info("pv-split-drop onDropNewConversationInTree", {
+        operation: "pv_split_drop_on_drop_new_conversation_in_tree",
+        edge,
+        path: JSON.stringify(path),
+      });
+      const newTabId = openNewConversationTab({});
+      openSessionInTree(newTabId, path, edge);
+      selectConversationDeferred(newTabId);
+    },
+    [openNewConversationTab, openSessionInTree],
+  );
+  const onCenterDropNewConversation = useCallback(
+    (targetTabId: string) => {
+      systemLogger.info("pv-split-drop onCenterDropNewConversation", {
+        operation: "pv_split_drop_on_center_drop_new_conversation",
+        targetTabId,
+      });
+      const newTabId = openNewConversationTab({});
+      replaceInTree(newTabId, targetTabId);
+    },
+    [openNewConversationTab, replaceInTree],
+  );
+
+  // Take a new-conversation pane out without the general close's "what's
+  // shown next" — the caller has already decided that.
+  const removeNewConversationTab = useCallback((id: string, focusNext: string | null) => {
+    newConversationPrevRef.current.delete(id);
+    setSplitTree((prev) => removeLeaf(prev, id));
+    setFocusedTabId((prev) => (prev === id ? focusNext : prev));
+    setTabs((prev) => prev.filter((t) => t.id !== id));
+  }, []);
+
+  const tabsForNewConversationRef = useRef(tabs);
+  tabsForNewConversationRef.current = tabs;
+  const effectiveSelectedForNewConversationRef = useRef(effectiveSelectedTabId);
+  effectiveSelectedForNewConversationRef.current = effectiveSelectedTabId;
+  const activeTabIdForNewConversationRef = useRef(activeTabId);
+  activeTabIdForNewConversationRef.current = activeTabId;
+  const newConversationHost = useMemo<NewConversationHost>(
+    () => ({
+      hostTree: realHostTree,
+      isAdmin,
+      adminKnown,
+      setStarting: (tabId, starting) => {
+        setStartingNewConversations((prev) => {
+          if (prev.has(tabId) === starting) return prev;
+          const next = new Set(prev);
+          if (starting) next.add(tabId);
+          else next.delete(tabId);
+          return next;
+        });
+      },
+      updatePicks: (tabId, picks) => {
+        setTabs((prev) =>
+          prev.map((t) =>
+            t.id === tabId && t.type === "new-conversation" && !samePicks(t.newConversation ?? {}, picks)
+              ? { ...t, newConversation: picks }
+              : t,
+          ),
+        );
+      },
+      started: (tabId, what: NewConversationStarted) => {
+        const sessionName = what.kind === "agent" ? what.name : (what.sessionName ?? null);
+        // Clicked away while it was being made: it takes the pane's place in
+        // the split if the pane is there, but never pulls the view to itself.
+        const wasShown = effectiveSelectedForNewConversationRef.current === tabId;
+        const prevActive = activeTabIdForNewConversationRef.current;
+        // Already open (the user clicked its row while it was being made):
+        // that tab takes the pane's place rather than a second one opening.
+        const existing =
+          sessionName === null
+            ? undefined
+            : tabsForNewConversationRef.current.find(
+                (t) =>
+                  t.type === "terminal" &&
+                  t.sessionKind !== "archived" &&
+                  t.host?.id === what.host.id &&
+                  (t.targetTmuxSession ?? "").toLowerCase() === sessionName.toLowerCase(),
+              );
+        const newTabId = existing?.id ?? openTab(what.host, "terminal", undefined, {
+          targetTmuxSession: sessionName,
+          label: sessionName ?? undefined,
+          // An agent's session was made by its birth; a shell's is made now.
+          allowCreateTmux: what.kind === "shell",
+        });
+        const inTree = findLeaf(splitTreeRef.current, tabId) !== null;
+        systemLogger.info("[new-conversation] started — in place", {
+          operation: "new_conversation_started",
+          tabId,
+          newTabId,
+          kind: what.kind,
+          hostId: parseInt(what.host.id, 10),
+          inTree,
+          wasShown,
+        });
+        // An already-open tab that sits in the split elsewhere stays there;
+        // the pane's leaf just goes.
+        const alreadyInTree = existing !== undefined && findLeaf(splitTreeRef.current, existing.id) !== null;
+        if (inTree && !alreadyInTree) setSplitTree((prev) => replaceLeaf(prev, tabId, newTabId));
+        if (wasShown) selectConversationDeferred(newTabId);
+        else setActiveTabId(prevActive);
+        setStartingNewConversations((prev) => {
+          if (!prev.has(tabId)) return prev;
+          const next = new Set(prev);
+          next.delete(tabId);
+          return next;
+        });
+        removeNewConversationTab(tabId, wasShown ? newTabId : null);
+        // Born into a project: the birth already wrote `project:`; filing it
+        // again here (as the old dialog did) also refreshes the store so the
+        // row lands under its project at once.
+        if (what.kind === "agent" && what.project !== null) {
+          const hostIdNum = parseInt(what.host.id, 10);
+          const key = what.name;
+          const slug = what.project;
+          setSessionProject(hostIdNum, key, slug)
+            .then(() => refreshIdentities({ [key]: hostIdNum }))
+            .catch((err: unknown) => {
+              systemLogger.warn("[new-conversation] couldn't file the newborn in its project", {
+                operation: "new_conversation_project_failed",
+                hostId: hostIdNum,
+                identityKey: key,
+                project: slug,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            });
+        }
+      },
+      close: (tabId) => {
+        const prev = newConversationPrevRef.current.get(tabId) ?? null;
+        const shownNow = effectiveSelectedForNewConversationRef.current === tabId;
+        const prevStillOpen = prev !== null && tabsForNewConversationRef.current.some((t) => t.id === prev);
+        systemLogger.info("[new-conversation] close", {
+          operation: "new_conversation_close",
+          tabId,
+          shownNow,
+          backTo: shownNow && prevStillOpen ? prev : null,
+        });
+        if (shownNow && prevStillOpen) {
+          // Whatever was showing before the pane opened comes back.
+          setActiveTabId(prev);
+          selectConversation(prev);
+          removeNewConversationTab(tabId, prev);
+          return;
+        }
+        newConversationPrevRef.current.delete(tabId);
+        doCloseTabRef.current(tabId);
+      },
+    }),
+    [realHostTree, isAdmin, adminKnown, openTab, removeNewConversationTab],
+  );
+
   // "Open beside conversation" in the agent window's Desktop tab: open the
   // desktop pane to the right of that agent's conversation pane. With no
   // split open, the shown conversation (if any) splits; otherwise the desktop
@@ -4002,38 +4316,7 @@ export function AppShell({
           onUserPrefsChanged={(delta) =>
             setUserPrefs((prev) => ({ ...prev, ...delta }))
           }
-          onCreateSession={(opts) => {
-            // opts is a discriminated union (see NewSessionDialog.tsx
-            // NewSessionOnCreateOpts):
-            //   identityMode: false → regular-session shape (sessionName optional)
-            //   identityMode: true  → identity-birth-success shape (sessionName = opts.name)
-            const host = opts.host;
-            // identity name doubles as tmux session name (Nelly mechanism)
-            const sessionName: string | undefined =
-              opts.identityMode === true ? opts.name : opts.sessionName;
-            const newTabId = openTab(host, "terminal", undefined, {
-              targetTmuxSession: sessionName ?? null,
-              label: sessionName ?? undefined,
-              // For identity-birth: backend already ran `tmux new-session -d -s <name>` at step 2
-              // and launched claude at step 3. Frontend attaches to existing session — do NOT
-              // create a new one (prevents race where frontend also tries to create and
-              // either fails "session already exists" or clobbers by creating a duplicate).
-              allowCreateTmux: opts.identityMode === false,
-            });
-            selectConversationDeferred(newTabId);
-            // When a split view is already up, slot the new agent into the
-            // currently-largest pane instead of hiding the whole arrangement
-            // behind the fullscreen active-tab render. No split — or a lone
-            // pane left over from closing one — falls through to the
-            // fullscreen behaviour, replacing the view.
-            const targetPath = splitTargetForOpen(splitTree);
-            if (targetPath !== null) {
-              openSessionInTree(newTabId, targetPath, "right");
-            }
-            if (isTouchDevice) navigateToView();
-            if (isMobile) setSidebarOpen(false);
-            sidebarPeek.close("item-opened");
-          }}
+          onNewConversation={(start, source) => openNewConversationRef.current(start, source)}
           onDetachedRowClick={(row) => {
             const host = row.host;
             if (!host) return;
@@ -4271,6 +4554,7 @@ export function AppShell({
   // mobile-view-only affordance.
 
   return (
+    <NewConversationHostContext.Provider value={newConversationHost}>
     <>
       <div
         className="flex w-screen bg-[color:var(--color-pv-base)]"
@@ -4614,7 +4898,8 @@ export function AppShell({
                   !types.includes("text/plain") &&
                   !types.includes("application/x-skynet-app-tile") &&
                   !types.includes(FILE_CHIP_MIME) &&
-                  !types.includes(DESKTOP_DRAG_MIME)
+                  !types.includes(DESKTOP_DRAG_MIME) &&
+                  !types.includes(NEW_CONVERSATION_DRAG_MIME)
                 )
                   return;
                 if (types.includes("Files")) return;
@@ -4687,7 +4972,8 @@ export function AppShell({
                   !types.includes("text/plain") &&
                   !types.includes("application/x-skynet-app-tile") &&
                   !types.includes(FILE_CHIP_MIME) &&
-                  !types.includes(DESKTOP_DRAG_MIME)
+                  !types.includes(DESKTOP_DRAG_MIME) &&
+                  !types.includes(NEW_CONVERSATION_DRAG_MIME)
                 )
                   return;
                 const rect = e.currentTarget.getBoundingClientRect();
@@ -4729,7 +5015,8 @@ export function AppShell({
                   !types.includes("text/plain") &&
                   !types.includes("application/x-skynet-app-tile") &&
                   !types.includes(FILE_CHIP_MIME) &&
-                  !types.includes(DESKTOP_DRAG_MIME)
+                  !types.includes(DESKTOP_DRAG_MIME) &&
+                  !types.includes(NEW_CONVERSATION_DRAG_MIME)
                 )
                   return;
                 if (types.includes("Files")) return;
@@ -4859,6 +5146,29 @@ export function AppShell({
                     operation: "pv_split_drop_outer_file_chip",
                     host: fileChip.host,
                     filename: fileChip.filename,
+                    edge,
+                    activeIsSession,
+                  });
+                  setSplitTree(() => {
+                    const droppedLeaf = { kind: "session" as const, tabId: newTabId };
+                    if (!activeIsSession || activeTab == null) return droppedLeaf;
+                    const activeLeaf = { kind: "session" as const, tabId: activeTab.id };
+                    return insertAtEdge(activeLeaf, [], droppedLeaf, edge);
+                  });
+                  selectConversationDeferred(newTabId);
+                  setFocusedTabId(newTabId);
+                  return;
+                }
+                // Pencil branch — same shape as the desktop branch: split the
+                // shown conversation at the nearest edge, else fill the area.
+                if (hasNewConversationDragMime(e.dataTransfer)) {
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  const edge = computeNearestEdge(rect, e.clientX, e.clientY);
+                  const activeTab = tabs.find((t) => t.id === activeTabId);
+                  const activeIsSession = isSplittableActiveTab(activeTab, identitiesByKey);
+                  const newTabId = openNewConversationTab({});
+                  systemLogger.info("pv-split-drop outer new-conversation dispatch", {
+                    operation: "pv_split_drop_outer_new_conversation",
                     edge,
                     activeIsSession,
                   });
@@ -5134,6 +5444,8 @@ export function AppShell({
                     onCenterDropFileChip={onCenterDropFileChip}
                     onDropDesktopInTree={onDropDesktopInTree}
                     onCenterDropDesktop={onCenterDropDesktop}
+                    onDropNewConversationInTree={onDropNewConversationInTree}
+                    onCenterDropNewConversation={onCenterDropNewConversation}
                     onSwapInTree={swapInTree}
                     onDropBadgeInTree={(payload, path, edge) =>
                       onDropBadgeInTree(
@@ -5328,5 +5640,6 @@ export function AppShell({
       <WhatsNewModal username={username} />
       <RequestedSkillsEditor hostTree={realHostTree} />
     </>
+    </NewConversationHostContext.Provider>
   );
 }

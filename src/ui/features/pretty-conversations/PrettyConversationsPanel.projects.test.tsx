@@ -117,7 +117,7 @@ vi.mock("@/features/terminal/session-hue", () => ({
     name ? name.toLowerCase() : null,
 }));
 
-const refreshIdentitiesSpy = vi.fn(async () => true);
+const refreshIdentitiesSpy = vi.fn(async (_extra?: Record<string, number>) => true);
 
 // Pin is offered only on identity rows; pin tests seed the identity here.
 let mockIdentitiesByKey = new Map<string, { identityKey: string }>();
@@ -392,88 +392,6 @@ vi.mock("@/features/pretty-view/roles-window/RolesWindow", () => ({
   RolesWindow: () => null,
 }));
 
-// Phase 117 M-F: NewSessionDialog stub — exposes buttons that fire onCreate
-// with controlled opts so tests can observe the panel's setSessionProject
-// wire without SSE / birth plumbing. Only renders when open=true. The
-// synthetic-fire buttons carry testids that map 1:1 to the two
-// NewSessionOnCreateOpts variants (identityMode false / true).
-vi.mock("@/sidebar/NewSessionDialog", () => ({
-  NewSessionDialog: (props: {
-    open: boolean;
-    onCreate: (opts: unknown) => void;
-    onClose: () => void;
-    // M-I: expose the incoming hostTree to tests so they can assert the
-    // panel-side filter (single-host tree in project context).
-    hostTree: { name: string; children: unknown[] } | null;
-  }) => {
-    if (!props.open) return null;
-    // Count top-level hosts (folders skipped for simplicity — the panel
-    // passes a flat single-host list in project context, not a nested tree).
-    const treeChildCount = props.hostTree?.children?.length ?? 0;
-    const host = {
-      id: "1",
-      name: "hostA",
-      username: "u",
-      ip: "1.1.1.1",
-      port: 22,
-      folder: "",
-      online: true,
-      cpu: null,
-      ram: null,
-      lastAccess: "",
-      authType: "password",
-      enableTerminal: true,
-      enableTunnel: false,
-      serverTunnels: [],
-      enableFileManager: false,
-      enableDocker: false,
-      enableSsh: true,
-      enableRdp: false,
-      canHostAgents: true,
-      pin: "",
-      protocol: "ssh",
-      publicKey: "",
-      externalUrl: "",
-      description: "",
-      isPublic: false,
-      autostart: false,
-      autostartTimeout: 60,
-    };
-    return (
-      <div
-        data-testid="pv-mock-new-session-dialog"
-        data-hosttree-child-count={String(treeChildCount)}
-      >
-        <button
-          data-testid="pv-mock-nsd-fire-birth"
-          onClick={() =>
-            props.onCreate({
-              host,
-              identityMode: true,
-              name: "wren",
-              path: "/home/u",
-            })
-          }
-        >
-          fire birth
-        </button>
-        <button
-          data-testid="pv-mock-nsd-fire-plain"
-          onClick={() =>
-            props.onCreate({
-              host,
-              identityMode: false,
-              path: "/home/u",
-            })
-          }
-        >
-          fire plain
-        </button>
-      </div>
-    );
-  },
-}));
-
 vi.mock("@/api/global-files-api", () => ({
   listGlobalFiles: vi.fn().mockResolvedValue([]),
   readGlobalFile: vi.fn().mockResolvedValue({ content: "", mtime: 0, size: 0 }),
@@ -636,7 +554,7 @@ describe("PrettyConversationsPanel: projects zone position (D-09)", () => {
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -689,7 +607,7 @@ describe("PrettyConversationsPanel: 'Projects' super-header", () => {
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -716,7 +634,7 @@ describe("PrettyConversationsPanel: 'Projects' super-header new-project button",
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -743,7 +661,7 @@ describe("PrettyConversationsPanel: 'Projects' super-header collapse", () => {
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -810,7 +728,7 @@ describe("PrettyConversationsPanel: empty projects visible (D-11)", () => {
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -850,7 +768,7 @@ describe("PrettyConversationsPanel: collapse state (D-13)", () => {
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -884,7 +802,7 @@ describe("PrettyConversationsPanel: collapse state (D-13)", () => {
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -923,7 +841,7 @@ describe("PrettyConversationsPanel: create-project header button", () => {
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -956,7 +874,7 @@ describe("PrettyConversationsPanel: project drop (identity row)", () => {
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -1002,7 +920,7 @@ describe("PrettyConversationsPanel: project drop (relay-room row)", () => {
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -1060,7 +978,7 @@ describe("PrettyConversationsPanel: flat-middle clear-project (D-22 gesture #2)"
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -1108,7 +1026,7 @@ describe("PrettyConversationsPanel: flat-middle no-op on unassigned", () => {
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -1154,7 +1072,7 @@ describe("PrettyConversationsPanel: RDP drop refused (D-08)", () => {
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -1185,7 +1103,7 @@ describe("PrettyConversationsPanel: CreateProjectModal wire (117-09 Task 1)", ()
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -1221,7 +1139,7 @@ describe("PrettyConversationsPanel: pin-drop on Pinned zone", () => {
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -1259,7 +1177,7 @@ describe("PrettyConversationsPanel: pin-drop on Pinned zone", () => {
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -1294,7 +1212,7 @@ describe("PrettyConversationsPanel: pin-drop on Pinned zone", () => {
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -1323,7 +1241,7 @@ describe("PrettyConversationsPanel: pin-drop on Pinned zone", () => {
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -1345,7 +1263,7 @@ describe("PrettyConversationsPanel: pin-drop on Pinned zone", () => {
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -1381,7 +1299,7 @@ describe("PrettyConversationsPanel: unpin-drop on flat middle", () => {
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -1431,7 +1349,7 @@ describe("PrettyConversationsPanel: unpin-drop on flat middle", () => {
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -1475,7 +1393,7 @@ describe("PrettyConversationsPanel: unpin-drop on flat middle", () => {
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -1514,7 +1432,7 @@ describe("PrettyConversationsPanel: unpin-drop on flat middle", () => {
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -1578,7 +1496,7 @@ describe("PrettyConversationsPanel: archive-project cascade (117-09 Task 2)", ()
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -1622,7 +1540,7 @@ describe("PrettyConversationsPanel: archive-project cascade (117-09 Task 2)", ()
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -1660,7 +1578,7 @@ describe("PrettyConversationsPanel: archive-project cascade (117-09 Task 2)", ()
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -1698,7 +1616,7 @@ describe("PrettyConversationsPanel: archive-project cascade (117-09 Task 2)", ()
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={onDeactivateRow}
       />,
     );
@@ -1729,7 +1647,7 @@ describe("PrettyConversationsPanel: archive-project cascade (117-09 Task 2)", ()
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -1771,7 +1689,7 @@ describe("PrettyConversationsPanel: archive-project cascade (117-09 Task 2)", ()
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -1817,7 +1735,7 @@ describe("PrettyConversationsPanel: archive-project cascade (117-09 Task 2)", ()
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -1860,7 +1778,7 @@ describe("PrettyConversationsPanel: archive-project cascade (117-09 Task 2)", ()
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -1894,7 +1812,7 @@ describe("PrettyConversationsPanel: archive-project cascade (117-09 Task 2)", ()
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -1921,7 +1839,7 @@ describe("PrettyConversationsPanel: archive-project cascade (117-09 Task 2)", ()
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -1962,7 +1880,7 @@ describe("PrettyConversationsPanel: archive-project cascade (117-09 Task 2)", ()
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -1998,7 +1916,7 @@ describe("PrettyConversationsPanel: archive-project cascade (117-09 Task 2)", ()
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -2028,7 +1946,7 @@ describe("PrettyConversationsPanel: archive-project cascade (117-09 Task 2)", ()
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -2057,7 +1975,7 @@ describe("PrettyConversationsPanel: archive-project cascade (117-09 Task 2)", ()
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -2097,7 +2015,7 @@ describe("PrettyConversationsPanel: archive-project cascade (117-09 Task 2)", ()
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -2123,7 +2041,7 @@ describe("PrettyConversationsPanel: archive-project cascade (117-09 Task 2)", ()
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -2179,28 +2097,29 @@ describe("rewriteDisplayNameInFrontmatter", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// A9 Test 9 (Task 2 panel wiring, revised M-F 2026-09-18) — SquarePen opens
-// the NEW-AGENT dialog (NewSessionDialog) with a pending project slug, and
-// the freshly-born identity gets setSessionProject called after onCreate.
-// The pre-M-F wire (opening NewConversationModal for a relay-room-in-project)
-// is retired — the relay-room wrapper's data attribute MUST NOT be set from
-// this button.
+// A9 Test 9 — a project's "New conversation in this project" asks AppShell for
+// a new-conversation pane born into that project, on the project's machine
+// (onNewConversation(start, "project")). The pane narrows its machine list to
+// the project's machine and sends the project in the birth request, so the
+// panel no longer tags the newborn itself (setSessionProject) — those wires
+// are the pane's now.
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe("PrettyConversationsPanel: new-conversation-in-project wire (M-F rewire)", () => {
-  it("Test 9: kebab 'New conversation in this project' sets pending project slug on the new-session wrapper", async () => {
+describe("PrettyConversationsPanel: new-conversation-in-project wire", () => {
+  it("Test 9: kebab 'New conversation in this project' calls onNewConversation with the project and its machine", async () => {
     setSnapshot({
       projectSections: [{ slug: "alpha", displayName: "Alpha", rows: [] }],
     });
     mockProjects = [
       { slug: "alpha", displayName: "Alpha", hostId: "1", hostname: "hostA", archived: false },
     ];
+    const onNewConversation = vi.fn();
 
     const { container } = render(
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={onNewConversation}
         onDeactivateRow={() => {}}
       />,
     );
@@ -2208,156 +2127,36 @@ describe("PrettyConversationsPanel: new-conversation-in-project wire (M-F rewire
     expect(kebabTrigger).not.toBeNull();
     await openProjectKebabAndClickItem(container, "alpha", "New conversation in this project");
 
-    // NEW wire: the pending slug lands on the new-session dialog wrapper.
-    const nsdWrapper = container.querySelector('[data-testid="pv-new-session-dialog-wrapper"]');
-    expect(nsdWrapper).not.toBeNull();
-    expect(nsdWrapper!.getAttribute("data-pending-project-slug")).toBe("alpha");
-
-  });
-
-  it("Test 9b: identity-birth onCreate fires setSessionProject(hostId, newborn identityKey, slug)", async () => {
-    setSnapshot({
-      projectSections: [{ slug: "alpha", displayName: "Alpha", rows: [] }],
-    });
-    mockProjects = [
-      { slug: "alpha", displayName: "Alpha", hostId: "1", hostname: "hostA", archived: false },
-    ];
-
-    const { container } = render(
-      <PrettyConversationsPanel isAdmin
-        variant="desktop"
-        hostTree={HOST_TREE}
-        onCreateSession={() => {}}
-        onDeactivateRow={() => {}}
-      />,
-    );
-    await openProjectKebabAndClickItem(container, "alpha", "New conversation in this project");
-
-    // The mocked NewSessionDialog exposes a "fire birth" button that
-    // synthesizes onCreate({identityMode:true, name:"wren", host:{id:"1"}, ...}).
-    const fireBirth = container.querySelector('[data-testid="pv-mock-nsd-fire-birth"]') as HTMLElement;
-    expect(fireBirth).not.toBeNull();
-    fireEvent.click(fireBirth);
-
-    // setSessionProject fired with the newborn identity's name + section slug.
-    expect(setSessionProjectSpy).toHaveBeenCalledTimes(1);
-    expect(setSessionProjectSpy).toHaveBeenCalledWith(1, "wren", "alpha");
-
-    // The pending slug is cleared after onCreate; the wrapper's data-attr
-    // reflects the reset.
-    const nsdWrapper = container.querySelector('[data-testid="pv-new-session-dialog-wrapper"]');
-    expect(nsdWrapper!.getAttribute("data-pending-project-slug")).toBe("");
-  });
-
-  it("Test 9d: identityMode=false (plain tmux session, no identity) does NOT fire setSessionProject", async () => {
-    setSnapshot({
-      projectSections: [{ slug: "alpha", displayName: "Alpha", rows: [] }],
-    });
-    mockProjects = [
-      { slug: "alpha", displayName: "Alpha", hostId: "1", hostname: "hostA", archived: false },
-    ];
-
-    const { container } = render(
-      <PrettyConversationsPanel isAdmin
-        variant="desktop"
-        hostTree={HOST_TREE}
-        onCreateSession={() => {}}
-        onDeactivateRow={() => {}}
-      />,
-    );
-    await openProjectKebabAndClickItem(container, "alpha", "New conversation in this project");
-    fireEvent.click(container.querySelector('[data-testid="pv-mock-nsd-fire-plain"]') as HTMLElement);
-
-    // Plain tmux session has no identity to tag; the write must be skipped.
+    expect(onNewConversation).toHaveBeenCalledTimes(1);
+    expect(onNewConversation).toHaveBeenCalledWith({ project: { slug: "alpha", hostId: 1 }, hostId: 1 }, "project");
+    // The panel no longer tags the newborn — the birth request carries the project.
     expect(setSessionProjectSpy).not.toHaveBeenCalled();
   });
 
-  // ─── M-H: refreshIdentities chains after setSessionProject ────────────────
-  it("Test 9e (M-H): birth path chains refreshIdentities({key: hostId}) after setSessionProject resolves", async () => {
+  it("Test 9g: in a multi-host fleet the start names the project's own machine (the pane narrows to it)", async () => {
     setSnapshot({
       projectSections: [{ slug: "alpha", displayName: "Alpha", rows: [] }],
     });
     mockProjects = [
-      { slug: "alpha", displayName: "Alpha", hostId: "1", hostname: "hostA", archived: false },
-    ];
-
-    const { container } = render(
-      <PrettyConversationsPanel isAdmin
-        variant="desktop"
-        hostTree={HOST_TREE}
-        onCreateSession={() => {}}
-        onDeactivateRow={() => {}}
-      />,
-    );
-    await openProjectKebabAndClickItem(container, "alpha", "New conversation in this project");
-    fireEvent.click(container.querySelector('[data-testid="pv-mock-nsd-fire-birth"]') as HTMLElement);
-
-    // Flush the setSessionProject().then(refreshIdentities) microtask chain.
-    await Promise.resolve();
-    await Promise.resolve();
-
-    expect(refreshIdentitiesSpy).toHaveBeenCalledTimes(1);
-    // Extra-map names the newborn identity + its host so the backend fanout
-    // is guaranteed to include the target host in the identityHosts wire
-    // parameter (birth flow's own precedent — NewSessionDialog:832).
-    expect(refreshIdentitiesSpy).toHaveBeenCalledWith({ wren: 1 });
-  });
-
-  it("Test 9f (M-H): plain path does NOT trigger refreshIdentities (no identity to refresh)", async () => {
-    setSnapshot({
-      projectSections: [{ slug: "alpha", displayName: "Alpha", rows: [] }],
-    });
-    mockProjects = [
-      { slug: "alpha", displayName: "Alpha", hostId: "1", hostname: "hostA", archived: false },
-    ];
-
-    const { container } = render(
-      <PrettyConversationsPanel isAdmin
-        variant="desktop"
-        hostTree={HOST_TREE}
-        onCreateSession={() => {}}
-        onDeactivateRow={() => {}}
-      />,
-    );
-    await openProjectKebabAndClickItem(container, "alpha", "New conversation in this project");
-    fireEvent.click(container.querySelector('[data-testid="pv-mock-nsd-fire-plain"]') as HTMLElement);
-
-    await Promise.resolve();
-    await Promise.resolve();
-
-    // No project write happened (Test 9d), so no refresh either.
-    expect(refreshIdentitiesSpy).not.toHaveBeenCalled();
-  });
-
-  // ─── M-I: host tree filtered to project's host in project context ─────────
-  it("Test 9g (M-I): opening dialog via kebab 'New conversation in this project' passes a SINGLE-host tree (picker auto-hides)", async () => {
-    // Simulate a multi-host fleet (2 hosts) so the picker would normally show.
-    setSnapshot({
-      projectSections: [{ slug: "alpha", displayName: "Alpha", rows: [] }],
-    });
-    mockProjects = [
-      { slug: "alpha", displayName: "Alpha", hostId: "1", hostname: "hostA", archived: false },
+      { slug: "alpha", displayName: "Alpha", hostId: "2", hostname: "hostB", archived: false },
     ];
     const multiHostTree: HostFolder = {
       name: "root",
       children: [makeHost("1", "hostA"), makeHost("2", "hostB")],
     };
+    const onNewConversation = vi.fn();
 
     const { container } = render(
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={multiHostTree}
-        onCreateSession={() => {}}
+        onNewConversation={onNewConversation}
         onDeactivateRow={() => {}}
       />,
     );
     await openProjectKebabAndClickItem(container, "alpha", "New conversation in this project");
 
-    // Panel-side filter: tree passed to NewSessionDialog carries only 1 child
-    // (the project's home host), regardless of the full fleet size.
-    const nsdMock = container.querySelector('[data-testid="pv-mock-new-session-dialog"]');
-    expect(nsdMock).not.toBeNull();
-    expect(nsdMock!.getAttribute("data-hosttree-child-count")).toBe("1");
+    expect(onNewConversation).toHaveBeenCalledWith({ project: { slug: "alpha", hostId: 2 }, hostId: 2 }, "project");
   });
 });
 
@@ -2384,7 +2183,7 @@ describe("PrettyConversationsPanel: project sections preserve selector order", (
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -2418,7 +2217,7 @@ describe("PrettyConversationsPanel: flat-middle section header (M-J)", () => {
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -2444,7 +2243,7 @@ describe("PrettyConversationsPanel: flat-middle section header (M-J)", () => {
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -2508,7 +2307,7 @@ describe("PrettyConversationsPanel: Move-to host filtering", () => {
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE_MULTI}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -2564,7 +2363,7 @@ describe("PrettyConversationsPanel: Move-to host filtering", () => {
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE_MULTI}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -2614,7 +2413,7 @@ describe("PrettyConversationsPanel: Move-to host filtering", () => {
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE_MULTI}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -2671,7 +2470,7 @@ describe("PrettyConversationsPanel: Move-to host filtering", () => {
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE_MULTI}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -2721,7 +2520,7 @@ describe("PrettyConversationsPanel: Move to → New project…", () => {
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE_MULTI}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -2777,7 +2576,7 @@ describe("PrettyConversationsPanel: Move to → New project…", () => {
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE_MULTI}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -2837,7 +2636,7 @@ describe("PrettyConversationsPanel: pinned and in-a-project are exclusive (Move-
     });
     mockProjects = [{ slug: "alpha", displayName: "Alpha", hostId: "1", hostname: "hostA", archived: false }];
     const { container } = render(
-      <PrettyConversationsPanel isAdmin variant="desktop" hostTree={HOST_TREE_ONE} onCreateSession={() => {}} onDeactivateRow={() => {}} />,
+      <PrettyConversationsPanel isAdmin variant="desktop" hostTree={HOST_TREE_ONE} onNewConversation={() => {}} onDeactivateRow={() => {}} />,
     );
     await openMoveTo(container, "id-row-a");
     await userEvent.setup().click(screen.getByRole("menuitem", { name: /^Remove from project$/ }));
@@ -2858,7 +2657,7 @@ describe("PrettyConversationsPanel: pinned and in-a-project are exclusive (Move-
     mockProjects = [{ slug: "alpha", displayName: "Alpha", hostId: "1", hostname: "hostA", archived: false }];
     setSessionProjectSpy.mockRejectedValueOnce(new Error("500"));
     const { container } = render(
-      <PrettyConversationsPanel isAdmin variant="desktop" hostTree={HOST_TREE_ONE} onCreateSession={() => {}} onDeactivateRow={() => {}} />,
+      <PrettyConversationsPanel isAdmin variant="desktop" hostTree={HOST_TREE_ONE} onNewConversation={() => {}} onDeactivateRow={() => {}} />,
     );
     await openMoveTo(container, "id-row-a");
     await userEvent.setup().click(screen.getByRole("menuitem", { name: /^Alpha$/ }));
@@ -2922,7 +2721,7 @@ describe("PrettyConversationsPanel: badge drops file the conversation", () => {
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -3002,7 +2801,7 @@ describe("PrettyConversationsPanel: unread marks show through collapsed headers"
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -3070,7 +2869,7 @@ describe("PrettyConversationsPanel: DM marks", () => {
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -3130,7 +2929,7 @@ describe("PrettyConversationsPanel (shape-sidebar): section headings", () => {
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );
@@ -3215,7 +3014,7 @@ describe("PrettyConversationsPanel: pinning relay rooms", () => {
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
-        onCreateSession={() => {}}
+        onNewConversation={() => {}}
         onDeactivateRow={() => {}}
       />,
     );

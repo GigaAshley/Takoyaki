@@ -6,6 +6,7 @@ import {
   FileText,
   LayoutDashboard,
   Monitor,
+  SquarePen,
   Terminal,
 } from "lucide-react";
 import { CommandHistoryProvider } from "@/features/terminal/command-history/CommandHistoryContext";
@@ -36,7 +37,7 @@ import type {
 import { PrettyView } from "@/features/pretty-view/PrettyView";
 import type { Tab, TabType, Host } from "@/types/ui-types";
 import { ArchivedConversationPane } from "@/features/archived-view/ArchivedConversationPane";
-import { isAppTab, isDesktopTab, isFileTab } from "@/types/ui-types";
+import { isAppTab, isDesktopTab, isFileTab, isNewConversationTab } from "@/types/ui-types";
 import type { SSHHost } from "@/types";
 // Phase 137 Plan 03 (D-16): UserPreferences threaded to PrettyView for the
 // fallbackVoice speak-flow resolution chain.
@@ -46,6 +47,7 @@ import { useIdentities } from "@/state/identities-store";
 import { sessionMatchKey } from "@/features/terminal/session-hue";
 import { AppPane } from "./AppPane";
 import { DesktopPane } from "./DesktopPane";
+import { NewConversationPane } from "@/features/new-conversation/NewConversationPane";
 import { FilePane } from "./FilePane";
 import { RemotePane } from "./RemotePane";
 import { useRelayRoomPaneMenu } from "./relay-room-pane-menu";
@@ -106,6 +108,7 @@ export const TAB_ICONS: Record<TabType, React.ElementType> = {
   app: AppWindow,
   file: FileText,
   desktop: Monitor,
+  "new-conversation": SquarePen,
 };
 
 export function tabIcon(type: TabType) {
@@ -540,6 +543,22 @@ const renderDesktopTab: Renderer = (tab, deps) => {
   );
 };
 
+// New-conversation leaf: a conversation that hasn't started yet. Keyed by
+// its seed so picks set from outside (a project or role entry, a return from
+// the roles window) start the form over.
+const renderNewConversationTab: Renderer = (tab, deps) => {
+  if (!isNewConversationTab(tab)) return null;
+  return (
+    <NewConversationPane
+      key={tab.newConversationSeed ?? 0}
+      tabId={tab.id}
+      picks={tab.newConversation}
+      isVisible={deps.isVisible}
+      onSelectPane={deps.onSelectPane}
+    />
+  );
+};
+
 // Record<TabType, Renderer> — compile-time exhaustive. Three explicit rows
 // for rdp/vnc/telnet all pointing at the same helper (D-04 cleanup replaces
 // the switch-fall-through). The `app` entry is appended (matches the
@@ -553,6 +572,7 @@ export const RENDERERS: Record<TabType, Renderer> = {
   app: renderAppTab,
   file: renderFileTab,
   desktop: renderDesktopTab,
+  "new-conversation": renderNewConversationTab,
 };
 
 export function renderTabContent(

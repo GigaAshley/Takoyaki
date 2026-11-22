@@ -43,7 +43,8 @@
 // auth-flow replaceState can strip it — sessionStorage is per-Chrome-tab.
 // AppShell consumes it after tabs are restored, then clears it.
 
-import type { TabType } from "@/types/ui-types";
+import type { NewConversationPicks, TabType } from "@/types/ui-types";
+import { picksFromWire, picksToWire } from "./new-conversation-picks";
 import { isValidFileAddress } from "@/features/pretty-view/file-url";
 
 export const PENDING_TAB_STORAGE_KEY = "skynet_pending_tab";
@@ -125,6 +126,22 @@ export type TabSpec =
       identityKey?: never;
     }
   | {
+      // New-conversation leaf: a conversation that hasn't started yet, with
+      // its picks so far. Wire form `new:<base64url of the picks' JSON>`
+      // (see new-conversation-picks.ts); `new:` alone is a fresh pane.
+      protocol: "new";
+      picks: NewConversationPicks;
+      host?: never;
+      session?: never;
+      roomId?: never;
+      hostId?: never;
+      slug?: never;
+      fileHost?: never;
+      path?: never;
+      origin?: never;
+      identityKey?: never;
+    }
+  | {
       // Desktop leaf: an agent's virtual desktop. hostId is stringified at
       // the URL boundary like the app variant's; identityKey matches the
       // backend's IDENTITY_KEY_RE. Wire form `desktop:<hostId>:<identity>`.
@@ -175,6 +192,7 @@ const PROTOCOLS: TabSpec["protocol"][] = [
   "app", // Phase 120 D-16 — app-leaf URL-fragment variant
   "file",
   "desktop",
+  "new",
 ];
 
 // App leaf identity shape (MEDIUM-7). Shared with the cross-window app-bar
@@ -320,6 +338,19 @@ export function parseTabParam(raw: string | null): TabSpec | null {
     if (!APP_SLUG_RE.test(slug)) return null;
     return { protocol: "app", hostId, slug };
   }
+  // New-conversation variant — `new:` (fresh) or `new:<base64url JSON>`.
+  // Picks that don't check out are dropped one by one; a payload that isn't
+  // JSON at all still restores the pane, just fresh.
+  if (protocol === "new") {
+    if (rest === "") return { protocol: "new", picks: {} };
+    try {
+      return { protocol: "new", picks: picksFromWire(JSON.parse(base64UrlDecode(rest))) };
+    } catch {
+      // eslint-disable-next-line no-console
+      console.info({ operation: "parse_tab_param_new_malformed", restLen: rest.length });
+      return { protocol: "new", picks: {} };
+    }
+  }
   // Desktop variant — `desktop:<hostId>:<identity>`. Same shape gates as
   // the app variant; anything malformed drops the tab.
   if (protocol === "desktop") {
@@ -401,6 +432,10 @@ export function encodeTabSpec(spec: TabSpec): string {
   if (spec.protocol === "desktop") {
     return `desktop:${spec.hostId}:${spec.identityKey}`;
   }
+  if (spec.protocol === "new") {
+    const wire = picksToWire(spec.picks);
+    return Object.keys(wire).length === 0 ? "new:" : `new:${base64UrlEncode(JSON.stringify(wire))}`;
+  }
   if (spec.protocol === "file") {
     const parts = spec.origin ? [spec.fileHost, spec.path, spec.origin] : [spec.fileHost, spec.path];
     return `file:${base64UrlEncode(JSON.stringify(parts))}`;
@@ -462,6 +497,8 @@ export function specForTab(input: {
   file?: { host: string; path: string; origin?: string | null };
   // Desktop leaf — mirrors `Tab.desktop`; present ONLY when input.type === "desktop".
   desktop?: { hostId: number; identityKey: string };
+  // New-conversation leaf — mirrors `Tab.newConversation`.
+  newConversation?: NewConversationPicks;
 }): TabSpec | null {
   // Phase 97 Plan 05: relay-room tabs surface via sessionKind + relayRoomId.
   // MUST come before the host-required check — relay tabs have no host.
@@ -492,6 +529,9 @@ export function specForTab(input: {
           origin: input.file.origin,
         }
       : { protocol: "file", fileHost: input.file.host, path: input.file.path };
+  }
+  if (input.type === "new-conversation") {
+    return { protocol: "new", picks: input.newConversation ?? {} };
   }
   if (input.type === "desktop") {
     if (!input.desktop) return null;

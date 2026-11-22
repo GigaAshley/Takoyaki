@@ -541,15 +541,15 @@ describe("Phase 120 D-21 — renderTabContent dispatch (six-arm Record<TabType, 
     // slide because the removed key satisfies the union — it doesn't, but
     // this test makes the intent explicit anyway).
     const expectedArms: Array<
-      "dashboard" | "terminal" | "rdp" | "vnc" | "telnet" | "app" | "file" | "desktop"
-    > = ["dashboard", "terminal", "rdp", "vnc", "telnet", "app", "file", "desktop"];
+      "dashboard" | "terminal" | "rdp" | "vnc" | "telnet" | "app" | "file" | "desktop" | "new-conversation"
+    > = ["dashboard", "terminal", "rdp", "vnc", "telnet", "app", "file", "desktop", "new-conversation"];
     const iconKeys = Object.keys(TAB_ICONS).sort();
     const rendererKeys = Object.keys(RENDERERS).sort();
     const expected = [...expectedArms].sort();
     expect(iconKeys).toEqual(expected);
     expect(rendererKeys).toEqual(expected);
     // Belt-and-suspenders: cardinality assertion.
-    expect(Object.keys(TAB_ICONS).length).toBe(8);
-    expect(Object.keys(RENDERERS).length).toBe(8);
+    expect(Object.keys(TAB_ICONS).length).toBe(9);
+    expect(Object.keys(RENDERERS).length).toBe(9);
   });
 });

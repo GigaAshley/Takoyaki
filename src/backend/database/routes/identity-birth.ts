@@ -124,6 +124,40 @@ const MAX_EXTRA_ROLES = 16;
 // orchestrator's "identity already exists on this host" error.
 import { derivePrettyNameSlug } from "../../utils/pretty-name-slug.js";
 import { getFleetNameCensus } from "../../pool/fleet-name-census.js";
+import { dropIdentityInboxMessage } from "../../claude-session/per-identity-file.js";
+import { blockedCommandIn } from "../../../types/blocked-commands.js";
+
+/** A first message bigger than this is refused (the inbox takes up to 1 MB). */
+const FIRST_MESSAGE_MAX_BYTES = 256 * 1024;
+
+/**
+ * Hand a new conversation's first message to its newborn agent, through the
+ * agent's inbox: the supervisor pastes it into the agent's session as the
+ * user's own words. Runs on the server as soon as the agent's folder is
+ * committed, so a closed tab, a reload or a slow start can't lose it.
+ * Fire-and-forget — a failure here is logged, not surfaced.
+ */
+function deliverFirstMessage(hostId: number, userId: string, identityName: string, body: string): void {
+  void withHost(hostId, userId, (conn) => dropIdentityInboxMessage(identityName, body, { hostId, conn }))
+    .then((file) => {
+      sshLogger.info("identity-birth: first message dropped in the newborn's inbox", {
+        operation: "identity_birth_first_message_delivered",
+        hostId,
+        identityName,
+        file,
+        bodyLen: body.length,
+      });
+    })
+    .catch((err: unknown) => {
+      sshLogger.warn("identity-birth: couldn't deliver the first message", {
+        operation: "identity_birth_first_message_failed",
+        hostId,
+        identityName,
+        bodyLen: body.length,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+}
 
 // ---------------------------------------------------------------------------
 // Local exec helper (child_process.exec promisified)
@@ -369,6 +403,7 @@ router.post(
       task,
       poolPicked,
       project,
+      firstMessage,
     } = bodyAny;
 
     if (
@@ -615,6 +650,30 @@ router.post(
       typeof project === "string" && /^[a-z0-9-]{1,64}$/.test(project.trim())
         ? project.trim()
         : undefined;
+
+    // Optional first message — what the user typed in the new conversation's
+    // compose box. Dropped into the newborn's inbox once it exists, so it
+    // arrives as the user's own message. Typed text, so Skynet's blocked
+    // commands are refused here the same as in a conversation's text area.
+    let parsedFirstMessage: string | undefined;
+    if (firstMessage !== undefined && firstMessage !== null) {
+      if (typeof firstMessage !== "string" || Buffer.byteLength(firstMessage, "utf-8") > FIRST_MESSAGE_MAX_BYTES) {
+        res.status(400).json({ error: "firstMessage must be a string of at most 256 KB" });
+        return;
+      }
+      const blocked = blockedCommandIn(firstMessage);
+      if (blocked !== null) {
+        sshLogger.info("identity-birth: first message refused (blocked command)", {
+          operation: "identity_birth_first_message_refused",
+          hostId,
+          command: blocked,
+        });
+        res.status(400).json({ error: "That command can't be sent from here." });
+        return;
+      }
+      if (firstMessage.trim() !== "") parsedFirstMessage = firstMessage.replace(/\r\n?/g, "\n");
+    }
+    const firstMessageForInbox = parsedFirstMessage;
 
     // -----------------------------------------------------------------------
     // Pretty-names shape (2026-10-01): auto-suffix the identity slug for the
@@ -872,6 +931,12 @@ router.post(
       // §"What would make it wrong" bullet 7.
       discoverIdentitySessionFile: (conn, identityName) =>
         discoverIdentitySessionFile(conn, identityName),
+      // The first message goes in as soon as the agent's folder exists — not
+      // on the success event, which a closed tab or a supervisor-wait
+      // timeout never sends. The inbox holds it until the agent is up.
+      ...(firstMessageForInbox !== undefined
+        ? { onCommitted: (name: string) => deliverFirstMessage(hostId, userId, name, firstMessageForInbox) }
+        : {}),
     };
 
     // -----------------------------------------------------------------------

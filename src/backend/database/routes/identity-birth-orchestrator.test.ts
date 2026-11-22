@@ -508,6 +508,39 @@ describe("rollback on failure", () => {
     expect(deactivateMock).toHaveBeenCalledWith("@testkey:synapse.example.com");
   });
 
+  it("onCommitted fires once, with the folder name, after the peer commit — before the supervisor wait", async () => {
+    const { events, emit } = collectEvents();
+    const onCommitted = vi.fn(() => {
+      // Nothing has ended yet when the folder is committed.
+      expect(events.some((e) => e.type === "ended")).toBe(false);
+    });
+    const deps = makeDeps({ onCommitted });
+    const birthPromise = birthIdentity(makeOpts(), emit, deps);
+    await vi.runAllTimersAsync();
+    await birthPromise;
+    expect(onCommitted).toHaveBeenCalledTimes(1);
+    expect(onCommitted).toHaveBeenCalledWith("testkey");
+  });
+
+  it("onCommitted does not fire when the peer commit fails, and a throwing hook doesn't fail the birth", async () => {
+    const failed = vi.fn();
+    mockExecCommand.mockRejectedValueOnce(new Error("peer_commit_mv_failed"));
+    const first = birthIdentity(makeOpts(), collectEvents().emit, makeDeps({ onCommitted: failed }));
+    await vi.runAllTimersAsync();
+    await first;
+    expect(failed).not.toHaveBeenCalled();
+
+    const { events, emit } = collectEvents();
+    const throwing = vi.fn(() => {
+      throw new Error("boom");
+    });
+    const second = birthIdentity(makeOpts(), emit, makeDeps({ onCommitted: throwing }));
+    await vi.runAllTimersAsync();
+    await second;
+    expect(throwing).toHaveBeenCalledTimes(1);
+    expect(events.find((e) => e.type === "ended")).toEqual(expect.objectContaining({ ok: true }));
+  });
+
   it("Step 8 peer-commit SUCCESS → matrixDeactivateUser NOT called", async () => {
     const { emit } = collectEvents();
     const deactivateMock = vi.fn().mockResolvedValue({ ok: true });

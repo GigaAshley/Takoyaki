@@ -40,6 +40,9 @@ export interface BadgeDragSource {
     relayRoomId?: string;
     relayRoomTitle?: string | null;
     targetTmuxSession?: string | null;
+    /** New-conversation pane: its picks in wire form (new-conversation-picks). */
+    newConversation?: object;
+    label?: string | null;
   } | null;
 }
 

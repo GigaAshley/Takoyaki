@@ -51,6 +51,7 @@ import {
   parseDesktopDragPayload,
   type DesktopDragPayload,
 } from "./desktop-drag";
+import { NEW_CONVERSATION_DRAG_MIME, hasNewConversationDragMime } from "./new-conversation-drag";
 
 /**
  * Phase 57 Plan 02 — overlay geometry helper. Given the current pane's
@@ -625,7 +626,8 @@ export function hasSkynetDragPayload(dt: DataTransfer | null | undefined): boole
     (dt?.types.includes("application/x-skynet-row") ?? false) ||
     (dt?.types.includes("application/x-skynet-app-tile") ?? false) ||
     (dt?.types.includes(FILE_CHIP_MIME) ?? false) ||
-    (dt?.types.includes(DESKTOP_DRAG_MIME) ?? false)
+    (dt?.types.includes(DESKTOP_DRAG_MIME) ?? false) ||
+    (dt?.types.includes(NEW_CONVERSATION_DRAG_MIME) ?? false)
   );
 }
 
@@ -645,11 +647,13 @@ const Pane = memo(function Pane({
   onDropAppTileInTree,
   onDropFileChipInTree,
   onDropDesktopInTree,
+  onDropNewConversationInTree,
   onReplaceInTree,
   onCenterDropRow,
   onCenterDropAppTile,
   onCenterDropFileChip,
   onCenterDropDesktop,
+  onCenterDropNewConversation,
   onSwapInTree,
   onDropBadgeInTree,
   onCenterDropBadge,
@@ -700,6 +704,8 @@ const Pane = memo(function Pane({
     path: SplitPath,
     edge: DropEdge,
   ) => void;
+  // Pencil drop (NEW_CONVERSATION_DRAG_MIME): opens a fresh new-conversation leaf at the edge.
+  onDropNewConversationInTree?: (path: SplitPath, edge: DropEdge) => void;
   // Phase 64 Plan 02 — center-drop-from-conv-list dispatch. AppShell wires
   // this to `replaceInTree` (functional-updater around split-tree
   // `replaceLeaf`). See
@@ -740,6 +746,8 @@ const Pane = memo(function Pane({
     payload: DesktopDragPayload,
     targetTabId: string,
   ) => void;
+  // Pencil center drop: replaces the target pane with a fresh new-conversation leaf.
+  onCenterDropNewConversation?: (targetTabId: string) => void;
   // Phase 64 Plan 02 — center-drop-from-open-badge dispatch. AppShell wires
   // this to `swapInTree` (functional-updater around split-tree
   // `swapLeaves`). See
@@ -1156,6 +1164,15 @@ const Pane = memo(function Pane({
           onCenterDropDesktop(desktopCenter, tabId);
           return;
         }
+        // Pencil center drop: a fresh new-conversation leaf in place of the target.
+        if (hasNewConversationDragMime(e.dataTransfer) && onCenterDropNewConversation) {
+          systemLogger.info("pv-split-drop center-drop dispatch=new-conversation", {
+            operation: "pv_split_drop_center_new_conversation",
+            targetTabId: tabId,
+          });
+          onCenterDropNewConversation(tabId);
+          return;
+        }
         // Phase 64 /close finding (Addition 2): text/plain-only fallback
         // path REMOVED. The shape strictly names two rich-payload sources
         // (row via application/x-skynet-row, badge via
@@ -1257,6 +1274,15 @@ const Pane = memo(function Pane({
         onDropDesktopInTree(desktopDrop, path, edge);
         return;
       }
+      // Pencil edge drop: a copy gesture — every drop opens a fresh pane.
+      if (hasNewConversationDragMime(e.dataTransfer) && onDropNewConversationInTree) {
+        systemLogger.info("pv-split-drop pane dispatch=new-conversation", {
+          operation: "pv_split_drop_new_conversation",
+          edge,
+        });
+        onDropNewConversationInTree(path, edge);
+        return;
+      }
       // Cross-window-aware badge edge-drop (2026-09-17). When onDropBadgeInTree
       // is wired AND the payload carries the badge MIME, route through
       // AppShell's descriptor resolver — same-window resolves to local tabId
@@ -1310,12 +1336,14 @@ const Pane = memo(function Pane({
     onDropAppTileInTree,
     onDropFileChipInTree,
     onDropDesktopInTree,
+    onDropNewConversationInTree,
     onOpenSessionInTree,
     onReplaceInTree,
     onCenterDropRow,
     onCenterDropAppTile,
     onCenterDropFileChip,
     onCenterDropDesktop,
+    onCenterDropNewConversation,
     onSwapInTree,
     onDropBadgeInTree,
     onCenterDropBadge,
@@ -1452,11 +1480,13 @@ function PaneTree({
   onDropAppTileInTree,
   onDropFileChipInTree,
   onDropDesktopInTree,
+  onDropNewConversationInTree,
   onReplaceInTree,
   onCenterDropRow,
   onCenterDropAppTile,
   onCenterDropFileChip,
   onCenterDropDesktop,
+  onCenterDropNewConversation,
   onSwapInTree,
   onDropBadgeInTree,
   onCenterDropBadge,
@@ -1498,6 +1528,8 @@ function PaneTree({
     path: SplitPath,
     edge: DropEdge,
   ) => void;
+  // Pencil drop (NEW_CONVERSATION_DRAG_MIME): opens a fresh new-conversation leaf at the edge.
+  onDropNewConversationInTree?: (path: SplitPath, edge: DropEdge) => void;
   // Phase 64 Plan 02 — center-drop handlers threaded through PaneTree to
   // reach each leaf's Pane instance.
   onReplaceInTree?: (
@@ -1521,6 +1553,8 @@ function PaneTree({
     payload: DesktopDragPayload,
     targetTabId: string,
   ) => void;
+  // Pencil center drop: replaces the target pane with a fresh new-conversation leaf.
+  onCenterDropNewConversation?: (targetTabId: string) => void;
   onSwapInTree?: (tabIdA: string, tabIdB: string) => void;
   onDropBadgeInTree?: (
     payload: unknown,
@@ -1547,11 +1581,13 @@ function PaneTree({
         onDropAppTileInTree={onDropAppTileInTree}
         onDropFileChipInTree={onDropFileChipInTree}
         onDropDesktopInTree={onDropDesktopInTree}
+        onDropNewConversationInTree={onDropNewConversationInTree}
         onReplaceInTree={onReplaceInTree}
         onCenterDropRow={onCenterDropRow}
         onCenterDropAppTile={onCenterDropAppTile}
         onCenterDropFileChip={onCenterDropFileChip}
         onCenterDropDesktop={onCenterDropDesktop}
+        onCenterDropNewConversation={onCenterDropNewConversation}
         onSwapInTree={onSwapInTree}
         onDropBadgeInTree={onDropBadgeInTree}
         onCenterDropBadge={onCenterDropBadge}
@@ -1578,11 +1614,13 @@ function PaneTree({
           onDropAppTileInTree={onDropAppTileInTree}
           onDropFileChipInTree={onDropFileChipInTree}
           onDropDesktopInTree={onDropDesktopInTree}
+          onDropNewConversationInTree={onDropNewConversationInTree}
           onReplaceInTree={onReplaceInTree}
           onCenterDropRow={onCenterDropRow}
           onCenterDropAppTile={onCenterDropAppTile}
           onCenterDropFileChip={onCenterDropFileChip}
           onCenterDropDesktop={onCenterDropDesktop}
+          onCenterDropNewConversation={onCenterDropNewConversation}
           onSwapInTree={onSwapInTree}
           onDropBadgeInTree={onDropBadgeInTree}
           onCenterDropBadge={onCenterDropBadge}
@@ -1610,11 +1648,13 @@ export const SplitView = memo(function SplitView({
   onDropAppTileInTree,
   onDropFileChipInTree,
   onDropDesktopInTree,
+  onDropNewConversationInTree,
   onReplaceInTree,
   onCenterDropRow,
   onCenterDropAppTile,
   onCenterDropFileChip,
   onCenterDropDesktop,
+  onCenterDropNewConversation,
   onSwapInTree,
   onDropBadgeInTree,
   onCenterDropBadge,
@@ -1657,6 +1697,8 @@ export const SplitView = memo(function SplitView({
     path: SplitPath,
     edge: DropEdge,
   ) => void;
+  // Pencil drop (NEW_CONVERSATION_DRAG_MIME): opens a fresh new-conversation leaf at the edge.
+  onDropNewConversationInTree?: (path: SplitPath, edge: DropEdge) => void;
   // Phase 64 Plan 02 — center-drop-from-conv-list-row dispatch. Wired by
   // AppShell to `replaceInTree` (functional-updater around split-tree
   // `replaceLeaf` from Plan 64-01). See CONTEXT.md § In-scope items 2, 3.
@@ -1681,6 +1723,8 @@ export const SplitView = memo(function SplitView({
     payload: DesktopDragPayload,
     targetTabId: string,
   ) => void;
+  // Pencil center drop: replaces the target pane with a fresh new-conversation leaf.
+  onCenterDropNewConversation?: (targetTabId: string) => void;
   // Phase 64 Plan 02 — center-drop-from-open-badge dispatch. Wired by
   // AppShell to `swapInTree` (functional-updater around split-tree
   // `swapLeaves` from Plan 64-01).
@@ -1749,11 +1793,13 @@ export const SplitView = memo(function SplitView({
         onDropAppTileInTree={onDropAppTileInTree}
         onDropFileChipInTree={onDropFileChipInTree}
         onDropDesktopInTree={onDropDesktopInTree}
+        onDropNewConversationInTree={onDropNewConversationInTree}
         onReplaceInTree={onReplaceInTree}
         onCenterDropRow={onCenterDropRow}
         onCenterDropAppTile={onCenterDropAppTile}
         onCenterDropFileChip={onCenterDropFileChip}
         onCenterDropDesktop={onCenterDropDesktop}
+        onCenterDropNewConversation={onCenterDropNewConversation}
         onSwapInTree={onSwapInTree}
         onDropBadgeInTree={onDropBadgeInTree}
         onCenterDropBadge={onCenterDropBadge}

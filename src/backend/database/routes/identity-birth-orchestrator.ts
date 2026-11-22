@@ -301,6 +301,13 @@ export interface BirthOptions {
 
 export interface BirthDeps {
   /**
+   * Called once the identity's folder is committed on the host — from then on
+   * it exists whatever happens to the request (a closed tab, a supervisor
+   * wait that times out). The route hands the first message over here.
+   * Must not throw; it isn't awaited.
+   */
+  onCommitted?: (identityFolderName: string) => void;
+  /**
    * Phase 68: no DB record is created; disk folder + frontmatter + avatar
    * sibling ARE the identity's identity. createIdentityRecord and
    * getIdentityRecord have been removed from BirthDeps entirely.
@@ -1747,6 +1754,16 @@ export async function birthIdentity(
     // peer disk and the supervisor will bring it alive on its own
     // schedule (Q2 no-rollback lock preserved for post-commit failures).
     birthCommitted = true;
+    try {
+      deps.onCommitted?.(identityFolderName);
+    } catch (hookErr) {
+      databaseLogger.warn("identity birth: onCommitted hook threw (ignored)", {
+        operation: "identity_birth_on_committed_failed",
+        identityKey: identityFolderName,
+        hostId: opts.hostId,
+        error: hookErr instanceof Error ? hookErr.message : String(hookErr),
+      });
+    }
 
     // Best-effort: pre-create opts.path (frontend-supplied custom workspace
     // directory) AFTER the atomic commit. Failure here does NOT fail the

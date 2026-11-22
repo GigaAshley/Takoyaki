@@ -6,7 +6,7 @@
 //
 // Coverage:
 //   Test 1: pv-footer-scheduled-agents-button renders with correct chrome + a11y attrs
-//   Test 2: button absent when onCreateSession is undefined (showPencilButton guard)
+//   Test 2: button absent when onNewConversation is undefined (showPencilButton guard)
 //   Test 3: clicking the button opens ScheduledAgentsModal (stubbed)
 //   Test 4: button position — first footer action, before Roles and the gear
 //
@@ -207,7 +207,7 @@ describe("PrettyConversationsPanel: Scheduled Agents footer button", () => {
       <PrettyConversationsPanel
         variant="desktop"
         hostTree={ONE_HOST_TREE}
-        onCreateSession={vi.fn()}
+        onNewConversation={vi.fn()}
         onDeactivateRow={() => {}}
       />,
     );
@@ -219,7 +219,7 @@ describe("PrettyConversationsPanel: Scheduled Agents footer button", () => {
     expect(btn.classList.contains("pv-footer-btn")).toBe(true);
   });
 
-  it("Test 2: button absent when onCreateSession is undefined (showPencilButton guard)", () => {
+  it("Test 2: button absent when onNewConversation is undefined (showPencilButton guard)", () => {
     render(
       <PrettyConversationsPanel
         variant="desktop"
@@ -234,7 +234,7 @@ describe("PrettyConversationsPanel: Scheduled Agents footer button", () => {
       <PrettyConversationsPanel
         variant="desktop"
         hostTree={ONE_HOST_TREE}
-        onCreateSession={vi.fn()}
+        onNewConversation={vi.fn()}
         onDeactivateRow={() => {}}
       />,
     );
@@ -253,7 +253,7 @@ describe("PrettyConversationsPanel: Scheduled Agents footer button", () => {
       <PrettyConversationsPanel
         variant="desktop"
         hostTree={ONE_HOST_TREE}
-        onCreateSession={vi.fn()}
+        onNewConversation={vi.fn()}
         onDeactivateRow={() => {}}
       />,
     );

@@ -3,16 +3,17 @@
  *
  *   A: footer Roles button → the roles window on its library → a role opens
  *      in the SAME window → Esc steps back → Esc closes.
- *   B: new-conversation dialog → "New role…" → the window's new-role view
- *      (swap, not stack) → back restores the dialog with its earlier picks.
- *   C: … → create → back in the dialog with the earlier picks plus the new role.
- *   D: the X during the hop closes everything and drops the picks.
- *   E: a new-conversation request (any role's "Start a conversation") opens
- *      the dialog with that role picked — including from the window's ⋯ menu.
+ *   E2: the window's ⋯ "Start a conversation" closes the window and sends a
+ *      new-conversation request for that role (AppShell answers it with a
+ *      new-conversation pane).
+ *
+ * The new-conversation pane's "New role…" hop is the pane's own now (see
+ * features/new-conversation/NewConversationPane tests); the panel no longer
+ * mounts a new-conversation dialog.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, fireEvent, waitFor, cleanup, act, within } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, cleanup, within } from "@testing-library/react";
 import type { Host, HostFolder } from "@/types/ui-types";
 
 // ── Global mocks ─────────────────────────────────────────────────────────────
@@ -137,17 +138,8 @@ vi.mock("@mdxeditor/editor", async () => (await import("@/features/pretty-view/r
 // ── Late imports ─────────────────────────────────────────────────────────────
 import { PrettyConversationsPanel } from "./PrettyConversationsPanel";
 import { __resetKitDialogsForTests } from "@/components/kit";
-import { requestNewConversation } from "@/lib/new-conversation-request";
+import { NEW_CONVERSATION_REQUEST_EVENT, type NewConversationRequest } from "@/lib/new-conversation-request";
 import { m, resetRolesWindowMocks } from "@/features/pretty-view/roles-window/roles-window.test-mocks";
-import {
-  pickedRoleValues,
-  queryNewRoleRow,
-  queryRolesGroup,
-  roleGroupHeaders,
-  roleRow,
-  rowDescription,
-  toggleRole,
-} from "@/sidebar/NewSessionDialog.roles-test-helpers";
 
 if (typeof window !== "undefined" && !window.ResizeObserver) {
   window.ResizeObserver = class {
@@ -201,7 +193,7 @@ function renderPanel(): void {
     <PrettyConversationsPanel
       variant="desktop"
       hostTree={ONE_HOST_TREE}
-      onCreateSession={vi.fn()}
+      onNewConversation={vi.fn()}
       onDeactivateRow={() => {}}
     />,
   );
@@ -212,15 +204,6 @@ const dialogCount = (): number => document.querySelectorAll('[role="dialog"]').l
 
 function escape(): void {
   fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape", code: "Escape" });
-}
-
-/** Open the new-agent dialog, pick hallmonitor, then the list's "New role…" row. */
-async function hopToNewRole(): Promise<void> {
-  fireEvent.click(screen.getByTestId("pv-header-new-agent-button"));
-  await waitFor(() => expect(roleRow("hallmonitor")).toBeTruthy());
-  toggleRole("hallmonitor");
-  fireEvent.click(queryNewRoleRow()!);
-  await screen.findByTestId("new-role-name");
 }
 
 beforeEach(() => {
@@ -281,104 +264,31 @@ describe("sidebar → roles window", () => {
     await waitFor(() => expect(m.createRole).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(m.getRoleFileByName).toHaveBeenCalledWith({ roleName: "meal-planner", hostId: 3 }));
     expect(await screen.findByTestId("role-view-facts")).toBeTruthy();
-    expect(queryRolesGroup()).toBeNull();
+    // No new-conversation roles list anywhere — the role opened, nothing else.
+    expect(screen.queryByTestId("role-pick-list")).toBeNull();
     expect(dialogCount()).toBe(1);
-  });
-});
-
-describe("new-conversation dialog → New role… hop", () => {
-  it("B0: the pencil's dialog lists the roles in the dialog — one machine, so no heading — with their descriptions and New role… at the bottom", async () => {
-    renderPanel();
-    fireEvent.click(screen.getByTestId("pv-header-new-agent-button"));
-    await waitFor(() => expect(roleRow("hallmonitor")).toBeTruthy());
-    expect(roleGroupHeaders()).toEqual([]);
-    expect(rowDescription(roleRow("hallmonitor")!)).toBe("The hall monitor role");
-    expect(rowDescription(roleRow("box-maintainer")!)).toBe("The box maintainer role");
-    expect(queryNewRoleRow()).toBeTruthy();
-    // One machine: "No roles" is preselected.
-    expect(pickedRoleValues()).toEqual([":no-roles"]);
-  });
-
-  it("B: New role… swaps to the window's new-role view; back restores the dialog with the earlier picks", async () => {
-    renderPanel();
-    await hopToNewRole();
-    // Swap, not stack: only the roles window is up.
-    expect(queryRolesGroup()).toBeNull();
-    expect(dialogCount()).toBe(1);
-    expect(rolesWindow()).toBeTruthy();
-    expect(screen.getByTestId("roles-window-back").textContent).toContain("Back");
-
-    fireEvent.click(screen.getByTestId("roles-window-back"));
-    await waitFor(() => expect(queryRolesGroup()).toBeTruthy());
-    await waitFor(() => expect(pickedRoleValues()).toEqual(["hallmonitor"]));
-    expect(rolesWindow()).toBeNull();
-  });
-
-  it("B2: Esc on the new-role view also goes back to the dialog", async () => {
-    renderPanel();
-    await hopToNewRole();
-    escape();
-    await waitFor(() => expect(queryRolesGroup()).toBeTruthy());
-    await waitFor(() => expect(pickedRoleValues()).toEqual(["hallmonitor"]));
-  });
-
-  it("C: creating the role returns to the dialog with the earlier picks plus the new role", async () => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(new Blob([new Uint8Array(4)]), { status: 200, headers: { "Content-Type": "image/webp" } }),
-    );
-    m.createRole.mockResolvedValue({ name: "meal-planner", description: "Plans meals", cosmetics: {} });
-    renderPanel();
-    await hopToNewRole();
-    fireEvent.change(screen.getByTestId("new-role-name"), { target: { value: "Meal Planner" } });
-    fireEvent.change(screen.getByTestId("new-role-description"), { target: { value: "Plans meals" } });
-    fireEvent.click(screen.getByRole("button", { name: /Generate picture/ }));
-    await waitFor(() => expect(document.querySelectorAll("[data-candidate-id]")).toHaveLength(3));
-    fireEvent.click(document.querySelectorAll("[data-candidate-id]")[0]);
-    // The dialog re-lists roles when it comes back — the new one included.
-    m.listRolesForHost.mockResolvedValue([BOX, HALL, MEAL]);
-    fireEvent.click(screen.getByTestId("new-role-create"));
-
-    await waitFor(() => expect(m.createRole).toHaveBeenCalledTimes(1));
-    expect((m.createRole.mock.calls[0][0] as { hostId: number }).hostId).toBe(3);
-    await waitFor(() => expect(queryRolesGroup()).toBeTruthy());
-    await waitFor(() => expect(pickedRoleValues()).toEqual(["hallmonitor", "meal-planner"]));
-    expect(rolesWindow()).toBeNull();
-    expect(dialogCount()).toBe(1);
-  });
-
-  it("D: the X during the hop closes the window and doesn't bring the dialog back", async () => {
-    renderPanel();
-    await hopToNewRole();
-    fireEvent.click(screen.getByTestId("roles-window-close"));
-    await waitFor(() => expect(rolesWindow()).toBeNull());
-    expect(queryRolesGroup()).toBeNull();
-    // A fresh open of the dialog doesn't inherit the hop's picks.
-    fireEvent.click(screen.getByTestId("pv-header-new-agent-button"));
-    await waitFor(() => expect(queryRolesGroup()).toBeTruthy());
-    expect(pickedRoleValues()).not.toContain("hallmonitor");
   });
 });
 
 describe("new-conversation request", () => {
-  it("E: a request opens the new-conversation dialog with that role picked", async () => {
-    renderPanel();
-    expect(queryRolesGroup()).toBeNull();
-    act(() => requestNewConversation({ hostId: 3, role: "box-maintainer" }));
-    await waitFor(() => expect(queryRolesGroup()).toBeTruthy());
-    await waitFor(() => expect(pickedRoleValues()).toEqual(["box-maintainer"]));
-  });
-
-  it("E2: Start a conversation in the roles window's ⋯ menu closes the window and opens the dialog with the role", async () => {
-    renderPanel();
-    fireEvent.click(screen.getByTestId("pv-footer-roles-button"));
-    fireEvent.click(await screen.findByTestId("roles-window-row-hallmonitor"));
-    await screen.findByTestId("role-view-facts");
-    const { default: userEvent } = await import("@testing-library/user-event");
-    await userEvent.setup().click(screen.getByTestId("role-view-menu"));
-    fireEvent.click(await screen.findByTestId("role-view-start-conversation"));
-    await waitFor(() => expect(rolesWindow()).toBeNull());
-    await waitFor(() => expect(queryRolesGroup()).toBeTruthy());
-    await waitFor(() => expect(pickedRoleValues()).toEqual(["hallmonitor"]));
-    expect(dialogCount()).toBe(1);
+  it("E2: Start a conversation in the roles window's ⋯ menu closes the window and sends a new-conversation request for the role", async () => {
+    const requests: NewConversationRequest[] = [];
+    const onReq = (e: Event) => requests.push((e as CustomEvent<NewConversationRequest>).detail);
+    window.addEventListener(NEW_CONVERSATION_REQUEST_EVENT, onReq);
+    try {
+      renderPanel();
+      fireEvent.click(screen.getByTestId("pv-footer-roles-button"));
+      fireEvent.click(await screen.findByTestId("roles-window-row-hallmonitor"));
+      await screen.findByTestId("role-view-facts");
+      const { default: userEvent } = await import("@testing-library/user-event");
+      await userEvent.setup().click(screen.getByTestId("role-view-menu"));
+      fireEvent.click(await screen.findByTestId("role-view-start-conversation"));
+      await waitFor(() => expect(rolesWindow()).toBeNull());
+      expect(requests).toEqual([{ hostId: 3, role: "hallmonitor" }]);
+      // The panel itself opens nothing — AppShell answers the request.
+      expect(dialogCount()).toBe(0);
+    } finally {
+      window.removeEventListener(NEW_CONVERSATION_REQUEST_EVENT, onReq);
+    }
   });
 });

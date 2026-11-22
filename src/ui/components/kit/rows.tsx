@@ -86,6 +86,8 @@ export interface KitSettingsRowProps {
   /** Press-and-hold handlers for the row (useRowKebabContextMenu's holdProps). */
   holdProps?: React.HTMLAttributes<HTMLElement>;
   className?: string;
+  /** Inline style on the row (e.g. a picked row's own tint). */
+  style?: React.CSSProperties;
   "data-testid"?: string;
   children?: React.ReactNode;
 }
@@ -108,6 +110,7 @@ export function KitSettingsRow({
   onContextMenu,
   holdProps,
   className,
+  style,
   "data-testid": testId,
   children,
 }: KitSettingsRowProps): JSX.Element {
@@ -126,6 +129,7 @@ export function KitSettingsRow({
     return (
       <div
         className={cn("k-row", className)}
+        style={style}
         data-split="true"
         data-tone={tone === "default" ? undefined : tone}
         data-truncate={truncate ? "true" : undefined}
@@ -162,6 +166,7 @@ export function KitSettingsRow({
   );
   const common = {
     className: cn("k-row", className),
+    style,
     "data-tone": tone === "default" ? undefined : tone,
     "data-disabled": disabled ? "true" : undefined,
     "data-stack": stacked ? "true" : undefined,

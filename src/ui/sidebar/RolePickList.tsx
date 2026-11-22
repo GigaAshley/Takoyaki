@@ -30,6 +30,8 @@ export interface RolePickItem {
   avatarSrc?: string | null;
   /** The "No roles" entry of its machine. */
   noRoles?: boolean;
+  /** The role's colour — a picked row is tinted with it (pane variant). */
+  hue?: number;
 }
 
 export interface RolePickGroup {
@@ -49,6 +51,7 @@ export function RolePickList({
   onNewRole,
   loading,
   disabled,
+  variant = "dialog",
 }: {
   groups: RolePickGroup[];
   value: string[];
@@ -61,6 +64,12 @@ export function RolePickList({
    */
   loading?: boolean;
   disabled?: boolean;
+  /**
+   * "pane": the list sits in a new-conversation pane's message area — the
+   * pane scrolls (no inner scroll box), the search box is always there, and a
+   * picked role is tinted with its own colour.
+   */
+  variant?: "dialog" | "pane";
 }): JSX.Element {
   const { t } = useTranslation();
   const [query, setQuery] = useState("");
@@ -94,7 +103,7 @@ export function RolePickList({
 
   return (
     <div className="flex flex-col gap-3 min-w-0" data-testid="role-pick-list">
-      {roleCount > SEARCH_FROM && (
+      {(roleCount > SEARCH_FROM || (variant === "pane" && roleCount > 0)) && (
         <KitSearch
           value={query}
           onValueChange={setQuery}
@@ -104,7 +113,13 @@ export function RolePickList({
           data-testid="role-pick-search"
         />
       )}
-      <div className="max-h-[min(46vh,360px)] sm:max-h-[min(58vh,640px)] overflow-y-auto overscroll-contain -mx-1 px-1">
+      <div
+        className={
+          variant === "pane"
+            ? "-mx-1 px-1"
+            : "max-h-[min(46vh,360px)] sm:max-h-[min(58vh,640px)] overflow-y-auto overscroll-contain -mx-1 px-1"
+        }
+      >
         {shown.length === 0 ? (
           loading ? null : searching ? (
             <KitEmpty
@@ -142,6 +157,11 @@ export function RolePickList({
                     disabled={disabled}
                     onClick={() => toggle(i.value)}
                     pressed={picked}
+                    style={
+                      variant === "pane" && picked && i.hue !== undefined
+                        ? { background: `hsla(${i.hue}, 45%, 40%, 0.22)` }
+                        : undefined
+                    }
                     control={
                       picked ? (
                         <Check className="size-[18px] text-[var(--k-acc-text)] shrink-0" aria-label={pickedLabel} />

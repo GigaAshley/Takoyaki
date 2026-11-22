@@ -581,6 +581,9 @@ export interface BirthRequest {
   poolPicked?: boolean;
   /** Project slug → the identity is born with `project: <slug>` frontmatter. */
   project?: string;
+  /** What the user typed in the new conversation's compose box. Delivered to
+   *  the newborn through its inbox once it exists, as the user's own message. */
+  firstMessage?: string;
 }
 
 export type BirthEvent =
