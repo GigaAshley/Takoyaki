@@ -3824,6 +3824,10 @@ export function AppShell({
     }
     const newTabId = openNewConversationTab(start ?? {});
     if (shown !== undefined) newConversationPrevRef.current.set(newTabId, shown.id);
+    // A split is up (two or more panes): the pane joins it beside the largest
+    // pane — where a new conversation used to land — instead of covering the
+    // whole arrangement. No split (or a phone): it takes over the view.
+    const splitTarget = isMobile ? null : splitTargetForOpen(splitTree);
     systemLogger.info("[new-conversation] open", {
       operation: "new_conversation_open",
       source,
@@ -3831,7 +3835,12 @@ export function AppShell({
       project: start?.project?.slug ?? null,
       roles: start?.roles?.join(",") ?? null,
       hadSplitTree: splitTree !== null,
+      intoSplit: splitTarget !== null,
     });
+    if (splitTarget !== null) {
+      openSessionInTree(newTabId, splitTarget, "right");
+      setFocusedTabId(newTabId);
+    }
     selectConversationDeferred(newTabId);
     if (isTouchDevice) navigateToView();
     if (isMobile) setSidebarOpen(false);
