@@ -383,11 +383,30 @@ describe("SkillsEditorModal — shared skills", () => {
     renderModal();
     await selectSkill("shared-skill");
     await openSkillMenu();
+    expect(screen.getByTestId("skills-editor-modal-reach").textContent).toBe("on every machine");
     await userEvent.setup().click(screen.getByTestId("skills-editor-modal-machines"));
     await waitFor(() => expect(dialogs.calls).toHaveLength(1));
     expect(dialogs.calls[0].opts.title).toBe('Machines for "shared-skill"');
     // Nothing changed — nothing saved.
     expect(iwApi.saveMachines).not.toHaveBeenCalled();
+  });
+
+  it("admin: a shared skill on a fixed list says how many machines it's on", async () => {
+    vi.mocked(iwApi.listInstanceWide).mockResolvedValue({
+      isAdmin: true,
+      items: [{ ...IW_ITEM, targets: ["1", "2", "3"], writeBack: [] }],
+    });
+    renderModal();
+    await selectSkill("shared-skill");
+    expect((await screen.findByTestId("skills-editor-modal-reach")).textContent).toBe("on 3 machines");
+  });
+
+  it("non-admin: no reach line on a shared skill", async () => {
+    vi.mocked(iwApi.listInstanceWide).mockResolvedValue({ isAdmin: false, items: [IW_ITEM] });
+    renderModal();
+    await selectSkill("shared-skill");
+    await screen.findByTestId("skills-editor-modal-readonly-banner");
+    expect(screen.queryByTestId("skills-editor-modal-reach")).toBeNull();
   });
 
   it("non-admin on a machine that writes it back: edits the host's copy, no sharing actions", async () => {

@@ -54,6 +54,7 @@ import { refreshSkillActions, settleSkillActions } from "./skill-actions-store";
 import {
   INSTANCE_HOST_ID,
   listInstanceWide,
+  reachLabel,
   removeInstanceWide,
   type InstanceWideList,
 } from "@/api/instance-wide-api";
@@ -1578,6 +1579,11 @@ export default function SkillsEditorModal({
           <Bot className="size-[15px] opacity-80" aria-hidden="true" />
           Agents can use it
         </label>
+        {selectedIwItem && isAdmin && selectedIwItem.targets ? (
+          <span className="text-[12.5px] text-[var(--k-t3)]" data-testid="skills-editor-modal-reach">
+            {reachLabel(selectedIwItem, true)}
+          </span>
+        ) : null}
         {selectedIwItem && isAdmin ? <InstanceWideSyncStatus item={selectedIwItem} /> : null}
         {skillMdDirty ? (
           <span className="text-[12.5px] text-[var(--k-t3)]">Save or discard your edits first</span>
