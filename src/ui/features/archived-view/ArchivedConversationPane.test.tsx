@@ -4,7 +4,7 @@
 // tab turns live once the agent is in the identities registry and the fleet.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, act, waitFor, fireEvent, screen } from "@testing-library/react";
+import { render, renderHook, act, waitFor, fireEvent, screen } from "@testing-library/react";
 
 type WsStub = {
   readyState: number;
@@ -88,6 +88,13 @@ import { ARCHIVED_TAB_LIVE_EVENT, noteAgentWindowReopen, seedArchivedLook, takeA
 import { PrettyView } from "@/features/pretty-view/PrettyView";
 import { identityFromArchivedLook } from "./archived-identity";
 import type { Tab, Host } from "@/types/ui-types";
+import type { ConversationSearchResult } from "@/api/conversation-search-api";
+import {
+  _resetForTests as _resetSearchForTests,
+  appendResults,
+  startNewSearch,
+  useSearchState,
+} from "@/state/search-store";
 
 const host = { id: "7", name: "harbor", enableSsh: true } as unknown as Host;
 const tab = {
@@ -187,10 +194,20 @@ describe("archived conversation tab", () => {
     unarchiveMock.mockResolvedValue({ outcome: "restored" });
     const live = vi.fn();
     window.addEventListener(ARCHIVED_TAB_LIVE_EVENT, live);
+    // Search lists it as archived; that row goes once the agent is back.
+    _resetSearchForTests();
+    const req = startNewSearch("printer");
+    appendResults(
+      [{ transcriptPath: "/olden.jsonl", identityKey: "olden", hostId: 7, isArchived: true } as ConversationSearchResult],
+      false,
+      req,
+    );
+    const search = renderHook(() => useSearchState());
     const { ws, rerender, onCloseTab } = mount();
     frame(ws, { type: "archived_state", state: "archived", look });
     fireEvent.click(screen.getByTestId("archived-unarchive"));
     await waitFor(() => expect(screen.getByTestId("archived-strip-status").textContent).toContain("Coming back"));
+    expect(search.result.current.results).toHaveLength(1);
     await waitFor(() => expect(refreshOneMock).toHaveBeenCalledWith("olden", 7));
     expect(live).not.toHaveBeenCalled();
 
@@ -200,6 +217,7 @@ describe("archived conversation tab", () => {
     rerender(<ArchivedConversationPane tab={tab} host={host} isVisible={true} onCloseTab={onCloseTab} />);
     await waitFor(() => expect(live).toHaveBeenCalledTimes(1));
     expect((live.mock.calls[0][0] as CustomEvent).detail).toEqual({ tabId: tab.id });
+    expect(search.result.current.results).toHaveLength(0);
     window.removeEventListener(ARCHIVED_TAB_LIVE_EVENT, live);
   });
 

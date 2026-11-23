@@ -60,7 +60,7 @@ import {
 } from "@/features/new-conversation/new-conversation-context";
 import { picksFromWire, samePicks } from "@/lib/new-conversation-picks";
 import { decideNewConversationOpen } from "@/lib/new-conversation-open";
-import { decideSearchResultPlacement, type SearchResultPlacement } from "@/lib/search-result-open";
+import { decideSearchResultPlacement, findOpenResultTab, type SearchResultPlacement } from "@/lib/search-result-open";
 import { NEW_CONVERSATION_DRAG_MIME, hasNewConversationDragMime } from "@/shell/new-conversation-drag";
 import { setSessionProject } from "@/api/session-project-api";
 import { usePhoneDesktop } from "@/shell/use-phone-desktop";
@@ -4368,12 +4368,7 @@ export function AppShell({
               // A view-only archived conversation tab; an open copy is
               // brought forward instead of opening a second.
               const key = result.identityKey.toLowerCase();
-              const existing = tabsRef.current.find(
-                (t) =>
-                  t.sessionKind === "archived" &&
-                  t.host?.id === host.id &&
-                  (t.targetTmuxSession ?? "").toLowerCase() === key,
-              );
+              const existing = findOpenResultTab(tabsRef.current, host.id, key, true);
               const tabId =
                 existing?.id ??
                 openTab(host, "terminal", undefined, {
@@ -4393,20 +4388,25 @@ export function AppShell({
             }
             const sessionName = result.tmuxSessionName;
             if (!sessionName) return;
-            const newTabId = openTab(host, "terminal", undefined, {
-              targetTmuxSession: sessionName,
-              // Use aiTitle when available (Wave-1 backend deferral: always
-              // null today, but the piggyback follow-up per 122-02-SUMMARY
-              // will populate it — this handler already handles both cases).
-              label: result.aiTitle || sessionName,
-              allowCreateTmux: false,
-            });
+            // An open copy is brought forward instead of opening a second.
+            const existing = findOpenResultTab(tabsRef.current, host.id, sessionName, false);
+            const newTabId =
+              existing?.id ??
+              openTab(host, "terminal", undefined, {
+                targetTmuxSession: sessionName,
+                // Use aiTitle when available (Wave-1 backend deferral: always
+                // null today, but the piggyback follow-up per 122-02-SUMMARY
+                // will populate it — this handler already handles both cases).
+                label: result.aiTitle || sessionName,
+                allowCreateTmux: false,
+              });
             const placement = placeSearchResultInSplit(newTabId);
             systemLogger.info("[conversation-search] open", {
               operation: "conversation_search_open",
               hostId: result.hostId,
               identityKey: result.identityKey,
               tabId: newTabId,
+              existing: !!existing,
               placement,
             });
             selectConversationDeferred(newTabId);

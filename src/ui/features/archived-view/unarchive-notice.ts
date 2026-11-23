@@ -1,5 +1,5 @@
-// What to tell the user when an un-archive is refused or fails — one wording
-// for search's row menu and the archived conversation tab.
+// What to tell the user when an un-archive is refused or fails, in the
+// archived conversation tab.
 
 import { UnarchiveError } from "@/api/identity-unarchive-api";
 

@@ -24,3 +24,19 @@ export function decideSearchResultPlacement(input: {
   const path = splitTargetForOpen(splitTree);
   return path === null ? { kind: "alone" } : { kind: "join", path };
 }
+
+/** The open tab already showing a search result's conversation, if any —
+ *  the archived view for an archived result, the live conversation
+ *  otherwise — so a click brings it forward instead of opening a second. */
+export function findOpenResultTab<
+  T extends { id: string; type: string; sessionKind?: string; host?: { id: string }; targetTmuxSession?: string | null },
+>(tabs: readonly T[], hostId: string, identityKey: string, archived: boolean): T | undefined {
+  const key = identityKey.toLowerCase();
+  return tabs.find(
+    (t) =>
+      t.type === "terminal" &&
+      t.host?.id === hostId &&
+      (t.targetTmuxSession ?? "").toLowerCase() === key &&
+      (archived ? t.sessionKind === "archived" : t.sessionKind === undefined || t.sessionKind === "harness"),
+  );
+}

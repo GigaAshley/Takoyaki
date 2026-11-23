@@ -4,7 +4,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { decideSearchResultPlacement } from "./search-result-open";
+import { decideSearchResultPlacement, findOpenResultTab } from "./search-result-open";
 import { findLargestLeafPath, type SplitNode } from "./split-tree";
 
 const split = (a: string, b: string): SplitNode =>
@@ -45,5 +45,29 @@ describe("decideSearchResultPlacement", () => {
     expect(decideSearchResultPlacement({ tabId: "r", splitTree: split("a", "b"), isMobile: true })).toEqual({
       kind: "alone",
     });
+  });
+});
+
+describe("findOpenResultTab", () => {
+  const tabs = [
+    { id: "t1", type: "terminal", host: { id: "1" }, targetTmuxSession: "bob" },
+    { id: "t2", type: "terminal", host: { id: "1" }, targetTmuxSession: "eve", sessionKind: "archived" },
+    { id: "t3", type: "terminal", host: { id: "2" }, targetTmuxSession: "bob", sessionKind: "harness" },
+    { id: "t4", type: "app", host: { id: "1" }, targetTmuxSession: "bob" },
+  ];
+
+  it("finds the live conversation on the result's host, case ignored", () => {
+    expect(findOpenResultTab(tabs, "1", "Bob", false)?.id).toBe("t1");
+    expect(findOpenResultTab(tabs, "2", "bob", false)?.id).toBe("t3");
+  });
+
+  it("finds the archived view for an archived result, not a live tab", () => {
+    expect(findOpenResultTab(tabs, "1", "eve", true)?.id).toBe("t2");
+    expect(findOpenResultTab(tabs, "1", "bob", true)).toBeUndefined();
+    expect(findOpenResultTab(tabs, "1", "eve", false)).toBeUndefined();
+  });
+
+  it("finds nothing on another host", () => {
+    expect(findOpenResultTab(tabs, "3", "bob", false)).toBeUndefined();
   });
 });

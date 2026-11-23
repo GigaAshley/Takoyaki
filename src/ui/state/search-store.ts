@@ -212,7 +212,7 @@ export function removeResultByIdentity(hostId: number, identityKey: string): voi
   state = {
     ...state,
     results: state.results.filter(
-      (r) => !(r.hostId === hostId && r.identityKey === identityKey),
+      (r) => !(r.hostId === hostId && r.identityKey.toLowerCase() === identityKey.toLowerCase()),
     ),
   };
   notify();
