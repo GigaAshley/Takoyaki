@@ -741,7 +741,7 @@ menu in the header and no "new group conversation" control in the app.
   Shell shows the machine list with a search box (no list when there's
   only one machine), an optional name and a path. For an agent:
   - **Roles** is a list right in the pane: each role's picture, name
-    ("· on every host" for a role kept on every host), its one-line
+    ("· shared" for a shared role), its one-line
     description and a check when picked. It's grouped by machine —
     the machine's name as a heading only when the user has more than one
     machine that can host agents (machines set to run the fleet); with
@@ -1264,13 +1264,13 @@ crown, then gear.
     **New role**, a search box, then every role as a row — picture, name
     (with a **Borrowable** tag when it's borrowable), its one-line
     description, how many agents hold it. Shared roles sit
-    first under **On every host**, then **On <machine>**. A last row,
+    first under **Shared**, then **On <machine>**. A last row,
     **Archived roles**, shows how many there are and opens them.
   - **A role** (click a row): its picture (click to upload a new one),
     name (click it to rename in place — the shown name only; the slug and
     folder stay) and one-line description — a faded *No description* when
     it has none; click it (pencil) to edit in place, Enter saves, Esc cancels.
-    Under that a quiet line ("3 agents hold this role · on every host")
+    Under that a quiet line ("3 agents hold this role · shared")
     ending in a link to its scheduled conversations ("2 scheduled conversations ›", or
     "No scheduled conversations ›") — it closes the roles window and opens the
     scheduled conversations window on just that role's scheduled conversations; then **Colour** and
@@ -1285,11 +1285,10 @@ crown, then gear.
     `~/fleet/roles/<slug>/` except the role file itself, which has its own
     tab) and **Git** when the folder holds a repo. The **⋯** menu has
     **Start a conversation** (opens a new conversation with this role
-    picked), for admins **Make instance-wide…** / **Delete from every host…**,
+    picked), for admins **Make instance-wide…** / **Machines…** / **Delete from every machine…**,
     and **Archive role…** — one confirm naming the agents that hold it,
     which are archived with it (and which of them have scheduled wake-ups that would
-    stop); greyed out on a shared role, which is
-    deleted from every host instead.
+    stop); greyed out on a shared role.
   - **A role skill** (click one under Skills): one level deeper; back
     reads the role's name; its name heads it with its description under
     it, as a skill does in the Skills window. It opens on its `SKILL.md`,
@@ -1336,10 +1335,11 @@ crown, then gear.
     already set to neither on disk shows "Nobody can use this". **New
     skill** (top right) asks for a name and a description, then opens the
     new skill.
-    Skills **shared to every host** (kept in step by an admin) have their
+    **Shared** skills (kept in step by an admin) have their
     own section at the top: everyone uses them like their own (Skills
-    button, `/<name>`, agents), but only an admin can change them — for
-    anyone else they're view-only, with ticks in place of the switches.
+    button, `/<name>`, agents), but only an admin can change them, except
+    on a machine an admin lets write them back — elsewhere they're
+    view-only, with ticks in place of the switches.
   - **One skill** (click a row's name): **‹ Skills** goes back; the name and
     description head it, the same two switches sit under that ("In my
     Skills button", "Agents can use it" — they wait while SKILL.md has
@@ -1347,8 +1347,8 @@ crown, then gear.
     **Delete skill…**. Rename changes the skill's folder (so `/<name>`
     changes) and the `name:` in its SKILL.md together. Editing `name:` in
     SKILL.md by hand doesn't save as is: Save offers to rename the skill to
-    that name, since the name and the folder always match. Skills shared to
-    every host and fleet-distributed ones can't be renamed.
+    that name, since the name and the folder always match. Shared skills
+    and fleet-distributed ones can't be renamed.
     The editor opens on SKILL.md; the skill's other files stay behind an
     **"N files"** button in the file's toolbar, which opens the file list
     (grouped by folder, a find box past ten files, **Add file** at the
