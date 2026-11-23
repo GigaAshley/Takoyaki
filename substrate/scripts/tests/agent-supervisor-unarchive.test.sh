@@ -695,6 +695,37 @@ test_identity_whoami_ok_but_no_profile_reactivates() {
   teardown_unarchive_scratch "$scratch"
 }
 
+test_identity_surviving_token_saves_new_password() {
+  local scratch; scratch=$(setup_unarchive_scratch)
+  fixture_live_role "$scratch" box-maintainer
+  fixture_archived_identity "$scratch" sigma "scalar:box-maintainer"
+  # The token outlives the deactivate (whoami 200 throughout). Profile is gone on tick 1 and
+  # back once the backend has reactivated; old password 403s, the new one logs in.
+  start_stub_admin "200" "403,200" "404,200" || { teardown_unarchive_scratch "$scratch"; return; }
+  _point_relay "$scratch" sigma
+  local d="${scratch}-archive/sigma"
+
+  _tick "$scratch" >/dev/null
+  local uuid; uuid=$(_state "$scratch" sigma)
+  assert_eq "1" "$(_request_count "$scratch")" "surviving token: reactivation requested"
+
+  # Backend reactivates within one tick — the account now looks live to the old token.
+  _respond "$scratch" "$uuid" '{"ok":true,"service":"identity-reactivate","result":{"password":"new-secret-pw"}}'
+
+  local out; out=$(_tick "$scratch")
+  assert_nogrep "chat login already works" "$out" "surviving token: fast path not taken mid-reactivation"
+  assert_eq "new-secret-pw" "$(jq -r '.password' "$d/relay.json")" "surviving token: new password saved"
+  assert_eq "saved" "$(_state "$scratch" sigma)" "surviving token: state is 'saved'"
+
+  out=$(_tick "$scratch")
+  local reqs; reqs=$(cat "$STUB_REQ_LOG")
+  stop_stub_admin
+  assert_grep '^POST /_matrix/client/v3/login .*new-secret-pw' "$reqs" "surviving token: logged in with the new password"
+  _assert_completed "$scratch" sigma "surviving token"
+  assert_eq "new-secret-pw" "$(jq -r '.password' "$scratch/sigma/relay.json")" "surviving token: password kept after move"
+  teardown_unarchive_scratch "$scratch"
+}
+
 test_identity_profile_check_transient_waits() {
   local scratch; scratch=$(setup_unarchive_scratch)
   fixture_live_role "$scratch" box-maintainer
@@ -1529,6 +1560,7 @@ run_test test_identity_missing_relay_json_refuses
 run_test test_identity_relay_json_without_account_refuses
 run_test test_identity_whoami_fast_path_completes
 run_test test_identity_whoami_ok_but_no_profile_reactivates
+run_test test_identity_surviving_token_saves_new_password
 run_test test_identity_profile_check_transient_waits
 run_test test_identity_reactivation_request_without_display_name
 run_test test_identity_happy_path_flow_list_all_live

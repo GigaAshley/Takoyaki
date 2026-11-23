@@ -2475,11 +2475,17 @@ _unarchive_account_step() {
     return 2
   fi
 
+  local state
+  state=$(cat "$d/.unarchive-reactivate" 2>/dev/null || true)
+
   # a. Already live with a working login? A working token alone doesn't prove it: a token the
   #    fleet admin issued by logging in as this account survives archiving's deactivate, so
   #    whoami answers 200 for a switched-off account. Deactivate-with-erase deletes the
   #    account's profile, so the profile lookup (404) is what tells a switched-off account apart.
-  if [ -n "$token" ]; then
+  #    Skipped once a reactivation is under way: the backend may already have switched the
+  #    account back on with a new password, and taking this shortcut would leave that password
+  #    unsaved — the agent then runs on its token until archiving needs the password and fails.
+  if [ -n "$token" ] && [ -z "$state" ]; then
     local code pcode
     code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
       -H "Authorization: Bearer $token" "$base/account/whoami" 2>/dev/null)
@@ -2500,9 +2506,6 @@ _unarchive_account_step() {
       esac
     fi
   fi
-
-  local state
-  state=$(cat "$d/.unarchive-reactivate" 2>/dev/null || true)
 
   # b. New password saved — log in with it.
   if [ "$state" = "saved" ]; then
