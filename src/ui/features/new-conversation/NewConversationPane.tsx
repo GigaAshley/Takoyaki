@@ -424,7 +424,7 @@ export function NewConversationPane({ tabId, picks, isVisible, onSelectPane }: N
   // role name. Each machine's entries start with "No roles".
   const roleOptionValue = (h: Host, role: string) => (multiHost ? `${h.id}/${role}` : role);
   const noRolesLabel = t("nav.newSessionNoRoles", { defaultValue: "No roles" });
-  const onEveryHost = t("nav.newSessionOnEveryHost", { defaultValue: "· on every host" });
+  const onEveryHost = t("nav.newSessionOnEveryHost", { defaultValue: "· shared" });
   const roleGroups: RolePickGroup[] = !rolesReady
     ? []
     : sortedHosts.flatMap((h) => {

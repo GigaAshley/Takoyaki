@@ -24,6 +24,9 @@ export const m = {
   previewPromote: vi.fn(),
   promote: vi.fn(),
   removeInstanceWide: vi.fn(),
+  listSharedMachines: vi.fn(),
+  previewMachines: vi.fn(),
+  saveMachines: vi.fn(),
   // archive / un-archive
   listArchivedRoles: vi.fn(),
   unarchiveRole: vi.fn(),
@@ -79,6 +82,12 @@ export function resetRolesWindowMocks(): void {
     sourceHostName: "boreal",
   });
   m.promote.mockResolvedValue(undefined);
+  m.listSharedMachines.mockResolvedValue([
+    { machineId: "1", hostName: "alpha", hostRowIds: ["1"], offline: false },
+    { machineId: "2", hostName: "boreal", hostRowIds: ["2"], offline: false },
+  ]);
+  m.previewMachines.mockResolvedValue({ clashes: [], unreachable: [] });
+  m.saveMachines.mockImplementation(async (_k: string, _n: string, lists: unknown) => lists);
   m.removeInstanceWide.mockResolvedValue({ hostCount: 4 });
   m.listArchivedRoles.mockResolvedValue([]);
   m.unarchiveRole.mockResolvedValue({ ok: true });
@@ -127,6 +136,9 @@ export async function instanceWideApi(orig: Orig): Promise<Record<string, unknow
     previewPromote: (...a: unknown[]) => m.previewPromote(...a),
     promote: (...a: unknown[]) => m.promote(...a),
     removeInstanceWide: (...a: unknown[]) => m.removeInstanceWide(...a),
+    listSharedMachines: (...a: unknown[]) => m.listSharedMachines(...a),
+    previewMachines: (...a: unknown[]) => m.previewMachines(...a),
+    saveMachines: (...a: unknown[]) => m.saveMachines(...a),
   };
 }
 

@@ -1,5 +1,5 @@
 /**
- * SkillsEditorModal — "Shared to every host" (instance-wide) and fleet-distributed
+ * SkillsEditorModal — "Shared" (instance-wide) and fleet-distributed
  * sections (shape-instance-wide-roles-and-skills, shape-skills-modal).
  *
  * Byte-shape mirror of GlobalFilesModal.test.tsx (quick 260805-7rq) with the
@@ -106,6 +106,12 @@ vi.mock("@/api/instance-wide-api", async (importOriginal) => {
     }),
     promote: vi.fn().mockResolvedValue(undefined),
     removeInstanceWide: vi.fn().mockResolvedValue({ hostCount: 3 }),
+    listSharedMachines: vi.fn().mockResolvedValue([
+      { machineId: "1", hostName: "boreal", hostRowIds: ["1"], offline: false },
+      { machineId: "2", hostName: "beta", hostRowIds: ["2"], offline: false },
+    ]),
+    previewMachines: vi.fn().mockResolvedValue({ clashes: [], unreachable: [] }),
+    saveMachines: vi.fn(),
   };
 });
 
@@ -248,7 +254,7 @@ function renderModal(): void {
   );
 }
 
-describe("SkillsEditorModal — shared to every host", () => {
+describe("SkillsEditorModal — shared skills", () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -261,7 +267,9 @@ describe("SkillsEditorModal — shared to every host", () => {
     vi.mocked(iwApi.listInstanceWide).mockResolvedValue({ isAdmin: true, items: [IW_ITEM] });
     renderModal();
     const sectionEl = await screen.findByTestId("skills-editor-modal-section-shared");
-    expect(within(sectionEl).getByText("Shared to every host")).toBeInTheDocument();
+    expect(within(sectionEl).getByText("Shared")).toBeInTheDocument();
+    // Listed for the selected host's machine.
+    expect(iwApi.listInstanceWide).toHaveBeenCalledWith("skill", 1);
     expect(within(sectionEl).getByRole("button", { name: "Open shared-skill" })).toBeInTheDocument();
     await selectSkill("shared-skill");
     await waitFor(() =>
@@ -269,7 +277,7 @@ describe("SkillsEditorModal — shared to every host", () => {
     );
     // Quiet status: one host behind → warning chip with detail on click.
     const warn = await screen.findByTestId("instance-wide-sync-warning");
-    expect(warn).toHaveTextContent("1 host behind");
+    expect(warn).toHaveTextContent("1 machine behind");
     fireEvent.click(warn);
     expect(screen.getByTestId("instance-wide-sync-detail")).toHaveTextContent("laptop");
   });
@@ -316,22 +324,25 @@ describe("SkillsEditorModal — shared to every host", () => {
     expect(screen.queryByTestId("instance-wide-sync-warning")).toBeNull();
   });
 
-  it("admin: Share to every host previews, warns, and promotes", async () => {
+  it("admin: Make instance-wide… picks machines, previews, warns, and promotes", async () => {
     vi.mocked(iwApi.listInstanceWide).mockResolvedValue({ isAdmin: true, items: [] });
     const dialogs = autoAnswerKitDialogs({ confirm: true });
     renderModal();
     await selectSkill("build");
     await openSkillMenu();
     await userEvent.setup().click(screen.getByTestId("skills-editor-modal-promote-skill"));
-    await waitFor(() => expect(iwApi.promote).toHaveBeenCalledWith("skill", "build", 1));
-    expect(iwApi.previewPromote).toHaveBeenCalledWith("skill", "build", 1);
-    const opts = dialogs.calls[0].opts;
+    await waitFor(() =>
+      expect(iwApi.promote).toHaveBeenCalledWith("skill", "build", 1, { targets: "all", writeBack: [] }),
+    );
+    expect(iwApi.previewPromote).toHaveBeenCalledWith("skill", "build", 1, "all");
+    expect(dialogs.calls[0].opts.title).toBe('Make "build" instance-wide?');
+    const opts = dialogs.calls[1].opts;
     const text = `${String(opts.title)}\n${String(opts.body)}`;
-    expect(text).toMatch(/every host/);
+    expect(text).toMatch(/every machine/);
     expect(text).toMatch(/beta/);
   });
 
-  it("admin: a shared skill's Delete skill… says it deletes it from every host, with the host count", async () => {
+  it("admin: a shared skill's Delete skill… says it deletes it from every machine, with the count", async () => {
     vi.mocked(iwApi.listInstanceWide).mockResolvedValue({ isAdmin: true, items: [IW_ITEM] });
     const dialogs = autoAnswerKitDialogs({ confirm: true });
     renderModal();
@@ -341,8 +352,8 @@ describe("SkillsEditorModal — shared to every host", () => {
     expect(screen.getByTestId("skills-editor-modal-remove-instance-skill").textContent).toContain("Delete skill…");
     await userEvent.setup().click(screen.getByTestId("skills-editor-modal-remove-instance-skill"));
     await waitFor(() => expect(iwApi.removeInstanceWide).toHaveBeenCalledWith("skill", "shared-skill"));
-    expect(dialogs.calls[0].opts.title).toBe('Delete "shared-skill" from every host?');
-    expect(String(dialogs.calls[0].opts.body)).toMatch(/all 3 hosts/);
+    expect(dialogs.calls[0].opts.title).toBe('Delete "shared-skill" from every machine?');
+    expect(String(dialogs.calls[0].opts.body)).toMatch(/all 3 machines/);
     expect((dialogs.calls[0].opts as { confirmLabel?: string }).confirmLabel).toBe("Delete everywhere");
   });
 
@@ -363,7 +374,39 @@ describe("SkillsEditorModal — shared to every host", () => {
     expect(within(own).getByRole("button", { name: "Open shared-skill" })).toBeTruthy();
   });
 
-  it("non-admin: no Share to every host on their own skills", async () => {
+  it("admin: a shared skill's menu has Machines…", async () => {
+    vi.mocked(iwApi.listInstanceWide).mockResolvedValue({
+      isAdmin: true,
+      items: [{ ...IW_ITEM, targets: "all", writeBack: [] }],
+    });
+    const dialogs = autoAnswerKitDialogs({ confirm: true });
+    renderModal();
+    await selectSkill("shared-skill");
+    await openSkillMenu();
+    await userEvent.setup().click(screen.getByTestId("skills-editor-modal-machines"));
+    await waitFor(() => expect(dialogs.calls).toHaveLength(1));
+    expect(dialogs.calls[0].opts.title).toBe('Machines for "shared-skill"');
+    // Nothing changed — nothing saved.
+    expect(iwApi.saveMachines).not.toHaveBeenCalled();
+  });
+
+  it("non-admin on a machine that writes it back: edits the host's copy, no sharing actions", async () => {
+    vi.mocked(iwApi.listInstanceWide).mockResolvedValue({ isAdmin: false, items: [{ ...IW_ITEM, writeBackHere: true }] });
+    vi.mocked(skillsApi.listSkills).mockResolvedValueOnce([{ name: "build" }, { name: "shared-skill", shared: true }]);
+    renderModal();
+    const shared = await screen.findByTestId("skills-editor-modal-section-shared");
+    expect(within(shared).getByRole("button", { name: "Open shared-skill" })).toBeTruthy();
+    expect(screen.getByTestId("skills-editor-modal-switch-agents-shared-skill")).toBeTruthy();
+    await selectSkill("shared-skill");
+    await waitFor(() => expect(skillsApi.enumerateSkillFiles).toHaveBeenCalledWith(1, "shared-skill"));
+    expect(screen.queryByTestId("skills-editor-modal-readonly-banner")).toBeNull();
+    await openSkillMenu();
+    expect(screen.queryByTestId("skills-editor-modal-delete-skill")).toBeNull();
+    expect(screen.queryByTestId("skills-editor-modal-rename-skill")).toBeNull();
+    expect(screen.queryByTestId("skills-editor-modal-promote-skill")).toBeNull();
+  });
+
+  it("non-admin: no Make instance-wide… on their own skills", async () => {
     vi.mocked(iwApi.listInstanceWide).mockResolvedValue({ isAdmin: false, items: [] });
     renderModal();
     await selectSkill("build");

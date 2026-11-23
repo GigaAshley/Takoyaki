@@ -5,14 +5,14 @@ import { syncSummary, type InstanceWideItem } from "@/api/instance-wide-api";
 
 // Marker + quiet sync status for an instance-wide skill or role.
 //
-// Always shows an "instance-wide" chip. When every host is current that's all
+// Always shows an "instance-wide" chip. When every machine is current that's all
 // it shows; otherwise a warning chip ("2 hosts behind", "1 conflict") that
 // toggles a per-host detail list. No alerts — visible when you look.
 
 export function InstanceWideChip({ className }: { className?: string }): JSX.Element {
   return (
     <span
-      title="Managed instance-wide: one master copy, kept in step on every host"
+      title="Managed instance-wide: one master copy, kept in step on every machine it goes to"
       data-testid="instance-wide-chip"
       className={cn(
         "shrink-0 inline-flex items-center gap-1 whitespace-nowrap text-[11px] px-2 py-0.5 rounded-full",

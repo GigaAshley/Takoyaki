@@ -264,7 +264,7 @@ describe("NewConversationPane roles: Test 21 — roles render as rows in the pan
     ]);
   });
 
-  it("Test 21d: a row shows the role's display name, \"· on every host\" for an instance-wide role, and its one-line description; the picked row sits under its machine", async () => {
+  it("Test 21d: a row shows the role's display name, \"· shared\" for an instance-wide role, and its one-line description; the picked row sits under its machine", async () => {
     mockListRolesForHost.mockImplementation(
       rolesByHost({
         1: [
@@ -279,7 +279,7 @@ describe("NewConversationPane roles: Test 21 — roles render as rows in the pan
     expect(rowLabel(roleRow("1/tina")!)).toBe("Tina");
     expect(rowDescription(roleRow("1/tina")!)).toBe("Keeps the books tidy.");
     expect(rowDescription(roleRow("2/tina")!)).toBeNull();
-    expect(rowLabel(roleRow("1/ops")!)).toBe("Ops Crew · on every host");
+    expect(rowLabel(roleRow("1/ops")!)).toBe("Ops Crew · shared");
     expect(rowLabel(roleRow(`1/${NO_ROLES_VALUE}`)!)).toBe("No roles");
     expect(rowDescription(roleRow(`1/${NO_ROLES_VALUE}`)!)).toMatch(/a plain agent/i);
 
@@ -287,7 +287,7 @@ describe("NewConversationPane roles: Test 21 — roles render as rows in the pan
     await waitFor(() => expect(pickedRoleValues()).toEqual(["2/tina"]));
     expect(screen.getByTestId("role-pick-group-2").contains(roleRow("2/tina"))).toBe(true);
     toggleRole("ops");
-    await waitFor(() => expect(pickedRoleLabels()).toEqual(["Ops Crew · on every host"]));
+    await waitFor(() => expect(pickedRoleLabels()).toEqual(["Ops Crew · shared"]));
   });
 
   it("Test 21e: a role with a picture shows it; one without shows its initial", async () => {

@@ -224,8 +224,8 @@ export function RolesLibraryView({
           <ModalBody className="pt-1" data-testid="roles-window-library">
             {shared.length > 0 && (
               <KitSettingsGroup
-                title="On every host"
-                note="One copy, kept in step on every host."
+                title="Shared"
+                note="One copy, kept in step on every machine it goes to."
                 data-testid="roles-window-section-shared"
               >
                 {shared.map(row)}

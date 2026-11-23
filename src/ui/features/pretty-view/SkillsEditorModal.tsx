@@ -54,13 +54,11 @@ import { refreshSkillActions, settleSkillActions } from "./skill-actions-store";
 import {
   INSTANCE_HOST_ID,
   listInstanceWide,
-  previewPromote,
-  promote,
-  promoteConfirmText,
   removeInstanceWide,
   type InstanceWideList,
 } from "@/api/instance-wide-api";
 import { InstanceWideSyncStatus } from "./InstanceWideStatus";
+import { editSharedMachines, shareWithMachines } from "./SharedMachines";
 import { isBlockedSkillName, SKILL_NAME_REFUSED_MESSAGE } from "@/types/blocked-commands";
 import { promptNewSkill, skillNameError } from "./new-skill-flow";
 
@@ -173,9 +171,12 @@ export default function SkillsEditorModal({
   const savingRef = useRef(false);
   const selectedHostIdRef = useRef(selectedHostId);
   selectedHostIdRef.current = selectedHostId;
-  // Instance-wide section: skills whose master copy lives in the app. When
-  // one is picked, every file call goes to INSTANCE_HOST_ID instead of the
-  // selected host. Non-admins see them read-only.
+  // Instance-wide section: the shared skills that go to the selected host's
+  // machine, whose master copy lives in the app. When an admin picks one,
+  // every file call goes to INSTANCE_HOST_ID instead of the selected host.
+  // Everyone else sees them read-only — except where an admin picked this
+  // machine to write the skill back: then they edit the host's copy, and the
+  // sync carries the change to the skill's other machines.
   const [instanceWide, setInstanceWide] = useState<InstanceWideList | null>(null);
   const [selectedIsInstance, setSelectedIsInstance] = useState(false);
   const apiHostId = selectedIsInstance ? INSTANCE_HOST_ID : selectedHostId;
@@ -184,6 +185,9 @@ export default function SkillsEditorModal({
   const selectedIwItem = selectedIsInstance
     ? iwItems.find((i) => i.name === selectedSkillName) ?? null
     : null;
+  // Shared here, whichever copy is being edited (the master, or — on a
+  // write-back machine — the host's).
+  const selectedIsShared = selectedSkillName != null && iwItems.some((i) => i.name === selectedSkillName);
   // On a host that receives shared skills, the host list includes their
   // copies (same folder on disk); this window shows them only in the shared
   // section. Elsewhere a same-named skill is the user's own and stays here.
@@ -214,7 +218,7 @@ export default function SkillsEditorModal({
 
   const refreshInstanceWide = useCallback(async (): Promise<InstanceWideList> => {
     try {
-      const list = await listInstanceWide("skill");
+      const list = await listInstanceWide("skill", selectedHostIdRef.current ?? undefined);
       if (mountedRef.current) setInstanceWide(list);
       return list;
     } catch {
@@ -272,9 +276,10 @@ export default function SkillsEditorModal({
     if (flatHosts.length === 1) setSelectedHostId(Number(flatHosts[0].id));
   }, [open, defaultHostId, flatHosts]);
 
+  // Shared skills are listed for the selected host's machine.
   useEffect(() => {
-    if (open) void refreshInstanceWide();
-  }, [open, refreshInstanceWide]);
+    if (open && selectedHostId != null) void refreshInstanceWide();
+  }, [open, selectedHostId, refreshInstanceWide]);
 
   // Fetch skills list when host changes.
   useEffect(() => {
@@ -618,10 +623,10 @@ export default function SkillsEditorModal({
         void kitAlert({ title: `"${name}" can't be a skill name`, body: SKILL_NAME_REFUSED_MESSAGE });
         return true;
       }
-      if (selectedIsInstance) {
+      if (selectedIsShared) {
         void kitAlert({
           title: `The name has to stay "${selectedSkillName}"`,
-          body: "Skills shared to every host can't be renamed.",
+          body: "Shared skills can't be renamed.",
         });
         return true;
       }
@@ -643,7 +648,7 @@ export default function SkillsEditorModal({
       await performRename(name, { content, expectedMtime: loaded.mtime });
       return true;
     },
-    [selectedSkillName, selectedIsInstance, dirtySet, binaryDrafts, performRename],
+    [selectedSkillName, selectedIsShared, dirtySet, binaryDrafts, performRename],
   );
 
   // Foot Save — dispatches to active tab's save with tracked draft.
@@ -991,32 +996,15 @@ export default function SkillsEditorModal({
     setDirtySet(new Set());
   }, []);
 
-  // "Make instance-wide…" (admins, host skills): preview the size and any
-  // same-name skills on other hosts, confirm with a blanket warning, promote,
-  // then show the skill in the instance-wide section.
+  // "Make instance-wide…" (admins, host skills): pick the machines, preview
+  // the size and any same-name skills on them, confirm with a blanket
+  // warning, promote, then show the skill in the instance-wide section.
   const handlePromote = useCallback(async (): Promise<void> => {
     if (selectedHostId == null || selectedSkillName == null || selectedIsInstance) return;
     const name = selectedSkillName;
     try {
-      const preview = await previewPromote("skill", name, selectedHostId);
-      if (preview.tooLarge) {
-        void kitAlert({
-          title: `"${name}" is too big to make instance-wide`,
-          body: `It has ${preview.files} files. Clean up its folder first.`,
-        });
-        return;
-      }
-      if (
-        !(await kitConfirm({
-          title: `Make "${name}" instance-wide?`,
-          // The text opens with the same question — the title carries it.
-          body: promoteConfirmText("skill", name, preview).replace(/^[^\n]*\n\n?/, ""),
-          confirmLabel: "Make instance-wide",
-        }))
-      )
-        return;
       savingRef.current = true;
-      await promote("skill", name, selectedHostId);
+      if (!(await shareWithMachines({ kind: "skill", name, label: `"${name}"`, hostId: selectedHostId }))) return;
       await refreshInstanceWide();
       const entries = await listSkills(selectedHostId, { includeDistributed: true });
       setSkills({ status: "ready", data: entries });
@@ -1030,15 +1018,38 @@ export default function SkillsEditorModal({
     }
   }, [selectedHostId, selectedSkillName, selectedIsInstance, refreshInstanceWide, clearSkillSelection]);
 
-  // "Delete skill…" on a shared skill (admins): deletes it from every host.
+  // "Machines…" on a shared skill (admins): which machines get it, and which
+  // write it back.
+  const handleMachines = useCallback(async (): Promise<void> => {
+    if (!selectedIsInstance || selectedSkillName == null || !selectedIwItem?.targets) return;
+    const name = selectedSkillName;
+    const result = await editSharedMachines({
+      kind: "skill",
+      name,
+      label: `"${name}"`,
+      hostId: selectedHostId,
+      current: { targets: selectedIwItem.targets, writeBack: selectedIwItem.writeBack ?? [] },
+    });
+    if (!result) return;
+    await refreshInstanceWide();
+    // Taken off this machine: it's on its way out here.
+    if (result.leftHere) {
+      clearSkillSelection();
+      if (selectedHostId != null) {
+        setSkills({ status: "ready", data: await listSkills(selectedHostId, { includeDistributed: true }) });
+      }
+    }
+  }, [selectedIsInstance, selectedSkillName, selectedIwItem, selectedHostId, refreshInstanceWide, clearSkillSelection]);
+
+  // "Delete skill…" on a shared skill (admins): deletes it from every machine it's on.
   const handleRemoveInstance = useCallback(async (): Promise<void> => {
     if (!selectedIsInstance || selectedSkillName == null) return;
     const name = selectedSkillName;
     const count = selectedIwItem?.hostCount ?? 0;
     if (
       !(await kitConfirm({
-        title: `Delete "${name}" from every host?`,
-        body: `It will be deleted from ${count === 0 ? "every host" : count === 1 ? "the 1 host it's on" : `all ${count} hosts it's on`}, along with any changes agents made there. Nobody will have it afterwards. This can't be undone.`,
+        title: `Delete "${name}" from every machine?`,
+        body: `It will be deleted from ${count === 0 ? "every machine it's on" : count === 1 ? "the 1 machine it's on" : `all ${count} machines it's on`}, along with any changes agents made there. Nobody will have it afterwards. This can't be undone.`,
         confirmLabel: "Delete everywhere",
         destructive: true,
       }))
@@ -1141,7 +1152,9 @@ export default function SkillsEditorModal({
   const libraryRows = useMemo<LibraryRow[]>(() => {
     const rows: LibraryRow[] = [];
     for (const i of iwItems) {
-      rows.push({ name: i.name, description: i.description, section: "shared", instance: true, readOnly: !isAdmin, flags: flagsOf(i) });
+      // On a write-back machine a non-admin edits the host's copy.
+      const writer = !isAdmin && i.writeBackHere === true;
+      rows.push({ name: i.name, description: i.description, section: "shared", instance: !writer, readOnly: !isAdmin && !writer, flags: flagsOf(i) });
     }
     for (const s of ownSkills) {
       rows.push({ name: s.name, description: s.description, section: "own", instance: false, readOnly: false, flags: flagsOf(s) });
@@ -1373,10 +1386,10 @@ export default function SkillsEditorModal({
           <ModalBody className="pt-1" data-testid="skills-editor-modal-library">
             {section(
               "shared",
-              "Shared to every host",
+              "Shared",
               isAdmin
-                ? "One copy, kept in step on every host. Changes here reach every host."
-                : "One copy, kept in step on every host by an admin. Use them like your own; only an admin can change them.",
+                ? "One copy, kept in step on every machine it goes to. Changes here reach all of them."
+                : "One copy, kept in step by an admin. Use them like your own; only an admin can change them.",
             )}
             {section("own", "Your skills")}
             {section(
@@ -1543,7 +1556,7 @@ export default function SkillsEditorModal({
       <KitBanner tone="info" data-testid="skills-editor-modal-readonly-banner">
         {selectedRow.section === "distributed"
           ? "Fleet-distributed — installed on every machine by your administrator. It's view-only here."
-          : "Shared to every host and kept in step by an admin — use it like your own; only an admin can change it."}
+          : "Shared and kept in step by an admin — use it like your own; only an admin can change it."}
       </KitBanner>
     ) : (
       <div className="flex flex-row flex-wrap items-center gap-x-5 gap-y-2.5">
@@ -1583,11 +1596,11 @@ export default function SkillsEditorModal({
       items={[
         // Admin status is unknown until the shared list loads; hold the
         // slot (disabled) until then.
-        ...(!selectedIsInstance && !selectedIsDistributed && (isAdmin || instanceWide == null)
+        ...(!selectedIsShared && !selectedIsDistributed && (isAdmin || instanceWide == null)
           ? [
               {
-                label: "Share to every host…",
-                hint: instanceWide == null ? "Loading…" : "Keep one copy of this skill in step on every host",
+                label: "Make instance-wide…",
+                hint: instanceWide == null ? "Loading…" : "Keep one copy of this skill in step on the machines you pick",
                 disabled: instanceWide == null,
                 testId: "skills-editor-modal-promote-skill",
                 onClick: () => {
@@ -1596,12 +1609,21 @@ export default function SkillsEditorModal({
               },
             ]
           : []),
-        ...(selectedIsInstance
-          ? isAdmin
+        ...(selectedIsShared
+          ? isAdmin && selectedIsInstance
             ? [
                 {
+                  label: "Machines…",
+                  hint: "Where it goes, and which machines write it back",
+                  disabled: !selectedIwItem?.targets,
+                  testId: "skills-editor-modal-machines",
+                  onClick: () => {
+                    void handleMachines();
+                  },
+                },
+                {
                   label: "Delete skill…",
-                  hint: "Deletes it from every host",
+                  hint: "Deletes it from every machine it's on",
                   danger: true,
                   testId: "skills-editor-modal-remove-instance-skill",
                   onClick: () => {

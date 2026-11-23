@@ -164,23 +164,23 @@ export function RolesWindow({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
-  // ── Shared data: shared-role list (also says whether you're an admin),
-  //    this host's roles, its archived roles ──────────────────────────────
+  // ── Shared data: the shared roles that go to this host's machine (also
+  //    says whether you're an admin), this host's roles, its archived roles ──
   const [instanceWide, setInstanceWide] = useState<InstanceWideList | null>(null);
   const [iwKey, setIwKey] = useState(0);
   useEffect(() => {
-    if (!open) {
+    if (!open || hostId == null) {
       setInstanceWide(null);
       return;
     }
     let cancelled = false;
-    listInstanceWide("role")
+    listInstanceWide("role", hostId)
       .then((list) => !cancelled && setInstanceWide(list))
       .catch(() => !cancelled && setInstanceWide({ isAdmin: false, items: [] }));
     return () => {
       cancelled = true;
     };
-  }, [open, iwKey]);
+  }, [open, hostId, iwKey]);
   const isAdmin = instanceWide?.isAdmin ?? false;
 
   const [roles, setRoles] = useState<TabState<RoleSummary[]>>({ status: "loading" });
@@ -230,22 +230,30 @@ export function RolesWindow({
   }, [open, hostId, archivedKey]);
 
   // ── Agents per role ──────────────────────────────────────────────────────
-  // Shared ("instance-wide") — from the role itself or the shared list (a
-  // role opened from an agent's window may not carry the flag).
+  // Shared ("instance-wide") to this machine — from the role itself or the
+  // shared list (a role opened from an agent's window may not carry the flag).
   const isShared = useCallback(
     (role: Pick<RoleSummary, "name" | "instanceWide">): boolean =>
       !!role.instanceWide || !!instanceWide?.items.some((i) => i.name === role.name),
     [instanceWide],
   );
 
-  // A shared role counts its agents on every host.
+  // A shared role counts its agents on the machines it goes to (admins know
+  // which; for everyone else, every host as before).
   const { identities } = useIdentities();
   const agentsHolding = useCallback(
     (role: Pick<RoleSummary, "name" | "instanceWide">): typeof identities => {
-      const everyHost = isShared(role);
-      return identities.filter((i) => identityRoles(i).includes(role.name) && (everyHost || i.hostId === hostId));
+      const shared = isShared(role);
+      const item = shared ? instanceWide?.items.find((i) => i.name === role.name) : undefined;
+      const reach =
+        item && item.hosts.length > 0 ? new Set(item.hosts.flatMap((h) => h.hostRowIds ?? [])) : null;
+      return identities.filter(
+        (i) =>
+          identityRoles(i).includes(role.name) &&
+          (shared ? reach === null || (i.hostId != null && reach.has(String(i.hostId))) : i.hostId === hostId),
+      );
     },
-    [identities, hostId, isShared],
+    [identities, hostId, isShared, instanceWide],
   );
 
   // A role just archived (from its view or a swipe in the list) leaves the list.

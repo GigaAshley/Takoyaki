@@ -262,10 +262,32 @@ describe("role view — facts line and tabs", () => {
     expect(screen.getByTestId("role-view-facts").textContent).toMatch(new RegExp("^" + "No agents hold this role"));
   });
 
-  it("a shared role lives 'on every host' and counts its agents everywhere", async () => {
+  it("a shared role says it's shared and, for a non-admin, counts its agents everywhere", async () => {
     store.identities = [agent("sam", ["support-bot"], 9)];
     await openRole("support-bot");
-    expect(screen.getByTestId("role-view-facts").textContent).toMatch(new RegExp("^" + "1 agent holds this role · on every host"));
+    expect(screen.getByTestId("role-view-facts").textContent).toMatch(new RegExp("^" + "1 agent holds this role · shared"));
+  });
+
+  it("an admin sees how far a shared role reaches, and its agents only on those machines", async () => {
+    m.listInstanceWide.mockResolvedValue({
+      isAdmin: true,
+      items: [
+        {
+          ...SUPPORT_ITEM,
+          targets: [String(HOST_ID), "9"],
+          writeBack: [],
+          hosts: [
+            { machineId: String(HOST_ID), hostName: "boreal", hostRowIds: [String(HOST_ID)], state: "current" },
+            { machineId: "9", hostName: "nine", hostRowIds: ["9"], state: "current" },
+          ],
+        },
+      ],
+    });
+    store.identities = [agent("sam", ["support-bot"], 9), agent("ola", ["support-bot"], 7)];
+    await openRole("support-bot");
+    await waitFor(() =>
+      expect(screen.getByTestId("role-view-facts").textContent).toMatch(new RegExp("^" + "1 agent holds this role · on 2 machines")),
+    );
   });
 
   it("tabs are Role file / Skills / Files — no skill count; Git only when the folder has a repo", async () => {
@@ -453,11 +475,18 @@ describe("role view — ⋯ menu", () => {
     await openRole();
     const menu = await openMenu("role-view-menu");
     fireEvent.click(within(menu).getByTestId("role-view-promote"));
-    await waitFor(() => expect(m.promote).toHaveBeenCalledWith("role", "box-maintainer", HOST_ID));
-    expect(m.previewPromote).toHaveBeenCalledWith("role", "box-maintainer", HOST_ID);
+    await waitFor(() =>
+      expect(m.promote).toHaveBeenCalledWith("role", "box-maintainer", HOST_ID, { targets: "all", writeBack: [] }),
+    );
+    expect(m.previewPromote).toHaveBeenCalledWith("role", "box-maintainer", HOST_ID, "all");
+    // First the machine picker, then what gets copied.
     expect(dialogs.calls[0].opts.title).toBe("Make Box Maintainer instance-wide?");
+    expect((dialogs.calls[0].opts as { confirmLabel?: string }).confirmLabel).toBe("Continue");
+    expect((dialogs.calls[1].opts as { confirmLabel?: string }).confirmLabel).toBe("Make instance-wide");
+    expect(String(dialogs.calls[1].opts.body)).toContain("copied to every machine");
     await waitFor(() => expect(m.listInstanceWide.mock.calls.length).toBeGreaterThan(1));
-    await waitFor(() => expect(screen.getByTestId("role-view-facts").textContent).toContain("on every host"));
+    expect(m.listInstanceWide).toHaveBeenCalledWith("role", HOST_ID);
+    await waitFor(() => expect(screen.getByTestId("role-view-facts").textContent).toContain("shared"));
   });
 
   it("admin: declining the promote confirm does nothing", async () => {
@@ -466,7 +495,9 @@ describe("role view — ⋯ menu", () => {
     await openRole();
     const menu = await openMenu("role-view-menu");
     fireEvent.click(within(menu).getByTestId("role-view-promote"));
-    await waitFor(() => expect(m.previewPromote).toHaveBeenCalled());
+    await waitFor(() => expect(m.listSharedMachines).toHaveBeenCalled());
+    await new Promise((r) => setTimeout(r, 0));
+    expect(m.previewPromote).not.toHaveBeenCalled();
     expect(m.promote).not.toHaveBeenCalled();
   });
 
@@ -476,25 +507,36 @@ describe("role view — ⋯ menu", () => {
     const dialogs = autoAnswerKitDialogs({ confirm: true });
     await openRole();
     fireEvent.click(within(await openMenu("role-view-menu")).getByTestId("role-view-promote"));
-    await waitFor(() => expect(dialogs.calls).toHaveLength(1));
-    expect(dialogs.calls[0].kind).toBe("alert");
-    expect(String(dialogs.calls[0].opts.body)).toContain("9000 files");
+    await waitFor(() => expect(dialogs.calls).toHaveLength(2));
+    expect(dialogs.calls[1].kind).toBe("alert");
+    expect(String(dialogs.calls[1].opts.body)).toContain("9000 files");
     expect(m.promote).not.toHaveBeenCalled();
   });
 
-  it("admin: Delete from every host… names how many hosts, removes it everywhere and goes back to the library", async () => {
+  it("admin: Delete from every machine… names how many machines, removes it everywhere and goes back to the library", async () => {
     m.listInstanceWide.mockResolvedValue({ isAdmin: true, items: [SUPPORT_ITEM] });
     const dialogs = autoAnswerKitDialogs({ confirm: true });
     await openRole("support-bot");
     const menu = await openMenu("role-view-menu");
     expect(within(menu).queryByTestId("role-view-promote")).toBeNull();
-    expect(within(menu).getByTestId("role-view-delete-everywhere").textContent).toContain("Delete from every host…");
+    expect(within(menu).getByTestId("role-view-delete-everywhere").textContent).toContain("Delete from every machine…");
     fireEvent.click(within(menu).getByTestId("role-view-delete-everywhere"));
     await waitFor(() => expect(m.removeInstanceWide).toHaveBeenCalledWith("role", "support-bot"));
-    expect(dialogs.calls[0].opts.title).toBe("Delete Support Bot from every host?");
-    expect(String(dialogs.calls[0].opts.body)).toMatch(/all 4 hosts/);
+    expect(dialogs.calls[0].opts.title).toBe("Delete Support Bot from every machine?");
+    expect(String(dialogs.calls[0].opts.body)).toMatch(/all 4 machines/);
     expect((dialogs.calls[0].opts as { confirmLabel?: string }).confirmLabel).toBe("Delete everywhere");
     await expectLibrary();
+  });
+
+  it("admin: Machines… opens the machine picker on the role's lists; nothing changed saves nothing", async () => {
+    m.listInstanceWide.mockResolvedValue({ isAdmin: true, items: [{ ...SUPPORT_ITEM, targets: "all", writeBack: ["1"] }] });
+    const dialogs = autoAnswerKitDialogs({ confirm: true });
+    await openRole("support-bot");
+    const menu = await openMenu("role-view-menu");
+    fireEvent.click(within(menu).getByTestId("role-view-machines"));
+    await waitFor(() => expect(dialogs.calls).toHaveLength(1));
+    expect(dialogs.calls[0].opts.title).toBe("Machines for Support Bot");
+    expect(m.saveMachines).not.toHaveBeenCalled();
   });
 
   it("Archive role… is one confirm naming the agents that hold it; yes archives and returns to the library", async () => {
@@ -563,14 +605,14 @@ describe("role view — ⋯ menu", () => {
     expect(screen.getByTestId("role-view-facts")).toBeTruthy();
   });
 
-  it("a shared role's Archive is greyed out, pointing at deleting it from every host (admin)", async () => {
+  it("a shared role's Archive is greyed out, pointing at its machine list (admin)", async () => {
     m.listInstanceWide.mockResolvedValue({ isAdmin: true, items: [SUPPORT_ITEM] });
     const dialogs = autoAnswerKitDialogs({ confirm: true });
     await openRole("support-bot");
     const menu = await openMenu("role-view-menu");
     const archive = within(menu).getByTestId("role-view-archive");
     expect(archive.getAttribute("aria-disabled")).toBe("true");
-    expect(archive.textContent).toContain("A shared role is deleted from every host instead");
+    expect(archive.textContent).toContain("A shared role is taken off machines under Machines… instead");
     fireEvent.click(archive);
     expect(dialogs.calls).toHaveLength(0);
     expect(m.archiveRole).not.toHaveBeenCalled();
@@ -643,6 +685,18 @@ describe("role view — a shared role for a non-admin is view-only", () => {
     const menu = await openMenu("role-view-menu");
     expect(within(menu).getByTestId("role-view-archive").getAttribute("aria-disabled")).toBe("true");
     expect(within(menu).getByTestId("role-view-archive").textContent).toContain("Only an admin can change a shared role");
+  });
+
+  it("on a machine that writes the role back, a non-admin can edit it", async () => {
+    m.listInstanceWide.mockResolvedValue({ isAdmin: false, items: [{ ...SUPPORT_ITEM, writeBackHere: true }] });
+    await openRole("support-bot");
+    expect(await screen.findByTestId("role-view-edit")).toBeTruthy();
+    expect(screen.queryByTestId("role-view-readonly-note")).toBeNull();
+    expect(screen.getByText("Changes reach the role's other machines.")).toBeTruthy();
+    const menu = await openMenu("role-view-menu");
+    // Still no sharing actions — those stay with admins.
+    expect(within(menu).queryByTestId("role-view-machines")).toBeNull();
+    expect(within(menu).queryByTestId("role-view-delete-everywhere")).toBeNull();
   });
 
   it("skills: listed but no New skill (also not on the empty state)", async () => {

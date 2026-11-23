@@ -130,7 +130,7 @@
     "newSessionNamePickRoleFirst": "Pick a role first",
     "newSessionNoRoles": "No roles",
     "newSessionNoRolesDescription": "A plain agent — give it roles later if you like.",
-    "newSessionOnEveryHost": "· on every host",
+    "newSessionOnEveryHost": "· shared",
     "newSessionSearchRoles": "Search roles",
     "newSessionLoadingRoles": "Loading roles…",
     "newSessionNoMatchingRoles": "No matching roles",

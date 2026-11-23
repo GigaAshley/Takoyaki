@@ -66,11 +66,11 @@ afterEach(() => {
 // ─── Library ────────────────────────────────────────────────────────────────
 
 describe("roles window — library", () => {
-  it("lists shared roles first under 'On every host', then the host's own under 'On <host>'", async () => {
+  it("lists shared roles first under 'Shared', then the host's own under 'On <host>'", async () => {
     renderWindow();
     const shared = await screen.findByTestId("roles-window-section-shared");
     const own = screen.getByTestId("roles-window-section-host");
-    expect(within(shared).getByRole("heading").textContent).toBe("On every host");
+    expect(within(shared).getByRole("heading").textContent).toBe("Shared");
     expect(within(own).getByRole("heading").textContent).toBe("On boreal");
     // Shared section comes first in the document.
     expect(shared.compareDocumentPosition(own) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();

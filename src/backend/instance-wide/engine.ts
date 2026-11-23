@@ -82,6 +82,8 @@ export type HostSyncState = "current" | "behind" | "conflict" | "offline";
 export interface ItemHostStatus {
   machineId: string;
   hostName: string;
+  /** Every hosts row that reaches this machine. */
+  hostRowIds: string[];
   state: HostSyncState;
   detail?: string;
   lastContactAt?: number;
@@ -648,6 +650,7 @@ export class InstanceWideEngine {
         const base: ItemHostStatus = {
           machineId: m.machineId,
           hostName: m.hostName,
+          hostRowIds: m.hostRowIds,
           state: "current",
           lastContactAt: ms?.lastContactAt,
         };

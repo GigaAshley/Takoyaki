@@ -5,7 +5,9 @@
 // files, and git when the folder holds a repo. Actions (start a
 // conversation, sharing, archive) are in the ⋯ menu.
 //
-// Non-admins looking at a shared role get all of it view-only.
+// Non-admins looking at a shared role get all of it view-only — unless an
+// admin picked this machine to write the role back. Admins choose where a
+// shared role goes, and which machines write it back, under Machines… in ⋯.
 //
 // Every per-field save merges one frontmatter key into the server-echoed
 // role file and writes the whole file back (see role-frontmatter.ts).
@@ -34,13 +36,8 @@ import {
 import { RowGestures, RowKebabMenu, type RowKebabMenuItem } from "@/features/pretty-conversations/RowKebabMenu";
 import { roleAvatarUrl, updateRoleAvatarByName, type RoleSummary } from "@/api/identities-api";
 import { getRoleFileByName, updateRoleFileByName } from "@/api/claude-session-api";
-import {
-  previewPromote,
-  promote,
-  promoteConfirmText,
-  removeInstanceWide,
-  type InstanceWideItem,
-} from "@/api/instance-wide-api";
+import { reachLabel, reachText, removeInstanceWide, type InstanceWideItem } from "@/api/instance-wide-api";
+import { editSharedMachines, shareWithMachines } from "../SharedMachines";
 import { confirmAndArchiveRole, confirmAndDeleteRoleSkill } from "./role-actions";
 import {
   createRoleSkill,
@@ -153,7 +150,9 @@ export function RoleView({
 }: RoleViewProps): JSX.Element {
   const name = role.name;
   const label = roleDisplayName(name, role.displayName);
-  const readOnly = shared && !isAdmin;
+  // A non-admin may change a shared role only where this machine writes it back.
+  const writesBackHere = shared && !isAdmin && instanceWideItem?.writeBackHere === true;
+  const readOnly = shared && !isAdmin && !writesBackHere;
 
   // ── Role file ────────────────────────────────────────────────────────────
   const [roleFile, setRoleFile] = useState<TabState<string>>({ status: "loading" });
@@ -543,35 +542,37 @@ export function RoleView({
 
   // ── Menu actions ─────────────────────────────────────────────────────────
   const handlePromote = async (): Promise<void> => {
-    try {
-      const preview = await previewPromote("role", name, hostId);
-      if (preview.tooLarge) {
-        void kitAlert({ title: `${label} is too big to make instance-wide`, body: `It has ${preview.files} files. Clean up its folder first.` });
-        return;
-      }
-      if (
-        !(await kitConfirm({
-          title: `Make ${label} instance-wide?`,
-          body: promoteConfirmText("role", name, preview).replace(/^[^\n]*\n\n?/, ""),
-          confirmLabel: "Make instance-wide",
-        }))
-      )
-        return;
-      await promote("role", name, hostId);
-      console.info({ operation: "role_promoted", hostId, roleName: name });
-      onRoleChanged({ instanceWide: true });
-      onSharingChanged();
-    } catch (err) {
-      void kitAlert({ title: "Couldn't make it instance-wide", body: err instanceof Error ? err.message : undefined });
-    }
+    if (!(await shareWithMachines({ kind: "role", name, label, hostId }))) return;
+    console.info({ operation: "role_promoted", hostId, roleName: name });
+    onRoleChanged({ instanceWide: true });
+    onSharingChanged();
+  };
+
+  const handleMachines = async (): Promise<void> => {
+    if (!instanceWideItem?.targets) return;
+    const result = await editSharedMachines({
+      kind: "role",
+      name,
+      label,
+      hostId,
+      current: { targets: instanceWideItem.targets, writeBack: instanceWideItem.writeBack ?? [] },
+      agentsOn: (m) =>
+        agents
+          .filter((a) => a.hostId != null && m.hostRowIds.includes(String(a.hostId)))
+          .map((a) => a.displayName || a.identityKey),
+    });
+    if (!result) return;
+    onSharingChanged();
+    // Taken off the machine this window is looking at: it's on its way out here.
+    if (result.leftHere) onBack();
   };
 
   const handleDeleteEverywhere = async (): Promise<void> => {
     const count = instanceWideItem?.hostCount ?? 0;
     if (
       !(await kitConfirm({
-        title: `Delete ${label} from every host?`,
-        body: `It will be deleted from ${count === 0 ? "every host" : count === 1 ? "the 1 host it's on" : `all ${count} hosts it's on`}, along with anything agents saved in it there. Nobody will have it afterwards. This can't be undone.`,
+        title: `Delete ${label} from every machine?`,
+        body: `It will be deleted from ${count === 0 ? "every machine it's on" : count === 1 ? "the 1 machine it's on" : `all ${count} machines it's on`}, along with anything agents saved in it there. Nobody will have it afterwards. This can't be undone.`,
         confirmLabel: "Delete everywhere",
         destructive: true,
       }))
@@ -600,28 +601,39 @@ export function RoleView({
     },
     ...(isAdmin
       ? [
-          shared
-            ? {
-                label: "Delete from every host…",
-                hint: "Nobody will have it afterwards",
-                danger: true,
-                separatorBefore: true,
-                onClick: () => void handleDeleteEverywhere(),
-                testId: "role-view-delete-everywhere",
-              }
-            : {
-                label: "Make instance-wide…",
-                hint: "Keep one copy in step on every host",
-                separatorBefore: true,
-                onClick: () => void handlePromote(),
-                testId: "role-view-promote",
-              },
+          ...(shared
+            ? [
+                {
+                  label: "Machines…",
+                  hint: "Where it goes, and which machines write it back",
+                  separatorBefore: true,
+                  disabled: !instanceWideItem?.targets,
+                  onClick: () => void handleMachines(),
+                  testId: "role-view-machines",
+                },
+                {
+                  label: "Delete from every machine…",
+                  hint: "Nobody will have it afterwards",
+                  danger: true,
+                  onClick: () => void handleDeleteEverywhere(),
+                  testId: "role-view-delete-everywhere",
+                },
+              ]
+            : [
+                {
+                  label: "Make instance-wide…",
+                  hint: "Keep one copy in step on the machines you pick",
+                  separatorBefore: true,
+                  onClick: () => void handlePromote(),
+                  testId: "role-view-promote",
+                },
+              ]),
         ]
       : []),
     shared
       ? {
           label: "Archive role…",
-          hint: isAdmin ? "A shared role is deleted from every host instead" : "Only an admin can change a shared role",
+          hint: isAdmin ? "A shared role is taken off machines under Machines… instead" : "Only an admin can change a shared role",
           disabled: true,
           separatorBefore: true,
           testId: "role-view-archive",
@@ -642,9 +654,8 @@ export function RoleView({
     agents.length === 0
       ? "No agents hold this role"
       : `${plural(agents.length, "agent")} ${agents.length === 1 ? "holds" : "hold"} this role`,
-    // The machine isn't named (owner\'s call, 2026-10-22); a shared role still says
-    // it's kept on every host.
-    shared ? "on every host" : null,
+    // Admins see how far it reaches; everyone else just that it's shared.
+    shared ? reachLabel(instanceWideItem, isAdmin) : null,
   ]
     .filter(Boolean)
     .join(" · ");
@@ -965,7 +976,11 @@ export function RoleView({
       </>
     );
 
-  const footNote = shared && !readOnly ? "Changes go to every host." : null;
+  const footNote = !shared || readOnly
+    ? null
+    : isAdmin && instanceWideItem?.targets
+      ? `Changes go to ${reachText(instanceWideItem.targets)}${instanceWideItem.targets === "all" ? "" : " it's on"}.`
+      : "Changes reach the role's other machines.";
 
   return (
     <>
