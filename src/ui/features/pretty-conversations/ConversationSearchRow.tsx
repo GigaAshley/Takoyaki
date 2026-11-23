@@ -1,14 +1,6 @@
 /**
  * Single result row for the conversation search modal.
  *
- * Phase 143 D-11 / D-12 / D-13 / D-14: Archived-identity rows now carry an
- * always-visible RowKebabMenu (three-dots ⋮) in the right-side slot, replacing
- * the chevron for archived rows. The menu contains a single "Un-archive" item.
- * Kebab click stops propagation so the row's default onClick does NOT fire
- * (D-14). Only render the kebab when `result.isArchived === true` AND
- * `onUnarchive` is provided — non-archived rows are unaffected.
- * See .planning/campaigns/un-archiving/shape-unarchive-frontend-backend.md
- *
  * Anatomy (apple-ux: the kit's KitListRow, passages in its subtitle):
  *   Avatar (avatarUrl → initial-letter fallback, hue = result.colorHue,
  *   gold sheen for multi-role via .pv-multi-role's --pv-mr-sheen) + title
@@ -31,8 +23,8 @@
  * hostName is intentionally NOT rendered. Tasting dropped it; per user
  * 2026-09-29: "if tasting dropped something then we are not re-adding it".
  *
- * Archived pill retained — real behavior signal (parent routes archived
- * clicks to kebab-menu Un-archive path per D-11/D-12/D-13/D-14).
+ * Archived pill retained — a click opens the view-only archived
+ * conversation, where un-archiving happens.
  *
  * The row is focusable (role=button via KitListRow) so keyboard focus +
  * Enter/Space activate it. Parent (ConversationSearchModal) provides the
@@ -63,13 +55,7 @@ import {
   useRelayRoomMembers,
   type RelayRoomMember,
 } from "@/features/pretty-view/relay-room-members";
-import { Loader2 } from "lucide-react";
 import { KitChip, KitListRow } from "@/components/kit";
-import {
-  RowKebabMenu,
-  useRowKebabContextMenu,
-  type RowKebabMenuItem,
-} from "./RowKebabMenu";
 
 const FALLBACK_HUE = 190;
 
@@ -78,16 +64,6 @@ export interface ConversationSearchRowProps {
   onClick: () => void;
   /** The fired query — every occurrence is highlighted in the passages. */
   query?: string;
-  /**
-   * Phase 143 D-11 / D-12 / D-13 / D-14 — when provided and
-   * result.isArchived === true, the row renders an always-visible RowKebabMenu
-   * with a single "Un-archive" item. Kebab click stops propagation (handled
-   * inside RowKebabMenu) so the row onClick does NOT fire (D-14). Non-archived
-   * rows are unaffected.
-   */
-  onUnarchive?: (result: ConversationSearchResult) => void;
-  /** True while an un-archive of this row is in flight: spinner, no menu. */
-  unarchiving?: boolean;
   /** Injected in tests; falls back to Date.now() so relative-time rendering
    *  is deterministic under vitest. */
   now?: number;
@@ -215,8 +191,6 @@ export function ConversationSearchRow({
   result,
   onClick,
   query = "",
-  onUnarchive,
-  unarchiving = false,
   now,
 }: ConversationSearchRowProps): JSX.Element {
   const name = result.displayName ?? result.identityKey;
@@ -287,36 +261,15 @@ export function ConversationSearchRow({
     body = <span className={cn(SNIPPET_CLASS, "mt-1.5")}>{result.snippet}</span>;
   }
 
-  // Phase 143 D-11 / D-12 / D-13 / D-14: render the kebab only on archived
-  // rows when the onUnarchive callback is provided. The kebab replaces the
-  // chevron slot for archived rows; non-archived rows are unaffected.
-  const showKebab = result.isArchived && onUnarchive != null && !unarchiving;
-  const kebabItems: RowKebabMenuItem[] = showKebab
-    ? [
-        {
-          label: "Un-archive",
-          onClick: () => onUnarchive!(result),
-        },
-      ]
-    : [];
-  // Right-click the row → same kebab menu at the cursor (no-op when the row
-  // has no kebab: empty items leave the native context menu alone).
-  const kebabContextMenu = useRowKebabContextMenu(kebabItems);
-
   return (
     <KitListRow
       onActivate={onClick}
-      onContextMenu={kebabContextMenu.onContextMenu}
-      {...kebabContextMenu.holdProps}
       data-testid={`conversation-search-row-${result.transcriptPath}`}
       data-archived={result.isArchived ? "true" : "false"}
       data-hue={hue}
       dim={result.isArchived}
       className={cn(
         "!items-start [&_.k-item-main]:!items-start",
-        // The menu floats over the title line's end instead of taking a
-        // column of its own beside the passages.
-        showKebab && "[&_.k-item-trail]:absolute [&_.k-item-trail]:top-[5px] [&_.k-item-trail]:right-[10px]",
         isMultiRole && "pv-multi-role", neutralLook && "pv-neutral")}
       style={isMultiRole ? ({ "--pv-mr-h": String(hue) } as CSSProperties) : undefined}
       avatarColor={
@@ -330,19 +283,10 @@ export function ConversationSearchRow({
         </span>
       }
       title={
-        <span className={cn("flex items-center gap-2 min-w-0", showKebab && "pr-9")}>
+        <span className={"flex items-center gap-2 min-w-0"}>
           <span data-part="name" className="truncate min-w-0 flex-1">{title}</span>
           <span className="text-[12px] font-normal text-[var(--k-t3)] whitespace-nowrap">{when}</span>
-          {result.isArchived && (
-            <KitChip>{unarchiving ? "un-archiving…" : "archived"}</KitChip>
-          )}
-          {unarchiving && (
-            <Loader2
-              className="size-4 animate-spin shrink-0 text-[var(--k-t3)]"
-              aria-label="Un-archiving"
-              data-testid={`conversation-search-unarchiving-${result.identityKey}-${result.hostId}`}
-            />
-          )}
+          {result.isArchived && <KitChip>archived</KitChip>}
         </span>
       }
       wrapSubtitle
@@ -361,16 +305,6 @@ export function ConversationSearchRow({
           </span>
           {body}
         </>
-      }
-      trailing={kebabContextMenu.menu}
-      menu={
-        showKebab ? (
-          <RowKebabMenu
-            testId={`conversation-search-archived-row-kebab-${result.identityKey}-${result.hostId}`}
-            ariaLabel={`Row menu for ${result.identityKey}`}
-            items={kebabItems}
-          />
-        ) : undefined
       }
     />
   );

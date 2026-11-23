@@ -13,6 +13,7 @@ import type { ArchivedIdentityLook, ArchivedStateEvent } from "@/api/claude-sess
 import { unarchiveIdentity } from "@/api/identity-unarchive-api";
 import { useIdentities, refreshOneIdentity } from "@/state/identities-store";
 import { clearPendingArchive, getFleetSessionsSnapshot, useConversations } from "@/state/conversation-store";
+import { removeResultByIdentity } from "@/state/search-store";
 import { useIsMobile } from "@/hooks/use-mobile";
 import { encodeWorkspaceSpec, specForTab } from "@/lib/tab-url";
 import { KitButton } from "@/components/kit";
@@ -97,6 +98,8 @@ export function ArchivedConversationPane({
     flippedRef.current = true;
     console.info(`[archived-view] agent back hostId=${hostId} identity=${identityKey} tabId=${tab.id}`);
     clearPendingArchive(hostId, identityKey);
+    // Search's archived row for it is stale now.
+    removeResultByIdentity(hostId, identityKey);
     // An open agent window stays open, on the same tab, once live.
     if (windowState.current.open) noteAgentWindowReopen(tab.id, windowState.current.tab);
     requestArchivedTabLive(tab.id);

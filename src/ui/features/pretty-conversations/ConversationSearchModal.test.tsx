@@ -12,9 +12,8 @@
  *   T-06  Row DOM contains NO dangerouslySetInnerHTML (grep the HTML)
  *   T-07  D-04/D-14: clicking active row → onOpenActiveConversation +
  *         onOpenChange(false)
- *   T-08  D-15/D-27: RETIRED — see breadcrumb below. Phase 143 replaces
- *         this behavior with kebab-menu Un-archive; see the "Phase 143 —
- *         kebab-menu Un-archive" describe block for new coverage.
+ *   T-08  archived rows: no menu; a click opens the view-only archived
+ *         conversation (see "archived rows" below)
  *   T-09  D-12: Load more visible when hasMore, click calls
  *         searchConversations(query, results.length, 20) and appends
  *   T-10  D-12: Load more hidden when hasMore false
@@ -39,6 +38,7 @@ import { seededArchivedLook } from "@/features/archived-view/archived-identity";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { useState } from "react";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -56,24 +56,7 @@ vi.mock("@/api/conversation-search-api", () => ({
     searchConversationsMock(query, offset, limit),
 }));
 
-// Phase 143 Plan 143-10 — mock unarchiveIdentity for kebab Un-archive tests.
-const unarchiveIdentityMock = vi.fn<
-  (
-    hostId: number,
-    identityKey: string,
-  ) => Promise<{ ok: true; outcome: "restored" | "pending" }>
->();
-vi.mock("@/api/identity-unarchive-api", async (importOriginal) => {
-  const orig = (await importOriginal()) as Record<string, unknown>;
-  return {
-    ...orig,
-    unarchiveIdentity: (hostId: number, identityKey: string) =>
-      unarchiveIdentityMock(hostId, identityKey),
-  };
-});
-
-// jsdom does not implement ResizeObserver; stub it so Radix DropdownMenu
-// (used by RowKebabMenu in archived rows) doesn't throw when the portal mounts.
+// jsdom does not implement ResizeObserver; stub it for kit components.
 if (typeof window !== "undefined" && !window.ResizeObserver) {
   window.ResizeObserver = class {
     observe() {}
@@ -83,23 +66,14 @@ if (typeof window !== "undefined" && !window.ResizeObserver) {
 }
 
 // Import store + component AFTER the mock
-import { _resetForTests, useSearchState } from "@/state/search-store";
+import { _resetForTests, removeResultByIdentity, useSearchState } from "@/state/search-store";
 import { ConversationSearchModal } from "./ConversationSearchModal";
-import { UnarchiveError } from "@/api/identity-unarchive-api";
 import {
-  markPendingArchive,
   upsertFleetSession,
   __getFleetOnlyRowsForTest,
   __resetFleetSessionsForTest,
 } from "@/state/conversation-store";
 import { autoAnswerKitDialogs, __resetKitDialogsForTests } from "@/components/kit";
-
-/** The i-th kit notice as one line: "<title> — <body>". */
-function kitAlertText(d: ReturnType<typeof autoAnswerKitDialogs>, i: number): string {
-  const alerts = d.calls.filter((c) => c.kind === "alert");
-  const o = alerts[i]?.opts;
-  return o ? `${String(o.title)}${o.body ? ` — ${String(o.body)}` : ""}` : "";
-}
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -136,8 +110,6 @@ function makeRow(overrides: Partial<ConversationSearchResult> = {}): Conversatio
 
 beforeEach(() => {
   searchConversationsMock.mockReset();
-  unarchiveIdentityMock.mockReset();
-  unarchiveIdentityMock.mockResolvedValue({ ok: true, outcome: "restored" });
   _resetForTests();
 });
 
@@ -460,13 +432,6 @@ describe("ConversationSearchModal: D-04 / D-14 active-click routes to open flow"
   });
 });
 
-// Phase 143 (un-archiving shape 2, D-27): the T-08 test that pinned the "coming soon" left-click
-// alert on archived rows has been REMOVED. The alert is retired (D-11) in favor of the always-
-// visible three-dots kebab menu for Un-archive. New coverage of the kebab-menu Un-archive path
-// (including endpoint-first sequence + D-17's distinct missing_roles alert copy) lives in the
-// "Phase 143 — kebab-menu Un-archive on archived-identity rows" describe block below.
-// Ref: .planning/campaigns/un-archiving/shape-unarchive-frontend-backend.md
-
 describe("ConversationSearchModal: D-12 load-more pagination", () => {
   it("T-09: Load more visible when hasMore, click fires searchConversations(query, results.length, 20) and appends", async () => {
     // First page: 2 rows, hasMore true
@@ -677,8 +642,8 @@ describe("ConversationSearchModal: D-03 no global keyboard shortcut", () => {
   });
 });
 
-// ─── Phase 143 — kebab-menu Un-archive on archived-identity rows (D-11, D-16, D-17, D-19) ───
-describe("Phase 143 — kebab-menu Un-archive on archived-identity rows (D-11, D-16, D-17, D-19)", () => {
+// ─── Archived rows: no menu — un-archiving happens in the archived conversation pane ───
+describe("ConversationSearchModal: archived rows", () => {
   // Helper to seed the store with search results via the search API mock,
   // then fire the Enter search.
   async function searchAndGetResults(
@@ -696,7 +661,7 @@ describe("Phase 143 — kebab-menu Un-archive on archived-identity rows (D-11, D
     }
   }
 
-  it("1: archived-identity row renders an always-visible kebab trigger", async () => {
+  it("an archived row has no menu — no ⋮, and right-click offers no Un-archive", async () => {
     const archivedRow = makeRow({
       transcriptPath: "/archived.jsonl",
       identityKey: "bob",
@@ -711,410 +676,12 @@ describe("Phase 143 — kebab-menu Un-archive on archived-identity rows (D-11, D
       />,
     );
     await searchAndGetResults([archivedRow]);
-    // Archived rows get a kebab with testId pattern conversation-search-archived-row-kebab-<key>-<hostId>
-    expect(
-      screen.getByTestId("conversation-search-archived-row-kebab-bob-1"),
-    ).toBeTruthy();
-  });
-
-  it("2: live-identity row does NOT render a kebab (kebab is archived-only per D-11 boundary)", async () => {
-    const liveRow = makeRow({
-      transcriptPath: "/live.jsonl",
-      identityKey: "charlie",
-      hostId: 1,
-      isArchived: false,
-    });
-    render(
-      <ConversationSearchModal
-        open={true}
-        onOpenChange={vi.fn()}
-        onOpenActiveConversation={vi.fn()}
-      />,
-    );
-    await searchAndGetResults([liveRow]);
-    expect(
-      screen.queryByTestId(/^conversation-search-archived-row-kebab-/),
-    ).toBeNull();
-  });
-
-  it("3: kebab click stops propagation — clicking kebab does NOT close the modal (onOpenChange NOT called with false)", async () => {
-    const archivedRow = makeRow({
-      transcriptPath: "/archived2.jsonl",
-      identityKey: "dave",
-      hostId: 1,
-      isArchived: true,
-    });
-    const onOpenChange = vi.fn();
-    const user = userEvent.setup();
-    render(
-      <ConversationSearchModal
-        open={true}
-        onOpenChange={onOpenChange}
-        onOpenActiveConversation={vi.fn()}
-      />,
-    );
-    await searchAndGetResults([archivedRow]);
-    const kebab = screen.getByTestId("conversation-search-archived-row-kebab-dave-1");
-    await user.click(kebab);
-    // Menu should be open
-    await screen.findByRole("menuitem", { name: /^Un-archive$/ });
-    // Modal should NOT have been told to close
-    expect(onOpenChange).not.toHaveBeenCalledWith(false);
-  });
-
-  it("4: clicking Un-archive item → unarchiveIdentity called with (hostId, identityKey)", async () => {
-    const archivedRow = makeRow({
-      transcriptPath: "/archived3.jsonl",
-      identityKey: "eve",
-      hostId: 7,
-      isArchived: true,
-    });
-    const user = userEvent.setup();
-    const alertSpy = autoAnswerKitDialogs();
-    render(
-      <ConversationSearchModal
-        open={true}
-        onOpenChange={vi.fn()}
-        onOpenActiveConversation={vi.fn()}
-      />,
-    );
-    await searchAndGetResults([archivedRow]);
-    const kebab = screen.getByTestId("conversation-search-archived-row-kebab-eve-7");
-    await user.click(kebab);
-    const unarchiveItem = await screen.findByRole("menuitem", { name: /^Un-archive$/ });
-    await user.click(unarchiveItem);
-    await waitFor(() =>
-      expect(unarchiveIdentityMock).toHaveBeenCalledWith(7, "eve"),
-      { timeout: 2000 },
-    );
-  });
-
-  it("4b: successful Un-archive releases this tab's pending-archive mark so the restored row can re-surface", async () => {
-    __resetFleetSessionsForTest();
-    // This tab archived eve earlier; the mark is still held.
-    markPendingArchive(7, "eve");
-    const archivedRow = makeRow({
-      transcriptPath: "/archived3b.jsonl",
-      identityKey: "eve",
-      hostId: 7,
-      isArchived: true,
-    });
-    const user = userEvent.setup();
-    const alertSpy = autoAnswerKitDialogs();
-    render(
-      <ConversationSearchModal
-        open={true}
-        onOpenChange={vi.fn()}
-        onOpenActiveConversation={vi.fn()}
-      />,
-    );
-    await searchAndGetResults([archivedRow]);
-    await user.click(screen.getByTestId("conversation-search-archived-row-kebab-eve-7"));
-    await user.click(await screen.findByRole("menuitem", { name: /^Un-archive$/ }));
-    await waitFor(() => expect(alertSpy.calls.length).toBeGreaterThan(0), { timeout: 2000 });
-
-    // Reconciler restored it; the next sweep's frame must land.
-    upsertFleetSession({ hostId: 7, hostName: "h7", sessionName: "eve", created: 1, role: null });
-    expect(__getFleetOnlyRowsForTest().some((r) => r.id === "fleet::7::eve")).toBe(true);
-    __resetFleetSessionsForTest();
-  });
-
-  it("5: row disappears ONLY after endpoint returns 200 (endpoint-first sequence — locks CONTEXT.md Risk Summary invariant, replaces retired T-08's pre-endpoint-removal pattern)", async () => {
-    // Set up a manually-controlled never-resolving promise for unarchiveIdentity.
-    // This lets us assert the row is STILL PRESENT mid-flight (before the
-    // endpoint returns), and only GONE after we manually resolve it with 200.
-    let resolveUnarchive!: () => void;
-    unarchiveIdentityMock.mockImplementation(
-      () => new Promise<{ ok: true; outcome: "restored" | "pending" }>((res) => {
-        resolveUnarchive = () => res({ ok: true, outcome: "restored" });
-      }),
-    );
-    const alertSpy = autoAnswerKitDialogs();
-    const user = userEvent.setup();
-
-    const archivedRow = makeRow({
-      transcriptPath: "/archived-mid.jsonl",
-      identityKey: "midflightkey",
-      hostId: 3,
-      isArchived: true,
-    });
-
-    render(
-      <ConversationSearchModal
-        open={true}
-        onOpenChange={vi.fn()}
-        onOpenActiveConversation={vi.fn()}
-      />,
-    );
-    await searchAndGetResults([archivedRow]);
-
-    // Open kebab and click Un-archive
-    const kebab = screen.getByTestId("conversation-search-archived-row-kebab-midflightkey-3");
-    await user.click(kebab);
-    const unarchiveItem = await screen.findByRole("menuitem", { name: /^Un-archive$/ });
-    await user.click(unarchiveItem);
-
-    // MID-FLIGHT ASSERTION: endpoint has not resolved yet.
-    // The row must still be present in the DOM and no kit notice must NOT have been called.
-    expect(screen.queryByTestId("conversation-search-row-/archived-mid.jsonl")).toBeTruthy();
-    expect(alertSpy.calls).toHaveLength(0);
-    // While waiting for the supervisor the row shows a spinner instead of its menu.
-    expect(screen.getByTestId("conversation-search-unarchiving-midflightkey-3")).toBeTruthy();
-    expect(screen.queryByTestId("conversation-search-archived-row-kebab-midflightkey-3")).toBeNull();
-
-    // Now resolve the never-resolving mock (endpoint returns 200).
-    resolveUnarchive();
-
-    // After endpoint returns 200, the row should be GONE and the success alert fired.
-    await waitFor(() =>
-      expect(screen.queryByTestId("conversation-search-row-/archived-mid.jsonl")).toBeNull(),
-      { timeout: 2000 },
-    );
-    expect(kitAlertText(alertSpy, 0)).toBe("Conversation un-archived — It's back in your sidebar.");
-  });
-
-  it("6: modal stays open after Un-archive success (D-19)", async () => {
-    const archivedRow = makeRow({
-      transcriptPath: "/archived4.jsonl",
-      identityKey: "frank",
-      hostId: 1,
-      isArchived: true,
-    });
-    const onOpenChange = vi.fn();
-    const user = userEvent.setup();
-    const alertSpy = autoAnswerKitDialogs();
-    render(
-      <ConversationSearchModal
-        open={true}
-        onOpenChange={onOpenChange}
-        onOpenActiveConversation={vi.fn()}
-      />,
-    );
-    await searchAndGetResults([archivedRow]);
-    const kebab = screen.getByTestId("conversation-search-archived-row-kebab-frank-1");
-    await user.click(kebab);
-    const unarchiveItem = await screen.findByRole("menuitem", { name: /^Un-archive$/ });
-    await user.click(unarchiveItem);
-    await waitFor(() => expect(alertSpy.calls.length).toBeGreaterThan(0), { timeout: 2000 });
-    // Modal stays open — onOpenChange should NOT have been called with false (D-19)
-    expect(onOpenChange).not.toHaveBeenCalledWith(false);
-  });
-
-  it("5b: pending outcome → row stays, spinner clears, 'still un-archiving' alert", async () => {
-    unarchiveIdentityMock.mockResolvedValueOnce({ ok: true, outcome: "pending" });
-    const archivedRow = makeRow({
-      transcriptPath: "/archived-pending.jsonl",
-      identityKey: "slowpoke",
-      hostId: 2,
-      isArchived: true,
-    });
-    const alertSpy = autoAnswerKitDialogs();
-    const user = userEvent.setup();
-    render(
-      <ConversationSearchModal
-        open={true}
-        onOpenChange={vi.fn()}
-        onOpenActiveConversation={vi.fn()}
-      />,
-    );
-    await searchAndGetResults([archivedRow]);
-    await user.click(screen.getByTestId("conversation-search-archived-row-kebab-slowpoke-2"));
-    await user.click(await screen.findByRole("menuitem", { name: /^Un-archive$/ }));
-
-    await waitFor(() => expect(alertSpy.calls.length).toBeGreaterThan(0), { timeout: 2000 });
-    expect(kitAlertText(alertSpy, 0)).toBe("Still un-archiving this conversation — It'll be back in your sidebar shortly.");
-    expect(screen.queryByTestId("conversation-search-row-/archived-pending.jsonl")).toBeTruthy();
-    await waitFor(() =>
-      expect(screen.queryByTestId("conversation-search-unarchiving-slowpoke-2")).toBeNull(),
-    );
-  });
-
-  it("7b: refused by the supervisor → row stays + alert carries the refusal reason", async () => {
-    unarchiveIdentityMock.mockRejectedValueOnce(
-      new UnarchiveError("the backend refused to reactivate the chat account (not_an_agent)", "refused"),
-    );
-    const archivedRow = makeRow({
-      transcriptPath: "/archived-refused.jsonl",
-      identityKey: "tina",
-      hostId: 1,
-      isArchived: true,
-    });
-    const alertSpy = autoAnswerKitDialogs();
-    const user = userEvent.setup();
-    render(
-      <ConversationSearchModal
-        open={true}
-        onOpenChange={vi.fn()}
-        onOpenActiveConversation={vi.fn()}
-      />,
-    );
-    await searchAndGetResults([archivedRow]);
-    await user.click(screen.getByTestId("conversation-search-archived-row-kebab-tina-1"));
-    await user.click(await screen.findByRole("menuitem", { name: /^Un-archive$/ }));
-
-    await waitFor(() => expect(alertSpy.calls.length).toBeGreaterThan(0), { timeout: 2000 });
-    expect(kitAlertText(alertSpy, 0)).toBe(
-      "Couldn't un-archive this conversation — the backend refused to reactivate the chat account (not_an_agent)",
-    );
-    expect(screen.queryByTestId("conversation-search-row-/archived-refused.jsonl")).toBeTruthy();
-  });
-
-  it("7: missing_roles failure → row stays + distinct alert copy naming the missing role(s) (D-17 verbatim)", async () => {
-    unarchiveIdentityMock.mockRejectedValueOnce(
-      new UnarchiveError("missing", "missing_roles", ["ops-oncall"]),
-    );
-    const archivedRow = makeRow({
-      transcriptPath: "/archived5.jsonl",
-      identityKey: "grace",
-      hostId: 1,
-      isArchived: true,
-    });
-    const alertSpy = autoAnswerKitDialogs();
-    const user = userEvent.setup();
-    render(
-      <ConversationSearchModal
-        open={true}
-        onOpenChange={vi.fn()}
-        onOpenActiveConversation={vi.fn()}
-      />,
-    );
-    await searchAndGetResults([archivedRow]);
-    const kebab = screen.getByTestId("conversation-search-archived-row-kebab-grace-1");
-    await user.click(kebab);
-    const unarchiveItem = await screen.findByRole("menuitem", { name: /^Un-archive$/ });
-    await user.click(unarchiveItem);
-
-    // Row must STAY after the promise settles (failure path — no removal)
-    await waitFor(() => expect(alertSpy.calls.length).toBeGreaterThan(0), { timeout: 2000 });
-    expect(screen.queryByTestId("conversation-search-row-/archived5.jsonl")).toBeTruthy();
-    // D-17 verbatim: names the still-archived role inline; asserts "depends on it"
-    const alertMsg = kitAlertText(alertSpy, 0);
-    expect(alertMsg).toMatch(/Un-archive role ops-oncall first — this conversation depends on it\./i);
-  });
-
-  it("8: missing_roles multiple roles → joined with comma + row stays", async () => {
-    unarchiveIdentityMock.mockRejectedValueOnce(
-      new UnarchiveError("missing", "missing_roles", ["ops-oncall", "researcher"]),
-    );
-    const archivedRow = makeRow({
-      transcriptPath: "/archived6.jsonl",
-      identityKey: "heidi",
-      hostId: 1,
-      isArchived: true,
-    });
-    const alertSpy = autoAnswerKitDialogs();
-    const user = userEvent.setup();
-    render(
-      <ConversationSearchModal
-        open={true}
-        onOpenChange={vi.fn()}
-        onOpenActiveConversation={vi.fn()}
-      />,
-    );
-    await searchAndGetResults([archivedRow]);
-    const kebab = screen.getByTestId("conversation-search-archived-row-kebab-heidi-1");
-    await user.click(kebab);
-    const unarchiveItem = await screen.findByRole("menuitem", { name: /^Un-archive$/ });
-    await user.click(unarchiveItem);
-
-    await waitFor(() => expect(alertSpy.calls.length).toBeGreaterThan(0), { timeout: 2000 });
-    // Row stays after failure
-    expect(screen.queryByTestId("conversation-search-row-/archived6.jsonl")).toBeTruthy();
-    // Alert contains both role names
-    const alertMsg = kitAlertText(alertSpy, 0);
-    expect(alertMsg).toContain("ops-oncall");
-    expect(alertMsg).toContain("researcher");
-  });
-
-  it("9: name_collision failure → row stays + distinct alert copy", async () => {
-    unarchiveIdentityMock.mockRejectedValueOnce(
-      new UnarchiveError("collision", "name_collision"),
-    );
-    const archivedRow = makeRow({
-      transcriptPath: "/archived7.jsonl",
-      identityKey: "ivan",
-      hostId: 1,
-      isArchived: true,
-    });
-    const alertSpy = autoAnswerKitDialogs();
-    const user = userEvent.setup();
-    render(
-      <ConversationSearchModal
-        open={true}
-        onOpenChange={vi.fn()}
-        onOpenActiveConversation={vi.fn()}
-      />,
-    );
-    await searchAndGetResults([archivedRow]);
-    const kebab = screen.getByTestId("conversation-search-archived-row-kebab-ivan-1");
-    await user.click(kebab);
-    const unarchiveItem = await screen.findByRole("menuitem", { name: /^Un-archive$/ });
-    await user.click(unarchiveItem);
-
-    await waitFor(() => expect(alertSpy.calls.length).toBeGreaterThan(0), { timeout: 2000 });
-    expect(screen.queryByTestId("conversation-search-row-/archived7.jsonl")).toBeTruthy();
-    const alertMsg = kitAlertText(alertSpy, 0);
-    expect(alertMsg).toMatch(/already a live conversation with the same name/i);
-  });
-
-  it("10: archive_not_found failure → row stays + distinct alert copy", async () => {
-    unarchiveIdentityMock.mockRejectedValueOnce(
-      new UnarchiveError("not found", "archive_not_found"),
-    );
-    const archivedRow = makeRow({
-      transcriptPath: "/archived8.jsonl",
-      identityKey: "julia",
-      hostId: 1,
-      isArchived: true,
-    });
-    const alertSpy = autoAnswerKitDialogs();
-    const user = userEvent.setup();
-    render(
-      <ConversationSearchModal
-        open={true}
-        onOpenChange={vi.fn()}
-        onOpenActiveConversation={vi.fn()}
-      />,
-    );
-    await searchAndGetResults([archivedRow]);
-    const kebab = screen.getByTestId("conversation-search-archived-row-kebab-julia-1");
-    await user.click(kebab);
-    const unarchiveItem = await screen.findByRole("menuitem", { name: /^Un-archive$/ });
-    await user.click(unarchiveItem);
-
-    await waitFor(() => expect(alertSpy.calls.length).toBeGreaterThan(0), { timeout: 2000 });
-    expect(screen.queryByTestId("conversation-search-row-/archived8.jsonl")).toBeTruthy();
-    const alertMsg = kitAlertText(alertSpy, 0);
-    expect(alertMsg).toMatch(/already been reactivated/i);
-  });
-
-  it("11: generic failure (non-UnarchiveError) → row stays + generic fallback copy", async () => {
-    unarchiveIdentityMock.mockRejectedValueOnce(new Error("network"));
-    const archivedRow = makeRow({
-      transcriptPath: "/archived9.jsonl",
-      identityKey: "kate",
-      hostId: 1,
-      isArchived: true,
-    });
-    const alertSpy = autoAnswerKitDialogs();
-    const user = userEvent.setup();
-    render(
-      <ConversationSearchModal
-        open={true}
-        onOpenChange={vi.fn()}
-        onOpenActiveConversation={vi.fn()}
-      />,
-    );
-    await searchAndGetResults([archivedRow]);
-    const kebab = screen.getByTestId("conversation-search-archived-row-kebab-kate-1");
-    await user.click(kebab);
-    const unarchiveItem = await screen.findByRole("menuitem", { name: /^Un-archive$/ });
-    await user.click(unarchiveItem);
-
-    await waitFor(() => expect(alertSpy.calls.length).toBeGreaterThan(0), { timeout: 2000 });
-    expect(screen.queryByTestId("conversation-search-row-/archived9.jsonl")).toBeTruthy();
-    const alertMsg = kitAlertText(alertSpy, 0);
-    expect(alertMsg).toMatch(/try again in a moment/i);
+    const row = screen.getByTestId("conversation-search-row-/archived.jsonl");
+    expect(row).toHaveTextContent("archived");
+    expect(screen.queryByTestId(/^conversation-search-archived-row-kebab-/)).toBeNull();
+    expect(screen.queryByRole("button", { name: /row menu/i })).toBeNull();
+    fireEvent.contextMenu(row);
+    expect(screen.queryByRole("menuitem", { name: /un-archive/i })).toBeNull();
   });
 
   it("12: left-click on an archived row opens it (view-only tab) and closes search, handing its look over", async () => {
@@ -1139,7 +706,6 @@ describe("Phase 143 — kebab-menu Un-archive on archived-identity rows (D-11, D
     );
     await searchAndGetResults([archivedRow]);
 
-    // Click the row's main body (NOT the kebab trigger)
     const row = screen.getByTestId("conversation-search-row-/archived10.jsonl");
     await user.click(row);
 
@@ -1282,15 +848,7 @@ describe("ConversationSearchModal: apple-ux chrome", () => {
     expect(screen.queryByText("Try fewer or different words.")).toBeNull();
   });
 
-  async function unarchiveRow(identityKey: string, hostId: number): Promise<void> {
-    const user = userEvent.setup();
-    await user.click(screen.getByTestId(`conversation-search-archived-row-kebab-${identityKey}-${hostId}`));
-    await user.click(await screen.findByRole("menuitem", { name: /^Un-archive$/ }));
-  }
-
   it("count line follows the listed results after an un-archive takes a row out", async () => {
-    unarchiveIdentityMock.mockResolvedValue({ ok: true, outcome: "restored" });
-    autoAnswerKitDialogs();
     const rows = [
       makeRow({ transcriptPath: "/x0.jsonl", identityKey: "gone", hostId: 1, isArchived: true }),
       ...rowsOf(19, "y"),
@@ -1301,15 +859,13 @@ describe("ConversationSearchModal: apple-ux chrome", () => {
     await user.type(input(), "foo");
     await user.keyboard("{Enter}");
     expect(await screen.findByTestId("conversation-search-count")).toHaveTextContent(/^20\+ conversations$/);
-    await unarchiveRow("gone", 1);
+    act(() => removeResultByIdentity(1, "gone"));
     await waitFor(() =>
       expect(screen.getByTestId("conversation-search-count")).toHaveTextContent(/^19\+ conversations$/),
     );
   });
 
   it("un-archiving the last listed row while more pages remain shows Load more, not \"No results\"", async () => {
-    unarchiveIdentityMock.mockResolvedValue({ ok: true, outcome: "restored" });
-    autoAnswerKitDialogs();
     searchConversationsMock.mockResolvedValueOnce({
       results: [makeRow({ transcriptPath: "/only.jsonl", identityKey: "only", hostId: 2, isArchived: true })],
       hasMore: true,
@@ -1319,7 +875,7 @@ describe("ConversationSearchModal: apple-ux chrome", () => {
     await user.type(input(), "foo");
     await user.keyboard("{Enter}");
     await screen.findByTestId("conversation-search-row-/only.jsonl");
-    await unarchiveRow("only", 2);
+    act(() => removeResultByIdentity(2, "only"));
     await waitFor(() => expect(screen.queryByTestId("conversation-search-row-/only.jsonl")).toBeNull());
     expect(screen.queryByTestId("conversation-search-count")).toBeNull();
     expect(screen.queryByTestId("conversation-search-no-results")).toBeNull();

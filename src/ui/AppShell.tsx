@@ -60,6 +60,7 @@ import {
 } from "@/features/new-conversation/new-conversation-context";
 import { picksFromWire, samePicks } from "@/lib/new-conversation-picks";
 import { decideNewConversationOpen } from "@/lib/new-conversation-open";
+import { decideSearchResultPlacement, type SearchResultPlacement } from "@/lib/search-result-open";
 import { NEW_CONVERSATION_DRAG_MIME, hasNewConversationDragMime } from "@/shell/new-conversation-drag";
 import { setSessionProject } from "@/api/session-project-api";
 import { usePhoneDesktop } from "@/shell/use-phone-desktop";
@@ -3795,6 +3796,15 @@ export function AppShell({
     [openTab],
   );
   const openNewConversationRef = useRef<(start: NewConversationPicks | null, source: string) => void>(() => {});
+  // A search result joins an open split instead of covering it
+  // (search-result-open.ts). Returns where it went, for the logs.
+  const placeSearchResultInSplit = (tabId: string): SearchResultPlacement["kind"] => {
+    const placement = decideSearchResultPlacement({ tabId, splitTree, isMobile });
+    if (placement.kind === "join") openSessionInTree(tabId, placement.path, "right");
+    if (placement.kind !== "alone") setFocusedTabId(tabId);
+    return placement.kind;
+  };
+
   openNewConversationRef.current = (start, source) => {
     const shown = tabs.find((t) => t.id === effectiveSelectedTabId);
     const decision = decideNewConversationOpen({
@@ -4372,7 +4382,8 @@ export function AppShell({
                   sessionKind: "archived",
                   allowCreateTmux: false,
                 });
-              console.info(`[archived-view] open hostId=${result.hostId} identity=${key} tabId=${tabId} existing=${!!existing}`);
+              const placement = placeSearchResultInSplit(tabId);
+              console.info(`[archived-view] open hostId=${result.hostId} identity=${key} tabId=${tabId} existing=${!!existing} placement=${placement}`);
               setActiveTabId(tabId);
               selectConversationDeferred(tabId);
               if (isTouchDevice) navigateToView();
@@ -4389,6 +4400,14 @@ export function AppShell({
               // will populate it — this handler already handles both cases).
               label: result.aiTitle || sessionName,
               allowCreateTmux: false,
+            });
+            const placement = placeSearchResultInSplit(newTabId);
+            systemLogger.info("[conversation-search] open", {
+              operation: "conversation_search_open",
+              hostId: result.hostId,
+              identityKey: result.identityKey,
+              tabId: newTabId,
+              placement,
             });
             selectConversationDeferred(newTabId);
             if (isTouchDevice) navigateToView();

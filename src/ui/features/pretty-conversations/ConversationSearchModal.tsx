@@ -1,11 +1,8 @@
 /**
  * Conversation search modal.
  *
- * Phase 143 Plan 143-08: retires the archived-row blunt-alert (D-11),
- * wires Un-archive kebab (D-12/D-13/D-14) with endpoint-first sequence,
- * kit notice (kitAlert) success/failure with distinct missing_roles copy (D-16/D-17),
- * modal stays open after un-archive (D-19).
- * See .planning/campaigns/un-archiving/shape-unarchive-frontend-backend.md
+ * Archived results have no menu: clicking one opens it as a view-only
+ * archived conversation tab, and un-archiving happens there.
  *
  * Locked behaviors (see .planning/phases/122-conversation-search-modal/
  * 122-CONTEXT.md decisions):
@@ -63,7 +60,6 @@ import {
   KitList,
   KitLoading,
   KitSearch,
-  kitAlert,
 } from "@/components/kit";
 import {
   searchConversations,
@@ -76,12 +72,8 @@ import {
   clearSearch,
   appendResults,
   setError,
-  removeResultByIdentity,
 } from "@/state/search-store";
-import { unarchiveIdentity, UnarchiveError } from "@/api/identity-unarchive-api";
-import { unarchiveFailureNotice } from "@/features/archived-view/unarchive-notice";
 import { archivedLookFromSearchResult, seedArchivedLook } from "@/features/archived-view/archived-identity";
-import { clearPendingArchive } from "@/state/conversation-store";
 import { ConversationSearchRow } from "./ConversationSearchRow";
 
 const PAGE_SIZE = 20; // D-12: 20 results per fetch
@@ -99,10 +91,6 @@ export interface ConversationSearchModalProps {
   onOpenActiveConversation: (result: ConversationSearchResult) => void;
 }
 
-function unarchivingKey(r: ConversationSearchResult): string {
-  return `${r.hostId}:${r.identityKey}`;
-}
-
 export function ConversationSearchModal({
   open,
   onOpenChange,
@@ -114,8 +102,6 @@ export function ConversationSearchModal({
   // even when the store's query is stale (e.g. user typed "foo" but hasn't
   // pressed Enter yet — state.query is still the previous fired query).
   const [localValue, setLocalValue] = useState<string>(state.query);
-  // Archived rows whose un-archive is in flight (keyed by host + identity).
-  const [unarchiving, setUnarchiving] = useState<ReadonlySet<string>>(new Set());
 
   // On open→true transition, re-seed the local input from the store's
   // last-fired query. If the user closed the modal mid-edit (localValue
@@ -203,72 +189,6 @@ export function ConversationSearchModal({
     });
     onOpenActiveConversation(result);
     onOpenChange(false);
-  }
-
-  // Phase 143 D-11 / D-16 / D-17 / D-19 — endpoint-first un-archive handler.
-  //
-  // CRITICAL SEQUENCE (CONTEXT.md Risk Summary): the row MUST NOT be removed
-  // until the endpoint reports "restored". The endpoint drops the flag and
-  // waits for the supervisor's outcome (shape-unarchive-one-path-supervisor-
-  // reactivation.md); the row shows a spinner meanwhile.
-  //
-  // restored → remove the row, then "Conversation un-archived" alert.
-  // pending  → row stays, "still un-archiving" alert (it keeps going).
-  // reject   → row stays, failure alert (refused reason, missing roles, ...).
-  //
-  // Modal stays open in all branches (D-19): no onOpenChange(false) call here.
-  async function handleUnarchive(result: ConversationSearchResult): Promise<void> {
-    if (!result.isArchived) return; // defensive guard
-    const rowKey = unarchivingKey(result);
-    if (unarchiving.has(rowKey)) return; // already in flight
-
-    setUnarchiving((prev) => new Set(prev).add(rowKey));
-    try {
-      // Step 1: call endpoint FIRST — row untouched while request is in flight.
-      // The backend drops the flag and waits (up to ~2 min) for the
-      // supervisor's outcome; the row shows a spinner meanwhile.
-      const { outcome } = await unarchiveIdentity(result.hostId, result.identityKey);
-      console.info({
-        operation: "conversation_search_unarchive_outcome",
-        identityKey: result.identityKey,
-        hostId: result.hostId,
-        outcome,
-      });
-
-      if (outcome === "pending") {
-        await kitAlert({
-          title: "Still un-archiving this conversation",
-          body: "It'll be back in your sidebar shortly.",
-        });
-        return;
-      }
-
-      // Release any optimistic-archive mark this tab still holds, so the
-      // reconciler's restore re-surfaces the row here too.
-      clearPendingArchive(result.hostId, result.identityKey);
-
-      // Step 2: restored — now remove the row from the store.
-      removeResultByIdentity(result.hostId, result.identityKey);
-
-      // Step 3: fire success notice (D-16).
-      await kitAlert({ title: "Conversation un-archived", body: "It's back in your sidebar." });
-    } catch (err) {
-      // Failure path: row was NEVER removed (no restore branch needed —
-      // by construction the row is still present). Fire failure notice (D-17).
-      console.info({
-        operation: "conversation_search_unarchive_failed",
-        identityKey: result.identityKey,
-        hostId: result.hostId,
-        reason: err instanceof UnarchiveError ? err.reason : "error",
-      });
-      await kitAlert(unarchiveFailureNotice(err));
-    } finally {
-      setUnarchiving((prev) => {
-        const next = new Set(prev);
-        next.delete(rowKey);
-        return next;
-      });
-    }
   }
 
   // Empty-state gate (D-06): shown only if hasEverOpened is false OR if
@@ -386,8 +306,6 @@ export function ConversationSearchModal({
                 result={r}
                 query={state.query}
                 onClick={() => handleRowClick(r)}
-                onUnarchive={r.isArchived ? handleUnarchive : undefined}
-                unarchiving={r.isArchived && unarchiving.has(unarchivingKey(r))}
               />
             ))}
           </KitList>
