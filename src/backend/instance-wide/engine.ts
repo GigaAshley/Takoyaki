@@ -5,9 +5,12 @@
  * Distribution is two-way:
  *   - every change made through the app is pushed out immediately
  *     (requestSync), and a catch-up pass runs every five minutes;
- *   - per machine and per item, merge.ts decides who wins: changes on a
- *     machine owned by an admin flow back into the master (and from there to
- *     everyone), changes anywhere else are put back;
+ *   - each item names the machines it goes to (every machine, or a fixed
+ *     list) and the machines that write back; a machine taken off an item's
+ *     list has its copy deleted at its next sync;
+ *   - per machine and per item, merge.ts decides who wins: changes on one of
+ *     the item's write-back machines flow back into the master (and from
+ *     there to the item's other machines), changes anywhere else are put back;
  *   - a whole folder going missing is restored, never treated as a removal —
  *     removal only happens through removeItem(), which leaves tombstones so
  *     machines that were offline delete their copy when they return.
@@ -23,7 +26,8 @@ import {
   type ItemKind,
   type ItemKey,
   type Manifest,
-  ADMIN_QUICK_CHECK_MS,
+  type ItemTargets,
+  WRITE_BACK_QUICK_CHECK_MS,
   CATCH_UP_INTERVAL_MS,
   MAX_ITEM_BYTES,
   MAX_ITEM_FILES,
@@ -35,9 +39,10 @@ import {
   itemKey,
   manifestsEqual,
   parseItemKey,
+  targetsInclude,
 } from "./model.js";
 import { planMerge, planIsNoop } from "./merge.js";
-import { InstanceWideStore, sha256, type SyncState, type MachineState } from "./store.js";
+import { InstanceWideStore, sha256, type SyncState, type MachineState, type ItemMeta } from "./store.js";
 import * as hostOps from "./host-ops.js";
 import { systemLogger } from "../utils/logger.js";
 
@@ -45,7 +50,10 @@ export interface SyncMachine {
   /** Physical-machine id (hosts.machine_id). */
   machineId: string;
   hostName: string;
-  /** The machine's primary owner is an admin — its changes flow back. */
+  /**
+   * The machine's primary owner is an admin. Only used once, to give items
+   * shared before per-item lists their write-back machines.
+   */
   adminOwned: boolean;
   /** Every hosts row id that points at this machine (any user). */
   hostRowIds: string[];
@@ -86,12 +94,28 @@ export interface ItemStatus {
   updatedAt: number;
   behind: number;
   conflicts: number;
+  /** One entry per machine the item goes to. */
   hosts: ItemHostStatus[];
+  targets: ItemTargets;
+  writeBack: string[];
+}
+
+/** An item's machine lists, as an admin sets them. */
+export interface ItemMachines {
+  targets: ItemTargets;
+  writeBack: string[];
 }
 
 export class PromoteError extends Error {
   constructor(
-    public readonly code: "not_found" | "too_large" | "unreachable" | "exists" | "unsafe" | "reserved",
+    public readonly code:
+      | "not_found"
+      | "too_large"
+      | "unreachable"
+      | "exists"
+      | "unsafe"
+      | "reserved"
+      | "bad_machines",
     message: string,
   ) {
     super(message);
@@ -101,6 +125,11 @@ export class PromoteError extends Error {
 
 function conflictStamp(now: number): string {
   return new Date(now).toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+}
+
+/** Lists of an item made before per-item lists, until migrated: every machine, no write-back. */
+function machinesOf(meta: ItemMeta | undefined): ItemMachines {
+  return { targets: meta?.targets ?? "all", writeBack: meta?.writeBack ?? [] };
 }
 
 function safeHostTag(hostName: string): string {
@@ -136,30 +165,39 @@ export class InstanceWideEngine {
       this.requestSync();
     }, CATCH_UP_INTERVAL_MS);
     this.quickTimer = si(() => {
-      void this.quickAdminCheck();
-    }, ADMIN_QUICK_CHECK_MS);
+      void this.quickWriteBackCheck();
+    }, WRITE_BACK_QUICK_CHECK_MS);
     this.requestSync();
   }
 
   /**
-   * Between catch-ups, look only at admin-owned machines (the only ones whose
-   * changes flow back). If one changed the master, a full pass follows so the
-   * change reaches everyone. Skipped while a full pass is running.
+   * Between catch-ups, look only at machines that write back some item (the
+   * only ones whose changes flow back). If one changed the master, a full pass
+   * follows so the change reaches everyone. Skipped while a full pass is
+   * running.
    */
-  async quickAdminCheck(): Promise<void> {
+  async quickWriteBackCheck(): Promise<void> {
     if (this.stopped || this.running || this.quickRunning) return;
     this.quickRunning = true;
     try {
-      await this.quickAdminCheckInner();
+      await this.quickWriteBackCheckInner();
     } finally {
       this.quickRunning = false;
     }
   }
 
-  private async quickAdminCheckInner(): Promise<void> {
+  private async quickWriteBackCheckInner(): Promise<void> {
     let machines: SyncMachine[];
     try {
-      machines = (await this.deps.listMachines()).filter((m) => m.adminOwned);
+      const all = await this.deps.listMachines();
+      await this.withLock(() => this.migrateLegacyItems(all));
+      const state = await this.store.loadState();
+      const writers = new Set<string>();
+      for (const meta of Object.values(state.items)) {
+        const { targets, writeBack } = machinesOf(meta);
+        for (const id of writeBack) if (targetsInclude(targets, id)) writers.add(id);
+      }
+      machines = all.filter((m) => writers.has(m.machineId));
     } catch {
       return;
     }
@@ -261,6 +299,15 @@ export class InstanceWideEngine {
       });
       return;
     }
+    try {
+      await this.withLock(() => this.migrateLegacyItems(machines));
+    } catch (err) {
+      systemLogger.warn("Instance-wide: couldn't fill in machine lists of older items", {
+        operation: "instance_wide_migrate_failed",
+        error: err instanceof Error ? err.message : "unknown",
+      });
+      return;
+    }
     let masterChanged = false;
     for (const machine of machines) {
       if (this.stopped) return;
@@ -277,6 +324,33 @@ export class InstanceWideEngine {
     }
     // A write-back changed the master: carry it to the machines visited earlier.
     if (masterChanged) this.rerun = true;
+  }
+
+  /**
+   * Items shared before per-item lists go to every machine, and write back
+   * from the machines admin-owned at the moment this first runs — what they
+   * did before. Runs once per item; later machine changes never move them.
+   */
+  private async migrateLegacyItems(machines: SyncMachine[]): Promise<void> {
+    const state = await this.store.loadState();
+    const adminOwned = machines.filter((m) => m.adminOwned).map((m) => m.machineId);
+    let changed = false;
+    for (const item of await this.store.listItems()) {
+      const key = itemKey(item.kind, item.name);
+      const meta = state.items[key] ?? { createdAt: this.now(), updatedAt: this.now() };
+      if (meta.writeBack !== undefined && meta.targets !== undefined) continue;
+      meta.targets = meta.targets ?? "all";
+      meta.writeBack = meta.writeBack ?? [...adminOwned];
+      state.items[key] = meta;
+      changed = true;
+      systemLogger.info("Instance-wide: older item given machine lists", {
+        operation: "instance_wide_item_migrated",
+        item: key,
+        targets: meta.targets === "all" ? "all" : meta.targets.join(","),
+        writeBack: meta.writeBack.join(","),
+      });
+    }
+    if (changed) await this.store.saveState(state);
   }
 
   /** Returns true when the master copy changed (write-back). */
@@ -303,7 +377,7 @@ export class InstanceWideEngine {
       // An item made instance-wide before its name became one of the app's
       // built-in skills is left alone: the distributor owns that folder now,
       // and syncing both would flip the file back and forth.
-      const items = (await this.store.listItems()).filter((i) => {
+      const allItems = (await this.store.listItems()).filter((i) => {
         if (!this.deps.isReservedName?.(i.kind, i.name)) return true;
         systemLogger.warn("Instance-wide: skipping item whose name is now built in", {
           operation: "instance_wide_item_reserved_skipped",
@@ -313,9 +387,21 @@ export class InstanceWideEngine {
         });
         return false;
       });
-      const removals = Object.entries(state.tombstones)
-        .filter(([, t]) => t.pending.includes(machine.machineId))
-        .map(([key]) => key);
+      const targeted = (i: { kind: ItemKind; name: string }) =>
+        targetsInclude(machinesOf(state.items[itemKey(i.kind, i.name)]).targets, machine.machineId);
+      const items = allItems.filter(targeted);
+      // Taken off this machine's list: its copy goes, the same way a removed
+      // item's does. A copy never synced here was never ours to delete.
+      const dropped = allItems
+        .filter((i) => !targeted(i))
+        .map((i) => itemKey(i.kind, i.name))
+        .filter((key) => (ms.items[key]?.syncedAt ?? 0) > 0);
+      const removals = [
+        ...Object.entries(state.tombstones)
+          .filter(([, t]) => t.pending.includes(machine.machineId))
+          .map(([key]) => key),
+        ...dropped,
+      ];
 
       const dirs = [
         ...items.map((i) => hostRelDir(i.kind, i.name)),
@@ -334,13 +420,17 @@ export class InstanceWideEngine {
         if (!parsed) continue;
         await hostOps.removeFolder(channel, hostRelDir(parsed.kind, parsed.name));
         const t = state.tombstones[key];
-        t.pending = t.pending.filter((id) => id !== machine.machineId);
-        if (t.pending.length === 0) delete state.tombstones[key];
+        if (t) {
+          t.pending = t.pending.filter((id) => id !== machine.machineId);
+          if (t.pending.length === 0) delete state.tombstones[key];
+        }
+        delete ms.items[key];
         systemLogger.info("Instance-wide: removed item from machine", {
           operation: "instance_wide_item_removed_from_machine",
           machineId: machine.machineId,
           hostName: machine.hostName,
           item: key,
+          reason: t ? "removed_everywhere" : "machine_taken_off_list",
         });
       }
 
@@ -358,7 +448,7 @@ export class InstanceWideEngine {
             item.kind,
             item.name,
             probe,
-            machine.adminOwned || adminSourced,
+            machinesOf(state.items[key]).writeBack.includes(machine.machineId) || adminSourced,
           );
           if (changed) masterChanged = true;
         } catch (err) {
@@ -383,7 +473,8 @@ export class InstanceWideEngine {
       // An admin's app-side edit is only "consumed" once everything synced.
       if (!itemFailed) this.adminSourced.delete(machine.machineId);
 
-      // Forget items that are gone from the master (tombstones handled above).
+      // Forget items that are gone from the master or no longer go to this
+      // machine (their copies were deleted above).
       for (const key of Object.keys(ms.items)) {
         const parsed = parseItemKey(key);
         if (!parsed || !items.some((i) => i.kind === parsed.kind && i.name === parsed.name)) {
@@ -550,7 +641,8 @@ export class InstanceWideEngine {
     for (const item of await this.store.listItems()) {
       const key = itemKey(item.kind, item.name);
       const master = await this.store.manifest(item.kind, item.name);
-      const hosts: ItemHostStatus[] = machines.map((m) => {
+      const lists = machinesOf(state.items[key]);
+      const hosts: ItemHostStatus[] = machines.filter((m) => targetsInclude(lists.targets, m.machineId)).map((m) => {
         const ms = state.machines[m.machineId];
         const its = ms?.items[key];
         const base: ItemHostStatus = {
@@ -582,7 +674,21 @@ export class InstanceWideEngine {
         behind: hosts.filter((h) => h.state === "behind").length,
         conflicts: hosts.filter((h) => h.state === "conflict").length,
         hosts,
+        targets: lists.targets,
+        writeBack: lists.writeBack.filter((id) => targetsInclude(lists.targets, id)),
       });
+    }
+    return out;
+  }
+
+  /** Machines not heard from for a day (or ever). */
+  async offlineMachineIds(): Promise<Set<string>> {
+    const state = await this.store.loadState();
+    const now = this.now();
+    const out = new Set<string>();
+    for (const m of await this.deps.listMachines()) {
+      const last = state.machines[m.machineId]?.lastContactAt;
+      if (!last || now - last > OFFLINE_AFTER_MS) out.add(m.machineId);
     }
     return out;
   }
@@ -604,19 +710,58 @@ export class InstanceWideEngine {
     return (await this.store.listItems()).filter((i) => i.kind === kind).map((i) => i.name);
   }
 
+  /** Names of the items of this kind that go to this machine. */
+  async namesOn(kind: ItemKind, machineId: string): Promise<string[]> {
+    const state = await this.store.loadState();
+    return (await this.store.listItems())
+      .filter((i) => i.kind === kind)
+      .filter((i) => targetsInclude(machinesOf(state.items[itemKey(i.kind, i.name)]).targets, machineId))
+      .map((i) => i.name);
+  }
+
+  /** The item exists and goes to this machine. */
+  async isSharedOn(kind: ItemKind, name: string, machineId: string): Promise<boolean> {
+    if (!(await this.store.hasItem(kind, name))) return false;
+    const state = await this.store.loadState();
+    return targetsInclude(machinesOf(state.items[itemKey(kind, name)]).targets, machineId);
+  }
+
+  /** The item goes to this machine and this machine's edits flow back. */
+  async writesBackFrom(kind: ItemKind, name: string, machineId: string): Promise<boolean> {
+    if (!(await this.store.hasItem(kind, name))) return false;
+    const { targets, writeBack } = machinesOf((await this.store.loadState()).items[itemKey(kind, name)]);
+    return targetsInclude(targets, machineId) && writeBack.includes(machineId);
+  }
+
+  async machinesFor(kind: ItemKind, name: string): Promise<ItemMachines> {
+    if (!(await this.store.hasItem(kind, name))) {
+      throw new PromoteError("not_found", `${kind} "${name}" is not instance-wide`);
+    }
+    const lists = machinesOf((await this.store.loadState()).items[itemKey(kind, name)]);
+    return { targets: lists.targets, writeBack: lists.writeBack.filter((id) => targetsInclude(lists.targets, id)) };
+  }
+
   /**
-   * Items removed everywhere whose copy on this machine hasn't been deleted
-   * yet. Lists hide them so a removed item doesn't reappear as the host's own
-   * in the moments before the sync reaches it.
+   * Items whose copy on this machine is on its way out — removed everywhere,
+   * or taken off this machine's list — and not yet deleted. Lists hide them so
+   * the copy doesn't show as the host's own in the moments before the sync
+   * reaches it.
    */
   async pendingRemovalNames(kind: ItemKind, machineId: string): Promise<string[]> {
     const state = await this.store.loadState();
-    const names: string[] = [];
+    const names = new Set<string>();
     for (const [key, t] of Object.entries(state.tombstones)) {
       const parsed = parseItemKey(key);
-      if (parsed && parsed.kind === kind && t.pending.includes(machineId)) names.push(parsed.name);
+      if (parsed && parsed.kind === kind && t.pending.includes(machineId)) names.add(parsed.name);
     }
-    return names;
+    const ms = state.machines[machineId];
+    for (const item of await this.store.listItems()) {
+      if (item.kind !== kind) continue;
+      const key = itemKey(item.kind, item.name);
+      if (targetsInclude(machinesOf(state.items[key]).targets, machineId)) continue;
+      if ((ms?.items[key]?.syncedAt ?? 0) > 0) names.add(item.name);
+    }
+    return [...names].sort();
   }
 
   // -------------------------------------------------------------------------
@@ -650,7 +795,7 @@ export class InstanceWideEngine {
       await this.store.putItem(kind, name, files);
       const state = await this.store.loadState();
       const key = itemKey(kind, name);
-      state.items[key] = { createdAt: this.now(), updatedAt: this.now() };
+      state.items[key] = { createdAt: this.now(), updatedAt: this.now(), targets: "all", writeBack: [] };
       delete state.tombstones[key];
       await this.store.saveState(state);
     });
@@ -666,17 +811,22 @@ export class InstanceWideEngine {
     }
   }
 
-  /** Machines (other than `exceptMachineId`) that already have a folder with this name. */
+  /**
+   * Machines (other than `exceptMachineId`, and only those `among` names when
+   * given) that already have a folder with this name.
+   */
   async findClashes(
     kind: ItemKind,
     name: string,
     exceptMachineId?: string,
+    among?: ItemTargets,
   ): Promise<{ clashes: string[]; unreachable: string[] }> {
     const clashes: string[] = [];
     const unreachable: string[] = [];
     const dir = hostRelDir(kind, name);
     for (const m of await this.deps.listMachines()) {
       if (m.machineId === exceptMachineId) continue;
+      if (among !== undefined && !targetsInclude(among, m.machineId)) continue;
       let ch: SshChannel | null = null;
       try {
         ch = await this.deps.acquireChannel(m);
@@ -725,8 +875,18 @@ export class InstanceWideEngine {
    * recorded as already in step. Same-name folders elsewhere are replaced on
    * the next sync (the caller has confirmed the clash list).
    */
-  async promote(kind: ItemKind, name: string, machine: SyncMachine): Promise<{ files: number; bytes: number }> {
+  async promote(
+    kind: ItemKind,
+    name: string,
+    machine: SyncMachine,
+    lists: ItemMachines = { targets: "all", writeBack: [] },
+  ): Promise<{ files: number; bytes: number }> {
     this.assertNotReserved(kind, name);
+    // The master is this machine's folder, so the machine always starts on
+    // the list — otherwise sharing would delete the folder it was copied from.
+    const targets: ItemTargets =
+      lists.targets === "all" ? "all" : [...new Set([machine.machineId, ...lists.targets])];
+    const checked = await this.checkLists({ targets, writeBack: lists.writeBack });
     const result = await this.withLock(async () => {
       if (await this.store.hasItem(kind, name)) {
         throw new PromoteError("exists", `${kind} "${name}" is already instance-wide`);
@@ -757,7 +917,7 @@ export class InstanceWideEngine {
         const state = await this.store.loadState();
         const key = itemKey(kind, name);
         const now = this.now();
-        state.items[key] = { createdAt: now, updatedAt: now };
+        state.items[key] = { createdAt: now, updatedAt: now, ...checked };
         delete state.tombstones[key];
         const ms = this.machineState(state, machine);
         ms.lastContactAt = now;
@@ -772,11 +932,74 @@ export class InstanceWideEngine {
           sourceHostName: machine.hostName,
           files: paths.length,
           bytes,
+          targets: checked.targets === "all" ? "all" : checked.targets.join(","),
+          writeBack: checked.writeBack.join(","),
         });
         return { files: paths.length, bytes };
       } finally {
         if (this.deps.releaseChannel) this.deps.releaseChannel(machine, ch);
       }
+    });
+    this.requestSync();
+    return result;
+  }
+
+  /**
+   * Validate an admin's lists against the machines in the fleet: a fixed list
+   * names at least one known machine, write-back machines are known and among
+   * the targets. Returns them de-duplicated and sorted.
+   */
+  private async checkLists(lists: ItemMachines): Promise<ItemMachines> {
+    const known = new Set((await this.deps.listMachines()).map((m) => m.machineId));
+    const unknown = (ids: string[]) => ids.filter((id) => !known.has(id));
+    let targets: ItemTargets = "all";
+    if (lists.targets !== "all") {
+      if (!Array.isArray(lists.targets) || lists.targets.length === 0) {
+        throw new PromoteError("bad_machines", "pick at least one machine, or every machine");
+      }
+      const bad = unknown(lists.targets);
+      if (bad.length > 0) throw new PromoteError("bad_machines", `unknown machine: ${bad.join(", ")}`);
+      targets = [...new Set(lists.targets)].sort((a, b) => Number(a) - Number(b));
+    }
+    const writeBack = [...new Set(lists.writeBack)].sort((a, b) => Number(a) - Number(b));
+    const badWb = unknown(writeBack);
+    if (badWb.length > 0) throw new PromoteError("bad_machines", `unknown machine: ${badWb.join(", ")}`);
+    const outside = writeBack.filter((id) => !targetsInclude(targets, id));
+    if (outside.length > 0) {
+      throw new PromoteError("bad_machines", "a machine can only write back an item it gets");
+    }
+    return { targets, writeBack };
+  }
+
+  /**
+   * Change which machines an item goes to and which write back. Machines
+   * taken off lose their copy at their next sync (offline ones when they
+   * return); machines added get it, replacing any same-named folder (the
+   * caller has confirmed the clash list).
+   */
+  async setMachines(kind: ItemKind, name: string, lists: ItemMachines): Promise<ItemMachines> {
+    const checked = await this.checkLists(lists);
+    const result = await this.withLock(async () => {
+      if (!(await this.store.hasItem(kind, name))) {
+        throw new PromoteError("not_found", `${kind} "${name}" is not instance-wide`);
+      }
+      const state = await this.store.loadState();
+      const key = itemKey(kind, name);
+      const meta = state.items[key] ?? { createdAt: this.now(), updatedAt: this.now() };
+      const before = machinesOf(meta);
+      meta.targets = checked.targets;
+      meta.writeBack = checked.writeBack;
+      state.items[key] = meta;
+      await this.store.saveState(state);
+      systemLogger.info("Instance-wide: item machines changed", {
+        operation: "instance_wide_item_machines_changed",
+        item: key,
+        targetsBefore: before.targets === "all" ? "all" : before.targets.join(","),
+        targets: checked.targets === "all" ? "all" : checked.targets.join(","),
+        writeBackBefore: before.writeBack.join(","),
+        writeBack: checked.writeBack.join(","),
+      });
+      return checked;
     });
     this.requestSync();
     return result;

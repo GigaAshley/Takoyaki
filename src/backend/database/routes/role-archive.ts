@@ -59,7 +59,7 @@
  */
 
 import type { AuthenticatedRequest } from "../../../types/index.js";
-import { getInstanceWide } from "../../instance-wide/production.js";
+import { getInstanceWide, syncedMachineForHostRow } from "../../instance-wide/production.js";
 import express from "express";
 import type { Request, Response } from "express";
 import { AuthManager } from "../../utils/auth-manager.js";
@@ -121,21 +121,27 @@ router.post(
         .json({ error: "role name must match [a-z0-9-]" });
     }
 
-    // Instance-wide roles are restored by the sync if archived on one host;
-    // they come off every host via "Remove" in the instance-wide section.
-    if (await getInstanceWide()?.isInstanceWide("role", name)) {
-      return res.status(409).json({
-        error: "this role is instance-wide — remove it from the instance-wide section instead",
-        code: "instance_wide",
-      });
-    }
-
     // 3. Verify host ownership (T-133-01-01 gate). Returns null for cross-user
     // or unknown hostId → 404 (same shape as sibling identity-archive route
     // to avoid a 403-vs-404 probe distinguisher).
     const host = await resolveHostById(hostId, userId);
     if (!host) {
       return res.status(404).json({ error: "Host not found" });
+    }
+
+    // A shared role that goes to this machine would be restored by the sync
+    // if archived here; it comes off machines via its machine list or
+    // "Delete from every machine". On a machine it doesn't go to, a
+    // same-named role is the machine's own.
+    const engine = getInstanceWide();
+    const machine = engine
+      ? await syncedMachineForHostRow(hostId, async () => (host as { username?: unknown }).username)
+      : null;
+    if (engine && machine && (await engine.isSharedOn("role", name, machine.machineId))) {
+      return res.status(409).json({
+        error: "this role is shared — take this machine off its list instead",
+        code: "instance_wide",
+      });
     }
 
     // 4. Branch on LOCAL vs REMOTE. LOCAL branch passes conn=null; REMOTE

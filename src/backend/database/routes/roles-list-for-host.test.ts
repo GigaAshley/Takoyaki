@@ -119,7 +119,7 @@ vi.mock("../../utils/host-user-counter.js", () => ({
 const instanceWideMock = vi.hoisted(() => ({
   syncedUser: "ubuntu" as string,
   engine: null as null | {
-    listNames: (kind: string) => Promise<string[]>;
+    namesOn: (kind: string, machineId: string) => Promise<string[]>;
     pendingRemovalNames: (kind: string, machineId: string) => Promise<string[]>;
   },
 }));
@@ -1055,7 +1055,7 @@ describe("Phase 129: role-picker gate on GET /roles?hostId=<n>", () => {
 describe("shared roles being deleted", () => {
   it("leaves out a shared role whose copy on this machine is still being deleted", async () => {
     instanceWideMock.engine = {
-      listNames: async () => ["tina"],
+      namesOn: async (kind, machineId) => (kind === "role" && machineId === "m7" ? ["tina"] : []),
       pendingRemovalNames: async (kind, machineId) => (kind === "role" && machineId === "m7" ? ["nelly"] : []),
     };
     (execCommand as Mock).mockImplementation(async (_conn: unknown, cmd: string) => {
@@ -1069,10 +1069,25 @@ describe("shared roles being deleted", () => {
     expect((res.body as Array<{ instanceWide?: boolean }>)[0].instanceWide).toBe(true);
   });
 
+  it("doesn't mark a role shared when the shared role of that name doesn't go to this machine", async () => {
+    instanceWideMock.engine = {
+      namesOn: async () => [],
+      pendingRemovalNames: async () => [],
+    };
+    (execCommand as Mock).mockImplementation(async (_conn: unknown, cmd: string) => {
+      if (cmd.includes("ls ")) return "tina";
+      return ["===ROLE:tina===", "# tina"].join("\n");
+    });
+    const res = await httpRequest(server, { method: "GET", path: "/roles?hostId=7" });
+    expect(res.status).toBe(200);
+    expect((res.body as Array<{ name: string; instanceWide?: boolean }>)[0]).toMatchObject({ name: "tina" });
+    expect((res.body as Array<{ instanceWide?: boolean }>)[0].instanceWide).toBeUndefined();
+  });
+
   it("leaves another account's own same-named role alone", async () => {
     instanceWideMock.syncedUser = "someone-else";
     instanceWideMock.engine = {
-      listNames: async () => [],
+      namesOn: async () => [],
       pendingRemovalNames: async () => ["nelly"],
     };
     (execCommand as Mock).mockImplementation(async (_conn: unknown, cmd: string) => {

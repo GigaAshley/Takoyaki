@@ -104,11 +104,23 @@ export const MAX_ITEM_BYTES = 25 * 1024 * 1024;
 export const CATCH_UP_INTERVAL_MS = 5 * 60 * 1000;
 
 /**
- * Admin-owned machines are also checked this often, so an agent's native edit
- * there reaches every host in well under a minute rather than at the next
- * catch-up. Cheap: one hashing command per admin machine.
+ * Machines that write back at least one item are also checked this often, so
+ * an agent's native edit there reaches the item's other machines in well under
+ * a minute rather than at the next catch-up. Cheap: one hashing command per
+ * write-back machine.
  */
-export const ADMIN_QUICK_CHECK_MS = 30 * 1000;
+export const WRITE_BACK_QUICK_CHECK_MS = 30 * 1000;
+
+// ---------------------------------------------------------------------------
+// Which machines an item goes to, and which write back
+// ---------------------------------------------------------------------------
+
+/** "all" = every fleet machine, including ones that join later. */
+export type ItemTargets = "all" | string[];
+
+export function targetsInclude(targets: ItemTargets, machineId: string): boolean {
+  return targets === "all" || targets.includes(machineId);
+}
 
 /** A machine not contacted for this long is "offline" and never counted as behind. */
 export const OFFLINE_AFTER_MS = 24 * 60 * 60 * 1000;

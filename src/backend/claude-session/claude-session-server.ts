@@ -1,6 +1,6 @@
 import { WebSocketServer, WebSocket, type RawData } from "ws";
 import { createHash, randomBytes } from "node:crypto";
-import { checkInstanceWideRoleWrite, afterAdminWrite, INSTANCE_WIDE_ROLE_REFUSAL } from "../instance-wide/role-guard.js";
+import { checkInstanceWideRoleWrite, afterAdminWrite, afterWriteBackWrite, INSTANCE_WIDE_ROLE_REFUSAL } from "../instance-wide/role-guard.js";
 import { basename } from "node:path";
 import type { Client as SSHClientType } from "ssh2";
 import { AuthManager } from "../utils/auth-manager.js";
@@ -1882,6 +1882,7 @@ export async function handleIdentityUpdateRoleFile(
   // Instance-wide roles: resolve the identity's role first and apply the same
   // admin-only rule as role:update-file.
   let instanceWideMachineId: string | null = null;
+  let instanceWideWriteBack = false;
   if (userId) {
     let resolvedRole: string | null = null;
     try {
@@ -1910,6 +1911,7 @@ export async function handleIdentityUpdateRoleFile(
         return;
       }
       if (check.verdict === "admin") instanceWideMachineId = check.machineId;
+      if (check.verdict === "writeBack") instanceWideWriteBack = true;
     }
   }
   const useLocal = isLocalHostId(hostIdNum);
@@ -1945,6 +1947,7 @@ export async function handleIdentityUpdateRoleFile(
       });
     }
     if (instanceWideMachineId) afterAdminWrite(instanceWideMachineId);
+    if (instanceWideWriteBack) afterWriteBackWrite();
     try { ws.send(JSON.stringify({ type: "identity:role-file-updated", markdown })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:role-file-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
   } catch (err) {
     sshLogger.error(
@@ -2002,6 +2005,7 @@ export async function handleRoleUpdateFile(
   // Instance-wide roles: non-admins are refused; an admin's write is followed
   // by a sync that carries it from this host to every machine.
   let instanceWideMachineId: string | null = null;
+  let instanceWideWriteBack = false;
   if (userId) {
     const check = await checkInstanceWideRoleWrite(userId, hostIdNum, roleName);
     if (check.verdict === "refuse") {
@@ -2009,6 +2013,7 @@ export async function handleRoleUpdateFile(
       return;
     }
     if (check.verdict === "admin") instanceWideMachineId = check.machineId;
+    if (check.verdict === "writeBack") instanceWideWriteBack = true;
   }
   const useLocal = isLocalHostId(hostIdNum);
   try {
@@ -2043,6 +2048,7 @@ export async function handleRoleUpdateFile(
       });
     }
     if (instanceWideMachineId) afterAdminWrite(instanceWideMachineId);
+    if (instanceWideWriteBack) afterWriteBackWrite();
     try { ws.send(JSON.stringify({ type: "role:file-updated", markdown })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=role:file-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
   } catch (err) {
     sshLogger.error(

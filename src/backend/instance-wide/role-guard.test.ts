@@ -3,6 +3,8 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 const engine = {
   isInstanceWide: vi.fn(async () => true),
+  isSharedOn: vi.fn(async () => true),
+  writesBackFrom: vi.fn(async () => false),
   markAdminSourced: vi.fn(),
   requestSync: vi.fn(),
 };
@@ -27,6 +29,8 @@ const MACHINE = { machineId: "6", hostRowIds: ["6"], local: true };
 beforeEach(() => {
   vi.clearAllMocks();
   engine.isInstanceWide.mockResolvedValue(true);
+  engine.isSharedOn.mockResolvedValue(true);
+  engine.writesBackFrom.mockResolvedValue(false);
   machineForHostRow.mockResolvedValue(MACHINE);
 });
 
@@ -82,5 +86,19 @@ describe("checkInstanceWideRoleWrite — with hostId", () => {
   it("allows when the host is not part of instance-wide sync", async () => {
     machineForHostRow.mockResolvedValue(null);
     expect(await checkInstanceWideRoleWrite("u1", 42, "box-maintainer")).toEqual({ verdict: "allow" });
+  });
+
+  it("allows anyone when the role doesn't go to this machine (a same-named role is the machine's own)", async () => {
+    callerIsAdmin.mockResolvedValue(false);
+    engine.isSharedOn.mockResolvedValue(false);
+    expect(await checkInstanceWideRoleWrite("u1", 6, "box-maintainer")).toEqual({ verdict: "allow" });
+    expect(engine.isSharedOn).toHaveBeenCalledWith("role", "box-maintainer", "6");
+  });
+
+  it("lets a non-admin write on a machine that writes the role back", async () => {
+    callerIsAdmin.mockResolvedValue(false);
+    engine.writesBackFrom.mockResolvedValue(true);
+    expect(await checkInstanceWideRoleWrite("u1", 6, "box-maintainer")).toEqual({ verdict: "writeBack", machineId: "6" });
+    expect(engine.markAdminSourced).not.toHaveBeenCalled();
   });
 });

@@ -97,10 +97,13 @@ import {
   downloadInstanceSkillFile,
 } from "../../instance-wide/skill-files.js";
 
-/** Names of the shared (instance-wide) skills; empty when sync isn't running or can't be read. */
-async function sharedSkillNames(): Promise<string[]> {
+/**
+ * Names of the shared (instance-wide) skills that go to this machine; empty
+ * when sync isn't running or can't be read.
+ */
+async function sharedSkillNames(machineId: string): Promise<string[]> {
   try {
-    return (await getInstanceWide()?.listNames("skill")) ?? [];
+    return (await getInstanceWide()?.namesOn("skill", machineId)) ?? [];
   } catch (err) {
     sshLogger.warn("skills-editor skills: couldn't read shared skill names", {
       operation: "skills_editor_shared_names",
@@ -125,15 +128,11 @@ async function removingSkillNames(machineId: string, hostId: number): Promise<st
 }
 
 /**
- * True when this host row reaches the home folder instance-wide sync keeps in
- * step — the synced row itself, or another row logging into the same account
- * on that box. Other accounts on the box, and boxes outside sync, hold only
- * their users' own skills, whatever their names.
+ * The machine whose home folder instance-wide sync keeps in step, when this
+ * host row reaches it — the synced row itself, or another row logging into the
+ * same account on that box. Other accounts on the box, and boxes outside sync,
+ * hold only their users' own skills, whatever their names.
  */
-async function hostReceivesShared(hostId: number, userId: string): Promise<boolean> {
-  return (await syncedMachineFor(hostId, userId)) !== null;
-}
-
 function syncedMachineFor(hostId: number, userId: string) {
   return syncedMachineForHostRow(hostId, async () => {
     const row = await resolveHostById(hostId, userId);
@@ -141,17 +140,19 @@ function syncedMachineFor(hostId: number, userId: string) {
   });
 }
 
-export const SHARED_SKILL_REFUSAL = "this skill is shared to every machine — only an admin can change it";
+export const SHARED_SKILL_REFUSAL = "this skill is shared — only an admin can change it";
 
 /**
  * Shared (instance-wide) skills are managed by admins: everyone can see and
  * use them, but a non-admin's change to the host's copy would only be put back
- * at the next sync — refuse it. Only where the folder really is the shared
- * copy (a host that receives shared skills); elsewhere a same-named skill is
- * the user's own. Runs after auth and the body parser (the name may ride in
- * the body). A rename's target and a new skill's name aren't checked here: on
- * a host that receives shared skills that folder already exists, and the
- * route says the name is taken.
+ * at the next sync — refuse it, unless an admin chose this machine to write
+ * the skill back (then the change is allowed and a sync carries it out). Only
+ * where the folder really is the shared copy (the skill goes to the machine
+ * whose synced home folder this host row reaches); elsewhere a same-named
+ * skill is the user's own. Runs after auth and the body parser (the name may
+ * ride in the body). A rename's target and a new skill's name aren't checked
+ * here: where the skill is shared that folder already exists, and the route
+ * says the name is taken.
  */
 async function refuseSharedSkillWrites(req: Request, res: Response, next: express.NextFunction): Promise<void> {
   if (isInstanceScope(req)) return next();
@@ -162,11 +163,34 @@ async function refuseSharedSkillWrites(req: Request, res: Response, next: expres
   if (names.length === 0) return next();
   const userId = (req as AuthenticatedRequest).userId;
   try {
-    const shared = await sharedSkillNames();
-    const hit = names.find((n) => shared.includes(n));
-    if (hit === undefined || (await callerIsAdmin(userId))) return next();
+    const engine = getInstanceWide();
+    if (!engine) return next();
+    const everywhere = await engine.listNames("skill");
+    if (!names.some((n) => everywhere.includes(n))) return next();
+    if (await callerIsAdmin(userId)) return next();
     const hostId = Number(query.hostId ?? body.hostId);
-    if (!Number.isInteger(hostId) || hostId <= 0 || !(await hostReceivesShared(hostId, userId))) return next();
+    if (!Number.isInteger(hostId) || hostId <= 0) return next();
+    const machine = await syncedMachineFor(hostId, userId);
+    if (!machine) return next();
+    const shared = await engine.namesOn("skill", machine.machineId);
+    const hits = names.filter((n) => shared.includes(n));
+    if (hits.length === 0) return next();
+    const writable: boolean[] = [];
+    for (const n of hits) writable.push(await engine.writesBackFrom("skill", n, machine.machineId));
+    if (writable.every(Boolean)) {
+      sshLogger.info("skills-editor: change to a shared skill allowed on a write-back machine", {
+        operation: "skills_editor_shared_write_back",
+        path: req.path,
+        hostId,
+        machineId: machine.machineId,
+        skill: hits.join(","),
+      });
+      res.on("finish", () => {
+        if (res.statusCode < 400) engine.requestSync();
+      });
+      return next();
+    }
+    const hit = hits[writable.indexOf(false)];
     sshLogger.info("skills-editor: non-admin change to a shared skill refused", {
       operation: "skills_editor_shared_write_refused",
       path: req.path,
@@ -583,7 +607,7 @@ router.get(
       // A skill counts as the shared one only where this host receives
       // shared skills; elsewhere a same-named skill is the user's own.
       const syncedMachine = await syncedMachineFor(hostId, userId).catch(() => null);
-      const shared = syncedMachine ? new Set(await sharedSkillNames()) : new Set<string>();
+      const shared = syncedMachine ? new Set(await sharedSkillNames(syncedMachine.machineId)) : new Set<string>();
       // A shared skill just removed everywhere is still on disk here until the
       // sync deletes it — don't list it as the host's own meanwhile.
       const removing = syncedMachine
@@ -1572,12 +1596,15 @@ router.post(
       return;
     }
 
+    // Only where the skill is shared to this host's machine; elsewhere a
+    // same-named skill is the user's own.
     const engine = getInstanceWide();
-    if (engine && (await engine.isInstanceWide("skill", skill))) {
+    const sharedHere = engine ? await syncedMachineFor(hostId, userId).catch(() => null) : null;
+    if (engine && sharedHere && (await engine.isSharedOn("skill", skill, sharedHere.machineId))) {
       res.status(403).json({ error: "instance-wide skills can't be renamed" });
       return;
     }
-    if (engine && (await engine.isInstanceWide("skill", newName))) {
+    if (engine && sharedHere && (await engine.isSharedOn("skill", newName, sharedHere.machineId))) {
       res.status(409).json({ error: "skill exists" });
       return;
     }

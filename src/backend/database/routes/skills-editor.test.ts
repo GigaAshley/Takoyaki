@@ -89,10 +89,22 @@ let mockSharedNames: string[] = [];
 let mockSyncedHostIds: number[] = [];
 // Shared skills removed everywhere, still pending on a machine (by machine id).
 let mockPendingRemovals: Record<string, string[]> = {};
+// Machines a shared skill doesn't go to, and machines that write one back
+// (by machine id); tests set these.
+let mockNotOn: Record<string, string[]> = {};
+let mockWriteBack: Record<string, string[]> = {};
+const mockRequestSync = vi.fn();
 vi.mock("../../instance-wide/production.js", () => ({
   getInstanceWide: () => ({
     listNames: async () => mockSharedNames,
+    namesOn: async (_kind: string, machineId: string) =>
+      mockSharedNames.filter((n) => !(mockNotOn[machineId] ?? []).includes(n)),
     isInstanceWide: async (_kind: string, name: string) => mockSharedNames.includes(name),
+    isSharedOn: async (_kind: string, name: string, machineId: string) =>
+      mockSharedNames.includes(name) && !(mockNotOn[machineId] ?? []).includes(name),
+    writesBackFrom: async (_kind: string, name: string, machineId: string) =>
+      (mockWriteBack[machineId] ?? []).includes(name),
+    requestSync: () => mockRequestSync(),
     pendingRemovalNames: async (kind: string, machineId: string) =>
       kind === "skill" ? (mockPendingRemovals[machineId] ?? []) : [],
   }),
@@ -428,6 +440,34 @@ describe("GET /skills-editor/skills", () => {
       mockSharedNames = [];
       mockSyncedHostIds = [];
       mockPendingRemovals = {};
+      mockNotOn = {};
+      mockWriteBack = {};
+      mockRequestSync.mockClear();
+    });
+
+    it("on a machine the shared skill doesn't go to, a same-named skill is the user's own", async () => {
+      (callerIsAdmin as Mock).mockResolvedValue(false);
+      mockNotOn = { "1": ["house-style"] };
+      const res = await httpRequest(server, { method: "GET", path: "/skills-editor/skills?hostId=1" });
+      expect((res.body as { skills: unknown[] }).skills).toEqual([{ name: "build" }, { name: "house-style" }]);
+      await httpRequest(server, {
+        method: "PUT",
+        path: "/skills-editor/write",
+        body: JSON.stringify({ hostId: 1, skill: "house-style", path: "SKILL.md", content: "x", expectedMtime: 1 }),
+      });
+      expect(connectOneShot).toHaveBeenCalled();
+    });
+
+    it("a non-admin may change it on a machine that writes it back", async () => {
+      (callerIsAdmin as Mock).mockResolvedValue(false);
+      mockWriteBack = { "1": ["house-style"] };
+      const res = await httpRequest(server, {
+        method: "PUT",
+        path: "/skills-editor/write",
+        body: JSON.stringify({ hostId: 1, skill: "house-style", path: "SKILL.md", content: "x", expectedMtime: 1 }),
+      });
+      expect(res.status).not.toBe(403);
+      expect(connectOneShot).toHaveBeenCalled();
     });
 
     it("a shared skill just deleted everywhere isn't listed while its copy here is still being deleted", async () => {

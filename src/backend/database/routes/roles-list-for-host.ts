@@ -69,23 +69,30 @@ import { getUsernameForUserId } from "../../utils/host-user-counter.js";
 const router = express.Router();
 
 /**
- * Shared roles removed everywhere whose copy is still being deleted from the
- * home folder this host row reaches. Rows into other accounts on the box hold
- * only their own roles and are left alone.
+ * For the home folder this host row reaches: the shared roles that go to its
+ * machine, and the shared roles whose copy there is still being deleted
+ * (removed everywhere, or taken off the machine's list). Rows into other
+ * accounts on the box, and boxes outside sync, hold only their own roles.
  */
-async function removingRoleNames(hostId: number, rowUsername: unknown): Promise<string[]> {
+async function sharedRoleNamesHere(
+  hostId: number,
+  rowUsername: unknown,
+): Promise<{ shared: string[]; removing: string[] }> {
   try {
     const engine = getInstanceWide();
     const machine = engine ? await syncedMachineForHostRow(hostId, async () => rowUsername) : null;
-    if (!engine || !machine) return [];
-    return await engine.pendingRemovalNames("role", machine.machineId);
+    if (!engine || !machine) return { shared: [], removing: [] };
+    return {
+      shared: await engine.namesOn("role", machine.machineId),
+      removing: await engine.pendingRemovalNames("role", machine.machineId),
+    };
   } catch (err) {
-    systemLogger.warn("roles list: couldn't read pending shared-role removals", {
-      operation: "roles_list_pending_removals",
+    systemLogger.warn("roles list: couldn't read shared roles for this machine", {
+      operation: "roles_list_shared_here",
       hostId,
       error: err instanceof Error ? err.message : "Unknown",
     });
-    return [];
+    return { shared: [], removing: [] };
   }
 }
 
@@ -251,8 +258,14 @@ router.get(
         });
         // Same graceful path — return names with empty descriptions so
         // user can still pick a role even if descriptions failed to load.
-        const removing = new Set(await removingRoleNames(hostId, (host as { username?: unknown }).username));
-        return res.json(validRoles.filter((name) => !removing.has(name)).map((name) => ({ name, description: "" })));
+        const here = await sharedRoleNamesHere(hostId, (host as { username?: unknown }).username);
+        const removing = new Set(here.removing);
+        const sharedHere = new Set(here.shared);
+        return res.json(
+          validRoles
+            .filter((name) => !removing.has(name))
+            .map((name) => ({ name, description: "", ...(sharedHere.has(name) ? { instanceWide: true } : {}) })),
+        );
       }
 
       // 7. Split on ===ROLE:<n>=== delimiters and extract per-role description
@@ -356,14 +369,13 @@ router.get(
         return visible;
       });
 
-      // Instance-wide roles are flagged so the roles window can list them in
-      // their own section and the role picker can mark them.
-      const instanceWideRoles = new Set(
-        (await getInstanceWide()?.listNames("role")) ?? [],
-      );
-      // A shared role just removed everywhere is still on disk here until the
-      // sync deletes it — leave it out meanwhile.
-      const removingRoles = new Set(await removingRoleNames(hostId, (host as { username?: unknown }).username));
+      // Shared roles that go to this machine are flagged so the roles window
+      // can list them in their own section and the role picker can mark them.
+      // A shared role on its way off this machine is still on disk here until
+      // the sync deletes it — leave it out meanwhile.
+      const here = await sharedRoleNamesHere(hostId, (host as { username?: unknown }).username);
+      const instanceWideRoles = new Set(here.shared);
+      const removingRoles = new Set(here.removing);
       const result = gatedRoles.filter((name) => !removingRoles.has(name)).map((name) => ({
         name,
         description: descByName.get(name) ?? "",

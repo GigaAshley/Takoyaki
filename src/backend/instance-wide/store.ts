@@ -18,6 +18,7 @@ import {
   type ItemKind,
   type ItemKey,
   type Manifest,
+  type ItemTargets,
   ITEM_KINDS,
   isIgnoredPath,
   isSafeRelPath,
@@ -43,8 +44,21 @@ export interface MachineState {
   items: Record<ItemKey, MachineItemState>;
 }
 
+export interface ItemMeta {
+  createdAt: number;
+  updatedAt: number;
+  /** Machines the item goes to. Absent on items shared before per-item lists: every machine. */
+  targets?: ItemTargets;
+  /**
+   * Machines whose native edits flow back into the master (always among the
+   * targets). Absent only on items shared before per-item lists, until the
+   * engine fills it in from the machines admin-owned at that moment.
+   */
+  writeBack?: string[];
+}
+
 export interface SyncState {
-  items: Record<ItemKey, { createdAt: number; updatedAt: number }>;
+  items: Record<ItemKey, ItemMeta>;
   /** Removed items still to be deleted from machines that had them. */
   tombstones: Record<ItemKey, { removedAt: number; pending: string[] }>;
   machines: Record<string, MachineState>;
