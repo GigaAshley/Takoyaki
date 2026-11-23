@@ -285,8 +285,14 @@ router.delete("/items", authenticateJWT, async (req: Request, res: Response) => 
     res.status(engine ? 400 : 503).json({ error: engine ? "kind and name are required" : "not running" });
     return;
   }
+  // keepOn: stop sharing it, leaving that machine's copy as its own.
+  const keepOn = (req.body ?? {}).keepOn;
+  if (keepOn !== undefined && (typeof keepOn !== "string" || !/^[0-9]{1,12}$/.test(keepOn))) {
+    res.status(400).json({ error: "keepOn must be a machine id" });
+    return;
+  }
   try {
-    res.json(await engine.removeItem(target.kind, target.name));
+    res.json(await engine.removeItem(target.kind, target.name, keepOn === undefined ? {} : { keepOn }));
   } catch (err) {
     sendPromoteError(res, err);
   }

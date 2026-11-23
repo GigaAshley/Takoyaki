@@ -31,6 +31,7 @@ vi.mock("../../ssh/host-resolver.js", () => ({
   resolveHostById: async (hostId: number) => (hostId === 77 ? null : { id: hostId, username: "ubuntu" }),
 }));
 
+const removeItem = vi.fn(async () => ({ hostCount: 1 }));
 const setMachines = vi.fn(async (_k: string, _n: string, lists: unknown) => lists);
 const findClashes = vi.fn(async (_k: string, _n: string, _except: unknown, among: string[]) => ({
   clashes: among.includes("6") ? ["six"] : [],
@@ -48,6 +49,7 @@ vi.mock("../../instance-wide/production.js", () => ({
     machinesFor: async () => ({ targets: ["5"], writeBack: [] }),
     setMachines,
     findClashes,
+    removeItem,
   }),
   getMachines: async () => [
     { machineId: "5", hostName: "five", hostRowIds: ["5", "9"] },
@@ -224,5 +226,26 @@ describe("machine-list routes", () => {
     const res = await call("POST", "/instance-wide/machines/preview", { kind: "skill", name: "house-style", targets: ["5"] });
     expect(res.body).toEqual({ clashes: [], unreachable: [] });
     expect(findClashes).not.toHaveBeenCalled();
+  });
+});
+
+describe("DELETE /instance-wide/items with keepOn", () => {
+  beforeEach(() => (callerIsAdmin as Mock).mockResolvedValue(true));
+
+  it("stops sharing it and leaves that machine's copy", async () => {
+    const res = await call("DELETE", "/instance-wide/items", { kind: "role", name: "helper", keepOn: "6" });
+    expect(res.status).toBe(200);
+    expect(removeItem).toHaveBeenCalledWith("role", "helper", { keepOn: "6" });
+  });
+
+  it("without keepOn removes it everywhere, as before", async () => {
+    await call("DELETE", "/instance-wide/items", { kind: "role", name: "helper" });
+    expect(removeItem).toHaveBeenCalledWith("role", "helper", {});
+  });
+
+  it("refuses a malformed keepOn", async () => {
+    const res = await call("DELETE", "/instance-wide/items", { kind: "role", name: "helper", keepOn: 6 });
+    expect(res.status).toBe(400);
+    expect(removeItem).not.toHaveBeenCalled();
   });
 });

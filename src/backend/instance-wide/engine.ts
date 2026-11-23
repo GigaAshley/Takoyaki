@@ -968,12 +968,15 @@ export class InstanceWideEngine {
     const unknown = (ids: string[]) => ids.filter((id) => !known.has(id));
     let targets: ItemTargets = "all";
     if (lists.targets !== "all") {
-      if (!Array.isArray(lists.targets) || lists.targets.length === 0) {
-        throw new PromoteError("bad_machines", "pick at least one machine, or every machine");
-      }
-      const bad = unknown(lists.targets);
+      const bad = Array.isArray(lists.targets) ? unknown(lists.targets) : [];
       if (bad.length > 0) throw new PromoteError("bad_machines", `unknown machine: ${bad.join(", ")}`);
-      targets = [...new Set(lists.targets)].sort((a, b) => Number(a) - Number(b));
+      const picked = Array.isArray(lists.targets) ? [...new Set(lists.targets)] : [];
+      // Instance-wide means kept in step on more than one machine. To keep
+      // it on one, stop sharing it instead (removeItem with keepOn).
+      if (picked.length < 2) {
+        throw new PromoteError("bad_machines", "pick at least two machines, or every machine");
+      }
+      targets = picked.sort((a, b) => Number(a) - Number(b));
     }
     const writeBack = [...new Set(lists.writeBack)].sort((a, b) => Number(a) - Number(b));
     const badWb = unknown(writeBack);
@@ -1022,8 +1025,11 @@ export class InstanceWideEngine {
   /**
    * Remove an item everywhere. Returns how many machines it is coming off.
    * Machines that had it but are offline delete it when they return.
+   *
+   * With `keepOn`, the item stops being instance-wide but that machine keeps
+   * its copy as its own: every other machine loses it.
    */
-  async removeItem(kind: ItemKind, name: string): Promise<{ hostCount: number }> {
+  async removeItem(kind: ItemKind, name: string, opts: { keepOn?: string } = {}): Promise<{ hostCount: number }> {
     const result = await this.withLock(async () => {
       const key = itemKey(kind, name);
       if (!(await this.store.hasItem(kind, name))) {
@@ -1031,8 +1037,14 @@ export class InstanceWideEngine {
       }
       const state = await this.store.loadState();
       const current = new Set((await this.deps.listMachines()).map((m) => m.machineId));
+      if (opts.keepOn !== undefined) {
+        if (!current.has(opts.keepOn)) throw new PromoteError("bad_machines", `unknown machine: ${opts.keepOn}`);
+        if (!targetsInclude(machinesOf(state.items[key]).targets, opts.keepOn)) {
+          throw new PromoteError("bad_machines", "it can only stay on a machine it goes to");
+        }
+      }
       const pending = Object.entries(state.machines)
-        .filter(([id, ms]) => current.has(id) && key in ms.items)
+        .filter(([id, ms]) => current.has(id) && key in ms.items && id !== opts.keepOn)
         .map(([id]) => id);
       await this.store.removeItem(kind, name);
       delete state.items[key];
@@ -1043,6 +1055,7 @@ export class InstanceWideEngine {
         operation: "instance_wide_item_removed",
         item: key,
         machines: pending.length,
+        keptOn: opts.keepOn,
       });
       return { hostCount: pending.length };
     });

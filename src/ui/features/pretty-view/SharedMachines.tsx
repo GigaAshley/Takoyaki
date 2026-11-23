@@ -19,6 +19,7 @@ import {
   previewPromote,
   promote,
   promoteConfirmText,
+  removeInstanceWide,
   saveMachines,
   type InstanceWideKind,
   type SharedLists,
@@ -226,6 +227,14 @@ export async function shareWithMachines(opts: {
   });
   if (!lists) return false;
   lists = await settleEveryMachineTicked(lists, machines);
+  // Instance-wide means kept in step on more than one machine.
+  if (lists.targets !== "all" && lists.targets.length < 2) {
+    void kitAlert({
+      title: "Pick at least one more machine",
+      body: `Instance-wide means kept in step on more than one machine. Pick another machine for this ${kindLabel}, or Every machine.`,
+    });
+    return false;
+  }
   try {
     const preview = await previewPromote(opts.kind, opts.name, opts.hostId, lists.targets);
     if (preview.tooLarge) {
@@ -264,7 +273,9 @@ export async function shareWithMachines(opts: {
  * named first (with the agents there holding the role); machines added that
  * already have a same-named folder are named before it's replaced. Resolves
  * the saved lists — and whether the machine `hostId` reaches lost the item —
- * or null when nothing changed.
+ * or null when nothing changed. Taken down to one machine, it stops being
+ * instance-wide instead (after a confirm): that machine keeps its copy as its
+ * own, and `saved` is null with `unshared` set.
  */
 export async function editSharedMachines(opts: {
   kind: InstanceWideKind;
@@ -275,7 +286,7 @@ export async function editSharedMachines(opts: {
   current: SharedLists;
   /** Names of the agents on a machine holding this role (roles only). */
   agentsOn?: (machine: SharedMachine) => string[];
-}): Promise<{ saved: SharedLists; leftHere: boolean } | null> {
+}): Promise<{ saved: SharedLists | null; leftHere: boolean; unshared?: boolean } | null> {
   const machines = await loadMachines();
   if (!machines) return null;
   let lists = await askForLists({
@@ -292,13 +303,45 @@ export async function editSharedMachines(opts: {
   }
 
   const losing = machines.filter((m) => gets(opts.current, m.machineId) && !gets(lists!, m.machineId)).sort(byName);
+  const here = opts.hostId == null ? undefined : machines.find((m) => m.hostRowIds.includes(String(opts.hostId)));
+  const losingLines = losing.map((m) => {
+    const agents = opts.agentsOn?.(m) ?? [];
+    return agents.length === 0
+      ? `${m.hostName}`
+      : `${m.hostName}: ${agents.length} agent${agents.length === 1 ? " holds" : "s hold"} this role there (${agents.join(", ")}) — they'll keep running without it`;
+  });
+
+  // Down to one machine: instance-wide means more than one, so it stops
+  // being shared and that machine keeps its copy as its own.
+  if (lists.targets !== "all" && lists.targets.length === 1) {
+    const keep = machines.find((m) => m.machineId === (lists!.targets as string[])[0]);
+    if (!keep) return null;
+    const body = [
+      `Instance-wide means kept in step on more than one machine. It stays on ${keep.hostName} as that machine's own ${opts.kind}, no longer kept in step, and is deleted from the others along with anything agents saved in it there:`,
+      "",
+      ...losingLines.map((l) => `• ${l}`),
+    ].join("\n");
+    if (
+      !(await kitConfirm({
+        title: `Stop sharing ${opts.label}?`,
+        body,
+        confirmLabel: "Stop sharing",
+        destructive: true,
+      }))
+    )
+      return null;
+    try {
+      await removeInstanceWide(opts.kind, opts.name, keep.machineId);
+      console.info({ operation: "shared_item_unshared", kind: opts.kind, name: opts.name, keptOn: keep.machineId });
+      return { saved: null, leftHere: here !== undefined && here.machineId !== keep.machineId, unshared: true };
+    } catch (err) {
+      void kitAlert({ title: "Couldn't stop sharing it", body: err instanceof Error ? err.message : undefined });
+      return null;
+    }
+  }
+
   if (losing.length > 0) {
-    const lines = losing.map((m) => {
-      const agents = opts.agentsOn?.(m) ?? [];
-      return agents.length === 0
-        ? `${m.hostName}`
-        : `${m.hostName}: ${agents.length} agent${agents.length === 1 ? " holds" : "s hold"} this role there (${agents.join(", ")}) — they'll keep running without it`;
-    });
+    const lines = losingLines;
     const body = [
       `It will be deleted from ${losing.length === 1 ? "this machine" : "these machines"}, along with anything agents saved in it there:`,
       "",
@@ -329,7 +372,6 @@ export async function editSharedMachines(opts: {
     )
       return null;
     const saved = await saveMachines(opts.kind, opts.name, lists);
-    const here = opts.hostId == null ? undefined : machines.find((m) => m.hostRowIds.includes(String(opts.hostId)));
     console.info({
       operation: "shared_item_machines_saved",
       kind: opts.kind,

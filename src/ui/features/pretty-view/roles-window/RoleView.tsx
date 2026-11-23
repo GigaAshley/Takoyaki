@@ -563,8 +563,9 @@ export function RoleView({
     });
     if (!result) return;
     onSharingChanged();
-    // Taken off the machine this window is looking at: it's on its way out here.
-    if (result.leftHere) onBack();
+    // Taken off the machine this window is looking at (on its way out here),
+    // or no longer shared at all: back to the list.
+    if (result.leftHere || result.unshared) onBack();
   };
 
   const handleDeleteEverywhere = async (): Promise<void> => {

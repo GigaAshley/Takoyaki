@@ -421,18 +421,23 @@ describe("InstanceWideEngine — per-item machines", () => {
     await engine.promote("skill", "demo", machines[0], { targets: "all", writeBack: [] });
     await engine.syncNow();
     offline.add("3");
-    await engine.setMachines("skill", "demo", { targets: ["1"], writeBack: [] });
-    expect(await engine.pendingRemovalNames("skill", "2")).toEqual(["demo"]);
-    expect(await engine.isSharedOn("skill", "demo", "2")).toBe(false);
+    await engine.setMachines("skill", "demo", { targets: ["1", "2"], writeBack: [] });
+    expect(await engine.pendingRemovalNames("skill", "3")).toEqual(["demo"]);
+    expect(await engine.isSharedOn("skill", "demo", "3")).toBe(false);
     await engine.syncNow();
-    expect(existsSync(skillDir("b"))).toBe(false);
-    expect(await engine.pendingRemovalNames("skill", "2")).toEqual([]);
     expect(existsSync(skillDir("c"))).toBe(true);
     expect(await engine.pendingRemovalNames("skill", "3")).toEqual(["demo"]);
     offline.delete("3");
     await engine.syncNow();
     expect(existsSync(skillDir("c"))).toBe(false);
+    expect(await engine.pendingRemovalNames("skill", "3")).toEqual([]);
+    // An online machine taken off loses it at once.
+    await engine.setMachines("skill", "demo", { targets: ["1", "3"], writeBack: [] });
+    expect(await engine.pendingRemovalNames("skill", "2")).toEqual(["demo"]);
+    await engine.syncNow();
+    expect(existsSync(skillDir("b"))).toBe(false);
     expect(read("a", "SKILL.md")).toContain("v1");
+    expect(read("c", "SKILL.md")).toContain("v1");
     // Once gone, a same-named folder there is the machine's own.
     await put("b", "SKILL.md", "beta's own now\n");
     await engine.syncNow();
@@ -440,25 +445,24 @@ describe("InstanceWideEngine — per-item machines", () => {
   });
 
   it("a machine added later gets it, replacing its same-named folder", async () => {
-    await engine.promote("skill", "demo", machines[0], { targets: ["1"], writeBack: [] });
+    await engine.promote("skill", "demo", machines[0], { targets: ["1", "2"], writeBack: [] });
     await engine.syncNow();
     await put("c", "SKILL.md", "gamma's own demo\n");
     expect((await engine.findClashes("skill", "demo", undefined, ["3"])).clashes).toEqual(["gamma"]);
-    expect((await engine.findClashes("skill", "demo", undefined, ["2"])).clashes).toEqual([]);
-    await engine.setMachines("skill", "demo", { targets: ["1", "3"], writeBack: [] });
+    await engine.setMachines("skill", "demo", { targets: ["1", "2", "3"], writeBack: [] });
     await engine.syncNow();
     expect(read("c", "SKILL.md")).toContain("v1");
-    expect(existsSync(skillDir("b"))).toBe(false);
   });
 
   it("re-adding a machine after its copy was removed installs it fresh", async () => {
     await engine.promote("skill", "demo", machines[0], { targets: "all", writeBack: [] });
     await engine.syncNow();
-    await engine.setMachines("skill", "demo", { targets: ["1"], writeBack: [] });
+    await engine.setMachines("skill", "demo", { targets: ["1", "2"], writeBack: [] });
     await engine.syncNow();
+    expect(existsSync(skillDir("c"))).toBe(false);
     await engine.setMachines("skill", "demo", { targets: "all", writeBack: [] });
     await engine.syncNow();
-    expect(read("b", "SKILL.md")).toContain("v1");
+    expect(read("c", "SKILL.md")).toContain("v1");
   });
 
   it("refuses lists that don't hold together", async () => {
@@ -466,11 +470,12 @@ describe("InstanceWideEngine — per-item machines", () => {
     const bad = (lists: Parameters<typeof engine.setMachines>[2]) =>
       expect(engine.setMachines("skill", "demo", lists)).rejects.toMatchObject({ code: "bad_machines" });
     await bad({ targets: [], writeBack: [] });
-    await bad({ targets: ["1"], writeBack: ["2"] });
+    await bad({ targets: ["1"], writeBack: [] });
+    await bad({ targets: ["1", "3"], writeBack: ["2"] });
     await bad({ targets: ["1", "99"], writeBack: [] });
     await bad({ targets: "all", writeBack: ["99"] });
     await expect(
-      engine.promote("role", "nope", machines[0], { targets: ["1"], writeBack: ["3"] }),
+      engine.promote("role", "nope", machines[0], { targets: ["1", "2"], writeBack: ["3"] }),
     ).rejects.toMatchObject({ code: "bad_machines" });
     await expect(engine.setMachines("skill", "missing", { targets: "all", writeBack: [] })).rejects.toMatchObject({
       code: "not_found",
@@ -546,13 +551,51 @@ describe("InstanceWideEngine — per-item machines", () => {
   });
 
   it("a machine that left the fleet drops out of the lists as shown", async () => {
-    await engine.promote("skill", "demo", machines[0], { targets: ["1", "3"], writeBack: ["3"] });
+    await engine.promote("skill", "demo", machines[0], { targets: ["1", "2", "3"], writeBack: ["3"] });
     machines = machines.filter((m) => m.machineId !== "3");
-    expect(await engine.machinesFor("skill", "demo")).toEqual({ targets: ["1"], writeBack: [] });
+    expect(await engine.machinesFor("skill", "demo")).toEqual({ targets: ["1", "2"], writeBack: [] });
     const [status] = await engine.status();
-    expect(status.targets).toEqual(["1"]);
+    expect(status.targets).toEqual(["1", "2"]);
     expect(status.writeBack).toEqual([]);
     // Saving what's shown works.
-    await expect(engine.setMachines("skill", "demo", { targets: ["1"], writeBack: [] })).resolves.toBeTruthy();
+    await expect(engine.setMachines("skill", "demo", { targets: ["1", "2"], writeBack: [] })).resolves.toBeTruthy();
+  });
+
+  it("instance-wide means more than one machine: a fixed list needs two", async () => {
+    await engine.promote("skill", "demo", machines[0], { targets: "all", writeBack: [] });
+    await expect(engine.setMachines("skill", "demo", { targets: ["1"], writeBack: [] })).rejects.toMatchObject({
+      code: "bad_machines",
+    });
+    // Sharing from alpha to alpha alone is one machine too.
+    const roleDir = path.join(homes.a, "fleet/roles/helper");
+    await fs.mkdir(roleDir, { recursive: true });
+    await fs.writeFile(path.join(roleDir, "helper.md"), "# helper\n");
+    await expect(
+      engine.promote("role", "helper", machines[0], { targets: ["1"], writeBack: [] }),
+    ).rejects.toMatchObject({ code: "bad_machines" });
+  });
+
+  it("stopping sharing but keeping it on one machine leaves that copy as the machine's own", async () => {
+    await engine.promote("skill", "demo", machines[0], { targets: "all", writeBack: [] });
+    await engine.syncNow();
+    const { hostCount } = await engine.removeItem("skill", "demo", { keepOn: "2" });
+    expect(hostCount).toBe(2);
+    expect(await engine.pendingRemovalNames("skill", "2")).toEqual([]);
+    expect(await engine.isInstanceWide("skill", "demo")).toBe(false);
+    await engine.syncNow();
+    expect(existsSync(skillDir("a"))).toBe(false);
+    expect(existsSync(skillDir("c"))).toBe(false);
+    expect(read("b", "SKILL.md")).toContain("v1");
+    // Beta's to change now, and nothing puts it back.
+    await put("b", "SKILL.md", "beta's own\n");
+    await engine.syncNow();
+    expect(read("b", "SKILL.md")).toBe("beta's own\n");
+  });
+
+  it("it can only stay on a machine it goes to", async () => {
+    await engine.promote("skill", "demo", machines[0], { targets: ["1", "2"], writeBack: [] });
+    await expect(engine.removeItem("skill", "demo", { keepOn: "3" })).rejects.toMatchObject({ code: "bad_machines" });
+    await expect(engine.removeItem("skill", "demo", { keepOn: "99" })).rejects.toMatchObject({ code: "bad_machines" });
+    expect(await engine.isInstanceWide("skill", "demo")).toBe(true);
   });
 });

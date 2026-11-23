@@ -23,6 +23,7 @@ const api = vi.hoisted(() => ({
   saveMachines: vi.fn(),
   previewPromote: vi.fn(),
   promote: vi.fn(),
+  removeInstanceWide: vi.fn(),
 }));
 vi.mock("@/api/instance-wide-api", async (importOriginal) => ({
   ...((await importOriginal()) as Record<string, unknown>),
@@ -31,6 +32,7 @@ vi.mock("@/api/instance-wide-api", async (importOriginal) => ({
   saveMachines: (...a: unknown[]) => api.saveMachines(...a),
   previewPromote: (...a: unknown[]) => api.previewPromote(...a),
   promote: (...a: unknown[]) => api.promote(...a),
+  removeInstanceWide: (...a: unknown[]) => api.removeInstanceWide(...a),
 }));
 
 import { MachineListsEditor, editSharedMachines, shareWithMachines } from "./SharedMachines";
@@ -63,6 +65,7 @@ beforeEach(() => {
   api.saveMachines.mockImplementation(async (_k: string, _n: string, lists: SharedLists) => lists);
   api.previewPromote.mockResolvedValue({ files: 1, bytes: 10, tooLarge: false, clashes: [], unreachable: [], sourceHostName: "alpha" });
   api.promote.mockResolvedValue(undefined);
+  api.removeInstanceWide.mockResolvedValue({ hostCount: 2 });
 });
 afterEach(() => cleanup());
 
@@ -214,6 +217,47 @@ describe("editSharedMachines", () => {
     expect(api.saveMachines).not.toHaveBeenCalled();
   });
 
+  it("down to one machine: asks to stop sharing; that machine keeps its copy", async () => {
+    answerPicker(() => {
+      fireEvent.click(every());
+      fireEvent.click(gets("1"));
+      fireEvent.click(gets("3"));
+    });
+    kit.confirm.mockResolvedValueOnce(true);
+    const res = await editSharedMachines({
+      kind: "role",
+      name: "helper",
+      label: "Helper",
+      hostId: 1,
+      current: { targets: "all", writeBack: [] },
+      agentsOn: (m) => (m.machineId === "3" ? ["Willa"] : []),
+    });
+    const ask = kit.confirm.mock.calls[1][0];
+    expect(ask.title).toBe("Stop sharing Helper?");
+    expect(String(ask.body)).toContain("It stays on beta as that machine's own role");
+    expect(String(ask.body)).toContain("gamma: 1 agent holds this role there (Willa)");
+    expect(ask.confirmLabel).toBe("Stop sharing");
+    expect(api.removeInstanceWide).toHaveBeenCalledWith("role", "helper", "2");
+    expect(api.saveMachines).not.toHaveBeenCalled();
+    // Looked at on alpha, which loses it.
+    expect(res).toEqual({ saved: null, leftHere: true, unshared: true });
+  });
+
+  it("declining stop-sharing changes nothing", async () => {
+    answerPicker(() => fireEvent.click(gets("1")));
+    kit.confirm.mockResolvedValueOnce(false);
+    const res = await editSharedMachines({
+      kind: "skill",
+      name: "demo",
+      label: '"demo"',
+      hostId: 2,
+      current: { targets: ["1", "2"], writeBack: [] },
+    });
+    expect(res).toBeNull();
+    expect(api.removeInstanceWide).not.toHaveBeenCalled();
+    expect(api.saveMachines).not.toHaveBeenCalled();
+  });
+
   it("nothing changed: nothing saved", async () => {
     kit.confirm.mockResolvedValueOnce(true);
     expect(
@@ -236,6 +280,18 @@ describe("shareWithMachines", () => {
     expect(api.previewPromote).toHaveBeenCalledWith("role", "helper", 1, ["1", "2"]);
     expect(String(kit.confirm.mock.calls[1][0].body)).toContain("copied to the 2 machines you picked");
     expect(api.promote).toHaveBeenCalledWith("role", "helper", 1, { targets: ["1", "2"], writeBack: [] });
+  });
+
+  it("sharing to only the machine it's shared from is refused: it needs one more", async () => {
+    answerPicker(() => {
+      fireEvent.click(every());
+      fireEvent.click(gets("2"));
+      fireEvent.click(gets("3"));
+    });
+    expect(await shareWithMachines({ kind: "skill", name: "demo", label: '"demo"', hostId: 1 })).toBe(false);
+    expect(kit.alert).toHaveBeenCalled();
+    expect(api.previewPromote).not.toHaveBeenCalled();
+    expect(api.promote).not.toHaveBeenCalled();
   });
 
   it("cancelling the picker shares nothing", async () => {

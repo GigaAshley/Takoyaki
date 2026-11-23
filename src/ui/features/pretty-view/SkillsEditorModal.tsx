@@ -1037,8 +1037,8 @@ export default function SkillsEditorModal({
     });
     if (!result) return;
     await refreshInstanceWide();
-    // Taken off this machine: it's on its way out here.
-    if (result.leftHere) {
+    // Taken off this machine (on its way out here), or no longer shared.
+    if (result.leftHere || result.unshared) {
       clearSkillSelection();
       if (selectedHostId != null) {
         setSkills({ status: "ready", data: await listSkills(selectedHostId, { includeDistributed: true }) });

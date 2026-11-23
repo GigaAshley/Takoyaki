@@ -155,12 +155,14 @@ export async function promote(
   }
 }
 
+/** With `keepOn`, it stops being instance-wide but that machine keeps its copy as its own. */
 export async function removeInstanceWide(
   kind: InstanceWideKind,
   name: string,
+  keepOn?: string,
 ): Promise<{ hostCount: number }> {
   try {
-    const res = await authApi.delete("/instance-wide/items", { data: { kind, name } });
+    const res = await authApi.delete("/instance-wide/items", { data: keepOn ? { kind, name, keepOn } : { kind, name } });
     return res.data as { hostCount: number };
   } catch (error) {
     throw new InstanceWideError(errorMessage(error, "Couldn't remove it"));
