@@ -705,7 +705,7 @@ name, so they can find it without knowing the app's terminology.
 **Right-click = press and hold.** On a touch screen (phone or tablet),
 anything whose menu opens on right-click — sidebar rows and app icons,
 project and Apps headers, task pills and relay-room badges, pane bars,
-Files-tab rows, scheduled conversation rows, archived-app rows, search results —
+Files-tab rows, scheduled conversation rows, archived-app rows —
 opens that same menu when held for about half a second. Moving the finger
 cancels the hold, so scrolling never opens one. Nothing on a touch screen
 can be dragged; a hold opens the menu instead.
@@ -822,18 +822,13 @@ conversation labels them — "You", the agent's name, or a relay message's
 "Finch → Bilbo" — with the words as the bubble shows them.
 
 In the full search window, archived conversations (matching the query but
-whose identity has been archived) render as rows with a three-dots menu on
-the right (shown on hover, always shown on a touch screen). Clicking the menu's **Un-archive** item
-starts the un-archive; the row shows a spinner ("un-archiving…") until it
-finishes — usually within a minute — and then a notice says the
-conversation is back (the row leaves the search view) or why it was refused
-(for example, a role that itself is still archived, which the notice names).
-If nothing has happened after two minutes the notice says it's still working,
-and it carries on in the background.
+whose identity has been archived) show with an "archived" tag and no menu;
+un-archiving happens from the conversation itself.
 
-**Clicking an archived row opens it as an archived conversation tab**, and
-search closes (an archived conversation already open is brought forward
-instead). It looks like any conversation: the agent's picture, name, colour
+**Clicking a result opens it, and search closes.** With two or more panes
+showing it joins the split beside the largest one, as the pencil does; one
+already showing is just focused. **An archived row opens as an archived
+conversation tab** (one already open is brought forward instead). It looks like any conversation: the agent's picture, name, colour
 and task line on the pill, and its whole history with **Load older
 messages**. It splits, drags, moves to another window and comes back after
 a reload like any tab, and on a phone opens full screen. It is view-only:
@@ -853,7 +848,8 @@ a reload like any tab, and on a phone opens full screen. It is view-only:
 While an un-archive runs the strip says so (still working after two
 minutes, it keeps waiting); once the agent is back the tab turns into the
 live conversation in place, with the agent window live and editable. A
-refusal stays in the strip, in the same words as search's notice. An agent
+refusal stays in the strip, saying why (for example, a role that is itself
+still archived, which it names). An agent
 whose history wasn't kept opens with a "No history was kept" notice.
 
 **Escape clears + blurs.** Escape empties the input, the everywhere link
