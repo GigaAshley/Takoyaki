@@ -49,6 +49,7 @@ const m = vi.hoisted(() => ({
   getOIDCConfig: vi.fn(),
   getPasswordLoginAllowed: vi.fn(),
   getSSHHosts: vi.fn(),
+  removeUserHost: vi.fn(),
 }));
 
 vi.mock("@/api/user-management-api", () => ({
@@ -61,6 +62,7 @@ vi.mock("@/api/user-management-api", () => ({
   revokeAllUserSessions: m.revokeAllUserSessions,
   setUserPhone: m.setUserPhone,
   setUserNotificationsEnabled: m.setUserNotificationsEnabled,
+  removeUserHost: m.removeUserHost,
   getOidcAutoProvision: m.getOidcAutoProvision,
   updatePasswordLoginAllowed: vi.fn(),
   updateOidcAutoProvision: vi.fn(),
@@ -482,6 +484,49 @@ describe("AdminModal — a user", () => {
     expect(screen.queryByTestId("admin-user-host-2")).toBeNull();
     expect(screen.getByText("Hosts · 1")).toBeTruthy();
     expect(m.getSSHHosts).toHaveBeenCalledWith(false);
+  });
+
+  it("removes one of their hosts after a confirm naming the user and the host", async () => {
+    const harbor = { id: 1, name: "harbor", ip: "10.0.0.1", port: 22, username: "riley", userId: "u2", status: "online" };
+    const dock = { id: 3, name: "dock", ip: "10.0.0.3", port: 22, username: "riley", userId: "u2", status: "online" };
+    m.getSSHHosts.mockResolvedValueOnce([harbor, dock]).mockResolvedValue([dock]);
+    m.removeUserHost.mockResolvedValue({});
+    const dialogs = autoAnswerKitDialogs({ confirm: true });
+    renderModal();
+    await openUser("riley");
+    await screen.findByTestId("admin-user-host-1");
+    await userEvent.click(btn("admin-user-host-remove-1"));
+    await waitFor(() => expect(m.removeUserHost).toHaveBeenCalledWith("u2", 1));
+    expect(dialogs.calls[0].opts.title).toBe("Remove harbor from riley?");
+    await waitFor(() => expect(screen.queryByTestId("admin-user-host-1")).toBeNull());
+    expect(screen.getByTestId("admin-user-host-3")).toBeTruthy();
+  });
+
+  it("keeps the host when the confirm is cancelled", async () => {
+    m.getSSHHosts.mockResolvedValue([
+      { id: 1, name: "harbor", ip: "10.0.0.1", port: 22, username: "riley", userId: "u2", status: "online" },
+    ]);
+    autoAnswerKitDialogs({ confirm: false });
+    renderModal();
+    await openUser("riley");
+    await screen.findByTestId("admin-user-host-1");
+    await userEvent.click(btn("admin-user-host-remove-1"));
+    expect(m.removeUserHost).not.toHaveBeenCalled();
+    expect(screen.getByTestId("admin-user-host-1")).toBeTruthy();
+  });
+
+  it("says so when removing a host fails", async () => {
+    m.getSSHHosts.mockResolvedValue([
+      { id: 1, name: "harbor", ip: "10.0.0.1", port: 22, username: "riley", userId: "u2", status: "online" },
+    ]);
+    m.removeUserHost.mockRejectedValue(new Error("boom"));
+    autoAnswerKitDialogs({ confirm: true });
+    renderModal();
+    await openUser("riley");
+    await screen.findByTestId("admin-user-host-1");
+    await userEvent.click(btn("admin-user-host-remove-1"));
+    expect(await screen.findByTestId("admin-user-hosts-error")).toBeTruthy();
+    expect(screen.getByTestId("admin-user-host-1")).toBeTruthy();
   });
 });
 

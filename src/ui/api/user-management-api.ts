@@ -228,6 +228,21 @@ export async function setUserPhone(
   }
 }
 
+/** Admin only: remove a host entry the user owns (the machine is untouched). */
+export async function removeUserHost(
+  userId: string,
+  hostId: number,
+): Promise<Record<string, unknown>> {
+  try {
+    const response = await authApi.delete(
+      `/users/${encodeURIComponent(userId)}/hosts/${hostId}`,
+    );
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "remove user host");
+  }
+}
+
 export async function setUserNotificationsEnabled(
   userId: string,
   enabled: boolean,

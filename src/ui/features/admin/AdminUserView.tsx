@@ -4,7 +4,8 @@
  *
  * One page, top to bottom: the user's picture, name and standing; Access
  * (admin, push notifications, two-factor); Phone; agent service keys; where
- * they're signed in (log out one, or everywhere); the hosts they own;
+ * they're signed in (log out one, or everywhere); the hosts they own
+ * (remove one);
  * details (Matrix ID, user ID); Delete user.
  *
  * The Matrix ID is shown read-only on purpose: re-pointing a user's mxid
@@ -35,6 +36,7 @@ import {
   makeUserAdmin,
   removeAdminStatus,
   revokeAllUserSessions,
+  removeUserHost,
   revokeSession,
   setUserNotificationsEnabled,
   setUserPhone,
@@ -519,15 +521,20 @@ function SessionsGroup({ user, isSelf }: { user: AdminUser; isSelf: boolean }) {
 function HostsGroup({ user }: { user: AdminUser }) {
   const [hosts, setHosts] = useState<SSHHostWithStatus[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [busyId, setBusyId] = useState<number | null>(null);
+
+  const load = useCallback(async () => {
+    // ownedOnly=false: an admin caller gets every user's hosts; narrow to
+    // the ones this user owns.
+    const all = await getSSHHosts(false);
+    return all.filter((h) => h.userId === user.id).sort((a, b) => a.name.localeCompare(b.name));
+  }, [user.id]);
 
   useEffect(() => {
     let cancelled = false;
-    // ownedOnly=false: an admin caller gets every user's hosts; narrow to
-    // the ones this user owns.
-    getSSHHosts(false)
-      .then((all) => {
-        if (cancelled) return;
-        setHosts(all.filter((h) => h.userId === user.id).sort((a, b) => a.name.localeCompare(b.name)));
+    load()
+      .then((mine) => {
+        if (!cancelled) setHosts(mine);
       })
       .catch((err) => {
         if (!cancelled) setError(adminErrorMessage(err, "Failed to load hosts."));
@@ -535,13 +542,34 @@ function HostsGroup({ user }: { user: AdminUser }) {
     return () => {
       cancelled = true;
     };
-  }, [user.id]);
+  }, [load]);
+
+  const remove = async (h: SSHHostWithStatus) => {
+    const hostName = h.name || h.ip;
+    const ok = await kitConfirm({
+      title: `Remove ${hostName} from ${user.username}?`,
+      body: `${user.username} loses this host and what they kept with it — recent files, pins, shortcuts, command history and access they gave others. The machine itself isn't touched. This can't be undone.`,
+      confirmLabel: "Remove",
+      destructive: true,
+    });
+    if (!ok) return;
+    setBusyId(h.id);
+    try {
+      await removeUserHost(user.id, h.id);
+      setHosts(await load());
+      setError(null);
+    } catch (err) {
+      setError(adminErrorMessage(err, "Failed to remove the host."));
+    } finally {
+      setBusyId(null);
+    }
+  };
 
   return (
     <div className="flex flex-col gap-2" data-testid="admin-user-hosts">
       <KitSettingsGroup
         title={hosts && hosts.length > 0 ? `Hosts · ${hosts.length}` : "Hosts"}
-        footer="Hosts they added. Only they can change them."
+        footer="Hosts they added. Only they can change them; you can remove one."
       >
         {hosts === null && !error ? (
           <div className="px-3.5 py-3">
@@ -572,6 +600,18 @@ function HostsGroup({ user }: { user: AdminUser }) {
                 </span>
               }
               value={h.connectionType && h.connectionType !== "ssh" ? h.connectionType.toUpperCase() : undefined}
+              control={
+                <KitButton
+                  variant="danger-quiet"
+                  size="sm"
+                  data-testid={`admin-user-host-remove-${h.id}`}
+                  busy={busyId === h.id}
+                  disabled={busyId !== null}
+                  onClick={() => void remove(h)}
+                >
+                  {busyId === h.id ? "Removing…" : "Remove"}
+                </KitButton>
+              }
             />
           ))
         )}

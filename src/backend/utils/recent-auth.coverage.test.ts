@@ -35,6 +35,7 @@ const PROTECTED: Array<[file: string, method: string, path: string]> = [
   ["database/routes/user-phone-routes.ts", "put", "/me/phone"],
   ["database/routes/user-admin-routes.ts", "post", "/:id/phone"],
   ["database/routes/user-admin-password-routes.ts", "post", "/:id/set-password"],
+  ["database/routes/user-admin-host-routes.ts", "delete", "/:id/hosts/:hostId"],
   ["database/routes/instance-wide.ts", "put", "/machines"],
 ];
 

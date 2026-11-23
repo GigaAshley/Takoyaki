@@ -440,6 +440,9 @@ vi.mock("./user-admin-password-routes.js", () => ({
 vi.mock("./user-admin-routes.js", () => ({
   registerUserAdminRoutes: vi.fn(),
 }));
+vi.mock("./user-admin-host-routes.js", () => ({
+  registerUserAdminHostRoutes: vi.fn(),
+}));
 vi.mock("./user-data-access-routes.js", () => ({
   registerUserDataAccessRoutes: vi.fn(),
 }));

@@ -337,6 +337,7 @@ vi.mock("./user-session-routes.js", () => ({ registerUserSessionRoutes: vi.fn() 
 vi.mock("./user-oidc-account-routes.js", () => ({ registerUserOidcAccountRoutes: vi.fn() }));
 vi.mock("./user-admin-password-routes.js", () => ({ registerUserAdminPasswordRoutes: vi.fn(), MIN_PASSWORD_LENGTH: 6 }));
 vi.mock("./user-admin-routes.js", () => ({ registerUserAdminRoutes: vi.fn() }));
+vi.mock("./user-admin-host-routes.js", () => ({ registerUserAdminHostRoutes: vi.fn() }));
 vi.mock("./user-data-access-routes.js", () => ({ registerUserDataAccessRoutes: vi.fn() }));
 vi.mock("../../utils/shared-credential-manager.js", () => ({
   SharedCredentialManager: {

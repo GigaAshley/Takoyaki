@@ -34,6 +34,7 @@ import {
   MIN_PASSWORD_LENGTH,
   registerUserAdminPasswordRoutes,
 } from "./user-admin-password-routes.js";
+import { registerUserAdminHostRoutes } from "./user-admin-host-routes.js";
 import { registerUserAdminRoutes } from "./user-admin-routes.js";
 import { registerAdminHostsRoutes } from "../../admin-hosts/routes.js";
 import { registerUserPhoneRoutes } from "./user-phone-routes.js";
@@ -2517,6 +2518,7 @@ router.delete("/delete-account", authenticateJWT, async (req, res) => {
 });
 
 registerUserAdminPasswordRoutes(router, { authManager, requireAdmin });
+registerUserAdminHostRoutes(router, { requireAdmin });
 
 /**
  * @openapi
