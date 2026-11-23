@@ -30,6 +30,7 @@ import {
   type ProductionMachine,
 } from "../../instance-wide/production.js";
 import { isIdentityVisibleToUser } from "../../fleet-status/identity-visibility-gate.js";
+import { requireRecentAuth } from "../../utils/recent-auth.js";
 
 const router = express.Router();
 const authManager = AuthManager.getInstance();
@@ -375,7 +376,9 @@ router.post("/machines/preview", authenticateJWT, async (req: Request, res: Resp
 // ---------------------------------------------------------------------------
 // PUT /instance-wide/machines  { kind, name, targets, writeBack }
 // ---------------------------------------------------------------------------
-router.put("/machines", authenticateJWT, async (req: Request, res: Response) => {
+// Granting write-back lets a machine's own edits reach other machines, so
+// saving the lists needs a recent "confirm it's you".
+router.put("/machines", authenticateJWT, requireRecentAuth, async (req: Request, res: Response) => {
   const change = await resolveListsChange(req, res, { requireBoth: true });
   if (!change) return;
   try {

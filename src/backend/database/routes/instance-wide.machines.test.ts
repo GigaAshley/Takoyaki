@@ -58,6 +58,11 @@ vi.mock("../../instance-wide/production.js", () => ({
     hostId === 5 ? { machineId: "5" } : hostId === 6 ? { machineId: "6" } : null,
 }));
 
+// Pass-through: the confirm-it's-you check is covered by its own tests.
+vi.mock("../../utils/recent-auth.js", () => ({
+  requireRecentAuth: (_req: unknown, _res: unknown, next: () => void) => next(),
+}));
+
 vi.mock("../../fleet-status/identity-visibility-gate.js", () => ({
   isIdentityVisibleToUser: () => true,
 }));
