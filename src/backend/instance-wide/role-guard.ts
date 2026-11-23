@@ -7,10 +7,13 @@
  * machines. Anyone else may write only where the machine writes the role back
  * (an admin chose that); the sync then carries it out the same way. Elsewhere
  * their change would only be put back at the next sync — refused. On a machine
- * the role doesn't go to, a same-named role is the machine's own.
+ * the role doesn't go to, a same-named role is the machine's own — and so is
+ * one in another account on the box: only the home folder sync keeps in step
+ * holds the shared copy.
  */
 import type { Response } from "express";
-import { getInstanceWide, machineForHostRow } from "./production.js";
+import { getInstanceWide, syncedMachineForHostRow } from "./production.js";
+import { resolveHostById } from "../ssh/host-resolver.js";
 import { callerIsAdmin } from "./admin.js";
 import { sshLogger } from "../utils/logger.js";
 
@@ -42,7 +45,10 @@ export async function checkInstanceWideRoleWrite(
   }
   const engine = getInstanceWide();
   if (!engine || !(await engine.isInstanceWide("role", role))) return { verdict: "allow" };
-  const machine = await machineForHostRow(hostId);
+  const machine = await syncedMachineForHostRow(hostId, async () => {
+    const row = await resolveHostById(hostId, userId);
+    return row ? (row as { username?: unknown }).username : undefined;
+  });
   if (!machine) return { verdict: "allow" };
   if (!(await engine.isSharedOn("role", role, machine.machineId))) return { verdict: "allow" };
   if (!(await callerIsAdmin(userId))) {
@@ -60,12 +66,12 @@ export async function checkInstanceWideRoleWrite(
   }
   // Marked before the write lands, so a sync that probes mid-write already
   // treats the change as the admin's rather than putting it back.
-  engine.markAdminSourced(machine.machineId);
+  engine.markAdminSourced(machine.machineId, "role", role);
   return { verdict: "admin", machineId: machine.machineId };
 }
 
-export function afterAdminWrite(machineId: string): void {
-  getInstanceWide()?.requestSync({ adminSourcedMachineId: machineId });
+export function afterAdminWrite(machineId: string, role: string): void {
+  getInstanceWide()?.requestSync({ adminSourced: { machineId, kind: "role", name: role } });
 }
 
 /** A write on a write-back machine: sync soon so it reaches the other machines. */
@@ -92,7 +98,7 @@ export async function guardInstanceWideRoleWrite(
     const { verdict, machineId } = check;
     res.on("finish", () => {
       if (res.statusCode >= 400) return;
-      if (verdict === "admin") afterAdminWrite(machineId);
+      if (verdict === "admin") afterAdminWrite(machineId, role);
       else afterWriteBackWrite();
     });
   }

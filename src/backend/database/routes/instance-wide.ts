@@ -140,6 +140,11 @@ router.get("/items", authenticateJWT, async (req: Request, res: Response) => {
         res.status(400).json({ error: "hostId must be a positive integer" });
         return;
       }
+      // What goes to a machine is only for people who can reach it.
+      if (!(await resolveHostById(hostId, userId))) {
+        res.status(404).json({ error: "Host not found" });
+        return;
+      }
       machineId = (await syncedMachineForCaller(hostId, userId))?.machineId ?? null;
     }
     const items = [];
@@ -314,7 +319,7 @@ router.get("/machines", authenticateJWT, async (req: Request, res: Response) => 
   }
 });
 
-async function resolveListsChange(req: Request, res: Response) {
+async function resolveListsChange(req: Request, res: Response, opts: { requireBoth: boolean }) {
   const userId = (req as AuthenticatedRequest).userId;
   if (!(await callerIsAdmin(userId))) {
     res.status(403).json({ error: "only admins can change where shared items go" });
@@ -331,6 +336,12 @@ async function resolveListsChange(req: Request, res: Response) {
     res.status(400).json({ error: "kind and name are required" });
     return null;
   }
+  // Saving names both lists: a missing one must not quietly mean "every
+  // machine" or "no write-back".
+  if (opts.requireBoth && (body.targets === undefined || body.writeBack === undefined)) {
+    res.status(400).json({ error: "targets and writeBack are both required" });
+    return null;
+  }
   const lists = parseLists(body);
   if (typeof lists === "string") {
     res.status(400).json({ error: lists });
@@ -344,7 +355,7 @@ async function resolveListsChange(req: Request, res: Response) {
 // Same-named folders on the machines being added, before the change is saved.
 // ---------------------------------------------------------------------------
 router.post("/machines/preview", authenticateJWT, async (req: Request, res: Response) => {
-  const change = await resolveListsChange(req, res);
+  const change = await resolveListsChange(req, res, { requireBoth: false });
   if (!change) return;
   try {
     const current = await change.engine.machinesFor(change.kind, change.name);
@@ -365,7 +376,7 @@ router.post("/machines/preview", authenticateJWT, async (req: Request, res: Resp
 // PUT /instance-wide/machines  { kind, name, targets, writeBack }
 // ---------------------------------------------------------------------------
 router.put("/machines", authenticateJWT, async (req: Request, res: Response) => {
-  const change = await resolveListsChange(req, res);
+  const change = await resolveListsChange(req, res, { requireBoth: true });
   if (!change) return;
   try {
     const saved = await change.engine.setMachines(change.kind, change.name, change.lists);

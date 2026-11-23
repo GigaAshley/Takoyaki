@@ -134,6 +134,17 @@ function machinesOf(meta: ItemMeta | undefined): ItemMachines {
   return { targets: meta?.targets ?? "all", writeBack: meta?.writeBack ?? [] };
 }
 
+/**
+ * The lists as shown and edited: only machines still in the fleet, and
+ * write-back only among the targets. A machine that left stays in the stored
+ * lists (harmless — nothing syncs to it) until the next save drops it.
+ */
+function listsAmong(lists: ItemMachines, machines: SyncMachine[]): ItemMachines {
+  const known = new Set(machines.map((m) => m.machineId));
+  const targets: ItemTargets = lists.targets === "all" ? "all" : lists.targets.filter((id) => known.has(id));
+  return { targets, writeBack: lists.writeBack.filter((id) => known.has(id) && targetsInclude(targets, id)) };
+}
+
 function safeHostTag(hostName: string): string {
   return hostName.replace(/[^a-zA-Z0-9_-]+/g, "-").slice(0, 40) || "host";
 }
@@ -148,7 +159,11 @@ export class InstanceWideEngine {
   private pendingTimer: ReturnType<typeof setTimeout> | null = null;
   private running: Promise<void> | null = null;
   private rerun = false;
-  /** Machines whose next sync should treat their changes as admin changes. */
+  /**
+   * `<machineId>|<itemKey>`: items on a machine whose next sync should treat
+   * the machine's changes as an admin's. Per item, so an admin's app edit to
+   * one item never lets the machine's own edits to other items write back.
+   */
   private adminSourced = new Set<string>();
   private stopped = false;
 
@@ -236,22 +251,22 @@ export class InstanceWideEngine {
   }
 
   /**
-   * Ask for a sync pass soon. Bursts coalesce; a request during a pass makes
-   * the pass run once more when it ends. `adminSourcedMachineId` marks a
-   * machine whose pending changes were made by an admin through the app, so
-   * they flow back even if the machine itself is not admin-owned.
+   * Mark an item on a machine before an admin's app-side write lands there,
+   * so a sync that happens to probe mid-write already treats the change as an
+   * admin's — it flows back even if the machine doesn't write the item back.
    */
-  /**
-   * Mark a machine before an admin's app-side write lands on it, so a sync
-   * that happens to probe mid-write already treats the change as an admin's.
-   */
-  markAdminSourced(machineId: string): void {
-    this.adminSourced.add(machineId);
+  markAdminSourced(machineId: string, kind: ItemKind, name: string): void {
+    this.adminSourced.add(`${machineId}|${itemKey(kind, name)}`);
   }
 
-  requestSync(opts: { adminSourcedMachineId?: string } = {}): void {
+  /**
+   * Ask for a sync pass soon. Bursts coalesce; a request during a pass makes
+   * the pass run once more when it ends. `adminSourced` marks an item on a
+   * machine whose pending change was made by an admin through the app.
+   */
+  requestSync(opts: { adminSourced?: { machineId: string; kind: ItemKind; name: string } } = {}): void {
     if (this.stopped) return;
-    if (opts.adminSourcedMachineId) this.adminSourced.add(opts.adminSourcedMachineId);
+    if (opts.adminSourced) this.markAdminSourced(opts.adminSourced.machineId, opts.adminSourced.kind, opts.adminSourced.name);
     if (this.running) {
       this.rerun = true;
       return;
@@ -362,7 +377,7 @@ export class InstanceWideEngine {
     const now = this.now();
     ms.lastAttemptAt = now;
 
-    const adminSourced = this.adminSourced.has(machine.machineId);
+    const adminSourced = (key: ItemKey) => this.adminSourced.has(`${machine.machineId}|${key}`);
     if (!channel) {
       ms.lastError = "unreachable";
       await this.store.saveState(state);
@@ -415,7 +430,6 @@ export class InstanceWideEngine {
       const probes = await hostOps.probeFolders(channel, dirs);
       ms.lastContactAt = now;
       delete ms.lastError;
-      let itemFailed = false;
 
       for (const key of removals) {
         const parsed = parseItemKey(key);
@@ -450,11 +464,12 @@ export class InstanceWideEngine {
             item.kind,
             item.name,
             probe,
-            machinesOf(state.items[key]).writeBack.includes(machine.machineId) || adminSourced,
+            machinesOf(state.items[key]).writeBack.includes(machine.machineId) || adminSourced(key),
           );
           if (changed) masterChanged = true;
+          // An admin's app-side edit is "consumed" once that item synced.
+          this.adminSourced.delete(`${machine.machineId}|${key}`);
         } catch (err) {
-          itemFailed = true;
           const prev = ms.items[key];
           ms.items[key] = {
             base: prev?.base ?? {},
@@ -471,9 +486,6 @@ export class InstanceWideEngine {
           });
         }
       }
-
-      // An admin's app-side edit is only "consumed" once everything synced.
-      if (!itemFailed) this.adminSourced.delete(machine.machineId);
 
       // Forget items that are gone from the master or no longer go to this
       // machine (their copies were deleted above).
@@ -677,8 +689,7 @@ export class InstanceWideEngine {
         behind: hosts.filter((h) => h.state === "behind").length,
         conflicts: hosts.filter((h) => h.state === "conflict").length,
         hosts,
-        targets: lists.targets,
-        writeBack: lists.writeBack.filter((id) => targetsInclude(lists.targets, id)),
+        ...listsAmong(lists, machines),
       });
     }
     return out;
@@ -741,7 +752,7 @@ export class InstanceWideEngine {
       throw new PromoteError("not_found", `${kind} "${name}" is not instance-wide`);
     }
     const lists = machinesOf((await this.store.loadState()).items[itemKey(kind, name)]);
-    return { targets: lists.targets, writeBack: lists.writeBack.filter((id) => targetsInclude(lists.targets, id)) };
+    return listsAmong(lists, await this.deps.listMachines());
   }
 
   /**

@@ -39,7 +39,7 @@ import { machineLockKey, withScheduledAgentLock } from "./scheduled-agents-write
 import { ROLE_NAME_PATTERN } from "./identity-birth-orchestrator.js";
 import { getUsernameForUserId } from "../../utils/host-user-counter.js";
 import { listMachinePeople } from "../../distributor/machine-people.js";
-import { getInstanceWide, machineForHostRow } from "../../instance-wide/production.js";
+import { getInstanceWide, syncedMachineForHostRow } from "../../instance-wide/production.js";
 import { getSubscriptionRegistry } from "../../fleet-status/subscription-registry.js";
 import { enrichForWire } from "./project-list.js";
 import {
@@ -142,15 +142,19 @@ function parseChange(body: Record<string, unknown>): Change | string {
 }
 
 /**
- * Shared roles kept in step on this host's machine. When that list can't be
+ * Shared roles kept in step in the home folder this host row reaches (other
+ * accounts on the box hold only their own roles). When that list can't be
  * read, every role is treated as one (fails closed: nothing an admin keeps in
  * step gets written).
  */
-async function instanceWideRoleNames(hostId: number): Promise<Set<string> | "unknown"> {
+async function instanceWideRoleNames(hostId: number, userId: string): Promise<Set<string> | "unknown"> {
   try {
     const engine = getInstanceWide();
     if (!engine) return new Set();
-    const machine = await machineForHostRow(hostId);
+    const machine = await syncedMachineForHostRow(hostId, async () => {
+      const row = await resolveHostById(hostId, userId);
+      return row ? (row as { username?: unknown }).username : undefined;
+    });
     return new Set(machine ? await engine.namesOn("role", machine.machineId) : []);
   } catch (err) {
     databaseLogger.warn("sharing: couldn't list roles kept on every machine — treating all roles as locked", {
@@ -228,7 +232,7 @@ async function peopleOn(hostId: number): Promise<string[]> {
 async function load(conn: SSHClientType | null, t: Target, userId: string, people: string[]): Promise<Loaded> {
   const you = await getUsernameForUserId(userId);
   if (!you) throw new HttpError(404, "Not found");
-  const iw = await instanceWideRoleNames(t.hostId);
+  const iw = await instanceWideRoleNames(t.hostId, userId);
   if (iw === "unknown" && t.kind === "role") throw new HttpError(503, "Try again in a moment");
   const state = await readShareHostState(conn, people, iw === "unknown" ? "all" : iw, t);
   if (!visibleTo(state, t, you)) throw new HttpError(404, "Not found");

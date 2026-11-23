@@ -26,8 +26,9 @@ vi.mock("../db/index.js", () => ({
 
 vi.mock("../../instance-wide/admin.js", () => ({ callerIsAdmin: vi.fn() }));
 
+// Host row 77 is someone else's: the caller can't reach it.
 vi.mock("../../ssh/host-resolver.js", () => ({
-  resolveHostById: async (hostId: number) => ({ id: hostId, username: "ubuntu" }),
+  resolveHostById: async (hostId: number) => (hostId === 77 ? null : { id: hostId, username: "ubuntu" }),
 }));
 
 const setMachines = vi.fn(async (_k: string, _n: string, lists: unknown) => lists);
@@ -130,6 +131,12 @@ describe("GET /instance-wide/items?hostId", () => {
     expect(res.body.items).toEqual([]);
   });
 
+  it("refuses a host the caller can't reach", async () => {
+    (callerIsAdmin as Mock).mockResolvedValue(false);
+    const res = await call("GET", "/instance-wide/items?hostId=77");
+    expect(res.status).toBe(404);
+  });
+
   it("gives admins the machine lists", async () => {
     (callerIsAdmin as Mock).mockResolvedValue(true);
     const res = await call("GET", "/instance-wide/items?hostId=6");
@@ -188,6 +195,9 @@ describe("machine-list routes", () => {
       { kind: "role", name: "helper", targets: [5], writeBack: [] },
       { kind: "role", name: "helper", targets: "all", writeBack: "6" },
       { kind: "nope", name: "helper", targets: "all" },
+      // Both lists, always: a missing one never means "every machine" or "no write-back".
+      { kind: "role", name: "helper", writeBack: ["6"] },
+      { kind: "role", name: "helper", targets: ["5"] },
     ]) {
       expect((await call("PUT", "/instance-wide/machines", body)).status).toBe(400);
     }

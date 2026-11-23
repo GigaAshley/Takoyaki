@@ -218,13 +218,17 @@ export default function SkillsEditorModal({
   }, []);
 
   const refreshInstanceWide = useCallback(async (): Promise<InstanceWideList> => {
+    // A reply for a host that's no longer selected is dropped — it would show
+    // that machine's shared skills (and write-back) under this one.
+    const forHost = selectedHostIdRef.current;
+    const current = () => mountedRef.current && selectedHostIdRef.current === forHost;
     try {
-      const list = await listInstanceWide("skill", selectedHostIdRef.current ?? undefined);
-      if (mountedRef.current) setInstanceWide(list);
+      const list = await listInstanceWide("skill", forHost ?? undefined);
+      if (current()) setInstanceWide(list);
       return list;
     } catch {
       const empty = { isAdmin: false, items: [] };
-      if (mountedRef.current) setInstanceWide(empty);
+      if (current()) setInstanceWide(empty);
       return empty;
     }
   }, []);

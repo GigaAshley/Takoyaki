@@ -1883,8 +1883,8 @@ export async function handleIdentityUpdateRoleFile(
   // admin-only rule as role:update-file.
   let instanceWideMachineId: string | null = null;
   let instanceWideWriteBack = false;
+  let resolvedRole: string | null = null;
   if (userId) {
-    let resolvedRole: string | null = null;
     try {
       if (isLocalHostId(hostIdNum)) {
         resolvedRole = await resolveRoleForIdentity(null, identityKey);
@@ -1946,7 +1946,7 @@ export async function handleIdentityUpdateRoleFile(
         }
       });
     }
-    if (instanceWideMachineId) afterAdminWrite(instanceWideMachineId);
+    if (instanceWideMachineId) afterAdminWrite(instanceWideMachineId, resolvedRole!);
     if (instanceWideWriteBack) afterWriteBackWrite();
     try { ws.send(JSON.stringify({ type: "identity:role-file-updated", markdown })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:role-file-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
   } catch (err) {
@@ -2047,7 +2047,7 @@ export async function handleRoleUpdateFile(
         }
       });
     }
-    if (instanceWideMachineId) afterAdminWrite(instanceWideMachineId);
+    if (instanceWideMachineId) afterAdminWrite(instanceWideMachineId, roleName);
     if (instanceWideWriteBack) afterWriteBackWrite();
     try { ws.send(JSON.stringify({ type: "role:file-updated", markdown })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=role:file-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
   } catch (err) {

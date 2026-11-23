@@ -198,7 +198,7 @@ describe("InstanceWideEngine", () => {
     await share();
     await engine.syncNow();
     await put("c", "SKILL.md", "admin edited via gamma\n");
-    engine.requestSync({ adminSourcedMachineId: "3" });
+    engine.requestSync({ adminSourced: { machineId: "3", kind: "skill", name: "demo" } });
     await engine.syncNow();
     expect(read("a", "SKILL.md")).toBe("admin edited via gamma\n");
   });
@@ -528,5 +528,31 @@ describe("InstanceWideEngine — per-item machines", () => {
     await engine.syncNow();
     expect(read("a", "SKILL.md")).toBe("quick from gamma\n");
     expect(read("b", "SKILL.md")).toBe("quick from gamma\n");
+  });
+
+  it("an admin's app edit to one item never lets the machine's edits to another item write back", async () => {
+    await put("a", "SKILL.md", "---\nname: other\n---\nother v1\n", "other");
+    await engine.promote("skill", "demo", machines[0], { targets: "all", writeBack: [] });
+    await engine.promote("skill", "other", machines[0], { targets: "all", writeBack: [] });
+    await engine.syncNow();
+    // An admin edits demo through the app on gamma; gamma's owner edits other natively.
+    await put("c", "SKILL.md", "admin's demo edit\n");
+    await put("c", "SKILL.md", "owner's edit to other\n", "other");
+    engine.requestSync({ adminSourced: { machineId: "3", kind: "skill", name: "demo" } });
+    await engine.syncNow();
+    expect(read("a", "SKILL.md")).toBe("admin's demo edit\n");
+    expect(read("a", "SKILL.md", "other")).toContain("other v1");
+    expect(read("c", "SKILL.md", "other")).toContain("other v1");
+  });
+
+  it("a machine that left the fleet drops out of the lists as shown", async () => {
+    await engine.promote("skill", "demo", machines[0], { targets: ["1", "3"], writeBack: ["3"] });
+    machines = machines.filter((m) => m.machineId !== "3");
+    expect(await engine.machinesFor("skill", "demo")).toEqual({ targets: ["1"], writeBack: [] });
+    const [status] = await engine.status();
+    expect(status.targets).toEqual(["1"]);
+    expect(status.writeBack).toEqual([]);
+    // Saving what's shown works.
+    await expect(engine.setMachines("skill", "demo", { targets: ["1"], writeBack: [] })).resolves.toBeTruthy();
   });
 });

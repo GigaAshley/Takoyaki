@@ -8,10 +8,15 @@ const engine = {
   markAdminSourced: vi.fn(),
   requestSync: vi.fn(),
 };
+// The synced-home lookup; it reads the row's username through rowUsername.
 const machineForHostRow = vi.fn();
 vi.mock("./production.js", () => ({
   getInstanceWide: vi.fn(() => engine),
-  machineForHostRow: (...a: unknown[]) => machineForHostRow(...a),
+  syncedMachineForHostRow: (hostId: number, rowUsername: () => Promise<unknown>) =>
+    machineForHostRow(hostId, rowUsername),
+}));
+vi.mock("../ssh/host-resolver.js", () => ({
+  resolveHostById: async (hostId: number) => ({ id: hostId, username: "ubuntu" }),
 }));
 const callerIsAdmin = vi.fn();
 vi.mock("./admin.js", () => ({
@@ -69,13 +74,13 @@ describe("checkInstanceWideRoleWrite — with hostId", () => {
   it("non-admin is refused on an instance-wide role of a synced host", async () => {
     callerIsAdmin.mockResolvedValue(false);
     expect(await checkInstanceWideRoleWrite("u1", 6, "box-maintainer")).toEqual({ verdict: "refuse" });
-    expect(machineForHostRow).toHaveBeenCalledWith(6);
+    expect(machineForHostRow).toHaveBeenCalledWith(6, expect.any(Function));
   });
 
   it("admin write on a synced host returns admin + marks the machine", async () => {
     callerIsAdmin.mockResolvedValue(true);
     expect(await checkInstanceWideRoleWrite("admin", 6, "box-maintainer")).toEqual({ verdict: "admin", machineId: "6" });
-    expect(engine.markAdminSourced).toHaveBeenCalledWith("6");
+    expect(engine.markAdminSourced).toHaveBeenCalledWith("6", "role", "box-maintainer");
   });
 
   it("allows when the role is not instance-wide", async () => {

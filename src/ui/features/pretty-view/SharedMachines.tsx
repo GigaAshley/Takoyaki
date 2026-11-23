@@ -165,7 +165,14 @@ async function askForLists(opts: {
   confirmLabel: string;
   pinnedMachineId?: string;
 }): Promise<SharedLists | null> {
-  let picked = opts.initial;
+  // Only machines the picker shows: a machine that left the fleet is
+  // dropped here rather than sent back unseen.
+  const known = new Set(opts.machines.map((m) => m.machineId));
+  const initial: SharedLists = {
+    targets: opts.initial.targets === "all" ? "all" : opts.initial.targets.filter((id) => known.has(id)),
+    writeBack: opts.initial.writeBack.filter((id) => known.has(id)),
+  };
+  let picked = initial;
   const ok = await kitConfirm({
     title: opts.title,
     body: (
@@ -173,7 +180,7 @@ async function askForLists(opts: {
         <p>{opts.intro}</p>
         <MachineListsEditor
           machines={opts.machines}
-          initial={opts.initial}
+          initial={initial}
           pinnedMachineId={opts.pinnedMachineId}
           onChange={(l) => (picked = l)}
         />
