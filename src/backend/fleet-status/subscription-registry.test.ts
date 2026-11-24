@@ -1168,6 +1168,22 @@ describe("subscription-registry", () => {
       expect([...(frame.reportedHostIds ?? [])].sort()).toEqual(["h1", "h3"]);
     });
 
+    it("the first full read of a host sends existing subscribers a snapshot for just that host, once", () => {
+      const registry = createSubscriptionRegistry();
+      const receivedFrames: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => receivedFrames.push(f));
+      receivedFrames.length = 0;
+      registry.publishAppUpdate("h1", makeAppState("h1", "todo"));
+      registry.publishAppUpdate("h2", makeAppState("h2", "kanban"));
+      registry.markAppsReported("h1");
+      registry.markAppsReported("h1");
+      const snaps = receivedFrames.filter((f) => f.type === "app-snapshot");
+      expect(snaps).toHaveLength(1);
+      if (snaps[0].type !== "app-snapshot") throw new Error("expected app-snapshot");
+      expect(snaps[0].apps.map((a) => a.slug)).toEqual(["todo"]);
+      expect(snaps[0].reportedHostIds).toEqual(["h1"]);
+    });
+
     it("Test 6: subscribing with no published apps still emits an app-snapshot frame carrying apps: []", () => {
       const registry = createSubscriptionRegistry();
       const receivedFrames: FrontendOutboundFrameType[] = [];

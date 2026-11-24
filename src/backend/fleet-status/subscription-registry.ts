@@ -296,7 +296,8 @@ export interface SubscriptionRegistry {
    * Record that this host's apps have been fully read at least once since
    * startup — from then on the app-snapshot frame speaks for this host, and a
    * client may replace its saved apps for it. Hosts never marked keep whatever
-   * the client already shows.
+   * the client already shows. The first mark for a host also sends current
+   * subscribers a snapshot scoped to that host.
    */
   markAppsReported(hostId: string): void;
 
@@ -1133,7 +1134,18 @@ export function createSubscriptionRegistry(
     },
 
     markAppsReported(hostId: string): void {
+      if (appsReportedHosts.has(hostId)) return;
       appsReportedHosts.add(hostId);
+      // Clients that subscribed before this host was read kept their saved
+      // apps for it; tell them now what it really has, so an app removed
+      // meanwhile doesn't linger for the rest of their visit.
+      const hostApps = Array.from(apps.values()).filter((a) => a.hostId === hostId);
+      const frame = makeAppSnapshotFrame(hostApps, [hostId]);
+      if (appFrameFilter !== undefined) {
+        void fanOutApp(subscribers, frame, appFrameFilter);
+      } else {
+        fanOut(subscribers, frame);
+      }
     },
 
     publishToUser(userId: string, frame: FrontendOutboundFrameType): void {
