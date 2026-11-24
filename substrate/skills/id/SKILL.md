@@ -938,9 +938,9 @@ not something agents drive.
   place ("Notified you") means the agent notified the user (§ Notifying the
   user); an **amber disc** on the
   picture means the agent has local work not pushed anywhere.
-  Only admins ever see a plain terminal row; for anyone else, an agent
-  whose machine can't be reached drops out of the sidebar until the
-  machine is back.
+  Only admins ever see a plain terminal row. A conversation whose machine
+  can't be reached stays where it is, greyed out, for everyone; tapping
+  it says the machine isn't reachable.
   **Swipe to archive (phone).** Swiping a conversation row to the left
   archives it at once, no confirm: the row slides away and a bar says
   "Archived … · Undo" for about 5 seconds. The archive only happens once
