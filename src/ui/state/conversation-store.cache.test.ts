@@ -21,6 +21,7 @@ vi.mock("@/api/user-preferences-api", () => ({
 
 import {
   readFleetSessionsCache,
+  hasFleetSessionsCache,
   writeFleetSessionsCache,
   readPinnedIdsCache,
   writePinnedIdsCache,
@@ -299,6 +300,13 @@ describe("FleetSession localStorage cache (quick-260805-tub)", () => {
     const snap = __getSnapshotForTest();
     const rows = [...snap.pinned, ...snap.middle];
     expect(rows.some((r) => r.roomId === "!room:matrix.example")).toBe(true);
+  });
+
+  it("an empty saved list is told apart from no saved list", () => {
+    expect(hasFleetSessionsCache()).toBe(false);
+    writeFleetSessionsCache([]);
+    expect(hasFleetSessionsCache()).toBe(true);
+    expect(readFleetSessionsCache()).toEqual([]);
   });
 
   it("malformed relay-room faces are dropped without losing the room", () => {

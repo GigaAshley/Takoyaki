@@ -131,6 +131,7 @@ import {
   addToActiveSet,
   useActiveSet,
   readFleetSessionsCache,
+  hasFleetSessionsCache,
   markHostReachable,
   writeFleetSessionsCache,
   useRelayRoomTitles,
@@ -1131,10 +1132,13 @@ export function AppShell({
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [stableHostTreeKey],
   );
-  useEffect(() => {
+  // Store inputs land before the browser paints (layout effects), so the
+  // sidebar's first painted frame already has them — a passive effect let one
+  // frame paint without them, then everything shifted into place.
+  useLayoutEffect(() => {
     updateHostTree(stableHostTree);
   }, [stableHostTree]);
-  useEffect(() => {
+  useLayoutEffect(() => {
     updateOpenTabs(tabs);
   }, [tabs]);
 
@@ -1232,7 +1236,8 @@ export function AppShell({
   // Mount effect — seed from localStorage cache THEN fetch (cold start only).
   // TG-17: the empty dep array now enforces "the SEED is exactly once per mount"
   // rather than "the fetch is" — the fetch now also fires on visibility (below).
-  useEffect(() => {
+  // A layout effect so the seeded rows are in the very first painted frame.
+  useLayoutEffect(() => {
     mountedRef.current = true;
     // quick-260805-tub: seed the store from the localStorage cache BEFORE
     // the network fetch fires. This paints the last-known conversation-list
@@ -1245,6 +1250,15 @@ export function AppShell({
     // data into the working store, undressing rows that the WS snapshot just
     // dressed. readFleetSessionsCache is called exactly once per mount.
     const cached = readFleetSessionsCache();
+    console.info({
+      operation: "fleet_sessions_cache_seed",
+      cachedRows: cached.length,
+      savedEmpty: cached.length === 0 && hasFleetSessionsCache(),
+    });
+    if (cached.length === 0 && hasFleetSessionsCache()) {
+      // Last time there was nothing: paint that, not "Loading agents…".
+      updateFleetSessions([]);
+    }
     if (cached.length > 0) {
       updateFleetSessions(cached);
       // Phase 44 Plan 04 — feed cached rows into the working-store max-wins
@@ -1304,13 +1318,13 @@ export function AppShell({
     return m;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stableHostTreeKey]);
-  useEffect(() => {
+  useLayoutEffect(() => {
     // Phase 111 Plan 05 — keep ref live so applyFleetState can resolve hostName
     // from the current map even though its enclosing effect has an empty dep array.
     hostsByIdRef.current = hostsById;
     updateHostsFlat(hostsById);
   }, [hostsById]);
-  useEffect(() => {
+  useLayoutEffect(() => {
     updateIdentitiesByKey(identitiesByKey);
   }, [identitiesByKey]);
 
@@ -1806,7 +1820,7 @@ export function AppShell({
   // Iterates byHostKey (one entry per host+identity), NOT byKey — byKey is
   // name-only, so two same-named identities on different hosts collapsed to
   // one and the other lost its project section.
-  useEffect(() => {
+  useLayoutEffect(() => {
     const next = new Map<string, string>();
     for (const identity of identitiesByHostKey.values()) {
       if (identity.project == null) continue;

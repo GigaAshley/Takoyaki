@@ -55,6 +55,7 @@ import type { RelayRoomFace } from "@/api/sessions-api";
 import { sessionMatchKey } from "@/features/terminal/session-hue";
 import {
   readUserScopedCache,
+  hasUserScopedCache,
   writeUserScopedCache,
 } from "@/state/user-scoped-cache";
 // Phase 92 Plan 04 (H2 lock): pin toggle callsites REUSE the existing
@@ -2516,6 +2517,15 @@ export function readFleetSessionsCache(): FleetSession[] {
   } catch {
     return [];
   }
+}
+
+/**
+ * Whether this device has a saved fleet snapshot for the logged-in user — even
+ * an empty one. An empty saved list means "last time there was nothing", which
+ * paints as loaded; a missing one means nothing is known yet.
+ */
+export function hasFleetSessionsCache(): boolean {
+  return hasUserScopedCache(FLEET_CACHE_KEY);
 }
 
 /**
