@@ -112,8 +112,8 @@ export function useSidebarMotion(rootRef: RefObject<HTMLElement | null>, enabled
     for (const [k, el] of items) {
       if (running.current.has(el)) onScreen.set(k, placeOf(el, root, rootRect));
     }
-    for (const el of running.current) {
-      for (const a of running.current.get(el) ?? []) a.cancel();
+    for (const anims of running.current.values()) {
+      for (const a of anims) a.cancel();
     }
     running.current = new Map();
     const next = new Map<string, Place>();

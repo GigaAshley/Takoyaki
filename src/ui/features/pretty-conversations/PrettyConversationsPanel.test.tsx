@@ -214,6 +214,7 @@ type MockRow = {
   rdpTabOpen?: boolean;
   kind?: string;
   roomId?: string;
+  hostUnreachable?: true;
 };
 
 type MockGroup = {

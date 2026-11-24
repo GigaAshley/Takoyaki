@@ -115,6 +115,7 @@ describe("useSidebarMotion", () => {
   it("a change landing mid-slide starts from where the row is on screen", () => {
     const { rerender, container } = render(<List ids={["a", "b", "c"]} />);
     rerender(<List ids={["c", "a", "b"]} />); // c slides up from 72 to 0
+    const firstSlides = animate.mock.results.map((r) => r.value as { cancel: ReturnType<typeof vi.fn> });
     animate.mockClear();
     // Mid-slide, c shows 30px below its new place.
     const c = container.querySelector('[data-conversation-id="c"]') as HTMLElement;
@@ -132,5 +133,7 @@ describe("useSidebarMotion", () => {
     rerender(<List ids={["a", "c", "b"]} />); // c now goes to 36
     // c was on screen at 0 + 30 = 30; its new place is 36: slide from -6.
     expect(calls()).toContain("c:translate(0px, -6px)");
+    // The slides still running were stopped before measuring.
+    for (const a of firstSlides) expect(a.cancel).toHaveBeenCalled();
   });
 });
