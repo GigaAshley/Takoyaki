@@ -249,6 +249,7 @@ import { publishFleetStatusWaitingFor } from "@/state/session-waiting-store";
 // conversation-store / identities-store / any session store (D-16).
 import {
   publishAppSnapshot,
+  pruneAppsToHosts,
   publishAppUpdate,
   publishAppGone,
   clearPendingAppArchive,
@@ -941,8 +942,8 @@ export function AppShell({
       // D-15's app-frame-filter is the sole authority (client re-filter would
       // drift). No try/catch — publish fns are pure Map + notify (no failure
       // surface); a thrown error would rightfully surface at the client.
-      onAppSnapshot: (apps) => {
-        publishAppSnapshot(apps);
+      onAppSnapshot: (apps, reportedHostIds) => {
+        publishAppSnapshot(apps, reportedHostIds);
       },
       onAppUpdate: (app) => {
         publishAppUpdate(app);
@@ -1647,6 +1648,7 @@ export function AppShell({
       // fetch failure so the last known-good snapshot survives a network
       // blip (mirrors writeFleetSessionsCache's T-07-01-04 discipline).
       writeHostTreeCache(raw);
+      pruneAppsToHosts(new Set(raw.map((h) => String(h.id))));
     } catch {
       // Keep empty state on error
     } finally {

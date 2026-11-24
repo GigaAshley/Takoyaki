@@ -215,6 +215,31 @@ describe("app-frame-filter", () => {
     }
   });
 
+  it("the snapshot's reported-host list only names hosts the user can see, even with no apps", async () => {
+    const frame = makeAppSnapshotFrame([makeAppState("h1", "todo")], ["h1", "h2", "h3"]);
+    const resolver = vi.fn(async (hostIdStr: string) => ({
+      hostIdNum: Number(hostIdStr.slice(1)),
+      hostUserId: hostIdStr === "h2" ? "OTHER" : "U",
+    }));
+    const checkAccessMock = vi.fn(
+      async (_hostIdNum: number, userId: string, hostUserId: string) => userId === hostUserId,
+    );
+    const ctx: AppFrameFilterCtx = {
+      userId: "U",
+      resolveHostOwnerById: resolver,
+      resolveIdentityGate: async () => true,
+    };
+    const result = await filterAppFrame(frame, ctx, undefined, checkAccessMock);
+    if (result?.type !== "app-snapshot") throw new Error("expected app-snapshot frame");
+    expect(result.reportedHostIds).toEqual(["h1", "h3"]);
+
+    const emptyApps = await filterAppFrame(
+      makeAppSnapshotFrame([], ["h2"]), ctx, undefined, checkAccessMock,
+    );
+    if (emptyApps?.type !== "app-snapshot") throw new Error("expected app-snapshot frame");
+    expect(emptyApps.reportedHostIds).toEqual([]);
+  });
+
   it("Test 5: empty snapshot returns a frame with apps: [] and makes zero checkHostAccess calls", async () => {
     const frame = makeAppSnapshotFrame([]);
     const resolver = vi.fn();

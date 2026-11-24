@@ -565,11 +565,14 @@ export async function filterAppFrame(
     // valid app-snapshot with apps: [] — proves the emit happened; frontend
     // renders empty state gracefully.
     const apps = frame.apps;
-    if (apps.length === 0) {
+    const reported = frame.reportedHostIds;
+    if (apps.length === 0 && (reported === undefined || reported.length === 0)) {
       return frame;
     }
 
-    const uniqueHostIds = Array.from(new Set(apps.map((a) => a.hostId)));
+    const uniqueHostIds = Array.from(
+      new Set([...apps.map((a) => a.hostId), ...(reported ?? [])]),
+    );
     const visibility = await Promise.all(
       uniqueHostIds.map(async (hid) => [hid, await canUserSee(hid)] as const),
     );
@@ -609,7 +612,11 @@ export async function filterAppFrame(
     const projectedApps: AppState[] = userVisible
       .filter((a) => !a.owner || ownerOk.get(`${a.hostId}\u0000${a.owner}`) === true)
       .map(stripAppUsers);
-    return makeAppSnapshotFrame(projectedApps);
+    // Only name hosts this user can see.
+    return makeAppSnapshotFrame(
+      projectedApps,
+      reported === undefined ? undefined : reported.filter((hid) => visible.has(hid)),
+    );
   }
 
   // Unmigrated frame types pass through verbatim (defense in depth). See file

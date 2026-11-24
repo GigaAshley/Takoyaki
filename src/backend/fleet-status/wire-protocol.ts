@@ -756,6 +756,10 @@ const AppSnapshotFrameSchema = z.object({
   schemaVersion: z.literal(FRAME_SCHEMA_VERSION),
   type: z.literal("app-snapshot"),
   apps: z.array(AppStateSchema),
+  // Hosts whose apps this snapshot speaks for. A client replaces its saved
+  // apps only for these hosts and keeps the rest; absent = every host
+  // (servers that predate the field).
+  reportedHostIds: z.array(z.string()).optional(),
 });
 
 const AppUpdateFrameSchema = z.object({
@@ -1009,11 +1013,13 @@ export function makeSessionProjectChangedFrame(
  */
 export function makeAppSnapshotFrame(
   apps: AppState[],
+  reportedHostIds?: string[],
 ): FrontendOutboundFrameType {
   return {
     schemaVersion: FRAME_SCHEMA_VERSION,
     type: "app-snapshot",
     apps,
+    ...(reportedHostIds !== undefined ? { reportedHostIds } : {}),
   };
 }
 

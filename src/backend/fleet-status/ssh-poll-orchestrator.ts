@@ -2520,6 +2520,7 @@ export function createSshPollOrchestrator(
       }
     }
     hostState.lastTickLiveApps = thisTickLiveApps;
+    deps.registry.markAppsReported(host.id);
 
     await reconcileViewerVisibility(hostState, parsed.appLines);
 

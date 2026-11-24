@@ -37,6 +37,7 @@ import {
   clearPendingAppTitle,
   __resetForTest,
   __seedFromCacheForTest,
+  pruneAppsToHosts,
 } from "./app-tiles-store.js";
 
 import type { AppState } from "../api/fleet-status-types.js";
@@ -1027,5 +1028,61 @@ describe("app-tiles-store: machine id", () => {
     });
     rerender();
     expect(result.current[0].machineId).toBe("3");
+  });
+});
+
+describe("app-tiles-store: a snapshot speaks only for the hosts it names", () => {
+  function seedSaved(apps: AppState[]): void {
+    localStorage.setItem(APP_TILES_CACHE_KEY, wrap(apps));
+    __seedFromCacheForTest();
+  }
+  const titles = (r: { current: AppState[] }) => r.current.map((a) => a.title);
+
+  it("keeps saved tiles for a host the snapshot doesn't cover", () => {
+    seedSaved([
+      makeApp({ hostId: "3", slug: "a", title: "Alpha" }),
+      makeApp({ hostId: "7", slug: "b", title: "Bravo", project: "work" }),
+    ]);
+    const { result } = renderHook(() => useAppTiles());
+    act(() => publishAppSnapshot([makeApp({ hostId: "3", slug: "a", title: "Alpha" })], ["3"]));
+    expect(titles(result)).toEqual(["Alpha", "Bravo"]);
+  });
+
+  it("replaces tiles for hosts the snapshot covers, including an app that went away", () => {
+    seedSaved([
+      makeApp({ hostId: "3", slug: "a", title: "Alpha" }),
+      makeApp({ hostId: "3", slug: "old", title: "Old" }),
+    ]);
+    const { result } = renderHook(() => useAppTiles());
+    act(() => publishAppSnapshot([makeApp({ hostId: "3", slug: "a", title: "Alpha" })], ["3"]));
+    expect(titles(result)).toEqual(["Alpha"]);
+  });
+
+  it("without the host list (older server) the snapshot replaces everything", () => {
+    seedSaved([makeApp({ hostId: "7", slug: "b", title: "Bravo" })]);
+    const { result } = renderHook(() => useAppTiles());
+    act(() => publishAppSnapshot([]));
+    expect(titles(result)).toEqual([]);
+  });
+
+  it("an identical snapshot over saved tiles changes nothing", () => {
+    const a = makeApp({ hostId: "3", slug: "a", title: "Alpha" });
+    seedSaved([a]);
+    const notified = vi.fn();
+    const off = subscribeAppTilesStore(notified);
+    publishAppSnapshot([{ ...a }], ["3"]);
+    off();
+    expect(notified).not.toHaveBeenCalled();
+  });
+
+  it("a fresh host list retires saved tiles of a host that's gone, but never live ones", () => {
+    seedSaved([
+      makeApp({ hostId: "3", slug: "a", title: "Alpha" }),
+      makeApp({ hostId: "9", slug: "z", title: "Zulu" }),
+    ]);
+    const { result } = renderHook(() => useAppTiles());
+    act(() => publishAppUpdate(makeApp({ hostId: "12", slug: "live", title: "Live" })));
+    act(() => pruneAppsToHosts(new Set(["3"])));
+    expect(titles(result)).toEqual(["Alpha", "Live"]);
   });
 });

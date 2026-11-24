@@ -86,6 +86,10 @@ let state: State = (() => {
 
 let snapshotVersion = 0;
 
+// Tiles a live frame has vouched for since this page loaded. Everything else
+// came from the saved copy and is only a paint hint until its host answers.
+const confirmedKeys = new Set<string>();
+
 const listeners = new Set<() => void>();
 
 // Pending-archive filter: composite `${hostId}:${slug}` keys for apps whose
@@ -301,10 +305,11 @@ export function subscribeAppTilesStore(cb: () => void): () => void {
  * renders the D-04 prompt). A snapshot identical to the current map (same
  * keys, every tile field-equal) is a no-op.
  */
-export function publishAppSnapshot(apps: AppState[]): void {
+export function publishAppSnapshot(apps: AppState[], reportedHostIds?: readonly string[]): void {
   console.info({
     operation: "app_tiles_store_snapshot",
     appCount: apps.length,
+    reportedHostCount: reportedHostIds?.length ?? null,
   });
 
   const nextMap = new Map<string, AppState>();
@@ -316,15 +321,33 @@ export function publishAppSnapshot(apps: AppState[]): void {
     // supervisor hasn't yet moved the folder. Without this, an app-snapshot
     // arriving mid-window would re-insert the tile the user just archived.
     if (isPendingAppArchive(key)) continue;
+    confirmedKeys.add(key);
     const next = applyPending(app);
     const current = state.map.get(key);
     // Keep the stored object when nothing changed so tile identity is stable.
     nextMap.set(key, current !== undefined && appStateEqual(current, next) ? current : next);
   }
+  // The snapshot speaks only for the hosts it names (when it names any): a
+  // host the server hasn't read yet keeps the tiles already shown for it,
+  // so a slow machine's apps don't vanish and come back.
+  const reported = reportedHostIds === undefined ? null : new Set(reportedHostIds);
+  if (reported !== null) {
+    let kept = 0;
+    for (const [key, tile] of state.map) {
+      if (reported.has(tile.hostId) || nextMap.has(key)) continue;
+      nextMap.set(key, tile);
+      kept += 1;
+    }
+    if (kept > 0) {
+      console.info({ operation: "app_tiles_store_snapshot_kept_unreported", kept });
+    }
+  }
   // A full snapshot that no longer carries a pending app means the archive
-  // completed backend-side — release the mark.
+  // completed backend-side — release the mark. Only for hosts it speaks for.
   for (const key of [...pendingAppArchiveKeys.keys()]) {
-    if (!presentKeys.has(key)) pendingAppArchiveKeys.delete(key);
+    if (presentKeys.has(key)) continue;
+    const hostId = key.slice(0, key.indexOf(":"));
+    if (reported === null || reported.has(hostId)) pendingAppArchiveKeys.delete(key);
   }
   // Identical snapshot (e.g. a reconnect re-sending the same list): same
   // keys and every tile reused above → nothing to re-render.
@@ -338,6 +361,26 @@ export function publishAppSnapshot(apps: AppState[]): void {
     }
     if (same) return;
   }
+  state = { map: nextMap };
+  notify();
+}
+
+/**
+ * Drop saved tiles for hosts no longer in the user's host list (removed, or
+ * access taken away). Called with a freshly fetched host list — saved tiles
+ * for a host the server hasn't read yet survive snapshots, so this is what
+ * retires them once their host is gone for good. Tiles a live frame has
+ * vouched for are never pruned here.
+ */
+export function pruneAppsToHosts(hostIds: ReadonlySet<string>): void {
+  let removed = 0;
+  const nextMap = new Map<string, AppState>();
+  for (const [key, tile] of state.map) {
+    if (hostIds.has(tile.hostId) || confirmedKeys.has(key)) nextMap.set(key, tile);
+    else removed += 1;
+  }
+  if (removed === 0) return;
+  console.info({ operation: "app_tiles_store_pruned_unknown_hosts", removed });
   state = { map: nextMap };
   notify();
 }
@@ -387,6 +430,7 @@ function appStateEqual(a: AppState, b: AppState): boolean {
 export function publishAppUpdate(app: AppState): void {
   const key = `${app.hostId}:${app.slug}`;
   if (isPendingAppArchive(key)) return;
+  confirmedKeys.add(key);
   const next = applyPending(app);
   const current = state.map.get(key);
   if (current !== undefined && appStateEqual(current, next)) return;
@@ -414,6 +458,7 @@ export function publishAppUpdate(app: AppState): void {
  */
 export function publishAppGone(hostId: string, slug: string): void {
   const key = `${hostId}:${slug}`;
+  confirmedKeys.delete(key);
   if (!state.map.has(key)) return; // no-op
 
   console.info({
@@ -577,6 +622,7 @@ export function __resetForTest(): void {
   pendingAppTitles.clear();
   pendingAppMoves.clear();
   pendingAppArchiveKeys.clear();
+  confirmedKeys.clear();
   state = { map: new Map<string, AppState>() };
   notify();
 }

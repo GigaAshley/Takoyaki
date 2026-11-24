@@ -425,6 +425,8 @@ export interface FrontendAppSnapshotFrame {
   schemaVersion: typeof FRAME_SCHEMA_VERSION;
   type: "app-snapshot";
   apps: AppState[];
+  /** Hosts this snapshot speaks for; absent = every host. */
+  reportedHostIds?: string[];
 }
 
 export interface FrontendAppUpdateFrame {

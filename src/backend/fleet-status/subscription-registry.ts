@@ -293,6 +293,14 @@ export interface SubscriptionRegistry {
   getAppSnapshot(): AppState[];
 
   /**
+   * Record that this host's apps have been fully read at least once since
+   * startup — from then on the app-snapshot frame speaks for this host, and a
+   * client may replace its saved apps for it. Hosts never marked keep whatever
+   * the client already shows.
+   */
+  markAppsReported(hostId: string): void;
+
+  /**
    * Return all current SessionState values as an array (order not guaranteed).
    */
   getSnapshot(): SessionState[];
@@ -539,6 +547,8 @@ export function createSubscriptionRegistry(
   // persistence, restart wipes it, next successful sweep tick rebuilds it
   // from disk-on-boxes.
   const apps = new Map<string, AppState>();
+  // Hosts whose apps have been read in full at least once (markAppsReported).
+  const appsReportedHosts = new Set<string>();
 
   return {
     subscribe(sendFrame: SendFrame, ctx?: { userId: string }): () => void {
@@ -664,7 +674,7 @@ export function createSubscriptionRegistry(
       // after subscribe returns (well under the 100ms UX budget — the
       // filter is one PermissionManager hit per unique hostId plus an
       // in-memory cache). Empty apps map short-circuits — no filter call.
-      const rawSnapshot = makeAppSnapshotFrame(Array.from(apps.values()));
+      const rawSnapshot = makeAppSnapshotFrame(Array.from(apps.values()), [...appsReportedHosts]);
       if (appFrameFilter !== undefined && ctx?.userId !== undefined) {
         const userIdForFilter = ctx.userId;
         // Phase 118 code-review HIGH-4 (fix pass 2026-09-18): open the
@@ -1120,6 +1130,10 @@ export function createSubscriptionRegistry(
       // Phase 118 Plan 118-03 — symmetric with getSnapshot() for sessions.
       // Order is Map insertion order; callers must not depend on it.
       return Array.from(apps.values());
+    },
+
+    markAppsReported(hostId: string): void {
+      appsReportedHosts.add(hostId);
     },
 
     publishToUser(userId: string, frame: FrontendOutboundFrameType): void {

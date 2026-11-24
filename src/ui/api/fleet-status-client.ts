@@ -124,7 +124,7 @@ export interface FleetStatusClientOptions {
   // dispatch primitive standalone — the store slice + AppShell wiring
   // land in follow-up plans. Omitting all three MUST NOT throw when app
   // frames arrive (regression-tested in fleet-status-client.test.ts).
-  onAppSnapshot?: (apps: AppState[]) => void;
+  onAppSnapshot?: (apps: AppState[], reportedHostIds?: string[]) => void;
   onAppUpdate?: (app: AppState) => void;
   onAppGone?: (hostId: string, slug: string) => void;
   /** This user's relay rooms changed (added, left, renamed): re-read the list. */
@@ -518,9 +518,13 @@ export function createFleetStatusClient(
             operation: "fleet_status_client_app_snapshot",
             url,
             appCount: parsed.apps.length,
+            reportedHostCount: Array.isArray(parsed.reportedHostIds) ? parsed.reportedHostIds.length : null,
           });
           lastLoggedAppJson.clear();
-          onAppSnapshot?.(parsed.apps);
+          onAppSnapshot?.(
+            parsed.apps,
+            Array.isArray(parsed.reportedHostIds) ? parsed.reportedHostIds : undefined,
+          );
           break;
         case "app-update":
           // Phase 119 Plan 119-01 (D-14): one app-state add / mutate on

@@ -1156,6 +1156,18 @@ describe("subscription-registry", () => {
       }
     });
 
+    it("the app-snapshot names only hosts whose apps have been read in full", () => {
+      const registry = createSubscriptionRegistry();
+      registry.publishAppUpdate("h1", makeAppState("h1", "todo"));
+      registry.markAppsReported("h1");
+      registry.markAppsReported("h3"); // read in full, has no apps
+      const receivedFrames: FrontendOutboundFrameType[] = [];
+      registry.subscribe((f) => receivedFrames.push(f));
+      const frame = receivedFrames.find((f) => f.type === "app-snapshot");
+      if (frame?.type !== "app-snapshot") throw new Error("expected app-snapshot");
+      expect([...(frame.reportedHostIds ?? [])].sort()).toEqual(["h1", "h3"]);
+    });
+
     it("Test 6: subscribing with no published apps still emits an app-snapshot frame carrying apps: []", () => {
       const registry = createSubscriptionRegistry();
       const receivedFrames: FrontendOutboundFrameType[] = [];

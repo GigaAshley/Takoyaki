@@ -283,6 +283,12 @@ class MockRegistry implements SubscriptionRegistry {
     this.publishedAppGone.push({ hostId, slug });
   }
 
+  appsReportedHosts: string[] = [];
+
+  markAppsReported(hostId: string): void {
+    this.appsReportedHosts.push(hostId);
+  }
+
   // Source E — project-list publishes from the sweep's project-list line.
   publishedProjectLists: Array<{ hostId: string; projects: ProjectListEntry[] }> = [];
 
@@ -7543,6 +7549,28 @@ describe("Phase 92 — batch sweep dispatch", () => {
     expect(deps.registry.publishedAppUpdates).toHaveLength(3);
     const tick2Update = deps.registry.publishedAppUpdates[2];
     expect(tick2Update.app.slug).toBe("todo");
+  });
+
+  it("a successful sweep marks the host's apps as read in full", async () => {
+    const channel = new MockSshChannel();
+    wireBatchProbe(channel, true);
+    channel.setResponse(
+      "~/.local/bin/fleet-status-sweep 2>/dev/null",
+      makeSweepJsonl({ identities: [], pids: [], apps: [{ slug: "todo" }] }),
+    );
+    const deps = buildDeps({ acquireSshChannel: vi.fn().mockResolvedValue(channel) });
+    await createSshPollOrchestrator(deps).start();
+    expect(deps.registry.appsReportedHosts).toContain("host-1");
+  });
+
+  it("a failed sweep doesn't mark the host's apps as read", async () => {
+    const channel = new MockSshChannel();
+    wireBatchProbe(channel, true);
+    channel.setResponse("~/.local/bin/fleet-status-sweep 2>/dev/null", null);
+    wireLegacyResponses(channel);
+    const deps = buildDeps({ acquireSshChannel: vi.fn().mockResolvedValue(channel) });
+    await createSshPollOrchestrator(deps).start();
+    expect(deps.registry.appsReportedHosts).toEqual([]);
   });
 
   it("Test P118-04-A3: sweep failure between two success ticks does NOT flap (zero publishAppGoneByHostSlug across the whole sequence)", async () => {
