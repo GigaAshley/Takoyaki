@@ -5226,7 +5226,7 @@ wss.on("connection", async (ws: WebSocket, req) => {
       const connSnapshot = sshConn;
       execCommand(connSnapshot, tasksCmd)
         .then((output) => {
-          if (stopped || ws.readyState !== WebSocket.OPEN) return;
+          if (stopped || ws.readyState !== WebSocket.OPEN || sshConn !== connSnapshot) return;
           const tasks: unknown[] = [];
           for (const raw of output.split("\n")) {
             const line = raw.trim();
@@ -5571,7 +5571,7 @@ wss.on("connection", async (ws: WebSocket, req) => {
       // pane still waiting for its first history file (newborn) looks it up.
       discoverClaudeSession(connSnapshot, activeTmuxSession, { knownHistoryFile: currentSessionFile })
         .then((result) => {
-          if (stopped || ws.readyState !== WebSocket.OPEN) return;
+          if (stopped || ws.readyState !== WebSocket.OPEN || sshConn !== connSnapshot) return;
           if (changeoverState === "dead") return; // idempotent guard
 
           // Fix A (2026-07-30): hoist isExecErrorTick flag so BOTH the
@@ -6492,7 +6492,16 @@ wss.on("connection", async (ws: WebSocket, req) => {
       const samePane = () => !stopped && paneGen === boundPaneGen;
       const releaseLease = boundConn ? leaseSendConn(boundConn) : () => {};
       inputChain = inputChain.then(async () => {
-        if (!samePane()) {
+        // Still this pane: read its state now, so a send queued while the
+        // pane was still attaching sees what discovery has since filled in.
+        const live = samePane();
+        const runConn = live ? sshConn : boundConn;
+        const runTmuxSession = live ? currentTmuxSession : boundTmuxSession;
+        const runHostId = live ? currentHostId : boundHostId;
+        const runSessionId = live ? sessionIdFromFile : boundSessionId;
+        // Arrived before the pane's connection existed: hold this one instead.
+        const releaseRunLease = runConn && runConn !== boundConn ? leaseSendConn(runConn) : () => {};
+        if (!live) {
           sshLogger.info(`[pv-input] delivering after pane went away mqid=${capturedMqid ?? "none"} hostId=${boundHostId} tmuxSession=${boundTmuxSession}`, {
             operation: "pv_input_detached_delivery",
             mqid: capturedMqid ?? "none",
@@ -6502,14 +6511,14 @@ wss.on("connection", async (ws: WebSocket, req) => {
         }
         try {
           await __applyInputMessageForTests({
-            sshConn: boundConn,
-            currentTmuxSession: boundTmuxSession,
-            currentHostId: boundHostId,
+            sshConn: runConn,
+            currentTmuxSession: runTmuxSession,
+            currentHostId: runHostId,
             execCommand,
             data: capturedData,
             messageQueueItemId: capturedMqid,
             textArea: (msg as { textArea?: unknown }).textArea === true,
-            sessionId: boundSessionId ?? undefined,
+            sessionId: runSessionId ?? undefined,
             wsSend: (frame: object) => {
               if (ws.readyState === WebSocket.OPEN) {
                 try {
@@ -6572,12 +6581,13 @@ wss.on("connection", async (ws: WebSocket, req) => {
             `[pv-input] chain segment error: ${err instanceof Error ? err.message : String(err)}`,
             {
               operation: "pv_input_chain_error",
-              hostId: boundHostId,
-              tmuxSession: boundTmuxSession,
+              hostId: runHostId,
+              tmuxSession: runTmuxSession,
               mqid: capturedMqid ?? "none",
             },
           );
         } finally {
+          releaseRunLease();
           releaseLease();
         }
       });
@@ -7150,7 +7160,7 @@ wss.on("connection", async (ws: WebSocket, req) => {
           // (no guard) — frontend renders loading placeholder.
           setContextPct(activeHostId, activeTmuxSession, pct);
           getSubscriptionRegistry()?.republishContextPct(String(activeHostId), activeTmuxSession);
-          if (!stopped && ws.readyState === WebSocket.OPEN) {
+          if (!stopped && ws.readyState === WebSocket.OPEN && sshConn === connSnapshot) {
             try {
               ws.send(JSON.stringify({ type: "context_pct", pct }));
             } catch {
@@ -7167,7 +7177,7 @@ wss.on("connection", async (ws: WebSocket, req) => {
           // Only VISIBLE panes are polled — hidden-pane suppression is inherited
           // from patch #344's WS-pause on !isVisible (the WS is closed, so poll
           // never fires). No additional gate needed here.
-          if (!dormantInFlight && currentTmuxSession !== null && !stopped && ws.readyState === WebSocket.OPEN) {
+          if (!dormantInFlight && currentTmuxSession !== null && !stopped && ws.readyState === WebSocket.OPEN && sshConn === connSnapshot) {
             // Use the escapedName for single-quote shell wrapping. tmuxSession is
             // already validated to alphanumeric/dash/underscore by the frontend
             // (same frontend-validated tmux-safe subset rule as the context-pct timer). Per T-cd6-02: the
@@ -7332,7 +7342,7 @@ wss.on("connection", async (ws: WebSocket, req) => {
       const connSnapshot = sshConn;
       execCommand(connSnapshot, asideCaptureCmd)
         .then((output) => {
-          if (stopped || ws.readyState !== WebSocket.OPEN) return;
+          if (stopped || ws.readyState !== WebSocket.OPEN || sshConn !== connSnapshot) return;
           const markerPresent = output.includes(ASIDE_END_MARKER);
           sshLogger.info("aside poll diag: poll", {
             hostId: currentHostId,
@@ -7872,11 +7882,17 @@ wss.on("connection", async (ws: WebSocket, req) => {
                 // ("active") on its own; here we cover the dormant:true and
                 // dormant:false wire emits the seam does directly.
                 const dormantEmittedBefore = dormantLastEmitted;
+                // A tick still running when the pane is torn down must not act
+                // on whatever pane is attached by the time it returns — its
+                // connection can outlive the pane while a send is delivered
+                // (send-conn-lease.ts).
+                const tickConn = sshConn;
+                const tickCurrent = () => !stopped && sshConn === tickConn;
                 (async () => {
                   try {
                     await __applyDormantPollWithRediscoveryForTests(
                       {
-                        connSnapshot: sshConn!,
+                        connSnapshot: tickConn,
                         escapedName: currentTmuxSession!,
                         // Phase 90 Plan 00 (Wave 0, D-10 delivery mechanism):
                         // pass currentHostId so the dormant-branch context_pct
@@ -7890,9 +7906,11 @@ wss.on("connection", async (ws: WebSocket, req) => {
                         execCommand,
                         discoverSession: (c, s) => discoverClaudeSession(c as import("ssh2").Client, s, { knownHistoryFile: dormantSessionFile }),
                         wsSend: (data: string) => {
+                          if (!tickCurrent()) return;
                           try { ws.send(data); } catch (err) { databaseLogger.warn(`[ws-server] send-failed err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
                         },
                         startActiveFlow: (pid, sessionFile) => {
+                          if (!tickCurrent()) return;
                           // Transition from dormant-poll to active flow.
                           // Clear dormant-poll timer — contextPctTimer takes over from here.
                           if (dormantPollTimer) { clearInterval(dormantPollTimer); dormantPollTimer = null; }
@@ -7992,12 +8010,13 @@ wss.on("connection", async (ws: WebSocket, req) => {
                         readJsonlPct: readContextPctFromJsonl,
                         dormantSessionFile: () => dormantSessionFile,
                         onArchived: () => {
+                          if (!tickCurrent()) return;
                           if (dormantPollTimer) { clearInterval(dormantPollTimer); dormantPollTimer = null; }
                         },
                       },
                       {
                         dormantLastEmitted: () => dormantLastEmitted,
-                        setDormantLastEmitted: (v) => { dormantLastEmitted = v; },
+                        setDormantLastEmitted: (v) => { if (tickCurrent()) dormantLastEmitted = v; },
                         wakeTriggerTs: () => wakeTriggerTs,
                       },
                     );
@@ -8019,6 +8038,7 @@ wss.on("connection", async (ws: WebSocket, req) => {
                     // exited dormancy" and the second establishes the fresh
                     // active session's attach-time pane_state.
                     if (
+                      tickCurrent() &&
                       dormantLastEmitted !== dormantEmittedBefore &&
                       dormantLastEmitted !== null
                     ) {
