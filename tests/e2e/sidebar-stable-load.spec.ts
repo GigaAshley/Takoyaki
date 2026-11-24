@@ -31,13 +31,31 @@ function installSampler(page: Page) {
     const t0 = performance.now();
     const w = window as unknown as { __sidebarSamples: unknown[] };
     w.__sidebarSamples = [];
+    // Everything in the sidebar's list, plus the footer below it.
     const SELECTOR = [
       "[data-conversation-id]",
       "[data-app-key]",
+      '[data-testid="pretty-conversations-apps-header"]',
       '[data-testid^="pv-project-section-header-"]',
       '[data-testid="pretty-conversations-pinned-header"]',
+      '[data-testid="pv-projects-super-header"]',
       '[data-testid="pv-flat-middle-section-header"]',
+      '[data-testid="rdp-divider"]',
     ].join(",");
+    const FOOTER_SELECTOR = [
+      '[data-testid="pv-footer-username"]',
+      '[data-testid="pv-footer-avatar-image"]',
+      '[data-testid="pv-footer-initials"]',
+      '[data-testid^="pv-footer-"][data-testid$="-button"]',
+    ].join(",");
+    // What a row shows, besides where it is: picture or letter, and its name.
+    const look = (el: HTMLElement): string => {
+      if (!el.hasAttribute("data-conversation-id")) return "";
+      const avatar = el.querySelector('[data-testid="pcrow-avatar"]');
+      const kind = avatar?.querySelector("img") ? "pic" : avatar?.querySelector('[data-testid="avatar-initial"]') ? "letter" : "none";
+      const name = el.querySelector(".pv-label")?.textContent?.trim() ?? "";
+      return ` ${kind} "${name}"`;
+    };
     const tick = () => {
       const root = document.querySelector(".pv-panel-scroll");
       const items: Item[] = [];
@@ -62,8 +80,20 @@ function installSampler(page: Page) {
             marks:
               (el.getAttribute("data-unread") ? " unread" : "") +
               (el.getAttribute("data-dm") ? " dm" : "") +
-              (el.getAttribute("data-host-unreachable") ? " down" : ""),
+              (el.getAttribute("data-host-unreachable") ? " down" : "") +
+              look(el),
           });
+        }
+        if (items.length > 0) {
+          for (const el of document.querySelectorAll<HTMLElement>(FOOTER_SELECTOR)) {
+            const r = el.getBoundingClientRect();
+            items.push({
+              key: `footer:${el.getAttribute("data-testid")}`,
+              top: Math.round(r.top),
+              left: Math.round(r.left),
+              marks: el.getAttribute("data-testid") === "pv-footer-username" ? ` "${el.textContent?.trim()}"` : "",
+            });
+          }
         }
       }
       w.__sidebarSamples.push({ t: Math.round(performance.now() - t0), items });
@@ -113,7 +143,10 @@ async function silenceMachine(page: Page, hostId: string) {
     const body = (await res.json()) as Array<{ hostId?: unknown }>;
     await route.fulfill({ response: res, json: Array.isArray(body) ? body.filter((i) => !sameHost(i.hostId)) : body });
   });
-  await page.route(new RegExp(`[?&]hostId=${hostId}(&|$)`), (route) => route.abort());
+  // Its pictures still come from the browser's cache in real life; leave them.
+  await page.route(new RegExp(`[?&]hostId=${hostId}(&|$)`), (route) =>
+    new URL(route.request().url()).pathname.endsWith("/avatar") ? route.fallback() : route.abort(),
+  );
   await page.routeWebSocket(/fleet-status/, (ws) => {
     const server = ws.connectToServer();
     ws.onMessage((m) => server.send(m));

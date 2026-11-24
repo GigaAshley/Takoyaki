@@ -320,10 +320,23 @@ describe("refresh-after-fleet-load — re-fetches per newly reported host", () =
     expect(keys).toEqual(["3:jarvis-2", "6:sonar"]);
   });
 
-  it("an identity missing from a host that did answer is dropped", async () => {
+  it("an agent left out of an answering host's reply keeps its name while its conversation exists", async () => {
     answerEveryHost();
     updateFleetSessions([makeSession(3, "jarvis-2"), makeSession(3, "aqua")]);
     await refreshIdentities();
+    vi.mocked(IdentitiesApi.listIdentities).mockImplementation(async () => [
+      makeIdentity("jarvis-2", false, 3),
+    ]);
+    await refreshIdentities();
+    const keys = __getIdentitiesStoreSnapshotForTest().identities.map((i) => i.identityKey).sort();
+    expect(keys).toEqual(["aqua", "jarvis-2"]);
+  });
+
+  it("an agent whose conversation is gone is dropped on the next refresh", async () => {
+    answerEveryHost();
+    updateFleetSessions([makeSession(3, "jarvis-2"), makeSession(3, "aqua")]);
+    await refreshIdentities();
+    updateFleetSessions([makeSession(3, "jarvis-2")]);
     vi.mocked(IdentitiesApi.listIdentities).mockImplementation(async () => [
       makeIdentity("jarvis-2", false, 3),
     ]);

@@ -123,16 +123,21 @@ function recordFetchOutcome(
     lastAppliedFetchSeq = seq;
     const answered = new Set<number>();
     for (const i of list) if (typeof i.hostId === "number") answered.add(i.hostId);
-    // A requested host that came back empty (the backend swallows a per-host
-    // SSH timeout as []) hasn't answered — keep what we already hold for it,
-    // so its agents don't lose their names until it does.
-    const requested = hostIdsOf(identityHosts);
+    // An agent that was asked about but isn't in the answer — its host came
+    // back empty (the backend swallows a per-host SSH timeout as []) or one
+    // read on it failed — hasn't been answered for: keep what we already hold,
+    // so its row doesn't lose its name. An agent that's really gone loses its
+    // row (the fleet's gone frame) and stops being asked about.
+    const returned = new Set(list.map((i) => `${i.hostId}::${i.identityKey.toLowerCase()}`));
     const kept = state.identities.filter(
-      (i) => typeof i.hostId === "number" && requested.has(i.hostId) && !answered.has(i.hostId),
+      (i) =>
+        typeof i.hostId === "number" &&
+        identityHosts[i.identityKey.toLowerCase()] === i.hostId &&
+        !returned.has(`${i.hostId}::${i.identityKey.toLowerCase()}`),
     );
     if (kept.length > 0) {
       console.info({
-        operation: "identities_store_kept_unanswered_hosts",
+        operation: "identities_store_kept_unanswered",
         kept: kept.length,
         hostIds: [...new Set(kept.map((i) => i.hostId))],
       });
