@@ -100,6 +100,9 @@ export function clearSkynetSessionStorage() {
   localStorage.removeItem("skynet:host-tree-cache:v2");
   localStorage.removeItem("skynet:app-tiles-cache:v2");
   localStorage.removeItem("skynet:identities-appearance-cache:v3");
+  localStorage.removeItem("skynet:me-cache:v1");
+  localStorage.removeItem("skynet:unreachable-hosts-cache:v1");
+  localStorage.removeItem("skynet:avatar-failed-srcs:v2");
 
   // Drafts are keyed by `skynet:compose-draft:<user>:...` and
   // `skynet:message-queue-draft:<user>:...`. On an explicit logout we clear

@@ -39,17 +39,18 @@ describe("AvatarImage", () => {
     expect(getByTestId("avatar-initial").textContent).toBe("?");
   });
 
-  it("a src that failed on an earlier load paints the initial straight away", () => {
+  it("a src that failed on an earlier load paints the initial straight away", async () => {
     const first = render(<AvatarImage src="/none.png" name="sonar" />);
     fireEvent.error(first.container.querySelector("img")!);
     first.unmount();
+    await Promise.resolve(); // the batched save
     __resetAvatarFailuresForTest(); // as on a fresh page load
     const { container, getByTestId } = render(<AvatarImage src="/none.png" name="sonar" />);
     expect(container.querySelector("img")).toBeNull();
     expect(getByTestId("avatar-initial").textContent).toBe("S");
   });
 
-  it("a src that loads is no longer remembered as failed", () => {
+  it("a src that loads is no longer remembered as failed", async () => {
     const first = render(<AvatarImage src="/flaky.png" name="sonar" />);
     fireEvent.error(first.container.querySelector("img")!);
     first.unmount();
@@ -61,16 +62,19 @@ describe("AvatarImage", () => {
     __resetAvatarFailuresForTest();
     const third = render(<AvatarImage src="/flaky.png" name="x" />);
     fireEvent.load(third.container.querySelector("img")!);
+    await Promise.resolve();
     __resetAvatarFailuresForTest();
     const fourth = render(<AvatarImage src="/flaky.png" name="x" />);
     expect(fourth.container.querySelector("img")).not.toBeNull();
   });
 
-  it("one person's remembered failures don't apply to another person on the same device", () => {
+  it("one person's remembered failures don't apply to another person on the same device", async () => {
     const first = render(<AvatarImage src="/none.png" name="sonar" />);
     fireEvent.error(first.container.querySelector("img")!);
     first.unmount();
+    await Promise.resolve();
     localStorage.setItem("skynet_auth", JSON.stringify({ loggedIn: true, username: "zoey" }));
+    __resetAvatarFailuresForTest(); // signing in as someone else reloads the page
     const { container } = render(<AvatarImage src="/none.png" name="sonar" />);
     expect(container.querySelector("img")).not.toBeNull();
   });

@@ -3,17 +3,18 @@
 // it slides to its new place instead of jumping; an arriving item fades in;
 // a leaving item fades out where it was while the items below close the gap.
 //
-// How: after every commit the position of each tracked item (rows, project
-// apps, app tiles, section and project headers, empty-section notes) is
-// recorded in the scroll region's content coordinates. On the next commit,
-// anything whose position changed is drawn at its old place and animated to
-// its new one (a FLIP). Removed items are caught by a mutation observer —
-// the removed element itself is parked in the scroll region at its old
+// How: the position of each tracked item (rows, project apps, app tiles,
+// section and project headers, empty-section notes) is recorded in the
+// scroll region's content coordinates. After a commit that added, removed or
+// reordered anything in the list (seen through a mutation observer — most
+// renders change nothing structural and do no layout work at all), anything
+// whose position changed is drawn at its old place and animated to its new
+// one (a FLIP). A removed item is parked in the scroll region at its old
 // place and faded out.
 //
 // Nothing animates on the first paint, while the sidebar search is in use,
-// across a resize, or with the device's reduce-motion setting on — those
-// just snap.
+// when the sidebar's width changed (a resize), or with the device's
+// reduce-motion setting on — those just snap.
 
 import { useEffect, useLayoutEffect, useRef, type RefObject } from "react";
 
@@ -45,16 +46,26 @@ function baseKey(el: Element): string {
   return `t:${el.getAttribute("data-testid") ?? ""}`;
 }
 
+const LEAVING_ATTR = "data-sidebar-leaving";
+
+/**
+ * Whether `el` should be skipped: it sits in a leaving item, or inside another
+ * tracked item (it moves with that one). Walks up to `root` only.
+ */
+function nestedOrLeaving(el: HTMLElement, root: HTMLElement): boolean {
+  if (el.hasAttribute(LEAVING_ATTR)) return true;
+  for (let p = el.parentElement; p !== null && p !== root; p = p.parentElement) {
+    if (p.hasAttribute(LEAVING_ATTR) || p.matches(TRACKED_SELECTOR)) return true;
+  }
+  return false;
+}
+
 /** Tracked items under `root`, keyed; repeats of a key get an occurrence suffix. */
 function trackedItems(root: HTMLElement): Map<string, HTMLElement> {
   const out = new Map<string, HTMLElement>();
   const seen = new Map<string, number>();
   for (const el of root.querySelectorAll<HTMLElement>(TRACKED_SELECTOR)) {
-    // A leaving item fading out isn't part of the sidebar any more.
-    if (el.closest("[data-sidebar-leaving]")) continue;
-    // An item nested in another tracked item moves with it.
-    const outer = el.parentElement?.closest(TRACKED_SELECTOR);
-    if (outer && root.contains(outer)) continue;
+    if (nestedOrLeaving(el, root)) continue;
     const k = baseKey(el);
     const n = seen.get(k) ?? 0;
     seen.set(k, n + 1);
@@ -83,67 +94,132 @@ function canAnimate(el: Element): el is HTMLElement {
   return typeof (el as HTMLElement).animate === "function";
 }
 
+/** The translate a running slide currently applies to `el` (0,0 if none). */
+function currentTranslate(el: HTMLElement): { x: number; y: number } {
+  const t = getComputedStyle(el).transform;
+  if (!t || t === "none") return { x: 0, y: 0 };
+  const m = /^matrix\(([^)]+)\)$/.exec(t);
+  if (m) {
+    const v = m[1].split(",").map(Number);
+    return { x: v[4] || 0, y: v[5] || 0 };
+  }
+  const m3 = /^matrix3d\(([^)]+)\)$/.exec(t);
+  if (m3) {
+    const v = m3[1].split(",").map(Number);
+    return { x: v[12] || 0, y: v[13] || 0 };
+  }
+  return { x: 0, y: 0 };
+}
+
+/** Whether a mutation record changed the list itself (not a fading ghost). */
+function structural(rec: MutationRecord): boolean {
+  if (rec.type !== "childList") return false;
+  const real = (n: Node) => !(n instanceof HTMLElement && n.hasAttribute(LEAVING_ATTR));
+  return [...rec.addedNodes].some(real) || [...rec.removedNodes].some(real);
+}
+
 /**
  * @param rootRef the sidebar's scroll region.
  * @param enabled false while the change comes from the user filtering (search).
  */
 export function useSidebarMotion(rootRef: RefObject<HTMLElement | null>, enabled: boolean): void {
   const places = useRef<Map<string, Place> | null>(null);
+  const width = useRef<number | null>(null);
   const enabledRef = useRef(enabled);
-  // Positions recorded before the latest commit, kept for the removal
-  // observer (which runs after this commit's layout effect has re-measured).
-  const previousPlaces = useRef<Map<string, Place> | null>(null);
-  const lastSkipReason = useRef<string | null>(null);
-  // Slides still in progress, per element.
-  const running = useRef(new Map<HTMLElement, Animation[]>());
+  enabledRef.current = enabled;
+  const observer = useRef<MutationObserver | null>(null);
+  // Something changed the list outside a commit (seen by the observer's own
+  // callback): measure on the next commit even if it brings no records.
+  const dirtyOutside = useRef(false);
+  // Slides in progress, per element (fades are left to finish on their own).
+  const slides = useRef(new Map<HTMLElement, Animation>());
 
-  // Every commit: compare with the last recorded positions, animate the
-  // difference, record the new positions. Positions are always the layout
-  // place, never a mid-slide one: an item still sliding is measured where it
-  // is on screen, its slide stopped, measured again where it really sits, and
-  // started afresh from where it was on screen — so a change landing mid-slide
-  // carries on smoothly instead of compounding.
   useLayoutEffect(() => {
     const root = rootRef.current;
     if (!root) return;
-    const items = trackedItems(root);
-    const rootRect = root.getBoundingClientRect();
-    const onScreen = new Map<string, Place>();
-    for (const [k, el] of items) {
-      if (running.current.has(el)) onScreen.set(k, placeOf(el, root, rootRect));
+    if (observer.current === null && typeof MutationObserver !== "undefined") {
+      observer.current = new MutationObserver((recs) => {
+        if (recs.some(structural)) dirtyOutside.current = true;
+      });
+      observer.current.observe(root, { childList: true, subtree: true });
     }
-    for (const anims of running.current.values()) {
-      for (const a of anims) a.cancel();
-    }
-    running.current = new Map();
-    const next = new Map<string, Place>();
-    for (const [k, el] of items) next.set(k, placeOf(el, root, rootRect));
+    const records = observer.current?.takeRecords() ?? [];
+    const changed = dirtyOutside.current || records.some(structural) || observer.current === null;
+    dirtyOutside.current = false;
+    const rootWidth = root.clientWidth;
+    const resized = width.current !== null && width.current !== rootWidth;
+    width.current = rootWidth;
+    // Nothing added, removed or reordered: nothing can have moved.
+    if (places.current !== null && !changed && !resized) return;
 
     const prev = places.current;
-    previousPlaces.current = prev;
+    const items = trackedItems(root);
+    const rootRect = root.getBoundingClientRect();
+    // Where each item sits (its layout place) and where it shows on screen
+    // (layout plus whatever slide it's in the middle of).
+    const next = new Map<string, Place>();
+    const onScreen = new Map<string, Place>();
+    for (const [k, el] of items) {
+      const shown = placeOf(el, root, rootRect);
+      onScreen.set(k, shown);
+      if (slides.current.has(el)) {
+        const t = currentTranslate(el);
+        next.set(k, { ...shown, top: shown.top - t.y, left: shown.left - t.x });
+      } else {
+        next.set(k, shown);
+      }
+    }
     places.current = next;
 
     const hadRows = prev !== null && [...prev.keys()].some((k) => k.startsWith("c:"));
     const skip =
       !hadRows ? "first-paint"
+      : resized ? "resize"
       : !enabledRef.current ? "search"
       : prefersReducedMotion() ? "reduced-motion"
       : null;
-    lastSkipReason.current = skip;
-    if (skip !== null) return;
+    if (skip !== null) {
+      for (const a of slides.current.values()) a.cancel();
+      slides.current.clear();
+      return;
+    }
 
-    const track = (el: HTMLElement, a: Animation) => {
-      const list = running.current.get(el) ?? [];
-      list.push(a);
-      running.current.set(el, list);
-      a.onfinish = () => {
-        const cur = running.current.get(el);
-        if (!cur) return;
-        const rest = cur.filter((x) => x !== a);
-        if (rest.length > 0) running.current.set(el, rest);
-        else running.current.delete(el);
-      };
-    };
+    // Items that left in this commit fade out where they were.
+    let left = 0;
+    for (const rec of records) {
+      for (const node of rec.removedNodes) {
+        if (!(node instanceof HTMLElement) || node.isConnected || node.hasAttribute(LEAVING_ATTR)) continue;
+        const removed = node.matches(TRACKED_SELECTOR)
+          ? [node]
+          : Array.from(node.querySelectorAll<HTMLElement>(TRACKED_SELECTOR));
+        for (const el of removed) {
+          const k = baseKey(el);
+          if (next.has(k)) continue; // still here under the same key: it moved
+          const was = prev!.get(k);
+          if (!was || !canAnimate(el)) continue;
+          left += 1;
+          el.style.position = "absolute";
+          el.style.top = `${was.top}px`;
+          el.style.left = `${was.left}px`;
+          el.style.width = `${was.width}px`;
+          el.style.height = `${was.height}px`;
+          el.style.margin = "0";
+          el.style.transform = "none";
+          el.style.pointerEvents = "none";
+          el.setAttribute("aria-hidden", "true");
+          el.setAttribute(LEAVING_ATTR, "true");
+          root.appendChild(el);
+          const anim = el.animate([{ opacity: 1 }, { opacity: 0 }], {
+            duration: LEAVE_MS,
+            easing: EASING,
+            fill: "forwards",
+          });
+          const done = () => el.remove();
+          anim.onfinish = done;
+          anim.oncancel = done;
+        }
+      }
+    }
 
     let moved = 0;
     let arrived = 0;
@@ -153,95 +229,40 @@ export function useSidebarMotion(rootRef: RefObject<HTMLElement | null>, enabled
       const now = next.get(k)!;
       if (was === undefined) {
         arrived += 1;
-        track(el, el.animate([{ opacity: 0 }, { opacity: 1 }], { duration: SIDEBAR_MOTION_MS, easing: EASING }));
+        el.animate([{ opacity: 0 }, { opacity: 1 }], { duration: SIDEBAR_MOTION_MS, easing: EASING });
         continue;
       }
-      // Where it was on screen just before this commit: its old place plus
-      // the offset of whatever slide it was still in the middle of.
-      const seen = onScreen.get(k);
-      const slideX = seen ? seen.left - now.left : 0;
-      const slideY = seen ? seen.top - now.top : 0;
-      const dx = was.left - now.left + slideX;
-      const dy = was.top - now.top + slideY;
-      if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) continue;
+      // Same place as before: a slide still running carries on untouched.
+      if (Math.abs(was.left - now.left) < 0.5 && Math.abs(was.top - now.top) < 0.5) continue;
+      // It moved: start from where it showed just before this commit — its old
+      // place plus the offset of any slide still running (that offset is how
+      // far it shows from its layout place now).
+      const shown = onScreen.get(k)!;
+      const startX = was.left - now.left + (shown.left - now.left);
+      const startY = was.top - now.top + (shown.top - now.top);
+      slides.current.get(el)?.cancel();
       moved += 1;
-      track(el, el.animate(
-        [{ transform: `translate(${dx}px, ${dy}px)` }, { transform: "translate(0, 0)" }],
+      const anim = el.animate(
+        [{ transform: `translate(${startX}px, ${startY}px)` }, { transform: "translate(0, 0)" }],
         { duration: SIDEBAR_MOTION_MS, easing: EASING },
-      ));
+      );
+      slides.current.set(el, anim);
+      anim.onfinish = () => {
+        if (slides.current.get(el) === anim) slides.current.delete(el);
+      };
     }
-    if (moved + arrived > 0) {
-      console.info({ operation: "sidebar_motion", moved, arrived });
+    // Forget slides on elements that are gone.
+    for (const el of slides.current.keys()) if (!el.isConnected) slides.current.delete(el);
+    if (moved + arrived + left > 0) {
+      console.info({ operation: "sidebar_motion", moved, arrived, left });
     }
   });
 
-  // Track whether motion is allowed this commit (read by the effects).
-  enabledRef.current = enabled;
-
-  // Removed items: park the detached element where it was and fade it out.
-  useEffect(() => {
-    const root = rootRef.current;
-    if (!root || typeof MutationObserver === "undefined") return;
-    const observer = new MutationObserver((records) => {
-      if (lastSkipReason.current !== null) return;
-      const prev = previousPlaces.current;
-      if (!prev) return;
-      const current = places.current;
-      let left = 0;
-      for (const rec of records) {
-        for (const node of rec.removedNodes) {
-          if (!(node instanceof HTMLElement) || node.isConnected) continue;
-          if (node.hasAttribute("data-sidebar-leaving")) continue;
-          const removed: HTMLElement[] = node.matches(TRACKED_SELECTOR)
-            ? [node]
-            : Array.from(node.querySelectorAll<HTMLElement>(TRACKED_SELECTOR));
-          for (const el of removed) {
-            const k = baseKey(el);
-            // Still present under the same key = it moved, not left.
-            if (current?.has(k)) continue;
-            const was = prev.get(k);
-            if (!was || !canAnimate(el)) continue;
-            left += 1;
-            el.style.position = "absolute";
-            el.style.top = `${was.top}px`;
-            el.style.left = `${was.left}px`;
-            el.style.width = `${was.width}px`;
-            el.style.height = `${was.height}px`;
-            el.style.margin = "0";
-            el.style.pointerEvents = "none";
-            el.setAttribute("aria-hidden", "true");
-            el.setAttribute("data-sidebar-leaving", "true");
-            root.appendChild(el);
-            const anim = el.animate([{ opacity: 1 }, { opacity: 0 }], {
-              duration: LEAVE_MS,
-              easing: EASING,
-              fill: "forwards",
-            });
-            const done = () => el.remove();
-            anim.onfinish = done;
-            anim.oncancel = done;
-          }
-        }
-      }
-      if (left > 0) console.info({ operation: "sidebar_motion_left", left });
-    });
-    observer.observe(root, { childList: true, subtree: true });
-    return () => observer.disconnect();
-  }, [rootRef]);
-
-  // A resize moves everything without a data change: re-record, don't animate.
-  useEffect(() => {
-    const root = rootRef.current;
-    if (!root || typeof ResizeObserver === "undefined") return;
-    const ro = new ResizeObserver(() => {
-      const r = rootRef.current;
-      if (!r || places.current === null) return;
-      const rootRect = r.getBoundingClientRect();
-      const next = new Map<string, Place>();
-      for (const [k, el] of trackedItems(r)) next.set(k, placeOf(el, r, rootRect));
-      places.current = next;
-    });
-    ro.observe(root);
-    return () => ro.disconnect();
-  }, [rootRef]);
+  useEffect(
+    () => () => {
+      observer.current?.disconnect();
+      observer.current = null;
+    },
+    [],
+  );
 }

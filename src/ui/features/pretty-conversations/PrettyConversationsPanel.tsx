@@ -1435,10 +1435,14 @@ export function PrettyConversationsPanel({
   //    section-collapse + all-empty fallback render behavior.
   const trimmedSidebarSearchQuery = sidebarSearchQuery.trim();
   const sidebarSearchActive = trimmedSidebarSearchQuery.length > 0;
-  // Real changes slide; the user's own filtering (and clearing it) snaps.
+  // Real changes slide; the user's own filtering (and clearing it) snaps. The
+  // last committed query is kept by an effect, so a double render (strict
+  // mode) can't hide that it just changed.
   const lastMotionSearchRef = useRef(trimmedSidebarSearchQuery);
   const searchJustChanged = lastMotionSearchRef.current !== trimmedSidebarSearchQuery;
-  lastMotionSearchRef.current = trimmedSidebarSearchQuery;
+  useEffect(() => {
+    lastMotionSearchRef.current = trimmedSidebarSearchQuery;
+  }, [trimmedSidebarSearchQuery]);
   useSidebarMotion(scrollRegionRef, !sidebarSearchActive && !searchJustChanged);
 
   const searchFilterRow = (row: ConversationRowShape): boolean => {

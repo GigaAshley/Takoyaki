@@ -13,41 +13,53 @@ export function initialOf(name: string | null | undefined): string {
 // error). Bounded; newest last.
 const FAILED_SRCS_KEY = "skynet:avatar-failed-srcs:v2";
 const FAILED_SRCS_MAX = 500;
-let failedSrcs: { owner: string | null; list: string[] } | null = null;
+// Read once per page (a sign-in as someone else reloads the page). In memory
+// as a Set; written back in one batch at the end of the current task.
+let failedSrcs: Set<string> | null = null;
+// Failures seen on this page — not worth an immediate background retry.
+const failedThisPage = new Set<string>();
+let saveQueued = false;
 
-function loadFailedSrcs(): string[] {
-  const owner = getCurrentUser();
-  if (failedSrcs !== null && failedSrcs.owner === owner) return failedSrcs.list;
-  const raw = owner ? readUserScopedCache<unknown>(FAILED_SRCS_KEY, ["skynet:avatar-failed-srcs:v1"]) : null;
-  const list = Array.isArray(raw) ? raw.filter((s): s is string => typeof s === "string") : [];
-  failedSrcs = { owner, list };
-  return list;
+function loadFailedSrcs(): Set<string> {
+  if (failedSrcs !== null) return failedSrcs;
+  const raw = getCurrentUser() ? readUserScopedCache<unknown>(FAILED_SRCS_KEY, ["skynet:avatar-failed-srcs:v1"]) : null;
+  failedSrcs = new Set(Array.isArray(raw) ? raw.filter((s): s is string => typeof s === "string") : []);
+  return failedSrcs;
 }
 
-function saveFailedSrcs(list: string[]): void {
-  failedSrcs = { owner: getCurrentUser(), list };
-  writeUserScopedCache(FAILED_SRCS_KEY, list);
+function queueSave(): void {
+  if (saveQueued) return;
+  saveQueued = true;
+  queueMicrotask(() => {
+    saveQueued = false;
+    const list = [...loadFailedSrcs()].slice(-FAILED_SRCS_MAX);
+    writeUserScopedCache(FAILED_SRCS_KEY, list);
+  });
 }
 
 export function rememberAvatarFailed(src: string): void {
-  const list = loadFailedSrcs();
-  if (list.includes(src)) return;
-  saveFailedSrcs([...list, src].slice(-FAILED_SRCS_MAX));
+  failedThisPage.add(src);
+  const set = loadFailedSrcs();
+  if (set.has(src)) return;
+  set.add(src);
+  if (set.size > FAILED_SRCS_MAX) set.delete(set.values().next().value as string);
+  queueSave();
 }
 
 export function forgetAvatarFailed(src: string): void {
-  const list = loadFailedSrcs();
-  if (!list.includes(src)) return;
-  saveFailedSrcs(list.filter((s) => s !== src));
+  const set = loadFailedSrcs();
+  if (!set.delete(src)) return;
+  queueSave();
 }
 
 export function isAvatarKnownFailed(src: string): boolean {
-  return loadFailedSrcs().includes(src);
+  return loadFailedSrcs().has(src);
 }
 
 /** Test-only: forget the in-memory copy so the next read comes from storage. */
 export function __resetAvatarFailuresForTest(): void {
   failedSrcs = null;
+  failedThisPage.clear();
 }
 
 /**
@@ -86,7 +98,8 @@ export function AvatarImage({
 
   const knownFailed = !!src && failedSrc === src;
   useEffect(() => {
-    if (!src || !knownFailed || typeof Image === "undefined") return;
+    // A picture that failed on this very page isn't retried straight away.
+    if (!src || !knownFailed || failedThisPage.has(src) || typeof Image === "undefined") return;
     let live = true;
     const probe = new Image();
     probe.onload = () => {

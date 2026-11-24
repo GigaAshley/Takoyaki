@@ -112,28 +112,50 @@ describe("useSidebarMotion", () => {
     expect(animate).not.toHaveBeenCalled();
   });
 
-  it("a change landing mid-slide starts from where the row is on screen", () => {
+  it("a change landing mid-slide starts from where the row is on screen; a row still sliding to the same place carries on", () => {
     const { rerender, container } = render(<List ids={["a", "b", "c"]} />);
-    rerender(<List ids={["c", "a", "b"]} />); // c slides up from 72 to 0
-    const firstSlides = animate.mock.results.map((r) => r.value as { cancel: ReturnType<typeof vi.fn> });
+    rerender(<List ids={["c", "a", "b"]} />); // c slides up 72→0; a 0→36; b 36→72
+    const slideOf = (id: string) => {
+      const i = animate.mock.contexts.findIndex((el) => (el as HTMLElement).getAttribute("data-conversation-id") === id);
+      return animate.mock.results[i].value as { cancel: ReturnType<typeof vi.fn> };
+    };
+    const [aSlide, bSlide, cSlide] = [slideOf("a"), slideOf("b"), slideOf("c")];
     animate.mockClear();
-    // Mid-slide, c shows 30px below its new place.
+    // Mid-slide, c shows 30px below its layout place (its slide's offset).
     const c = container.querySelector('[data-conversation-id="c"]') as HTMLElement;
-    const real = HTMLElement.prototype.getBoundingClientRect as unknown as ReturnType<typeof vi.fn>;
-    let first = true;
-    const base = real.getMockImplementation()!;
-    real.mockImplementation(function (this: HTMLElement) {
+    const rect = HTMLElement.prototype.getBoundingClientRect as unknown as ReturnType<typeof vi.fn>;
+    const base = rect.getMockImplementation()!;
+    rect.mockImplementation(function (this: HTMLElement) {
       const r = base.call(this) as DOMRect;
-      if (this === c && first) {
-        first = false;
-        return { ...r, top: r.top + 30, y: r.y + 30 } as DOMRect;
-      }
-      return r;
+      return this === c ? ({ ...r, top: r.top + 30, y: r.y + 30 } as DOMRect) : r;
     });
-    rerender(<List ids={["a", "c", "b"]} />); // c now goes to 36
-    // c was on screen at 0 + 30 = 30; its new place is 36: slide from -6.
+    const realStyle = window.getComputedStyle;
+    vi.spyOn(window, "getComputedStyle").mockImplementation((el: Element) =>
+      el === c ? ({ transform: "matrix(1, 0, 0, 1, 0, 30)" } as CSSStyleDeclaration) : realStyle(el),
+    );
+    rerender(<List ids={["a", "c", "b"]} />); // c's layout goes 0→36; a 36→0; b stays at 72
+    // c showed at 0 + 30 = 30 just before; its new place is 36: slide from -6.
     expect(calls()).toContain("c:translate(0px, -6px)");
-    // The slides still running were stopped before measuring.
-    for (const a of firstSlides) expect(a.cancel).toHaveBeenCalled();
+    expect(cSlide.cancel).toHaveBeenCalled();
+    expect(aSlide.cancel).toHaveBeenCalled();
+    // b's target didn't change: its slide is left running.
+    expect(bSlide.cancel).not.toHaveBeenCalled();
+    expect(calls().some((x) => x.startsWith("b:"))).toBe(false);
+  });
+
+  it("a render that changes nothing in the list does no measuring", () => {
+    const { rerender } = render(<List ids={["a", "b"]} />);
+    const rect = HTMLElement.prototype.getBoundingClientRect as unknown as ReturnType<typeof vi.fn>;
+    rect.mockClear();
+    rerender(<List ids={["a", "b"]} />);
+    expect(rect).not.toHaveBeenCalled();
+  });
+
+  it("a change of sidebar width counts as a resize and snaps", () => {
+    const { rerender, container } = render(<List ids={["a", "b", "c"]} />);
+    const root = container.firstElementChild as HTMLElement;
+    Object.defineProperty(root, "clientWidth", { configurable: true, value: 420 });
+    rerender(<List ids={["c", "a", "b"]} />);
+    expect(animate).not.toHaveBeenCalled();
   });
 });

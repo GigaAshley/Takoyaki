@@ -1805,10 +1805,18 @@ export function AppShell({
       // No answer leaves every room where the sidebar shows it; rooms moved
       // while this ran, or that couldn't be read, keep what the sidebar shows.
       const placementMark = roomPlacementMark();
+      // Hosts last seen down go last; an access refusal is the same on every
+      // host, so it ends the asking.
+      const down = getUnreachableHostIds();
+      const hostIds = allHosts.map((h) => parseInt(h.id, 10));
       const tags = await askFirstAnsweringHost(
-        allHosts.map((h) => parseInt(h.id, 10)),
+        [...hostIds.filter((h) => !down.has(h)), ...hostIds.filter((h) => down.has(h))],
         listRelayRoomProjectTags,
         () => cancelled,
+        (err) => {
+          const status = (err as { status?: number } | null)?.status;
+          return status === 401 || status === 403;
+        },
       );
       if (cancelled) return;
       if (tags !== null) {

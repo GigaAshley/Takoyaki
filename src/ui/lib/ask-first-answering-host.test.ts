@@ -22,6 +22,13 @@ describe("askFirstAnsweringHost", () => {
     expect(await askFirstAnsweringHost([], async () => 1)).toBeNull();
   });
 
+  it("stops at a failure every host would give", async () => {
+    const ask = vi.fn(async () => { throw Object.assign(new Error("no"), { status: 403 }); });
+    const givesUp = (e: unknown) => (e as { status?: number }).status === 403;
+    expect(await askFirstAnsweringHost([3, 6, 7], ask, () => false, givesUp)).toBeNull();
+    expect(ask).toHaveBeenCalledTimes(1);
+  });
+
   it("stops asking once cancelled", async () => {
     let cancelled = false;
     const ask = vi.fn(async () => { cancelled = true; throw new Error("x"); });
