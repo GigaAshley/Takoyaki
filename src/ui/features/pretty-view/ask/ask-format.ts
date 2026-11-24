@@ -298,13 +298,36 @@ function quoteUnreadableListLines(body: string): string {
   }).join("\n");
 }
 
+// A text field's value holding ": " ("question: Start? First steps: add …")
+// isn't YAML. Quote the value of each text key that doesn't read as plain
+// text by itself, in a question or a list entry alike; only tried on a block
+// that already failed, before the list lines are looked at.
+const TEXT_KEYS = new Set([
+  "question", "q", "ask", "header", "tab", "placeholder", "yes", "no",
+  "label", "name", "text", "description", "detail",
+]);
+const TEXT_LINE_RE = /^(\s*(?:-\s+)?)([\w-]+)(:\s+)([^\s[{#|>&*!'"].*?)\s*$/;
+function quoteUnreadableTextValues(body: string): string {
+  return body.split("\n").map((line) => {
+    const m = TEXT_LINE_RE.exec(line);
+    if (!m || !TEXT_KEYS.has(m[2])) return line;
+    try {
+      const v: unknown = parseYaml(m[4]);
+      if (v === null || typeof v !== "object") return line;
+    } catch {
+      // unreadable — quote it below
+    }
+    return `${m[1]}${m[2]}${m[3]}'${m[4].replace(/'/g, "''")}'`;
+  }).join("\n");
+}
+
 export function parseAskBlock(body: string): AskParseResult {
   let doc: unknown;
   try {
     doc = parseYaml(body);
   } catch (e) {
     try {
-      doc = parseYaml(quoteUnreadableListLines(body));
+      doc = parseYaml(quoteUnreadableListLines(quoteUnreadableTextValues(body)));
     } catch {
       return { ok: false, error: `not readable YAML: ${(e as Error).message.split("\n")[0]}` };
     }

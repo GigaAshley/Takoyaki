@@ -57,6 +57,36 @@ items:
     expect(q.options[1].description).toBe('"Asked you: … · You picked: Ship now"');
   });
 
+  it("reads an unquoted question whose text holds a colon", () => {
+    const q = ok(`id: keyless-go
+question: Start keyless? First steps: add the upload rule to the bucket now (additive, nothing current changes) and make the tool change, ready to test.
+options:
+  - Yes, add the rule and build the change (recommended) | Testing and the 35-WorkSpace rollout each come back to you for a yes
+  - Show me the exact bucket rule first | I'll paste the JSON before applying anything
+  - Hold | Do the folder cleanup first, keyless after
+`).questions[0];
+    expect(q.question).toBe(
+      "Start keyless? First steps: add the upload rule to the bucket now (additive, nothing current changes) and make the tool change, ready to test.",
+    );
+    expect(q.options.map((o) => o.label)).toEqual(["Yes, add the rule and build the change", "Show me the exact bucket rule first", "Hold"]);
+    expect(q.options[0].recommended).toBe(true);
+  });
+
+  it("reads colons in the questions of a multi-question block", () => {
+    const ask = ok(`id: two-step
+questions:
+  - question: Ship it: now or later?
+    header: When
+    options: [Now, Later]
+  - question: Who's told: Joe or Stacy?
+    header: Tell: who
+    options: [Joe, Stacy]
+`);
+    expect(ask.questions.map((q) => q.question)).toEqual(["Ship it: now or later?", "Who's told: Joe or Stacy?"]);
+    expect(ask.questions[1].header).toBe("Tell: who");
+    expect(ask.questions[1].options.map((o) => o.label)).toEqual(["Joe", "Stacy"]);
+  });
+
   it("reads an item that opens with a quoted phrase", () => {
     const q = ok(`id: close-browse-extras
 question: Keep or change each of these?
