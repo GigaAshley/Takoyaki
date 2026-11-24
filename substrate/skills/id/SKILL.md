@@ -1965,8 +1965,9 @@ A single pick-one question sends on the tap.
 **Several questions at once.** An ask can hold up to four questions. They
 show as tabs, each ticking when answered, with one Send at the end that waits
 until all are answered. Each tab has a **Something else…** link that opens a
-one-line field for an answer of the user's own, with a mic inside it: tap to
-talk, tap again and the words are added to the field (nothing is sent).
+one-line field for an answer of the user's own. It and every typed-answer
+field have a mic inside: tap to talk, tap again and the words are added to
+the field (nothing is sent).
 
 **Answering.** Anything typed in the composer when the user answers goes
 along as a note. The answer is an ordinary message from the user, drawn as an
