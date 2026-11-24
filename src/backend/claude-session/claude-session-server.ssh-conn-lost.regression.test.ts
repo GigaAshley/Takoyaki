@@ -42,7 +42,10 @@ describe("claude-session-server.ts — pane SSH connection loss", () => {
     expect(body).toMatch(/operation: "claude_session_ssh_conn_lost"/);
   });
 
-  it("our teardown nulls sshConn right after ending it, so the guard holds", () => {
-    expect(SERVER_SRC).toMatch(/sshConn\.end\(\);\n\s+\} catch \(err\) \{[\s\S]{0,300}?\n\s+\}\n\s+sshConn = null;/);
+  it("our teardown nulls sshConn as it hands the connection off to be ended, so the guard holds", () => {
+    // The end itself may be deferred until in-flight sends are typed
+    // (send-conn-lease.ts); sshConn must already be null when it happens.
+    const teardown = SERVER_SRC.slice(SERVER_SRC.indexOf("  const teardownPane = () => {"));
+    expect(teardown).toMatch(/const conn = sshConn;[\s\S]{0,200}?endConnWhenSendsDone\(conn, \(\) => \{[\s\S]{0,400}?conn\.end\(\);[\s\S]{0,400}?\}\);\n\s+sshConn = null;/);
   });
 });
