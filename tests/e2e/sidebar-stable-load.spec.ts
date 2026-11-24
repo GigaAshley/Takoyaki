@@ -165,7 +165,7 @@ async function reloadAndCompare(
   page: Page,
   mode: Mode,
   beforeSample: Sample,
-): Promise<{ problems: string[] } | { changed: string }> {
+): Promise<{ problems: string[] } | { changed: string; silencedMoved: boolean }> {
   const down = mode === "one-machine-down" ? machineToSilence(layoutOf(beforeSample)) ?? undefined : undefined;
   const before = layoutOf(beforeSample, down);
   await cutOff(page, mode, layoutOf(beforeSample));
@@ -176,7 +176,13 @@ async function reloadAndCompare(
   const first = layoutOf(all[0], down);
   const last = layoutOf(all[all.length - 1], down);
   // Cut off from the server, nothing can change; otherwise a real change may land.
-  if (mode !== "offline" && last !== before) return { changed: diff(before, last) };
+  if (mode !== "offline" && last !== before) {
+    const lastSet = new Set(last.split("\n"));
+    const silencedMoved =
+      down !== undefined &&
+      before.split("\n").some((l) => l.startsWith(`fleet::${down}::`) && !lastSet.has(l));
+    return { changed: diff(before, last), silencedMoved };
+  }
   const target = before;
   const problems: string[] = [];
   if (first !== target) problems.push(`first paint differs from last time:\n${diff(first, target)}`);
@@ -215,6 +221,9 @@ for (const size of ["desktop", "phone"] as const) {
         await loginViaUI(page, readCreds());
         let problems: string[] | null = null;
         let changed = "";
+        // The silent machine's own rows moving on every attempt is the failure
+        // this mode looks for, not a real change elsewhere.
+        let silencedMovedEveryTime = true;
         for (let attempt = 0; attempt < ATTEMPTS && problems === null; attempt++) {
           await page.unrouteAll({ behavior: "ignoreErrors" });
           await page.routeWebSocket(/.*/, (ws) => ws.connectToServer());
@@ -226,7 +235,13 @@ for (const size of ["desktop", "phone"] as const) {
           }
           const outcome = await reloadAndCompare(page, mode, before);
           if ("problems" in outcome) problems = outcome.problems;
-          else changed = outcome.changed;
+          else {
+            changed = outcome.changed;
+            silencedMovedEveryTime &&= outcome.silencedMoved;
+          }
+        }
+        if (problems === null && mode === "one-machine-down" && silencedMovedEveryTime) {
+          problems = [`the silent machine's conversations moved on every attempt:\n${changed}`];
         }
         test.skip(problems === null, `something really changed on every attempt; last time:\n${changed}`);
         expect(problems, (problems ?? []).join("\n")).toEqual([]);
