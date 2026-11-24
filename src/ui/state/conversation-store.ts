@@ -545,6 +545,10 @@ const PROJECTS_CACHE_LEGACY_KEYS = ["skynet:projects-cache:v1"];
 const PINNED_IDS_CACHE_KEY = "skynet:pinned-ids-cache:v2";
 const PINNED_IDS_CACHE_LEGACY_KEYS = ["skynet:pinned-ids-cache:v1"];
 
+// Machines last known to be down, so their rows paint greyed on first load
+// instead of greying a moment later. Hoisted for the same TDZ reason.
+const UNREACHABLE_HOSTS_CACHE_KEY = "skynet:unreachable-hosts-cache:v1";
+
 // Module-load seed for the projects slice from localStorage: paint project
 // sections + membership on cold refresh BEFORE the aggregated per-host
 // listProjects / listRelayRoomProjectTags fetches resolve. Empty / missing /
@@ -564,7 +568,7 @@ let state: State = {
   selectedId: null,
   fleetSessions: [],
   fleetSessionsLoaded: false,
-  unreachableHostIds: new Set<number>(),
+  unreachableHostIds: readUnreachableHostsCache(),
   hostsFlat: new Map<number, Host>(),
   identitiesByKey: new Map<string, Identity>(),
   activeSet: hydrateActiveSetFromStorage(),
@@ -1933,10 +1937,18 @@ export function reconcileFleetSessionsFromList(
   updateFleetSessions(out);
 }
 
+function readUnreachableHostsCache(): Set<number> {
+  const raw = readUserScopedCache<unknown>(UNREACHABLE_HOSTS_CACHE_KEY);
+  const out = new Set<number>();
+  if (Array.isArray(raw)) for (const h of raw) if (typeof h === "number" && Number.isFinite(h)) out.add(h);
+  return out;
+}
+
 function setUnreachableHostIds(next: ReadonlySet<number>): void {
   const cur = state.unreachableHostIds;
   if (cur.size === next.size && [...next].every((h) => cur.has(h))) return;
   state = { ...state, unreachableHostIds: new Set(next) };
+  writeUserScopedCache(UNREACHABLE_HOSTS_CACHE_KEY, [...next]);
   notify();
 }
 
@@ -1947,6 +1959,13 @@ export function markHostReachable(hostId: number): void {
   next.delete(hostId);
   console.info({ operation: "fleet_host_reachable_again", hostId });
   state = { ...state, unreachableHostIds: next };
+  writeUserScopedCache(UNREACHABLE_HOSTS_CACHE_KEY, [...next]);
+  notify();
+}
+
+/** Test-only: re-read the saved down-machine list as a fresh page load would. */
+export function __reseedUnreachableHostsForTest(): void {
+  state = { ...state, unreachableHostIds: readUnreachableHostsCache() };
   notify();
 }
 

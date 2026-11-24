@@ -23,6 +23,7 @@ import {
   updateFleetSessions,
   reconcileFleetSessionsFromList,
   markHostReachable,
+  __reseedUnreachableHostsForTest,
   removeFleetSession,
   upsertFleetSession,
   markPendingArchive,
@@ -4226,6 +4227,22 @@ describe("conversation-store: reconcileFleetSessionsFromList", () => {
     expect(marked()).toEqual(["fleet::2::idle-agent"]);
     act(() => markHostReachable(2));
     expect(marked()).toEqual([]);
+  });
+
+  it("a down machine's rows paint greyed on the next load, before the server answers", () => {
+    localStorage.setItem("skynet_auth", JSON.stringify({ loggedIn: true, username: "ashley" }));
+    const h2 = makeHost("2", "workstation");
+    act(() => {
+      updateHostsFlat(new Map([[2, h2]]));
+      reconcileFleetSessionsFromList([row(2, "idle-agent")], { startedAt: Date.now(), unreachableHostIds: [2] });
+      __resetFleetSessionsForTest(); // a fresh page: in-memory state gone
+      __reseedUnreachableHostsForTest();
+      updateFleetSessions([row(2, "idle-agent")]);
+    });
+    expect(__getFleetOnlyRowsForTest().map((r) => r.hostUnreachable)).toEqual([true]);
+    act(() => markHostReachable(2));
+    act(() => __reseedUnreachableHostsForTest());
+    expect(__getFleetOnlyRowsForTest().map((r) => r.hostUnreachable)).toEqual([undefined]);
   });
 
   it("a later list that reaches the machine clears the mark", () => {
