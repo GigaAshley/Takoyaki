@@ -305,6 +305,33 @@ describe("refresh-after-fleet-load — re-fetches per newly reported host", () =
     }
   });
 
+  it("a later refresh where one host's fan-out fails keeps that host's agents", async () => {
+    answerEveryHost();
+    updateFleetSessions([makeSession(3, "jarvis-2"), makeSession(6, "sonar")]);
+    await refreshIdentities();
+    // Host 6 times out server-side on the next refresh: the 200 has nothing for it.
+    vi.mocked(IdentitiesApi.listIdentities).mockImplementation(async () => [
+      makeIdentity("jarvis-2", false, 3),
+    ]);
+    await refreshIdentities();
+    const keys = __getIdentitiesStoreSnapshotForTest()
+      .identities.map((i) => `${i.hostId}:${i.identityKey}`)
+      .sort();
+    expect(keys).toEqual(["3:jarvis-2", "6:sonar"]);
+  });
+
+  it("an identity missing from a host that did answer is dropped", async () => {
+    answerEveryHost();
+    updateFleetSessions([makeSession(3, "jarvis-2"), makeSession(3, "aqua")]);
+    await refreshIdentities();
+    vi.mocked(IdentitiesApi.listIdentities).mockImplementation(async () => [
+      makeIdentity("jarvis-2", false, 3),
+    ]);
+    await refreshIdentities();
+    const keys = __getIdentitiesStoreSnapshotForTest().identities.map((i) => i.identityKey);
+    expect(keys).toEqual(["jarvis-2"]);
+  });
+
   it("Test 7f: an older response landing after a newer one is ignored", async () => {
     // Requests naming only host 1 hang until released (the "older" ones);
     // requests naming both hosts answer at once.

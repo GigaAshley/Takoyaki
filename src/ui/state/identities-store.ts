@@ -121,9 +121,23 @@ function recordFetchOutcome(
   if (list !== null) {
     if (seq < lastAppliedFetchSeq) return false;
     lastAppliedFetchSeq = seq;
-    setIdentities(list);
     const answered = new Set<number>();
     for (const i of list) if (typeof i.hostId === "number") answered.add(i.hostId);
+    // A requested host that came back empty (the backend swallows a per-host
+    // SSH timeout as []) hasn't answered — keep what we already hold for it,
+    // so its agents don't lose their names until it does.
+    const requested = hostIdsOf(identityHosts);
+    const kept = state.identities.filter(
+      (i) => typeof i.hostId === "number" && requested.has(i.hostId) && !answered.has(i.hostId),
+    );
+    if (kept.length > 0) {
+      console.info({
+        operation: "identities_store_kept_unanswered_hosts",
+        kept: kept.length,
+        hostIds: [...new Set(kept.map((i) => i.hostId))],
+      });
+    }
+    setIdentities(kept.length > 0 ? [...list, ...kept] : list);
     coveredHostIds = answered;
   }
   const now = Date.now();
