@@ -25,6 +25,7 @@ import {
 import { tailSessionFile, type TailHandle } from "./session-file-tail.js";
 import { tailSessionFileWindowed, searchBackgroundWorkHistory, type RunExec } from "./session-file-window.js";
 import { isRepeatComposeMqid } from "./seen-input-mqids.js";
+import { endConnWhenSendsDone, leaseSendConn } from "./send-conn-lease.js";
 import {
   InterruptCancelTracker,
   isPromptStart,
@@ -4613,6 +4614,10 @@ wss.on("connection", async (ws: WebSocket, req) => {
   // that holds regardless of what the send-path is doing internally.
   let inputChain: Promise<void> = Promise.resolve();
   let stopped = false;
+  // Bumped on every teardownPane. An input frame records the value it arrived
+  // under, so a send still in flight after the pane went away (app closed,
+  // pane switched) knows it no longer owns the connection-scoped state.
+  let paneGen = 0;
 
   // Phase 3 session-changeover state machine. Per D-30:
   // `active`  — currently tailing a live session; ticker also polls context-% + tasks.
@@ -4680,6 +4685,7 @@ wss.on("connection", async (ws: WebSocket, req) => {
   };
 
   const teardownPane = () => {
+    paneGen++;
     if (currentHostId !== null || currentTmuxSession !== null) {
       databaseLogger.info(`[session-server] detach hostId=${currentHostId ?? 'null'} tmuxSession=${currentTmuxSession ?? 'null'} userId=${userId ?? 'null'}`, { operation: "session_detach" });
     }
@@ -4808,11 +4814,17 @@ wss.on("connection", async (ws: WebSocket, req) => {
       ownedUploadBatches.clear();
     }
     if (sshConn) {
-      try {
-        sshConn.end();
-      } catch (err) {
-        databaseLogger.warn(`[ws-server] conn-end-failed hostId=${currentHostId ?? 'null'} err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_conn_end_failed" });
-      }
+      // Sends already received keep the connection until they're typed
+      // (send-conn-lease.ts) — closing the app mid-wake must not lose them.
+      const conn = sshConn;
+      const hostIdForLog = currentHostId;
+      endConnWhenSendsDone(conn, () => {
+        try {
+          conn.end();
+        } catch (err) {
+          databaseLogger.warn(`[ws-server] conn-end-failed hostId=${hostIdForLog ?? 'null'} err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_conn_end_failed" });
+        }
+      });
       sshConn = null;
     }
   };
@@ -6467,17 +6479,37 @@ wss.on("connection", async (ws: WebSocket, req) => {
         });
         return;
       }
+      // Bind the send to the pane it arrived on. It may still be waiting on a
+      // wake when the pane goes away (app closed, pane switched); it must
+      // then finish on this connection, into this pane — never the next
+      // pane's, and never dropped. The lease keeps teardown from ending the
+      // connection until the send is typed (send-conn-lease.ts).
+      const boundConn = sshConn;
+      const boundTmuxSession = currentTmuxSession;
+      const boundHostId = currentHostId;
+      const boundSessionId = sessionIdFromFile;
+      const boundPaneGen = paneGen;
+      const samePane = () => !stopped && paneGen === boundPaneGen;
+      const releaseLease = boundConn ? leaseSendConn(boundConn) : () => {};
       inputChain = inputChain.then(async () => {
+        if (!samePane()) {
+          sshLogger.info(`[pv-input] delivering after pane went away mqid=${capturedMqid ?? "none"} hostId=${boundHostId} tmuxSession=${boundTmuxSession}`, {
+            operation: "pv_input_detached_delivery",
+            mqid: capturedMqid ?? "none",
+            hostId: boundHostId,
+            tmuxSession: boundTmuxSession,
+          });
+        }
         try {
           await __applyInputMessageForTests({
-            sshConn,
-            currentTmuxSession,
-            currentHostId,
+            sshConn: boundConn,
+            currentTmuxSession: boundTmuxSession,
+            currentHostId: boundHostId,
             execCommand,
             data: capturedData,
             messageQueueItemId: capturedMqid,
             textArea: (msg as { textArea?: unknown }).textArea === true,
-            sessionId: sessionIdFromFile ?? undefined,
+            sessionId: boundSessionId ?? undefined,
             wsSend: (frame: object) => {
               if (ws.readyState === WebSocket.OPEN) {
                 try {
@@ -6487,8 +6519,14 @@ wss.on("connection", async (ws: WebSocket, req) => {
                 }
               }
             },
-            armWatchdog: armPvSendWatchdog,
+            // The watchdog's retries report to this WS and run on the pane's
+            // connection; once the pane is gone neither is there for it.
+            armWatchdog: (args: Parameters<typeof armPvSendWatchdog>[0]) => {
+              if (!samePane()) return;
+              armPvSendWatchdog(args);
+            },
             trackMqid: (mqid: string) => {
+              if (!samePane()) return;
               pendingMqidsForThisConnection.add(mqid);
             },
             // Phase 56 Plan 01 — send-while-dormant wire-up. Reads the connection-
@@ -6499,9 +6537,11 @@ wss.on("connection", async (ws: WebSocket, req) => {
             // seam wire-up at L7013-below (both share the same `.resume-complete`
             // read contract — if these two ever drift, extract into a module-scope
             // helper).
-            dormantLastEmitted: () => dormantLastEmitted,
+            // Both are the current pane's state: once the pane is gone, the
+            // send-time probe of the host decides whether to wake instead.
+            dormantLastEmitted: () => (samePane() ? dormantLastEmitted : null),
             setWakeTriggerTs: (ts: number) => {
-              wakeTriggerTs = ts;
+              if (samePane()) wakeTriggerTs = ts;
             },
             markerCommand: async (
               conn: unknown,
@@ -6532,11 +6572,13 @@ wss.on("connection", async (ws: WebSocket, req) => {
             `[pv-input] chain segment error: ${err instanceof Error ? err.message : String(err)}`,
             {
               operation: "pv_input_chain_error",
-              hostId: currentHostId,
-              tmuxSession: currentTmuxSession,
+              hostId: boundHostId,
+              tmuxSession: boundTmuxSession,
               mqid: capturedMqid ?? "none",
             },
           );
+        } finally {
+          releaseLease();
         }
       });
       return;
@@ -7639,7 +7681,7 @@ wss.on("connection", async (ws: WebSocket, req) => {
         archivedTailSlot.release();
         // No history kept for this agent: say so, keep nothing open.
         try { ws.send(JSON.stringify({ type: "archived_state", state: "archived", noHistory: true })); } catch { /* mid-close */ }
-        try { conn.end(); } catch { /* already closed */ }
+        endConnWhenSendsDone(conn, () => { try { conn.end(); } catch { /* already closed */ } });
         sshConn = null;
       }
       return;
@@ -8250,11 +8292,14 @@ wss.on("connection", async (ws: WebSocket, req) => {
       closeForTornDownSession();
       // Keep sshConn open? No — releasing the SSH connection here keeps
       // idle inactive WSs cheap. A subsequent connectToPane will reopen.
-      try {
-        conn.end();
-      } catch (err) {
-        databaseLogger.warn(`[ws-server] conn-end-failed hostId=${currentHostId ?? 'null'} err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_conn_end_failed" });
-      }
+      const hostIdForLog = currentHostId;
+      endConnWhenSendsDone(conn, () => {
+        try {
+          conn.end();
+        } catch (err) {
+          databaseLogger.warn(`[ws-server] conn-end-failed hostId=${hostIdForLog ?? 'null'} err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_conn_end_failed" });
+        }
+      });
       sshConn = null;
       return;
     }
