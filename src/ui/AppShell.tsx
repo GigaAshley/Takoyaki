@@ -155,6 +155,7 @@ import {
 import type { ProjectRow } from "@/state/conversation-store";
 import { onScreenConversationIds, useSeenTracker, type SeenTarget } from "@/state/use-seen-tracker";
 import { RELAY_ROOM_ATTENTION_HOST } from "@/state/attention-store";
+import { askFirstAnsweringHost } from "@/lib/ask-first-answering-host";
 // Cold-boot paint hint for the host tree — seeds hostsFlat so
 // projectForRow() resolves identity carriers on first render and
 // sidebar project sections + RDP rows paint immediately. See module
@@ -164,7 +165,7 @@ import {
   writeHostTreeCache,
 } from "@/state/host-tree-cache";
 // Phase 117 Plan 117-07 (Fix 1 gate): boot-time hydration API — listProjects
-// per host (project list) + listRelayRoomProjectTags per host (u.project.<slug>
+// per host (project list) + listRelayRoomProjectTags from one host (u.project.<slug>
 // account_data enumeration for relay-room membership). Feeds setProjects +
 // setRoomProjectAssignments before the first WS snapshot arrives.
 import {
@@ -1693,8 +1694,8 @@ export function AppShell({
   // there is NO race between the two paths and NO gratuitous re-render.
   //
   // Room-project assignments come from GET /relay-rooms/project-tags. Matrix
-  // rooms are fleet-wide (one relay room shared across all hosts), so the
-  // per-host fetches return the SAME set — dedup by roomId; last write wins.
+  // rooms are fleet-wide (one relay room shared across all hosts), so one
+  // host's answer is the whole picture.
   useEffect(() => {
     if (allHosts.length === 0) return;
     let cancelled = false;
@@ -1734,38 +1735,33 @@ export function AppShell({
         }
       });
       setProjects(aggregated);
+    })();
 
-      // Relay-room project-tag hydration (Fix 1 gate). Aggregates the
-      // per-host assignments into a single Map<roomId, slug>. Since relay
-      // rooms are fleet-wide, the same room may be returned by multiple
-      // hosts — we dedupe on roomId with last-write-wins semantics (all
-      // hosts should agree on the assignment, so any consistent choice is
-      // fine).
-      // Pinned rooms come back on the same call. A host that failed gives
-      // null so a blip can't unpin or un-file every room; rooms moved while
-      // this ran, or that couldn't be read, keep what the sidebar shows.
+    // Runs alongside the project fetches, so a slow host's project list
+    // doesn't hold back where relay rooms sit.
+    void (async () => {
+      // Relay-room project-tag hydration (Fix 1 gate). Rooms live on the one
+      // chat server, so every host gives the same answer: ask one, moving on
+      // to the next only if it fails. Pinned rooms come back on the same call.
+      // No answer leaves every room where the sidebar shows it; rooms moved
+      // while this ran, or that couldn't be read, keep what the sidebar shows.
       const placementMark = roomPlacementMark();
-      const tagResults = await Promise.all(
-        allHosts.map(async (h) => {
-          try {
-            return await listRelayRoomProjectTags(parseInt(h.id, 10));
-          } catch {
-            return null;
-          }
-        }),
+      const tags = await askFirstAnsweringHost(
+        allHosts.map((h) => parseInt(h.id, 10)),
+        listRelayRoomProjectTags,
+        () => cancelled,
       );
       if (cancelled) return;
-      const answered = tagResults.filter((r) => r !== null);
-      if (answered.length > 0) {
+      if (tags !== null) {
         const roomMap = new Map<string, string>();
         const pinned = new Set<string>();
         const unknown = new Set<string>();
-        for (const r of answered) {
-          for (const { roomId, slug } of r.assignments ?? []) roomMap.set(roomId, slug);
-          for (const roomId of r.pinned ?? []) pinned.add(roomId);
-          for (const roomId of r.unknown ?? []) unknown.add(roomId);
-        }
+        for (const { roomId, slug } of tags.assignments ?? []) roomMap.set(roomId, slug);
+        for (const roomId of tags.pinned ?? []) pinned.add(roomId);
+        for (const roomId of tags.unknown ?? []) unknown.add(roomId);
         mergeRoomPlacementsFromServer({ mark: placementMark, assignments: roomMap, pinned, unknown });
+      } else {
+        console.warn({ operation: "relay_room_placements_unavailable", hostCount: allHosts.length });
       }
     })();
 
