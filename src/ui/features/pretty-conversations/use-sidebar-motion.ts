@@ -18,7 +18,7 @@
 import { useEffect, useLayoutEffect, useRef, type RefObject } from "react";
 
 export const SIDEBAR_MOTION_MS = 250;
-const LEAVE_MS = 200;
+const LEAVE_MS = 120;
 const EASING = "cubic-bezier(0.2, 0, 0, 1)";
 
 const TRACKED_SELECTOR = [
