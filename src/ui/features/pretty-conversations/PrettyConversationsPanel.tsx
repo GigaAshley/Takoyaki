@@ -612,6 +612,7 @@ export function PrettyConversationsPanel({
   onDetachedRowClick,
   onRdpRowClick,
   onRelayRoomRowClick,
+  onOpenRowClick,
   onDeactivateRow,
   onKillRow,
   sidebarToggleOverlaps = false,
@@ -668,6 +669,9 @@ export function PrettyConversationsPanel({
   // relay-room rows fall through to selectConversation (matches
   // rdpHostRow/fleetOnly semantics — silent-no-op at the store level).
   onRelayRoomRowClick?: (row: ConversationRowShape) => void;
+  /** A click on a row whose tab is already open, after it's selected —
+   *  AppShell joins it to an open split (or focuses its pane). */
+  onOpenRowClick?: (row: ConversationRowShape) => void;
   // quick-260727-gm3: fired when user clicks the red-tinted X on an
   // active-set row. AppShell wires this to closeTab(row.id) so
   // the deactivate action reuses the existing tab-close plumbing verbatim
@@ -1621,6 +1625,7 @@ export function PrettyConversationsPanel({
       }
     }
     selectConversation(row.id);
+    onOpenRowClick?.(row);
     onConversationSelected?.(row.id);
   };
 

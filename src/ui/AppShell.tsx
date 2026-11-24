@@ -60,6 +60,7 @@ import {
 } from "@/features/new-conversation/new-conversation-context";
 import { picksFromWire, samePicks } from "@/lib/new-conversation-picks";
 import { decideNewConversationOpen } from "@/lib/new-conversation-open";
+import { findAppPaneTab } from "@/lib/sidebar-app-open";
 import { decideSearchResultPlacement, findOpenResultTab, type SearchResultPlacement } from "@/lib/search-result-open";
 import { NEW_CONVERSATION_DRAG_MIME, hasNewConversationDragMime } from "@/shell/new-conversation-drag";
 import { setSessionProject } from "@/api/session-project-api";
@@ -3562,12 +3563,32 @@ export function AppShell({
   );
 
   // Phase 120 D-06 — left-click on an AppTile: open the app in a new pane
-  // leaf via openTab with type: "app" and the (hostId, slug) tuple. D-15
-  // multi-instance is preserved: no dedupe here — every click emits a
-  // fresh openTab call. Label is the app's static title (D-19 — tab bar
+  // leaf via openTab with type: "app" and the (hostId, slug) tuple. Each
+  // call opens a fresh copy, except a sidebar click while a split is up
+  // whose app is already one of the panes: that pane is focused.
+  // Label is the app's static title (D-19 — tab bar
   // shows the metadata title, not the app's live document.title).
   const onOpenApp = useCallback(
-    (hostId: number, slug: string, title: string) => {
+    (hostId: number, slug: string, title: string, from: "sidebar" | "elsewhere" = "elsewhere") => {
+      // A sidebar tile click while a split is up: an app already in a pane
+      // is focused instead of opening a second copy (sidebar-app-open.ts).
+      const shownTab =
+        from === "sidebar"
+          ? findAppPaneTab({ tabs: tabsRef.current, splitTree, isMobile, hostId, slug })
+          : undefined;
+      if (shownTab !== undefined) {
+        setFocusedTabId(shownTab.id);
+        selectConversationDeferred(shownTab.id);
+        systemLogger.info("app-tile click onOpenApp focuses open pane", {
+          operation: "app_shell_on_open_app_focus",
+          hostId,
+          slug,
+          tabId: shownTab.id,
+        });
+        if (isTouchDevice) navigateToView();
+        sidebarPeek.close("app-opened");
+        return;
+      }
       const newTabId = openTab(null, "app", undefined, {
         app: { hostId, slug },
         label: title,
@@ -3592,6 +3613,7 @@ export function AppShell({
         operation: "app_shell_on_open_app",
         hostId,
         slug,
+        from,
         tabId: newTabId,
         hadSplitTree: splitTree !== null,
         loneLeaf: splitTree?.kind === "session",
@@ -3861,13 +3883,25 @@ export function AppShell({
     [openTab],
   );
   const openNewConversationRef = useRef<(start: NewConversationPicks | null, source: string) => void>(() => {});
-  // A search result joins an open split instead of covering it
+  // A search result or a sidebar click joins an open split instead of
+  // covering it; one already in a pane is just focused
   // (search-result-open.ts). Returns where it went, for the logs.
-  const placeSearchResultInSplit = (tabId: string): SearchResultPlacement["kind"] => {
+  const placeInOpenSplit = (tabId: string): SearchResultPlacement["kind"] => {
     const placement = decideSearchResultPlacement({ tabId, splitTree, isMobile });
     if (placement.kind === "join") openSessionInTree(tabId, placement.path, "right");
     if (placement.kind !== "alone") setFocusedTabId(tabId);
     return placement.kind;
+  };
+  // A sidebar row click: same rule as a search result, logged per row kind.
+  const placeSidebarOpen = (tabId: string, rowKind: string, rowId: string): void => {
+    const placement = placeInOpenSplit(tabId);
+    systemLogger.info("[sidebar-open] placement", {
+      operation: "sidebar_open_placement",
+      rowKind,
+      rowId,
+      tabId,
+      placement,
+    });
   };
 
   openNewConversationRef.current = (start, source) => {
@@ -4367,7 +4401,7 @@ export function AppShell({
           visibleInSplitTreeTabIds={visibleInSplitTreeTabIds}
           isAdmin={isAdmin}
           username={meUsername}
-          onOpenApp={onOpenApp}
+          onOpenApp={(hostId, slug, title) => onOpenApp(hostId, slug, title, "sidebar")}
           onArchiveApp={onArchiveApp}
           // Phase 123 shape 2 (D-07/D-08): lift the EXISTING feedbackOpen
           // state atom (L357) to "general" when the panel's header
@@ -4406,11 +4440,16 @@ export function AppShell({
             if (!host) return;
             const sessionName = row.targetTmuxSession;
             if (!sessionName) return;
-            const newTabId = openTab(host, "terminal", undefined, {
-              targetTmuxSession: sessionName,
-              label: sessionName,
-              allowCreateTmux: false,
-            });
+            // A quick second click can land before the row turns into the
+            // open one: reuse that tab rather than opening it twice.
+            const newTabId =
+              findOpenResultTab(tabsRef.current, host.id, sessionName, false)?.id ??
+              openTab(host, "terminal", undefined, {
+                targetTmuxSession: sessionName,
+                label: sessionName,
+                allowCreateTmux: false,
+              });
+            placeSidebarOpen(newTabId, "detached", row.id);
             selectConversationDeferred(newTabId);
             if (isTouchDevice) navigateToView();
             if (isMobile) setSidebarOpen(false);
@@ -4442,7 +4481,7 @@ export function AppShell({
                   sessionKind: "archived",
                   allowCreateTmux: false,
                 });
-              const placement = placeSearchResultInSplit(tabId);
+              const placement = placeInOpenSplit(tabId);
               console.info(`[archived-view] open hostId=${result.hostId} identity=${key} tabId=${tabId} existing=${!!existing} placement=${placement}`);
               setActiveTabId(tabId);
               selectConversationDeferred(tabId);
@@ -4465,7 +4504,7 @@ export function AppShell({
                 label: result.aiTitle || sessionName,
                 allowCreateTmux: false,
               });
-            const placement = placeSearchResultInSplit(newTabId);
+            const placement = placeInOpenSplit(newTabId);
             systemLogger.info("[conversation-search] open", {
               operation: "conversation_search_open",
               hostId: result.hostId,
@@ -4479,10 +4518,17 @@ export function AppShell({
             if (isMobile) setSidebarOpen(false);
             sidebarPeek.close("item-opened");
           }}
+          onOpenRowClick={(row) => {
+            // A row whose tab is already open (row id = tab id). The list can
+            // trail a just-closed tab by a render; never place a missing tab.
+            if (!tabsRef.current.some((t) => t.id === row.id)) return;
+            placeSidebarOpen(row.id, row.rdpHostRow ? "rdp-open" : "open", row.id);
+          }}
           onRdpRowClick={(row) => {
             const host = row.host;
             if (!host) return;
             const newTabId = openTab(host, "rdp");
+            placeSidebarOpen(newTabId, "rdp", row.id);
             selectConversationDeferred(newTabId);
             if (isTouchDevice) navigateToView();
             if (isMobile) setSidebarOpen(false);
@@ -4515,6 +4561,7 @@ export function AppShell({
                 tabId: existing.id,
                 roomId: row.roomId,
               });
+              placeSidebarOpen(existing.id, "relay-room", row.id);
               selectConversationDeferred(existing.id);
               if (isTouchDevice) navigateToView();
               if (isMobile) setSidebarOpen(false);
@@ -4529,6 +4576,7 @@ export function AppShell({
               // Relay-room tabs have no tmux to create; safe-noop.
               allowCreateTmux: false,
             });
+            placeSidebarOpen(newTabId, "relay-room", row.id);
             selectConversationDeferred(newTabId);
             if (isTouchDevice) navigateToView();
             if (isMobile) setSidebarOpen(false);

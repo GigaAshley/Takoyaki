@@ -529,3 +529,54 @@ describe("PrettyConversationsPanel: mixed harness + relay-room row list", () => 
     expect(selectConversationSpy).toHaveBeenCalledTimes(1);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A click on an already-open row tells AppShell, after selecting it, so it can
+// join an open split; rows that open a new tab go through their own callback.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("PrettyConversationsPanel: onOpenRowClick", () => {
+  it("fires with the row after selectConversation on an open row", () => {
+    const row = makeConversationRow({ id: "open-1", label: "tina", kind: "harness" });
+    setSnapshot({ middle: [row] });
+    const order: string[] = [];
+    selectConversationSpy.mockImplementation(() => order.push("select"));
+    const onOpenRowClick = vi.fn(() => order.push("open-row"));
+    const { container } = render(
+      <PrettyConversationsPanel isAdmin
+        variant="desktop"
+        hostTree={ONE_HOST_TREE}
+        onOpenRowClick={onOpenRowClick}
+        onDeactivateRow={() => {}}
+      />,
+    );
+    const wrapper = container.querySelector('[data-conversation-id="open-1"]') as HTMLElement;
+    fireEvent.click(wrapper.querySelector('[role="button"]') as HTMLElement);
+    expect(onOpenRowClick).toHaveBeenCalledTimes(1);
+    expect((onOpenRowClick.mock.calls[0] as unknown[])[0]).toMatchObject({ id: "open-1" });
+    expect(order).toEqual(["select", "open-row"]);
+  });
+
+  it("doesn't fire for a relay-room row handled by its own callback", () => {
+    const row = makeConversationRow({
+      id: "relay-2",
+      kind: "relay-room",
+      roomId: "!r:matrix.example",
+      roomTitle: "Room",
+    });
+    setSnapshot({ middle: [row] });
+    const onOpenRowClick = vi.fn();
+    const { container } = render(
+      <PrettyConversationsPanel isAdmin
+        variant="desktop"
+        hostTree={ONE_HOST_TREE}
+        onRelayRoomRowClick={() => {}}
+        onOpenRowClick={onOpenRowClick}
+        onDeactivateRow={() => {}}
+      />,
+    );
+    const wrapper = container.querySelector('[data-conversation-id="relay-2"]') as HTMLElement;
+    fireEvent.click(wrapper.querySelector('[role="button"]') as HTMLElement);
+    expect(onOpenRowClick).not.toHaveBeenCalled();
+  });
+});
