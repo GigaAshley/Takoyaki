@@ -94,14 +94,28 @@ export function useSidebarMotion(rootRef: RefObject<HTMLElement | null>, enabled
   // observer (which runs after this commit's layout effect has re-measured).
   const previousPlaces = useRef<Map<string, Place> | null>(null);
   const lastSkipReason = useRef<string | null>(null);
+  // Slides still in progress, per element.
+  const running = useRef(new Map<HTMLElement, Animation[]>());
 
   // Every commit: compare with the last recorded positions, animate the
-  // difference, record the new positions.
+  // difference, record the new positions. Positions are always the layout
+  // place, never a mid-slide one: an item still sliding is measured where it
+  // is on screen, its slide stopped, measured again where it really sits, and
+  // started afresh from where it was on screen — so a change landing mid-slide
+  // carries on smoothly instead of compounding.
   useLayoutEffect(() => {
     const root = rootRef.current;
     if (!root) return;
-    const rootRect = root.getBoundingClientRect();
     const items = trackedItems(root);
+    const rootRect = root.getBoundingClientRect();
+    const onScreen = new Map<string, Place>();
+    for (const [k, el] of items) {
+      if (running.current.has(el)) onScreen.set(k, placeOf(el, root, rootRect));
+    }
+    for (const el of running.current) {
+      for (const a of running.current.get(el) ?? []) a.cancel();
+    }
+    running.current = new Map();
     const next = new Map<string, Place>();
     for (const [k, el] of items) next.set(k, placeOf(el, root, rootRect));
 
@@ -109,36 +123,52 @@ export function useSidebarMotion(rootRef: RefObject<HTMLElement | null>, enabled
     previousPlaces.current = prev;
     places.current = next;
 
+    const hadRows = prev !== null && [...prev.keys()].some((k) => k.startsWith("c:"));
     const skip =
-      prev === null || prev.size === 0 ? "first-paint"
+      !hadRows ? "first-paint"
       : !enabledRef.current ? "search"
       : prefersReducedMotion() ? "reduced-motion"
       : null;
-    if (skip !== null) {
-      lastSkipReason.current = skip;
-      return;
-    }
-    lastSkipReason.current = null;
+    lastSkipReason.current = skip;
+    if (skip !== null) return;
+
+    const track = (el: HTMLElement, a: Animation) => {
+      const list = running.current.get(el) ?? [];
+      list.push(a);
+      running.current.set(el, list);
+      a.onfinish = () => {
+        const cur = running.current.get(el);
+        if (!cur) return;
+        const rest = cur.filter((x) => x !== a);
+        if (rest.length > 0) running.current.set(el, rest);
+        else running.current.delete(el);
+      };
+    };
 
     let moved = 0;
     let arrived = 0;
     for (const [k, el] of items) {
       if (!canAnimate(el)) continue;
-      const was = prev.get(k);
+      const was = prev!.get(k);
       const now = next.get(k)!;
       if (was === undefined) {
         arrived += 1;
-        el.animate([{ opacity: 0 }, { opacity: 1 }], { duration: SIDEBAR_MOTION_MS, easing: EASING });
+        track(el, el.animate([{ opacity: 0 }, { opacity: 1 }], { duration: SIDEBAR_MOTION_MS, easing: EASING }));
         continue;
       }
-      const dx = was.left - now.left;
-      const dy = was.top - now.top;
+      // Where it was on screen just before this commit: its old place plus
+      // the offset of whatever slide it was still in the middle of.
+      const seen = onScreen.get(k);
+      const slideX = seen ? seen.left - now.left : 0;
+      const slideY = seen ? seen.top - now.top : 0;
+      const dx = was.left - now.left + slideX;
+      const dy = was.top - now.top + slideY;
       if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) continue;
       moved += 1;
-      el.animate(
+      track(el, el.animate(
         [{ transform: `translate(${dx}px, ${dy}px)` }, { transform: "translate(0, 0)" }],
         { duration: SIDEBAR_MOTION_MS, easing: EASING },
-      );
+      ));
     }
     if (moved + arrived > 0) {
       console.info({ operation: "sidebar_motion", moved, arrived });
