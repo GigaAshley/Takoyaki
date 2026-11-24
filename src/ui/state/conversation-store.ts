@@ -115,6 +115,10 @@ export type ConversationRow = {
   label: string;
   host: Host | undefined;
   targetTmuxSession: string | null;
+  // Set when the row's machine couldn't be reached on the last sessions list
+  // and hasn't sent a live frame since. The row stays where it is, greyed;
+  // opening it says the machine isn't reachable. Omitted otherwise.
+  hostUnreachable?: true;
   // Plan 07-01 (TG-12, TG-13, TG-14): INTERNAL routing marker for detached-
   // row-click plumbing. `true` on synthetic fleet-derived rows that have no
   // corresponding entry in `openTabs`; `undefined` on openTabs-derived rows
@@ -457,6 +461,9 @@ type State = {
   // (see computeSnapshot) AND — pending Plan 07-02 — for RDP row derivation
   // filtered on `host.enableRdp === true`.
   hostsFlat: Map<number, Host>;
+  // Machines the last sessions list couldn't reach, minus any that have sent a
+  // live frame since (markHostReachable). Their rows are drawn greyed.
+  unreachableHostIds: ReadonlySet<number>;
   // Phase 25 (Plan 25-02): identityKey.toLowerCase() → Identity lookup for
   // role resolution at row-construction time. Fed by AppShell via
   // updateIdentitiesByKey on identity-store change — mirrors the hostsFlat
@@ -556,6 +563,7 @@ let state: State = {
   selectedId: null,
   fleetSessions: [],
   fleetSessionsLoaded: false,
+  unreachableHostIds: new Set<number>(),
   hostsFlat: new Map<number, Host>(),
   identitiesByKey: new Map<string, Identity>(),
   activeSet: hydrateActiveSetFromStorage(),
@@ -947,6 +955,12 @@ function attentionKeyForRow(row: ConversationRow): string | null {
   return sessionWorkingKeyForRow(row.host, row.targetTmuxSession);
 }
 
+function decorateReachability(row: ConversationRow): void {
+  const hostId = row.host ? parseInt(row.host.id, 10) : NaN;
+  if (Number.isFinite(hostId) && state.unreachableHostIds.has(hostId)) row.hostUnreachable = true;
+  else delete row.hostUnreachable;
+}
+
 function decorateAttention(row: ConversationRow): void {
   const k = attentionKeyForRow(row);
   // Sort inputs and the unread / DM marks fall back to the saved picture until
@@ -1279,7 +1293,10 @@ function computeSnapshot(): ConversationList {
       pinnedName(a).localeCompare(pinnedName(b), undefined, { sensitivity: "base" }) ||
       (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
   );
-  for (const row of pinned) decorateAttention(row);
+  for (const row of pinned) {
+    decorateAttention(row);
+    decorateReachability(row);
+  }
 
   // ── Middle zone (Phase 41 Plan 01): FLAT list of non-pinned / non-RDP
   //    identity-tmux + fleet-synthetic rows, sorted by compareByRecencyDesc.
@@ -1329,7 +1346,10 @@ function computeSnapshot(): ConversationList {
     middleRows.push(row);
     middleInsertionOrder.set(row, middlePushIndex++);
   }
-  for (const row of middleRows) decorateAttention(row);
+  for (const row of middleRows) {
+    decorateAttention(row);
+    decorateReachability(row);
+  }
   middleRows.sort(compareByAttention(compareByRecencyDesc(middleInsertionOrder)));
   // Consume the fleet hostName fallback + host-tree order to keep the
   // ESLint no-unused-vars / TypeScript unused-symbol linters quiet — both
@@ -1908,7 +1928,25 @@ export function reconcileFleetSessionsFromList(
       unreachableHostIds: [...unreachable],
     });
   }
+  setUnreachableHostIds(unreachable);
   updateFleetSessions(out);
+}
+
+function setUnreachableHostIds(next: ReadonlySet<number>): void {
+  const cur = state.unreachableHostIds;
+  if (cur.size === next.size && [...next].every((h) => cur.has(h))) return;
+  state = { ...state, unreachableHostIds: new Set(next) };
+  notify();
+}
+
+/** A live frame came from this machine — its rows are no longer greyed. */
+export function markHostReachable(hostId: number): void {
+  if (!state.unreachableHostIds.has(hostId)) return;
+  const next = new Set(state.unreachableHostIds);
+  next.delete(hostId);
+  console.info({ operation: "fleet_host_reachable_again", hostId });
+  state = { ...state, unreachableHostIds: next };
+  notify();
 }
 
 // Plan 07-01 (TG-12, TG-17): fleet-discovery snapshot input. AppShell calls
@@ -3594,7 +3632,7 @@ export function __resetPinnedIdsForTest(): void {
 export function __resetFleetSessionsForTest(): void {
   pendingArchiveKeys.clear();
   fleetRowTouches.clear();
-  state = { ...state, fleetSessions: [], fleetSessionsLoaded: false };
+  state = { ...state, fleetSessions: [], fleetSessionsLoaded: false, unreachableHostIds: new Set<number>() };
   notify();
 }
 

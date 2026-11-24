@@ -1301,6 +1301,31 @@ describe("PrettyConversationsPanel: deactivate action (quick-260727-gm3)", () =>
       expect(container.querySelector('[data-conversation-id="agent-1"]')).toBeNull();
     });
 
+    it("a non-admin keeps a down machine's rows, greyed, even before its agent is known", () => {
+      const hostA = makeHost("h1", "hostA");
+      setSnapshot({
+        activeSet: [],
+        pinned: [],
+        middle: [
+          makeConversationRow({
+            id: "down-1",
+            label: "sonar",
+            host: hostA,
+            targetTmuxSession: "sonar",
+            hostUnreachable: true,
+          }),
+        ],
+      });
+      mockIdentitiesByKey = new Map();
+      const { container } = render(
+        <PrettyConversationsPanel variant="desktop" onDeactivateRow={() => {}} />,
+      );
+      const row = container.querySelector('[data-conversation-id="down-1"]');
+      expect(row).not.toBeNull();
+      expect(row!.getAttribute("data-host-unreachable")).toBe("true");
+      expect(row!.querySelector(".pv-row--unreachable")).not.toBeNull();
+    });
+
     it("an admin still sees every row", () => {
       seedRows();
       const { container } = render(
@@ -1898,6 +1923,30 @@ describe("PrettyConversationsPanel: row-click routing (RDP)", () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe("PrettyConversationsPanel: row-click routing (fleet-only)", () => {
+  it("clicking a row whose machine is down says so instead of opening it", () => {
+    const hostA = makeHost("h1", "workstation");
+    const downRow = makeConversationRow({
+      id: "fleet::1::sonar",
+      label: "sonar",
+      host: hostA,
+      fleetOnly: true,
+      targetTmuxSession: "sonar",
+      hostUnreachable: true,
+    });
+    setSnapshot({ pinned: [], grouped: [{ hostId: "h1", hostName: "workstation", rows: [downRow] }] });
+    const onDetachedRowClick = vi.fn();
+    (toastSpy as unknown as ReturnType<typeof vi.fn>).mockClear();
+    const { container } = render(
+      <PrettyConversationsPanel isAdmin variant="desktop" onDetachedRowClick={onDetachedRowClick} onDeactivateRow={() => {}} />,
+    );
+    const body = container
+      .querySelector('[data-conversation-id="fleet::1::sonar"]')!
+      .querySelector('[role="button"]') as HTMLElement;
+    fireEvent.click(body);
+    expect(onDetachedRowClick).not.toHaveBeenCalled();
+    expect(toastSpy).toHaveBeenCalledWith("workstation isn't reachable right now", expect.anything());
+  });
+
   it("Test 13: clicking a fleetOnly row calls onDetachedRowClick and NOT onRdpRowClick", () => {
     const hostA = makeHost("h1", "hostA");
     const detachedRow = makeConversationRow({

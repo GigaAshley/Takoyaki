@@ -1397,9 +1397,11 @@ export function PrettyConversationsPanel({
   // resolve to a known identity (a bare tmux shell, or an agent whose host
   // sweep is unreachable so its identity isn't loaded) is left out entirely.
   const hideTerminalRows = !isAdmin;
+  // A row whose machine is down stays (greyed) even before its agent is known.
   const isPlainTerminalRow = (row: ConversationRowShape): boolean =>
     row.type === "terminal" &&
     row.kind !== "relay-room" &&
+    row.hostUnreachable !== true &&
     resolveIdentityForRow(row, identitiesByHostKey, identitiesByKey) === null;
   const keepRow = (row: ConversationRowShape): boolean =>
     notSwipePending(row) &&
@@ -1564,6 +1566,15 @@ export function PrettyConversationsPanel({
     // `rdp-host::` id: the row takes the new tab's id (enrolled when it's
     // selected), and a stale host id would light the row up — with a no-op
     // Close — every time it reverts after the tab closes.
+    // A conversation on a machine that's down can't be opened — say so.
+    if (row.hostUnreachable === true && row.fleetOnly) {
+      const machine = row.host?.name ?? "This machine";
+      console.info({ operation: "sidebar_row_open_blocked_unreachable", rowId: row.id, hostId: row.host?.id });
+      toast(`${machine} isn't reachable right now`, {
+        description: "Its conversations will open again once it's back.",
+      });
+      return;
+    }
     if (!(row.rdpHostRow && !row.rdpTabOpen)) addToActiveSet(row.id);
     if (row.rdpHostRow && !row.rdpTabOpen && onRdpRowClick) {
       onRdpRowClick(row);

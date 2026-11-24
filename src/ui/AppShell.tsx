@@ -131,6 +131,7 @@ import {
   addToActiveSet,
   useActiveSet,
   readFleetSessionsCache,
+  markHostReachable,
   writeFleetSessionsCache,
   useRelayRoomTitles,
   // Phase 117 Plan 117-07 (D-37 / D-39): projects slice mutators + relay-room
@@ -878,6 +879,10 @@ export function AppShell({
       },
       onUpdate: (fleetState) => {
         applyFleetState(fleetState);
+        // A live update means its machine answered just now (the snapshot
+        // replays saved state, so it doesn't count).
+        const hostIdNum = parseInt(fleetState.hostId, 10);
+        if (Number.isFinite(hostIdNum)) markHostReachable(hostIdNum);
       },
       // Phase 117 Plan 117-07 (D-37): project-list-changed wire frame from
       // 117-03's registry.publishProjectListChanged. Backend fires this on

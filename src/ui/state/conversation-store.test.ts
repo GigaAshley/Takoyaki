@@ -22,6 +22,7 @@ import {
   updateOpenTabs,
   updateFleetSessions,
   reconcileFleetSessionsFromList,
+  markHostReachable,
   removeFleetSession,
   upsertFleetSession,
   markPendingArchive,
@@ -4211,6 +4212,30 @@ describe("conversation-store: reconcileFleetSessionsFromList", () => {
       }),
     );
     expect(ids()).toEqual(["fleet::1::a", "fleet::2::idle-agent"]);
+  });
+
+  it("rows of a machine that's down are marked until it sends a live frame", () => {
+    const h2 = makeHost("2", "workstation");
+    act(() => {
+      updateHostsFlat(new Map([[2, h2]]));
+      updateFleetSessions([row(1, "a"), row(2, "idle-agent")]);
+      reconcileFleetSessionsFromList([row(1, "a")], { startedAt: Date.now(), unreachableHostIds: [2] });
+    });
+    const marked = () =>
+      __getFleetOnlyRowsForTest().filter((r) => r.hostUnreachable === true).map((r) => r.id);
+    expect(marked()).toEqual(["fleet::2::idle-agent"]);
+    act(() => markHostReachable(2));
+    expect(marked()).toEqual([]);
+  });
+
+  it("a later list that reaches the machine clears the mark", () => {
+    const h2 = makeHost("2", "workstation");
+    act(() => {
+      updateHostsFlat(new Map([[2, h2]]));
+      reconcileFleetSessionsFromList([row(2, "idle-agent")], { startedAt: Date.now(), unreachableHostIds: [2] });
+      reconcileFleetSessionsFromList([row(2, "idle-agent")], { startedAt: Date.now(), unreachableHostIds: [] });
+    });
+    expect(__getFleetOnlyRowsForTest().some((r) => r.hostUnreachable === true)).toBe(false);
   });
 
   it("a removal from before the fetch started does not suppress a row the response has again", () => {

@@ -182,16 +182,20 @@ function setTitleIfOverflowing(e: React.MouseEvent<HTMLElement>): void {
 function setRowTooltip(
   displayName: string | null | undefined,
   task: string | null | undefined,
+  unreachableMachine?: string | null,
 ): (e: React.MouseEvent<HTMLElement>) => void {
   return (e) => {
     const rowEl = e.currentTarget;
+    const down = unreachableMachine ? `${unreachableMachine} isn't reachable right now` : null;
     if (!displayName) {
-      rowEl.removeAttribute("title");
+      if (down) rowEl.title = down;
+      else rowEl.removeAttribute("title");
       return;
     }
     const label = rowEl.querySelector<HTMLElement>(".pv-label");
     const overflowing = !!label && label.scrollWidth > label.clientWidth;
-    rowEl.title = task && overflowing ? `${displayName}\n${task}` : displayName;
+    const base = task && overflowing ? `${displayName}\n${task}` : displayName;
+    rowEl.title = down ? `${base}\n${down}` : base;
   };
 }
 
@@ -513,6 +517,8 @@ function PrettyConversationRowImpl({
     // DM'd: the agent DM'd this user. Keeps the unread outline; a red
     // envelope takes the unread dot's place at the row's end.
     row.dm === true && "pv-row--dm",
+    // Its machine is down: stays in place, greyed (pretty-conversations.css).
+    row.hostUnreachable === true && "pv-row--unreachable",
     // Phase 41 Plan 01: amb-recession className toggle retired.
     // (Phase 115 post-code-review fix 3: `hidden && "hidden"` className toggle
     //  retired alongside the Hide/Show menu branch — hidden prop is gone.)
@@ -697,6 +703,7 @@ function PrettyConversationRowImpl({
       data-pinned={pinned ? "true" : "false"}
       data-unread={row.unread === true ? "true" : undefined}
       data-dm={row.dm === true ? "true" : undefined}
+      data-host-unreachable={row.hostUnreachable === true ? "true" : undefined}
       data-variant={variant}
       data-rdp-host-row={isRdp ? "true" : undefined}
       data-swiping={touch.offset !== 0 ? "true" : undefined}
@@ -735,7 +742,11 @@ function PrettyConversationRowImpl({
           }
           onBodyKeyDown(e);
         }}
-        onMouseEnter={setRowTooltip(identity?.displayName, identity?.task)}
+        onMouseEnter={setRowTooltip(
+          identity?.displayName,
+          identity?.task,
+          row.hostUnreachable === true ? (row.host?.name ?? "This machine") : null,
+        )}
         onDragStart={onRowDragStart}
         style={{ ...bodyStyle, ...touch.style }}
         className={cn("group", rowClassName)}

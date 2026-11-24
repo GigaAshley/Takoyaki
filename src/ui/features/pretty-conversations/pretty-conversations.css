@@ -1271,3 +1271,9 @@
 .pv-variant-tab:hover:not(.on) {
   color: hsla(var(--pv-id-hue), 22%, 92%, 0.85);
 }
+
+/* A conversation whose machine is down: stays in place, greyed. */
+.pv-row--unreachable .pv-body {
+  opacity: 0.45;
+  filter: grayscale(1);
+}
