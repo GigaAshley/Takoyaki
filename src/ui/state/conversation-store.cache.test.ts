@@ -30,6 +30,7 @@ import {
   updateFleetSessions,
   __resetPinnedIdsForTest,
   __resetFleetSessionsForTest,
+  __getSnapshotForTest,
   type FleetSession,
 } from "./conversation-store";
 
@@ -269,6 +270,50 @@ describe("FleetSession localStorage cache (quick-260805-tub)", () => {
     expect(got[0].kind).toBe("relay-room");
     expect(got[0].roomId).toBe("!room:matrix.example");
     expect(got[0].roomTitle).toBe("Working session");
+  });
+
+  it("a cached relay room paints on first load — the row id, activity time and faces survive", () => {
+    const relayRow = {
+      kind: "relay-room",
+      id: "relay::!room:matrix.example",
+      roomId: "!room:matrix.example",
+      roomTitle: "Ashley & Zoey",
+      lastActivityAt: "2026-11-20T10:00:00.000Z",
+      roomFaces: [{ mxid: "@zoey:matrix.example", kind: "human", name: "Zoey", avatarPath: null }],
+      roomOthersCount: 1,
+      lastMessageAt: null,
+      aiTitle: null,
+    } as unknown as FleetSession;
+
+    writeFleetSessionsCache([relayRow]);
+    const got = readFleetSessionsCache();
+    expect(got[0].id).toBe("relay::!room:matrix.example");
+    expect(got[0].lastActivityAt).toBe("2026-11-20T10:00:00.000Z");
+    expect(got[0].roomFaces).toEqual([
+      { mxid: "@zoey:matrix.example", kind: "human", name: "Zoey", avatarPath: null },
+    ]);
+    expect(got[0].roomOthersCount).toBe(1);
+
+    // Seeding the store from the cache alone draws the room.
+    updateFleetSessions(got);
+    const snap = __getSnapshotForTest();
+    const rows = [...snap.pinned, ...snap.middle];
+    expect(rows.some((r) => r.roomId === "!room:matrix.example")).toBe(true);
+  });
+
+  it("malformed relay-room faces are dropped without losing the room", () => {
+    const relayRow = {
+      kind: "relay-room",
+      id: "relay::!room:matrix.example",
+      roomId: "!room:matrix.example",
+      roomTitle: "Room",
+      roomFaces: [{ mxid: 42 }],
+    } as unknown as FleetSession;
+    writeFleetSessionsCache([relayRow]);
+    const got = readFleetSessionsCache();
+    expect(got).toHaveLength(1);
+    expect(got[0].id).toBe("relay::!room:matrix.example");
+    expect(got[0].roomFaces).toBeUndefined();
   });
 
   it("quick-260910-jqx: mixed cache round-trip — harness + relay both survive", () => {

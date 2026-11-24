@@ -2386,6 +2386,36 @@ function isFleetSession(x: unknown): x is FleetSession {
   return true;
 }
 
+function isRelayRoomFace(x: unknown): x is RelayRoomFace {
+  if (!x || typeof x !== "object") return false;
+  const f = x as Record<string, unknown>;
+  return (
+    typeof f.mxid === "string" &&
+    (f.kind === "human" || f.kind === "agent") &&
+    typeof f.name === "string" &&
+    (f.userId === undefined || typeof f.userId === "string") &&
+    (f.avatarPath === undefined || f.avatarPath === null || typeof f.avatarPath === "string")
+  );
+}
+
+// The relay-room fields the sidebar needs to draw a room row: its row id, its
+// activity time (sort position) and its stacked faces. Fields of the wrong
+// type are dropped rather than failing the whole row.
+function relayRoomCacheFields(
+  s: FleetSession,
+): Pick<FleetSession, "id" | "lastActivityAt" | "roomFaces" | "roomOthersCount"> {
+  const out: Pick<FleetSession, "id" | "lastActivityAt" | "roomFaces" | "roomOthersCount"> = {};
+  if (typeof s.id === "string" && s.id.length > 0) out.id = s.id;
+  if (s.lastActivityAt === null || typeof s.lastActivityAt === "string") {
+    out.lastActivityAt = s.lastActivityAt;
+  }
+  if (Array.isArray(s.roomFaces) && s.roomFaces.every(isRelayRoomFace)) {
+    out.roomFaces = s.roomFaces.map((f) => ({ ...f }));
+  }
+  if (typeof s.roomOthersCount === "number") out.roomOthersCount = s.roomOthersCount;
+  return out;
+}
+
 /**
  * Read the cached fleet snapshot from localStorage. Returns `[]` on any
  * failure mode (missing key, malformed JSON, non-array top level, elements
@@ -2439,6 +2469,9 @@ export function readFleetSessionsCache(): FleetSession[] {
           kind: item.kind,
           roomId: item.roomId,
           roomTitle: item.roomTitle ?? null,
+          // Relay rooms are drawn from these on first paint — without the
+          // row id the room was skipped until the server answered.
+          ...(item.kind === "relay-room" ? relayRoomCacheFields(item) : {}),
         });
       }
     }
@@ -2487,6 +2520,7 @@ export function writeFleetSessionsCache(sessions: FleetSession[]): void {
       kind: s.kind,
       roomId: s.roomId,
       roomTitle: s.roomTitle ?? null,
+      ...(s.kind === "relay-room" ? relayRoomCacheFields(s) : {}),
     }));
     writeUserScopedCache(FLEET_CACHE_KEY, canonical);
   } catch {
