@@ -576,7 +576,11 @@ function HostsGroup({ user }: { user: AdminUser }) {
     <div className="flex flex-col gap-2" data-testid="admin-user-hosts">
       <KitSettingsGroup
         title={hosts && hosts.length > 0 ? `Hosts · ${hosts.length}` : "Hosts"}
-        footer="Hosts they added. Only they can change them; you can remove one."
+        footer={
+          user.isAdmin
+            ? "Hosts they added. Only they can change or remove them."
+            : "Hosts they added. Only they can change them; you can remove one."
+        }
       >
         {hosts === null && !error ? (
           <div className="px-3.5 py-3">
@@ -608,6 +612,8 @@ function HostsGroup({ user }: { user: AdminUser }) {
               }
               value={h.connectionType && h.connectionType !== "ssh" ? h.connectionType.toUpperCase() : undefined}
               control={
+                // An admin's hosts are usually shared with everyone; the server refuses these.
+                user.isAdmin ? undefined : (
                 <KitButton
                   variant="danger-quiet"
                   size="sm"
@@ -618,6 +624,7 @@ function HostsGroup({ user }: { user: AdminUser }) {
                 >
                   {busyId === h.id ? "Removing…" : "Remove"}
                 </KitButton>
+                )
               }
             />
           ))

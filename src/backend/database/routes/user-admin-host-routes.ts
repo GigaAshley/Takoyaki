@@ -6,7 +6,9 @@ import { db, DatabaseSaveTrigger } from "../db/index.js";
 
 // An admin removing a host entry another user owns — the owner's own delete
 // (DELETE /db/host/:id) only ever reaches the caller's rows. Clears the same
-// things the owner's delete does, in one transaction.
+// things the owner's delete does, in one transaction. Hosts owned by admin
+// accounts are refused: an admin's hosts are usually the ones shared with
+// everyone, so removing one cuts off every user it's shared with.
 
 const STATS_SERVER_URL = "http://localhost:30005";
 
@@ -39,7 +41,8 @@ export function registerUserAdminHostRoutes(
    *       Deletes the user's host entry and what hangs off it (file-manager
    *       recents, pins and shortcuts, transfers, command history, credential
    *       usage, recent activity, session recordings, access given to others).
-   *       The machine itself is untouched. Needs a session that confirmed it's
+   *       The machine itself is untouched. Refused for hosts owned by an
+   *       admin account (403 TARGET_IS_ADMIN). Needs a session that confirmed it's
    *       you in the last 10 minutes; access keys are refused.
    *     tags:
    *       - Users
@@ -60,7 +63,7 @@ export function registerUserAdminHostRoutes(
    *       400:
    *         description: Invalid host id.
    *       403:
-   *         description: Not an admin, or REAUTH_REQUIRED / REAUTH_UNAVAILABLE.
+   *         description: Not an admin, the host's owner is an admin (TARGET_IS_ADMIN), or REAUTH_REQUIRED / REAUTH_UNAVAILABLE.
    *       404:
    *         description: That user has no host with that id.
    *       500:
@@ -78,10 +81,10 @@ export function registerUserAdminHostRoutes(
     try {
       const row = db.$client
         .prepare(
-          "SELECT h.id, h.name, h.ip, u.username FROM ssh_data h JOIN users u ON u.id = h.user_id WHERE h.id = ? AND h.user_id = ?",
+          "SELECT h.id, h.name, h.ip, u.username, u.is_admin FROM ssh_data h JOIN users u ON u.id = h.user_id WHERE h.id = ? AND h.user_id = ?",
         )
         .get(hostId, targetId) as
-        | { id: number; name: string | null; ip: string | null; username: string }
+        | { id: number; name: string | null; ip: string | null; username: string; is_admin: number }
         | undefined;
       if (!row) {
         databaseLogger.warn("Admin host remove: not found", {
@@ -91,6 +94,19 @@ export function registerUserAdminHostRoutes(
           hostId,
         });
         return res.status(404).json({ error: "That user has no such host" });
+      }
+      if (row.is_admin) {
+        databaseLogger.warn("Admin host remove refused: owner is an admin", {
+          operation: "admin_host_remove_refused",
+          adminId,
+          targetUserId: targetId,
+          hostId,
+          reason: "target_is_admin",
+        });
+        return res.status(403).json({
+          error: "Hosts owned by an admin can't be removed this way. The owner can delete it themselves.",
+          code: "TARGET_IS_ADMIN",
+        });
       }
 
       db.$client.transaction(() => {

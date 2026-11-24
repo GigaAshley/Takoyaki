@@ -55,18 +55,18 @@ const HOST_TABLES = [
 function bootstrap(): void {
   sqlite = new Database(":memory:");
   sqlite.exec(`
-    CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT);
+    CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT, is_admin INTEGER DEFAULT 0);
     CREATE TABLE ssh_data (id INTEGER PRIMARY KEY, user_id TEXT, name TEXT, ip TEXT);
     CREATE TABLE transfer_recent (id INTEGER PRIMARY KEY, source_host_id INTEGER, dest_host_id INTEGER);
   `);
   for (const t of HOST_TABLES) sqlite.exec(`CREATE TABLE ${t} (id INTEGER PRIMARY KEY, host_id INTEGER)`);
   sqlite.exec(`
-    INSERT INTO users VALUES ('u2', 'beta'), ('other', 'other');
-    INSERT INTO ssh_data VALUES (37, 'u2', 'shared-agents', '10.0.0.1'), (38, 'u2', 'keep', '10.0.0.2'), (40, 'other', 'theirs', '10.0.0.3');
+    INSERT INTO users VALUES ('u2', 'beta', 0), ('other', 'other', 0), ('boss', 'boss', 1);
+    INSERT INTO ssh_data VALUES (37, 'u2', 'shared-agents', '10.0.0.1'), (38, 'u2', 'keep', '10.0.0.2'), (40, 'other', 'theirs', '10.0.0.3'), (50, 'boss', 'fleet', '10.0.0.5');
     INSERT INTO transfer_recent (source_host_id, dest_host_id) VALUES (37, 38), (38, 37), (38, 40);
   `);
   for (const t of HOST_TABLES) {
-    for (const h of [37, 38, 40]) sqlite.prepare(`INSERT INTO ${t} (host_id) VALUES (?)`).run(h);
+    for (const h of [37, 38, 40, 50]) sqlite.prepare(`INSERT INTO ${t} (host_id) VALUES (?)`).run(h);
   }
 }
 
@@ -112,10 +112,10 @@ describe("admin removes a user's host", () => {
     const res = await remove("u2", 37);
     expect(res.status).toBe(200);
     expect(count("SELECT COUNT(*) c FROM ssh_data WHERE id = 37")).toBe(0);
-    expect(count("SELECT COUNT(*) c FROM ssh_data")).toBe(2);
+    expect(count("SELECT COUNT(*) c FROM ssh_data")).toBe(3);
     for (const t of HOST_TABLES) {
       expect(count(`SELECT COUNT(*) c FROM ${t} WHERE host_id = 37`)).toBe(0);
-      expect(count(`SELECT COUNT(*) c FROM ${t}`)).toBe(2);
+      expect(count(`SELECT COUNT(*) c FROM ${t}`)).toBe(3);
     }
     expect(count("SELECT COUNT(*) c FROM transfer_recent")).toBe(1);
     expect(forceSave).toHaveBeenCalledWith("admin_host_remove");
@@ -129,6 +129,19 @@ describe("admin removes a user's host", () => {
         hostId: 37,
         hostName: "shared-agents",
       }),
+    );
+  });
+
+  it("refuses a host owned by an admin and leaves it and its access alone", async () => {
+    const res = await remove("boss", 50);
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe("TARGET_IS_ADMIN");
+    expect(count("SELECT COUNT(*) c FROM ssh_data WHERE id = 50")).toBe(1);
+    expect(count("SELECT COUNT(*) c FROM host_access WHERE host_id = 50")).toBe(1);
+    expect(forceSave).not.toHaveBeenCalled();
+    expect(logger.warn).toHaveBeenCalledWith(
+      "Admin host remove refused: owner is an admin",
+      expect.objectContaining({ adminId: "admin-1", targetUserId: "boss", hostId: 50, reason: "target_is_admin" }),
     );
   });
 

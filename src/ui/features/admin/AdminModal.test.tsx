@@ -529,6 +529,17 @@ describe("AdminModal — a user", () => {
     expect(screen.getByTestId("admin-user-host-1")).toBeTruthy();
   });
 
+  it("offers no Remove on an admin's hosts", async () => {
+    m.getSSHHosts.mockResolvedValue([
+      { id: 5, name: "fleet", ip: "10.0.0.5", port: 22, username: "alice", userId: "me", status: "online" },
+    ]);
+    renderModal();
+    await openUser("alice");
+    await screen.findByTestId("admin-user-host-5");
+    expect(screen.queryByTestId("admin-user-host-remove-5")).toBeNull();
+    expect(screen.getByText("Hosts they added. Only they can change or remove them.")).toBeTruthy();
+  });
+
   it("drops a removed host even when refreshing the list fails, and says the refresh failed", async () => {
     m.getSSHHosts
       .mockResolvedValueOnce([
