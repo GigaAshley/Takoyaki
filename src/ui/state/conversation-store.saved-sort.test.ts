@@ -175,15 +175,15 @@ describe("sidebar order on a fresh page", () => {
     expect(ids(result.current.middle)).toEqual(lastSeenOrder);
   });
 
-  it("shows no unread dots or DM marks until the server confirms them", () => {
+  it("paints last visit's unread dots and DM marks before the server answers", () => {
     lastVisit();
     reloadPage(NAMES);
     const { result } = renderHook(() => useConversations());
-    for (const row of result.current.middle) {
-      expect(row.unread).toBeUndefined();
-      expect(row.dm).toBeUndefined();
-    }
+    const marks = (rows: typeof result.current.middle) =>
+      rows.filter((r) => r.unread || r.dm).map((r) => `${r.id}:${r.dm ? "dm" : "unread"}`);
+    expect(marks(result.current.middle)).toEqual(["t-elm:dm", "t-cedar:unread"]);
 
+    // The server confirms the same picture: nothing changes.
     act(() => {
       publishLastFinishAt("1", "cedar", BASELINE + 30);
       publishLastFinishAt("1", "elm", BASELINE + 5);
@@ -193,9 +193,25 @@ describe("sidebar order on a fresh page", () => {
         dms: [{ hostId: "1", identityName: "elm", lastDmAt: BASELINE + 5, seenDmAt: 0 }],
       });
     });
-    const byId = new Map(result.current.middle.map((r) => [r.id, r]));
-    expect(byId.get("t-cedar")?.unread).toBe(true);
-    expect(byId.get("t-elm")?.dm).toBe(true);
+    expect(marks(result.current.middle)).toEqual(["t-elm:dm", "t-cedar:unread"]);
+  });
+
+  it("a saved mark read on another device clears once the server answers", () => {
+    lastVisit();
+    reloadPage(NAMES);
+    const { result } = renderHook(() => useConversations());
+    act(() => {
+      publishLastFinishAt("1", "cedar", BASELINE + 30);
+      applyReadState({
+        baselineAt: BASELINE,
+        seen: [{ hostId: "1", identityName: "cedar", seenFinishAt: BASELINE + 30 }],
+        dms: [{ hostId: "1", identityName: "elm", lastDmAt: BASELINE + 5, seenDmAt: BASELINE + 5 }],
+      });
+    });
+    for (const row of result.current.middle) {
+      expect(row.unread).toBeUndefined();
+      expect(row.dm).toBeUndefined();
+    }
   });
 
   it("moves only what changed once the server answers (read on another device, a new turn)", () => {

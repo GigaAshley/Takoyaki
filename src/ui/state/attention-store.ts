@@ -24,9 +24,10 @@
 // of the above, which a fresh page only has once the fleet snapshot and the
 // read state arrive — so rows used to paint in a different order and then
 // jump. The last full picture is saved per user and, until the read state
-// loads, the sort reads it (max-wins with anything live). It decides ORDER
-// only: unread dots and DM envelopes still wait for the server, so a mark
-// cleared on another device never flashes.
+// loads, the sidebar reads it (max-wins with anything live) — for its order
+// and for its rows' unread dots and DM envelopes, the way chat apps paint
+// their saved badges. A mark cleared on another device clears once the read
+// state lands. Everything else (seen marks, DM jumps) waits for the server.
 //
 // Relay rooms use the same maps under a key of their own
 // (roomAttentionKey): the server records, per user, when someone else last

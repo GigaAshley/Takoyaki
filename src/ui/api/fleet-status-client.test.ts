@@ -1537,6 +1537,29 @@ describe("fleet-status-client: app-frame dispatch (Phase 117 Plan 117-01)", () =
     healthMessage: "unit exists but currently stopped",
   };
 
+  it("passes the snapshot's reported hosts through to onAppSnapshot", () => {
+    const onAppSnapshot = vi.fn();
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    createFleetStatusClient({
+      url: "ws://localhost/fleet-status/ws",
+      onSnapshot: vi.fn(),
+      onUpdate: vi.fn(),
+      onGone: vi.fn(),
+      onAppSnapshot,
+    });
+    const ws = latestWs();
+    ws.onopen?.();
+    ws.onmessage?.({
+      data: JSON.stringify({
+        schemaVersion: FRAME_SCHEMA_VERSION,
+        type: "app-snapshot",
+        apps: [sampleApp],
+        reportedHostIds: ["3", "7"],
+      }),
+    });
+    expect(onAppSnapshot).toHaveBeenCalledWith([sampleApp], ["3", "7"]);
+  });
+
   it("dispatches app-snapshot frame to onAppSnapshot with the apps array", () => {
     const onAppSnapshot = vi.fn();
     const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
@@ -1560,7 +1583,7 @@ describe("fleet-status-client: app-frame dispatch (Phase 117 Plan 117-01)", () =
     });
 
     expect(onAppSnapshot).toHaveBeenCalledTimes(1);
-    expect(onAppSnapshot).toHaveBeenCalledWith([sampleApp, sampleAppUnhealthy]);
+    expect(onAppSnapshot).toHaveBeenCalledWith([sampleApp, sampleAppUnhealthy], undefined);
 
     // Structured logging is emitted with the plan-specified operation name.
     const snapshotLogs = infoSpy.mock.calls.filter((args) =>

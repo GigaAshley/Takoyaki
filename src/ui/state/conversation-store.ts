@@ -84,9 +84,7 @@ import {
   getLastDmAt,
   getLastFinishAt,
   getSortFinishAt,
-  getUnseenDmAt,
   getUnseenDmAtForSort,
-  isUnread,
   isUnreadForSort,
   roomAttentionKey,
   subscribeAttention,
@@ -951,8 +949,9 @@ function attentionKeyForRow(row: ConversationRow): string | null {
 
 function decorateAttention(row: ConversationRow): void {
   const k = attentionKeyForRow(row);
-  // Sort inputs fall back to the saved picture until the server's lands, so a
-  // fresh page opens in the order last seen; the marks below never do.
+  // Sort inputs and the unread / DM marks fall back to the saved picture until
+  // the server's lands, so a fresh page opens in the order — and with the
+  // marks — last seen. A mark read on another device clears when it lands.
   const finishAt = getSortFinishAt(k);
   const sent = row.lastMessageAt ?? null;
   const activityAt =
@@ -960,9 +959,10 @@ function decorateAttention(row: ConversationRow): void {
   // Omitted when unknown, like the other optional row fields.
   if (activityAt !== null) row.activityAt = activityAt;
   else delete row.activityAt;
-  if (k !== null && isUnread(k)) row.unread = true;
+  const unread = k !== null && isUnreadForSort(k);
+  const dmAt = getUnseenDmAtForSort(k);
+  if (unread) row.unread = true;
   else delete row.unread;
-  const dmAt = getUnseenDmAt(k);
   if (dmAt !== null) {
     row.dm = true;
     row.dmAt = dmAt;
@@ -970,10 +970,9 @@ function decorateAttention(row: ConversationRow): void {
     delete row.dm;
     delete row.dmAt;
   }
-  const sortDmAt = getUnseenDmAtForSort(k);
-  if (sortDmAt !== null) row.sortDmAt = sortDmAt;
+  if (dmAt !== null) row.sortDmAt = dmAt;
   else delete row.sortDmAt;
-  if (k !== null && isUnreadForSort(k)) row.sortUnread = true;
+  if (unread) row.sortUnread = true;
   else delete row.sortUnread;
 }
 
