@@ -73,6 +73,7 @@ import {
 // lastMessageAt signal + a subscribe hook so a working-store publish invalidates
 // our memoized snapshot (row derivation re-runs and re-picks up fresh recency).
 import {
+  getSessionAiTitle,
   getSessionLastMessageAt,
   subscribeSessionWorkingStore,
 } from "./session-working-store";
@@ -2575,14 +2576,23 @@ export function writeFleetSessionsCache(sessions: FleetSession[]): void {
     // preserved (JSON.stringify drops it) so a legacy row without the field
     // rehydrates as kind=undefined → backward-compat "harness" fallback.
     // roomTitle coerces undefined → null (Matrix's "no title" wire value).
+    // Recency and the generated title also arrive live during a visit; save
+    // the newest known so the next load paints with them, not with what the
+    // sessions list said when the page opened.
+    const live = (s: FleetSession) =>
+      s.kind === "relay-room" || typeof s.sessionName !== "string"
+        ? null
+        : `${String(s.hostId)}:${s.sessionName}`;
+    const newest = (a: number | null | undefined, b: number | null): number | null =>
+      typeof a === "number" ? (b !== null && b > a ? b : a) : b;
     const canonical = sessions.map((s) => ({
       hostId: s.hostId,
       hostName: s.hostName,
       sessionName: s.sessionName,
       created: s.created,
       role: s.role,
-      lastMessageAt: s.lastMessageAt ?? null,
-      aiTitle: s.aiTitle ?? null,
+      lastMessageAt: newest(s.lastMessageAt, getSessionLastMessageAt(live(s))),
+      aiTitle: getSessionAiTitle(live(s)) ?? s.aiTitle ?? null,
       kind: s.kind,
       roomId: s.roomId,
       roomTitle: s.roomTitle ?? null,
@@ -3727,7 +3737,21 @@ export function __getFleetOnlyRowsForTest(): ConversationRow[] {
 // useConversations() consumers do not re-render for them.
 subscribeSessionWorkingStore(() => {
   notify();
+  scheduleLiveFleetCacheWrite();
 });
+
+// Live recency / title changes are saved for the next load (debounced). Only
+// once the list has loaded, so a cold page never overwrites the saved copy
+// with a partial one.
+const LIVE_FLEET_CACHE_WRITE_MS = 2_000;
+let liveFleetCacheTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleLiveFleetCacheWrite(): void {
+  if (!state.fleetSessionsLoaded || liveFleetCacheTimer !== null) return;
+  liveFleetCacheTimer = setTimeout(() => {
+    liveFleetCacheTimer = null;
+    if (state.fleetSessions.length > 0) writeFleetSessionsCache(getFleetSessionsSnapshot());
+  }, LIVE_FLEET_CACHE_WRITE_MS);
+}
 subscribeAttention(() => {
   notify();
 });

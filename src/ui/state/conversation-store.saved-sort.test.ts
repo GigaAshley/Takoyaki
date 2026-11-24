@@ -214,6 +214,30 @@ describe("sidebar order on a fresh page", () => {
     }
   });
 
+  it("a conversation the server says nothing about keeps its saved place and mark", () => {
+    lastVisit();
+    reloadPage(NAMES);
+    const { result } = renderHook(() => useConversations());
+    // The read state lands, but cedar's and dune's machine sends nothing this load.
+    act(() => {
+      publishLastFinishAt("1", "ash", BASELINE + 50);
+      publishLastFinishAt("1", "birch", BASELINE + 40);
+      publishLastFinishAt("1", "elm", BASELINE + 5);
+      applyReadState({
+        baselineAt: BASELINE,
+        seen: [
+          { hostId: "1", identityName: "ash", seenFinishAt: BASELINE + 50 },
+          { hostId: "1", identityName: "birch", seenFinishAt: BASELINE + 40 },
+          { hostId: "1", identityName: "dune", seenFinishAt: BASELINE + 60 },
+          { hostId: "1", identityName: "elm", seenFinishAt: BASELINE + 5 },
+        ],
+        dms: [{ hostId: "1", identityName: "elm", lastDmAt: BASELINE + 5, seenDmAt: 0 }],
+      });
+    });
+    expect(ids(result.current.middle)).toEqual(["t-elm", "t-cedar", "t-dune", "t-ash", "t-birch"]);
+    expect(result.current.middle.find((r) => r.id === "t-cedar")?.unread).toBe(true);
+  });
+
   it("moves only what changed once the server answers (read on another device, a new turn)", () => {
     lastVisit();
     reloadPage(NAMES);

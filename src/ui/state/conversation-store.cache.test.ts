@@ -34,6 +34,7 @@ import {
   __getSnapshotForTest,
   type FleetSession,
 } from "./conversation-store";
+import { seedSessionLastMessageAt, seedSessionAiTitle } from "./session-working-store";
 
 // Phase 47 Plan 01: cache key bumped v2 → v3 (FleetSession gained
 // optional aiTitle; see conversation-store.ts FLEET_CACHE_KEY comment).
@@ -300,6 +301,15 @@ describe("FleetSession localStorage cache (quick-260805-tub)", () => {
     const snap = __getSnapshotForTest();
     const rows = [...snap.pinned, ...snap.middle];
     expect(rows.some((r) => r.roomId === "!room:matrix.example")).toBe(true);
+  });
+
+  it("the saved copy keeps the newest recency and title learned live", () => {
+    seedSessionLastMessageAt(SAMPLE_A.hostId, SAMPLE_A.sessionName, 9_999_999);
+    seedSessionAiTitle(SAMPLE_A.hostId, SAMPLE_A.sessionName, "Live title");
+    writeFleetSessionsCache([{ ...SAMPLE_A, lastMessageAt: 1, aiTitle: "Old title" }]);
+    const got = readFleetSessionsCache();
+    expect(got[0].lastMessageAt).toBe(9_999_999);
+    expect(got[0].aiTitle).toBe("Live title");
   });
 
   it("an empty saved list is told apart from no saved list", () => {

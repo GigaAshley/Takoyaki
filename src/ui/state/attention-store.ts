@@ -177,26 +177,26 @@ function maxOf(a: number | undefined, b: number | undefined): number | undefined
 /** For sorting: the latest finished turn, live or saved. */
 export function getSortFinishAt(k: Key | null): number | null {
   if (k === null) return null;
-  const live = finishes.get(k);
-  if (baselineAt !== null) return live ?? null;
-  return maxOf(live, savedForCurrentUser()?.finishes.get(k)) ?? null;
+  // Saved values stay in play after the server's read state lands: a machine
+  // that hasn't sent anything this load keeps last time's picture (max-wins,
+  // so anything live and newer replaces it).
+  return maxOf(finishes.get(k), savedForCurrentUser()?.finishes.get(k)) ?? null;
 }
 
-/** For sorting: unread, judged from the saved read state until the server's lands. */
+/** For the sidebar: unread, from live and saved read state together. */
 export function isUnreadForSort(k: Key | null): boolean {
-  if (baselineAt !== null) return isUnread(k);
   if (k === null) return false;
   const old = savedForCurrentUser();
-  if (!old || old.baselineAt === null) return false;
-  const finish = maxOf(finishes.get(k), old.finishes.get(k));
+  const base = baselineAt ?? old?.baselineAt ?? null;
+  if (base === null) return false;
+  const finish = maxOf(finishes.get(k), old?.finishes.get(k));
   if (finish === undefined) return false;
-  const s = maxOf(seen.get(k), old.seen.get(k));
-  return finish > (s !== undefined ? Math.max(s, old.baselineAt) : old.baselineAt);
+  const s = maxOf(seen.get(k), old?.seen.get(k));
+  return finish > (s !== undefined ? Math.max(s, base) : base);
 }
 
-/** For sorting: the unseen DM's time, judged from the saved read state until the server's lands. */
+/** For the sidebar: the unseen DM's time, from live and saved read state together. */
 export function getUnseenDmAtForSort(k: Key | null): number | null {
-  if (baselineAt !== null) return getUnseenDmAt(k);
   if (k === null) return null;
   const old = savedForCurrentUser();
   const dm = maxOf(dms.get(k), old?.dms.get(k));

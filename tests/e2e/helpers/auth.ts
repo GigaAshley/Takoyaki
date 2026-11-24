@@ -1,4 +1,5 @@
 import { Page, expect, APIRequestContext } from "@playwright/test";
+import { createHmac } from "crypto";
 
 export interface Creds {
   username: string;
@@ -31,8 +32,38 @@ export async function loginViaUI(page: Page, creds: Creds): Promise<void> {
   await usernameField.fill(creds.username);
   await passwordField.fill(creds.password);
   await page.getByRole("button", { name: /^login$|^sign in$/i }).click();
+  // An account with two-step codes asks for one next; SKYNET_TEST_TOTP_SECRET
+  // (the account's base32 secret) answers it.
+  const secret = process.env.SKYNET_TEST_TOTP_SECRET;
+  if (secret) {
+    const codeField = page.locator("#totp-code");
+    const askedForCode = await codeField
+      .waitFor({ state: "visible", timeout: 5_000 })
+      .then(() => true, () => false);
+    if (askedForCode) {
+      await codeField.fill(totpCode(secret));
+      await page.getByRole("button", { name: /verify/i }).click();
+      await expect(codeField).toBeHidden({ timeout: 15_000 });
+    }
+  }
   // Post-login: URL leaves /login (if it was there); shell paints.
   await expect(usernameField).toBeHidden({ timeout: 15_000 });
+}
+
+/** The current 6-digit code for a base32 TOTP secret (RFC 6238, SHA-1, 30s). */
+export function totpCode(secret: string, now = Date.now()): string {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  let bits = "";
+  for (const ch of secret.replace(/=+$/, "").toUpperCase()) {
+    const v = alphabet.indexOf(ch);
+    if (v >= 0) bits += v.toString(2).padStart(5, "0");
+  }
+  const key = Buffer.from((bits.match(/.{8}/g) ?? []).map((b) => parseInt(b, 2)));
+  const counter = Buffer.alloc(8);
+  counter.writeBigUInt64BE(BigInt(Math.floor(now / 30_000)));
+  const h = createHmac("sha1", key).update(counter).digest();
+  const o = h[h.length - 1] & 0xf;
+  return String((h.readUInt32BE(o) & 0x7fffffff) % 1_000_000).padStart(6, "0");
 }
 
 export async function seedAuthCookie(

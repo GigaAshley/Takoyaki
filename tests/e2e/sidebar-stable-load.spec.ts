@@ -7,8 +7,11 @@
 // inconclusive and repeated (a live instance has agents working).
 //
 // Three ways of reloading: normally; with every server answer slowed down;
-// and with the server cut off (only the sign-in check gets through — the saved
-// copy alone must paint the whole sidebar). Desktop and phone sizes.
+// with the server cut off (only the sign-in check gets through — the saved
+// copy alone must paint the whole sidebar); and with one machine gone silent
+// (the server reports it unreachable and passes on nothing from it) — its
+// conversations may grey out, but nothing anywhere may move, appear or vanish.
+// Desktop and phone sizes.
 // PLAYWRIGHT_LOCAL_DIST runs it against a local build (helpers/local-dist.ts).
 
 import { test, expect, devices, type Page } from "@playwright/test";
@@ -56,7 +59,10 @@ function installSampler(page: Page) {
             key: n === 0 ? base : `${base}#${n}`,
             top: Math.round(r.top - rootRect.top + root.scrollTop),
             left: Math.round(r.left - rootRect.left),
-            marks: `${el.getAttribute("data-unread") ?? ""}${el.getAttribute("data-dm") ?? ""}${el.getAttribute("data-host-unreachable") ?? ""}`,
+            marks:
+              (el.getAttribute("data-unread") ? " unread" : "") +
+              (el.getAttribute("data-dm") ? " dm" : "") +
+              (el.getAttribute("data-host-unreachable") ? " down" : ""),
           });
         }
       }
@@ -67,24 +73,79 @@ function installSampler(page: Page) {
   }, WATCH_MS + 8_000);
 }
 
-const layoutOf = (s: Sample) =>
-  s.items.map((i) => `${i.key}@${i.top},${i.left}${i.marks}`).sort().join("\n");
+/** One machine's rows are allowed to grey out (its down mark is left out). */
+const layoutOf = (s: Sample, downHost?: string) =>
+  s.items
+    .map((i) => {
+      const onDownHost = downHost !== undefined && i.key.startsWith(`fleet::${downHost}::`);
+      return `${i.key}@${i.top},${i.left}${onDownHost ? i.marks.replace(" down", "") : i.marks}`;
+    })
+    .sort()
+    .join("\n");
 
 async function samples(page: Page): Promise<Sample[]> {
   return page.evaluate(() => (window as unknown as { __sidebarSamples: Sample[] }).__sidebarSamples);
 }
 
-/** The layout once the page has been sitting still. */
-async function settledLayout(page: Page): Promise<string> {
+/** The sidebar once the page has been sitting still. */
+async function settledSample(page: Page): Promise<Sample> {
   await page.waitForTimeout(SETTLE_MS);
   const all = await samples(page);
-  return layoutOf(all[all.length - 1]);
+  return all[all.length - 1];
 }
 
-type Mode = "normal" | "slow" | "offline";
+type Mode = "normal" | "slow" | "offline" | "one-machine-down";
 
-async function cutOff(page: Page, mode: Mode) {
+/** The server reports `hostId` unreachable and passes on nothing from it. */
+async function silenceMachine(page: Page, hostId: string) {
+  const sameHost = (h: unknown) => String(h) === hostId;
+  await page.route(/\/sessions\/list/, async (route) => {
+    const res = await route.fetch();
+    const body = (await res.json()) as Array<{ hostId?: unknown }>;
+    await route.fulfill({
+      response: res,
+      json: body.filter((s) => !sameHost(s.hostId)),
+      headers: { ...res.headers(), "x-skynet-unreachable-hosts": hostId },
+    });
+  });
+  await page.route(/\/identities(\?|$)/, async (route) => {
+    const res = await route.fetch();
+    const body = (await res.json()) as Array<{ hostId?: unknown }>;
+    await route.fulfill({ response: res, json: Array.isArray(body) ? body.filter((i) => !sameHost(i.hostId)) : body });
+  });
+  await page.route(new RegExp(`[?&]hostId=${hostId}(&|$)`), (route) => route.abort());
+  await page.routeWebSocket(/fleet-status/, (ws) => {
+    const server = ws.connectToServer();
+    ws.onMessage((m) => server.send(m));
+    server.onMessage((m) => {
+      let f: Record<string, any>;
+      try {
+        f = JSON.parse(String(m));
+      } catch {
+        return ws.send(m);
+      }
+      if (f.type === "snapshot") f.states = f.states.filter((st: any) => !sameHost(st.hostId));
+      else if (f.type === "update" && sameHost(f.state?.hostId)) return;
+      else if ((f.type === "gone" || f.type === "project-list-changed" || f.type === "app-gone") && sameHost(f.hostId)) return;
+      else if (f.type === "app-update" && sameHost(f.app?.hostId)) return;
+      else if (f.type === "app-snapshot") {
+        f.apps = f.apps.filter((a: any) => !sameHost(a.hostId));
+        if (Array.isArray(f.reportedHostIds)) f.reportedHostIds = f.reportedHostIds.filter((h: unknown) => !sameHost(h));
+      }
+      ws.send(JSON.stringify(f));
+    });
+  });
+}
+
+/** A machine with conversations in the sidebar, when there are at least two. */
+function machineToSilence(layout: string): string | null {
+  const hosts = new Set([...layout.matchAll(/^fleet::(\d+)::/gm)].map((m) => m[1]));
+  return hosts.size >= 2 ? [...hosts][0] : null;
+}
+
+async function cutOff(page: Page, mode: Mode, before: string) {
   if (mode === "normal") return;
+  if (mode === "one-machine-down") return silenceMachine(page, machineToSilence(before)!);
   const isAsset = (path: string) => /\.(js|css|woff2?|png|webp|svg|ico|html|json)$/.test(path) || path === "/";
   if (mode === "offline") await page.routeWebSocket(/.*/, (ws) => ws.close());
   await page.route("**/*", async (route) => {
@@ -96,27 +157,37 @@ async function cutOff(page: Page, mode: Mode) {
   });
 }
 
-/** Reload and report what moved after the first paint, or null if something really changed. */
-async function reloadAndCompare(page: Page, mode: Mode, before: string): Promise<string[] | null> {
-  await cutOff(page, mode);
+/**
+ * Reload and report what moved after the first paint — or, as `changed`, what
+ * really changed between the two loads (the attempt is then inconclusive).
+ */
+async function reloadAndCompare(
+  page: Page,
+  mode: Mode,
+  beforeSample: Sample,
+): Promise<{ problems: string[] } | { changed: string }> {
+  const down = mode === "one-machine-down" ? machineToSilence(layoutOf(beforeSample)) ?? undefined : undefined;
+  const before = layoutOf(beforeSample, down);
+  await cutOff(page, mode, layoutOf(beforeSample));
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.waitForTimeout(WATCH_MS);
   const all = (await samples(page)).filter((s) => s.items.length > 0);
   expect(all.length, "the sidebar painted").toBeGreaterThan(0);
-  const first = layoutOf(all[0]);
-  const last = layoutOf(all[all.length - 1]);
-  if (mode !== "offline" && last !== before) return null; // a real change landed
-  const target = mode === "offline" ? before : last;
+  const first = layoutOf(all[0], down);
+  const last = layoutOf(all[all.length - 1], down);
+  // Cut off from the server, nothing can change; otherwise a real change may land.
+  if (mode !== "offline" && last !== before) return { changed: diff(before, last) };
+  const target = before;
   const problems: string[] = [];
   if (first !== target) problems.push(`first paint differs from last time:\n${diff(first, target)}`);
   for (const s of all) {
-    const l = layoutOf(s);
+    const l = layoutOf(s, down);
     if (l !== target) {
       problems.push(`at +${s.t - all[0].t}ms:\n${diff(l, target)}`);
       break;
     }
   }
-  return problems;
+  return { problems };
 }
 
 function diff(a: string, b: string): string {
@@ -137,20 +208,27 @@ for (const size of ["desktop", "phone"] as const) {
     }
     test.setTimeout(ATTEMPTS * (SETTLE_MS + WATCH_MS + 20_000) + 30_000);
 
-    for (const mode of ["normal", "slow", "offline"] as const) {
+    for (const mode of ["normal", "slow", "offline", "one-machine-down"] as const) {
       test(`${mode} reload`, async ({ page, context, baseURL }) => {
         await serveLocalDist(context, baseURL!);
         await installSampler(page);
         await loginViaUI(page, readCreds());
         let problems: string[] | null = null;
+        let changed = "";
         for (let attempt = 0; attempt < ATTEMPTS && problems === null; attempt++) {
           await page.unrouteAll({ behavior: "ignoreErrors" });
           await page.routeWebSocket(/.*/, (ws) => ws.connectToServer());
           await page.reload({ waitUntil: "domcontentloaded" });
-          const before = await settledLayout(page);
-          problems = await reloadAndCompare(page, mode, before);
+          const before = await settledSample(page);
+          if (mode === "one-machine-down" && machineToSilence(layoutOf(before)) === null) {
+            const keys = before.items.map((i) => i.key);
+            test.skip(true, `needs conversations on at least two machines (saw ${keys.length} items: ${keys.slice(0, 5).join(", ")})`);
+          }
+          const outcome = await reloadAndCompare(page, mode, before);
+          if ("problems" in outcome) problems = outcome.problems;
+          else changed = outcome.changed;
         }
-        test.skip(problems === null, "something really changed on every attempt");
+        test.skip(problems === null, `something really changed on every attempt; last time:\n${changed}`);
         expect(problems, (problems ?? []).join("\n")).toEqual([]);
       });
     }
