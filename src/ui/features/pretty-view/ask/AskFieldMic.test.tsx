@@ -48,7 +48,7 @@ vi.mock("../useVoiceRecording", async () => {
 });
 
 import { AskTray } from "./AskTray";
-import { appendTranscript } from "./AskOtherMic";
+import { appendTranscript } from "./AskFieldMic";
 import { parseAskBlock } from "./ask-format";
 import type { QuestionAnswer } from "./answer-format";
 
@@ -65,7 +65,7 @@ function mount() {
   const tray = within(screen.getByTestId("ask-tray"));
   act(() => { fireEvent.click(tray.getByRole("button", { name: "Something else…" })); });
   const field = () => tray.getByLabelText("Something else") as HTMLInputElement;
-  const mic = () => tray.getByTestId("ask-other-mic") as HTMLButtonElement;
+  const mic = () => tray.getByTestId("ask-field-mic") as HTMLButtonElement;
   return { tray, field, mic, onAnswer, view, setDisabled };
 }
 
@@ -189,5 +189,32 @@ describe("Something-else mic", () => {
     const { mic, setDisabled } = mount();
     act(() => setDisabled(true));
     expect(mic().disabled).toBe(true);
+  });
+});
+
+describe("Typed-answer mic", () => {
+  function mountKind(kind: "text" | "long-text") {
+    const r = parseAskBlock(`kind: ${kind}\nquestion: What's number 1?`);
+    if (!r.ok) throw new Error(r.error);
+    const onAnswer = vi.fn();
+    render(<AskTray open={{ ask: r.ask, eventId: "e1", replaced: [] }} onAnswer={onAnswer} hostName="box" />);
+    const tray = within(screen.getByTestId("ask-tray"));
+    const field = () => tray.getByLabelText("What's number 1?") as HTMLInputElement | HTMLTextAreaElement;
+    const mic = () => tray.getByTestId("ask-field-mic") as HTMLButtonElement;
+    return { tray, field, mic, onAnswer };
+  }
+
+  it.each(["text", "long-text"] as const)("a %s answer has a mic that adds the words to it", async (kind) => {
+    const { field, mic, onAnswer } = mountKind(kind);
+    act(() => { fireEvent.change(field(), { target: { value: "The" } }); });
+    act(() => { fireEvent.click(mic()); });
+    await act(async () => { fireEvent.click(mic()); });
+    expect(field().value).toBe("The spoken words");
+    expect(onAnswer).not.toHaveBeenCalled();
+  });
+
+  it("a long-text answer's mic sits at the box's bottom", () => {
+    const { mic } = mountKind("long-text");
+    expect(mic().parentElement?.getAttribute("data-multiline")).toBe("true");
   });
 });

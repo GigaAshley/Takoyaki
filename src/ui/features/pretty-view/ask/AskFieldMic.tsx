@@ -1,4 +1,5 @@
-// Mic for the tray's "Something else" field, inside the field's right end: tap
+// Mic for the tray's typed answers (text, long-text, "Something else"), inside
+// the field's right end — at the bottom for a long-text box: tap
 // to record; while recording it shows the composer's "add to text" arrow, and
 // tapping it stops and adds the words to the end of the field. Never sends — the user
 // checks the text and presses Send. Same recorder as the composer's mic, and
@@ -12,12 +13,14 @@ import {
   useVoiceModeActiveAnywhere,
 } from "../voice-mode-registry";
 
-export interface AskOtherMicProps {
+export interface AskFieldMicProps {
   /** The field's current text; the transcript is added after it. */
   text: string;
   onText: (text: string) => void;
   logContext?: VoiceLogContext;
   disabled?: boolean;
+  /** A long-text box: the mic sits at its bottom-right instead of centred. */
+  multiline?: boolean;
   /** The field itself; the mic sits inside its right end. */
   children: ReactNode;
 }
@@ -29,7 +32,7 @@ export function appendTranscript(text: string, transcript: string): string {
   return `${text} ${transcript}`;
 }
 
-export function AskOtherMic({ text, onText, logContext, disabled, children }: AskOtherMicProps) {
+export function AskFieldMic({ text, onText, logContext, disabled, multiline, children }: AskFieldMicProps) {
   const voice = useVoiceRecording(logContext);
   // The field can change while the words are being transcribed; add them to
   // what it holds when they arrive.
@@ -37,7 +40,7 @@ export function AskOtherMic({ text, onText, logContext, disabled, children }: As
   textRef.current = text;
 
   const busyHere = voice.state !== "idle";
-  const [tokenHere] = useState(() => Symbol("ask-other-mic"));
+  const [tokenHere] = useState(() => Symbol("ask-field-mic"));
   useEffect(() => {
     if (!busyHere) return;
     return registerManualRecording(tokenHere);
@@ -60,18 +63,18 @@ export function AskOtherMic({ text, onText, logContext, disabled, children }: As
     return () => {
       mountedRef.current = false;
       if (startedRef.current || voiceRef.current.state !== "idle") {
-        console.info(`[ask] other-mic-drop reason=field-closed state=${voiceRef.current.state}`);
+        console.info(`[ask] field-mic-drop reason=field-closed state=${voiceRef.current.state}`);
         void voiceRef.current.cancel({ silent: true });
       }
     };
   }, []);
 
   async function stop() {
-    console.info(`[ask] other-mic-stop hostId=${logContext?.hostId ?? "null"} sessionId=${logContext?.sessionId ?? "null"}`);
+    console.info(`[ask] field-mic-stop hostId=${logContext?.hostId ?? "null"} sessionId=${logContext?.sessionId ?? "null"}`);
     const result = await voice.endAppend(textRef.current);
     startedRef.current = false;
     if (!mountedRef.current) {
-      console.info(`[ask] other-mic-drop reason=field-closed-while-transcribing`);
+      console.info(`[ask] field-mic-drop reason=field-closed-while-transcribing`);
       return;
     }
     if (!result) return; // errorMessage is set on the hook
@@ -86,7 +89,7 @@ export function AskOtherMic({ text, onText, logContext, disabled, children }: As
       return;
     }
     if (voice.state !== "idle") return;
-    console.info(`[ask] other-mic-start hostId=${logContext?.hostId ?? "null"} sessionId=${logContext?.sessionId ?? "null"}`);
+    console.info(`[ask] field-mic-start hostId=${logContext?.hostId ?? "null"} sessionId=${logContext?.sessionId ?? "null"}`);
     // No await before start() — iOS only grants the mic from the tap itself.
     voice.start();
     startedRef.current = true;
@@ -100,7 +103,7 @@ export function AskOtherMic({ text, onText, logContext, disabled, children }: As
     : label;
   return (
     <>
-      <div className="pv-ask-other-field">
+      <div className="pv-ask-field" data-multiline={multiline ? "true" : undefined}>
         {children}
         <button
           type="button"
@@ -111,7 +114,7 @@ export function AskOtherMic({ text, onText, logContext, disabled, children }: As
           // Its own recording can always be stopped, even if the tray greys out meanwhile.
           disabled={(disabled && !recording) || blockedByOther || transcribing}
           onClick={onClick}
-          data-testid="ask-other-mic"
+          data-testid="ask-field-mic"
         >
           {transcribing ? <LoaderCircle className="pv-ask-mic-spin" aria-hidden="true" />
             : recording ? <ArrowDownToLine aria-hidden="true" />

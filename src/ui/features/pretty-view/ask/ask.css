@@ -157,19 +157,20 @@ select.pv-ask-input { appearance: auto; }
 .pv-ask-other { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
 /* The mic sits inside the field's right end; the text stops short of it.
    Scoped under the field so it outranks `.pv-ask button` (colour, disabled). */
-.pv-ask-other-field { position: relative; width: 100%; }
-.pv-ask-other-field .pv-ask-input { padding-right: 42px; }
-.pv-ask-other-field .pv-ask-mic {
+.pv-ask-field { position: relative; width: 100%; }
+.pv-ask-field .pv-ask-input { padding-right: 42px; }
+.pv-ask-field .pv-ask-mic {
   position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
   display: inline-flex; align-items: center; justify-content: center;
   width: 30px; height: 30px; border-radius: 999px; padding: 0;
   border: 0; background: transparent; color: var(--k-t2);
 }
-.pv-ask-other-field .pv-ask-mic svg { width: 16px; height: 16px; }
-.pv-ask-other-field .pv-ask-mic:hover:not(:disabled) { background: rgba(255, 255, 255, 0.08); color: var(--k-t1); }
-.pv-ask-other-field .pv-ask-mic:disabled { opacity: 0.4; }
+.pv-ask-field[data-multiline="true"] .pv-ask-mic { top: auto; bottom: 6px; transform: none; }
+.pv-ask-field .pv-ask-mic svg { width: 16px; height: 16px; }
+.pv-ask-field .pv-ask-mic:hover:not(:disabled) { background: rgba(255, 255, 255, 0.08); color: var(--k-t1); }
+.pv-ask-field .pv-ask-mic:disabled { opacity: 0.4; }
 /* Recording: the "add to text" arrow, with a soft red ring pulsing. */
-.pv-ask-other-field .pv-ask-mic[data-recording="true"] {
+.pv-ask-field .pv-ask-mic[data-recording="true"] {
   background: rgba(255, 255, 255, 0.08); color: var(--k-t1);
   animation: pv-ask-mic-rec 1.6s ease-in-out infinite;
 }
@@ -178,7 +179,7 @@ select.pv-ask-input { appearance: auto; }
   50% { box-shadow: 0 0 0 4px rgba(229, 72, 77, 0.15); }
 }
 @media (prefers-reduced-motion: reduce) {
-  .pv-ask-other-field .pv-ask-mic[data-recording="true"] { animation: none; box-shadow: 0 0 0 2px rgba(229, 72, 77, 0.45); }
+  .pv-ask-field .pv-ask-mic[data-recording="true"] { animation: none; box-shadow: 0 0 0 2px rgba(229, 72, 77, 0.45); }
 }
 .pv-ask-mic-spin { animation: pv-ask-mic-spin 0.9s linear infinite; }
 @keyframes pv-ask-mic-spin { to { transform: rotate(360deg); } }

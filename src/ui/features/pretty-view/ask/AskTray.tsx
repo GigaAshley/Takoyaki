@@ -12,7 +12,7 @@ import { formatSlotTime, type Ask, type AskOption, type AskQuestion } from "./as
 import { formatMoney, type QuestionAnswer } from "./answer-format";
 import type { OpenAsk } from "./open-ask";
 import type { VoiceLogContext } from "../useVoiceRecording";
-import { AskOtherMic } from "./AskOtherMic";
+import { AskFieldMic } from "./AskFieldMic";
 import "./ask.css";
 
 export interface AskTrayProps {
@@ -181,7 +181,7 @@ function QuestionBody(props: BodyProps) {
       {multi && (
         <div className="pv-ask-other">
           {otherOpen ? (
-            <AskOtherMic
+            <AskFieldMic
               text={otherText}
               onText={(text) => onDraft({ kind: "other", text })}
               logContext={props.voiceLogContext}
@@ -201,7 +201,7 @@ function QuestionBody(props: BodyProps) {
                   }
                 }}
               />
-            </AskOtherMic>
+            </AskFieldMic>
           ) : null}
           <button
             type="button"
@@ -224,7 +224,7 @@ function QuestionBody(props: BodyProps) {
   );
 }
 
-function KindBody({ q, draft, hostName, onOpenFile, onPickOne, onDraft, onEnter, disabled }: BodyProps) {
+function KindBody({ q, draft, hostName, onOpenFile, onPickOne, onDraft, onEnter, disabled, voiceLogContext }: BodyProps) {
   switch (q.kind) {
     case "pick-one":
     case "pick-several": {
@@ -343,7 +343,7 @@ function KindBody({ q, draft, hostName, onOpenFile, onPickOne, onDraft, onEnter,
         placeholder: q.placeholder ?? "",
         value: text,
       };
-      return q.kind === "text" ? (
+      const field = q.kind === "text" ? (
         <input
           {...common}
           onChange={(e) => onDraft({ kind: "text", text: e.target.value })}
@@ -361,6 +361,17 @@ function KindBody({ q, draft, hostName, onOpenFile, onPickOne, onDraft, onEnter,
           className="pv-ask-input pv-ask-textarea"
           onChange={(e) => onDraft({ kind: "text", text: e.target.value })}
         />
+      );
+      return (
+        <AskFieldMic
+          text={text}
+          onText={(t) => onDraft({ kind: "text", text: t })}
+          logContext={voiceLogContext}
+          disabled={disabled}
+          multiline={q.kind === "long-text"}
+        >
+          {field}
+        </AskFieldMic>
       );
     }
     case "number":
