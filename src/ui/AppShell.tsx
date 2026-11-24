@@ -156,6 +156,7 @@ import type { ProjectRow } from "@/state/conversation-store";
 import { onScreenConversationIds, useSeenTracker, type SeenTarget } from "@/state/use-seen-tracker";
 import { RELAY_ROOM_ATTENTION_HOST } from "@/state/attention-store";
 import { askFirstAnsweringHost } from "@/lib/ask-first-answering-host";
+import { readMeCache, writeMeCache } from "@/state/me-cache";
 // Cold-boot paint hint for the host tree — seeds hostsFlat so
 // projectForRow() resolves identity carriers on first render and
 // sidebar project sections + RDP rows paint immediately. See module
@@ -463,7 +464,11 @@ export function AppShell({
   const [allHosts, setAllHosts] = useState<Host[]>(() =>
     readHostTreeCache().map(sshHostToHost),
   );
-  const [isAdmin, setIsAdmin] = useState(false);
+  // The footer's own-user details paint from the saved copy until /users/me
+  // answers (readMeCache) — isAdmin included, so the footer's buttons don't
+  // shift when the admin one arrives. adminKnown still waits for the answer.
+  const [cachedMe] = useState(() => readMeCache());
+  const [isAdmin, setIsAdmin] = useState(() => cachedMe?.isAdmin ?? false);
   // Whether isAdmin has been answered yet — a restored shell pane waits for it.
   const [adminKnown, setAdminKnown] = useState(false);
   // Sidebar-footer "you" anchor: current username from /users/me. Held here
@@ -478,13 +483,13 @@ export function AppShell({
   // local state is a distinct concept (fresh from /users/me alongside
   // isAdmin) from the prop (passed from the Auth wrapper at mount time) —
   // renamed rather than merged to avoid touching the outer prop shape.
-  const [meUsername, setMeUsername] = useState<string | null>(null);
+  const [meUsername, setMeUsername] = useState<string | null>(() => cachedMe?.username ?? null);
   // Phase 137 D-30: userId from /users/me, threaded to PrettyConversationsPanel →
   // PreferencesModal → PreferencesAccountPane for avatar PUT/DELETE endpoints.
-  const [meUserId, setMeUserId] = useState<string | null>(null);
+  const [meUserId, setMeUserId] = useState<string | null>(() => cachedMe?.userId ?? null);
   // Phase 137 D-30: avatar filename from /users/me, threaded to PrettyConversationsPanel
   // for the sidebar footer conditional <img> and into PreferencesModal for live-sync.
-  const [meAvatarPath, setMeAvatarPath] = useState<string | null>(null);
+  const [meAvatarPath, setMeAvatarPath] = useState<string | null>(() => cachedMe?.avatarPath ?? null);
   const [backgroundTabRecords, setBackgroundTabRecords] = useState<
     OpenTabRecord[]
   >([]);
@@ -626,6 +631,13 @@ export function AppShell({
         setMeAvatarPath(null);       // Phase 137 D-30
       });
   }, []);
+
+  // Save the footer's own-user details once /users/me has answered (and again
+  // when the picture changes in Preferences) for the next first paint.
+  useEffect(() => {
+    if (!adminKnown || meUsername === null) return;
+    writeMeCache({ username: meUsername, userId: meUserId, avatarPath: meAvatarPath, isAdmin });
+  }, [adminKnown, meUsername, meUserId, meAvatarPath, isAdmin]);
 
   // Phase 126 Plan 02 (D-18): install first-gesture AudioContext unlock so
   // playTink() from mounted PrettyView instances fires post-user-interaction.
