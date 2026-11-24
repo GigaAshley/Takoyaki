@@ -556,12 +556,19 @@ function HostsGroup({ user }: { user: AdminUser }) {
     setBusyId(h.id);
     try {
       await removeUserHost(user.id, h.id);
-      setHosts(await load());
-      setError(null);
     } catch (err) {
       setError(adminErrorMessage(err, "Failed to remove the host."));
-    } finally {
       setBusyId(null);
+      return;
+    }
+    // Removed: drop it here, so a failed refresh can't show it as still there.
+    setHosts((cur) => cur?.filter((x) => x.id !== h.id) ?? cur);
+    setError(null);
+    setBusyId(null);
+    try {
+      setHosts(await load());
+    } catch {
+      setError("Host removed, but the list couldn't be refreshed.");
     }
   };
 

@@ -528,6 +528,22 @@ describe("AdminModal — a user", () => {
     expect(await screen.findByTestId("admin-user-hosts-error")).toBeTruthy();
     expect(screen.getByTestId("admin-user-host-1")).toBeTruthy();
   });
+
+  it("drops a removed host even when refreshing the list fails, and says the refresh failed", async () => {
+    m.getSSHHosts
+      .mockResolvedValueOnce([
+        { id: 1, name: "harbor", ip: "10.0.0.1", port: 22, username: "riley", userId: "u2", status: "online" },
+      ])
+      .mockRejectedValue(new Error("blip"));
+    m.removeUserHost.mockResolvedValue({});
+    autoAnswerKitDialogs({ confirm: true });
+    renderModal();
+    await openUser("riley");
+    await screen.findByTestId("admin-user-host-1");
+    await userEvent.click(btn("admin-user-host-remove-1"));
+    expect((await screen.findByTestId("admin-user-hosts-error")).textContent).toContain("Host removed");
+    expect(screen.queryByTestId("admin-user-host-1")).toBeNull();
+  });
 });
 
 describe("AdminModal — Sign-in", () => {
