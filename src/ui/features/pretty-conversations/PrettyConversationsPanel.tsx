@@ -294,6 +294,7 @@ import { archiveIdentity } from "@/api/identity-archive-api";
 // present so the empty-expanded prompt is discoverable).
 import { AppTile } from "./AppTile";
 import { ProjectAppRow } from "./ProjectAppRow";
+import { useSidebarMotion } from "./use-sidebar-motion";
 import { droppedApp, endAppDrag, getDraggedApp, hasAppMime, type DraggedApp } from "./app-drag";
 import { moveApp } from "./app-menu-items";
 import type { AppState } from "../../api/fleet-status-types";
@@ -1434,6 +1435,11 @@ export function PrettyConversationsPanel({
   //    section-collapse + all-empty fallback render behavior.
   const trimmedSidebarSearchQuery = sidebarSearchQuery.trim();
   const sidebarSearchActive = trimmedSidebarSearchQuery.length > 0;
+  // Real changes slide; the user's own filtering (and clearing it) snaps.
+  const lastMotionSearchRef = useRef(trimmedSidebarSearchQuery);
+  const searchJustChanged = lastMotionSearchRef.current !== trimmedSidebarSearchQuery;
+  lastMotionSearchRef.current = trimmedSidebarSearchQuery;
+  useSidebarMotion(scrollRegionRef, !sidebarSearchActive && !searchJustChanged);
 
   const searchFilterRow = (row: ConversationRowShape): boolean => {
     if (!sidebarSearchActive) return true;

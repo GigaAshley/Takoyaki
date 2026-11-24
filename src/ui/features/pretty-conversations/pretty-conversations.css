@@ -185,6 +185,9 @@
 
 .pv-panel-scroll {
   flex: 1;
+  /* Leaving rows are parked here at their old place while they fade
+     (use-sidebar-motion.ts). */
+  position: relative;
   overflow-y: auto;
   /* Never scroll sideways — rows truncate instead. */
   overflow-x: hidden;
