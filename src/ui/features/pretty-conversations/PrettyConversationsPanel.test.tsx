@@ -1302,7 +1302,7 @@ describe("PrettyConversationsPanel: deactivate action (quick-260727-gm3)", () =>
       expect(container.querySelector('[data-conversation-id="agent-1"]')).toBeNull();
     });
 
-    it("a non-admin keeps a down machine's rows, greyed, even before its agent is known", () => {
+    it("a non-admin keeps a down machine's agents, greyed, but never sees its bare shells", () => {
       const hostA = makeHost("h1", "hostA");
       setSnapshot({
         activeSet: [],
@@ -1315,9 +1315,16 @@ describe("PrettyConversationsPanel: deactivate action (quick-260727-gm3)", () =>
             targetTmuxSession: "sonar",
             hostUnreachable: true,
           }),
+          makeConversationRow({
+            id: "down-shell",
+            label: "bash",
+            host: hostA,
+            targetTmuxSession: "bash",
+            hostUnreachable: true,
+          }),
         ],
       });
-      mockIdentitiesByKey = new Map();
+      mockIdentitiesByKey = new Map([["sonar", { identityKey: "sonar" }]]);
       const { container } = render(
         <PrettyConversationsPanel variant="desktop" onDeactivateRow={() => {}} />,
       );
@@ -1325,6 +1332,7 @@ describe("PrettyConversationsPanel: deactivate action (quick-260727-gm3)", () =>
       expect(row).not.toBeNull();
       expect(row!.getAttribute("data-host-unreachable")).toBe("true");
       expect(row!.querySelector(".pv-row--unreachable")).not.toBeNull();
+      expect(container.querySelector('[data-conversation-id="down-shell"]')).toBeNull();
     });
 
     it("an admin still sees every row", () => {
@@ -1924,7 +1932,7 @@ describe("PrettyConversationsPanel: row-click routing (RDP)", () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe("PrettyConversationsPanel: row-click routing (fleet-only)", () => {
-  it("clicking a row whose machine is down says so instead of opening it", () => {
+  it("clicking a row whose machine is down says so, and still tries to open it", () => {
     const hostA = makeHost("h1", "workstation");
     const downRow = makeConversationRow({
       id: "fleet::1::sonar",
@@ -1944,8 +1952,8 @@ describe("PrettyConversationsPanel: row-click routing (fleet-only)", () => {
       .querySelector('[data-conversation-id="fleet::1::sonar"]')!
       .querySelector('[role="button"]') as HTMLElement;
     fireEvent.click(body);
-    expect(onDetachedRowClick).not.toHaveBeenCalled();
     expect(toastSpy).toHaveBeenCalledWith("workstation isn't reachable right now", expect.anything());
+    expect(onDetachedRowClick).toHaveBeenCalledTimes(1);
   });
 
   it("tapping an already-open conversation whose machine is down says so and still brings it forward", () => {

@@ -133,6 +133,8 @@ import {
   readFleetSessionsCache,
   hasFleetSessionsCache,
   markHostReachable,
+  useUnreachableHostIds,
+  getUnreachableHostIds,
   writeFleetSessionsCache,
   useRelayRoomTitles,
   // Phase 117 Plan 117-07 (D-37 / D-39): projects slice mutators + relay-room
@@ -1284,6 +1286,32 @@ export function AppShell({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []); // EMPTY DEP ARRAY — TG-17 shape lock: the SEED is exactly once per mount.
           // The fetch also fires on becoming-visible (see effect below).
+
+  // A machine the sessions list couldn't reach is asked about again on a
+  // backoff (the list is the only thing that says it's down, and idle agents
+  // send no live frames to say it's back), so one timed-out answer doesn't
+  // leave a healthy machine greyed for the whole visit.
+  const anyHostUnreachable = useUnreachableHostIds().size > 0;
+  useEffect(() => {
+    if (!anyHostUnreachable) return;
+    const delays = [15_000, 30_000, 60_000, 120_000, 300_000];
+    let attempt = 0;
+    let timer: ReturnType<typeof setTimeout>;
+    const next = () => {
+      timer = setTimeout(() => {
+        attempt += 1;
+        console.info({
+          operation: "fleet_unreachable_recheck",
+          hostIds: [...getUnreachableHostIds()],
+          attempt,
+        });
+        void fetchFleetSessionsRef.current?.({ isColdStart: false });
+        next();
+      }, delays[Math.min(attempt, delays.length - 1)]);
+    };
+    next();
+    return () => clearTimeout(timer);
+  }, [anyHostUnreachable]);
 
   // Visibility re-ask — fire GET /sessions/list on becoming visible (D-07).
   // Pairs with fleet-status-client.ts's visibility reconnect so both halves

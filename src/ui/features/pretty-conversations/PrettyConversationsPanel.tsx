@@ -1398,11 +1398,11 @@ export function PrettyConversationsPanel({
   // resolve to a known identity (a bare tmux shell, or an agent whose host
   // sweep is unreachable so its identity isn't loaded) is left out entirely.
   const hideTerminalRows = !isAdmin;
-  // A row whose machine is down stays (greyed) even before its agent is known.
+  // A down machine's agents keep their saved details, so they still resolve
+  // here and stay (greyed); a bare shell on it stays hidden.
   const isPlainTerminalRow = (row: ConversationRowShape): boolean =>
     row.type === "terminal" &&
     row.kind !== "relay-room" &&
-    row.hostUnreachable !== true &&
     resolveIdentityForRow(row, identitiesByHostKey, identitiesByKey) === null;
   const keepRow = (row: ConversationRowShape): boolean =>
     notSwipePending(row) &&
@@ -1572,8 +1572,8 @@ export function PrettyConversationsPanel({
     // `rdp-host::` id: the row takes the new tab's id (enrolled when it's
     // selected), and a stale host id would light the row up — with a no-op
     // Close — every time it reverts after the tab closes.
-    // A conversation on a machine that's down: say so. One not open yet can't
-    // be opened; one already open is still brought forward.
+    // A conversation on a machine that's down: say so, and open it anyway —
+    // "down" is the last list's view, and the machine may well be back.
     if (row.hostUnreachable === true) {
       const machine = row.host?.name ?? "This machine";
       console.info({
@@ -1583,11 +1583,8 @@ export function PrettyConversationsPanel({
         alreadyOpen: !row.fleetOnly,
       });
       toast(`${machine} isn't reachable right now`, {
-        description: row.fleetOnly
-          ? "Its conversations will open again once it's back."
-          : "This conversation will pick up again once it's back.",
+        description: "This conversation will pick up again once it's back.",
       });
-      if (row.fleetOnly) return;
     }
     if (!(row.rdpHostRow && !row.rdpTabOpen)) addToActiveSet(row.id);
     if (row.rdpHostRow && !row.rdpTabOpen && onRdpRowClick) {

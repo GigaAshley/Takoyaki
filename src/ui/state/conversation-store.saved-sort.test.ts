@@ -238,6 +238,23 @@ describe("sidebar order on a fresh page", () => {
     expect(result.current.middle.find((r) => r.id === "t-cedar")?.unread).toBe(true);
   });
 
+  it("looking at a conversation clears a mark painted from the saved copy", () => {
+    lastVisit();
+    reloadPage(NAMES);
+    const { result } = renderHook(() => useConversations());
+    act(() => {
+      applyReadState({ baselineAt: BASELINE, seen: [], dms: [] });
+    });
+    // cedar's machine sends nothing this load; its saved unread dot shows.
+    expect(result.current.middle.find((r) => r.id === "t-cedar")?.unread).toBe(true);
+    act(() => markSeen("1", "cedar"));
+    expect(result.current.middle.find((r) => r.id === "t-cedar")?.unread).toBeUndefined();
+    // elm's saved envelope clears the same way.
+    expect(result.current.middle.find((r) => r.id === "t-elm")?.dm).toBe(true);
+    act(() => markSeen("1", "elm"));
+    expect(result.current.middle.find((r) => r.id === "t-elm")?.dm).toBeUndefined();
+  });
+
   it("moves only what changed once the server answers (read on another device, a new turn)", () => {
     lastVisit();
     reloadPage(NAMES);

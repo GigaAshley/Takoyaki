@@ -542,13 +542,17 @@ export function subscribeDmArrival(k: Key, cb: (since: number) => void): () => v
 export function markSeen(hostId: string | number, identityName: string, arrived = false): void {
   const k = attentionKey(hostId, identityName);
   let changed = false;
-  // DMs need no baseline: a DM in the map is always one to clear.
-  const dm = getUnseenDmAt(k);
+  // Clear what the sidebar shows, which includes marks painted from the saved
+  // copy — a mark whose live value never arrives (its machine is down) must
+  // still clear when looked at. DMs need no baseline.
+  const dm = getUnseenDmAtForSort(k);
   // No seen mark yet (a conversation whose DMs predate tracking): count only
   // the latest DM as unseen — with a little slack, since its time comes from
   // the relay and the message's own from the transcript — not the whole
   // history back to the first message to the user.
-  const seenBefore = dmSeen.get(k) ?? (dm !== null ? Math.max(0, dm - DM_TIME_SLACK_MS) : 0);
+  const seenBefore =
+    maxOf(dmSeen.get(k), savedForCurrentUser()?.dmSeen.get(k)) ??
+    (dm !== null ? Math.max(0, dm - DM_TIME_SLACK_MS) : 0);
   if (dm !== null && advanceMax(dmSeen, k, dm)) {
     changed = true;
     if (arrived) {
@@ -565,9 +569,9 @@ export function markSeen(hostId: string | number, identityName: string, arrived 
     console.info({ operation: "attention_mark_dm_seen", hostId: String(hostId), identityName, seenDmAt: dm });
     postDmSeen(k, String(hostId), identityName, dm);
   }
-  // Until the read state has loaded nothing shows as unread, and the load
-  // itself notifies — the seen tracker re-runs then.
-  const finish = finishes.get(k);
+  // Seen marks wait for the read state (the load itself notifies — the seen
+  // tracker re-runs then); the finish is the newest known, live or saved.
+  const finish = getSortFinishAt(k) ?? undefined;
   if (baselineAt !== null && finish !== undefined && advanceSeen(k, finish)) {
     changed = true;
     console.info({ operation: "attention_mark_seen", hostId: String(hostId), identityName, seenFinishAt: finish });

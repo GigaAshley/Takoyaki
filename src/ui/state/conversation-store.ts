@@ -1953,6 +1953,15 @@ function setUnreachableHostIds(next: ReadonlySet<number>): void {
   notify();
 }
 
+/** Machines the sidebar currently shows as down. */
+export function getUnreachableHostIds(): ReadonlySet<number> {
+  return state.unreachableHostIds;
+}
+
+export function useUnreachableHostIds(): ReadonlySet<number> {
+  return useSyncExternalStore(subscribe, getUnreachableHostIds, getUnreachableHostIds);
+}
+
 /** A live frame came from this machine — its rows are no longer greyed. */
 export function markHostReachable(hostId: number): void {
   if (!state.unreachableHostIds.has(hostId)) return;
