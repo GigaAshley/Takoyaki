@@ -4230,7 +4230,7 @@ describe("conversation-store: reconcileFleetSessionsFromList", () => {
   });
 
   it("a down machine's rows paint greyed on the next load, before the server answers", () => {
-    localStorage.setItem("skynet_auth", JSON.stringify({ loggedIn: true, username: "ashley" }));
+    localStorage.setItem("skynet_auth", JSON.stringify({ loggedIn: true, username: "alice" }));
     const h2 = makeHost("2", "workstation");
     act(() => {
       updateHostsFlat(new Map([[2, h2]]));

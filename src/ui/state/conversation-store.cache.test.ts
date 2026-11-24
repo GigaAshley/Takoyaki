@@ -279,9 +279,9 @@ describe("FleetSession localStorage cache (quick-260805-tub)", () => {
       kind: "relay-room",
       id: "relay::!room:matrix.example",
       roomId: "!room:matrix.example",
-      roomTitle: "Ashley & Zoey",
+      roomTitle: "Alice & Bob",
       lastActivityAt: "2026-11-20T10:00:00.000Z",
-      roomFaces: [{ mxid: "@zoey:matrix.example", kind: "human", name: "Zoey", avatarPath: null }],
+      roomFaces: [{ mxid: "@bob:matrix.example", kind: "human", name: "Bob", avatarPath: null }],
       roomOthersCount: 1,
       lastMessageAt: null,
       aiTitle: null,
@@ -292,7 +292,7 @@ describe("FleetSession localStorage cache (quick-260805-tub)", () => {
     expect(got[0].id).toBe("relay::!room:matrix.example");
     expect(got[0].lastActivityAt).toBe("2026-11-20T10:00:00.000Z");
     expect(got[0].roomFaces).toEqual([
-      { mxid: "@zoey:matrix.example", kind: "human", name: "Zoey", avatarPath: null },
+      { mxid: "@bob:matrix.example", kind: "human", name: "Bob", avatarPath: null },
     ]);
     expect(got[0].roomOthersCount).toBe(1);
 

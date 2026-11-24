@@ -4,7 +4,7 @@ import { AvatarImage, __resetAvatarFailuresForTest } from "./avatar-image";
 
 beforeEach(() => {
   localStorage.clear();
-  localStorage.setItem("skynet_auth", JSON.stringify({ loggedIn: true, username: "ashley" }));
+  localStorage.setItem("skynet_auth", JSON.stringify({ loggedIn: true, username: "alice" }));
   __resetAvatarFailuresForTest();
 });
 
@@ -73,7 +73,7 @@ describe("AvatarImage", () => {
     fireEvent.error(first.container.querySelector("img")!);
     first.unmount();
     await Promise.resolve();
-    localStorage.setItem("skynet_auth", JSON.stringify({ loggedIn: true, username: "zoey" }));
+    localStorage.setItem("skynet_auth", JSON.stringify({ loggedIn: true, username: "bob" }));
     __resetAvatarFailuresForTest(); // signing in as someone else reloads the page
     const { container } = render(<AvatarImage src="/none.png" name="sonar" />);
     expect(container.querySelector("img")).not.toBeNull();
