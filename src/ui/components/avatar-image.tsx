@@ -1,4 +1,5 @@
 import { useEffect, useState, type CSSProperties } from "react";
+import { getCurrentUser, readUserScopedCache, writeUserScopedCache } from "@/state/user-scoped-cache";
 
 /** First letter of `name`, upper-cased; "?" when there is none. */
 export function initialOf(name: string | null | undefined): string {
@@ -6,31 +7,26 @@ export function initialOf(name: string | null | undefined): string {
   return ch ? ch.toUpperCase() : "?";
 }
 
-// Avatar URLs that failed to load, remembered across page loads so an agent
-// with no picture paints its initial straight away instead of a beat later
-// (after the image's error). Bounded; newest last.
-const FAILED_SRCS_KEY = "skynet:avatar-failed-srcs:v1";
+// Avatar URLs that failed to load, remembered across page loads (per signed-in
+// user, like the rest of the sidebar's saved copy) so an agent with no picture
+// paints its initial straight away instead of a beat later (after the image's
+// error). Bounded; newest last.
+const FAILED_SRCS_KEY = "skynet:avatar-failed-srcs:v2";
 const FAILED_SRCS_MAX = 500;
-let failedSrcs: string[] | null = null;
+let failedSrcs: { owner: string | null; list: string[] } | null = null;
 
 function loadFailedSrcs(): string[] {
-  if (failedSrcs !== null) return failedSrcs;
-  try {
-    const parsed = JSON.parse(localStorage.getItem(FAILED_SRCS_KEY) ?? "[]") as unknown;
-    failedSrcs = Array.isArray(parsed) ? parsed.filter((s): s is string => typeof s === "string") : [];
-  } catch {
-    failedSrcs = [];
-  }
-  return failedSrcs;
+  const owner = getCurrentUser();
+  if (failedSrcs !== null && failedSrcs.owner === owner) return failedSrcs.list;
+  const raw = owner ? readUserScopedCache<unknown>(FAILED_SRCS_KEY, ["skynet:avatar-failed-srcs:v1"]) : null;
+  const list = Array.isArray(raw) ? raw.filter((s): s is string => typeof s === "string") : [];
+  failedSrcs = { owner, list };
+  return list;
 }
 
 function saveFailedSrcs(list: string[]): void {
-  failedSrcs = list;
-  try {
-    localStorage.setItem(FAILED_SRCS_KEY, JSON.stringify(list));
-  } catch {
-    // Silent — losing this only costs a late initial.
-  }
+  failedSrcs = { owner: getCurrentUser(), list };
+  writeUserScopedCache(FAILED_SRCS_KEY, list);
 }
 
 export function rememberAvatarFailed(src: string): void {

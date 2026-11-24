@@ -1572,14 +1572,22 @@ export function PrettyConversationsPanel({
     // `rdp-host::` id: the row takes the new tab's id (enrolled when it's
     // selected), and a stale host id would light the row up — with a no-op
     // Close — every time it reverts after the tab closes.
-    // A conversation on a machine that's down can't be opened — say so.
-    if (row.hostUnreachable === true && row.fleetOnly) {
+    // A conversation on a machine that's down: say so. One not open yet can't
+    // be opened; one already open is still brought forward.
+    if (row.hostUnreachable === true) {
       const machine = row.host?.name ?? "This machine";
-      console.info({ operation: "sidebar_row_open_blocked_unreachable", rowId: row.id, hostId: row.host?.id });
-      toast(`${machine} isn't reachable right now`, {
-        description: "Its conversations will open again once it's back.",
+      console.info({
+        operation: "sidebar_row_tap_unreachable",
+        rowId: row.id,
+        hostId: row.host?.id,
+        alreadyOpen: !row.fleetOnly,
       });
-      return;
+      toast(`${machine} isn't reachable right now`, {
+        description: row.fleetOnly
+          ? "Its conversations will open again once it's back."
+          : "This conversation will pick up again once it's back.",
+      });
+      if (row.fleetOnly) return;
     }
     if (!(row.rdpHostRow && !row.rdpTabOpen)) addToActiveSet(row.id);
     if (row.rdpHostRow && !row.rdpTabOpen && onRdpRowClick) {

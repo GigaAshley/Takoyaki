@@ -4,6 +4,7 @@ import { AvatarImage, __resetAvatarFailuresForTest } from "./avatar-image";
 
 beforeEach(() => {
   localStorage.clear();
+  localStorage.setItem("skynet_auth", JSON.stringify({ loggedIn: true, username: "ashley" }));
   __resetAvatarFailuresForTest();
 });
 
@@ -56,12 +57,21 @@ describe("AvatarImage", () => {
     second.rerender(<AvatarImage src="/flaky.png" name="x" />);
     expect(second.container.querySelector("img")).toBeNull();
     second.unmount();
-    localStorage.clear();
+    localStorage.removeItem("skynet:avatar-failed-srcs:v2");
     __resetAvatarFailuresForTest();
     const third = render(<AvatarImage src="/flaky.png" name="x" />);
     fireEvent.load(third.container.querySelector("img")!);
     __resetAvatarFailuresForTest();
     const fourth = render(<AvatarImage src="/flaky.png" name="x" />);
     expect(fourth.container.querySelector("img")).not.toBeNull();
+  });
+
+  it("one person's remembered failures don't apply to another person on the same device", () => {
+    const first = render(<AvatarImage src="/none.png" name="sonar" />);
+    fireEvent.error(first.container.querySelector("img")!);
+    first.unmount();
+    localStorage.setItem("skynet_auth", JSON.stringify({ loggedIn: true, username: "zoey" }));
+    const { container } = render(<AvatarImage src="/none.png" name="sonar" />);
+    expect(container.querySelector("img")).not.toBeNull();
   });
 });

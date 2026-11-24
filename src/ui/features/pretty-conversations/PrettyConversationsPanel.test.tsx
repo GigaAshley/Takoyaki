@@ -1948,6 +1948,27 @@ describe("PrettyConversationsPanel: row-click routing (fleet-only)", () => {
     expect(toastSpy).toHaveBeenCalledWith("workstation isn't reachable right now", expect.anything());
   });
 
+  it("tapping an already-open conversation whose machine is down says so and still brings it forward", () => {
+    const hostA = makeHost("h1", "workstation");
+    const openRow = makeConversationRow({
+      id: "tab-sonar",
+      label: "sonar",
+      host: hostA,
+      targetTmuxSession: "sonar",
+      hostUnreachable: true,
+    });
+    setSnapshot({ pinned: [], grouped: [{ hostId: "h1", hostName: "workstation", rows: [openRow] }] });
+    (toastSpy as unknown as ReturnType<typeof vi.fn>).mockClear();
+    const { container } = render(
+      <PrettyConversationsPanel isAdmin variant="desktop" onDeactivateRow={() => {}} />,
+    );
+    fireEvent.click(
+      container.querySelector('[data-conversation-id="tab-sonar"]')!.querySelector('[role="button"]') as HTMLElement,
+    );
+    expect(toastSpy).toHaveBeenCalledWith("workstation isn't reachable right now", expect.anything());
+    expect(selectConversationSpy).toHaveBeenCalledWith("tab-sonar");
+  });
+
   it("Test 13: clicking a fleetOnly row calls onDetachedRowClick and NOT onRdpRowClick", () => {
     const hostA = makeHost("h1", "hostA");
     const detachedRow = makeConversationRow({
