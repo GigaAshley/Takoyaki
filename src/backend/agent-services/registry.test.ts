@@ -191,6 +191,11 @@ describe("a broken service folder", () => {
       /not executable/,
     ],
     [
+      "has a file where its bin folder should be",
+      { "service.js": serviceJs("broken"), bin: "#!/bin/sh\n" },
+      /bin is not a folder/,
+    ],
+    [
       "has a skill folder with no SKILL.md",
       { "service.js": serviceJs("broken"), "skill/notes.md": "x" },
       /no SKILL\.md/,
@@ -209,6 +214,33 @@ describe("a broken service folder", () => {
       expect.stringContaining('service "broken" skipped'),
       expect.objectContaining({ operation: "agent_services_service_skipped", service: "broken" }),
     );
+  });
+
+  it("is skipped when a script is a symlink (it would never be pushed)", async () => {
+    const root = makeRoot({ broken: { "service.js": serviceJs("broken"), "real/x": { exec: "#!/bin/sh\n" } } });
+    fs.mkdirSync(path.join(root, "broken", "bin"));
+    fs.symlinkSync(path.join(root, "broken", "real", "x"), path.join(root, "broken", "bin", "x"));
+    const { services, skipped } = await discoverServices(root, () => {});
+    expect(services).toEqual([]);
+    expect(skipped[0].reason).toMatch(/bin\/x is a symlink/);
+  });
+
+  it("ignores hidden files like .DS_Store in skill/ and bin/", async () => {
+    const root = makeRoot({
+      tidy: {
+        "service.js": serviceJs("tidy"),
+        "skill/SKILL.md": "x",
+        "skill/.DS_Store": "junk",
+        "bin/tidy": { exec: "#!/bin/sh\n" },
+        "bin/.DS_Store": "junk",
+      },
+    });
+    const { services, skipped } = await discoverServices(root, () => {});
+    expect(skipped).toEqual([]);
+    expect(serviceCatalogRows(services).map((r) => r.installPath)).toEqual([
+      "~/.claude/skills/tidy/SKILL.md",
+      "~/.local/bin/tidy",
+    ]);
   });
 
   it("is skipped when its folder name isn't kebab-case", async () => {

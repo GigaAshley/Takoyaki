@@ -11,9 +11,13 @@
  * A broken folder is skipped with a loud log line; the other services still
  * start. The registry test fails on any broken folder in this repo, so one
  * should never ship.
+ *
+ * Loaded with a top-level await, so a service module must never import this
+ * file (or anything that does, like distributor/full-catalog.ts): the
+ * circular import would see the lists before they are filled.
  */
 
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { systemLogger } from "../utils/logger.js";
@@ -39,6 +43,8 @@ export const SERVICES_DIR = fileURLToPath(new URL("./services/", import.meta.url
 
 const NAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const KEY_NAME_RE = /^[A-Z][A-Z0-9_]*$/;
+
+const errText = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
 /** Why a service definition can't be used, or null when it can. */
 function definitionProblem(def: unknown, folder: string): string | null {
@@ -79,21 +85,63 @@ function definitionProblem(def: unknown, folder: string): string | null {
   return null;
 }
 
+/** Hidden files (e.g. .DS_Store) in skill/ and bin/ are never shipped. */
+export const isHidden = (name: string) => name.startsWith(".");
+
+/**
+ * Why a skill/ or bin/ tree can't be shipped, or null. Everything in it
+ * must be a plain file or folder: a symlink would be skipped by the push, so
+ * it is refused here instead.
+ */
+function treeProblem(root: string, label: string): string | null {
+  for (const e of readdirSync(root, { withFileTypes: true })) {
+    if (isHidden(e.name)) continue;
+    const rel = `${label}/${e.name}`;
+    if (e.isSymbolicLink()) return `${rel} is a symlink`;
+    if (e.isDirectory()) {
+      const inner = treeProblem(path.join(root, e.name), rel);
+      if (inner) return inner;
+    } else if (!e.isFile()) {
+      return `${rel} is not a file`;
+    }
+  }
+  return null;
+}
+
 /** Why a service's skill/ and bin/ folders can't be shipped, or null. */
 function assetProblem(dir: string): string | null {
+  for (const sub of ["skill", "bin"]) {
+    const p = path.join(dir, sub);
+    const st = lstatSafe(p);
+    if (!st) continue;
+    if (!st.isDirectory()) return `${sub} is not a folder`;
+    const problem = treeProblem(p, sub);
+    if (problem) return problem;
+  }
   const skillDir = path.join(dir, "skill");
   if (existsSync(skillDir) && !existsSync(path.join(skillDir, "SKILL.md"))) {
     return "skill/ has no SKILL.md";
   }
   const binDir = path.join(dir, "bin");
   if (existsSync(binDir)) {
-    for (const file of readdirSync(binDir)) {
-      const st = statSync(path.join(binDir, file));
-      if (!st.isFile()) return `bin/${file} is not a file`;
-      if ((st.mode & 0o111) === 0) return `bin/${file} is not executable`;
+    for (const e of readdirSync(binDir, { withFileTypes: true })) {
+      if (isHidden(e.name)) continue;
+      if (!e.isFile()) return `bin/${e.name} is not a file`;
+      if ((statSync(path.join(binDir, e.name)).mode & 0o111) === 0) {
+        return `bin/${e.name} is not executable`;
+      }
     }
   }
   return null;
+}
+
+/** lstat that returns null instead of throwing (e.g. for a dangling link). */
+function lstatSafe(p: string) {
+  try {
+    return lstatSync(p);
+  } catch {
+    return null;
+  }
 }
 
 function serviceModulePath(dir: string): string | null {
@@ -146,10 +194,16 @@ export async function discoverServices(
       def = ((await import(pathToFileURL(modulePath).href)) as { default?: unknown })
         .default;
     } catch (err) {
-      skip(folder, `service file failed to load: ${err instanceof Error ? err.message : String(err)}`);
+      skip(folder, `service file failed to load: ${errText(err)}`);
       continue;
     }
-    const problem = definitionProblem(def, folder) ?? assetProblem(dir);
+    let problem: string | null;
+    try {
+      problem = definitionProblem(def, folder) ?? assetProblem(dir);
+    } catch (err) {
+      // Unreadable folder, a file vanishing mid-read, …: still just this one.
+      problem = `folder could not be read: ${errText(err)}`;
+    }
     if (problem) {
       skip(folder, problem);
       continue;

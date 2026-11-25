@@ -8,9 +8,9 @@
  * the same keys, STT_MODEL and STT_LANGUAGE, and STT_FALLBACK_PROVIDER takes
  * over when it fails. No separate provider config.
  *
- * This is the one service that borrows something from the app's own voice
- * features, so it declares no keys of its own. Until it gets its own
- * provider and key, the keys it uses are voice's.
+ * It borrows the provider from the app's own voice features, so it declares
+ * no keys of its own; until it gets its own provider and key, the keys it
+ * uses are voice's. (agent-phone does the same for transcribing replies.)
  *
  * Agent side: bin/stt (wrapper over fleet-service) and skill/SKILL.md, both
  * in this folder.

@@ -39,11 +39,6 @@ export interface ServiceOutputFile {
   bytes: Buffer;
 }
 
-/**
- * A secret stored per Skynet user (e.g. their Zoho API key), encrypted at
- * rest with the backend's system key so it can be used while they are
- * logged out. Values are write-only: no API ever returns one.
- */
 /** One instance key a service needs. Keys belong to the service alone. */
 export interface InstanceKeySpec {
   /** Plain name an admin recognises, e.g. "Twilio auth token". */
@@ -52,6 +47,11 @@ export interface InstanceKeySpec {
   description: string;
 }
 
+/**
+ * A secret stored per Skynet user (e.g. their Zoho API key), encrypted at
+ * rest with the backend's system key so it can be used while they are
+ * logged out. Values are write-only: no API ever returns one.
+ */
 export interface UserSecretSpec {
   /** Shown next to the input in Preferences or the admin user modal. */
   label: string;

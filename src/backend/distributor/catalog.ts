@@ -127,7 +127,8 @@ export interface BundledCatalogEntry {
 
   /**
    * Absolute path inside the container image where the canonical bytes live.
-   * Always under /app/fleet-substrate/ (established by slice 1).
+   * Under /app/fleet-substrate/ for hand-kept rows; agent services' rows
+   * point into their service folders in the compiled backend.
    */
   bundledPath: string;
 

@@ -64,8 +64,12 @@ services/<name>/
   fails on any broken folder in the repo, so one shouldn't ship.
 - **A service's keys are its own.** It never shares a key with the app's own
   voice features. An operator who wants one account behind both enters it
-  in both places. (`stt` is the one exception for now: it uses the voice
-  provider's keys.)
+  in both places. Two exceptions remain for now: `stt`, and agent-phone's
+  transcription of the callee's reply, both use the voice-input provider and
+  its keys.
+- **Wrapper headers say `substrate/scripts/<name>`.** That's where the
+  wrappers used to live. Leave the line alone: changing a wrapper's bytes
+  re-pushes it to every host.
 
 ## Adding a service
 

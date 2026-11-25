@@ -110,7 +110,13 @@ describe("the base app name stays out of user-facing text", () => {
   });
 
   it("agent instructions", () => {
-    const files = walk(path.join(ROOT, "substrate/skills"), (f) => f.endsWith(".md"));
+    const files = [
+      ...walk(path.join(ROOT, "substrate/skills"), (f) => f.endsWith(".md")),
+      // Agent services' skills live in their service folders.
+      ...walk(path.join(ROOT, "src/backend/agent-services/services"), (f) =>
+        f.includes(`${path.sep}skill${path.sep}`) && f.endsWith(".md"),
+      ),
+    ];
     expect(files.length).toBeGreaterThan(1);
     expect(files.flatMap((f) => offenders(f, readFileSync(f, "utf-8"), false))).toEqual([]);
   });
