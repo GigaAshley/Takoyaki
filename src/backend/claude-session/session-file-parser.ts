@@ -178,6 +178,8 @@ export type RelayOutboundMessage = {
   to?: string | null;
   /** relay-mcp sends only: the tool_use id, matched to its relay_send_result. */
   toolUseId?: string | null;
+  /** relay-mcp send_file only: the file's name and caption. */
+  file?: { name: string; caption: string | null } | null;
   eventId: string;
   ts: number;
 };
@@ -192,6 +194,8 @@ export type RelaySendResultMessage = {
   toolUseId: string;
   ok: boolean;
   roomId: string | null;
+  /** The Matrix event the send posted (for a file, the file post itself). */
+  matrixEventId: string | null;
   error: string | null;
   eventId: string;
   ts: number;
@@ -303,6 +307,7 @@ export function detectRelayOutbound(
   body: string | null;
   to?: string | null;
   toolUseId?: string | null;
+  file?: { name: string; caption: string | null } | null;
 } | null {
   if (obj.type !== "assistant") return null;
   const msg = obj.message;
@@ -341,7 +346,9 @@ const MATRIX_ROOM_ID_RE = /^![a-zA-Z0-9._=-]+:[a-zA-Z0-9.-]+$/;
  * input IS the message, so nothing is guessed: `room` when the agent replied
  * into a room, `to` when it addressed someone (the server resolves that to
  * the same person the bubble shows). Body for a file is its name, plus the
- * caption when there is one.
+ * caption when there is one; `file` carries both so the bubble can show the
+ * posted file itself once the send's result names its post. relay-mcp also
+ * takes `body` as the caption.
  */
 function detectRelayMcpSend(b: Record<string, unknown>): {
   room: string | null;
@@ -349,6 +356,7 @@ function detectRelayMcpSend(b: Record<string, unknown>): {
   body: string | null;
   to: string | null;
   toolUseId: string | null;
+  file: { name: string; caption: string | null } | null;
 } | null {
   if (b.name !== "mcp__relay__send" && b.name !== "mcp__relay__send_file") return null;
   const input = b.input;
@@ -359,15 +367,17 @@ function detectRelayMcpSend(b: Record<string, unknown>): {
   const room = roomRaw !== null && RELAY_MCP_ROOM_RE.test(roomRaw) ? roomRaw : null;
   const to = room === null ? str(inp.to) : null;
   let body: string | null;
+  let file: { name: string; caption: string | null } | null = null;
   if (b.name === "mcp__relay__send") {
     body = typeof inp.body === "string" && inp.body !== "" ? inp.body : null;
   } else {
     const path = str(inp.path);
     const name = path !== null ? path.split("/").pop() || path : null;
-    const caption = str(inp.caption);
+    const caption = str(inp.caption) ?? str(inp.body);
     body = name !== null ? `📎 ${name}${caption !== null ? `\n\n${caption}` : ""}` : caption;
+    if (name !== null) file = { name, caption };
   }
-  return { room, rawCommand: "", body, to, toolUseId: typeof b.id === "string" ? b.id : null };
+  return { room, rawCommand: "", body, to, toolUseId: typeof b.id === "string" ? b.id : null, file };
 }
 
 // Same shape relay-mcp accepts (ROOM_RE there): wider than MATRIX_ROOM_ID_RE —
@@ -384,6 +394,7 @@ export function detectRelayMcpResult(obj: Record<string, unknown>): {
   toolUseId: string;
   ok: boolean;
   roomId: string | null;
+  matrixEventId: string | null;
   error: string | null;
 } | null {
   if (obj.type !== "user") return null;
@@ -401,7 +412,7 @@ export function detectRelayMcpResult(obj: Record<string, unknown>): {
           : "";
     if (b.is_error === true) {
       if (text.startsWith("relay error:") || text.startsWith("ECONNREFUSED")) {
-        return { toolUseId: b.tool_use_id, ok: false, roomId: null, error: text.slice(0, 300) };
+        return { toolUseId: b.tool_use_id, ok: false, roomId: null, matrixEventId: null, error: text.slice(0, 300) };
       }
       continue;
     }
@@ -409,7 +420,7 @@ export function detectRelayMcpResult(obj: Record<string, unknown>): {
     try {
       const r = JSON.parse(text) as Record<string, unknown>;
       if (r.ok === true && typeof r.room_id === "string" && typeof r.event_id === "string") {
-        return { toolUseId: b.tool_use_id, ok: true, roomId: r.room_id, error: null };
+        return { toolUseId: b.tool_use_id, ok: true, roomId: r.room_id, matrixEventId: r.event_id, error: null };
       }
     } catch {
       /* not JSON — not a relay result */
@@ -1610,6 +1621,7 @@ export function parseSessionLine(line: string, sessionId?: string): ParsedLine {
         body: outbound.body,
         to: outbound.to ?? null,
         toolUseId: outbound.toolUseId ?? null,
+        file: outbound.file ?? null,
         eventId: eventIdO,
         ts: tsO,
       };

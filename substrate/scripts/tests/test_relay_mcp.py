@@ -579,6 +579,24 @@ def t_send_file(e):
     assert err and "absolute file path" in err, err
 
 
+def t_send_file_body_is_the_caption(e):
+    path = os.path.join(e.tmp, "pic.png")
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG fake")
+    out, err = e.call("send_file", {"to": BETA, "path": path, "body": "favorites?"})
+    assert err is None, err
+    assert "caption_event_id" in out, out
+    evs = e.world.rooms[out["room_id"]]["events"]
+    assert evs[1]["content"] == {"msgtype": "m.text", "body": "favorites?"}, evs
+
+
+def t_unknown_arguments_refused(e):
+    _, err = e.call("send", {"to": BETA, "body": "hi", "captoin": "x"})
+    assert err and "'captoin'" in err and "body" in err, err
+    _, err = e.call("find", {"name": "beta", "bogus": 1})
+    assert err and "'bogus'" in err, err
+
+
 def t_find_and_list_and_create(e):
     out, err = e.call("find", {"name": "beta-box-maintainer"})
     assert err is None, err

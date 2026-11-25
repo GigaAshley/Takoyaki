@@ -411,6 +411,8 @@ export type RelayOutboundEvent = {
   to?: string | null;
   /** relay-mcp sends: the tool call id, matched to its RelaySendResultEvent. */
   toolUseId?: string | null;
+  /** relay-mcp send_file: the file's name and caption. */
+  file?: { name: string; caption: string | null } | null;
   eventId: string;
   ts: number;
   /**
@@ -430,6 +432,8 @@ export type RelaySendResultEvent = {
   toolUseId: string;
   ok: boolean;
   roomId: string | null;
+  /** The Matrix event the send posted (for a file, the file post itself). */
+  matrixEventId?: string | null;
   error: string | null;
   eventId: string;
   ts: number;

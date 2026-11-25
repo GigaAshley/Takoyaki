@@ -8,6 +8,8 @@ import { addressingFor, mxidLocalpart, partyForAddressee, previewLine, type Rela
 import { useViewingUserMxid } from "@/state/viewing-user-store";
 import { useRelayRoomMembers } from "./relay-room-members";
 import { RelayChatBubble, RelayDmCard, RelayToYouBubble } from "./RelayBubbleParts";
+import { RoomFileChip } from "./RoomFileChip";
+import { buildRoomFileUrl } from "./room-file";
 
 // RelayOutboundBubble — a relay message this pane's agent sent. Harness view
 // renders a folded RelayDmCard ("Aster → Tina [DM]"). The recipient comes
@@ -17,13 +19,18 @@ import { RelayChatBubble, RelayDmCard, RelayToYouBubble } from "./RelayBubblePar
 // send reads "not sent" (never "notified"). Otherwise the card reads "Aster
 // sent a DM".
 //
+// A relay-mcp file send shows the posted file itself (pictures inline) once
+// its result names the post, the same chip a relay room shows; until then,
+// when it failed, or when the viewer can't open it (not in the room), its
+// "📎 name" text.
+//
 // The raw send command is never shown. When the message text couldn't be
 // extracted from the command, the card says so in plain words.
 //
 // Security: body renders as a React text child, never
 // dangerouslySetInnerHTML.
 
-export type RelayOutboundBubbleProps = Pick<RelayOutboundEvent, "room" | "body" | "to"> & {
+export type RelayOutboundBubbleProps = Pick<RelayOutboundEvent, "room" | "body" | "to" | "file"> & {
   /** ms-epoch timestamp; shown as a hover title. */
   ts?: number;
   /** Relay-source view: plain chat bubble, always open. */
@@ -36,6 +43,10 @@ export type RelayOutboundBubbleProps = Pick<RelayOutboundEvent, "room" | "body" 
   fallbackVoice?: string | null;
   /** relay-mcp sends: the call's outcome, once its tool_result has arrived. */
   result?: RelaySendResultEvent | null;
+  /** Opens the file window for a sent file (same contract as other file chips). */
+  onOpenEditor?: (args: { messageEventId: string; url: string; filename: string }) => void;
+  /** Encoded tab spec of this conversation, for dragging a sent file into a pane. */
+  fileDragOrigin?: string | null;
 };
 
 export function RelayOutboundBubble({
@@ -48,6 +59,9 @@ export function RelayOutboundBubble({
   selfIdentity = null,
   fallbackVoice = null,
   result = null,
+  file = null,
+  onOpenEditor,
+  fileDragOrigin = null,
 }: RelayOutboundBubbleProps) {
   const { byKey } = useIdentities();
   const viewerMxid = useViewingUserMxid();
@@ -87,7 +101,11 @@ export function RelayOutboundBubble({
       ? { speakState, onClick: (e: MouseEvent) => { void onSpeakClick(e); } }
       : null;
 
-  const content =
+  const posted =
+    file && result?.ok && result.roomId && result.matrixEventId
+      ? { roomId: result.roomId, eventId: result.matrixEventId }
+      : null;
+  const text =
     body !== null ? (
       body
     ) : (
@@ -95,6 +113,24 @@ export function RelayOutboundBubble({
         {sender.name} sent a message here, but its text couldn't be shown.
       </div>
     );
+  const content = posted && file ? (
+    <RoomFileChip
+      file={{
+        roomId: posted.roomId,
+        eventId: posted.eventId,
+        name: file.name,
+        size: null,
+        mimetype: null,
+        url: buildRoomFileUrl(posted.roomId, posted.eventId, file.name),
+        ...(file.caption ? { caption: file.caption } : {}),
+      }}
+      onOpenEditor={onOpenEditor}
+      dragOrigin={fileDragOrigin}
+      fallback={text}
+    />
+  ) : (
+    text
+  );
 
   if (alwaysExpanded) {
     return (

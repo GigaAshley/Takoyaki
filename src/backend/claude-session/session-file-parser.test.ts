@@ -1854,6 +1854,29 @@ describe("parseSessionLine — relay-mcp sends", () => {
     expect(parsed.to).toBe("beta");
   });
 
+  it("send_file → carries the file name and caption for the bubble's file chip", () => {
+    const parsed = parseSessionLine(
+      mcpTurn("mcp__relay__send_file", { to: "beta", path: "/tmp/out/pic.jpg", caption: "look" }),
+    );
+    if (parsed.kind !== "relay_outbound") throw new Error(`got ${parsed.kind}`);
+    expect(parsed.file).toEqual({ name: "pic.jpg", caption: "look" });
+  });
+
+  it("send_file with its caption passed as body → still the caption", () => {
+    const parsed = parseSessionLine(
+      mcpTurn("mcp__relay__send_file", { to: "beta", path: "/tmp/out/pic.jpg", body: "favorites?" }),
+    );
+    if (parsed.kind !== "relay_outbound") throw new Error(`got ${parsed.kind}`);
+    expect(parsed.file).toEqual({ name: "pic.jpg", caption: "favorites?" });
+    expect(parsed.body).toBe("📎 pic.jpg\n\nfavorites?");
+  });
+
+  it("plain send → no file", () => {
+    const parsed = parseSessionLine(mcpTurn("mcp__relay__send", { to: "beta", body: "x" }));
+    if (parsed.kind !== "relay_outbound") throw new Error(`got ${parsed.kind}`);
+    expect(parsed.file).toBeNull();
+  });
+
   it("send alongside narration text still classifies as the send", () => {
     const parsed = parseSessionLine(
       mcpTurn("mcp__relay__send", { to: "beta", body: "ping" }, [{ type: "text", text: "Messaging beta." }]),
@@ -1890,14 +1913,14 @@ describe("parseSessionLine — relay-mcp sends", () => {
   it("successful send result → relay_send_result ok with the room", () => {
     const text = JSON.stringify({ ok: true, room_id: "!dm:hs", event_id: "$e", new_room: false, recipients: [] });
     const parsed = parseSessionLine(resultTurn({ content: [{ type: "text", text }] }));
-    expect(parsed).toMatchObject({ kind: "relay_send_result", toolUseId: "toolu_mcp_1", ok: true, roomId: "!dm:hs", error: null, eventId: "relay-res-1" });
+    expect(parsed).toMatchObject({ kind: "relay_send_result", toolUseId: "toolu_mcp_1", ok: true, roomId: "!dm:hs", matrixEventId: "$e", error: null, eventId: "relay-res-1" });
   });
 
   it("relay error result → relay_send_result not ok, with the error", () => {
     const parsed = parseSessionLine(
       resultTurn({ is_error: true, content: [{ type: "text", text: "relay error: 'ash' matches several accounts" }] }),
     );
-    expect(parsed).toMatchObject({ kind: "relay_send_result", ok: false, roomId: null });
+    expect(parsed).toMatchObject({ kind: "relay_send_result", ok: false, roomId: null, matrixEventId: null });
     if (parsed.kind !== "relay_send_result") throw new Error("unreachable");
     expect(parsed.error).toContain("several accounts");
   });

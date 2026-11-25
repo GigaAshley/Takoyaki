@@ -530,7 +530,8 @@ TOOLS = [
                 "to": TO_PROP,
                 "room": ROOM_PROP,
                 "path": {"type": "string", "description": "Absolute path of the file to send."},
-                "caption": {"type": "string", "description": "Optional message sent right after the file."},
+                "caption": {"type": "string", "description": "Optional message sent right after the file. `body` is taken as the same thing."},
+                "body": {"type": "string", "description": "Same as `caption`."},
                 "account": ACCOUNT_PROP,
             },
             "required": ["path"],
@@ -640,6 +641,8 @@ def tool_send_file(mx, args):
     eid = _send_event(mx, room_id, {"msgtype": msgtype, "url": mxc, "body": name, "info": {"mimetype": mime, "size": size}})
     out = {"ok": True, "room_id": room_id, "event_id": eid, "new_room": created, "file": name}
     caption = args.get("caption")
+    if not (isinstance(caption, str) and caption.strip()):
+        caption = args.get("body")
     if isinstance(caption, str) and caption.strip():
         out["caption_event_id"] = _send_event(mx, room_id, {"msgtype": "m.text", "body": caption})
     out.update(_recipients(mx, room_id))
@@ -819,12 +822,20 @@ HANDLERS = {
 }
 
 
+# Each tool's accepted arguments, from its schema — anything else is refused
+# rather than silently dropped (a misnamed caption would otherwise never send).
+TOOL_ARGS = {t["name"]: set(t["inputSchema"].get("properties", {})) for t in TOOLS}
+
+
 def call_tool(identity, name, args):
     handler = HANDLERS.get(name)
     if not handler:
         return {"content": [{"type": "text", "text": f"unknown tool {name!r}"}], "isError": True}
     started = time.monotonic()
     try:
+        unknown = sorted(set(args or {}) - TOOL_ARGS.get(name, set()))
+        if unknown:
+            raise ToolError(f"{name} doesn't take {', '.join(map(repr, unknown))}; it takes {', '.join(sorted(TOOL_ARGS[name]))}")
         mx = Matrix(identity, (args or {}).get("account") or "relay")
         result = handler(mx, args or {})
         log(f"[relay-mcp] call identity={identity} tool={name} ok=true ms={int((time.monotonic() - started) * 1000)}")

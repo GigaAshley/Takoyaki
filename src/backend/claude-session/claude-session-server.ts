@@ -307,6 +307,7 @@ type StreamEvent =
       body: string | null;
       to: string | null;
       toolUseId: string | null;
+      file: { name: string; caption: string | null } | null;
       eventId: string;
       ts: number;
       line: number;
@@ -316,6 +317,7 @@ type StreamEvent =
       toolUseId: string;
       ok: boolean;
       roomId: string | null;
+      matrixEventId: string | null;
       error: string | null;
       eventId: string;
       ts: number;
@@ -392,6 +394,7 @@ export function reshapeParsedLineToWireFrame(
         body: parsed.body ?? null,
         to: parsed.to ?? null,
         toolUseId: parsed.toolUseId ?? null,
+        file: parsed.file ?? null,
         eventId: parsed.eventId,
         ts: parsed.ts,
         line,
@@ -402,6 +405,7 @@ export function reshapeParsedLineToWireFrame(
         toolUseId: parsed.toolUseId,
         ok: parsed.ok,
         roomId: parsed.roomId,
+        matrixEventId: parsed.matrixEventId,
         error: parsed.error,
         eventId: parsed.eventId,
         ts: parsed.ts,

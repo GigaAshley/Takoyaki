@@ -109,6 +109,13 @@ describe("RoomFileChip", () => {
     expect(await screen.findByTestId("room-file-unavailable")).toHaveTextContent("No longer available");
   });
 
+  it("with a fallback, a file that can't be opened shows the fallback instead of the note", async () => {
+    api.getRelayRoomFileStatus.mockResolvedValue("not_found");
+    render(<RoomFileChip file={ref()} fallback={<span>📎 report.pdf</span>} />);
+    expect(await screen.findByText("📎 report.pdf")).toBeInTheDocument();
+    expect(screen.queryByTestId("room-file-unavailable")).toBeNull();
+  });
+
   it("shows a post's own caption under the chip", () => {
     render(<RoomFileChip file={ref({ caption: "the Q3 numbers" })} />);
     expect(screen.getByTestId("room-file-caption")).toHaveTextContent("the Q3 numbers");

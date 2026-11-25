@@ -5,7 +5,7 @@
 // with its name and a note instead of vanishing. A caption written inside
 // the post (another client's picture-with-text) shows under the chip.
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { FileWarning } from "lucide-react";
 import type { RoomFileRef } from "@/api/claude-session-api";
 import { getRelayRoomFileStatus } from "@/api/relay-room-files-api";
@@ -78,9 +78,14 @@ export interface RoomFileChipProps {
   onOpenEditor?: (args: { messageEventId: string; url: string; filename: string }) => void;
   /** Encoded tab spec of the room's conversation, for drags into a pane. */
   dragOrigin?: string | null;
+  /**
+   * Shown instead of the "can't be opened" chip when the file can't be opened
+   * — for a file sent from a conversation whose viewer isn't in the room.
+   */
+  fallback?: ReactNode;
 }
 
-export function RoomFileChip({ file, onOpenEditor, dragOrigin }: RoomFileChipProps) {
+export function RoomFileChip({ file, onOpenEditor, dragOrigin, fallback }: RoomFileChipProps) {
   const [gone, setGone] = useState<string | null>(null);
 
   useEffect(() => {
@@ -109,6 +114,7 @@ export function RoomFileChip({ file, onOpenEditor, dragOrigin }: RoomFileChipPro
     </div>
   ) : null;
   if (file.url === null || gone !== null) {
+    if (fallback !== undefined) return <>{fallback}</>;
     return (
       <>
         <UnavailableFileChip name={file.name} reason={gone ?? file.unavailable ?? "missing"} />

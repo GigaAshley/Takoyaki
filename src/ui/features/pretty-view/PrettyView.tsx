@@ -5176,7 +5176,10 @@ export function PrettyView({
                   room={m.room}
                   body={m.body}
                   to={m.to ?? null}
+                  file={m.file ?? null}
                   result={m.toolUseId ? relayResults.get(m.toolUseId) ?? null : null}
+                  onOpenEditor={handleOpenEditor}
+                  fileDragOrigin={fileDragOrigin}
                   ts={m.ts}
                   hostId={hostId}
                   selfIdentity={pvIdentity}

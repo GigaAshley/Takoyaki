@@ -265,3 +265,68 @@ describe("RelayOutboundBubble", () => {
     expect(membersMock).toHaveBeenCalledWith(null, 42);
   });
 });
+
+vi.mock("./RoomFileChip", () => ({
+  RoomFileChip: ({
+    file,
+    fallback,
+  }: {
+    file: { name: string; url: string | null; eventId: string; caption?: string };
+    fallback?: React.ReactNode;
+  }) => (
+    <div data-testid="room-file-chip-stub" data-url={file.url ?? ""} data-event={file.eventId}>
+      {file.name}
+      {file.caption ? ` / ${file.caption}` : ""}
+      <div data-testid="room-file-chip-fallback">{fallback}</div>
+    </div>
+  ),
+}));
+
+describe("RelayOutboundBubble — sent files", () => {
+  const sent = {
+    type: "relay_send_result" as const,
+    toolUseId: "toolu_1",
+    ok: true,
+    roomId: "!dm:harbor.example",
+    matrixEventId: "$post1",
+    error: null,
+    eventId: "res-1",
+    ts: 0,
+  };
+  const fileProps = {
+    room: "!dm:harbor.example",
+    body: "📎 pic.jpg\n\nfavorites?",
+    file: { name: "pic.jpg", caption: "favorites?" },
+    to: "@robin:harbor.example",
+  };
+
+  it("shows the posted file once the send's result names its post", () => {
+    renderOut({ ...fileProps, result: sent });
+    const chip = screen.getByTestId("room-file-chip-stub");
+    expect(chip).toHaveTextContent("pic.jpg / favorites?");
+    expect(chip.getAttribute("data-event")).toBe("$post1");
+    expect(chip.getAttribute("data-url")).toContain("/file/.relay-room/");
+  });
+
+  it("hands the chip the 📎 text to show when the viewer can't open the file", () => {
+    renderOut({ ...fileProps, result: sent });
+    expect(screen.getByTestId("room-file-chip-fallback")).toHaveTextContent("📎 pic.jpg");
+  });
+
+  it("before the result arrives → the 📎 name text", () => {
+    renderOut({ ...fileProps, result: null });
+    expect(screen.queryByTestId("room-file-chip-stub")).toBeNull();
+    expect(screen.getByText(/📎 pic\.jpg/)).toBeInTheDocument();
+  });
+
+  it("a failed send → the 📎 name text, no chip", () => {
+    renderOut({ ...fileProps, result: { ...sent, ok: false, roomId: null, matrixEventId: null, error: "relay error: x" } });
+    expect(screen.queryByTestId("room-file-chip-stub")).toBeNull();
+    expect(screen.getByText(/📎 pic\.jpg/)).toBeInTheDocument();
+  });
+
+  it("a plain text send never shows a chip", () => {
+    renderOut({ to: "@robin:harbor.example", result: sent });
+    expect(screen.queryByTestId("room-file-chip-stub")).toBeNull();
+  });
+});
