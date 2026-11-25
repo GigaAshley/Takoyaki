@@ -19,7 +19,14 @@ Wire contract (canonical): src/backend/fleet-status/sweep-schema.ts.
       accounted for below with the same key name.
 
 Invocation (production):
-    ~/.local/bin/fleet-status-sweep      # no args, no stdin, reads env $HOME
+    ~/.local/bin/fleet-status-sweep [--known-tails <b64>]   # no stdin, reads env $HOME
+
+    --known-tails carries base64 of a JSON object {identity: [inode, end]}:
+    how far into each identity's JSONL the caller already holds whole lines.
+    For a listed identity whose file is the same inode and has grown by at
+    most TAIL_BYTES, the pid line carries only the whole lines appended past
+    `end` (jsonl_tail_base = end). Anything else — no flag, unknown
+    identity, new file, shrunk file, a bigger jump — gets the full tail.
 
 Distribution: this file is git-committed with the execute bit set. The substrate
 distributor bundles substrate/scripts/*.* into the container at
@@ -57,7 +64,7 @@ Exec-site → emission mapping (parity with RESEARCH.md § "Current per-identity
     A9  cat stop-<sid>.json                      → SweepPidLine.per_session_stop_payload
     A10 stat identities/<name>/.dormant  (A)     → SweepPidLine.dormant_a
     A11 discover JSONL path per PID              → folded (reused from B4)
-    A12 tail -c 262144 <jsonlPath>               → SweepPidLine.jsonl_tail
+    A12 tail -c 262144 <jsonlPath>               → SweepPidLine.jsonl_tail (+ _ino/_end/_base; deltas)
     B0  find identities/                         → identity enumeration (this script)
     B1  stat identities/<name>/.dormant  (B)     → SweepIdentityLine.dormant
     B2  stat identities/<name>/.compact-requested → SweepIdentityLine.compact_requested
@@ -84,6 +91,7 @@ Constraints:
       caller re-applies in Plan 04 belt-and-suspenders).
 """
 
+import base64
 import glob
 import hashlib
 import json
@@ -353,26 +361,69 @@ def discover_identity_jsonl_path(identity_name, home):
 
 
 # ---------------------------------------------------------------------------
-# Section — helper: read the last TAIL_BYTES of a file safely.
+# Section — helper: read a JSONL tail (full, or only what was appended).
 # ---------------------------------------------------------------------------
 
 
-def _read_tail_bytes(path):
-    """Read the last TAIL_BYTES bytes of `path` (or the whole file if smaller).
+def _read_jsonl_tail(path, known):
+    """A12 with deltas: the tail of `path`, or only what was appended since
+    the caller's `known` = (inode, end) position.
 
-    Returns a str (decoded utf-8 with errors="replace"), or None on any
-    OSError. Deliberately mirrors `tail -c 262144 <path> 2>/dev/null`.
+    Returns {"text", "ino", "end", "base"} or None on any OSError:
+      * base is None  → text is the full tail (last TAIL_BYTES), as before.
+      * base is an int → text is the bytes [base, end) — whole lines only,
+        possibly "" when nothing was appended.
+    `end` stops after the last newline read, so a line still being written
+    is left for the next tick; a full tail with no newline at all ends at
+    the file size, as the plain tail always did.
     """
     try:
         with open(path, "rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            size = fh.tell()
-            start = max(0, size - TAIL_BYTES)
+            st = os.fstat(fh.fileno())
+            size = st.st_size
+            ino = st.st_ino
+            base = None
+            if known is not None:
+                k_ino, k_end = known
+                if k_ino == ino and 0 <= k_end <= size and size - k_end <= TAIL_BYTES:
+                    base = k_end
+            start = base if base is not None else max(0, size - TAIL_BYTES)
             fh.seek(start, os.SEEK_SET)
-            data = fh.read()
-        return data.decode("utf-8", errors="replace")
+            data = fh.read(size - start)
     except OSError:
         return None
+    cut = data.rfind(b"\n") + 1
+    if cut > 0:
+        data = data[:cut]
+    elif base is not None:
+        data = b""
+    return {
+        "text": data.decode("utf-8", errors="replace"),
+        "ino": ino,
+        "end": start + len(data),
+        "base": base,
+    }
+
+
+def _parse_known_tails(argv):
+    """`--known-tails <b64>` → {identity: (inode, end)}. Malformed → {} so
+    the sweep falls back to full tails rather than failing."""
+    try:
+        i = argv.index("--known-tails")
+        raw = json.loads(base64.b64decode(argv[i + 1], validate=True))
+    except (ValueError, IndexError, TypeError):
+        return {}
+    known = {}
+    if isinstance(raw, dict):
+        for name, pos in raw.items():
+            if (
+                isinstance(name, str)
+                and isinstance(pos, list)
+                and len(pos) == 2
+                and all(isinstance(v, int) and not isinstance(v, bool) for v in pos)
+            ):
+                known[name] = (pos[0], pos[1])
+    return known
 
 
 # ---------------------------------------------------------------------------
@@ -1245,7 +1296,7 @@ def _build_identity_line(name, home, sentinels, jsonl_path, role_cosmetics_memo)
     return line
 
 
-def _build_pid_line(pid, identity, home, identity_jsonl_paths, jsonl_tail_cache):
+def _build_pid_line(pid, identity, home, identity_jsonl_paths, jsonl_tail_cache, known_tails=None):
     """Assemble a SweepPidLine dict.
 
     Fields match SweepPidLine in sweep-schema.ts. Per G6, if the sessionId
@@ -1303,7 +1354,7 @@ def _build_pid_line(pid, identity, home, identity_jsonl_paths, jsonl_tail_cache)
     # A12: jsonl_tail — read at most once per identity per tick (several
     # PIDs can share an identity), memoized in `jsonl_tail_cache`. If the
     # identity had no discovered path OR the tail read failed, emit None.
-    jsonl_tail = None
+    # With a known position from --known-tails it is only the appended lines.
     if identity is not None:
         if identity not in jsonl_tail_cache:
             fallback_path = identity_jsonl_paths.get(identity)
@@ -1315,10 +1366,14 @@ def _build_pid_line(pid, identity, home, identity_jsonl_paths, jsonl_tail_cache)
                 fallback_path = discover_identity_jsonl_path(identity, home)
                 identity_jsonl_paths[identity] = fallback_path
             if fallback_path is not None:
-                jsonl_tail_cache[identity] = _read_tail_bytes(fallback_path)
+                jsonl_tail_cache[identity] = _read_jsonl_tail(
+                    fallback_path, (known_tails or {}).get(identity),
+                )
             else:
                 jsonl_tail_cache[identity] = None
-        jsonl_tail = jsonl_tail_cache[identity]
+        tail = jsonl_tail_cache[identity]
+    else:
+        tail = None
 
     return {
         "line_kind": "pid",
@@ -1332,7 +1387,10 @@ def _build_pid_line(pid, identity, home, identity_jsonl_paths, jsonl_tail_cache)
         "stopped_mtime_ms": stopped_mtime_ms,
         "per_session_stop_payload": per_session_stop_payload,
         "dormant_a": dormant_a,
-        "jsonl_tail": jsonl_tail,
+        "jsonl_tail": tail["text"] if tail is not None else None,
+        "jsonl_tail_ino": tail["ino"] if tail is not None else None,
+        "jsonl_tail_end": tail["end"] if tail is not None else None,
+        "jsonl_tail_base": tail["base"] if tail is not None else None,
     }
 
 
@@ -1937,12 +1995,14 @@ def main():
 
     # ---- Emit pid lines. Skip PIDs with no resolved identity — matches
     #      today's "no tmuxSession → no source-A frame" path. ----
-    jsonl_tail_cache = {}  # name -> str | None (A12 tail, one read per identity)
+    jsonl_tail_cache = {}  # name -> dict | None (A12 tail, one read per identity)
+    known_tails = _parse_known_tails(sys.argv[1:])
     for pid, identity in resolved_pids:
         if identity is None:
             continue
         line = _build_pid_line(
             pid, identity, home, identity_jsonl_paths, jsonl_tail_cache,
+            known_tails,
         )
         _emit(line)
 

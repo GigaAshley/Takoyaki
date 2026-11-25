@@ -73,6 +73,7 @@ import {
   type SweepPidLine,
   type SweepIdentityLine,
 } from "./sweep-schema.js";
+import { resolveSweepTails, sweepCommand } from "./sweep-tail-store.js";
 // Phase 85 (D-07): per-tick `lastMessageAt` derivation reads user's newest
 // send-time timestamp from the identity-name-keyed send-log store instead of
 // scanning the JSONL tail. `scanTailForNewestMessageAt` stays defined + exported
@@ -2227,7 +2228,7 @@ export function createSshPollOrchestrator(
       // on a stalled managed box.
       try {
         sweepRaw = await Promise.race([
-          channel.exec("~/.local/bin/fleet-status-sweep 2>/dev/null", undefined, {
+          channel.exec(sweepCommand(peer ?? null), undefined, {
             timeoutMs: SWEEP_EXEC_TIMEOUT_MS,
           }),
           new Promise<string | null>((_, reject) =>
@@ -2284,6 +2285,9 @@ export function createSshPollOrchestrator(
     }
 
     const parsed = parseSweepJsonl(sweepRaw);
+    // A12 — the sweep may send only the lines appended since the last tick;
+    // rebuild each identity's full tail before anything reads it.
+    const resolvedTails = resolveSweepTails(peer ?? null, sweepRaw, parsed.pidLines);
     if (parsed.schemaMismatch) {
       systemLogger.warn(
         "Fleet-status: sweep-emit schema_version mismatch — latching fallback",
@@ -2370,7 +2374,12 @@ export function createSshPollOrchestrator(
     // Source A — dispatch each SweepPidLine into the SAME compose helper the
     // legacy path uses. writeSessionFileCache fires here (compose G8).
     for (const pidLine of parsed.pidLines) {
-      const fetched = pidLineToPerPidFetched(pidLine, identityLineByName, host.id);
+      const fetched = pidLineToPerPidFetched(
+        pidLine,
+        identityLineByName,
+        host.id,
+        resolvedTails.get(pidLine.identity) ?? null,
+      );
       await composeAndPublishPerPid(hostState, pidLine.pid, fetched);
     }
 
@@ -2676,6 +2685,9 @@ export function createSshPollOrchestrator(
     // Note: `identityLine` here is the SAME joined line the A11 `jsonl_path`
     // fold already uses — no new lookup, no new SSH read.
     hostIdRaw: string,
+    // The identity's full tail, rebuilt by resolveSweepTails (the line's own
+    // jsonl_tail may be only the newly appended lines).
+    jsonlTail: string | null,
   ): PerPidFetchedState {
     const identityLine = identityLineByName.get(pidLine.identity);
     return {
@@ -2694,7 +2706,7 @@ export function createSshPollOrchestrator(
         // Line for every SweepPidLine.identity (per Plan 02 contract).
         ? (identityLine?.jsonl_path ?? null)
         : (identityLine?.jsonl_path ?? null),
-      jsonlTail: pidLine.jsonl_tail,
+      jsonlTail,
       // Phase 111 Plan 03: appearance resolved via the shared helper once per
       // identity per tick. The joined identityLine is the same line A11 uses.
       identityAppearance: appearanceFromIdentityLine(identityLine, hostIdRaw, pidLine.identity),

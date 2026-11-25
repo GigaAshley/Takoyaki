@@ -216,7 +216,16 @@ export interface SweepIdentityLine {
  *   • jsonl_tail                ↔ A12 (up-to-256KB tail of the identity's
  *                                active JSONL for the ai-title scan; null
  *                                when path unknown/unreadable; caller runs
- *                                scanTailForLatestAiTitle unchanged)
+ *                                scanTailForLatestAiTitle unchanged). When
+ *                                jsonl_tail_base is a number it is NOT the
+ *                                tail but only the whole lines appended past
+ *                                that byte offset (see --known-tails in the
+ *                                sweep script); the caller splices it onto
+ *                                the tail it already holds.
+ *   • jsonl_tail_ino / _end     ↔ the file's inode and the byte offset just
+ *                                past the last whole line read — what the
+ *                                caller sends back as its known position.
+ *                                Absent from older sweep scripts.
  *
  * G6 note (safe-char guard): sessionIds failing the /^[a-zA-Z0-9_-]+$/ regex
  * cause the server-side script to emit null for per_session_stop_mtime_ms,
@@ -236,6 +245,9 @@ export interface SweepPidLine {
   per_session_stop_payload: string | null;
   dormant_a: boolean;
   jsonl_tail: string | null;
+  jsonl_tail_ino?: number | null;
+  jsonl_tail_end?: number | null;
+  jsonl_tail_base?: number | null;
 }
 
 // ---------------------------------------------------------------------------

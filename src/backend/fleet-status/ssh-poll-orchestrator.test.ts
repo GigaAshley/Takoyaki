@@ -28,7 +28,9 @@ import {
   __scanTailForNewestMessageAtForTests,
   parseSpawnRequestBatch,
   scanSpawnRequests,
+  __resetSweepResultCacheForTests,
 } from "./ssh-poll-orchestrator.js";
+import { __resetSweepTailStoreForTests } from "./sweep-tail-store.js";
 import type { PendingBirth } from "../spawn-requests/types.js";
 import type { SubscriptionRegistry, ProjectListEntry } from "./subscription-registry.js";
 import type { AppState, SessionState } from "./wire-protocol.js";
@@ -459,6 +461,9 @@ function makeSweepJsonl(input: {
       per_session_stop_payload: raw.per_session_stop_payload ?? null,
       dormant_a: raw.dormant_a ?? false,
       jsonl_tail: raw.jsonl_tail ?? null,
+      ...(raw.jsonl_tail_ino !== undefined ? { jsonl_tail_ino: raw.jsonl_tail_ino } : {}),
+      ...(raw.jsonl_tail_end !== undefined ? { jsonl_tail_end: raw.jsonl_tail_end } : {}),
+      ...(raw.jsonl_tail_base !== undefined ? { jsonl_tail_base: raw.jsonl_tail_base } : {}),
     };
     lines.push(JSON.stringify(line));
   }
@@ -6980,6 +6985,79 @@ describe("Phase 92 — batch sweep dispatch", () => {
     expect(
       countExact(channel, "~/.local/bin/fleet-status-sweep 2>/dev/null"),
     ).toBe(3);
+  });
+
+  // -------------------------------------------------------------------------
+  // Tail deltas — once a tail is held, the next sweep is asked with
+  // --known-tails and its appended lines are spliced onto the held tail
+  // before anything reads it (here: the ai-title scan).
+  // -------------------------------------------------------------------------
+  it("sends known tail positions on the next sweep and rebuilds the tail from the appended lines", async () => {
+    __resetSweepTailStoreForTests();
+    __resetSweepResultCacheForTests();
+    const channel = new MockSshChannel();
+    (channel as unknown as { peer: string }).peer = "100.64.0.42:22";
+    wireBatchProbe(channel, true);
+    const identities = IDENTITIES.map((identity) => ({ identity, jsonl_path: null }));
+    const first = '{"type":"ai-title","aiTitle":"First","sessionId":"s"}\n';
+    const added = '{"type":"ai-title","aiTitle":"Second","sessionId":"s"}\n';
+    channel.setResponse(
+      "fleet-status-sweep --known-tails",
+      makeSweepJsonl({
+        identities,
+        pids: [{
+          identity: "alpha",
+          pid: PID_ALPHA,
+          jsonl_tail: added,
+          jsonl_tail_ino: 5,
+          jsonl_tail_end: first.length + added.length,
+          jsonl_tail_base: first.length,
+        }],
+      }),
+    );
+    channel.setResponse(
+      "~/.local/bin/fleet-status-sweep 2>/dev/null",
+      makeSweepJsonl({
+        identities,
+        pids: [{
+          identity: "alpha",
+          pid: PID_ALPHA,
+          jsonl_tail: first,
+          jsonl_tail_ino: 5,
+          jsonl_tail_end: first.length,
+          jsonl_tail_base: null,
+        }],
+      }),
+    );
+
+    const capture = makeSetIntervalCapture();
+    const deps = buildDeps({
+      acquireSshChannel: vi.fn().mockResolvedValue(channel),
+      setInterval: capture.setInterval,
+    });
+    const orchestrator = createSshPollOrchestrator(deps);
+    await orchestrator.start();
+    const titles = () =>
+      deps.registry.publishedStates
+        .filter((p) => p.state.tmuxSession === "alpha")
+        .map((p) => p.state.aiTitle);
+    expect(titles().at(-1)).toBe("First");
+
+    __resetSweepResultCacheForTests();
+    const pollFn = capture.fns.find((f) => f.ms === 2000);
+    await pollFn!.fn();
+
+    const sweeps = channel
+      .getCalls()
+      .map((c) => c.command)
+      .filter((c) => c.includes("fleet-status-sweep") && !c.startsWith("test -x"));
+    expect(sweeps[0]).toBe("~/.local/bin/fleet-status-sweep 2>/dev/null");
+    const arg = /--known-tails (\S+) 2>\/dev\/null$/.exec(sweeps[1])![1];
+    expect(JSON.parse(Buffer.from(arg, "base64").toString("utf8"))).toEqual({
+      alpha: [5, first.length],
+    });
+    expect(titles().at(-1)).toBe("Second");
+    orchestrator.stop();
   });
 
   // -------------------------------------------------------------------------
