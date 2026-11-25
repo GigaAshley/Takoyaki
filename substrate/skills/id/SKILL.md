@@ -1866,13 +1866,13 @@ crown, then gear.
   in the composer's row, just right of the paperclip. Tapping it opens a
   menu listing the skills on the box this agent runs on — the skills whose
   **You** switch is on in the footer's lightning-bolt Skills editor
-  (fleet-distributed ones stay out), alphabetical, each with a lettered
-  tile and its description (up to two lines). A search field on top
+  (fleet-distributed ones stay out), alphabetical, each its name over its
+  description (up to two lines). A search field on top
   (focused on open, except on touch screens) filters by name and
   description; after typing a search, Enter runs the top match. Tapping a skill sends `/<skill-name>` at once,
   exactly like thumbs-up sends its reply: no arguments, anything the user
-  had typed stays in the compose box. The last row, **New skill…** (a plus
-  tile, there even mid-search), sends nothing: it asks for a new skill's
+  had typed stays in the compose box. The last row, **+ New skill…** (there
+  even mid-search), sends nothing: it asks for a new skill's
   name (starting from whatever was typed in the search) and description,
   makes it on this agent's box, and opens the Skills window on it;
   cancelling either question leaves the user in the conversation. The
