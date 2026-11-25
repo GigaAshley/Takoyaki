@@ -3,9 +3,8 @@
 #
 # Hermetic tests for the agent-services host helpers:
 #   substrate/scripts/fleet-service   (shared file-drop client)
-#   substrate/scripts/agent-phone      (wrapper)
-#   substrate/scripts/image-gen        (wrapper)
-#   substrate/scripts/stt              (wrapper)
+#   and each service's own wrapper, in
+#   src/backend/agent-services/services/<name>/bin/
 #
 # A fake backend (fake_backend below) plays the server's part: it waits for a
 # request envelope in $HOME/fleet/service-requests/, claims it the way the
@@ -21,10 +20,14 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS="$(cd "$SCRIPT_DIR/.." && pwd)"
+SERVICES="$(cd "$SCRIPTS/../../src/backend/agent-services/services" && pwd)"
 FLEET_SERVICE="$SCRIPTS/fleet-service"
-AGENT_PHONE="$SCRIPTS/agent-phone"
-IMAGE_GEN="$SCRIPTS/image-gen"
-STT="$SCRIPTS/stt"
+AGENT_PHONE="$SERVICES/agent-phone/bin/agent-phone"
+IMAGE_GEN="$SERVICES/image-gen/bin/image-gen"
+STT="$SERVICES/stt/bin/stt"
+# On a host the wrappers sit next to fleet-service in ~/.local/bin; here they
+# don't, so they find it on PATH.
+export PATH="$SCRIPTS:$PATH"
 
 for s in "$FLEET_SERVICE" "$AGENT_PHONE" "$IMAGE_GEN" "$STT"; do
   [ -x "$s" ] || { printf 'FATAL: %s missing or not executable\n' "$s" >&2; exit 1; }

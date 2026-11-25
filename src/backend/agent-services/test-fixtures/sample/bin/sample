@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+exec fleet-service call sample --input "{\"word\":\"$1\"}"

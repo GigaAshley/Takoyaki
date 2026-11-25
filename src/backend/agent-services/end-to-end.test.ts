@@ -1,6 +1,6 @@
 /**
- * End to end: the real host-side wrappers (substrate/scripts/image-gen,
- * agent-phone, stt → fleet-service) against the real engine, local-host request
+ * End to end: the real host-side wrappers (each service's bin/ folder:
+ * image-gen, agent-phone, stt → substrate/scripts/fleet-service) against the real engine, local-host request
  * I/O and atomic writers, in a temp HOME. Only the third-party calls (OpenAI,
  * Twilio, the users table) are faked.
  */
@@ -145,9 +145,16 @@ function makeEngine() {
 /** Run a helper while acting as the backend scan loop, until it exits. */
 async function runWithBackend(script: string, args: string[], stdin?: string) {
   const { engine, ...fakes } = makeEngine();
-  const child = spawn(path.join(SCRIPTS, script), args, {
+  const scriptPath =
+    script === "fleet-service"
+      ? path.join(SCRIPTS, script)
+      : path.join(__dirname, "services", script, "bin", script);
+  const child = spawn(scriptPath, args, {
     env: {
       ...process.env,
+      // On a host the wrappers sit next to fleet-service; here they find it
+      // on PATH.
+      PATH: `${SCRIPTS}:${process.env.PATH ?? ""}`,
       HOME: home,
       IMAGE_GEN_TIMEOUT_SEC: "20",
       AGENT_PHONE_TIMEOUT_SEC: "20",

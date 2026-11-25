@@ -8,8 +8,12 @@
  * the same keys, STT_MODEL and STT_LANGUAGE, and STT_FALLBACK_PROVIDER takes
  * over when it fails. No separate provider config.
  *
- * Agent side: substrate/scripts/stt (wrapper over fleet-service) and
- * substrate/skills/stt/SKILL.md.
+ * This is the one service that borrows something from the app's own voice
+ * features, so it declares no keys of its own. Until it gets its own
+ * provider and key, the keys it uses are voice's.
+ *
+ * Agent side: bin/stt (wrapper over fleet-service) and skill/SKILL.md, both
+ * in this folder.
  *
  * Limits: 4 requests in flight, a fleet-wide requests-per-minute cap from
  * SKYNET_STT_RPM (default 30), 25 MB per file (same cap as voice input), and

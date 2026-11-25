@@ -2,8 +2,8 @@
  * image-gen — generate images from a prompt (optionally editing a reference
  * image) with OpenAI gpt-image-1.5, and hand the PNGs back to the agent.
  *
- * Agent side: substrate/scripts/image-gen (wrapper over fleet-service) and
- * substrate/skills/image-gen/SKILL.md.
+ * Agent side: bin/image-gen (wrapper over fleet-service) and
+ * skill/SKILL.md, both in this folder.
  *
  * Limits: 5 requests in flight, a fleet-wide requests-per-minute cap from
  * SKYNET_IMAGE_GEN_RPM (default 30), and a 5-minute TTL matching the
@@ -55,7 +55,12 @@ export function createImageGenService(
         maxBytes: MAX_REF_BYTES,
       },
     },
-    secrets: ["OPENAI_API_KEY"],
+    secrets: {
+      OPENAI_API_KEY: {
+        label: "OpenAI API key",
+        description: "platform.openai.com → API keys",
+      },
+    },
     ttlMs: 5 * 60 * 1000,
     concurrency: 5,
     rateLimitPerMinute: () => imageGenRpmFromEnv(),

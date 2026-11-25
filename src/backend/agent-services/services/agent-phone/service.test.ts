@@ -73,7 +73,7 @@ describe("agent-phone input", () => {
 describe("agent-phone service", () => {
   it("declares the Twilio secrets, TTL and one-call-per-recipient serialization", () => {
     const svc = createAgentPhoneService(deps());
-    expect(svc.secrets).toEqual([
+    expect(Object.keys(svc.secrets ?? {})).toEqual([
       "TWILIO_ACCOUNT_SID",
       "TWILIO_AUTH_TOKEN",
       "TWILIO_FROM_NUMBER",

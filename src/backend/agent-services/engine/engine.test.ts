@@ -192,7 +192,7 @@ describe("agent-services engine", () => {
     const seen: Record<string, string>[] = [];
     const svc = defineService({
       ...echo,
-      secrets: ["API_KEY"],
+      secrets: { API_KEY: { label: "API key", description: "test" } },
       handle: async (_i, ctx) => {
         seen.push(ctx.secrets);
         return ok({});

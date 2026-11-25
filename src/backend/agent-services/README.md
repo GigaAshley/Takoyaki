@@ -30,14 +30,42 @@ births (`spawn-requests/`) predate this and still have their own scanner.
 | `engine/host-io.ts`           | Claim and attachment reads over SSH or the local bind mount; response writer |
 | `engine/scan-orchestrator.ts` | The one scan loop over every substrate host                                  |
 | `boot.ts`                     | Wiring, called from `starter.ts`                                             |
-| `registry.ts`                 | The list of services                                                         |
-| `services/<name>/service.ts`  | One service each                                                             |
+| `registry.ts`                 | Finds the services by reading `services/`                                    |
+| `distribution.ts`             | Turns each service's `skill/` and `bin/` into distributor rows               |
+| `services/<name>/`            | One service each: everything about it lives in its folder                    |
 | `user-secrets/`               | Per-user secrets: encrypted store, acting-user resolution, routes            |
 
-Host side: `substrate/scripts/fleet-service` is the shared client. Each
-service usually also ships a friendly wrapper (`substrate/scripts/agent-phone`)
-and a skill (`substrate/skills/agent-phone/SKILL.md`) that tells agents when
-and how to use it.
+Host side: `substrate/scripts/fleet-service` is the shared client every
+service's wrapper calls. It belongs to no service, so it stays in the
+general substrate.
+
+## A service is one folder
+
+```
+services/<name>/
+  service.ts        default-exports defineService({ name: "<name>", ... })
+  skill/SKILL.md    optional: tells agents when and how to use it
+  skill/...         optional companions, installed beside SKILL.md
+  bin/<command>     optional: friendly wrapper over fleet-service (executable)
+  *.ts              anything else the service needs (adapters, tests)
+```
+
+- **The server finds it.** `registry.ts` loads every folder under
+  `services/`. Nothing else in the app lists services.
+- **Hosts get its skill and wrapper.** The distributor pushes `skill/` to
+  `~/.claude/skills/<name>/` and each file in `bin/` to
+  `~/.local/bin/<file>` on every managed host, next to its hand-kept catalog
+  (`src/backend/distributor/full-catalog.ts`). The backend build copies
+  these files beside the compiled code (`scripts/copy-service-assets.mjs`).
+- **A broken folder is skipped, never fatal.** Examples: no `service.ts`,
+  a `name` that isn't the folder name, a script that isn't executable, a
+  key without a label. The server starts without that service and logs
+  `agent_services_service_skipped` with the reason. `registry.test.ts`
+  fails on any broken folder in the repo, so one shouldn't ship.
+- **A service's keys are its own.** It never shares a key with the app's own
+  voice features. An operator who wants one account behind both enters it
+  in both places. (`stt` is the one exception for now: it uses the voice
+  provider's keys.)
 
 ## Adding a service
 
@@ -56,7 +84,16 @@ export default defineService({
     to_user: z.string().min(1).max(200),
     body: z.string().min(1).max(1600),
   }),
-  secrets: ["TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN"],
+  secrets: {
+    TWILIO_ACCOUNT_SID: {
+      label: "Twilio account SID",
+      description: "Twilio console → Account info (starts with AC)",
+    },
+    TWILIO_AUTH_TOKEN: {
+      label: "Twilio auth token",
+      description: "Twilio console → Account info",
+    },
+  },
   ttlMs: 2 * 60 * 1000,
   concurrency: 4,
 
@@ -69,23 +106,23 @@ export default defineService({
 });
 ```
 
-**2. Register it** in `registry.ts`.
+That's the service: the server picks it up on its next start.
 
-**3. Host side.** Agents can call it right away with the shared client:
+**2. Host side.** Agents can call it right away with the shared client:
 
 ```
 fleet-service call sms --input '{"to_user":"alice","body":"Deploy done"}'
 ```
 
-For a nicer interface, add a wrapper script in `substrate/scripts/` (copy
-`agent-phone`; it's about 40 lines past the usage text) and a skill in
-`substrate/skills/sms/SKILL.md`. Add a catalog row for each in
-`src/backend/distributor/catalog.ts` and bump the counts in `catalog.test.ts`.
-The distributor then installs them on every managed host.
+For a nicer interface, add a wrapper at `services/sms/bin/sms` (copy
+`services/agent-phone/bin/agent-phone`; it's about 40 lines past the usage
+text; make it executable) and a skill at `services/sms/skill/SKILL.md`. The
+distributor installs both on every managed host. There is nothing to
+register.
 
-**4. Document the secrets** in `docker/skynet.env.example`.
+**3. Document the keys** in `docker/skynet.env.example`.
 
-**5. Test it.** Call `handle()` directly with a fake context (see
+**4. Test it.** Call `handle()` directly with a fake context (see
 `services/agent-phone/service.test.ts`). `end-to-end.test.ts` shows how to
 drive a real wrapper script against the real engine.
 
@@ -95,7 +132,7 @@ drive a real wrapper script against the real engine.
 | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `input`              | Zod schema. Failures go back as `malformed` with the field path. Use `z.strictObject` so typos are caught.                                                                       |
 | `attachments`        | Named file slots (`{ ref: { extensions, maxBytes, required? } }`). The agent sends them with `--attach ref=path`; the handler gets `ctx.attachments.ref.bytes`.                  |
-| `secrets`            | Env vars the handler needs. Any unset → `not_configured`, handler not called.                                                                                                    |
+| `secrets`            | Instance keys, `{ NAME: { label, description } }`: the label an admin recognises and one line on where to get it. Read from the env var `NAME`; any unset → `not_configured`, handler not called. |
 | `userSecrets`        | Per-user secrets (see below). The handler gets `ctx.user` and `ctx.userSecrets`.                                                                                                 |
 | `ttlMs`              | Requests older than this when they reach the front of the queue → `expired`. Keep it at or under the wrapper's timeout so the backend never does work for a caller that gave up. |
 | `concurrency`        | Max simultaneous requests for this service (default 1).                                                                                                                          |

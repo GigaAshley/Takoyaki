@@ -44,6 +44,14 @@ export interface ServiceOutputFile {
  * rest with the backend's system key so it can be used while they are
  * logged out. Values are write-only: no API ever returns one.
  */
+/** One instance key a service needs. Keys belong to the service alone. */
+export interface InstanceKeySpec {
+  /** Plain name an admin recognises, e.g. "Twilio auth token". */
+  label: string;
+  /** One line on where to get it, e.g. "Twilio console → Account info". */
+  description: string;
+}
+
 export interface UserSecretSpec {
   /** Shown next to the input in Preferences or the admin user modal. */
   label: string;
@@ -121,10 +129,13 @@ export interface ServiceDefinition<
   /** Named attachment slots. Requests naming any other slot are `malformed`. */
   attachments?: Record<string, AttachmentSpec>;
   /**
-   * Env vars the handler needs. If any is unset the engine answers
-   * `not_configured` without calling the handler.
+   * Instance keys the handler needs, keyed by an UPPER_SNAKE name (read from
+   * the env var of that name). If any is unset the engine answers
+   * `not_configured` without calling the handler. A service never shares a
+   * key with the app's own voice features; an operator who wants one account
+   * behind both enters it in both places.
    */
-  secrets?: readonly string[];
+  secrets?: Record<string, InstanceKeySpec>;
   /**
    * Per-user secrets, keyed by an UPPER_SNAKE name. Declaring any makes the
    * engine work out which user the request acts for (ctx.user) and load

@@ -54,7 +54,6 @@
  *       coord-as-mode retirement; role retired 2026-10-09 with the
  *       role-history retirement (host copies removed via
  *       RETIRED_SUBSTRATE_FILES in run-bootstrap.ts)
- *     - 1 row for image-gen skill (Phase 116 file-drop broker SKILL.md)
  *     - 38 rows for app-development/ (SKILL.md + 8 helper scripts +
  *       25 starter-template files including a pre-generated initial
  *       Drizzle migration; first-class-apps campaign shape 1, 2026-09-17;
@@ -68,9 +67,9 @@
  *       campaign;
  *       fleet-status-sweep is the Phase 92 batch sweep for the fleet-status
  *       poller; pv-context-pct-sweep is the Phase 95 batch sweep for the
- *       PV context-pct poller;
- *       image-gen is the Phase 116 file-drop broker helper, now a wrapper
- *       over the shared fleet-service agent-services client)
+ *       PV context-pct poller)
+ *     - agent services' skills and wrappers are not rows here: they ship
+ *       from each service's folder (full-catalog.ts)
  *     - 1 row for user-onboarding/agent-supervisor.service
  *     - 1 row for instance-policy-claude-md (Phase 114 twinkie — runtime-sourced,
  *       system-root-installed)
@@ -289,35 +288,6 @@ export const FLEET_SUBSTRATE_CATALOG: readonly CatalogEntry[] = [
     installPath: "~/.claude/skills/call-me/SKILL.md",
     restartHook: null,
   },
-  // Phase 116: file-drop broker skill body — carries the D-17 PHI directive
-  // at top primacy plus the D-18 recency echo inline in the invocation
-  // section. No restart hook — on-demand-loaded skill file (Claude Code
-  // re-reads on next skill invocation).
-  {
-    slug: "image-gen-skill",
-    sourceKind: "bundled",
-    bundledPath: "/app/fleet-substrate/skills/image-gen/SKILL.md",
-    installPath: "~/.claude/skills/image-gen/SKILL.md",
-    restartHook: null,
-  },
-  // agent-phone: file-drop broker skill body for the phone-call capability.
-  // Same shape as image-gen-skill above — on-demand-loaded, no restart hook.
-  {
-    slug: "agent-phone-skill",
-    sourceKind: "bundled",
-    bundledPath: "/app/fleet-substrate/skills/agent-phone/SKILL.md",
-    installPath: "~/.claude/skills/agent-phone/SKILL.md",
-    restartHook: null,
-  },
-  // stt: agent-services skill for speech to text. Same shape as
-  // image-gen-skill above — on-demand-loaded, no restart hook.
-  {
-    slug: "stt-skill",
-    sourceKind: "bundled",
-    bundledPath: "/app/fleet-substrate/skills/stt/SKILL.md",
-    installPath: "~/.claude/skills/stt/SKILL.md",
-    restartHook: null,
-  },
   // sensor-development: teaches agents to build a sensor (logic that fires a
   // wake-up or scheduled task). On-demand-loaded skill file — no restart hook.
   {
@@ -395,39 +365,14 @@ export const FLEET_SUBSTRATE_CATALOG: readonly CatalogEntry[] = [
   },
   // Agent services: fleet-service is the shared file-drop client every
   // service wrapper calls (request envelope into ~/fleet/service-requests/,
-  // wait for the response, collect output files). See
-  // src/backend/agent-services/README.md. On-demand executables, no restart
-  // hooks.
+  // wait for the response, collect output files). Each service's own skill
+  // and wrapper are not listed here: they ship from the service's folder
+  // (full-catalog.ts). See src/backend/agent-services/README.md.
   {
     slug: "fleet-service-helper",
     sourceKind: "bundled",
     bundledPath: "/app/fleet-substrate/scripts/fleet-service",
     installPath: "~/.local/bin/fleet-service",
-    restartHook: null,
-  },
-  // image-gen wrapper: `image-gen "..."` → prints image paths on stdout.
-  {
-    slug: "image-gen-helper",
-    sourceKind: "bundled",
-    bundledPath: "/app/fleet-substrate/scripts/image-gen",
-    installPath: "~/.local/bin/image-gen",
-    restartHook: null,
-  },
-  // agent-phone wrapper: `agent-phone --to <user> --from "<name>" "<msg>"`
-  // → prints the call transcript on stdout.
-  {
-    slug: "agent-phone-helper",
-    sourceKind: "bundled",
-    bundledPath: "/app/fleet-substrate/scripts/agent-phone",
-    installPath: "~/.local/bin/agent-phone",
-    restartHook: null,
-  },
-  // stt wrapper: `stt <audio-file>` → prints the transcript on stdout.
-  {
-    slug: "stt-helper",
-    sourceKind: "bundled",
-    bundledPath: "/app/fleet-substrate/scripts/stt",
-    installPath: "~/.local/bin/stt",
     restartHook: null,
   },
   // sensor-fire: the one command a sensor runs to fire its trigger (drops a

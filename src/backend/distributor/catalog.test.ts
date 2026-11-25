@@ -143,7 +143,10 @@ describe("FLEET_SUBSTRATE_CATALOG", () => {
     // +1 move-app.sh (project-scoped apps: Move to) — 80 → 81.
     // +6 for the app starter's JSON API (api helpers, todo logic, routes,
     // openapi.json) — 81 → 87.
-    expect(FLEET_SUBSTRATE_CATALOG.length).toBe(87);
+    // -6 for the image-gen, agent-phone and stt skills and wrappers, which
+    // now ship from their service folders (full-catalog.ts) — 87 → 81.
+    // Adding a service never changes this count.
+    expect(FLEET_SUBSTRATE_CATALOG.length).toBe(81);
   });
 
   it("Test 2: every bundled row's bundledPath starts with /app/fleet-substrate/skills/, /app/fleet-substrate/scripts/, or /app/fleet-substrate/user-onboarding/", () => {
@@ -290,7 +293,8 @@ describe("FLEET_SUBSTRATE_CATALOG", () => {
     // +2 for notify-me and call-me (done-bell) — 45 → 47.
     // +1 for move-app.sh (project-scoped apps) — 47 → 48.
     // +6 for the app starter's JSON API — 48 → 54.
-    expect(skillRows.length).toBe(54);
+    // -3 for the service skills, now in their service folders — 54 → 51.
+    expect(skillRows.length).toBe(51);
     // 18 helper scripts: agent-supervisor + wakeup-scheduler +
     // file-watch (4th ambient monitor) + fleet-status-sweep (Phase 92
     // batch sweep) + (usage-reporter / usage-report / claude-usage-collector
@@ -324,7 +328,8 @@ describe("FLEET_SUBSTRATE_CATALOG", () => {
     // + machine-people (SessionStart hook — people on this machine)
     // + borrowable-roles-context (the roles a loading agent may borrow)
     // + person-files (SessionStart hook — the About you files of an agent's people)
-    expect(scriptRows.length).toBe(26);
+    // -3 for the service wrappers, now in their service folders — 26 → 23.
+    expect(scriptRows.length).toBe(23);
     // user-onboarding files: agent-supervisor.service
     // + scheduled-agents-scheduler.service (this ship: move
     // scheduled-agents scheduler from in-process agent-supervisor child
@@ -486,7 +491,9 @@ describe("FLEET_SUBSTRATE_CATALOG", () => {
     // +1 for person-files — 78 → 79.
     // +1 for move-app.sh (project-scoped apps) — 79 → 80.
     // +6 for the app starter's JSON API — 80 → 86.
-    expect(bundled.length).toBe(86);
+    // -6 for the service skills and wrappers, now in their service
+    // folders — 86 → 80.
+    expect(bundled.length).toBe(80);
     expect(runtime.length).toBe(1);
 
     // Every bundled row retains bundledPath under /app/fleet-substrate/

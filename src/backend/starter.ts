@@ -1707,7 +1707,7 @@ if (process.env.VITEST !== "true") {
       type IwMachine = import("./instance-wide/production.js").ProductionMachine;
       const listIwMachines = () => listInstanceWideMachines(getDbForSubstrate);
       const { reservedNameCheck } = await import("./instance-wide/production.js");
-      const { FLEET_SUBSTRATE_CATALOG: iwCatalog } = await import("./distributor/catalog.js");
+      const { FULL_SUBSTRATE_CATALOG: iwCatalog } = await import("./distributor/full-catalog.js");
       const { RETIRED_SUBSTRATE_DIRS } = await import("./distributor/run-bootstrap.js");
       const instanceWide = new InstanceWideEngine({
         store: new InstanceWideStore(),

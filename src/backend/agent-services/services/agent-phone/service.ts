@@ -2,8 +2,8 @@
  * agent-phone — place a one-turn voice call to a Skynet user (via Twilio)
  * and return the transcript.
  *
- * Agent side: substrate/scripts/agent-phone (wrapper over fleet-service)
- * and substrate/skills/agent-phone/SKILL.md.
+ * Agent side: bin/agent-phone (wrapper over fleet-service) and
+ * skill/SKILL.md, both in this folder.
  *
  * Rules:
  *   - The caller may only ring people who registered the host it runs on.
@@ -60,8 +60,21 @@ export function createAgentPhoneService(deps: AgentPhoneDeps = productionDeps) {
     description:
       "Ring a user's phone, speak a message, return their reply",
     input: agentPhoneInput,
-    // TWILIO_FROM_NUMBER is the instance's one Twilio number (E.164).
-    secrets: ["TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM_NUMBER"],
+    secrets: {
+      TWILIO_ACCOUNT_SID: {
+        label: "Twilio account SID",
+        description: "Twilio console → Account info (starts with AC)",
+      },
+      TWILIO_AUTH_TOKEN: {
+        label: "Twilio auth token",
+        description: "Twilio console → Account info",
+      },
+      TWILIO_FROM_NUMBER: {
+        label: "Twilio phone number",
+        description:
+          "The instance's one Twilio number, in +E.164 form (Twilio console → Phone numbers)",
+      },
+    },
     // Part of the time budget in adapter.ts; see the header.
     ttlMs: 2 * 60 * 1000,
     concurrency: 10,

@@ -192,7 +192,7 @@ export function createAgentServiceEngine(deps: EngineDeps): AgentServiceEngine {
     }
 
     const secrets: Record<string, string> = {};
-    for (const name of def.secrets ?? []) {
+    for (const name of Object.keys(def.secrets ?? {})) {
       const value = env[name];
       if (!value) {
         await respond(

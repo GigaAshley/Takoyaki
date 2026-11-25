@@ -40,7 +40,7 @@
  */
 
 import { runSweepForHost } from "./run-sweep.js";
-import { FLEET_SUBSTRATE_CATALOG } from "./catalog.js";
+import { FULL_SUBSTRATE_CATALOG } from "./full-catalog.js";
 import { logSweepHookError, logPersistentFailure } from "./log-tags.js";
 import { bundledReaderFromDisk } from "./bundled-reader.js";
 import { readInstanceFileBytes } from "../instance-file/store.js";
@@ -482,7 +482,7 @@ export function createServerSubstrateOrchestrator(
         });
         result = await installFleetSubstrateLocally(
           { id: host.id, name: host.name },
-          FLEET_SUBSTRATE_CATALOG,
+          FULL_SUBSTRATE_CATALOG,
           {
             readBundledBytes: bundledReaderFromDisk,
             resolvedRuntimeBytes: runtimeBytes,
@@ -556,7 +556,7 @@ export function createServerSubstrateOrchestrator(
             machineId: host.machineId,
             ...(deps.machinePeopleFile ? { peopleFile: await readPeopleFile(host.id) } : {}),
           },
-          FLEET_SUBSTRATE_CATALOG,
+          FULL_SUBSTRATE_CATALOG,
           {
             readBundledBytes: bundledReaderFromDisk,
             // Phase 114 Plan 05 (D-15 + Pitfall 6): pass the per-tick
