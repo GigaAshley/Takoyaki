@@ -57,25 +57,28 @@ describe("the services that ship", () => {
   it("are found from their folders, with none skipped", async () => {
     const found = await discoverServices(SERVICES_DIR, () => {});
     expect(found.skipped).toEqual([]);
-    expect(found.services.map((s) => s.def.name)).toEqual([
-      "agent-phone",
-      "identity-reactivate",
-      "image-gen",
-      "stt",
-    ]);
+    // The four that existed before the move; new services just add to this.
+    expect(found.services.map((s) => s.def.name)).toEqual(
+      expect.arrayContaining(["agent-phone", "identity-reactivate", "image-gen", "stt"]),
+    );
     expect(AGENT_SERVICES.map((s) => s.name)).toEqual(found.services.map((s) => s.def.name));
   });
 
   it("push the same skills and scripts, to the same places, as before the move", () => {
     const rows = serviceCatalogRows(DISCOVERED_SERVICES).map((r) => [r.slug, r.installPath]);
-    expect(rows).toEqual([
-      ["agent-phone-skill", "~/.claude/skills/agent-phone/SKILL.md"],
-      ["agent-phone-helper", "~/.local/bin/agent-phone"],
-      ["image-gen-skill", "~/.claude/skills/image-gen/SKILL.md"],
-      ["image-gen-helper", "~/.local/bin/image-gen"],
-      ["stt-skill", "~/.claude/skills/stt/SKILL.md"],
-      ["stt-helper", "~/.local/bin/stt"],
-    ]);
+    // What machines got before the move; new services just add rows.
+    expect(rows).toEqual(
+      expect.arrayContaining([
+        ["agent-phone-skill", "~/.claude/skills/agent-phone/SKILL.md"],
+        ["agent-phone-helper", "~/.local/bin/agent-phone"],
+        ["image-gen-skill", "~/.claude/skills/image-gen/SKILL.md"],
+        ["image-gen-helper", "~/.local/bin/image-gen"],
+        ["stt-skill", "~/.claude/skills/stt/SKILL.md"],
+        ["stt-helper", "~/.local/bin/stt"],
+      ]),
+    );
+    // identity-reactivate has nothing for hosts.
+    expect(rows.some(([slug]) => slug.startsWith("identity-reactivate"))).toBe(false);
     for (const row of serviceCatalogRows(DISCOVERED_SERVICES)) {
       expect(fs.existsSync(row.bundledPath)).toBe(true);
       if (row.installPath.startsWith("~/.local/bin/")) {
@@ -85,7 +88,9 @@ describe("the services that ship", () => {
   });
 
   it("are all in the distributor's full catalog, alongside the hand-kept one", () => {
-    expect(FULL_SUBSTRATE_CATALOG.length).toBe(FLEET_SUBSTRATE_CATALOG.length + 6);
+    expect(FULL_SUBSTRATE_CATALOG.length).toBe(
+      FLEET_SUBSTRATE_CATALOG.length + serviceCatalogRows(DISCOVERED_SERVICES).length,
+    );
     const paths = FULL_SUBSTRATE_CATALOG.map((r) => r.installPath);
     expect(new Set(paths).size).toBe(paths.length);
     const slugs = FULL_SUBSTRATE_CATALOG.map((r) => r.slug);
@@ -141,7 +146,7 @@ describe("adding a service is one folder", () => {
     const before = FLEET_SUBSTRATE_CATALOG.length;
     const full = combineCatalog(FLEET_SUBSTRATE_CATALOG, serviceCatalogRows(all), () => {});
     expect(FLEET_SUBSTRATE_CATALOG.length).toBe(before);
-    expect(full.length).toBe(before + 8);
+    expect(full.length).toBe(before + serviceCatalogRows(shipped.services).length + 2);
     expect(full.slice(-2).map((r) => [r.slug, r.installPath])).toEqual([
       ["sample-skill", "~/.claude/skills/sample/SKILL.md"],
       ["sample-helper", "~/.local/bin/sample"],

@@ -118,11 +118,11 @@ For a nicer interface, add a wrapper at `services/sms/bin/sms` (copy
 `services/agent-phone/bin/agent-phone`; it's about 40 lines past the usage
 text; make it executable) and a skill at `services/sms/skill/SKILL.md`. The
 distributor installs both on every managed host. There is nothing to
-register.
+register, and nothing to document elsewhere: each key's label and note in
+`secrets` say what it is and where to get it, and its name is the server
+setting it's read from.
 
-**3. Document the keys** in `docker/skynet.env.example`.
-
-**4. Test it.** Call `handle()` directly with a fake context (see
+**3. Test it.** Call `handle()` directly with a fake context (see
 `services/agent-phone/service.test.ts`). `end-to-end.test.ts` shows how to
 drive a real wrapper script against the real engine.
 
