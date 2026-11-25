@@ -337,7 +337,7 @@
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: hsl(220, 75%, 66%);
+  background: var(--k-t1);
 }
 /* DM'd inside: the row's red envelope disc after the label, and the row's
    red tint across the whole header. */
@@ -632,8 +632,9 @@
   color: #f4a09b;
 }
 
-/* Unread: a dot in the agent's own colour at the row's end. It steps aside
-   for the ⋮ while the row is hovered or focused on desktop. */
+/* Unread: an off-white dot at the row's end, the same on every row, so the
+   red envelope stays the only coloured mark. It steps aside for the ⋮ while
+   the row is hovered or focused on desktop. */
 .pv-unread-dot {
   position: absolute;
   top: 50%;
@@ -642,12 +643,8 @@
   height: 7px;
   border-radius: 50%;
   transform: translateY(-50%);
-  background: hsl(var(--pv-hue), 75%, 64%);
+  background: var(--k-t1);
   pointer-events: none;
-}
-.pv-row.pv-neutral .pv-unread-dot,
-.pv-row.rdp .pv-unread-dot {
-  background: hsl(220, 75%, 66%);
 }
 .pv-row--unread .pv-body {
   padding-right: 12px;

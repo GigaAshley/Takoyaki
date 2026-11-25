@@ -933,7 +933,7 @@ not something agents drive.
   name with its role in brackets, then the conversation's generated title
   (if any) — and each run of rows sits on one rounded panel. An
   **unread** conversation (the agent finished a turn the user hasn't seen)
-  shows a small dot in the agent's colour at the row's end and a brighter
+  shows a small off-white dot at the row's end and a brighter
   title; a red-tinted row with a bigger **red envelope** in that dot's
   place ("Notified you") means the agent notified the user (§ Notifying the
   user); an **amber disc** on the

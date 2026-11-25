@@ -892,7 +892,7 @@ function PrettyConversationRowImpl({
           )}
         </div>
 
-        {/* Unread: a small dot in the agent's own colour at the row's end
+        {/* Unread: a small off-white dot at the row's end
             (pretty-conversations.css). Notified (the agent DM'd this user):
             a bigger red envelope in the dot's place. Pinned rows carry no pin
             glyph — they already sit under Pinned. */}
