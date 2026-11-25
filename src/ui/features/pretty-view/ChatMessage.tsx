@@ -579,30 +579,33 @@ export const ChatMessage = React.memo(function ChatMessage({
           // below (see the strip render below the bubble div). Every visual
           // + interaction state (Loader2/Pause/Play/Volume2 glyphs,
           // hover-lift, touch baseline) is preserved verbatim in the strip
-          // copy per D-15/D-16/D-17.
-          <button
-            type="button"
-            onClick={(e) => { void onSpeakClick(e); }}
-            aria-label={
-              speakState === "playing"
-                ? "Pause speaking"
-                : speakState === "paused"
-                  ? "Resume speaking"
-                  : "Speak message"
-            }
-            data-active={speakState === "playing" || speakState === "paused" ? "true" : undefined}
-            className="pv-speak-btn"
-          >
-            {speakState === "loading" ? (
-              <Loader2 size={16} className="animate-spin" />
-            ) : speakState === "playing" ? (
-              <Pause size={16} />
-            ) : speakState === "paused" ? (
-              <Play size={16} />
-            ) : (
-              <Volume2 size={16} />
-            )}
-          </button>
+          // copy per D-15/D-16/D-17. The column runs the bubble's height so
+          // the button can stay in view while the corner is scrolled away.
+          <span className="pv-speak-col">
+            <button
+              type="button"
+              onClick={(e) => { void onSpeakClick(e); }}
+              aria-label={
+                speakState === "playing"
+                  ? "Pause speaking"
+                  : speakState === "paused"
+                    ? "Resume speaking"
+                    : "Speak message"
+              }
+              data-active={speakState === "playing" || speakState === "paused" ? "true" : undefined}
+              className="pv-speak-btn"
+            >
+              {speakState === "loading" ? (
+                <Loader2 size={16} className="animate-spin" />
+              ) : speakState === "playing" ? (
+                <Pause size={16} />
+              ) : speakState === "paused" ? (
+                <Play size={16} />
+              ) : (
+                <Volume2 size={16} />
+              )}
+            </button>
+          </span>
         )}
       </div>
       {!isUser && feedbackEnabled && (

@@ -379,12 +379,12 @@ button.pv-float:focus-visible { outline: 2px solid var(--k-acc); outline-offset:
 .pv-bubble-fail-dismiss:hover { color: var(--k-t1); }
 :is(.pv-bubble-agent, .pv-bubble-user) :is(p, li) { margin-top: var(--pv-b-gap); margin-bottom: var(--pv-b-gap); }
 :is(.pv-bubble-agent, .pv-bubble-user) :is(h1, h2, h3) { font-size: 15.5px; font-weight: 650; margin: 1em 0 0.35em; }
-/* No extra space above the first line or below the last (the speak button
+/* No extra space above the first line or below the last (the speak column
    can be the bubble's real last child). */
 :is(.pv-bubble-agent, .pv-bubble-user) > :first-child,
 :is(.pv-bubble-agent, .pv-bubble-user) > :first-child > li:first-child { margin-top: 0; }
-:is(.pv-bubble-agent, .pv-bubble-user) > :is(:last-child, :has(+ .pv-speak-btn:last-child)),
-:is(.pv-bubble-agent, .pv-bubble-user) > :is(:last-child, :has(+ .pv-speak-btn:last-child)) > li:last-child { margin-bottom: 0; }
+:is(.pv-bubble-agent, .pv-bubble-user) > :is(:last-child, :has(+ .pv-speak-col:last-child)),
+:is(.pv-bubble-agent, .pv-bubble-user) > :is(:last-child, :has(+ .pv-speak-col:last-child)) > li:last-child { margin-bottom: 0; }
 /* Code: a dark well inside either bubble. */
 :is(.pv-bubble-agent, .pv-bubble-user) pre {
   margin: 0.5em 0;
@@ -406,11 +406,27 @@ button.pv-float:focus-visible { outline: 2px solid var(--k-acc); outline-offset:
 :is(.pv-bubble-agent, .pv-bubble-user) :not(pre) > code::after { content: none; }
 
 /* Speak: just outside the agent bubble's bottom-right corner, quiet until
-   hovered; inside the corner on narrow panes. */
-.pv-speak-btn {
+   hovered; inside the corner on narrow panes. It sits at the foot of a column
+   running the bubble's height and sticks above the composer, so while the
+   corner is scrolled out of sight the button rides up the bubble's side
+   (never past its top). Offset: the dock's height less its 40px top fade
+   and the list's 12px bottom padding (sticky measures inside it), plus 6px. */
+.pv-speak-col {
   position: absolute;
+  top: 0;
   right: -38px;
   bottom: 0;
+  width: 30px;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  pointer-events: none;
+}
+.pv-speak-btn {
+  position: sticky;
+  bottom: max(0px, calc(var(--pv-dock-h, 0px) - 46px));
+  flex-shrink: 0;
+  pointer-events: auto;
   width: 30px;
   height: 30px;
   padding: 0;
@@ -425,12 +441,13 @@ button.pv-float:focus-visible { outline: 2px solid var(--k-acc); outline-offset:
   transition: opacity 0.12s, background-color 0.12s;
 }
 .pv-speak-btn svg { width: 15px; height: 15px; }
-.pv-bubble-agent:hover > .pv-speak-btn, .pv-speak-btn:focus-visible { opacity: 0.9; }
+.pv-bubble-agent:hover > .pv-speak-col > .pv-speak-btn, .pv-speak-btn:focus-visible { opacity: 0.9; }
 .pv-speak-btn:hover { background: var(--k-s2); color: var(--k-t1); opacity: 1; }
 .pv-speak-btn[data-active="true"] { opacity: 1; color: var(--k-t1); }
 @media (hover: none) { .pv-speak-btn { opacity: 0.6; } }
-[data-pv-narrow="true"] .pv-bubble-agent:has(> .pv-speak-btn) { padding-right: 38px; }
-[data-pv-narrow="true"] .pv-speak-btn { right: 5px; bottom: 5px; color: #f1ede4; opacity: 0.6; }
+[data-pv-narrow="true"] .pv-bubble-agent:has(> .pv-speak-col) { padding-right: 38px; }
+[data-pv-narrow="true"] .pv-speak-col { top: 5px; right: 5px; bottom: 5px; }
+[data-pv-narrow="true"] .pv-speak-btn { color: #f1ede4; opacity: 0.6; }
 
 /* A message that notified YOU over the relay: a vivid red fill (the rim's own
    red), so it can't be missed; accents on the envelope's hue. */
@@ -502,7 +519,8 @@ button.pv-float:focus-visible { outline: 2px solid var(--k-acc); outline-offset:
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
-.pv-agent-card-body .pv-speak-btn { right: -6px; bottom: 8px; opacity: 0.55; }
+.pv-agent-card-body .pv-speak-col { top: 8px; right: -6px; bottom: 8px; }
+.pv-agent-card-body .pv-speak-btn { opacity: 0.55; }
 .pv-relay-avatar {
   width: 28px;
   height: 28px;
