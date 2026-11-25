@@ -222,9 +222,10 @@ export interface SweepIdentityLine {
  *                                that byte offset (see --known-tails in the
  *                                sweep script); the caller splices it onto
  *                                the tail it already holds.
- *   • jsonl_tail_ino / _end     ↔ the file's inode and the byte offset just
- *                                past the last whole line read — what the
- *                                caller sends back as its known position.
+ *   • jsonl_tail_file / _end    ↔ which file was read ("<dev>:<inode>:<path
+ *                                hash>") and the byte offset just past the
+ *                                last whole line read — what the caller
+ *                                sends back as its known position.
  *                                Absent from older sweep scripts.
  *
  * G6 note (safe-char guard): sessionIds failing the /^[a-zA-Z0-9_-]+$/ regex
@@ -245,7 +246,7 @@ export interface SweepPidLine {
   per_session_stop_payload: string | null;
   dormant_a: boolean;
   jsonl_tail: string | null;
-  jsonl_tail_ino?: number | null;
+  jsonl_tail_file?: string | null;
   jsonl_tail_end?: number | null;
   jsonl_tail_base?: number | null;
 }

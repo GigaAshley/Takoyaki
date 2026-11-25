@@ -6,7 +6,8 @@ import {
   knownTailsArg,
   resolveSweepTails,
   sweepCommand,
-  TAIL_CHARS,
+  PEER_IDLE_FORGET_MS,
+  TAIL_BYTES,
 } from "./sweep-tail-store.js";
 
 const PEER = "100.64.0.9:22";
@@ -15,7 +16,7 @@ const PLAIN = "~/.local/bin/fleet-status-sweep 2>/dev/null";
 function pidLine(
   identity: string,
   tail: string | null,
-  pos: { ino?: number | null; end?: number | null; base?: number | null } = {},
+  pos: { file?: string | null; end?: number | null; base?: number | null } = {},
 ): SweepPidLine {
   return {
     line_kind: "pid",
@@ -30,13 +31,13 @@ function pidLine(
     per_session_stop_payload: null,
     dormant_a: false,
     jsonl_tail: tail,
-    ...("ino" in pos ? { jsonl_tail_ino: pos.ino } : {}),
+    ...("file" in pos ? { jsonl_tail_file: pos.file } : {}),
     ...("end" in pos ? { jsonl_tail_end: pos.end } : {}),
     ...("base" in pos ? { jsonl_tail_base: pos.base } : {}),
   };
 }
 
-function decodeArg(cmd: string): Record<string, [number, number]> {
+function decodeArg(cmd: string): Record<string, [string, number]> {
   const m = /--known-tails (\S+)/.exec(cmd);
   if (!m) throw new Error(`no --known-tails in ${cmd}`);
   return JSON.parse(Buffer.from(m[1], "base64").toString("utf8"));
@@ -47,56 +48,65 @@ describe("sweep-tail-store", () => {
 
   it("asks plainly until it holds a tail, then sends what it holds", () => {
     expect(sweepCommand(PEER)).toBe(PLAIN);
-    resolveSweepTails(PEER, "r1", [pidLine("finch", "a\nb\n", { ino: 7, end: 4, base: null })]);
-    expect(decodeArg(sweepCommand(PEER))).toEqual({ finch: [7, 4] });
+    resolveSweepTails(PEER, "r1", [pidLine("finch", "a\nb\n", { file: "f7", end: 4, base: null })]);
+    expect(decodeArg(sweepCommand(PEER))).toEqual({ finch: ["f7", 4] });
     expect(sweepCommand(PEER)).toMatch(/ 2>\/dev\/null$/);
   });
 
   it("splices appended lines onto the held tail", () => {
-    resolveSweepTails(PEER, "r1", [pidLine("finch", "one\n", { ino: 7, end: 4, base: null })]);
-    const t = resolveSweepTails(PEER, "r2", [pidLine("finch", "two\n", { ino: 7, end: 8, base: 4 })]);
+    resolveSweepTails(PEER, "r1", [pidLine("finch", "one\n", { file: "f7", end: 4, base: null })]);
+    const t = resolveSweepTails(PEER, "r2", [pidLine("finch", "two\n", { file: "f7", end: 8, base: 4 })]);
     expect(t.get("finch")).toBe("one\ntwo\n");
-    expect(decodeArg(sweepCommand(PEER))).toEqual({ finch: [7, 8] });
+    expect(decodeArg(sweepCommand(PEER))).toEqual({ finch: ["f7", 8] });
   });
 
   it("an empty delta returns the held tail unchanged", () => {
-    resolveSweepTails(PEER, "r1", [pidLine("finch", "one\n", { ino: 7, end: 4, base: null })]);
-    const t = resolveSweepTails(PEER, "r2", [pidLine("finch", "", { ino: 7, end: 4, base: 4 })]);
+    resolveSweepTails(PEER, "r1", [pidLine("finch", "one\n", { file: "f7", end: 4, base: null })]);
+    const t = resolveSweepTails(PEER, "r2", [pidLine("finch", "", { file: "f7", end: 4, base: 4 })]);
     expect(t.get("finch")).toBe("one\n");
   });
 
-  it("keeps the rebuilt tail within the window", () => {
-    const big = "x".repeat(TAIL_CHARS - 2) + "\n";
-    resolveSweepTails(PEER, "r1", [pidLine("finch", big, { ino: 1, end: 9000, base: null })]);
-    const t = resolveSweepTails(PEER, "r2", [pidLine("finch", "new\n", { ino: 1, end: 9004, base: 9000 })]);
+  it("keeps the rebuilt tail within the window, counted in bytes", () => {
+    const big = "x".repeat(TAIL_BYTES - 2) + "\n";
+    resolveSweepTails(PEER, "r1", [pidLine("finch", big, { file: "f1", end: 9000, base: null })]);
+    const t = resolveSweepTails(PEER, "r2", [pidLine("finch", "new\n", { file: "f1", end: 9004, base: 9000 })]);
     const tail = t.get("finch")!;
-    expect(tail.length).toBe(TAIL_CHARS);
+    expect(tail.length).toBe(TAIL_BYTES);
     expect(tail.endsWith("x\nnew\n")).toBe(true);
+
+    const wide = "é".repeat(TAIL_BYTES / 2 - 1) + "\n"; // 2 bytes each
+    resolveSweepTails(PEER, "r3", [pidLine("mira", wide, { file: "f2", end: 5, base: null })]);
+    const w = resolveSweepTails(PEER, "r4", [
+      pidLine("finch", "", { file: "f1", end: 9004, base: 9004 }),
+      pidLine("mira", "ééé\n", { file: "f2", end: 12, base: 5 }),
+    ]).get("mira")!;
+    expect(Buffer.byteLength(w, "utf8")).toBeLessThanOrEqual(TAIL_BYTES);
+    expect(w.endsWith("\nééé\n")).toBe(true);
   });
 
   it("a delta from an offset it doesn't hold resolves to null and keeps what's held", () => {
-    resolveSweepTails(PEER, "r1", [pidLine("finch", "one\n", { ino: 7, end: 4, base: null })]);
-    const t = resolveSweepTails(PEER, "r2", [pidLine("finch", "two\n", { ino: 7, end: 12, base: 8 })]);
+    resolveSweepTails(PEER, "r1", [pidLine("finch", "one\n", { file: "f7", end: 4, base: null })]);
+    const t = resolveSweepTails(PEER, "r2", [pidLine("finch", "two\n", { file: "f7", end: 12, base: 8 })]);
     expect(t.get("finch")).toBeNull();
-    expect(decodeArg(sweepCommand(PEER))).toEqual({ finch: [7, 4] });
+    expect(decodeArg(sweepCommand(PEER))).toEqual({ finch: ["f7", 4] });
   });
 
   it("a delta on a different file resolves to null", () => {
-    resolveSweepTails(PEER, "r1", [pidLine("finch", "one\n", { ino: 7, end: 4, base: null })]);
-    const t = resolveSweepTails(PEER, "r2", [pidLine("finch", "two\n", { ino: 8, end: 8, base: 4 })]);
+    resolveSweepTails(PEER, "r1", [pidLine("finch", "one\n", { file: "f7", end: 4, base: null })]);
+    const t = resolveSweepTails(PEER, "r2", [pidLine("finch", "two\n", { file: "f8", end: 8, base: 4 })]);
     expect(t.get("finch")).toBeNull();
   });
 
   it("a full tail replaces what's held (new file, or the sweep chose to resend)", () => {
-    resolveSweepTails(PEER, "r1", [pidLine("finch", "one\n", { ino: 7, end: 4, base: null })]);
-    const t = resolveSweepTails(PEER, "r2", [pidLine("finch", "fresh\n", { ino: 8, end: 6, base: null })]);
+    resolveSweepTails(PEER, "r1", [pidLine("finch", "one\n", { file: "f7", end: 4, base: null })]);
+    const t = resolveSweepTails(PEER, "r2", [pidLine("finch", "fresh\n", { file: "f8", end: 6, base: null })]);
     expect(t.get("finch")).toBe("fresh\n");
-    expect(decodeArg(sweepCommand(PEER))).toEqual({ finch: [8, 6] });
+    expect(decodeArg(sweepCommand(PEER))).toEqual({ finch: ["f8", 6] });
   });
 
   it("resolving the same sweep twice doesn't splice twice", () => {
-    resolveSweepTails(PEER, "r1", [pidLine("finch", "one\n", { ino: 7, end: 4, base: null })]);
-    const lines = [pidLine("finch", "two\n", { ino: 7, end: 8, base: 4 })];
+    resolveSweepTails(PEER, "r1", [pidLine("finch", "one\n", { file: "f7", end: 4, base: null })]);
+    const lines = [pidLine("finch", "two\n", { file: "f7", end: 8, base: 4 })];
     const a = resolveSweepTails(PEER, "r2", lines);
     const b = resolveSweepTails(PEER, "r2", lines);
     expect(a.get("finch")).toBe("one\ntwo\n");
@@ -105,16 +115,30 @@ describe("sweep-tail-store", () => {
 
   it("drops identities whose PID has gone", () => {
     resolveSweepTails(PEER, "r1", [
-      pidLine("finch", "one\n", { ino: 7, end: 4, base: null }),
-      pidLine("bilbo", "hi\n", { ino: 9, end: 3, base: null }),
+      pidLine("finch", "one\n", { file: "f7", end: 4, base: null }),
+      pidLine("bilbo", "hi\n", { file: "f9", end: 3, base: null }),
     ]);
-    resolveSweepTails(PEER, "r2", [pidLine("bilbo", "", { ino: 9, end: 3, base: 3 })]);
-    expect(decodeArg(sweepCommand(PEER))).toEqual({ bilbo: [9, 3] });
+    resolveSweepTails(PEER, "r2", [pidLine("bilbo", "", { file: "f9", end: 3, base: 3 })]);
+    expect(decodeArg(sweepCommand(PEER))).toEqual({ bilbo: ["f9", 3] });
+  });
+
+  it("a sweep with no PIDs at all keeps what's held", () => {
+    resolveSweepTails(PEER, "r1", [pidLine("finch", "one\n", { file: "f7", end: 4, base: null })]);
+    resolveSweepTails(PEER, "r2", []);
+    expect(decodeArg(sweepCommand(PEER))).toEqual({ finch: ["f7", 4] });
+  });
+
+  it("forgets a peer that hasn't been resolved for a while", () => {
+    resolveSweepTails(PEER, "r1", [pidLine("finch", "one\n", { file: "f7", end: 4, base: null })], 1000);
+    resolveSweepTails("100.64.0.10:22", "r1", [], 1000 + PEER_IDLE_FORGET_MS - 1);
+    expect(sweepCommand(PEER)).not.toBe(PLAIN);
+    resolveSweepTails("100.64.0.10:22", "r2", [], 1000 + PEER_IDLE_FORGET_MS);
+    expect(sweepCommand(PEER)).toBe(PLAIN);
   });
 
   it("several PIDs of one identity resolve once", () => {
-    resolveSweepTails(PEER, "r1", [pidLine("finch", "one\n", { ino: 7, end: 4, base: null })]);
-    const delta = pidLine("finch", "two\n", { ino: 7, end: 8, base: 4 });
+    resolveSweepTails(PEER, "r1", [pidLine("finch", "one\n", { file: "f7", end: 4, base: null })]);
+    const delta = pidLine("finch", "two\n", { file: "f7", end: 8, base: 4 });
     const t = resolveSweepTails(PEER, "r2", [delta, { ...delta, pid: 101 }]);
     expect(t.get("finch")).toBe("one\ntwo\n");
   });
@@ -126,16 +150,16 @@ describe("sweep-tail-store", () => {
   });
 
   it("a null tail clears what's held", () => {
-    resolveSweepTails(PEER, "r1", [pidLine("finch", "one\n", { ino: 7, end: 4, base: null })]);
+    resolveSweepTails(PEER, "r1", [pidLine("finch", "one\n", { file: "f7", end: 4, base: null })]);
     const t = resolveSweepTails(PEER, "r2", [pidLine("finch", null)]);
     expect(t.get("finch")).toBeNull();
     expect(sweepCommand(PEER)).toBe(PLAIN);
   });
 
   it("peers are kept apart, and no peer holds nothing", () => {
-    resolveSweepTails(PEER, "r1", [pidLine("finch", "one\n", { ino: 7, end: 4, base: null })]);
+    resolveSweepTails(PEER, "r1", [pidLine("finch", "one\n", { file: "f7", end: 4, base: null })]);
     expect(sweepCommand("100.64.0.10:22")).toBe(PLAIN);
-    const t = resolveSweepTails(null, "r1", [pidLine("finch", "one\n", { ino: 7, end: 4, base: null })]);
+    const t = resolveSweepTails(null, "r1", [pidLine("finch", "one\n", { file: "f7", end: 4, base: null })]);
     expect(t.get("finch")).toBe("one\n");
     expect(sweepCommand(null)).toBe(PLAIN);
   });
@@ -143,7 +167,7 @@ describe("sweep-tail-store", () => {
   it("leaves the argument off when it would be too long", () => {
     const lines: SweepPidLine[] = [];
     for (let i = 0; lines.length * 30 < KNOWN_TAILS_ARG_MAX; i++) {
-      lines.push(pidLine(`agent-with-a-long-name-${i}`, "x\n", { ino: 123456789, end: 2, base: null }));
+      lines.push(pidLine(`agent-with-a-long-name-${i}`, "x\n", { file: "f123456789", end: 2, base: null }));
     }
     resolveSweepTails(PEER, "r1", lines);
     expect(knownTailsArg(PEER)).toBeNull();

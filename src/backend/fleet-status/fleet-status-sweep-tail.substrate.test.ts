@@ -12,7 +12,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 const sweep = join(__dirname, "..", "..", "..", "substrate", "scripts", "fleet-status-sweep.py");
 
-type Tail = { text: string; ino: number; end: number; base: number | null } | null;
+type Tail = { text: string; file: string; end: number; base: number | null } | null;
 
 /** Call one of the sweep's helpers with JSON args and get its JSON result. */
 function py(fn: string, ...args: unknown[]): unknown {
@@ -32,7 +32,7 @@ function py(fn: string, ...args: unknown[]): unknown {
   return JSON.parse(out);
 }
 
-const readTail = (path: string, known: [number, number] | null) =>
+const readTail = (path: string, known: [string, number] | null) =>
   py("_read_jsonl_tail", path, known) as Tail;
 
 describe("fleet-status-sweep JSONL tail", () => {
@@ -50,32 +50,36 @@ describe("fleet-status-sweep JSONL tail", () => {
     expect(t.text).toBe('{"a":1}\n{"b":2}\n');
     expect(t.base).toBeNull();
     expect(t.end).toBe(16);
-    expect(t.ino).toBe(statSync(file).ino);
+    const st = statSync(file, { bigint: true });
+    expect(t.file.startsWith(`${st.dev}:${st.ino}:`)).toBe(true);
   });
 
   it("from a known position, sends only the whole lines appended", () => {
     writeFileSync(file, '{"a":1}\n');
     const first = readTail(file, null)!;
     appendFileSync(file, '{"b":2}\n{"c":');
-    const t = readTail(file, [first.ino, first.end])!;
-    expect(t).toEqual({ text: '{"b":2}\n', ino: first.ino, end: 16, base: 8 });
+    const t = readTail(file, [first.file, first.end])!;
+    expect(t).toEqual({ text: '{"b":2}\n', file: first.file, end: 16, base: 8 });
   });
 
   it("nothing appended (or only part of a line) sends an empty delta", () => {
     writeFileSync(file, '{"a":1}\n');
     const first = readTail(file, null)!;
-    expect(readTail(file, [first.ino, first.end])).toEqual({ text: "", ino: first.ino, end: 8, base: 8 });
+    expect(readTail(file, [first.file, first.end])).toEqual({ text: "", file: first.file, end: 8, base: 8 });
     appendFileSync(file, '{"b":');
-    expect(readTail(file, [first.ino, first.end])).toEqual({ text: "", ino: first.ino, end: 8, base: 8 });
+    expect(readTail(file, [first.file, first.end])).toEqual({ text: "", file: first.file, end: 8, base: 8 });
   });
 
   it("a different file, a shrunk file, or a big jump gets the full tail", () => {
     writeFileSync(file, '{"a":1}\n');
-    const { ino } = readTail(file, null)!;
-    expect(readTail(file, [ino + 1, 8])!.base).toBeNull();
-    expect(readTail(file, [ino, 999])!.base).toBeNull();
+    const known = readTail(file, null)!.file;
+    expect(readTail(file, [known + "0", 8])!.base).toBeNull();
+    expect(readTail(file, [known, 999])!.base).toBeNull();
+    const other = join(dir, "other.jsonl");
+    writeFileSync(other, '{"a":1}\n{"b":2}\n');
+    expect(readTail(other, [known, 8])!.base).toBeNull();
     appendFileSync(file, ("x".repeat(1000) + "\n").repeat(300));
-    const t = readTail(file, [ino, 8])!;
+    const t = readTail(file, [known, 8])!;
     expect(t.base).toBeNull();
     expect(t.text.length).toBe(262144);
     expect(t.text.endsWith("x\n")).toBe(true);
@@ -88,14 +92,14 @@ describe("fleet-status-sweep JSONL tail", () => {
 
   it("--known-tails parses, and anything malformed means nothing known", () => {
     const b64 = (v: unknown) => Buffer.from(JSON.stringify(v)).toString("base64");
-    expect(py("_parse_known_tails", ["--known-tails", b64({ finch: [7, 4] })])).toEqual({ finch: [7, 4] });
+    expect(py("_parse_known_tails", ["--known-tails", b64({ finch: ["1:7:ab", 4] })])).toEqual({ finch: ["1:7:ab", 4] });
     expect(py("_parse_known_tails", [])).toEqual({});
     expect(py("_parse_known_tails", ["--known-tails"])).toEqual({});
     expect(py("_parse_known_tails", ["--known-tails", "not base64!"])).toEqual({});
     expect(py("_parse_known_tails", ["--known-tails", b64([1, 2])])).toEqual({});
     expect(
-      py("_parse_known_tails", ["--known-tails", b64({ a: [1], b: ["1", 2], c: [true, 2], d: [3, 4] })]),
-    ).toEqual({ d: [3, 4] });
+      py("_parse_known_tails", ["--known-tails", b64({ a: ["x"], b: [1, 2], c: ["x", true], d: ["x", 4] })]),
+    ).toEqual({ d: ["x", 4] });
   });
 
   it("a run with --known-tails still emits (unknown identities just get full tails)", () => {

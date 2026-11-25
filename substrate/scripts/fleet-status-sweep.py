@@ -21,9 +21,10 @@ Wire contract (canonical): src/backend/fleet-status/sweep-schema.ts.
 Invocation (production):
     ~/.local/bin/fleet-status-sweep [--known-tails <b64>]   # no stdin, reads env $HOME
 
-    --known-tails carries base64 of a JSON object {identity: [inode, end]}:
-    how far into each identity's JSONL the caller already holds whole lines.
-    For a listed identity whose file is the same inode and has grown by at
+    --known-tails carries base64 of a JSON object {identity: [file, end]}:
+    how far into each identity's JSONL the caller already holds whole lines
+    (`file` is the jsonl_tail_file token below). For a listed identity whose
+    file is the same file and has grown by at
     most TAIL_BYTES, the pid line carries only the whole lines appended past
     `end` (jsonl_tail_base = end). Anything else — no flag, unknown
     identity, new file, shrunk file, a bigger jump — gets the full tail.
@@ -64,7 +65,7 @@ Exec-site → emission mapping (parity with RESEARCH.md § "Current per-identity
     A9  cat stop-<sid>.json                      → SweepPidLine.per_session_stop_payload
     A10 stat identities/<name>/.dormant  (A)     → SweepPidLine.dormant_a
     A11 discover JSONL path per PID              → folded (reused from B4)
-    A12 tail -c 262144 <jsonlPath>               → SweepPidLine.jsonl_tail (+ _ino/_end/_base; deltas)
+    A12 tail -c 262144 <jsonlPath>               → SweepPidLine.jsonl_tail (+ _file/_end/_base; deltas)
     B0  find identities/                         → identity enumeration (this script)
     B1  stat identities/<name>/.dormant  (B)     → SweepIdentityLine.dormant
     B2  stat identities/<name>/.compact-requested → SweepIdentityLine.compact_requested
@@ -367,9 +368,13 @@ def discover_identity_jsonl_path(identity_name, home):
 
 def _read_jsonl_tail(path, known):
     """A12 with deltas: the tail of `path`, or only what was appended since
-    the caller's `known` = (inode, end) position.
+    the caller's `known` = (file, end) position.
 
-    Returns {"text", "ino", "end", "base"} or None on any OSError:
+    `file` is "<dev>:<inode>:<path hash>" — a string so 64-bit inode numbers
+    survive the JSON round trip through the backend, and with the path so a
+    reused inode on another transcript never reads as the same file.
+
+    Returns {"text", "file", "end", "base"} or None on any OSError:
       * base is None  → text is the full tail (last TAIL_BYTES), as before.
       * base is an int → text is the bytes [base, end) — whole lines only,
         possibly "" when nothing was appended.
@@ -381,11 +386,14 @@ def _read_jsonl_tail(path, known):
         with open(path, "rb") as fh:
             st = os.fstat(fh.fileno())
             size = st.st_size
-            ino = st.st_ino
+            file_token = "%d:%d:%s" % (
+                st.st_dev, st.st_ino,
+                hashlib.sha1(path.encode("utf-8", "surrogateescape")).hexdigest()[:12],
+            )
             base = None
             if known is not None:
-                k_ino, k_end = known
-                if k_ino == ino and 0 <= k_end <= size and size - k_end <= TAIL_BYTES:
+                k_file, k_end = known
+                if k_file == file_token and 0 <= k_end <= size and size - k_end <= TAIL_BYTES:
                     base = k_end
             start = base if base is not None else max(0, size - TAIL_BYTES)
             fh.seek(start, os.SEEK_SET)
@@ -399,14 +407,14 @@ def _read_jsonl_tail(path, known):
         data = b""
     return {
         "text": data.decode("utf-8", errors="replace"),
-        "ino": ino,
+        "file": file_token,
         "end": start + len(data),
         "base": base,
     }
 
 
 def _parse_known_tails(argv):
-    """`--known-tails <b64>` → {identity: (inode, end)}. Malformed → {} so
+    """`--known-tails <b64>` → {identity: (file, end)}. Malformed → {} so
     the sweep falls back to full tails rather than failing."""
     try:
         i = argv.index("--known-tails")
@@ -420,7 +428,9 @@ def _parse_known_tails(argv):
                 isinstance(name, str)
                 and isinstance(pos, list)
                 and len(pos) == 2
-                and all(isinstance(v, int) and not isinstance(v, bool) for v in pos)
+                and isinstance(pos[0], str)
+                and isinstance(pos[1], int)
+                and not isinstance(pos[1], bool)
             ):
                 known[name] = (pos[0], pos[1])
     return known
@@ -1388,7 +1398,7 @@ def _build_pid_line(pid, identity, home, identity_jsonl_paths, jsonl_tail_cache,
         "per_session_stop_payload": per_session_stop_payload,
         "dormant_a": dormant_a,
         "jsonl_tail": tail["text"] if tail is not None else None,
-        "jsonl_tail_ino": tail["ino"] if tail is not None else None,
+        "jsonl_tail_file": tail["file"] if tail is not None else None,
         "jsonl_tail_end": tail["end"] if tail is not None else None,
         "jsonl_tail_base": tail["base"] if tail is not None else None,
     }

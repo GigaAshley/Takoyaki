@@ -461,7 +461,7 @@ function makeSweepJsonl(input: {
       per_session_stop_payload: raw.per_session_stop_payload ?? null,
       dormant_a: raw.dormant_a ?? false,
       jsonl_tail: raw.jsonl_tail ?? null,
-      ...(raw.jsonl_tail_ino !== undefined ? { jsonl_tail_ino: raw.jsonl_tail_ino } : {}),
+      ...(raw.jsonl_tail_file !== undefined ? { jsonl_tail_file: raw.jsonl_tail_file } : {}),
       ...(raw.jsonl_tail_end !== undefined ? { jsonl_tail_end: raw.jsonl_tail_end } : {}),
       ...(raw.jsonl_tail_base !== undefined ? { jsonl_tail_base: raw.jsonl_tail_base } : {}),
     };
@@ -7009,7 +7009,7 @@ describe("Phase 92 — batch sweep dispatch", () => {
           identity: "alpha",
           pid: PID_ALPHA,
           jsonl_tail: added,
-          jsonl_tail_ino: 5,
+          jsonl_tail_file: "1:5:ab",
           jsonl_tail_end: first.length + added.length,
           jsonl_tail_base: first.length,
         }],
@@ -7023,7 +7023,7 @@ describe("Phase 92 — batch sweep dispatch", () => {
           identity: "alpha",
           pid: PID_ALPHA,
           jsonl_tail: first,
-          jsonl_tail_ino: 5,
+          jsonl_tail_file: "1:5:ab",
           jsonl_tail_end: first.length,
           jsonl_tail_base: null,
         }],
@@ -7054,7 +7054,7 @@ describe("Phase 92 — batch sweep dispatch", () => {
     expect(sweeps[0]).toBe("~/.local/bin/fleet-status-sweep 2>/dev/null");
     const arg = /--known-tails (\S+) 2>\/dev\/null$/.exec(sweeps[1])![1];
     expect(JSON.parse(Buffer.from(arg, "base64").toString("utf8"))).toEqual({
-      alpha: [5, first.length],
+      alpha: ["1:5:ab", first.length],
     });
     expect(titles().at(-1)).toBe("Second");
     orchestrator.stop();

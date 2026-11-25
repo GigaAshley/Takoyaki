@@ -25,7 +25,10 @@
 import type { SweepPidLine } from "./sweep-schema.js";
 
 /** Same window as the sweep's TAIL_BYTES — the tail consumers were built for. */
-export const TAIL_CHARS = 262144;
+export const TAIL_BYTES = 262144;
+
+/** A peer not resolved for this long (no longer polled) is forgotten. */
+export const PEER_IDLE_FORGET_MS = 10 * 60 * 1000;
 
 /**
  * Above this the known-positions argument is left off and the sweep sends
@@ -35,26 +38,29 @@ export const TAIL_CHARS = 262144;
 export const KNOWN_TAILS_ARG_MAX = 96 * 1024;
 
 interface HeldTail {
-  readonly ino: number;
+  readonly file: string;
   readonly end: number;
   readonly text: string;
 }
 
 const store = new Map<string, Map<string, HeldTail>>();
 
-/** The last raw sweep each peer's tails were resolved from, and the result. */
-const lastResolved = new Map<string, { raw: string; tails: Map<string, string | null> }>();
+/** The last raw sweep each peer's tails were resolved from, the result, and when. */
+const lastResolved = new Map<
+  string,
+  { raw: string; tails: Map<string, string | null>; at: number }
+>();
 
 /**
- * base64 of `{identity: [inode, end]}` for every tail held for `peer`, or
+ * base64 of `{identity: [file, end]}` for every tail held for `peer`, or
  * null when there's nothing held (or it would be too long to pass).
  */
 export function knownTailsArg(peer: string | null): string | null {
   if (peer === null) return null;
   const held = store.get(peer);
   if (!held || held.size === 0) return null;
-  const known: Record<string, [number, number]> = {};
-  for (const [identity, tail] of held) known[identity] = [tail.ino, tail.end];
+  const known: Record<string, [string, number]> = {};
+  for (const [identity, tail] of held) known[identity] = [tail.file, tail.end];
   const arg = Buffer.from(JSON.stringify(known), "utf8").toString("base64");
   return arg.length > KNOWN_TAILS_ARG_MAX ? null : arg;
 }
@@ -74,7 +80,9 @@ function isInt(v: unknown): v is number {
 /**
  * identity → the full tail to hand consumers (null = none this tick), for the
  * pid lines of one sweep. Updates what's held for `peer` and drops identities
- * that no longer have a live PID. Resolving the same raw sweep twice (the
+ * that no longer have a live PID (unless the sweep had no PIDs at all — a
+ * glitchy empty sweep shouldn't cost a full re-send of every tail on the next
+ * tick). Resolving the same raw sweep twice (the
  * peer cache hands one sweep to several orchestrators) returns the first
  * result rather than splicing again.
  */
@@ -82,7 +90,9 @@ export function resolveSweepTails(
   peer: string | null,
   raw: string,
   pidLines: readonly SweepPidLine[],
+  now: number = Date.now(),
 ): Map<string, string | null> {
+  forgetIdlePeers(now);
   if (peer !== null) {
     const prior = lastResolved.get(peer);
     if (prior && prior.raw === raw) return prior.tails;
@@ -98,13 +108,29 @@ export function resolveSweepTails(
     if (tails.has(identity)) continue;
     tails.set(identity, resolveOne(held, line));
   }
-  if (held) {
+  if (held && pidLines.length > 0) {
     for (const identity of [...held.keys()]) {
       if (!tails.has(identity)) held.delete(identity);
     }
   }
-  if (peer !== null) lastResolved.set(peer, { raw, tails });
+  if (peer !== null) lastResolved.set(peer, { raw, tails, at: now });
   return tails;
+}
+
+function forgetIdlePeers(now: number): void {
+  for (const [peer, entry] of lastResolved) {
+    if (now - entry.at >= PEER_IDLE_FORGET_MS) {
+      lastResolved.delete(peer);
+      store.delete(peer);
+    }
+  }
+}
+
+/** Last `maxBytes` of `text` measured in UTF-8 bytes, like the sweep's window. */
+function lastBytes(text: string, maxBytes: number): string {
+  if (text.length * 3 <= maxBytes) return text;
+  const buf = Buffer.from(text, "utf8");
+  return buf.length <= maxBytes ? text : buf.subarray(buf.length - maxBytes).toString("utf8");
 }
 
 function resolveOne(
@@ -117,23 +143,22 @@ function resolveOne(
     held?.delete(identity);
     return null;
   }
-  const ino = line.jsonl_tail_ino;
+  const file = line.jsonl_tail_file;
   const end = line.jsonl_tail_end;
   const base = line.jsonl_tail_base;
   if (!isInt(base)) {
     // Full tail (or an older sweep that doesn't send positions).
-    if (isInt(ino) && isInt(end)) held?.set(identity, { ino, end, text });
+    if (typeof file === "string" && isInt(end)) held?.set(identity, { file, end, text });
     else held?.delete(identity);
     return text;
   }
   const prev = held?.get(identity);
-  if (!prev || !isInt(ino) || !isInt(end) || prev.ino !== ino || prev.end !== base) {
+  if (!prev || typeof file !== "string" || !isInt(end) || prev.file !== file || prev.end !== base) {
     return null;
   }
   if (text === "") return prev.text;
-  const joined = prev.text + text;
-  const trimmed = joined.length > TAIL_CHARS ? joined.slice(-TAIL_CHARS) : joined;
-  held!.set(identity, { ino, end, text: trimmed });
+  const trimmed = lastBytes(prev.text + text, TAIL_BYTES);
+  held!.set(identity, { file, end, text: trimmed });
   return trimmed;
 }
 
