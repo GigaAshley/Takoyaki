@@ -1,13 +1,12 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
 import type { SkillActionEntry } from "./skill-actions-store";
-import { skillHue } from "./skill-match";
 
 // Slash skill list (shape slash-skill-menu): the list that floats above the
 // compose box while a skill name is being typed after a leading slash. Pure
 // presentation — the compose box owns the query, the highlight and every key;
 // the keyboard never leaves the compose box. Same family as the
-// lightning-bolt menu: lettered tiles, slash names, two-line descriptions.
+// lightning-bolt menu: slash names over two-line descriptions.
 //
 // Rows never take focus: a pointerdown is prevented so the compose box keeps
 // the caret (and a phone keeps its keyboard up); the pick happens on click,
@@ -26,7 +25,7 @@ const LIST_CLASS = cn(
 );
 
 const ROW_CLASS = cn(
-  "grid grid-cols-[30px_minmax(0,1fr)] items-center gap-x-[11px] gap-y-px",
+  "grid grid-cols-[minmax(0,1fr)] items-center gap-y-px",
   "mx-1.5 px-2 py-[7px] rounded-[10px] cursor-pointer select-none",
 );
 
@@ -91,7 +90,6 @@ export function SlashSkillMenu({
       style={{ maxHeight }}
     >
       {skills.map((skill, i) => {
-        const hue = skillHue(skill.name);
         const active = i === highlighted;
         return (
           <div
@@ -112,17 +110,6 @@ export function SlashSkillMenu({
             }}
             onClick={() => onPick(skill.name)}
           >
-            <span
-              aria-hidden="true"
-              className="row-span-2 grid place-items-center size-[30px] rounded-[8px] text-[13px] font-bold uppercase"
-              style={{
-                color: `hsl(${hue}, 70%, 82%)`,
-                background: `hsl(${hue}, 30%, 26%)`,
-                boxShadow: `inset 0 0 0 1px hsla(${hue}, 50%, 70%, 0.2)`,
-              }}
-            >
-              {skill.name.slice(0, 1)}
-            </span>
             <span className="text-[13.5px] font-semibold truncate">/{skill.name}</span>
             {skill.description ? (
               <span

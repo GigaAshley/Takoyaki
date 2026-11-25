@@ -32,10 +32,3 @@ export function rankSkills(skills: readonly SkillActionEntry[], query: string): 
   ranked.sort((a, b) => a.tier - b.tier || a.i - b.i);
   return ranked.map((r) => r.skill);
 }
-
-/** A skill's steady tile colour, from its name. */
-export function skillHue(name: string): number {
-  let h = 0;
-  for (const c of name) h = (h * 31 + c.charCodeAt(0)) % 360;
-  return h;
-}

@@ -11,7 +11,7 @@ import { cn } from "@/lib/utils";
 import { refreshSkillActions, useSkillActions, type SkillActionEntry } from "./skill-actions-store";
 import { promptNewSkill } from "./new-skill-flow";
 import { requestOpenSkillsEditor } from "@/features/pretty-conversations/open-skills-editor";
-import { rankSkills, skillHue } from "./skill-match";
+import { rankSkills } from "./skill-match";
 
 // Skill-actions menu (campaign skill-actions, shape skill-action-menu): the
 // lightning-bolt aux button left of ThumbsUp. Opens a flat alphabetical list
@@ -26,8 +26,8 @@ import { rankSkills, skillHue } from "./skill-match";
 // (the search text, if any, starts as the name), and the Skills window opens
 // on this host with the new skill. Backing out leaves you in the conversation.
 
-// Kit pop-over (shape-conversation-view): a search field on top, a lettered
-// tile in each skill's own steady colour, two-line descriptions.
+// Kit pop-over (shape-conversation-view): a search field on top, each skill's
+// slash name over a two-line description.
 const CONTENT_CLASS = cn(
   "w-[360px] max-md:w-[calc(100vw-24px)] max-w-[calc(100vw-16px)] min-w-0 p-0 pb-1.5",
   "max-h-[min(62vh,460px,var(--radix-dropdown-menu-content-available-height))]",
@@ -36,7 +36,7 @@ const CONTENT_CLASS = cn(
 );
 
 const ITEM_CLASS = cn(
-  "grid grid-cols-[30px_minmax(0,1fr)] items-center gap-x-[11px] gap-y-px",
+  "grid grid-cols-[minmax(0,1fr)] items-center gap-y-px",
   "mx-1.5 px-2 py-[7px] max-md:py-[9px] rounded-[10px] cursor-pointer",
   "focus:bg-[hsl(220,62%,52%)] focus:text-white data-[highlighted]:bg-[hsl(220,62%,52%)]",
 );
@@ -186,7 +186,6 @@ export function SkillActionsButton({
           <div className="px-3.5 py-4 text-center text-[13px] text-[color:var(--k-t3)]">No skills match</div>
         )}
         {shown.map((skill) => {
-          const hue = skillHue(skill.name);
           return (
             <DropdownMenuItem
               key={skill.name}
@@ -195,17 +194,6 @@ export function SkillActionsButton({
               data-testid={`skill-actions-item-${skill.name}`}
               onSelect={() => fire(skill.name)}
             >
-              <span
-                aria-hidden="true"
-                className="row-span-2 grid place-items-center size-[30px] rounded-[8px] text-[13px] font-bold uppercase"
-                style={{
-                  color: `hsl(${hue}, 70%, 82%)`,
-                  background: `hsl(${hue}, 30%, 26%)`,
-                  boxShadow: `inset 0 0 0 1px hsla(${hue}, 50%, 70%, 0.2)`,
-                }}
-              >
-                {skill.name.slice(0, 1)}
-              </span>
               <span className="text-[13.5px] font-semibold truncate group-focus/dropdown-menu-item:text-white!">/{skill.name}</span>
               {skill.description ? (
                 <span
@@ -227,13 +215,10 @@ export function SkillActionsButton({
           data-testid="skill-actions-new-skill"
           onSelect={() => newSkill(query.trim())}
         >
-          <span
-            aria-hidden="true"
-            className="row-span-2 grid place-items-center size-[30px] rounded-[8px] text-[color:var(--k-t2)] border border-dashed border-[color:var(--k-hair2)] group-focus/dropdown-menu-item:text-white! group-focus/dropdown-menu-item:border-white/60!"
-          >
-            <Plus className="size-[16px]" />
+          <span className="flex items-center gap-1 text-[13.5px] font-semibold truncate group-focus/dropdown-menu-item:text-white!">
+            <Plus aria-hidden="true" className="size-[15px] shrink-0" />
+            New skill…
           </span>
-          <span className="text-[13.5px] font-semibold truncate group-focus/dropdown-menu-item:text-white!">New skill…</span>
           <span className="text-[12px] leading-snug text-[color:var(--k-t2)] group-focus/dropdown-menu-item:text-white/85!">
             Make a skill that isn't here
           </span>
