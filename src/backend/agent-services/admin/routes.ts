@@ -20,11 +20,13 @@ import type { Request, RequestHandler, Response, Router } from "express";
 import { eq } from "drizzle-orm";
 import type { AuthenticatedRequest } from "../../../types/index.js";
 import { getDb } from "../../database/db/index.js";
-import { hosts, users } from "../../database/db/schema.js";
+import { users } from "../../database/db/schema.js";
 import { systemLogger } from "../../utils/logger.js";
 import type { ServiceDefinition } from "../engine/types.js";
 import { AGENT_SERVICES } from "../registry.js";
-import { unreachableSince } from "./reachability.js";
+import { hostReach } from "./reachability.js";
+import { listAgentMachines } from "./machines.js";
+import { servicesUpgradeFinished } from "./upgrade.js";
 import {
   clearUserSecret,
   listServiceUserSecretStatus,
@@ -47,6 +49,8 @@ export const MAX_KEY_LENGTH = 8192;
 
 export interface ServicesRouteDeps extends OverviewDeps {
   services(): readonly ServiceDefinition[];
+  /** Resolves once the one-time import has run; changes wait for it. */
+  ready(): Promise<void>;
   setSetting(service: string, name: string, value: string, by: string): Promise<void>;
   clearSetting(service: string, name: string): Promise<void>;
   setEnabled(service: string, machineId: string, enabled: boolean, by: string): Promise<boolean>;
@@ -57,20 +61,24 @@ export interface ServicesRouteDeps extends OverviewDeps {
   clearPersonKey(userId: string, service: string, name: string): Promise<boolean>;
 }
 
-/** Agent machines: host rows set to run agents, one entry per machine. */
-export async function listAgentMachines(): Promise<AgentMachine[]> {
-  const rows = await getDb()
-    .select({ id: hosts.id, name: hosts.name, machineId: hosts.machineId })
-    .from(hosts)
-    .where(eq(hosts.runsFleetSubstrate, true));
-  const byMachine = new Map<string, AgentMachine>();
-  for (const r of rows.sort((a, b) => a.id - b.id)) {
-    const machineId = String(r.machineId ?? r.id);
-    const m = byMachine.get(machineId) ?? { machineId, name: r.name || `host ${r.id}`, hostIds: [] };
-    m.hostIds.push(String(r.id));
-    byMachine.set(machineId, m);
-  }
-  return [...byMachine.values()].sort((a, b) => a.name.localeCompare(b.name));
+/** How long a change waits for start-up to finish before giving up. */
+const READY_WAIT_MS = 30_000;
+
+/** One re-push for a burst of switch changes (an admin flipping several). */
+const RESWEEP_DEBOUNCE_MS = 3_000;
+function debounceResweep(fn: (reason: string) => void): (reason: string) => void {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const reasons = new Set<string>();
+  return (reason) => {
+    reasons.add(reason);
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      timer = null;
+      const all = [...reasons].join("; ");
+      reasons.clear();
+      fn(all);
+    }, RESWEEP_DEBOUNCE_MS);
+  };
 }
 
 export const defaultServicesRouteDeps: ServicesRouteDeps = {
@@ -84,7 +92,8 @@ export const defaultServicesRouteDeps: ServicesRouteDeps = {
   listAgentMachines,
   serviceHealth: (s) => serviceHealth(s),
   usageSummary: (s) => usageSummary(s),
-  unreachableSince,
+  hostReach,
+  ready: () => servicesUpgradeFinished,
   async listUsers() {
     return getDb().select({ id: users.id, username: users.username }).from(users);
   },
@@ -92,9 +101,7 @@ export const defaultServicesRouteDeps: ServicesRouteDeps = {
   setSetting,
   clearSetting,
   setEnabled,
-  resweep(reason) {
-    void getSubstrateOrchestrator()?.resweepAll(reason);
-  },
+  resweep: debounceResweep((reason) => void getSubstrateOrchestrator()?.resweepAll(reason)),
   async userExists(userId) {
     const rows = await getDb().select({ id: users.id }).from(users).where(eq(users.id, userId)).limit(1);
     return rows.length > 0;
@@ -130,6 +137,17 @@ export function registerServicesAdminRoutes(
     systemLogger.error(`Admin services: failed to ${what}`, err, { operation: "admin_services_failed", what });
     res.status(500).json({ error: `Failed to ${what}` });
   };
+  /** Changes wait for the one-time import, so it can't undo or overwrite them. */
+  const isReady = async (res: Response): Promise<boolean> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const ready = await Promise.race([
+      deps.ready().then(() => true),
+      new Promise<boolean>((r) => (timer = setTimeout(() => r(false), READY_WAIT_MS))),
+    ]);
+    clearTimeout(timer);
+    if (!ready) res.status(503).json({ error: "Services are still starting; try again in a moment" });
+    return ready;
+  };
   const log = (operation: string, ctx: Record<string, unknown>) =>
     systemLogger.info(`Admin services: ${operation.replace(/^admin_service_/, "").replace(/_/g, " ")}`, {
       operation,
@@ -164,10 +182,11 @@ export function registerServicesAdminRoutes(
 
   router.put("/admin/services/:service/keys/:name", requireAdmin, async (req, res) => {
     try {
+      if (!(await isReady(res))) return;
       const def = findService(req, res);
       if (!def) return;
       const name = param(req, "name");
-      if (!def.secrets?.[name]) return res.status(404).json({ error: "No such key" });
+      if (!Object.hasOwn(def.secrets ?? {}, name)) return res.status(404).json({ error: "No such key" });
       if (!deps.keyStore.writable) {
         return res.status(409).json({ error: `Keys are read from ${deps.keyStore.kind} and can't be changed here` });
       }
@@ -183,10 +202,11 @@ export function registerServicesAdminRoutes(
 
   router.delete("/admin/services/:service/keys/:name", requireAdmin, async (req, res) => {
     try {
+      if (!(await isReady(res))) return;
       const def = findService(req, res);
       if (!def) return;
       const name = param(req, "name");
-      if (!def.secrets?.[name]) return res.status(404).json({ error: "No such key" });
+      if (!Object.hasOwn(def.secrets ?? {}, name)) return res.status(404).json({ error: "No such key" });
       if (!deps.keyStore.writable) {
         return res.status(409).json({ error: `Keys are read from ${deps.keyStore.kind} and can't be changed here` });
       }
@@ -200,10 +220,11 @@ export function registerServicesAdminRoutes(
 
   router.put("/admin/services/:service/settings/:name", requireAdmin, async (req, res) => {
     try {
+      if (!(await isReady(res))) return;
       const def = findService(req, res);
       if (!def) return;
       const name = param(req, "name");
-      const spec = def.settings?.[name];
+      const spec = Object.hasOwn(def.settings ?? {}, name) ? def.settings![name] : undefined;
       if (!spec) return res.status(404).json({ error: "No such setting" });
       const value = (req.body as { value?: unknown } | undefined)?.value;
       if (typeof value !== "string") return res.status(400).json({ error: "value must be a string" });
@@ -223,6 +244,7 @@ export function registerServicesAdminRoutes(
 
   router.put("/admin/services/:service/machines/:machineId", requireAdmin, async (req, res) => {
     try {
+      if (!(await isReady(res))) return;
       const def = findService(req, res);
       if (!def) return;
       const machineId = param(req, "machineId");
@@ -244,7 +266,7 @@ export function registerServicesAdminRoutes(
     const def = findService(req, res);
     if (!def) return null;
     const name = param(req, "name");
-    if (!def.userSecrets?.[name]) {
+    if (!Object.hasOwn(def.userSecrets ?? {}, name)) {
       res.status(404).json({ error: "No such per-person key" });
       return null;
     }
@@ -257,6 +279,7 @@ export function registerServicesAdminRoutes(
 
   router.put("/admin/services/:service/people/:userId/keys/:name", requireAdmin, async (req, res) => {
     try {
+      if (!(await isReady(res))) return;
       const target = await personKey(req, res);
       if (!target) return;
       const value = readValue(req);
@@ -271,6 +294,7 @@ export function registerServicesAdminRoutes(
 
   router.delete("/admin/services/:service/people/:userId/keys/:name", requireAdmin, async (req, res) => {
     try {
+      if (!(await isReady(res))) return;
       const target = await personKey(req, res);
       if (!target) return;
       const removed = await deps.clearPersonKey(target.userId, target.def.name, target.name);

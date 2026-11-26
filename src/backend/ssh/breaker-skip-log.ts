@@ -9,8 +9,9 @@
  * as well buried the log under one host that was simply switched off, so
  * each scanner records the change instead.
  *
- * Only breaker refusals count as skipping. Real connect failures (timeouts,
- * auth errors) keep logging at the call site on every attempt.
+ * Breaker refusals count as skipping. A scanner may route real connect
+ * failures (timeouts, auth errors) through refused() too, as the agent
+ * services scan does, so a machine that is simply off logs once.
  */
 
 import type { Logger } from "../utils/logger.js";

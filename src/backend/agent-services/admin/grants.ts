@@ -15,9 +15,12 @@ import { agentServiceGrants } from "../../database/db/schema.js";
 import { persist } from "./persist.js";
 
 let cache: Map<string, Set<string>> | null = null;
+/** Bumped on every change: a load that began before one never fills the cache. */
+let generation = 0;
 
 async function load(): Promise<Map<string, Set<string>>> {
   if (cache) return cache;
+  const started = generation;
   const rows = await getDb()
     .select({ service: agentServiceGrants.service, machineId: agentServiceGrants.machineId })
     .from(agentServiceGrants);
@@ -26,7 +29,7 @@ async function load(): Promise<Map<string, Set<string>>> {
     if (!map.has(r.service)) map.set(r.service, new Set());
     map.get(r.service)!.add(r.machineId);
   }
-  cache = map;
+  if (started === generation) cache = map;
   return map;
 }
 
@@ -68,6 +71,7 @@ export async function setEnabled(
       .where(and(eq(agentServiceGrants.service, service), eq(agentServiceGrants.machineId, machineId)));
   }
   cache = null;
+  generation++;
   await persist("agent_service_grant_set");
   return true;
 }
@@ -75,4 +79,12 @@ export async function setEnabled(
 /** Test hook: forget the cache. */
 export function __resetGrantCache(): void {
   cache = null;
+  generation++;
+}
+
+/** Every switched-on (service, machine) pair, for the start-up orphan check. */
+export async function allGrants(): Promise<Array<{ service: string; machineId: string }>> {
+  return getDb()
+    .select({ service: agentServiceGrants.service, machineId: agentServiceGrants.machineId })
+    .from(agentServiceGrants);
 }

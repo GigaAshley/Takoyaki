@@ -41,7 +41,7 @@ import { defineService, ok, type ServiceDefinition } from "../engine/types.js";
 import { databaseKeyStore } from "./key-store.js";
 import { effectiveSettings, setSetting } from "./settings-store.js";
 import { __resetGrantCache, enabledServices, isEnabled, setEnabled } from "./grants.js";
-import { USAGE_RETENTION_MS, recordUsage, serviceHealth, usageSummary } from "./usage.js";
+import { USAGE_RETENTION_MS, __resetUsagePrune, recordUsage, serviceHealth, usageSummary } from "./usage.js";
 import { importFromEnvironment, leftoverServiceKeys, runServicesUpgrade } from "./upgrade.js";
 import { defaultServicesRouteDeps, registerServicesAdminRoutes } from "./routes.js";
 import { setReachabilitySource } from "./reachability.js";
@@ -90,6 +90,7 @@ beforeEach(() => {
   sqlite.exec(DDL);
   drizzleInstance = drizzle(sqlite);
   __resetGrantCache();
+  __resetUsagePrune();
   vi.mocked(systemLogger.info).mockClear();
 });
 
@@ -240,7 +241,7 @@ describe("the one-time upgrade", () => {
 
   it("brings in service keys and speech to text's setup, and switches nothing on", async () => {
     machine(1, "t1000");
-    expect(await importFromEnvironment(SERVICES, ENV)).toBe(true);
+    expect(await importFromEnvironment(SERVICES, { ...ENV, STT_LANGUAGE: "en-US" })).toBe(true);
     expect(await databaseKeyStore.get("agent-phone", "TWILIO_AUTH_TOKEN")).toBe("tok");
     expect(await databaseKeyStore.get("image-gen", "OPENAI_API_KEY")).toBe("sk-openai");
     expect(await effectiveSettings("stt", STT_SETTINGS)).toEqual({ provider: "elevenlabs", backup: "groq", language: "en" });
@@ -321,6 +322,7 @@ describe("Admin → Services routes", () => {
     registerServicesAdminRoutes(router, requireAdmin, {
       ...defaultServicesRouteDeps,
       services: () => SERVICES,
+      ready: async () => {},
       resweep,
     });
     app.use("/users", router);
@@ -393,18 +395,56 @@ describe("Admin → Services routes", () => {
     expect(detail.usage.recentErrors[0]).toMatchObject({ name: "thenasty", code: "provider_unavailable" });
   });
 
-  it("says when a machine can't be reached, only once none of its rows answer", async () => {
+  it("says when a machine can't be reached, only once none of its scanned rows answer", async () => {
     const down = new Map([["2", Date.parse("2026-11-25T10:00:00Z")]]);
-    setReachabilitySource((id) => down.get(id) ?? null);
+    const scanned = new Set(["1", "2", "3"]);
+    setReachabilitySource((id) => ({ scanned: scanned.has(id), since: down.get(id) ?? null }));
+    const thenasty = async () =>
+      (await call("GET", "/admin/services/image-gen")).body.service.machines.find(
+        (m: { machineId: string }) => m.machineId === "2",
+      ).unreachableSince;
     try {
-      let machines = (await call("GET", "/admin/services/image-gen")).body.service.machines;
-      expect(machines.find((m: { machineId: string }) => m.machineId === "2").unreachableSince).toBeNull();
+      expect(await thenasty()).toBeNull();
       down.set("3", Date.parse("2026-11-25T11:00:00Z"));
-      machines = (await call("GET", "/admin/services/image-gen")).body.service.machines;
-      expect(machines.find((m: { machineId: string }) => m.machineId === "2").unreachableSince).toBe("2026-11-25T11:00:00.000Z");
+      expect(await thenasty()).toBe("2026-11-25T11:00:00.000Z");
+      // A row the scan never visits (no SSH) doesn't keep the machine looking fine.
+      down.delete("3");
+      scanned.delete("3");
+      expect(await thenasty()).toBe("2026-11-25T10:00:00.000Z");
     } finally {
-      setReachabilitySource(() => null);
+      setReachabilitySource(() => ({ scanned: false, since: null }));
     }
+  });
+
+  it("changes wait for start-up to finish", async () => {
+    let finish!: () => void;
+    const started = new Promise<void>((r) => (finish = r));
+    const app = express();
+    app.use(express.json());
+    const router = express.Router();
+    registerServicesAdminRoutes(router, (req, _res, next) => {
+      (req as unknown as { userId: string }).userId = "u-admin";
+      next();
+    }, { ...defaultServicesRouteDeps, services: () => SERVICES, ready: () => started, resweep });
+    app.use("/users", router);
+    const s = app.listen(0);
+    await new Promise<void>((r) => s.once("listening", () => r()));
+    try {
+      const url = `http://127.0.0.1:${(s.address() as AddressInfo).port}/users/admin/services/image-gen/keys/OPENAI_API_KEY`;
+      const put = fetch(url, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ value: "k" }) });
+      await new Promise((r) => setTimeout(r, 50));
+      expect(await databaseKeyStore.get("image-gen", "OPENAI_API_KEY")).toBeNull();
+      finish();
+      expect((await put).status).toBe(200);
+      expect(await databaseKeyStore.get("image-gen", "OPENAI_API_KEY")).toBe("k");
+    } finally {
+      await new Promise<void>((r) => s.close(() => r()));
+    }
+  });
+
+  it("ignores names that aren't the service's own (no inherited object names)", async () => {
+    expect((await call("PUT", "/admin/services/agent-phone/keys/constructor", { value: "x" })).status).toBe(404);
+    expect((await call("PUT", "/admin/services/stt/settings/constructor", { value: "x" })).status).toBe(404);
   });
 
   it("speech to text asks only for the keys its chosen providers need", async () => {

@@ -76,8 +76,12 @@ async function listSubstrateHostsCaching() {
   const list = await listSubstrateHosts({ getDb });
   systemConnDetailsByHost.clear();
   for (const h of list) systemConnDetailsByHost.set(h.id, h._connDetails);
+  scannedHostIds = new Set(list.map((h) => h.id));
   return list;
 }
+
+/** The host rows the last scan tick visited, for the Services view. */
+let scannedHostIds = new Set<string>();
 
 async function getSystemConnDetails(
   hostIdNum: number,
@@ -124,7 +128,10 @@ export async function startAgentServices(): Promise<void> {
     label: "agent-services scan",
     logger: systemLogger,
   });
-  setReachabilitySource((hostId) => skipLog.skippingSince(hostId));
+  setReachabilitySource((hostId) => ({
+    scanned: scannedHostIds.has(hostId),
+    since: skipLog.skippingSince(hostId),
+  }));
 
   async function acquireChannel(
     host: ScanHostRecord,

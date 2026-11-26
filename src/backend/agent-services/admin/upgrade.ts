@@ -29,8 +29,18 @@ import type { ServiceDefinition } from "../engine/types.js";
 import { getKeyStore } from "./key-store.js";
 import { effectiveSettings, setSetting, storedSettings } from "./settings-store.js";
 import { persist } from "./persist.js";
+import { allGrants } from "./grants.js";
+import { listAgentMachines } from "./machines.js";
 
 export const UPGRADE_MARKER = "agent_services_env_import";
+
+let markFinished: () => void = () => {};
+/**
+ * Resolves once runServicesUpgrade has finished (imported or not). Admin
+ * changes wait on it, so the import never overwrites or brings back a key an
+ * admin changed while the server was still starting.
+ */
+export const servicesUpgradeFinished: Promise<void> = new Promise((r) => (markFinished = r));
 
 /**
  * Environment variables the app itself reads (voice, avatars), so their
@@ -82,7 +92,8 @@ async function importSttSettings(def: ServiceDefinition, env: Env, existing: boo
   if (valid("provider", provider)) await put("provider", provider);
   const backup = (env.STT_FALLBACK_PROVIDER ?? "").trim().toLowerCase();
   if (valid("backup", backup) && backup !== provider) await put("backup", backup);
-  const language = (env.STT_LANGUAGE ?? "").trim().toLowerCase();
+  // A region-style code (en-US) pins its language (en).
+  const language = (env.STT_LANGUAGE ?? "").trim().toLowerCase().split(/[-_]/)[0];
   if (valid("language", language)) await put("language", language);
   return imported;
 }
@@ -148,11 +159,36 @@ export async function runServicesUpgrade(
       error: err instanceof Error ? err.message : String(err),
     });
   }
+  markFinished();
   const leftover = leftoverServiceKeys(services, env);
   if (leftover.length > 0) {
     systemLogger.info(
       `agent-services: ignoring service keys still in the server settings (${leftover.join(", ")}); they live in Admin → Services now and can be deleted from the settings file`,
       { operation: "agent_services_env_keys_ignored", names: leftover },
     );
+  }
+  await warnOrphanedGrants();
+}
+
+/**
+ * Switches for a machine id no agent machine has any more (a host deleted
+ * or re-addressed). They do nothing, but would come back to life if that id
+ * is ever used again, so say so at start.
+ */
+async function warnOrphanedGrants(): Promise<void> {
+  try {
+    const known = new Set((await listAgentMachines()).map((m) => m.machineId));
+    const orphaned = (await allGrants()).filter((g) => !known.has(g.machineId));
+    if (orphaned.length > 0) {
+      systemLogger.warn("agent-services: services switched on for machines that no longer exist", {
+        operation: "agent_services_orphaned_grants",
+        orphaned,
+      });
+    }
+  } catch (err) {
+    systemLogger.warn("agent-services: couldn't check for switches on removed machines", {
+      operation: "agent_services_orphaned_grants_check_failed",
+      error: err instanceof Error ? err.message : String(err),
+    });
   }
 }

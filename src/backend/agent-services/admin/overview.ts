@@ -30,8 +30,8 @@ export interface OverviewDeps {
   listAgentMachines(): Promise<AgentMachine[]>;
   serviceHealth(service: string): Promise<ServiceHealth>;
   usageSummary(service: string): Promise<UsageSummary>;
-  /** When the scan stopped reaching a host row (ms), or null. */
-  unreachableSince(hostId: string): number | null;
+  /** Whether the scan visits a host row, and since when it can't reach it. */
+  hostReach(hostId: string): { scanned: boolean; since: number | null };
   listUsers(): Promise<Array<{ id: string; username: string }>>;
   listPersonKeyStatus(service: string): Promise<Array<{ userId: string; name: string; updatedAt: string }>>;
 }
@@ -173,8 +173,9 @@ export async function serviceDetail(def: ServiceDefinition, deps: OverviewDeps):
   const machineName = (id: string) => nameOf.get(id) ?? "a removed machine";
 
   const machineViews: MachineView[] = machines.map((m) => {
-    const since = m.hostIds.map((id) => deps.unreachableSince(id));
-    // Unreachable only when no row of it is being reached.
+    // Judged over the rows the scan visits; unreachable only when none of
+    // them is being reached. A machine with no scanned row says nothing.
+    const since = m.hostIds.map((id) => deps.hostReach(id)).filter((r) => r.scanned).map((r) => r.since);
     const down = since.length > 0 && since.every((t) => t !== null);
     return {
       machineId: m.machineId,

@@ -311,6 +311,28 @@ describe("agent-services engine", () => {
     });
   });
 
+  it("a key these settings don't use can't fail the request", async () => {
+    const svc = defineService({
+      ...echo,
+      secrets: { SPARE: { label: "spare", description: "test", neededWhen: () => false } },
+    });
+    const engine = createAgentServiceEngine({
+      services: [svc],
+      ...storeDeps({}),
+      getKey: async () => {
+        throw new Error("bad blob");
+      },
+      now: () => NOW,
+      writeResponse: async (_h, _u, _f, _n, json) => void answers.push(JSON.parse(json)),
+    });
+    const answers: Record<string, any>[] = [];
+    await engine.intake(HOST, { claim: async () => [], readAttachment: async () => "missing" }, [
+      { uuid: UUID, body: JSON.stringify(envelope({ text: "x" })) },
+    ]);
+    await vi.waitFor(() => expect(answers).toHaveLength(1));
+    expect(answers[0].ok).toBe(true);
+  });
+
   describe("machine switches", () => {
     it("refuses a machine the service isn't switched on for, before queueing", async () => {
       const handle = vi.fn(async () => ok({}));
@@ -323,6 +345,36 @@ describe("agent-services engine", () => {
         message:
           "echo isn't switched on for this machine; an admin can switch it on in Admin → Services",
       });
+    });
+
+    it("refuses a queued job whose machine was switched off while it waited", async () => {
+      let on = true;
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      const handle = vi.fn(async (input: { text: string }) => {
+        if (input.text === "first") await gate;
+        return ok({});
+      });
+      const svc = defineService({ ...echo, handle });
+      const answers: Record<string, any>[] = [];
+      const engine = createAgentServiceEngine({
+        services: [svc],
+        ...storeDeps({}),
+        isEnabled: async () => on,
+        now: () => NOW,
+        writeResponse: async (_h, uuid, _f, _n, json) => void answers.push({ uuid, ...JSON.parse(json) }),
+      });
+      const io: HostRequestIo = { claim: async () => [], readAttachment: async () => "missing" };
+      const second = "bbbbbbbb-1111-4111-8111-111111111111";
+      await engine.intake(HOST, io, [
+        { uuid: UUID, body: JSON.stringify(envelope({ text: "first" })) },
+        { uuid: second, body: JSON.stringify(envelope({ text: "second" })) },
+      ]);
+      on = false;
+      release();
+      await vi.waitFor(() => expect(answers).toHaveLength(2));
+      expect(answers.find((a) => a.uuid === second).error.code).toBe("not_enabled");
+      expect(handle).toHaveBeenCalledTimes(1);
     });
 
     it("serves a machine it's switched on for", async () => {

@@ -218,6 +218,37 @@ export function createAgentServiceEngine(deps: EngineDeps): AgentServiceEngine {
     );
   }
 
+  /** True if the service is on for the host's machine; else answers and returns false. */
+  async function switchedOn(host: RequestHost, uuid: string, service: string): Promise<boolean> {
+    let enabled: boolean;
+    try {
+      enabled = await deps.isEnabled(service, host.machineId);
+    } catch (err) {
+      await respond(
+        host,
+        uuid,
+        service,
+        engineFailure(
+          "internal",
+          `switch lookup failed: ${err instanceof Error ? err.message : String(err)}`,
+        ),
+      );
+      return false;
+    }
+    if (!enabled) {
+      await respond(
+        host,
+        uuid,
+        service,
+        engineFailure(
+          "not_enabled",
+          `${service} isn't switched on for this machine; an admin can switch it on in Admin → Services`,
+        ),
+      );
+    }
+    return enabled;
+  }
+
   async function runJob(
     rt: ServiceRuntime,
     host: RequestHost,
@@ -238,6 +269,9 @@ export function createAgentServiceEngine(deps: EngineDeps): AgentServiceEngine {
       );
       return;
     }
+
+    // Switched off while it waited in the queue: don't run it.
+    if (!rt.core && !(await switchedOn(host, uuid, def.name))) return;
 
     const notConfigured = (what: string) =>
       respond(
@@ -276,16 +310,27 @@ export function createAgentServiceEngine(deps: EngineDeps): AgentServiceEngine {
 
     const secrets: Record<string, string> = {};
     for (const [name, spec] of Object.entries(def.secrets ?? {})) {
+      const needed = spec.neededWhen?.(settings) ?? true;
       let value: string | null;
       try {
         value = await deps.getKey(def.name, name);
       } catch (err) {
-        await lookupFailed("key", err);
-        return;
+        if (needed) {
+          await lookupFailed("key", err);
+          return;
+        }
+        // A key these settings don't use can't fail the request.
+        systemLogger.warn("agent-services: unused key couldn't be read", {
+          operation: "agent_services_unused_key_unreadable",
+          service: def.name,
+          name,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        continue;
       }
       if (value) {
         secrets[name] = value;
-      } else if (spec.neededWhen?.(settings) ?? true) {
+      } else if (needed) {
         await notConfigured(`its ${spec.label}`);
         return;
       }
@@ -420,35 +465,7 @@ export function createAgentServiceEngine(deps: EngineDeps): AgentServiceEngine {
       return;
     }
     const { def } = rt;
-    if (!rt.core) {
-      let enabled: boolean;
-      try {
-        enabled = await deps.isEnabled(def.name, host.machineId);
-      } catch (err) {
-        await respond(
-          host,
-          uuid,
-          def.name,
-          engineFailure(
-            "internal",
-            `switch lookup failed: ${err instanceof Error ? err.message : String(err)}`,
-          ),
-        );
-        return;
-      }
-      if (!enabled) {
-        await respond(
-          host,
-          uuid,
-          def.name,
-          engineFailure(
-            "not_enabled",
-            `${def.name} isn't switched on for this machine; an admin can switch it on in Admin → Services`,
-          ),
-        );
-        return;
-      }
-    }
+    if (!rt.core && !(await switchedOn(host, uuid, def.name))) return;
     const malformed = (message: string) =>
       respond(host, uuid, def.name, engineFailure("malformed", message));
 

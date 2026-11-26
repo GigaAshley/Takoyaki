@@ -8,7 +8,7 @@
  * USAGE_RETENTION_MS are cleared.
  */
 
-import { and, desc, eq, gte, lt } from "drizzle-orm";
+import { and, desc, eq, gte, lt, ne, or } from "drizzle-orm";
 import { getDb } from "../../database/db/index.js";
 import { agentServiceUsage } from "../../database/db/schema.js";
 import { systemLogger } from "../../utils/logger.js";
@@ -33,7 +33,8 @@ export async function recordUsage(r: UsageRecord, now: number = Date.now()): Pro
   try {
     const db = getDb();
     await db.insert(agentServiceUsage).values({ ...r, at: new Date(now).toISOString() });
-    if (now - lastPrune > PRUNE_EVERY_MS) {
+    // A clock that stepped back prunes too, rather than waiting it out.
+    if (now - lastPrune > PRUNE_EVERY_MS || now < lastPrune) {
       lastPrune = now;
       await db
         .delete(agentServiceUsage)
@@ -57,22 +58,49 @@ export interface ServiceHealth {
   lastUsedAt: string | null;
 }
 
+/** Test hook: forget when usage was last pruned. */
+export function __resetUsagePrune(): void {
+  lastPrune = 0;
+}
+
 /** Whether the service is failing, from its most recent telling record. */
 export async function serviceHealth(service: string): Promise<ServiceHealth> {
+  const db = getDb();
   // The latest record that says something about the service itself: a
   // success, or a failure that is its fault. A bad request says nothing.
-  const recent = await getDb()
-    .select({ at: agentServiceUsage.at, ok: agentServiceUsage.ok, code: agentServiceUsage.code, fault: agentServiceUsage.fault })
-    .from(agentServiceUsage)
-    .where(eq(agentServiceUsage.service, service))
-    .orderBy(desc(agentServiceUsage.id))
-    .limit(200);
-  const decisive = recent.find((r) => r.ok || r.fault);
+  const decisive = (
+    await db
+      .select({ at: agentServiceUsage.at, ok: agentServiceUsage.ok, code: agentServiceUsage.code })
+      .from(agentServiceUsage)
+      .where(
+        and(
+          eq(agentServiceUsage.service, service),
+          or(eq(agentServiceUsage.ok, true), eq(agentServiceUsage.fault, true)),
+        ),
+      )
+      .orderBy(desc(agentServiceUsage.id))
+      .limit(1)
+  )[0];
+  // Last used: the last request the service was asked to do, not one
+  // refused because the machine isn't switched on.
+  const last = (
+    await db
+      .select({ at: agentServiceUsage.at })
+      .from(agentServiceUsage)
+      .where(
+        and(
+          eq(agentServiceUsage.service, service),
+          or(eq(agentServiceUsage.ok, true), ne(agentServiceUsage.code, "not_enabled")),
+        ),
+      )
+      .orderBy(desc(agentServiceUsage.id))
+      .limit(1)
+  )[0];
   const failing = Boolean(decisive && !decisive.ok);
   return {
     failing,
     lastFault: failing && decisive ? { at: decisive.at, code: decisive.code } : null,
-    lastUsedAt: recent[0]?.at ?? null,
+    lastUsedAt: last?.at ?? null,
   };
 }
 
