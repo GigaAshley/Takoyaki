@@ -107,6 +107,7 @@ const phone = defineService({
     TWILIO_ACCOUNT_SID: { label: "Twilio account SID", description: "Twilio console" },
     TWILIO_AUTH_TOKEN: { label: "Twilio auth token", description: "Twilio console" },
   },
+  uses: ["stt"],
   ttlMs: 1000,
   handle: async () => ok({}),
 });
@@ -392,6 +393,18 @@ describe("Admin → Services routes", () => {
     expect((await call("GET", "/admin/services/stt")).body.service.state).toBe("not_set_up");
   });
 
+  it("phone lists speech to text as missing until speech to text is set up", async () => {
+    await call("PUT", "/admin/services/agent-phone/keys/TWILIO_ACCOUNT_SID", { value: "AC1" });
+    await call("PUT", "/admin/services/agent-phone/keys/TWILIO_AUTH_TOKEN", { value: "t" });
+    let phone = (await call("GET", "/admin/services/agent-phone")).body.service;
+    expect(phone.state).toBe("not_set_up");
+    expect(phone.missing).toEqual(["Speech to text"]);
+
+    await call("PUT", "/admin/services/stt/settings/provider", { value: "bedrock" });
+    phone = (await call("GET", "/admin/services")).body.services.find((s: { name: string }) => s.name === "agent-phone");
+    expect(phone).toMatchObject({ state: "ready", missing: [] });
+  });
+
   it("per-person keys are set by an admin, per person, and never shown back", async () => {
     let detail = (await call("GET", "/admin/services/zoho")).body.service;
     expect(detail.personKeys).toEqual({
@@ -520,6 +533,7 @@ describe("Admin → Services with keys in AWS Parameter Store", () => {
   });
 
   it("while AWS is unreachable the panel says so, and shows what was last read", async () => {
+    await call("PUT", "/admin/services/stt/settings/provider", { value: "bedrock" });
     await call("PUT", "/admin/services/image-gen/keys/OPENAI_API_KEY", { value: "sk-aws" });
     aws.state.mode = "down";
     const list = await call("GET", "/admin/services");

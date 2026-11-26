@@ -76,6 +76,8 @@ export function createAgentPhoneService(deps: AgentPhoneDeps = productionDeps) {
           "The instance's one Twilio number, in +E.164 form (Twilio console → Phone numbers)",
       },
     },
+    // Replies are transcribed with speech to text's setup.
+    uses: ["stt"],
     // Twilio refusing or failing the call, or the backend itself; never the
     // person not answering.
     faultCodes: ["placement_error", "queue_error", "timeout", "unknown"],

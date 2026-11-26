@@ -165,6 +165,12 @@ export interface ServiceDefinition<
    */
   settings?: Record<string, ServiceSettingSpec>;
   /**
+   * Other services whose setup this one relies on (e.g. phone transcribes
+   * replies with speech to text). Admin → Services lists one that isn't set
+   * up as missing here too. The engine doesn't refuse requests over it.
+   */
+  uses?: readonly string[];
+  /**
    * Failure codes this service returns when the service itself is at fault
    * (a rejected key, a provider that is down or refusing), as opposed to a
    * bad request or an outcome that is no failure (nobody picked up). The

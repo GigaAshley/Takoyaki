@@ -3,8 +3,9 @@
  * from the service definitions and the stores. Never carries a key value.
  *
  * State, in order:
- *   not_set_up  a required setting has no value, or a key the service needs
- *               with its settings isn't set;
+ *   not_set_up  a required setting has no value, a key the service needs
+ *               with its settings isn't set, or a service it uses isn't set
+ *               up;
  *   failing     the key store can't say whether a needed key is set (AWS
  *               unreachable, or refusing), or the last success-or-fault
  *               record was a fault (usage.ts);
@@ -25,6 +26,8 @@ export interface AgentMachine {
 }
 
 export interface OverviewDeps {
+  /** Every service, to judge the ones a service uses. */
+  services(): readonly ServiceDefinition[];
   keyStore: InstanceKeyStore;
   effectiveSettings(service: string, specs: ServiceDefinition["settings"]): Promise<Record<string, string>>;
   storedSettings(service: string): Promise<Record<string, string>>;
@@ -150,6 +153,10 @@ export async function summarize(
   machines: AgentMachine[],
 ): Promise<ServiceSummary & { keys: KeyView[]; settings: SettingView[]; lastFault: ServiceHealth["lastFault"] }> {
   const { keys, settings, missing, keyProblem } = await keysAndSettings(def, deps);
+  for (const name of def.uses ?? []) {
+    const used = deps.services().find((s) => s.name === name);
+    if (used && (await keysAndSettings(used, deps)).missing.length > 0) missing.push(used.title);
+  }
   const health = await deps.serviceHealth(def.name);
   const on = await deps.enabledMachines(def.name);
   const state: ServiceState =
