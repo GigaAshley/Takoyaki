@@ -3,8 +3,8 @@
  * from starter.ts; replaces the per-service boot blocks that used to live
  * there.
  *
- * Before the engine starts, the one-time upgrade brings service keys in
- * from the server settings (admin/upgrade.ts). The engine reads keys,
+ * The key store is the one the instance chose in its server settings
+ * (admin/choose-store.ts), picked on first use. The engine reads keys,
  * settings and machine switches from the stores in admin/, and records each
  * answer there. Identity reactivate is the app's own machinery riding the
  * same request files: a core handler, answered for every machine.
@@ -53,7 +53,7 @@ import { getKeyStore } from "./admin/key-store.js";
 import { effectiveSettings } from "./admin/settings-store.js";
 import { isEnabled } from "./admin/grants.js";
 import { recordUsage } from "./admin/usage.js";
-import { runServicesUpgrade } from "./admin/upgrade.js";
+import { warnOrphanedGrants } from "./admin/orphaned-grants.js";
 import { setReachabilitySource } from "./admin/reachability.js";
 
 const SCAN_INTERVAL_MS = 10_000;
@@ -95,7 +95,9 @@ async function getSystemConnDetails(
 }
 
 export async function startAgentServices(): Promise<void> {
-  await runServicesUpgrade(AGENT_SERVICES);
+  // Choose now (if nothing has yet), so a setup mistake is logged at start.
+  getKeyStore();
+  await warnOrphanedGrants();
 
   const engine = createAgentServiceEngine({
     services: AGENT_SERVICES,
@@ -189,7 +191,7 @@ export async function startAgentServices(): Promise<void> {
   systemLogger.info("Agent services started", {
     operation: "agent_services_started",
     services: AGENT_SERVICES.map((s) => s.name),
-    keyStore: getKeyStore().kind,
+    keyStore: getKeyStore().info().label,
     scanIntervalMs: SCAN_INTERVAL_MS,
   });
 

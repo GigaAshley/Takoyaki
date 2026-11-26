@@ -2,8 +2,9 @@
  * agent-services/admin/key-store.ts — where services' instance keys live.
  *
  * Every read and write goes through the current key store, so where keys
- * are kept can change (the database today; AWS Secrets Manager is the next
- * option) without the engine, the routes or any service knowing.
+ * are kept (the database, or AWS Parameter Store: parameter-store.ts) can
+ * change without the engine, the routes or any service knowing. The store
+ * is the instance's choice, made in the server settings (choose-store.ts).
  *
  * The database store keeps FieldCrypto ciphertext under the system
  * ENCRYPTION_KEY (like per-user secrets), so the backend can read a key at
@@ -20,23 +21,46 @@ import { agentServiceKeys } from "../../database/db/schema.js";
 import { FieldCrypto } from "../../utils/field-crypto.js";
 import { SystemCrypto } from "../../utils/system-crypto.js";
 import { persist } from "./persist.js";
+// Circular (choose-store builds on this file); used only at call time.
+import { chooseKeyStore } from "./choose-store.js";
 
 export interface KeyStatus {
   name: string;
-  updatedAt: string;
+  /** Null when the store can't tell right now (AWS unreachable). */
+  isSet: boolean | null;
+  updatedAt: string | null;
+}
+
+/** What admins are told about where keys live. */
+export interface KeyStoreInfo {
+  kind: "database" | "parameter_store";
+  /** e.g. "the database", "AWS Parameter Store under /takoyaki/t1000". */
+  label: string;
+  /** Set when the store can't be used at all (half-configured). */
+  problem: string | null;
+  /** ISO time AWS stopped answering; last-read values are in use meanwhile. */
+  unreachableSince: string | null;
+}
+
+/**
+ * A change the store's backend refused (permissions). The message is meant
+ * for an admin: what was refused and what to fix.
+ */
+export class KeyStoreRefusedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "KeyStoreRefusedError";
+  }
 }
 
 export interface InstanceKeyStore {
-  /** Shown to admins, e.g. "the database". */
-  readonly kind: string;
-  /** False where the store can only be read (keys are changed elsewhere). */
-  readonly writable: boolean;
+  info(): KeyStoreInfo;
   get(service: string, name: string): Promise<string | null>;
   set(service: string, name: string, value: string, updatedBy: string | null): Promise<void>;
   /** True if a value was removed. */
   remove(service: string, name: string): Promise<boolean>;
-  /** Which of a service's keys are set, without values. */
-  status(service: string): Promise<KeyStatus[]>;
+  /** Whether each of a service's keys is set, without values. Never throws for reachability. */
+  status(service: string, names: readonly string[]): Promise<KeyStatus[]>;
 }
 
 const recordIdFor = (service: string) => `agent-service-key:${service}`;
@@ -45,8 +69,7 @@ const byKey = (service: string, name: string) =>
   and(eq(agentServiceKeys.service, service), eq(agentServiceKeys.name, name));
 
 export const databaseKeyStore: InstanceKeyStore = {
-  kind: "the database",
-  writable: true,
+  info: () => ({ kind: "database", label: "the database", problem: null, unreachableSince: null }),
 
   async get(service, name) {
     const rows = await getDb()
@@ -90,22 +113,30 @@ export const databaseKeyStore: InstanceKeyStore = {
     return deleted.length > 0;
   },
 
-  async status(service) {
-    return getDb()
+  async status(service, names) {
+    const rows = await getDb()
       .select({ name: agentServiceKeys.name, updatedAt: agentServiceKeys.updatedAt })
       .from(agentServiceKeys)
       .where(eq(agentServiceKeys.service, service));
+    const byName = new Map(rows.map((r) => [r.name, r.updatedAt]));
+    return names.map((name) => ({ name, isSet: byName.has(name), updatedAt: byName.get(name) ?? null }));
   },
 };
 
-let current: InstanceKeyStore = databaseKeyStore;
+let current: InstanceKeyStore | null = null;
 
-/** The store keys are read from and written to. */
+/**
+ * The store keys are read from and written to. Chosen from the server
+ * settings on first use, so nothing (the admin routes serve before the
+ * engine boots) can ever reach the database on an instance that chose
+ * Parameter Store.
+ */
 export function getKeyStore(): InstanceKeyStore {
+  current ??= chooseKeyStore();
   return current;
 }
 
-/** Pick where keys live (at boot, from the instance's configuration). */
-export function setKeyStore(store: InstanceKeyStore): void {
+/** Override the chosen store (tests); null chooses again on next use. */
+export function setKeyStore(store: InstanceKeyStore | null): void {
   current = store;
 }

@@ -5,14 +5,19 @@
  * Write-only: the API says whether a key is set and when, never its value.
  */
 
+import axios from "axios";
 import { authApi, handleApiError } from "@/main-axios";
 
 export type ServiceState = "not_set_up" | "ready" | "failing";
 
 export interface KeyStoreInfo {
-  /** e.g. "the database". */
-  kind: string;
-  writable: boolean;
+  kind: "database" | "parameter_store";
+  /** e.g. "the database", "AWS Parameter Store under /takoyaki/t1000". */
+  label: string;
+  /** Set when the store can't be used at all (half set up). */
+  problem: string | null;
+  /** ISO time AWS stopped answering; last-read keys are in use meanwhile. */
+  unreachableSince: string | null;
 }
 
 export interface ServiceSummary {
@@ -22,6 +27,8 @@ export interface ServiceSummary {
   state: ServiceState;
   /** What's missing while not set up (labels). */
   missing: string[];
+  /** Why the key store couldn't say which keys are set, when it couldn't. */
+  keyProblem: string | null;
   lastUsedAt: string | null;
   machinesOn: number;
   machinesTotal: number;
@@ -33,7 +40,8 @@ export interface ServiceKey {
   description: string;
   /** Needed with the current settings. */
   needed: boolean;
-  isSet: boolean;
+  /** Null when the key store can't tell right now. */
+  isSet: boolean | null;
   updatedAt: string | null;
 }
 
@@ -90,11 +98,25 @@ export async function getAgentService(name: string): Promise<{ keyStore: KeyStor
   }
 }
 
+/**
+ * A key change the key store couldn't make (AWS refused it, or couldn't be
+ * reached) comes back as 424/503 with a message saying what to fix. The
+ * shared handler would turn that into a generic server error, so it's kept.
+ */
+function keyStoreError(error: unknown, operation: string): never {
+  if (axios.isAxiosError(error)) {
+    const status = error.response?.status;
+    const message = (error.response?.data as { error?: unknown } | undefined)?.error;
+    if ((status === 424 || status === 503) && typeof message === "string" && message) throw new Error(message);
+  }
+  handleApiError(error, operation);
+}
+
 export async function setServiceKey(service: string, key: string, value: string): Promise<void> {
   try {
     await authApi.put(`${BASE}/${enc(service)}/keys/${enc(key)}`, { value });
   } catch (error) {
-    handleApiError(error, "save key");
+    keyStoreError(error, "save key");
   }
 }
 
@@ -102,7 +124,7 @@ export async function removeServiceKey(service: string, key: string): Promise<vo
   try {
     await authApi.delete(`${BASE}/${enc(service)}/keys/${enc(key)}`);
   } catch (error) {
-    handleApiError(error, "remove key");
+    keyStoreError(error, "remove key");
   }
 }
 

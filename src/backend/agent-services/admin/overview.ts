@@ -5,7 +5,9 @@
  * State, in order:
  *   not_set_up  a required setting has no value, or a key the service needs
  *               with its settings isn't set;
- *   failing     the last success-or-fault record was a fault (usage.ts);
+ *   failing     the key store can't say whether a needed key is set (AWS
+ *               unreachable, or refusing), or the last success-or-fault
+ *               record was a fault (usage.ts);
  *   ready.
  */
 
@@ -42,7 +44,8 @@ export interface KeyView {
   description: string;
   /** Needed with the current settings (else optional, e.g. another provider's). */
   needed: boolean;
-  isSet: boolean;
+  /** Null when the key store can't tell right now. */
+  isSet: boolean | null;
   updatedAt: string | null;
 }
 
@@ -63,6 +66,8 @@ export interface ServiceSummary {
   state: ServiceState;
   /** Missing pieces, when not set up: key labels and setting labels. */
   missing: string[];
+  /** Why the key store couldn't say which keys are set, when it couldn't. */
+  keyProblem: string | null;
   lastUsedAt: string | null;
   machinesOn: number;
   machinesTotal: number;
@@ -94,7 +99,16 @@ export interface ServiceDetail extends ServiceSummary {
 
 async function keysAndSettings(def: ServiceDefinition, deps: OverviewDeps) {
   const settings = await deps.effectiveSettings(def.name, def.settings);
-  const status = await deps.keyStore.status(def.name);
+  const names = Object.keys(def.secrets ?? {});
+  let status: Awaited<ReturnType<InstanceKeyStore["status"]>> = [];
+  let keyProblem: string | null = null;
+  if (names.length > 0) {
+    try {
+      status = await deps.keyStore.status(def.name, names);
+    } catch (err) {
+      keyProblem = err instanceof Error ? err.message : String(err);
+    }
+  }
   const keys: KeyView[] = Object.entries(def.secrets ?? {}).map(([name, spec]) => {
     const s = status.find((k) => k.name === name);
     return {
@@ -102,10 +116,19 @@ async function keysAndSettings(def: ServiceDefinition, deps: OverviewDeps) {
       label: spec.label,
       description: spec.description,
       needed: spec.neededWhen?.(settings) ?? true,
-      isSet: Boolean(s),
+      isSet: s ? s.isSet : null,
       updatedAt: s?.updatedAt ?? null,
     };
   });
+  const unknown = keys.filter((k) => k.needed && k.isSet === null);
+  if (!keyProblem && unknown.length > 0) {
+    const info = deps.keyStore.info();
+    keyProblem =
+      info.problem ??
+      (info.unreachableSince
+        ? `Can't reach ${info.label} to check ${unknown.map((k) => k.label).join(", ")}`
+        : `Can't check ${unknown.map((k) => k.label).join(", ")} in ${info.label}`);
+  }
   const settingViews: SettingView[] = Object.entries(def.settings ?? {}).map(([name, spec]) => ({
     name,
     label: spec.label,
@@ -116,9 +139,9 @@ async function keysAndSettings(def: ServiceDefinition, deps: OverviewDeps) {
   }));
   const missing = [
     ...settingViews.filter((s) => s.required && !s.value).map((s) => s.label),
-    ...keys.filter((k) => k.needed && !k.isSet).map((k) => k.label),
+    ...keys.filter((k) => k.needed && k.isSet === false).map((k) => k.label),
   ];
-  return { keys, settings: settingViews, missing };
+  return { keys, settings: settingViews, missing, keyProblem };
 }
 
 export async function summarize(
@@ -126,16 +149,18 @@ export async function summarize(
   deps: OverviewDeps,
   machines: AgentMachine[],
 ): Promise<ServiceSummary & { keys: KeyView[]; settings: SettingView[]; lastFault: ServiceHealth["lastFault"] }> {
-  const { keys, settings, missing } = await keysAndSettings(def, deps);
+  const { keys, settings, missing, keyProblem } = await keysAndSettings(def, deps);
   const health = await deps.serviceHealth(def.name);
   const on = await deps.enabledMachines(def.name);
-  const state: ServiceState = missing.length > 0 ? "not_set_up" : health.failing ? "failing" : "ready";
+  const state: ServiceState =
+    missing.length > 0 ? "not_set_up" : keyProblem || health.failing ? "failing" : "ready";
   return {
     name: def.name,
     title: def.title,
     description: def.description,
     state,
     missing,
+    keyProblem,
     lastUsedAt: health.lastUsedAt,
     machinesOn: machines.filter((m) => on.has(m.machineId)).length,
     machinesTotal: machines.length,
@@ -156,6 +181,7 @@ export async function listServices(services: readonly ServiceDefinition[], deps:
       description: s.description,
       state: s.state,
       missing: s.missing,
+      keyProblem: s.keyProblem,
       lastUsedAt: s.lastUsedAt,
       machinesOn: s.machinesOn,
       machinesTotal: s.machinesTotal,

@@ -333,6 +333,28 @@ describe("agent-services engine", () => {
     expect(answers[0].ok).toBe(true);
   });
 
+  it("a needed key the store can't read fails without passing the store's reason to the agent", async () => {
+    const svc = defineService({ ...echo, secrets: { NEEDED: { label: "needed", description: "test" } } });
+    const engine = createAgentServiceEngine({
+      services: [svc],
+      ...storeDeps({}),
+      getKey: async () => {
+        throw new Error("AWS refused to read keys under /takoyaki/t1000: arn:aws:sts::1:assumed-role/r");
+      },
+      now: () => NOW,
+      writeResponse: async (_h, _u, _f, _n, json) => void answers.push(JSON.parse(json)),
+    });
+    const answers: Record<string, any>[] = [];
+    await engine.intake(HOST, { claim: async () => [], readAttachment: async () => "missing" }, [
+      { uuid: UUID, body: JSON.stringify(envelope({ text: "x" })) },
+    ]);
+    await vi.waitFor(() => expect(answers).toHaveLength(1));
+    expect(answers[0].error).toEqual({
+      code: "internal",
+      message: "echo can't read its keys right now; an admin can see why in Admin → Services",
+    });
+  });
+
   describe("machine switches", () => {
     it("refuses a machine the service isn't switched on for, before queueing", async () => {
       const handle = vi.fn(async () => ok({}));

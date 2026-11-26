@@ -35,7 +35,7 @@ import {
   KitSettingsRow,
   KitSwitch,
 } from "@/components/kit";
-import { AdminBack, adminErrorMessage, relativeAdminTime, useEscBack } from "./admin-ui";
+import { AdminBack, adminErrorMessage, formatAdminDate, relativeAdminTime, useEscBack } from "./admin-ui";
 import { ServiceKeyRow } from "./ServiceKeyRow";
 
 const STATE_CHIP: Record<ServiceState, { text: string; tone: "warn" | "ok" | "danger" }> = {
@@ -84,6 +84,30 @@ export function AdminServicesPane({
   );
 }
 
+/** Where keys live, and whether that store can be used right now. */
+function KeyStoreLine({ store }: { store: KeyStoreInfo }) {
+  if (store.problem) {
+    return (
+      <KitBanner tone="danger" data-testid="admin-services-store">
+        Keys can't be read or saved: {store.problem}
+      </KitBanner>
+    );
+  }
+  if (store.unreachableSince) {
+    return (
+      <KitBanner tone="warn" data-testid="admin-services-store">
+        {store.label} hasn't answered since {formatAdminDate(store.unreachableSince)}. Services keep using the keys
+        last read; this shows what was last read.
+      </KitBanner>
+    );
+  }
+  return (
+    <p className="text-[13px] text-[var(--k-t3)]" data-testid="admin-services-store">
+      Keys are kept in {store.label}.
+    </p>
+  );
+}
+
 function AdminServicesList({ onOpen }: { onOpen: (name: string) => void }) {
   const [data, setData] = useState<{ keyStore: KeyStoreInfo; services: ServiceSummary[] } | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -105,9 +129,7 @@ function AdminServicesList({ onOpen }: { onOpen: (name: string) => void }) {
   const now = Date.now();
   return (
     <div className="flex flex-col gap-5" data-testid="admin-services-list">
-      {!data.keyStore.writable && (
-        <KitBanner tone="info">Keys are read from {data.keyStore.kind}, so they can't be changed here.</KitBanner>
-      )}
+      <KeyStoreLine store={data.keyStore} />
       <KitSettingsGroup
         footer="A service is off on every machine until you switch it on. Keys are kept encrypted and can never be read back."
       >
@@ -118,6 +140,8 @@ function AdminServicesList({ onOpen }: { onOpen: (name: string) => void }) {
             description={
               s.state === "not_set_up"
                 ? `Needs ${s.missing.join(", ")}`
+                : s.keyProblem
+                ? s.keyProblem
                 : `On for ${s.machinesOn} of ${s.machinesTotal} machine${s.machinesTotal === 1 ? "" : "s"}${
                     s.lastUsedAt ? ` · last used ${relativeAdminTime(s.lastUsedAt, now)}` : ""
                   }`
@@ -196,7 +220,12 @@ function AdminServiceView({ name, onBack }: { name: string; onBack: () => void }
         {s.state === "not_set_up" && (
           <p className="text-[13px] text-[var(--k-warn)]">Needs {s.missing.join(", ")} before agents can use it.</p>
         )}
-        {s.state === "failing" && s.lastFault && (
+        {s.keyProblem && (
+          <p className="text-[13px] text-[var(--k-danger-text)]" data-testid="admin-service-key-problem">
+            {s.keyProblem}
+          </p>
+        )}
+        {s.state === "failing" && !s.keyProblem && s.lastFault && (
           <p className="text-[13px] text-[var(--k-danger-text)]" data-testid="admin-service-fault">
             Last failed {relativeAdminTime(s.lastFault.at, now)}: {codeWords(s.lastFault.code)}. It clears with the next
             request that works.
@@ -205,9 +234,7 @@ function AdminServiceView({ name, onBack }: { name: string; onBack: () => void }
       </div>
 
       {actionError && <KitBanner tone="danger">{actionError}</KitBanner>}
-      {!keyStore.writable && (
-        <KitBanner tone="info">Keys are read from {keyStore.kind}, so they can't be changed here.</KitBanner>
-      )}
+      <KeyStoreLine store={keyStore} />
 
       {s.settings.length > 0 && (
         <KitSettingsGroup title="Settings" data-testid="admin-service-settings">
@@ -252,7 +279,6 @@ function AdminServiceView({ name, onBack }: { name: string; onBack: () => void }
                 updatedAt={k.updatedAt}
                 chip={k.needed ? undefined : { text: "Not used with these settings", tone: "neutral" }}
                 removeBody={`${s.title} stops working until a new one is saved.`}
-                readOnly={!keyStore.writable}
                 onSave={async (value) => {
                   await setServiceKey(s.name, k.name, value);
                   await load();

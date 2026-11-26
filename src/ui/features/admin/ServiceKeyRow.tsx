@@ -22,7 +22,8 @@ export interface ServiceKeyRowProps {
   label: string;
   /** e.g. where to get it. */
   description?: string | null;
-  isSet: boolean;
+  /** Null when the key store can't tell right now. */
+  isSet: boolean | null;
   updatedAt: string | null;
   /** Shown when not set, e.g. "the company default is used". */
   unsetNote?: string;
@@ -30,8 +31,6 @@ export interface ServiceKeyRowProps {
   chip?: { text: string; tone: "neutral" | "warn" };
   /** What removing it means, for the confirm. */
   removeBody?: string;
-  /** Read-only store: status only. */
-  readOnly?: boolean;
   onSave: (value: string) => Promise<void>;
   onClear: () => Promise<void>;
 }
@@ -45,17 +44,18 @@ export function ServiceKeyRow({
   unsetNote,
   chip,
   removeBody = "Agents will no longer be able to use it.",
-  readOnly = false,
   onSave,
   onClear,
-}: ServiceKeyRowProps): JSX.Element {
+}: ServiceKeyRowProps) {
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState<"saving" | "removing" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
   const id = `service-key-${rawId}`;
 
-  const status = isSet
+  const status = isSet === null
+    ? "Can't check right now"
+    : isSet
     ? `Set${updatedAt ? ` · updated ${formatAdminDate(updatedAt)}` : ""}`
     : unsetNote
       ? `Not set · ${unsetNote}`
@@ -122,7 +122,6 @@ export function ServiceKeyRow({
           {description}
         </span>
       )}
-      {!readOnly && (
       <form
         className="flex gap-2 flex-wrap items-center"
         onSubmit={(e) => {
@@ -172,7 +171,6 @@ export function ServiceKeyRow({
           </KitButton>
         )}
       </form>
-      )}
       {error && (
         <KitBanner tone="danger" data-testid={`${id}-error`}>
           {error}

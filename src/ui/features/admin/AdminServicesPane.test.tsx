@@ -9,13 +9,17 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useState } from "react";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import type { ServiceDetail } from "@/api/agent-services-admin-api";
+import type { KeyStoreInfo, ServiceDetail } from "@/api/agent-services-admin-api";
 import { autoAnswerKitDialogs, __resetKitDialogsForTests } from "@/components/kit";
 
-const server = vi.hoisted(() => ({ services: [] as ServiceDetail[], keys: new Map<string, string>() }));
+const server = vi.hoisted(() => ({
+  services: [] as ServiceDetail[],
+  keys: new Map<string, string>(),
+  keyStore: {} as KeyStoreInfo,
+  refuseSaves: null as string | null,
+}));
 
 vi.mock("@/api/agent-services-admin-api", () => {
-  const keyStore = { kind: "the database", writable: true };
   const find = (name: string) => server.services.find((s) => s.name === name)!;
   /** Recompute what the server derives: needed keys, missing, state. */
   const derive = (s: ServiceDetail) => {
@@ -36,9 +40,10 @@ vi.mock("@/api/agent-services-admin-api", () => {
     return s;
   };
   return {
-    listAgentServices: vi.fn(async () => ({ keyStore, services: server.services.map((s) => ({ ...derive(s) })) })),
-    getAgentService: vi.fn(async (name: string) => ({ keyStore, service: structuredClone(derive(find(name))) })),
+    listAgentServices: vi.fn(async () => ({ keyStore: server.keyStore, services: server.services.map((s) => ({ ...derive(s) })) })),
+    getAgentService: vi.fn(async (name: string) => ({ keyStore: server.keyStore, service: structuredClone(derive(find(name))) })),
     setServiceKey: vi.fn(async (service: string, key: string, value: string) => {
+      if (server.refuseSaves) throw new Error(server.refuseSaves);
       server.keys.set(`${service}/${key}`, value);
     }),
     removeServiceKey: vi.fn(async (service: string, key: string) => {
@@ -67,6 +72,8 @@ const machines = () => [
 ];
 
 function seed() {
+  server.keyStore = { kind: "database", label: "the database", problem: null, unreachableSince: null };
+  server.refuseSaves = null;
   server.keys = new Map([["agent-phone/TWILIO_AUTH_TOKEN", "tok"]]);
   server.services = [
     {
@@ -75,6 +82,7 @@ function seed() {
       description: "Ring a user's phone, speak a message, return their reply",
       state: "failing",
       missing: [],
+      keyProblem: null,
       lastUsedAt: "2026-11-25T00:00:00Z",
       machinesOn: 0,
       machinesTotal: 0,
@@ -97,6 +105,7 @@ function seed() {
       description: "Transcribe an audio file",
       state: "not_set_up",
       missing: [],
+      keyProblem: null,
       lastUsedAt: null,
       machinesOn: 0,
       machinesTotal: 0,
@@ -129,6 +138,7 @@ function seed() {
       description: "CRM",
       state: "ready",
       missing: [],
+      keyProblem: null,
       lastUsedAt: null,
       machinesOn: 0,
       machinesTotal: 0,
@@ -238,6 +248,34 @@ describe("Admin → Services", () => {
     expect(api.setPersonKey).toHaveBeenCalledWith("zoho", "u-zoey", "ZOHO_TOKEN", "zt");
     await waitFor(() =>
       expect(screen.getByTestId("service-key-zoho-u-zoey-ZOHO_TOKEN-status").textContent).toMatch(/^Set/),
+    );
+  });
+
+  it("says where keys live, and when AWS can't be reached", async () => {
+    const { unmount } = render(<Harness />);
+    expect((await screen.findByTestId("admin-services-store")).textContent).toBe("Keys are kept in the database.");
+    unmount();
+    server.keyStore = {
+      kind: "parameter_store",
+      label: "AWS Parameter Store under /takoyaki/t1000",
+      problem: null,
+      unreachableSince: new Date(Date.now() - 5 * 60_000).toISOString(),
+    };
+    render(<Harness />);
+    const line = await screen.findByTestId("admin-services-store");
+    expect(line.textContent).toContain("AWS Parameter Store under /takoyaki/t1000 hasn't answered since");
+    expect(line.textContent).toContain("keep using the keys last read");
+  });
+
+  it("a save AWS refuses shows AWS's reason by the key", async () => {
+    server.refuseSaves = "AWS refused to save the key: not authorized. This machine's AWS role needs ssm:PutParameter";
+    const user = userEvent.setup();
+    render(<Harness />);
+    await user.click(await screen.findByTestId("admin-service-row-agent-phone"));
+    await user.type(await screen.findByTestId("service-key-agent-phone-TWILIO_AUTH_TOKEN-input"), "new");
+    await user.click(screen.getByTestId("service-key-agent-phone-TWILIO_AUTH_TOKEN-save"));
+    expect((await screen.findByTestId("service-key-agent-phone-TWILIO_AUTH_TOKEN-error")).textContent).toContain(
+      "ssm:PutParameter",
     );
   });
 

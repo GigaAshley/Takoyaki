@@ -26,14 +26,14 @@ import type { ServiceDefinition } from "../engine/types.js";
 import { AGENT_SERVICES } from "../registry.js";
 import { hostReach } from "./reachability.js";
 import { listAgentMachines } from "./machines.js";
-import { servicesUpgradeFinished } from "./upgrade.js";
 import {
   clearUserSecret,
   listServiceUserSecretStatus,
   setUserSecret,
 } from "../user-secrets/store.js";
 import { getSubstrateOrchestrator } from "../../distributor/substrate-orchestrator-singleton.js";
-import { getKeyStore } from "./key-store.js";
+import { getKeyStore, KeyStoreRefusedError } from "./key-store.js";
+import { ParameterStoreUnreachableError } from "./parameter-store.js";
 import { clearSetting, effectiveSettings, setSetting, storedSettings } from "./settings-store.js";
 import { enabledMachines, setEnabled } from "./grants.js";
 import { serviceHealth, usageSummary } from "./usage.js";
@@ -49,8 +49,6 @@ export const MAX_KEY_LENGTH = 8192;
 
 export interface ServicesRouteDeps extends OverviewDeps {
   services(): readonly ServiceDefinition[];
-  /** Resolves once the one-time import has run; changes wait for it. */
-  ready(): Promise<void>;
   setSetting(service: string, name: string, value: string, by: string): Promise<void>;
   clearSetting(service: string, name: string): Promise<void>;
   setEnabled(service: string, machineId: string, enabled: boolean, by: string): Promise<boolean>;
@@ -60,9 +58,6 @@ export interface ServicesRouteDeps extends OverviewDeps {
   setPersonKey(userId: string, service: string, name: string, value: string, by: string): Promise<void>;
   clearPersonKey(userId: string, service: string, name: string): Promise<boolean>;
 }
-
-/** How long a change waits for start-up to finish before giving up. */
-const READY_WAIT_MS = 30_000;
 
 /** One re-push for a burst of switch changes (an admin flipping several). */
 const RESWEEP_DEBOUNCE_MS = 3_000;
@@ -93,7 +88,6 @@ export const defaultServicesRouteDeps: ServicesRouteDeps = {
   serviceHealth: (s) => serviceHealth(s),
   usageSummary: (s) => usageSummary(s),
   hostReach,
-  ready: () => servicesUpgradeFinished,
   async listUsers() {
     return getDb().select({ id: users.id, username: users.username }).from(users);
   },
@@ -137,16 +131,24 @@ export function registerServicesAdminRoutes(
     systemLogger.error(`Admin services: failed to ${what}`, err, { operation: "admin_services_failed", what });
     res.status(500).json({ error: `Failed to ${what}` });
   };
-  /** Changes wait for the one-time import, so it can't undo or overwrite them. */
-  const isReady = async (res: Response): Promise<boolean> => {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const ready = await Promise.race([
-      deps.ready().then(() => true),
-      new Promise<boolean>((r) => (timer = setTimeout(() => r(false), READY_WAIT_MS))),
-    ]);
-    clearTimeout(timer);
-    if (!ready) res.status(503).json({ error: "Services are still starting; try again in a moment" });
-    return ready;
+  /**
+   * A key change the store couldn't make: AWS refused it (a setup mistake
+   * the admin fixes) or couldn't be reached. The message says which, and
+   * what to fix; anything else is an unexpected failure.
+   */
+  const keyChangeFailed = (res: Response, err: unknown, what: string) => {
+    if (err instanceof KeyStoreRefusedError || err instanceof ParameterStoreUnreachableError) {
+      systemLogger.warn(`Admin services: couldn't ${what}`, {
+        operation: "admin_services_key_store_refused",
+        what,
+        error: err.message,
+      });
+      return res
+        // 424, not a 5xx: proxies that replace error pages leave it alone.
+        .status(err instanceof KeyStoreRefusedError ? 424 : 503)
+        .json({ error: err instanceof KeyStoreRefusedError ? err.message : `Couldn't ${what}: ${err.message}` });
+    }
+    return failed(res, err, what);
   };
   const log = (operation: string, ctx: Record<string, unknown>) =>
     systemLogger.info(`Admin services: ${operation.replace(/^admin_service_/, "").replace(/_/g, " ")}`, {
@@ -156,11 +158,9 @@ export function registerServicesAdminRoutes(
 
   router.get("/admin/services", requireAdmin, async (_req, res) => {
     try {
-      const store = deps.keyStore;
-      res.json({
-        keyStore: { kind: store.kind, writable: store.writable },
-        services: await listServices(deps.services(), deps),
-      });
+      const services = await listServices(deps.services(), deps);
+      // After the reads, so it reflects whether AWS just answered.
+      res.json({ keyStore: deps.keyStore.info(), services });
     } catch (err) {
       failed(res, err, "list services");
     }
@@ -170,11 +170,8 @@ export function registerServicesAdminRoutes(
     try {
       const def = findService(req, res);
       if (!def) return;
-      const store = deps.keyStore;
-      res.json({
-        keyStore: { kind: store.kind, writable: store.writable },
-        service: await serviceDetail(def, deps),
-      });
+      const service = await serviceDetail(def, deps);
+      res.json({ keyStore: deps.keyStore.info(), service });
     } catch (err) {
       failed(res, err, "load the service");
     }
@@ -182,45 +179,36 @@ export function registerServicesAdminRoutes(
 
   router.put("/admin/services/:service/keys/:name", requireAdmin, async (req, res) => {
     try {
-      if (!(await isReady(res))) return;
       const def = findService(req, res);
       if (!def) return;
       const name = param(req, "name");
       if (!Object.hasOwn(def.secrets ?? {}, name)) return res.status(404).json({ error: "No such key" });
-      if (!deps.keyStore.writable) {
-        return res.status(409).json({ error: `Keys are read from ${deps.keyStore.kind} and can't be changed here` });
-      }
       const value = readValue(req);
       if (value === null) return badValue(res);
       await deps.keyStore.set(def.name, name, value, actor(req));
       log("admin_service_key_set", { service: def.name, name, actorId: actor(req) });
       res.json({ ok: true });
     } catch (err) {
-      failed(res, err, "save the key");
+      keyChangeFailed(res, err, "save the key");
     }
   });
 
   router.delete("/admin/services/:service/keys/:name", requireAdmin, async (req, res) => {
     try {
-      if (!(await isReady(res))) return;
       const def = findService(req, res);
       if (!def) return;
       const name = param(req, "name");
       if (!Object.hasOwn(def.secrets ?? {}, name)) return res.status(404).json({ error: "No such key" });
-      if (!deps.keyStore.writable) {
-        return res.status(409).json({ error: `Keys are read from ${deps.keyStore.kind} and can't be changed here` });
-      }
       const removed = await deps.keyStore.remove(def.name, name);
       log("admin_service_key_removed", { service: def.name, name, removed, actorId: actor(req) });
       res.json({ ok: true, removed });
     } catch (err) {
-      failed(res, err, "remove the key");
+      keyChangeFailed(res, err, "remove the key");
     }
   });
 
   router.put("/admin/services/:service/settings/:name", requireAdmin, async (req, res) => {
     try {
-      if (!(await isReady(res))) return;
       const def = findService(req, res);
       if (!def) return;
       const name = param(req, "name");
@@ -244,7 +232,6 @@ export function registerServicesAdminRoutes(
 
   router.put("/admin/services/:service/machines/:machineId", requireAdmin, async (req, res) => {
     try {
-      if (!(await isReady(res))) return;
       const def = findService(req, res);
       if (!def) return;
       const machineId = param(req, "machineId");
@@ -279,7 +266,6 @@ export function registerServicesAdminRoutes(
 
   router.put("/admin/services/:service/people/:userId/keys/:name", requireAdmin, async (req, res) => {
     try {
-      if (!(await isReady(res))) return;
       const target = await personKey(req, res);
       if (!target) return;
       const value = readValue(req);
@@ -294,7 +280,6 @@ export function registerServicesAdminRoutes(
 
   router.delete("/admin/services/:service/people/:userId/keys/:name", requireAdmin, async (req, res) => {
     try {
-      if (!(await isReady(res))) return;
       const target = await personKey(req, res);
       if (!target) return;
       const removed = await deps.clearPersonKey(target.userId, target.def.name, target.name);

@@ -39,11 +39,13 @@ still have their own scanner.
 | `distribution.ts`             | Turns each service's `skill/` and `bin/` into distributor rows               |
 | `services/<name>/`            | One service each: everything about it lives in its folder                    |
 | `user-secrets/`               | Per-person keys: encrypted store, acting-user resolution                     |
-| `admin/key-store.ts`          | Where instance keys live (swappable; the database today), encrypted          |
+| `admin/key-store.ts`          | The key store contract, and the encrypted database store                     |
+| `admin/parameter-store.ts`    | The AWS Parameter Store key store: cache, outage fallback, refusals          |
+| `admin/choose-store.ts`       | Picks the store from the server settings at start                            |
 | `admin/settings-store.ts`     | Services' settings (e.g. which provider)                                     |
 | `admin/grants.ts`             | Which machines each service is switched on for (none, until an admin says)   |
 | `admin/usage.ts`              | One record per answer (no content), for state, usage and recent errors       |
-| `admin/upgrade.ts`            | The one-time move of service keys out of the server settings                 |
+| `admin/orphaned-grants.ts`    | Start-up warning for switches left on for machines that no longer exist      |
 | `admin/routes.ts`             | Admin → Services' routes (`/users/admin/services…`)                          |
 
 Host side: `substrate/scripts/fleet-service` is the shared client every
@@ -77,14 +79,46 @@ services/<name>/
   `agent_services_service_skipped` with the reason. `registry.test.ts`
   fails on any broken folder in the repo, so one shouldn't ship.
 - **A service's keys are its own.** An admin sets them in Admin → Services;
-  they are never read from the environment. A service never shares a key or
+  they are never read from the environment, and nothing carries them over
+  from it. A service never shares a key or
   a setting with the app's own voice features: an operator who wants one
   account behind both enters it in both places. (`stt` runs through the
   voice STT code with its own setup, and agent-phone transcribes replies
   with `stt`'s setup.)
+- **Keys live in the database or in AWS Parameter Store**, as the instance
+  chooses in its server settings (see below). Services never know which.
 - **Wrapper headers say `substrate/scripts/<name>`.** That's where the
   wrappers used to live. Leave the line alone: changing a wrapper's bytes
   re-pushes it to every host.
+
+## Where instance keys live
+
+Set in the server settings (`skynet.env`):
+
+- **Neither setting: the database**, encrypted under the instance's system
+  key.
+- **`AGENT_SERVICES_PARAMETER_STORE_PATH` and
+  `AGENT_SERVICES_PARAMETER_STORE_KMS_KEY`: AWS Parameter Store.** Each key
+  is a SecureString at `<path>/<service>/<KEY_NAME>`, always encrypted with
+  the named KMS key (never AWS's default `aws/ssm` key: naming it as
+  `alias/aws/…` is refused at start; named by its key id it can't be told
+  apart, so don't). The operator sets
+  up the path, the key and who may use them. The machine's role needs
+  `ssm:GetParameters`, `ssm:PutParameter` and `ssm:DeleteParameter` on the
+  path, plus `kms:Decrypt`, `kms:Encrypt` and `kms:GenerateDataKey` on the
+  key. `AGENT_SERVICES_AWS_REGION` defaults to `us-east-1`.
+  - Writing is required. A write AWS refuses is reported in the panel with
+    the permission it needs.
+  - Values are cached. Panel changes take effect at once. A change made
+    directly in AWS is picked up within an hour.
+  - While AWS can't be reached, the last value read is served; a key never
+    read fails the request, and the panel says AWS can't be reached.
+- **Only one of the two, or a path Parameter Store won't take:** a setup
+  mistake. Keys are neither read nor saved anywhere until it's fixed, and
+  the panel says what's wrong.
+
+Switching stores moves nothing: keys in the old store are ignored, and an
+admin enters them again. Per-person keys always stay in the database.
 
 ## Adding a service
 

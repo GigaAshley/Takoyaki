@@ -1,6 +1,7 @@
 /**
  * Admin → Services against a real in-memory SQLite and the real FieldCrypto:
- * the stores, the one-time upgrade, and the routes an admin's panel drives.
+ * the stores and the routes an admin's panel drives, with keys in the
+ * database or in a stand-in for AWS Parameter Store.
  * Only the system key, the save trigger and the service list are stubbed.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
@@ -42,8 +43,10 @@ import { databaseKeyStore } from "./key-store.js";
 import { effectiveSettings, setSetting } from "./settings-store.js";
 import { __resetGrantCache, enabledServices, isEnabled, setEnabled } from "./grants.js";
 import { USAGE_RETENTION_MS, __resetUsagePrune, recordUsage, serviceHealth, usageSummary } from "./usage.js";
-import { importFromEnvironment, leftoverServiceKeys, runServicesUpgrade } from "./upgrade.js";
-import { defaultServicesRouteDeps, registerServicesAdminRoutes } from "./routes.js";
+import { createParameterStoreKeyStore, type ParameterStoreClient } from "./parameter-store.js";
+import { misconfiguredKeyStore } from "./choose-store.js";
+import { defaultServicesRouteDeps, registerServicesAdminRoutes, type ServicesRouteDeps } from "./routes.js";
+type ServicesRouteDepsKeyStore = ServicesRouteDeps["keyStore"];
 import { setReachabilitySource } from "./reachability.js";
 import { STT_SECRETS, STT_SETTINGS, loadSttEnv } from "../services/stt/setup.js";
 
@@ -146,8 +149,11 @@ describe("key store", () => {
     expect(await databaseKeyStore.get("image-gen", "TWILIO_AUTH_TOKEN")).toBeNull();
     const raw = sqlite.prepare("SELECT value FROM agent_service_keys").get() as { value: string };
     expect(raw.value).not.toContain("s3cret");
-    const status = await databaseKeyStore.status("agent-phone");
-    expect(status).toEqual([{ name: "TWILIO_AUTH_TOKEN", updatedAt: expect.any(String) }]);
+    const status = await databaseKeyStore.status("agent-phone", ["TWILIO_AUTH_TOKEN", "TWILIO_ACCOUNT_SID"]);
+    expect(status).toEqual([
+      { name: "TWILIO_AUTH_TOKEN", isSet: true, updatedAt: expect.any(String) },
+      { name: "TWILIO_ACCOUNT_SID", isSet: false, updatedAt: null },
+    ]);
     expect(await databaseKeyStore.remove("agent-phone", "TWILIO_AUTH_TOKEN")).toBe(true);
     expect(await databaseKeyStore.get("agent-phone", "TWILIO_AUTH_TOKEN")).toBeNull();
   });
@@ -226,63 +232,6 @@ describe("usage records", () => {
   });
 });
 
-describe("the one-time upgrade", () => {
-  const ENV = {
-    TWILIO_ACCOUNT_SID: "AC1",
-    TWILIO_AUTH_TOKEN: "tok",
-    OPENAI_API_KEY: "sk-openai",
-    STT_PROVIDER: "elevenlabs",
-    STT_FALLBACK_PROVIDER: "groq",
-    STT_LANGUAGE: "en",
-    ELEVENLABS_API_KEY: "el",
-    GROQ_API_KEY: "gq",
-    MISTRAL_API_KEY: "unused",
-  };
-
-  it("brings in service keys and speech to text's setup, and switches nothing on", async () => {
-    machine(1, "t1000");
-    expect(await importFromEnvironment(SERVICES, { ...ENV, STT_LANGUAGE: "en-US" })).toBe(true);
-    expect(await databaseKeyStore.get("agent-phone", "TWILIO_AUTH_TOKEN")).toBe("tok");
-    expect(await databaseKeyStore.get("image-gen", "OPENAI_API_KEY")).toBe("sk-openai");
-    expect(await effectiveSettings("stt", STT_SETTINGS)).toEqual({ provider: "elevenlabs", backup: "groq", language: "en" });
-    expect(await databaseKeyStore.get("stt", "ELEVENLABS_API_KEY")).toBe("el");
-    expect(await databaseKeyStore.get("stt", "GROQ_API_KEY")).toBe("gq");
-    // Mistral isn't picked, so its key stays behind.
-    expect(await databaseKeyStore.get("stt", "MISTRAL_API_KEY")).toBeNull();
-    expect((sqlite.prepare("SELECT COUNT(*) AS n FROM agent_service_grants").get() as { n: number }).n).toBe(0);
-  });
-
-  it("runs once, and never overwrites what an admin set", async () => {
-    await databaseKeyStore.set("agent-phone", "TWILIO_AUTH_TOKEN", "from-panel", "u-admin");
-    await importFromEnvironment(SERVICES, ENV);
-    expect(await databaseKeyStore.get("agent-phone", "TWILIO_AUTH_TOKEN")).toBe("from-panel");
-    // Removed in the panel: a stale copy in the settings file never brings it back.
-    await databaseKeyStore.remove("agent-phone", "TWILIO_ACCOUNT_SID");
-    expect(await importFromEnvironment(SERVICES, ENV)).toBe(false);
-    expect(await databaseKeyStore.get("agent-phone", "TWILIO_ACCOUNT_SID")).toBeNull();
-  });
-
-  it("an instance that already runs agents gets Amazon when voice used the default", async () => {
-    machine(1, "t800");
-    await importFromEnvironment(SERVICES, {});
-    expect((await effectiveSettings("stt", STT_SETTINGS)).provider).toBe("bedrock");
-  });
-
-  it("a brand-new instance leaves speech to text not set up", async () => {
-    await importFromEnvironment(SERVICES, {});
-    expect((await effectiveSettings("stt", STT_SETTINGS)).provider).toBe("");
-  });
-
-  it("names service keys left in the settings file, but not the ones the app itself reads", async () => {
-    expect(leftoverServiceKeys(SERVICES, ENV)).toEqual(["TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN"]);
-    await runServicesUpgrade(SERVICES, ENV);
-    expect(systemLogger.info).toHaveBeenCalledWith(
-      expect.stringContaining("TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN"),
-      expect.objectContaining({ operation: "agent_services_env_keys_ignored" }),
-    );
-  });
-});
-
 describe("speech to text's own setup, as phone reads it", () => {
   it("is null until a provider is picked, then carries only the service's keys", async () => {
     process.env.ELEVENLABS_API_KEY = "voice-key";
@@ -322,7 +271,6 @@ describe("Admin → Services routes", () => {
     registerServicesAdminRoutes(router, requireAdmin, {
       ...defaultServicesRouteDeps,
       services: () => SERVICES,
-      ready: async () => {},
       resweep,
     });
     app.use("/users", router);
@@ -350,7 +298,7 @@ describe("Admin → Services routes", () => {
 
   it("an admin sets a service up, switches machines on, and sees it ready — keys never come back", async () => {
     const list = await call("GET", "/admin/services");
-    expect(list.body.keyStore).toEqual({ kind: "the database", writable: true });
+    expect(list.body.keyStore).toEqual({ kind: "database", label: "the database", problem: null, unreachableSince: null });
     expect(list.body.services.find((s: { name: string }) => s.name === "image-gen")).toMatchObject({
       title: "Image generation",
       state: "not_set_up",
@@ -416,32 +364,6 @@ describe("Admin → Services routes", () => {
     }
   });
 
-  it("changes wait for start-up to finish", async () => {
-    let finish!: () => void;
-    const started = new Promise<void>((r) => (finish = r));
-    const app = express();
-    app.use(express.json());
-    const router = express.Router();
-    registerServicesAdminRoutes(router, (req, _res, next) => {
-      (req as unknown as { userId: string }).userId = "u-admin";
-      next();
-    }, { ...defaultServicesRouteDeps, services: () => SERVICES, ready: () => started, resweep });
-    app.use("/users", router);
-    const s = app.listen(0);
-    await new Promise<void>((r) => s.once("listening", () => r()));
-    try {
-      const url = `http://127.0.0.1:${(s.address() as AddressInfo).port}/users/admin/services/image-gen/keys/OPENAI_API_KEY`;
-      const put = fetch(url, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ value: "k" }) });
-      await new Promise((r) => setTimeout(r, 50));
-      expect(await databaseKeyStore.get("image-gen", "OPENAI_API_KEY")).toBeNull();
-      finish();
-      expect((await put).status).toBe(200);
-      expect(await databaseKeyStore.get("image-gen", "OPENAI_API_KEY")).toBe("k");
-    } finally {
-      await new Promise<void>((r) => s.close(() => r()));
-    }
-  });
-
   it("ignores names that aren't the service's own (no inherited object names)", async () => {
     expect((await call("PUT", "/admin/services/agent-phone/keys/constructor", { value: "x" })).status).toBe(404);
     expect((await call("PUT", "/admin/services/stt/settings/constructor", { value: "x" })).status).toBe(404);
@@ -498,5 +420,134 @@ describe("Admin → Services routes", () => {
     expect((await call("PUT", "/admin/services/image-gen/machines/99", { enabled: true })).status).toBe(404);
     expect((await call("PUT", "/admin/services/image-gen/machines/1", { enabled: "yes" })).status).toBe(400);
     expect(resweep).not.toHaveBeenCalled();
+  });
+});
+
+/** A stand-in for Parameter Store: parameters in memory, and a switch for how AWS answers. */
+function fakeParameterStore() {
+  const params = new Map<string, { value: string; kmsKeyId: string; at: Date }>();
+  const state = { mode: "ok" as "ok" | "refuse" | "down" };
+  const fail = () => {
+    if (state.mode === "refuse") {
+      throw Object.assign(new Error("User is not authorized to perform: ssm:PutParameter"), { name: "AccessDeniedException" });
+    }
+    if (state.mode === "down") throw Object.assign(new Error("connect ETIMEDOUT"), { name: "TimeoutError" });
+  };
+  const client: ParameterStoreClient = {
+    async getParameters(names) {
+      fail();
+      return {
+        found: names
+          .filter((n) => params.has(n))
+          .map((n) => ({ name: n, value: params.get(n)!.value, type: "SecureString", lastModified: params.get(n)!.at })),
+        missing: names.filter((n) => !params.has(n)),
+      };
+    },
+    async putParameter(name, value, kmsKeyId) {
+      fail();
+      params.set(name, { value, kmsKeyId, at: new Date() });
+    },
+    async deleteParameter(name) {
+      fail();
+      return params.delete(name);
+    },
+  };
+  return { client, params, state };
+}
+
+describe("Admin → Services with keys in AWS Parameter Store", () => {
+  let server: http.Server;
+  let base: string;
+  let aws: ReturnType<typeof fakeParameterStore>;
+  let clock = Date.parse("2026-11-26T12:00:00Z");
+
+  async function serve(keyStore: ServicesRouteDepsKeyStore) {
+    const app = express();
+    app.use(express.json());
+    const router = express.Router();
+    registerServicesAdminRoutes(router, (req, _res, next) => {
+      (req as unknown as { userId: string }).userId = "u-admin";
+      next();
+    }, { ...defaultServicesRouteDeps, services: () => SERVICES, resweep: vi.fn(), keyStore });
+    app.use("/users", router);
+    server = app.listen(0);
+    await new Promise<void>((r) => server.once("listening", () => r()));
+    base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/users`;
+  }
+  async function call(method: string, path: string, body?: unknown) {
+    const res = await fetch(`${base}${path}`, {
+      method,
+      headers: { "content-type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    const text = await res.text();
+    return { status: res.status, body: text ? JSON.parse(text) : null, text };
+  }
+
+  beforeEach(async () => {
+    machine(1, "t1000");
+    aws = fakeParameterStore();
+    await serve(
+      createParameterStoreKeyStore({ path: "/takoyaki/t1000", kmsKeyId: "alias/fleet-secrets", client: aws.client, now: () => clock }),
+    );
+  });
+  afterEach(() => new Promise<void>((r) => server.close(() => r())));
+
+  it("an admin saves a key: it lands under the path, locked with the named key, and isn't shown back", async () => {
+    const list = await call("GET", "/admin/services");
+    expect(list.body.keyStore).toMatchObject({ kind: "parameter_store", label: "AWS Parameter Store under /takoyaki/t1000" });
+    expect((await call("PUT", "/admin/services/image-gen/keys/OPENAI_API_KEY", { value: "sk-aws" })).body).toEqual({ ok: true });
+    expect(aws.params.get("/takoyaki/t1000/image-gen/OPENAI_API_KEY")).toMatchObject({ value: "sk-aws", kmsKeyId: "alias/fleet-secrets" });
+    // Nothing went to the database.
+    expect(await databaseKeyStore.get("image-gen", "OPENAI_API_KEY")).toBeNull();
+    const detail = await call("GET", "/admin/services/image-gen");
+    expect(detail.text).not.toContain("sk-aws");
+    expect(detail.body.service).toMatchObject({ state: "ready", keys: [{ name: "OPENAI_API_KEY", isSet: true }] });
+
+    expect((await call("DELETE", "/admin/services/image-gen/keys/OPENAI_API_KEY")).body).toEqual({ ok: true, removed: true });
+    expect(aws.params.size).toBe(0);
+    expect((await call("GET", "/admin/services/image-gen")).body.service.state).toBe("not_set_up");
+  });
+
+  it("a write AWS refuses says what was refused and what to fix", async () => {
+    aws.state.mode = "refuse";
+    const res = await call("PUT", "/admin/services/image-gen/keys/OPENAI_API_KEY", { value: "sk-aws" });
+    expect(res.status).toBe(424);
+    expect(res.body.error).toContain("AWS refused to save the key");
+    expect(res.body.error).toContain("ssm:PutParameter on /takoyaki/t1000/*");
+    expect(res.body.error).toContain("alias/fleet-secrets");
+    expect(aws.params.size).toBe(0);
+  });
+
+  it("while AWS is unreachable the panel says so, and shows what was last read", async () => {
+    await call("PUT", "/admin/services/image-gen/keys/OPENAI_API_KEY", { value: "sk-aws" });
+    aws.state.mode = "down";
+    const list = await call("GET", "/admin/services");
+    expect(list.body.keyStore.unreachableSince).toEqual(expect.any(String));
+    // Image generation's key was read before the outage: still ready.
+    expect(list.body.services.find((s: { name: string }) => s.name === "image-gen").state).toBe("ready");
+    // Phone's keys were never read: it can't be called set up or not.
+    const phone = list.body.services.find((s: { name: string }) => s.name === "agent-phone");
+    expect(phone.state).toBe("failing");
+    expect(phone.keyProblem).toContain("Can't reach AWS Parameter Store under /takoyaki/t1000");
+    // Saving during the outage fails with the reason.
+    const put = await call("PUT", "/admin/services/agent-phone/keys/TWILIO_AUTH_TOKEN", { value: "t" });
+    expect(put.status).toBe(503);
+    expect(put.body.error).toContain("couldn't reach AWS Parameter Store");
+
+    aws.state.mode = "ok";
+    clock += 60_000; // past the once-a-minute hold-off
+    expect((await call("GET", "/admin/services")).body.keyStore.unreachableSince).toBeNull();
+  });
+
+  it("a half set-up store is named, and nothing is read or saved anywhere", async () => {
+    await new Promise<void>((r) => server.close(() => r()));
+    await serve(misconfiguredKeyStore("Parameter Store is only half set up"));
+    const list = await call("GET", "/admin/services");
+    expect(list.body.keyStore.problem).toBe("Parameter Store is only half set up");
+    expect(list.body.services.find((s: { name: string }) => s.name === "image-gen").state).toBe("failing");
+    const put = await call("PUT", "/admin/services/image-gen/keys/OPENAI_API_KEY", { value: "sk" });
+    expect(put.status).toBe(424);
+    expect(await databaseKeyStore.get("image-gen", "OPENAI_API_KEY")).toBeNull();
   });
 });

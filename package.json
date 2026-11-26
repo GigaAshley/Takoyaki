@@ -32,6 +32,7 @@
   "dependencies": {
     "@aws-sdk/client-bedrock-runtime": "^3.784.0",
     "@aws-sdk/client-polly": "^3.1129.0",
+    "@aws-sdk/client-ssm": "^3.1178.0",
     "@codemirror/lang-sql": "^6.10.0",
     "@excalidraw/excalidraw": "^0.18.1",
     "@fontsource-variable/inter": "^5.2.8",

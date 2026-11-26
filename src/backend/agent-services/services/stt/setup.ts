@@ -115,7 +115,9 @@ export async function loadSttEnv(): Promise<NodeJS.ProcessEnv | null> {
   if (!settings.provider) return null;
   const store = getKeyStore();
   const secrets: Record<string, string> = {};
-  for (const name of Object.keys(STT_SECRETS)) {
+  // Only the chosen providers' keys, as the engine reads them for stt itself.
+  for (const [name, spec] of Object.entries(STT_SECRETS)) {
+    if (!(spec.neededWhen?.(settings) ?? true)) continue;
     const value = await store.get("stt", name);
     if (value) secrets[name] = value;
   }

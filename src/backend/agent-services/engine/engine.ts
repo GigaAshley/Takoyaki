@@ -316,7 +316,23 @@ export function createAgentServiceEngine(deps: EngineDeps): AgentServiceEngine {
         value = await deps.getKey(def.name, name);
       } catch (err) {
         if (needed) {
-          await lookupFailed("key", err);
+          // The reason (an AWS refusal or outage) names the store's path,
+          // role and encryption key: for admins, not agents.
+          systemLogger.warn("agent-services: a needed key couldn't be read", {
+            operation: "agent_services_key_unreadable",
+            service: def.name,
+            name,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          await respond(
+            host,
+            uuid,
+            def.name,
+            engineFailure(
+              "internal",
+              `${def.name} can't read its keys right now; an admin can see why in Admin → Services`,
+            ),
+          );
           return;
         }
         // A key these settings don't use can't fail the request.
