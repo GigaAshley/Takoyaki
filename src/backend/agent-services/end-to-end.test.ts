@@ -59,7 +59,7 @@ afterEach(() => {
   fs.rmSync(home, { recursive: true, force: true });
 });
 
-function makeEngine() {
+function makeEngine(switchedOn: (service: string) => boolean = () => true) {
   const openAi = vi.fn(async () => ({
     ok: true as const,
     images: [Buffer.from("PNG-0"), Buffer.from("PNG-1")],
@@ -80,9 +80,10 @@ function makeEngine() {
   const zohoCalls: Array<{ user: string; token: string }> = [];
   const zoho = defineService({
     name: "zoho",
+    title: "Zoho",
     description: "test stand-in for a per-user-key service",
     input: z.strictObject({ query: z.string() }),
-    userSecrets: { ZOHO_TOKEN: { label: "Zoho token", managedBy: "admin" } },
+    userSecrets: { ZOHO_TOKEN: { label: "Zoho token" } },
     ttlMs: 60_000,
     async handle(input, ctx) {
       zohoCalls.push({
@@ -117,12 +118,18 @@ function makeEngine() {
         sleep: async () => {},
       }),
     ],
-    env: {
-      OPENAI_API_KEY: "k",
-      TWILIO_ACCOUNT_SID: "AC1",
-      TWILIO_AUTH_TOKEN: "tok",
-      TWILIO_FROM_NUMBER: "+17165550000",
-    },
+    // Keys as an admin would have set them in Admin → Services.
+    getKey: async (service, name) =>
+      ({
+        "image-gen/OPENAI_API_KEY": "k",
+        "agent-phone/TWILIO_ACCOUNT_SID": "AC1",
+        "agent-phone/TWILIO_AUTH_TOKEN": "tok",
+        "agent-phone/TWILIO_FROM_NUMBER": "+17165550000",
+        "stt/GROQ_API_KEY": "gq",
+      })[`${service}/${name}`] ?? null,
+    getSettings: async (def) =>
+      def.name === "stt" ? { provider: "groq", backup: "none", language: "auto" } : {},
+    isEnabled: async (service) => switchedOn(service),
     createTokenBucket: () => ({
       acquire: async () => {},
       getState: () => ({}) as never,
@@ -143,8 +150,13 @@ function makeEngine() {
 }
 
 /** Run a helper while acting as the backend scan loop, until it exits. */
-async function runWithBackend(script: string, args: string[], stdin?: string) {
-  const { engine, ...fakes } = makeEngine();
+async function runWithBackend(
+  script: string,
+  args: string[],
+  stdin?: string,
+  switchedOn?: (service: string) => boolean,
+) {
+  const { engine, ...fakes } = makeEngine(switchedOn);
   const scriptPath =
     script === "fleet-service"
       ? path.join(SCRIPTS, script)
@@ -177,7 +189,7 @@ async function runWithBackend(script: string, args: string[], stdin?: string) {
   while (code === null) {
     const claimed = await io.claim();
     if (claimed.length > 0)
-      await engine.intake({ id: "1", idNum: 1 }, io, claimed);
+      await engine.intake({ id: "1", idNum: 1, machineId: "1" }, io, claimed);
     await new Promise((r) => setTimeout(r, 50));
   }
   return { code, stdout, stderr, ...fakes };
@@ -186,6 +198,16 @@ async function runWithBackend(script: string, args: string[], stdin?: string) {
 const wireDir = () => path.join(home, "fleet", "service-requests");
 
 describe("agent services end to end", () => {
+  it("a machine the service isn't switched on for is told so, and nothing runs", async () => {
+    const r = await runWithBackend("image-gen", ["a cat"], undefined, () => false);
+    expect(r.code).not.toBe(0);
+    expect(r.openAi).not.toHaveBeenCalled();
+    expect(JSON.parse(r.stderr.trim().split("\n").pop()!)).toMatchObject({
+      reason: "not_enabled",
+      message: expect.stringMatching(/isn't switched on for this machine/),
+    });
+  });
+
   it("image-gen: reference image in, two PNGs out, wire folder left clean", async () => {
     const ref = path.join(home, "base.webp");
     fs.writeFileSync(ref, "REF");

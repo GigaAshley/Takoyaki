@@ -20,6 +20,8 @@ import type { ClaimedFile } from "./protocol.js";
 export interface ScanHostRecord {
   id: string;
   name: string;
+  /** Shared by every host row for the same box; grants are per machine. */
+  machineId?: string;
   _connDetails: Record<string, unknown>;
 }
 
@@ -30,7 +32,7 @@ export interface ScanOrchestratorDeps {
   sshIo(hostId: string, channel: SshChannel): HostRequestIo;
   localIo(): HostRequestIo;
   intake(
-    host: { id: string; idNum: number },
+    host: { id: string; idNum: number; machineId: string },
     io: HostRequestIo,
     claimed: ClaimedFile[],
   ): Promise<void>;
@@ -80,7 +82,7 @@ export function createScanOrchestrator(
         hostName: host.name,
         claimed: claimed.length,
       });
-      await deps.intake({ id: host.id, idNum }, io, claimed);
+      await deps.intake({ id: host.id, idNum, machineId: host.machineId ?? host.id }, io, claimed);
     } catch (err) {
       systemLogger.warn("agent-services scan: host scan threw", {
         operation: "agent_services_scan_host_threw",

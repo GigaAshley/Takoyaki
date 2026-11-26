@@ -66,6 +66,12 @@ export interface SttInput {
   durationMs?: number;
   /** Cancels the request (the other provider won, or the deadline passed). */
   signal?: AbortSignal;
+  /**
+   * Provider setup in the server-settings shape (STT_PROVIDER, keys,
+   * STT_LANGUAGE …), for callers with their own (the stt agent service).
+   * Absent = the server's settings, which voice uses.
+   */
+  env?: NodeJS.ProcessEnv;
 }
 
 export interface SttProvider {
@@ -262,6 +268,7 @@ export interface SttFallbackOptions {
   deadlineMs?: number;
   /** The caller stopped waiting (the browser went away): cancel everything, outcome failed. */
   signal?: AbortSignal;
+  /** Provider setup to use instead of the server's settings (see SttInput.env). */
   env?: NodeJS.ProcessEnv;
   /** Test seam: one provider's turn (defaults to transcribeWithRetries). */
   attempt?: (provider: SttProvider, input: SttInput, maxAttempts: number, reqId: string) => Promise<string>;
@@ -306,6 +313,8 @@ export function sttHedgeDelayMs(input: Pick<SttInput, "audio" | "durationMs">, p
  */
 export async function transcribeWithFallback(input: SttInput, opts: SttFallbackOptions): Promise<SttOutcome> {
   const env = opts.env ?? process.env;
+  // The providers read their key and language from the same setup.
+  if (opts.env) input = { ...input, env: opts.env };
   const reqId = opts.reqId ?? Math.random().toString(36).slice(2, 10);
   const maxAttempts = opts.maxAttempts ?? 3;
   const attempt = opts.attempt ?? transcribeWithRetries;

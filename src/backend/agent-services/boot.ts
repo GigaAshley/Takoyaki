@@ -2,6 +2,17 @@
  * agent-services/boot.ts — start the engine and its scan loop. Called once
  * from starter.ts; replaces the per-service boot blocks that used to live
  * there.
+ *
+ * Before the engine starts, the one-time upgrade brings service keys in
+ * from the server settings (admin/upgrade.ts). The engine reads keys,
+ * settings and machine switches from the stores in admin/, and records each
+ * answer there. Identity reactivate is the app's own machinery riding the
+ * same request files: a core handler, answered for every machine.
+ *
+ * Every agent machine is read each tick (an un-archive request can come from
+ * any). A machine that can't be reached is logged once when it goes and once
+ * when it's back, never per tick; admin/reachability.ts tells the Services
+ * view.
  */
 
 import type { Client as SSHClientType } from "ssh2";
@@ -37,6 +48,13 @@ import {
 import { AGENT_SERVICES } from "./registry.js";
 import { resolveActingUser } from "./user-secrets/acting-user.js";
 import { getUserSecret } from "./user-secrets/store.js";
+import identityReactivate from "../matrix/identity-reactivate.js";
+import { getKeyStore } from "./admin/key-store.js";
+import { effectiveSettings } from "./admin/settings-store.js";
+import { isEnabled } from "./admin/grants.js";
+import { recordUsage } from "./admin/usage.js";
+import { runServicesUpgrade } from "./admin/upgrade.js";
+import { setReachabilitySource } from "./admin/reachability.js";
 
 const SCAN_INTERVAL_MS = 10_000;
 
@@ -72,9 +90,16 @@ async function getSystemConnDetails(
   return systemConnDetailsByHost.get(key) ?? null;
 }
 
-export function startAgentServices(): void {
+export async function startAgentServices(): Promise<void> {
+  await runServicesUpgrade(AGENT_SERVICES);
+
   const engine = createAgentServiceEngine({
     services: AGENT_SERVICES,
+    coreHandlers: [identityReactivate],
+    isEnabled,
+    getKey: (service, name) => getKeyStore().get(service, name),
+    getSettings: (def) => effectiveSettings(def.name, def.settings),
+    recordUsage: (r) => recordUsage(r),
     resolveActingUser,
     loadUserSecret: getUserSecret,
     writeResponse: createResponseWriter({
@@ -99,6 +124,7 @@ export function startAgentServices(): void {
     label: "agent-services scan",
     logger: systemLogger,
   });
+  setReachabilitySource((hostId) => skipLog.skippingSince(hostId));
 
   async function acquireChannel(
     host: ScanHostRecord,
@@ -130,18 +156,10 @@ export function startAgentServices(): void {
         semaphore: getHostSemaphore(host.id),
       });
     } catch (err) {
-      if (err instanceof Error && err.name === "CircuitBreakerOpenError") {
-        // Host is down and the breaker already said so; log the change only,
-        // not every refused tick.
-        skipLog.refused(host, err.message);
-        return null;
-      }
-      systemLogger.warn("agent-services scan: SSH acquire failed", {
-        operation: "agent_services_scan_acquire_failed",
-        fleetHostId: host.id,
-        hostName: host.name,
-        error: err instanceof Error ? err.message : "unknown",
-      });
+      // Breaker open or a real connect failure: either way the host can't be
+      // reached. Log the change only (one line when it goes, one when it's
+      // back), never every ten-second tick.
+      skipLog.refused(host, err instanceof Error ? err.message : "unknown");
       return null;
     }
   }
@@ -164,6 +182,7 @@ export function startAgentServices(): void {
   systemLogger.info("Agent services started", {
     operation: "agent_services_started",
     services: AGENT_SERVICES.map((s) => s.name),
+    keyStore: getKeyStore().kind,
     scanIntervalMs: SCAN_INTERVAL_MS,
   });
 

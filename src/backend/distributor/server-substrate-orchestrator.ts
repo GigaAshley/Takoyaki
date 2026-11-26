@@ -40,7 +40,8 @@
  */
 
 import { runSweepForHost } from "./run-sweep.js";
-import { FULL_SUBSTRATE_CATALOG } from "./full-catalog.js";
+import { catalogForMachine } from "./full-catalog.js";
+import type { CatalogEntry } from "./catalog.js";
 import { logSweepHookError, logPersistentFailure } from "./log-tags.js";
 import { bundledReaderFromDisk } from "./bundled-reader.js";
 import { readInstanceFileBytes } from "../instance-file/store.js";
@@ -77,6 +78,13 @@ export interface SubstrateHostRecord {
 export interface ServerSubstrateOrchestratorDeps {
   /** Enumerate all hosts with runsFleetSubstrate:true from the DB. */
   listSubstrateHosts(): Promise<SubstrateHostRecord[]>;
+
+  /**
+   * The catalog to sweep onto one host: the hand-kept rows plus the agent
+   * services switched on for its machine (the rest withdrawn). Default: no
+   * services on, so every service's files are withdrawn.
+   */
+  catalogFor?(host: SubstrateHostRecord): Promise<readonly CatalogEntry[]>;
 
   /** Open a dedicated SSH channel for a host; returns null on failure. */
   acquireChannel(host: SubstrateHostRecord): Promise<SshChannel | null>;
@@ -203,6 +211,26 @@ export function createServerSubstrateOrchestrator(
   deps: ServerSubstrateOrchestratorDeps,
 ): ServerSubstrateOrchestrator {
   const retryIntervalMs = deps.retryIntervalMs ?? 30000;
+
+  /**
+   * Never throws. If the switches can't be read, the services' rows are left
+   * out for this sweep (their files stay as they are) rather than withdrawn
+   * from every host on a transient error.
+   */
+  const noServicesCatalog = catalogForMachine(new Set());
+  async function catalogFor(host: SubstrateHostRecord): Promise<readonly CatalogEntry[]> {
+    try {
+      return await deps.catalogFor!(host);
+    } catch (err) {
+      systemLogger.warn("Fleet-substrate: couldn't read which services this machine has — leaving their files as they are this sweep", {
+        operation: "fleet_substrate_service_catalog_failed",
+        fleetHostId: host.id,
+        hostName: host.name,
+        error: err instanceof Error ? err.message : "unknown",
+      });
+      return noServicesCatalog.filter((row) => !(row.sourceKind === "bundled" && row.service));
+    }
+  }
   const persistentFailureThreshold = deps.persistentFailureThreshold ?? 3;
 
   // -------------------------------------------------------------------------
@@ -482,7 +510,7 @@ export function createServerSubstrateOrchestrator(
         });
         result = await installFleetSubstrateLocally(
           { id: host.id, name: host.name },
-          FULL_SUBSTRATE_CATALOG,
+          deps.catalogFor ? await catalogFor(host) : noServicesCatalog,
           {
             readBundledBytes: bundledReaderFromDisk,
             resolvedRuntimeBytes: runtimeBytes,
@@ -556,7 +584,7 @@ export function createServerSubstrateOrchestrator(
             machineId: host.machineId,
             ...(deps.machinePeopleFile ? { peopleFile: await readPeopleFile(host.id) } : {}),
           },
-          FULL_SUBSTRATE_CATALOG,
+          deps.catalogFor ? await catalogFor(host) : noServicesCatalog,
           {
             readBundledBytes: bundledReaderFromDisk,
             // Phase 114 Plan 05 (D-15 + Pitfall 6): pass the per-tick

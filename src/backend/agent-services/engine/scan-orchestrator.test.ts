@@ -58,8 +58,8 @@ describe("agent-services scan orchestrator", () => {
     expect(d.acquireChannel).toHaveBeenCalledWith(host("2"));
     expect(d.intake).toHaveBeenCalledTimes(2);
     expect(vi.mocked(d.intake).mock.calls.map((c) => c[0])).toEqual([
-      { id: "1", idNum: 1 },
-      { id: "2", idNum: 2 },
+      { id: "1", idNum: 1, machineId: "1" },
+      { id: "2", idNum: 2, machineId: "2" },
     ]);
   });
 

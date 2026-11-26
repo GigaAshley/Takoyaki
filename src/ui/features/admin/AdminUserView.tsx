@@ -3,7 +3,7 @@
  * (apple-ux shape-admin-modals). "‹ Users" (or Esc) goes back.
  *
  * One page, top to bottom: the user's picture, name and standing; Access
- * (admin, push notifications, two-factor); Phone; agent service keys; where
+ * (admin, push notifications, two-factor); Phone; where
  * they're signed in (log out one, or everywhere); the hosts they own
  * (remove one);
  * details (Matrix ID, user ID); Delete user.
@@ -44,7 +44,6 @@ import {
 } from "@/api/user-management-api";
 import { getSSHHosts } from "@/api/ssh-host-management-api";
 import type { SSHHostWithStatus } from "@/main-axios";
-import { AdminServiceSecrets } from "./AdminServiceSecrets";
 import type { AdminLeaveGuard } from "./AdminModal";
 import {
   AdminBack,
@@ -121,7 +120,6 @@ export function AdminUserView({
       <div className="flex flex-col gap-5">
         <AccessGroup user={user} isSelf={isSelf} onUserChanged={onUserChanged} />
         <PhoneGroup user={user} onUserChanged={onUserChanged} onDirtyChange={setPhoneDirty} />
-        <AdminServiceSecrets userId={user.id} />
         <SessionsGroup user={user} isSelf={isSelf} />
         <HostsGroup user={user} />
         <KitSettingsGroup title="Details" footer="The Matrix ID is set when the account is made and can't be changed here.">

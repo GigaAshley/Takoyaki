@@ -9,8 +9,9 @@
  * The HKDF context binds each ciphertext to its (user, service, name), so a
  * value copied to another row will not decrypt.
  *
- * Write-only by design: nothing here is exposed by a route that returns a
- * value. Routes only see `listUserSecretStatus`.
+ * Only admins set them, in Admin → Services (admin/routes.ts). Write-only
+ * by design: nothing here is exposed by a route that returns a value.
+ * Routes only see `listServiceUserSecretStatus`.
  */
 
 import { and, eq } from "drizzle-orm";
@@ -120,16 +121,16 @@ export async function clearUserSecret(
   return deleted.length > 0;
 }
 
-/** Which secrets a user has stored, without values. */
-export async function listUserSecretStatus(
-  userId: string,
-): Promise<UserSecretStatus[]> {
+/** Which people have a service's keys stored, without values. */
+export async function listServiceUserSecretStatus(
+  service: string,
+): Promise<Array<{ userId: string; name: string; updatedAt: string }>> {
   return getDb()
     .select({
-      service: agentServiceUserSecrets.service,
+      userId: agentServiceUserSecrets.userId,
       name: agentServiceUserSecrets.name,
       updatedAt: agentServiceUserSecrets.updatedAt,
     })
     .from(agentServiceUserSecrets)
-    .where(eq(agentServiceUserSecrets.userId, userId));
+    .where(eq(agentServiceUserSecrets.service, service));
 }

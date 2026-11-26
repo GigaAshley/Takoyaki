@@ -36,11 +36,15 @@ const audio = {
   bytes: Buffer.from("AUDIO"),
 };
 
-const ctx = (): ServiceContext => ({
+const ctx = (
+  settings: Record<string, string> = { provider: "elevenlabs", backup: "none", language: "auto" },
+  secrets: Record<string, string> = { ELEVENLABS_API_KEY: "el" },
+): ServiceContext => ({
   requestId: "0b5c2f9e-1a2b-4c3d-8e9f-001122334455",
   host: { id: "1", idNum: 1 },
   attachments: { audio },
-  secrets: {},
+  secrets,
+  settings,
   userSecrets: {},
   log: { info: vi.fn(), warn: vi.fn() },
   now: () => 0,
@@ -55,7 +59,7 @@ describe("stt input", () => {
 });
 
 describe("stt service", () => {
-  it("transcribes with the instance's provider", async () => {
+  it("transcribes with its own setup", async () => {
     const transcribe = vi.fn(async () => ({
       kind: "ok" as const,
       text: "hello there",
@@ -79,15 +83,17 @@ describe("stt service", () => {
         timeoutMs: STT_ATTEMPT_TIMEOUT_MS,
       },
       "0b5c2f9e",
+      { STT_PROVIDER: "elevenlabs", ELEVENLABS_API_KEY: "el" },
     );
   });
 
-  it("uses STT_PROVIDER, then STT_FALLBACK_PROVIDER, and reports who transcribed", async () => {
+  it("uses its provider, then its backup, never voice's, and reports who transcribed", async () => {
     const saved = { ...process.env };
-    process.env.STT_PROVIDER = "elevenlabs";
-    process.env.STT_FALLBACK_PROVIDER = "groq";
-    process.env.ELEVENLABS_API_KEY = "el";
-    process.env.GROQ_API_KEY = "gq";
+    // Voice's own setup: none of it may reach the service.
+    process.env.STT_PROVIDER = "mistral";
+    process.env.STT_FALLBACK_PROVIDER = "none";
+    process.env.MISTRAL_API_KEY = "voice-key";
+    process.env.ELEVENLABS_API_KEY = "voice-el";
     const fetchMock = vi.fn<typeof fetch>();
     vi.stubGlobal("fetch", fetchMock);
     try {
@@ -101,12 +107,23 @@ describe("stt service", () => {
             headers: { "content-type": "application/json" },
           }),
         );
-      const r = await createSttService().handle({}, ctx());
+      const r = await createSttService().handle(
+        {},
+        ctx(
+          { provider: "elevenlabs", backup: "groq", language: "auto" },
+          { ELEVENLABS_API_KEY: "el", GROQ_API_KEY: "gq" },
+        ),
+      );
       expect(r).toMatchObject({
         ok: true,
         result: { text: "from groq", provider: "groq" },
       });
-      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(fetchMock.mock.calls.map((c) => String(c[0]))).toEqual([
+        "https://api.elevenlabs.io/v1/speech-to-text",
+        "https://api.groq.com/openai/v1/audio/transcriptions",
+      ]);
+      const headers = fetchMock.mock.calls.map((c) => (c[1] as RequestInit).headers);
+      expect(headers).toEqual([{ "xi-api-key": "el" }, { Authorization: "Bearer gq" }]);
     } finally {
       vi.unstubAllGlobals();
       process.env = saved;
@@ -118,19 +135,19 @@ describe("stt service", () => {
       "unknown STT_PROVIDER",
       new SttNotConfiguredError("unknown STT_PROVIDER"),
       undefined,
-      "not_configured",
+      "provider_rejected",
     ],
     [
       "missing key",
       new SttNotConfiguredError("no key"),
       elevenLabsSttProvider,
-      "not_configured",
+      "provider_rejected",
     ],
     [
       "rejected key",
       new SttHttpError("elevenlabs", 401, "bad key"),
       elevenLabsSttProvider,
-      "not_configured",
+      "provider_rejected",
     ],
     [
       "rate limited after retries",

@@ -2,16 +2,16 @@ import { describe, it, expect, vi } from "vitest";
 
 // The service under test gets fakes via deps; keep the production imports
 // from reaching the DB or the chat server.
-vi.mock("../../../matrix/matrix-admin-client.js", () => ({
+vi.mock("./matrix-admin-client.js", () => ({
   createOrUpdateUser: vi.fn(),
   setUserDisplayName: vi.fn(),
   getRoomMembershipOf: vi.fn(),
   getUserAccountStatus: vi.fn(),
 }));
-vi.mock("../../../matrix/matrix-admin-creds-store.js", () => ({
+vi.mock("./matrix-admin-creds-store.js", () => ({
   getMatrixAdminCreds: vi.fn(),
 }));
-vi.mock("../../../relay-sessions/registry-rooms.js", () => ({
+vi.mock("../relay-sessions/registry-rooms.js", () => ({
   getAgentsRegistryRoomId: vi.fn(),
   getHumansRegistryRoomId: vi.fn(),
   joinAgentToAgentsRegistry: vi.fn(),
@@ -21,8 +21,8 @@ import {
   createIdentityReactivateService,
   identityReactivateInput,
   type IdentityReactivateDeps,
-} from "./service.js";
-import type { ServiceContext } from "../../engine/types.js";
+} from "./identity-reactivate.js";
+import type { ServiceContext } from "../agent-services/engine/types.js";
 
 const SERVER = "harbor.example-tailnet.ts.net";
 const ACCOUNT = `@ace:${SERVER}`;
@@ -36,6 +36,7 @@ function makeCtx(): ServiceContext {
     host: { id: "3", idNum: 3 },
     attachments: {},
     secrets: {},
+    settings: {},
     userSecrets: {},
     log: { info: vi.fn(), warn: vi.fn() },
     now: () => 0,

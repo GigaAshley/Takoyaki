@@ -15,8 +15,8 @@
  *   2. Poll GET /Calls/:sid until a terminal status or the deadline. On the
  *      deadline the call is hung up, so it can never ring late.
  *   3. On `completed`, fetch the recording of the callee's reply,
- *      transcribe it with the instance's STT provider (the same one voice
- *      input and the `stt` service use, STT_FALLBACK_PROVIDER included),
+ *      transcribe it with the `stt` service's setup (Admin → Services:
+ *      its provider, backup and keys; never voice's),
  *      then delete it from Twilio —
  *      always, whether or not transcription worked.
  *
@@ -24,7 +24,7 @@
  *   queue TTL 2 min (service.ts) + call deadline 9 min + recording wait
  *   20s + transcription ≤ 2 × 30s ≈ 12.3 min. So a call never starts or
  *   keeps ringing after the agent has been told it timed out. A backup STT
- *   provider (STT_FALLBACK_PROVIDER) adds up to another 2 × 30s after the
+ *   provider (the stt service's backup) adds up to another 2 × 30s after the
  *   call has ended, which can overrun the helper's wait (~13.4 min worst
  *   case): the agent is then told the call timed out and loses the reply's
  *   transcript, though the call itself has already finished.
@@ -37,6 +37,8 @@
 
 import { systemLogger } from "../../../utils/logger.js";
 import { transcribeWithFallback } from "../../../voice/stt-provider.js";
+import { SttNotConfiguredError } from "../../../voice/stt-errors.js";
+import { loadSttEnv } from "../stt/setup.js";
 import { CALL_LANGUAGE, buildCallTwiml } from "./call-script.js";
 import type { PhoneCallOutcome } from "./types.js";
 
@@ -147,6 +149,9 @@ function errorText(err: unknown): string {
  * turned it into Hindi or unrelated English words.
  */
 async function defaultTranscribe(audio: Buffer): Promise<string> {
+  // The stt service's setup, never voice's.
+  const env = await loadSttEnv();
+  if (!env) throw new SttNotConfiguredError("speech to text has no provider set up in Admin → Services");
   const outcome = await transcribeWithFallback(
     {
       audio,
@@ -155,7 +160,7 @@ async function defaultTranscribe(audio: Buffer): Promise<string> {
       timeoutMs: TRANSCRIBE_TIMEOUT_MS,
       language: CALL_LANGUAGE.split("-")[0],
     },
-    { caller: "phone", maxAttempts: TRANSCRIBE_MAX_ATTEMPTS },
+    { caller: "phone", maxAttempts: TRANSCRIBE_MAX_ATTEMPTS, env },
   );
   if (outcome.kind === "failed") throw outcome.err;
   return outcome.text;

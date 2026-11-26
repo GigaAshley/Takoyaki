@@ -1,4 +1,4 @@
-import { sqliteTable, text, integer, real } from "drizzle-orm/sqlite-core";
+import { sqliteTable, text, integer, real, primaryKey } from "drizzle-orm/sqlite-core";
 import { sql } from "drizzle-orm";
 
 // Phase 85 (D-22) — INVARIANT: any code that deletes a users row MUST call
@@ -954,4 +954,54 @@ export const agentServiceUserSecrets = sqliteTable("agent_service_user_secrets",
   updatedAt: text("updated_at").notNull(),
   /** User id of whoever last set it (the user, or an admin). */
   updatedBy: text("updated_by"),
+});
+
+/** Agent services' instance keys (ciphertext). See agent-services/admin/key-store.ts. */
+export const agentServiceKeys = sqliteTable(
+  "agent_service_keys",
+  {
+    service: text("service").notNull(),
+    name: text("name").notNull(),
+    value: text("value").notNull(),
+    updatedAt: text("updated_at").notNull(),
+    updatedBy: text("updated_by"),
+  },
+  (t) => ({ pk: primaryKey({ columns: [t.service, t.name] }) }),
+);
+
+/** Agent services' settings (plain values). */
+export const agentServiceSettings = sqliteTable(
+  "agent_service_settings",
+  {
+    service: text("service").notNull(),
+    name: text("name").notNull(),
+    value: text("value").notNull(),
+    updatedAt: text("updated_at").notNull(),
+    updatedBy: text("updated_by"),
+  },
+  (t) => ({ pk: primaryKey({ columns: [t.service, t.name] }) }),
+);
+
+/** Machines switched on for a service; no row = off. */
+export const agentServiceGrants = sqliteTable(
+  "agent_service_grants",
+  {
+    service: text("service").notNull(),
+    machineId: text("machine_id").notNull(),
+    updatedAt: text("updated_at").notNull(),
+    updatedBy: text("updated_by"),
+  },
+  (t) => ({ pk: primaryKey({ columns: [t.service, t.machineId] }) }),
+);
+
+/** One row per answered agent-service request (no content). */
+export const agentServiceUsage = sqliteTable("agent_service_usage", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  at: text("at").notNull(),
+  service: text("service").notNull(),
+  machineId: text("machine_id").notNull(),
+  hostId: integer("host_id").notNull(),
+  ok: integer("ok", { mode: "boolean" }).notNull(),
+  code: text("code"),
+  fault: integer("fault", { mode: "boolean" }).notNull().default(false),
 });

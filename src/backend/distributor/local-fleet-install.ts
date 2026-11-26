@@ -883,7 +883,11 @@ export async function installFleetSubstrateLocally(
       try {
         // ---- Source resolution ----
         let bundledResult: { bytes: Buffer; mode: number } | null;
-        if (entry.sourceKind === "runtime") {
+        // An agent service switched off for this machine: its file must go.
+        const withdrawn = entry.sourceKind === "bundled" && entry.withdrawn === true;
+        if (withdrawn) {
+          bundledResult = null;
+        } else if (entry.sourceKind === "runtime") {
           const runtimeBytes =
             deps.resolvedRuntimeBytes?.get(entry.resolverKey) ?? null;
           bundledResult =
@@ -896,7 +900,7 @@ export async function installFleetSubstrateLocally(
 
         // ---- Runtime removal branch (D-16 mirror) ----
         // A runtime row with null bytes → file should be removed if present.
-        if (entry.sourceKind === "runtime" && bundledResult === null) {
+        if ((entry.sourceKind === "runtime" || withdrawn) && bundledResult === null) {
           const finalPath = resolveInstalledPath(entry.installPath);
           let statOk = false;
           try {

@@ -290,8 +290,9 @@ describe("transcribeWithFallback", () => {
 
     expect(r).toMatchObject({ kind: "ok", text: "from groq", provider: { id: "groq" } });
     expect(attempt.mock.calls.map((c) => [c[0].id, c[1], c[2]])).toEqual([
-      ["elevenlabs", { ...INPUT, signal: expect.any(AbortSignal) }, 2],
-      ["groq", { ...INPUT, signal: expect.any(AbortSignal) }, 2],
+      // The providers read their keys from the same setup.
+      ["elevenlabs", { ...INPUT, env: ENV, signal: expect.any(AbortSignal) }, 2],
+      ["groq", { ...INPUT, env: ENV, signal: expect.any(AbortSignal) }, 2],
     ]);
     const line = warnLines().find((l) => l.includes("transcribe-fallback "));
     expect(line).toMatch(/reqId=abc123 caller=transcribe from=elevenlabs to=groq reason=quota/);
@@ -368,8 +369,8 @@ describe("transcribeWithFallback", () => {
     const fetchMock = vi.fn<typeof fetch>();
     vi.stubGlobal("fetch", fetchMock);
     const saved = { ...process.env };
-    process.env.ELEVENLABS_API_KEY = "el";
-    process.env.GROQ_API_KEY = "gq";
+    // A caller's own setup: keys come from it, not the server settings.
+    const env = { ...ENV, ELEVENLABS_API_KEY: "el", GROQ_API_KEY: "gq" };
     try {
       // elevenlabs: 503 three times (retried), groq: success.
       fetchMock
@@ -378,7 +379,7 @@ describe("transcribeWithFallback", () => {
         .mockResolvedValueOnce(new Response("", { status: 503 }))
         .mockResolvedValueOnce(okJson({ text: " backup text " }));
       vi.useFakeTimers();
-      const p = transcribeWithFallback(INPUT, { caller: "t", env: ENV });
+      const p = transcribeWithFallback(INPUT, { caller: "t", env });
       await vi.runAllTimersAsync();
       const r = await p;
       expect(r).toMatchObject({ kind: "ok", text: "backup text", provider: { id: "groq" } });

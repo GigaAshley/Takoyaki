@@ -13,6 +13,9 @@
  *   - Hosts:    every host Skynet knows about, the ones that need
  *               attention first; a host opens one level deeper, and its
  *               Files (the home folder over SSH) one level below that.
+ *   - Services: the backend services agents use (phone, images, …); a
+ *               service opens one level deeper: settings, keys, which
+ *               machines may use it, usage, people's keys.
  *   - Sign-in:  registration / password-reset policy and session length.
  *   - Instance file: the CLAUDE.md every host gets at
  *               /etc/claude-code/CLAUDE.md — read, then Edit.
@@ -27,7 +30,7 @@
  */
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { FileText, LogIn, Server, SlidersHorizontal, Users } from "lucide-react";
+import { FileText, KeyRound, LogIn, Server, SlidersHorizontal, Users } from "lucide-react";
 import {
   Modal,
   ModalBody,
@@ -47,12 +50,14 @@ import { AdminHostsPane } from "./AdminHostsPane";
 import { AdminHostFilesPane } from "./AdminHostFilesPane";
 import { AdminInstanceFilePane } from "./AdminInstanceFilePane";
 import { AdminUserView } from "./AdminUserView";
+import { AdminServicesPane } from "./AdminServicesPane";
 
-type AdminTab = "users" | "hosts" | "signin" | "instance-file" | "system";
+type AdminTab = "users" | "hosts" | "services" | "signin" | "instance-file" | "system";
 
 const SECTIONS: ReadonlyArray<ModalSidebarTabDef<AdminTab>> = [
   { value: "users", label: "Users", Icon: Users },
   { value: "hosts", label: "Hosts", Icon: Server },
+  { value: "services", label: "Services", Icon: KeyRound },
   { value: "signin", label: "Sign-in", Icon: LogIn },
   { value: "instance-file", label: "Instance file", Icon: FileText },
   { value: "system", label: "System", Icon: SlidersHorizontal, pinned: true },
@@ -62,6 +67,7 @@ const SECTIONS: ReadonlyArray<ModalSidebarTabDef<AdminTab>> = [
 const HERO_COPY: Record<AdminTab, string> = {
   users: "Everyone with an account on this instance. Open someone to change their access or sign them out.",
   hosts: "Every host this app connects to, how it's doing, and whether its agents are running.",
+  services: "What agents can ask the server to do for them, with keys only the server holds. Set each one up and choose which machines may use it.",
   signin: "Who can make an account, and how long a sign-in lasts.",
   "instance-file": "Instructions every agent on every host starts with.",
   system: "The version this instance runs, its database, logging and voice services.",
@@ -83,6 +89,7 @@ export default function AdminModal({ open, onOpenChange, currentUserId }: AdminM
   const [oidcConfigured, setOidcConfigured] = useState(false);
   const [selectedUserId, setSelectedUserId] = useState<string | null>(null);
   const [selectedHostKey, setSelectedHostKey] = useState<string | null>(null);
+  const [selectedService, setSelectedService] = useState<string | null>(null);
   // A host's Files view, one level below its page.
   const [hostFiles, setHostFiles] = useState<{ name: string; hostId: number } | null>(null);
   // Kept here so going into a user and back keeps what was typed.
@@ -122,6 +129,7 @@ export default function AdminModal({ open, onOpenChange, currentUserId }: AdminM
       setTab("users");
       setSelectedUserId(null);
       setSelectedHostKey(null);
+      setSelectedService(null);
       setHostFiles(null);
       setUserQuery("");
       leaveGuard.current = null;
@@ -138,6 +146,7 @@ export default function AdminModal({ open, onOpenChange, currentUserId }: AdminM
       if (!(await mayLeave())) return;
       setSelectedUserId(null);
       setSelectedHostKey(null);
+      setSelectedService(null);
       setHostFiles(null);
       setTab(next);
     },
@@ -151,6 +160,7 @@ export default function AdminModal({ open, onOpenChange, currentUserId }: AdminM
         if (!ok) return;
         setSelectedUserId(null);
         setSelectedHostKey(null);
+        setSelectedService(null);
         setHostFiles(null);
         rawDrill.drillIn();
       });
@@ -161,6 +171,7 @@ export default function AdminModal({ open, onOpenChange, currentUserId }: AdminM
         if (!ok) return;
         setSelectedUserId(null);
         setSelectedHostKey(null);
+        setSelectedService(null);
         setHostFiles(null);
         rawDrill.back();
       });
@@ -183,7 +194,10 @@ export default function AdminModal({ open, onOpenChange, currentUserId }: AdminM
   const adminCount = (users ?? []).filter((u) => u.isAdmin).length;
   const fullscreen = rawDrill.fullscreen;
   const section = SECTIONS.find((s) => s.value === tab)!;
-  const deeper = (tab === "users" && selectedUser !== null) || (tab === "hosts" && selectedHostKey !== null);
+  const deeper =
+    (tab === "users" && selectedUser !== null) ||
+    (tab === "hosts" && selectedHostKey !== null) ||
+    (tab === "services" && selectedService !== null);
   const showHostFiles = tab === "hosts" && selectedHostKey !== null && hostFiles !== null;
 
   const hero = deeper ? null : (
@@ -201,7 +215,7 @@ export default function AdminModal({ open, onOpenChange, currentUserId }: AdminM
   const paneRef = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
     if (paneRef.current) paneRef.current.scrollTop = 0;
-  }, [selectedUserId, selectedHostKey]);
+  }, [selectedUserId, selectedHostKey, selectedService]);
 
   const body =
     tab === "instance-file" ? (
@@ -257,6 +271,9 @@ export default function AdminModal({ open, onOpenChange, currentUserId }: AdminM
                   if (h.filesHostId !== null) setHostFiles({ name: h.name, hostId: h.filesHostId });
                 }}
               />
+            )}
+            {tab === "services" && (
+              <AdminServicesPane selected={selectedService} onSelect={setSelectedService} />
             )}
             {tab === "signin" && <AdminSignInPane oidcInUse={oidcInUse} />}
             {tab === "system" && <AdminSystemPane />}

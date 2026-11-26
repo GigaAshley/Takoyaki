@@ -380,13 +380,19 @@ export async function restartUserUnit(
 export async function removeInstalledFile(
   channel: SshChannel,
   installPath: string,
+  opts: { installMode?: "user-home" | "system-root" } = {},
 ): Promise<
   | { ok: true; action: "removed" | "already-absent" }
   | { ok: false; stage: "remove" | "verify"; errorMessage: string }
 > {
   try {
-    // Absolute-path safe quoting — no tilde preservation (Pitfall 2).
-    const escaped = shellSingleQuote(installPath);
+    // A user-home row (an agent service's skill or helper switched off for
+    // this machine) is a `~/` path in the SSH user's own home: expand the
+    // tilde and remove it without sudo. Anything else keeps the absolute-path
+    // quoting (no tilde preservation, Pitfall 2) and sudo.
+    const userHome = opts.installMode === "user-home" && installPath.startsWith("~/");
+    const escaped = userHome ? quotePathPreservingTilde(installPath) : shellSingleQuote(installPath);
+    const rm = userHome ? "rm -f" : "sudo -n rm -f";
     // Phase 115: `sudo -n rm -f` for the mutating branch — same rationale
     // as writeInstalledBytesWithMode's system-root branch (no DB-string
     // gate; NOPASSWD sudo is the fleet-wide effective privilege). The
@@ -395,7 +401,7 @@ export async function removeInstalledFile(
     // password-required or unavailable, `sudo -n rm` fails fast and the
     // command emits __REMOVE_FAIL__ via the outer error path.
     const cmd =
-      `{ if [ -f ${escaped} ]; then sudo -n rm -f ${escaped} && echo __REMOVE_DID__ ; ` +
+      `{ if [ -f ${escaped} ]; then ${rm} ${escaped} && echo __REMOVE_DID__ ; ` +
       `elif [ ! -e ${escaped} ]; then echo __REMOVE_ALREADY__ ; ` +
       `else echo __REMOVE_FAIL__ ; fi ; } 2>&1`;
 

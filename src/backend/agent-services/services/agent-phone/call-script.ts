@@ -14,7 +14,7 @@
  * or room noise doesn't hold it open the way <Record>'s volume-based
  * silence detection did, and any keypad press ends it too. Its own result
  * is discarded — a <Start><Recording> around it captures the reply, which
- * the adapter fetches, transcribes with the instance STT provider and
+ * the adapter fetches, transcribes with the stt service's setup and
  * deletes. <Gather> has no `action`; with inline TwiML Twilio carries on
  * to the next verb (verified on live calls), so no webhook is needed.
  *

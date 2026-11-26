@@ -45,6 +45,7 @@ function makeRoot(folders: Record<string, Record<string, string | { exec: string
 /** A plain-JS service file (no imports, so it loads from any folder). */
 const serviceJs = (name: string, extra = "") => `export default {
   name: ${JSON.stringify(name)},
+  title: "Test",
   description: "test",
   input: { safeParse() { return { success: true, data: {} }; } },
   ttlMs: 1000,
@@ -57,10 +58,11 @@ describe("the services that ship", () => {
   it("are found from their folders, with none skipped", async () => {
     const found = await discoverServices(SERVICES_DIR, () => {});
     expect(found.skipped).toEqual([]);
-    // The four that existed before the move; new services just add to this.
-    expect(found.services.map((s) => s.def.name)).toEqual(
-      expect.arrayContaining(["agent-phone", "identity-reactivate", "image-gen", "stt"]),
-    );
+    // The three that existed before the move; new services just add to this.
+    // Identity reactivate is the app's own machinery, not a service.
+    const names = found.services.map((s) => s.def.name);
+    expect(names).toEqual(expect.arrayContaining(["agent-phone", "image-gen", "stt"]));
+    expect(names).not.toContain("identity-reactivate");
     expect(AGENT_SERVICES.map((s) => s.name)).toEqual(found.services.map((s) => s.def.name));
   });
 
@@ -77,8 +79,8 @@ describe("the services that ship", () => {
         ["stt-helper", "~/.local/bin/stt"],
       ]),
     );
-    // identity-reactivate has nothing for hosts.
-    expect(rows.some(([slug]) => slug.startsWith("identity-reactivate"))).toBe(false);
+    // Every row names its service, so a switched-off machine can lose it.
+    expect(serviceCatalogRows(DISCOVERED_SERVICES).every((r) => r.service)).toBe(true);
     for (const row of serviceCatalogRows(DISCOVERED_SERVICES)) {
       expect(fs.existsSync(row.bundledPath)).toBe(true);
       if (row.installPath.startsWith("~/.local/bin/")) {
@@ -118,13 +120,15 @@ describe("adding a service is one folder", () => {
     let answered: Record<string, unknown> | undefined;
     const engine = createAgentServiceEngine({
       services: all.map((s) => s.def),
-      env: { SAMPLE_API_KEY: "abcd" },
+      getKey: async (service, name) => (service === "sample" && name === "SAMPLE_API_KEY" ? "abcd" : null),
+      getSettings: async () => ({}),
+      isEnabled: async () => true,
       writeResponse: async (_host, _uuid, _files, _name, json) => {
         answered = JSON.parse(json);
       },
     });
     await engine.intake(
-      { id: "7", idNum: 7 },
+      { id: "7", idNum: 7, machineId: "7" },
       { claim: async () => [], readAttachment: async () => "missing" },
       [
         {
@@ -194,6 +198,27 @@ describe("a broken service folder", () => {
       "has a file where its bin folder should be",
       { "service.js": serviceJs("broken"), bin: "#!/bin/sh\n" },
       /bin is not a folder/,
+    ],
+    ["has no title", { "service.js": serviceJs("broken").replace('title: "Test",', "") }, /no title/],
+    [
+      "has a setting without options",
+      { "service.js": serviceJs("broken", 'settings: { provider: { label: "P", description: "d", options: [] } },') },
+      /needs options/,
+    ],
+    [
+      "has a setting default that isn't an option",
+      {
+        "service.js": serviceJs(
+          "broken",
+          'settings: { provider: { label: "P", description: "d", options: [{ value: "a", label: "A" }], default: "b" } },',
+        ),
+      },
+      /default isn't one of its options/,
+    ],
+    [
+      "has a per-person fallback that isn't one of its keys",
+      { "service.js": serviceJs("broken", 'userSecrets: { T: { label: "t", fallbackKey: "NOPE" } },') },
+      /fallbackKey isn't one of the service's keys/,
     ],
     [
       "has a skill folder with no SKILL.md",

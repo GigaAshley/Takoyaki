@@ -152,6 +152,8 @@ export async function runSweepForHost(
     // password-only sudo or no-sudo — real errors surface via logItemFailed,
     // no strings hardcoded here.
     const installMode = entry.installMode ?? "user-home";
+    // An agent service switched off for this machine: its file must go.
+    const withdrawn = entry.sourceKind === "bundled" && entry.withdrawn === true;
 
     try {
       // Read bundled and installed bytes for this item. ssh-push's
@@ -166,7 +168,9 @@ export async function runSweepForHost(
         // sourceKind. Runtime rows pull bytes from the pre-resolved
         // per-tick map (populated ONCE per sweep by the orchestrator,
         // Pitfall 6); bundled rows continue the existing fs-adapter path.
-        if (entry.sourceKind === "runtime") {
+        if (withdrawn) {
+          bundledResult = null;
+        } else if (entry.sourceKind === "runtime") {
           const runtimeBytes =
             deps.resolvedRuntimeBytes?.get(entry.resolverKey) ?? null;
           // D-18: twinkie file lands mode 0644. Runtime rows do not carry
@@ -185,8 +189,9 @@ export async function runSweepForHost(
         // host reaches a clean-unset state. The D-13 gate above already
         // ensured host.username === "root" for system-root rows, so the
         // rm is safe here.
-        if (entry.sourceKind === "runtime" && bundledResult === null) {
-          const rmResult = await removeInstalledFile(channel, entry.installPath);
+        // A withdrawn service row takes the same path.
+        if ((entry.sourceKind === "runtime" || withdrawn) && bundledResult === null) {
+          const rmResult = await removeInstalledFile(channel, entry.installPath, { installMode });
           if (rmResult.ok === false) {
             itemsFailed++;
             logItemFailed({

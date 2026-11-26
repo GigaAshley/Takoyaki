@@ -39,7 +39,7 @@ import { registerUserAdminRoutes } from "./user-admin-routes.js";
 import { registerAdminHostsRoutes } from "../../admin-hosts/routes.js";
 import { registerUserPhoneRoutes } from "./user-phone-routes.js";
 import { getSessionTimeoutHours } from "../../utils/session-timeout.js";
-import { registerServiceSecretRoutes } from "../../agent-services/user-secrets/routes.js";
+import { registerServicesAdminRoutes } from "../../agent-services/admin/routes.js";
 import { registerUserDataAccessRoutes } from "./user-data-access-routes.js";
 import {
   userAvatarUpload,
@@ -2664,6 +2664,7 @@ router.post("/change-username", authenticateJWT, async (req, res) => {
 
 registerUserAdminRoutes(router, authenticateJWT);
 registerAdminHostsRoutes(router, requireAdmin);
+registerServicesAdminRoutes(router, requireAdmin);
 
 registerUserTotpRoutes(router, {
   authenticateJWT,
@@ -2787,8 +2788,6 @@ registerUserOidcAccountRoutes(router, {
 registerUserSettingsRoutes(router, authenticateJWT);
 
 registerUserPhoneRoutes(router, authenticateJWT);
-
-registerServiceSecretRoutes(router, authenticateJWT);
 
 registerUserApiKeyRoutes(router, requireAdmin);
 

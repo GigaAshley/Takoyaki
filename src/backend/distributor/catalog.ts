@@ -157,6 +157,19 @@ export interface BundledCatalogEntry {
    * on-demand scripts).
    */
   restartHook: string | null;
+
+  /**
+   * The agent service this row belongs to (agent-services/distribution.ts).
+   * Absent on hand-kept rows.
+   */
+  service?: string;
+
+  /**
+   * True when the file must NOT be on this host (its agent service is
+   * switched off for the machine): the sweep removes it if present.
+   * Set per host by full-catalog.ts catalogForMachine.
+   */
+  withdrawn?: boolean;
 }
 
 /**

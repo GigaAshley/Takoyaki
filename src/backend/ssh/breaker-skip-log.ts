@@ -22,6 +22,8 @@ export type BreakerSkipLog = {
   refused(host: SkipLogHost, error: string): void;
   /** A channel was acquired. Logs only if the host was being skipped. */
   acquired(host: SkipLogHost): void;
+  /** When the host started being skipped (ms), or null while it's reachable. */
+  skippingSince(hostId: string): number | null;
 };
 
 export function createBreakerSkipLog(opts: {
@@ -47,6 +49,9 @@ export function createBreakerSkipLog(opts: {
           error,
         },
       );
+    },
+    skippingSince(hostId) {
+      return skippingSince.get(hostId) ?? null;
     },
     acquired(host) {
       const since = skippingSince.get(host.id);

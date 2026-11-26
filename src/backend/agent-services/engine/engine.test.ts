@@ -17,7 +17,7 @@ import type { HostRequestIo, OutgoingFile } from "./host-io.js";
 import { defineService, fail, ok, type ServiceDefinition } from "./types.js";
 
 const UUID = "0b5c2f9e-1a2b-4c3d-8e9f-001122334455";
-const HOST = { id: "7", idNum: 7 };
+const HOST = { id: "7", idNum: 7, machineId: "m7" };
 const NOW = Date.parse("2026-10-08T12:00:00Z");
 
 interface Written {
@@ -28,10 +28,35 @@ interface Written {
   response: Record<string, any>;
 }
 
+/** Store-backed deps: keys "service/NAME", settings per service, grants "service@machine". */
+function storeDeps(opts: {
+  keys?: Record<string, string>;
+  settings?: Record<string, Record<string, string>>;
+  /** Default: every service on for every machine. */
+  grants?: string[];
+}) {
+  return {
+    isEnabled: async (service: string, machineId: string) =>
+      opts.grants ? opts.grants.includes(`${service}@${machineId}`) : true,
+    getKey: async (service: string, name: string) => opts.keys?.[`${service}/${name}`] ?? null,
+    getSettings: async (def: ServiceDefinition) => {
+      const out: Record<string, string> = {};
+      for (const [name, spec] of Object.entries(def.settings ?? {})) {
+        out[name] = opts.settings?.[def.name]?.[name] ?? spec.default ?? "";
+      }
+      return out;
+    },
+  };
+}
+
 function setup(
   services: ServiceDefinition[],
   opts: {
-    env?: Record<string, string>;
+    keys?: Record<string, string>;
+    settings?: Record<string, Record<string, string>>;
+    grants?: string[];
+    coreHandlers?: ServiceDefinition[];
+    recordUsage?: EngineDeps["recordUsage"];
     now?: number;
     resolveActingUser?: EngineDeps["resolveActingUser"];
     loadUserSecret?: EngineDeps["loadUserSecret"];
@@ -41,8 +66,10 @@ function setup(
   let done: () => void = () => {};
   const engine = createAgentServiceEngine({
     services,
+    coreHandlers: opts.coreHandlers,
+    ...storeDeps(opts),
+    recordUsage: opts.recordUsage,
     now: () => opts.now ?? NOW,
-    env: opts.env ?? {},
     resolveActingUser: opts.resolveActingUser,
     loadUserSecret: opts.loadUserSecret,
     writeResponse: async (hostIdNum, uuid, files, responseFilename, json) => {
@@ -82,6 +109,7 @@ function setup(
 
 const echo = defineService({
   name: "echo",
+  title: "Echo",
   description: "test",
   input: z.strictObject({ text: z.string().min(1) }),
   ttlMs: 60_000,
@@ -201,12 +229,152 @@ describe("agent-services engine", () => {
     const missing = await setup([svc]).submit(envelope({ text: "x" }));
     expect(missing.response.error).toEqual({
       code: "not_configured",
-      message: "API_KEY is not set on the backend",
+      message:
+        "echo isn't set up yet: it needs its API key; an admin can set it up in Admin → Services",
     });
-    await setup([svc], { env: { API_KEY: "k" } }).submit(
+    await setup([svc], { keys: { "echo/API_KEY": "k" } }).submit(
       envelope({ text: "x" }),
     );
     expect(seen).toEqual([{ API_KEY: "k" }]);
+  });
+
+  it("never reads a key from the environment", async () => {
+    process.env.ENV_ONLY_KEY = "from-env";
+    try {
+      const svc = defineService({
+        ...echo,
+        secrets: { ENV_ONLY_KEY: { label: "env key", description: "test" } },
+      });
+      const w = await setup([svc]).submit(envelope({ text: "x" }));
+      expect(w.response.error.code).toBe("not_configured");
+    } finally {
+      delete process.env.ENV_ONLY_KEY;
+    }
+  });
+
+  describe("settings", () => {
+    const picky = defineService({
+      ...echo,
+      settings: {
+        provider: {
+          label: "Provider",
+          description: "test",
+          options: [
+            { value: "a", label: "A" },
+            { value: "b", label: "B" },
+          ],
+          required: true,
+        },
+        tone: {
+          label: "Tone",
+          description: "test",
+          options: [{ value: "calm", label: "Calm" }],
+          default: "calm",
+        },
+      },
+      secrets: {
+        B_KEY: {
+          label: "B key",
+          description: "test",
+          neededWhen: (s) => s.provider === "b",
+        },
+      },
+      handle: async (_i, ctx) => ok({ settings: ctx.settings, secrets: ctx.secrets }),
+    });
+
+    it("isn't set up until a required setting is picked", async () => {
+      const w = await setup([picky]).submit(envelope({ text: "x" }));
+      expect(w.response.error).toEqual({
+        code: "not_configured",
+        message:
+          "echo isn't set up yet: it needs a choice of provider; an admin can set it up in Admin → Services",
+      });
+    });
+
+    it("hands the handler its settings, defaults applied", async () => {
+      const w = await setup([picky], { settings: { echo: { provider: "a" } } }).submit(
+        envelope({ text: "x" }),
+      );
+      expect(w.response.result).toEqual({ settings: { provider: "a", tone: "calm" }, secrets: {} });
+    });
+
+    it("needs a key only when the settings call for it, and passes it either way", async () => {
+      const needs = await setup([picky], { settings: { echo: { provider: "b" } } }).submit(
+        envelope({ text: "x" }),
+      );
+      expect(needs.response.error.message).toMatch(/needs its B key/);
+      const spare = await setup([picky], {
+        settings: { echo: { provider: "a" } },
+        keys: { "echo/B_KEY": "bk" },
+      }).submit(envelope({ text: "x" }));
+      expect(spare.response.result.secrets).toEqual({ B_KEY: "bk" });
+    });
+  });
+
+  describe("machine switches", () => {
+    it("refuses a machine the service isn't switched on for, before queueing", async () => {
+      const handle = vi.fn(async () => ok({}));
+      const w = await setup([{ ...echo, handle }], { grants: ["echo@other"] }).submit(
+        envelope({ text: "x" }),
+      );
+      expect(handle).not.toHaveBeenCalled();
+      expect(w.response.error).toEqual({
+        code: "not_enabled",
+        message:
+          "echo isn't switched on for this machine; an admin can switch it on in Admin → Services",
+      });
+    });
+
+    it("serves a machine it's switched on for", async () => {
+      const w = await setup([echo], { grants: ["echo@m7"] }).submit(envelope({ text: "x" }));
+      expect(w.response.ok).toBe(true);
+    });
+
+    it("answers a core handler for every machine, unrecorded", async () => {
+      const recordUsage = vi.fn(async () => {});
+      const core = defineService({ ...echo, name: "core-thing", title: "Core" });
+      const w = await setup([echo], { grants: [], coreHandlers: [core], recordUsage }).submit({
+        ...envelope({ text: "x" }),
+        service: "core-thing",
+      });
+      expect(w.response.ok).toBe(true);
+      expect(recordUsage).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("usage records", () => {
+    const flaky = (code: string) =>
+      defineService({
+        ...echo,
+        faultCodes: ["provider_down"],
+        handle: async () => fail(code, "no"),
+      });
+
+    it("records each answer with its machine, and whether the service was at fault", async () => {
+      const recordUsage = vi.fn(async () => {});
+      await setup([echo], { recordUsage }).submit(envelope({ text: "x" }));
+      await setup([flaky("provider_down")], { recordUsage }).submit(envelope({ text: "x" }));
+      await setup([flaky("bad_prompt")], { recordUsage }).submit(envelope({ text: "x" }));
+      await setup([echo], { recordUsage }).submit(envelope({ text: "" }));
+      expect(recordUsage.mock.calls.map((c) => c[0])).toEqual([
+        { service: "echo", machineId: "m7", hostId: 7, ok: true, code: null, fault: false },
+        { service: "echo", machineId: "m7", hostId: 7, ok: false, code: "provider_down", fault: true },
+        { service: "echo", machineId: "m7", hostId: 7, ok: false, code: "bad_prompt", fault: false },
+        { service: "echo", machineId: "m7", hostId: 7, ok: false, code: "malformed", fault: false },
+      ]);
+    });
+
+    it("counts a handler that throws as the service's fault", async () => {
+      const recordUsage = vi.fn(async () => {});
+      const svc = defineService({
+        ...echo,
+        handle: async () => {
+          throw new Error("kaboom");
+        },
+      });
+      await setup([svc], { recordUsage }).submit(envelope({ text: "x" }));
+      expect(recordUsage.mock.calls[0][0]).toMatchObject({ code: "internal", fault: true });
+    });
   });
 
   it("answers internal when the handler throws", async () => {
@@ -324,8 +492,8 @@ describe("agent-services engine", () => {
     const answered = new Promise<void>((r) => (done = r));
     const engine = createAgentServiceEngine({
       services: [svc],
+      ...storeDeps({}),
       now: () => NOW,
-      env: {},
       createTokenBucket,
       writeResponse: async (...args) => {
         written.push(args);
@@ -351,11 +519,17 @@ describe("agent-services engine", () => {
       ...echo,
       name: "zoho",
       userSecrets: {
-        ZOHO_TOKEN: { label: "Zoho API token", managedBy: "admin" },
+        ZOHO_TOKEN: { label: "Zoho API token" },
         PREF: {
           label: "preference key",
-          managedBy: "user",
-          fallbackEnv: "PREF_DEFAULT",
+          fallbackKey: "PREF_DEFAULT",
+        },
+      },
+      secrets: {
+        PREF_DEFAULT: {
+          label: "default preference key",
+          description: "test",
+          neededWhen: () => false,
         },
       },
       handle: async (_i, ctx) =>
@@ -410,7 +584,7 @@ describe("agent-services engine", () => {
       });
     });
 
-    it("says an admin must set an admin-managed secret", async () => {
+    it("says an admin must set a missing per-person key", async () => {
       const d = deps({ loadUserSecret: vi.fn(async () => null) });
       const w = await setup([zoho], d).submit({
         ...envelope({ text: "x" }),
@@ -418,11 +592,11 @@ describe("agent-services engine", () => {
       });
       expect(w.response.error.code).toBe("no_user_secret");
       expect(w.response.error.message).toBe(
-        "alice has no Zoho API token for zoho; an admin needs to set it for them",
+        "alice has no Zoho API token for zoho; an admin can set it for them in Admin → Services",
       );
     });
 
-    it("points at Preferences for a user-managed secret, unless the fallback env var is set", async () => {
+    it("uses the service's fallback key for someone with none of their own", async () => {
       const missingPref = vi.fn(async (_u: string, _s: string, n: string) =>
         n === "ZOHO_TOKEN" ? "tok" : null,
       );
@@ -433,11 +607,11 @@ describe("agent-services engine", () => {
         ...envelope({ text: "x" }),
         service: "zoho",
       });
-      expect(w.response.error.message).toMatch(/Preferences → Services/);
+      expect(w.response.error.message).toMatch(/Admin → Services/);
 
       const fallback = await setup([zoho], {
         ...deps({ loadUserSecret: missingPref }),
-        env: { PREF_DEFAULT: "dflt" },
+        keys: { "zoho/PREF_DEFAULT": "dflt" },
       }).submit({
         ...envelope({ text: "x" }),
         service: "zoho",
@@ -479,7 +653,7 @@ describe("agent-services engine", () => {
       const bad = {
         ...zoho,
         userSecrets: {
-          "zoho-token": { label: "x", managedBy: "user" as const },
+          "zoho-token": { label: "x" },
         },
       };
       expect(() => setup([bad], deps())).toThrow(/UPPER_SNAKE/);

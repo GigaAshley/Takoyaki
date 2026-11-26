@@ -7,6 +7,8 @@
  *
  * The distributor sweeps these alongside its hand-kept catalog, so a new
  * service's skill and wrapper reach hosts without touching the catalog.
+ * Each row names its service: a machine the service is switched off for has
+ * the files removed instead (distributor/full-catalog.ts).
  */
 
 import { existsSync, readdirSync } from "node:fs";
@@ -68,6 +70,7 @@ function rowsFor({ def, dir }: DiscoveredService): BundledCatalogEntry[] {
             ? `${def.name}-skill`
             : `${def.name}-skill-${rel.replace(/[^A-Za-z0-9]+/g, "-")}`,
         sourceKind: "bundled",
+        service: def.name,
         bundledPath: path.join(skillDir, rel),
         installPath: `~/.claude/skills/${def.name}/${rel}`,
         restartHook: null,
@@ -80,6 +83,7 @@ function rowsFor({ def, dir }: DiscoveredService): BundledCatalogEntry[] {
       rows.push({
         slug: `${file}-helper`,
         sourceKind: "bundled",
+        service: def.name,
         bundledPath: path.join(binDir, file),
         installPath: `~/.local/bin/${file}`,
         restartHook: null,

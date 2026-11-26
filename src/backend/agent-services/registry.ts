@@ -6,7 +6,9 @@
  *   service.ts      default-exports `defineService({ name: "<name>", ... })`
  *   skill/          optional; installed to ~/.claude/skills/<name>/ on hosts
  *   bin/            optional; each file installed to ~/.local/bin/<file>
- * Nothing else in the app names a service. See README.md.
+ * Nothing else in the app names a service. See README.md. (Identity
+ * reactivate rides the same request files but is the app's own machinery,
+ * not a service; it lives in matrix/ and is wired in boot.ts.)
  *
  * A broken folder is skipped with a loud log line; the other services still
  * start. The registry test fails on any broken folder in this repo, so one
@@ -43,6 +45,7 @@ export const SERVICES_DIR = fileURLToPath(new URL("./services/", import.meta.url
 
 const NAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const KEY_NAME_RE = /^[A-Z][A-Z0-9_]*$/;
+const SETTING_NAME_RE = /^[a-z][a-z0-9_]*$/;
 
 const errText = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
@@ -54,6 +57,9 @@ function definitionProblem(def: unknown, folder: string): string | null {
   const d = def as Partial<ServiceDefinition>;
   if (d.name !== folder) {
     return `service is named "${String(d.name)}" but its folder is "${folder}"`;
+  }
+  if (typeof d.title !== "string" || d.title.length === 0) {
+    return "service has no title";
   }
   if (typeof d.description !== "string" || d.description.length === 0) {
     return "service has no description";
@@ -80,6 +86,34 @@ function definitionProblem(def: unknown, folder: string): string | null {
       ) {
         return `key ${key} needs a label and a description`;
       }
+      if (spec.neededWhen !== undefined && typeof spec.neededWhen !== "function") {
+        return `key ${key}: neededWhen must be a function`;
+      }
+    }
+  }
+  if (d.settings !== undefined) {
+    if (typeof d.settings !== "object" || d.settings === null || Array.isArray(d.settings)) {
+      return "settings must map each setting name to its label, description and options";
+    }
+    for (const [name, spec] of Object.entries(d.settings)) {
+      if (!SETTING_NAME_RE.test(name)) return `setting name "${name}" is not lower_snake`;
+      if (!spec || typeof spec.label !== "string" || !spec.label || typeof spec.description !== "string" || !spec.description) {
+        return `setting ${name} needs a label and a description`;
+      }
+      if (!Array.isArray(spec.options) || spec.options.length === 0) {
+        return `setting ${name} needs options to pick from`;
+      }
+      if (spec.default !== undefined && !spec.options.some((o) => o.value === spec.default)) {
+        return `setting ${name}: its default isn't one of its options`;
+      }
+    }
+  }
+  if (d.faultCodes !== undefined && !(Array.isArray(d.faultCodes) && d.faultCodes.every((c) => typeof c === "string"))) {
+    return "faultCodes must be a list of failure codes";
+  }
+  for (const [name, spec] of Object.entries(d.userSecrets ?? {})) {
+    if (spec?.fallbackKey !== undefined && !(d.secrets && spec.fallbackKey in d.secrets)) {
+      return `per-person key ${name}: its fallbackKey isn't one of the service's keys`;
     }
   }
   return null;

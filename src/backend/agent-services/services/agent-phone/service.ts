@@ -57,6 +57,7 @@ const productionDeps: AgentPhoneDeps = {
 export function createAgentPhoneService(deps: AgentPhoneDeps = productionDeps) {
   return defineService({
     name: "agent-phone",
+    title: "Phone calls",
     description:
       "Ring a user's phone, speak a message, return their reply",
     input: agentPhoneInput,
@@ -75,6 +76,9 @@ export function createAgentPhoneService(deps: AgentPhoneDeps = productionDeps) {
           "The instance's one Twilio number, in +E.164 form (Twilio console → Phone numbers)",
       },
     },
+    // Twilio refusing or failing the call, or the backend itself; never the
+    // person not answering.
+    faultCodes: ["placement_error", "queue_error", "timeout", "unknown"],
     // Part of the time budget in adapter.ts; see the header.
     ttlMs: 2 * 60 * 1000,
     concurrency: 10,

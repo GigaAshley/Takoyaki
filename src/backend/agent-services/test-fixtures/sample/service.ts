@@ -8,6 +8,7 @@ import { defineService, ok } from "../../engine/types.js";
 
 export default defineService({
   name: "sample",
+  title: "Sample",
   description: "Echo a word back (test only)",
   input: z.strictObject({ word: z.string().min(1) }),
   secrets: {

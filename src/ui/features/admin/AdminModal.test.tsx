@@ -104,11 +104,6 @@ vi.mock("@/api/ssh-host-management-api", () => ({
   getSSHHosts: m.getSSHHosts,
 }));
 
-vi.mock("@/api/service-secrets-api", () => ({
-  getUserServiceSecrets: vi.fn(async () => []),
-  setUserServiceSecret: vi.fn(),
-  clearUserServiceSecret: vi.fn(),
-}));
 
 vi.mock("@/api/instance-file-api", () => ({
   getInstanceFile: vi.fn(async () => ({ content: "# Rules" })),
@@ -190,7 +185,7 @@ describe("AdminModal — window", () => {
     renderModal();
     await screen.findByTestId("admin-users-pane");
     const nav = screen.getAllByTestId(/^admin-tab-/).map((b) => b.textContent);
-    expect(nav).toEqual(["Users", "Hosts", "Sign-in", "Instance file", "System"]);
+    expect(nav).toEqual(["Users", "Hosts", "Services", "Sign-in", "Instance file", "System"]);
     expect(screen.getByTestId("admin-section-hero").textContent).toContain("Users");
     expect(screen.queryByText("Close")).toBeNull();
     expect(screen.queryByText(/Machines/)).toBeNull();

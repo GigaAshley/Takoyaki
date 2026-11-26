@@ -4,7 +4,7 @@
  *
  *   - The list opens with the account card (picture, name) — the account
  *     section holds the picture and Log out. Then About you, Voice,
- *     Notifications, Phone, Services; About pinned at the bottom.
+ *     Notifications, Phone; About pinned at the bottom.
  *   - Every section saves as it changes, so there is no Close button at the
  *     bottom; About you carries its own Edit / Cancel / Save foot.
  *   - About you can hold unsaved writing: it registers a leave guard, asked
@@ -17,15 +17,12 @@
  * (fetched each time the window opens; a failed fetch hides it). Removing
  * the number hides it again and drops back to the account.
  *
- * Services — only when GET /users/me/service-secrets returns at least one
- * user-managed secret; admin-managed (company) keys are never listed here.
- *
  * Notifications — gated server-side (users.notifications_enabled or admin);
  * only when GET /push-subscriptions/telegram succeeds on open.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Volume2, Bell, Sparkles, Phone, KeyRound, Info } from "lucide-react";
+import { Volume2, Bell, Sparkles, Phone, Info } from "lucide-react";
 import {
   Modal,
   ModalHead,
@@ -40,10 +37,8 @@ import { PreferencesVoicePane } from "./PreferencesVoicePane";
 import { PreferencesNotificationsPane } from "./PreferencesNotificationsPane";
 import { PreferencesAboutYouPane } from "./PreferencesAboutYouPane";
 import { PreferencesPhonePane } from "./PreferencesPhonePane";
-import { PreferencesServicesPane } from "./PreferencesServicesPane";
 import { PreferencesAboutPane } from "./PreferencesAboutPane";
 import { getMyPhone } from "@/api/user-phone-api";
-import { getMyServiceSecrets, type ServiceSecret } from "@/api/service-secrets-api";
 import { getTelegramStatus } from "@/features/notifications/telegram-setup-api";
 import type { UserPreferences } from "@/api/open-tabs-api";
 import type { HostFolder } from "@/types/ui-types";
@@ -55,7 +50,6 @@ const NAV_SECTIONS = [
   { value: "voice",         label: "Voice",         Icon: Volume2  },
   { value: "notifications", label: "Notifications", Icon: Bell     },
   { value: "phone",         label: "Phone",         Icon: Phone    },
-  { value: "services",      label: "Services",      Icon: KeyRound },
 ] as const;
 
 type SectionValue = (typeof NAV_SECTIONS)[number]["value"] | "account" | "about";
@@ -69,8 +63,6 @@ const HERO_COPY: Partial<Record<SectionValue, string>> = {
   voice: "How your agents sound when they read replies aloud, and how voice mode listens.",
   notifications: "Where notifications from agents reach you outside the app.",
   phone: "Agents can call you at this number when they need you.",
-  services:
-    "Keys your agents use when they call these services for you. Once saved, a key can be replaced or removed but not viewed.",
 };
 
 /** Asked before leaving a section; resolves false to stay. */
@@ -173,24 +165,6 @@ export default function PreferencesModal({
     };
   }, [open]);
 
-  // [] → no user-managed service secrets → Services section hidden.
-  const [serviceSecrets, setServiceSecrets] = useState<ServiceSecret[]>([]);
-  const [serviceSecretsVersion, setServiceSecretsVersion] = useState(0);
-  useEffect(() => {
-    if (!open) return;
-    let cancelled = false;
-    getMyServiceSecrets()
-      .then((secrets) => {
-        if (!cancelled) setServiceSecrets(secrets);
-      })
-      .catch(() => {
-        if (!cancelled) setServiceSecrets([]);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [open, serviceSecretsVersion]);
-
   // false → no notifications access (403) → Notifications section hidden.
   const [notificationsAllowed, setNotificationsAllowed] = useState(false);
   useEffect(() => {
@@ -210,7 +184,6 @@ export default function PreferencesModal({
 
   const visibleSections = NAV_SECTIONS.filter(({ value }) => {
     if (value === "phone") return phoneE164 !== null;
-    if (value === "services") return serviceSecrets.length > 0;
     if (value === "notifications") return notificationsAllowed;
     return true;
   });
@@ -271,12 +244,6 @@ export default function PreferencesModal({
             <PreferencesNotificationsPane userId={userId} />
           )}
           {activeSection === "about" && <PreferencesAboutPane />}
-          {activeSection === "services" && serviceSecrets.length > 0 && (
-            <PreferencesServicesPane
-              secrets={serviceSecrets}
-              onChanged={() => setServiceSecretsVersion((v) => v + 1)}
-            />
-          )}
           {activeSection === "phone" && phoneE164 !== null && (
             <PreferencesPhonePane
               phoneE164={phoneE164}

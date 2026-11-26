@@ -670,6 +670,53 @@ async function initializeCompleteDatabase(): Promise<void> {
         FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
     );
 
+    -- Agent services, run from Admin → Services (agent-services/admin/).
+    -- Instance keys: FieldCrypto ciphertext under the system ENCRYPTION_KEY,
+    -- write-only through the API. Drizzle mirror agentServiceKeys.
+    CREATE TABLE IF NOT EXISTS agent_service_keys (
+        service TEXT NOT NULL,
+        name TEXT NOT NULL,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        updated_by TEXT,
+        PRIMARY KEY (service, name)
+    );
+
+    -- A service's settings (e.g. which provider): plain values, not secret.
+    CREATE TABLE IF NOT EXISTS agent_service_settings (
+        service TEXT NOT NULL,
+        name TEXT NOT NULL,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        updated_by TEXT,
+        PRIMARY KEY (service, name)
+    );
+
+    -- Which machines (hosts.machine_id) may use which service. A missing
+    -- row is off.
+    CREATE TABLE IF NOT EXISTS agent_service_grants (
+        service TEXT NOT NULL,
+        machine_id TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        updated_by TEXT,
+        PRIMARY KEY (service, machine_id)
+    );
+
+    -- One row per answered request: who, when and how it ended. Never what
+    -- was asked or answered. Kept about 30 days.
+    CREATE TABLE IF NOT EXISTS agent_service_usage (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        at TEXT NOT NULL,
+        service TEXT NOT NULL,
+        machine_id TEXT NOT NULL,
+        host_id INTEGER NOT NULL,
+        ok INTEGER NOT NULL,
+        code TEXT,
+        fault INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS agent_service_usage_service_at
+        ON agent_service_usage (service, at);
+
 `);
 
   // Sidebar unread marks: turn-finish log + per-user read state.

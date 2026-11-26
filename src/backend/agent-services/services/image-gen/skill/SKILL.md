@@ -57,7 +57,8 @@ Full failure enum and what to do for each:
 | content_blocked | Rephrase and retry, or tell the user the request isn't something the provider will generate. |
 | rate_limited | Signal misconfiguration to the operator (should never fire under normal load). |
 | provider_unavailable | Retry after a brief delay. |
-| not_configured | Escalate to the operator — the backend has no image provider credential set. |
+| not_configured | Escalate to the operator — image generation isn't set up yet (no key); an admin sets it up in Admin → Services. |
+| not_enabled | Image generation isn't switched on for this machine. Not agent-retriable: tell the user an admin can switch it on in Admin → Services. |
 | malformed | Read the `message` field and fix the request (e.g. `n: ...` means `--n` was out of range); retry. |
 | expired | The request waited in the queue past 5 minutes. Retry — the fleet may be overloaded. |
 | timeout | The backend accepted the request but did not answer within 5 minutes. Retry. |

@@ -38,8 +38,8 @@ interface HttpProviderSpec {
   formFields(model: string, language: string | undefined): Record<string, string>;
 }
 
-function readApiKey(spec: HttpProviderSpec): string {
-  const key = process.env[spec.apiKeyEnv]?.trim();
+function readApiKey(spec: HttpProviderSpec, env: NodeJS.ProcessEnv): string {
+  const key = env[spec.apiKeyEnv]?.trim();
   if (!key) {
     throw new SttNotConfiguredError(`${spec.id} STT needs ${spec.apiKeyEnv}, which is not set`);
   }
@@ -47,13 +47,16 @@ function readApiKey(spec: HttpProviderSpec): string {
 }
 
 async function transcribeOverHttp(spec: HttpProviderSpec, input: SttInput): Promise<string> {
-  const apiKey = readApiKey(spec);
+  // The caller's setup (the stt agent service passes its own), else the
+  // server's settings, which voice uses.
+  const env = input.env ?? process.env;
+  const apiKey = readApiKey(spec, env);
   // STT_MODEL names a model of the SELECTED provider; a backup
   // (STT_FALLBACK_PROVIDER) always uses its own default.
-  const selected = (process.env.STT_PROVIDER ?? "").trim().toLowerCase() === spec.id;
-  const model = (selected && process.env.STT_MODEL?.trim()) || spec.defaultModel;
+  const selected = (env.STT_PROVIDER ?? "").trim().toLowerCase() === spec.id;
+  const model = (selected && env.STT_MODEL?.trim()) || spec.defaultModel;
   const language =
-    input.language?.trim() || process.env.STT_LANGUAGE?.trim() || undefined;
+    input.language?.trim() || env.STT_LANGUAGE?.trim() || undefined;
 
   const form = new FormData();
   for (const [k, v] of Object.entries(spec.formFields(model, language))) {

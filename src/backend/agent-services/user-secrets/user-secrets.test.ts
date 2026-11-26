@@ -26,11 +26,10 @@ vi.mock("../../utils/logger.js", () => {
 import {
   clearUserSecret,
   getUserSecret,
-  listUserSecretStatus,
+  listServiceUserSecretStatus,
   setUserSecret,
 } from "./store.js";
 import { listHostRegistrants, resolveActingUser } from "./acting-user.js";
-import { declaredUserSecrets } from "./declared.js";
 
 beforeEach(() => {
   sqlite = new Database(":memory:");
@@ -75,10 +74,11 @@ describe("user secret store", () => {
     await setUserSecret("u-alice", "zoho", "ZOHO_TOKEN", "one", "u-alice");
     await setUserSecret("u-alice", "zoho", "ZOHO_TOKEN", "two", "u-alice");
     expect(await getUserSecret("u-alice", "zoho", "ZOHO_TOKEN")).toBe("two");
-    const status = await listUserSecretStatus("u-alice");
+    await setUserSecret("u-bob", "other", "ZOHO_TOKEN", "x", "u-admin");
+    const status = await listServiceUserSecretStatus("zoho");
     expect(status).toHaveLength(1);
-    expect(status[0]).toMatchObject({ service: "zoho", name: "ZOHO_TOKEN" });
-    expect(Object.keys(status[0]).sort()).toEqual(["name", "service", "updatedAt"]);
+    expect(status[0]).toMatchObject({ userId: "u-alice", name: "ZOHO_TOKEN" });
+    expect(Object.keys(status[0]).sort()).toEqual(["name", "updatedAt", "userId"]);
   });
 
   it("keeps users, services and names separate", async () => {
@@ -136,39 +136,5 @@ describe("acting user", () => {
   it("refuses non-registrants and unknown names", async () => {
     expect(await resolveActingUser(3, "alice")).toMatchObject({ ok: false, code: "not_permitted" });
     expect(await resolveActingUser(3, "mallory")).toMatchObject({ ok: false, code: "unknown_user" });
-  });
-});
-
-describe("declaredUserSecrets", () => {
-  it("flattens service declarations and reports fallbacks", () => {
-    const services = [
-      {
-        name: "zoho",
-        description: "Zoho CRM",
-        userSecrets: {
-          ZOHO_TOKEN: { label: "Zoho token", managedBy: "admin" as const, fallbackEnv: "ZOHO_DEFAULT" },
-          NOTE: { label: "Note", managedBy: "user" as const },
-        },
-      },
-      { name: "plain", description: "no secrets" },
-    ] as never;
-    expect(declaredUserSecrets(services, { ZOHO_DEFAULT: "x" })).toEqual([
-      {
-        service: "zoho",
-        serviceDescription: "Zoho CRM",
-        name: "ZOHO_TOKEN",
-        label: "Zoho token",
-        managedBy: "admin",
-        hasFallback: true,
-      },
-      {
-        service: "zoho",
-        serviceDescription: "Zoho CRM",
-        name: "NOTE",
-        label: "Note",
-        managedBy: "user",
-        hasFallback: false,
-      },
-    ]);
   });
 });

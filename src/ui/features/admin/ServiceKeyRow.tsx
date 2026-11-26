@@ -1,15 +1,13 @@
 /**
- * ServiceSecretRow — one agent-service secret: status, a write-only input,
- * Save, and Remove. Shared by Preferences → Services (the user's own
- * user-managed secrets) and the admin user modal (every secret).
+ * ServiceKeyRow — one key in Admin → Services (a service's own key, or one
+ * person's key): status, a write-only input, Save, and Remove.
  *
  * The value is never shown: the API never returns it, and the input always
  * starts empty. Saving replaces whatever is stored.
  */
 
 import { useState } from "react";
-import type { ServiceSecret } from "@/api/service-secrets-api";
-import { adminErrorMessage, formatAdminDate } from "@/features/admin/admin-ui";
+import { adminErrorMessage, formatAdminDate } from "./admin-ui";
 import {
   KitBanner,
   KitButton,
@@ -18,30 +16,49 @@ import {
   kitConfirm,
 } from "@/components/kit";
 
-export interface ServiceSecretRowProps {
-  secret: ServiceSecret;
+export interface ServiceKeyRowProps {
+  /** Unique within the page; prefixes the test ids. */
+  id: string;
+  label: string;
+  /** e.g. where to get it. */
+  description?: string | null;
+  isSet: boolean;
+  updatedAt: string | null;
+  /** Shown when not set, e.g. "the company default is used". */
+  unsetNote?: string;
+  /** A chip beside the label, e.g. "Not needed with this provider". */
+  chip?: { text: string; tone: "neutral" | "warn" };
+  /** What removing it means, for the confirm. */
+  removeBody?: string;
+  /** Read-only store: status only. */
+  readOnly?: boolean;
   onSave: (value: string) => Promise<void>;
   onClear: () => Promise<void>;
-  /** Admin view: show who manages it. */
-  showManagedBy?: boolean;
 }
 
-export function ServiceSecretRow({
-  secret,
+export function ServiceKeyRow({
+  id: rawId,
+  label,
+  description,
+  isSet,
+  updatedAt,
+  unsetNote,
+  chip,
+  removeBody = "Agents will no longer be able to use it.",
+  readOnly = false,
   onSave,
   onClear,
-  showManagedBy = false,
-}: ServiceSecretRowProps): JSX.Element {
+}: ServiceKeyRowProps): JSX.Element {
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState<"saving" | "removing" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
-  const id = `service-secret-${secret.service}-${secret.name}`;
+  const id = `service-key-${rawId}`;
 
-  const status = secret.isSet
-    ? `Set${secret.updatedAt ? ` · updated ${formatAdminDate(secret.updatedAt)}` : ""}`
-    : secret.hasFallback
-      ? "Not set · the instance default is used"
+  const status = isSet
+    ? `Set${updatedAt ? ` · updated ${formatAdminDate(updatedAt)}` : ""}`
+    : unsetNote
+      ? `Not set · ${unsetNote}`
       : "Not set";
 
   const save = async () => {
@@ -63,8 +80,8 @@ export function ServiceSecretRow({
 
   const clear = async () => {
     const ok = await kitConfirm({
-      title: `Remove ${secret.label}?`,
-      body: "Agents will no longer be able to use it.",
+      title: `Remove ${label}?`,
+      body: removeBody,
       confirmLabel: "Remove",
       destructive: true,
     });
@@ -81,8 +98,8 @@ export function ServiceSecretRow({
     }
   };
 
-  // A block that sits inside a kit settings group (Preferences → Services,
-  // Admin → user → Service secrets); hairline between consecutive rows.
+  // A block that sits inside a kit settings group; hairline between
+  // consecutive rows.
   return (
     <div
       className="flex flex-col gap-1.5 py-2.5 border-b border-[var(--k-hair)] last:border-b-0"
@@ -90,13 +107,9 @@ export function ServiceSecretRow({
     >
       <div className="flex items-center gap-2 flex-wrap">
         <label htmlFor={`${id}-input`} className="text-[14px] text-[var(--k-t1)]">
-          {secret.label}
+          {label}
         </label>
-        {showManagedBy && (
-          <KitChip tone={secret.managedBy === "admin" ? "accent" : "neutral"}>
-            {secret.managedBy === "admin" ? "Admin-managed" : "User can change"}
-          </KitChip>
-        )}
+        {chip && <KitChip tone={chip.tone}>{chip.text}</KitChip>}
         <span
           className="text-[12.5px] text-[var(--k-t3)]"
           data-testid={`${id}-status`}
@@ -104,11 +117,12 @@ export function ServiceSecretRow({
           {status}
         </span>
       </div>
-      {secret.description && (
+      {description && (
         <span className="text-[12.5px] leading-[1.4] text-[var(--k-t3)]">
-          {secret.description}
+          {description}
         </span>
       )}
+      {!readOnly && (
       <form
         className="flex gap-2 flex-wrap items-center"
         onSubmit={(e) => {
@@ -126,7 +140,7 @@ export function ServiceSecretRow({
           value={draft}
           disabled={busy !== null}
           placeholder={
-            secret.isSet ? "Enter a new value to replace it" : "Paste the value"
+            isSet ? "Enter a new value to replace it" : "Paste the value"
           }
           onChange={(e) => {
             setDraft(e.target.value);
@@ -143,9 +157,9 @@ export function ServiceSecretRow({
           disabled={!draft.trim() || busy === "removing"}
           busy={busy === "saving"}
         >
-          {busy === "saving" ? "Saving…" : secret.isSet ? "Replace" : "Save"}
+          {busy === "saving" ? "Saving…" : isSet ? "Replace" : "Save"}
         </KitButton>
-        {secret.isSet && (
+        {isSet && (
           <KitButton
             size="sm"
             variant="danger-quiet"
@@ -158,6 +172,7 @@ export function ServiceSecretRow({
           </KitButton>
         )}
       </form>
+      )}
       {error && (
         <KitBanner tone="danger" data-testid={`${id}-error`}>
           {error}
@@ -170,26 +185,4 @@ export function ServiceSecretRow({
       )}
     </div>
   );
-}
-
-/** Group secrets by service, keeping declaration order. */
-export function groupByService(secrets: ServiceSecret[]): Array<{
-  service: string;
-  description: string;
-  secrets: ServiceSecret[];
-}> {
-  const groups = new Map<
-    string,
-    { service: string; description: string; secrets: ServiceSecret[] }
-  >();
-  for (const s of secrets) {
-    const g = groups.get(s.service) ?? {
-      service: s.service,
-      description: s.serviceDescription,
-      secrets: [],
-    };
-    g.secrets.push(s);
-    groups.set(s.service, g);
-  }
-  return [...groups.values()];
 }

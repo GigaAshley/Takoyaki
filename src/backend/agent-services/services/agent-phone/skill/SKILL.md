@@ -96,7 +96,8 @@ Every response file carries exactly one `outcome`. Successful transcripts land u
 | timeout            | The call didn't finish within 9 minutes and the backend hung it up (or, from the helper, the backend never answered). Very rare. **The phone may have rung**, so do NOT retry right away — tell the user by another channel or escalate. |
 | expired            | The request sat in the queue past 2 minutes and was dropped without dialing (usually because another call to the same person was in progress). The phone did not ring; retry. |
 | not_picked_up      | The backend never picked up the request. The backend may be down or not managing this host. Not agent-retriable — escalate to the operator. |
-| not_configured     | The backend's phone provider isn't set up (the Twilio account settings are missing). Not agent-retriable — escalate to the operator. |
+| not_configured     | Phone calls aren't set up yet (the Twilio keys are missing). Not agent-retriable — escalate to the operator; an admin sets them up in Admin → Services. |
+| not_enabled        | Phone calls aren't switched on for this machine. Not agent-retriable — tell the user an admin can switch them on in Admin → Services. |
 | queue_full         | Too many calls are queued. Try again later. |
 | unknown            | Defensive fallback — the provider returned a state the backend couldn't classify. Treat as a failure and escalate. |
 | internal           | The backend hit an unexpected error handling the request. Escalate to the operator. |

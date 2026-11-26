@@ -45,29 +45,43 @@ export interface InstanceKeySpec {
   label: string;
   /** One line on where to get it, e.g. "Twilio console → Account info". */
   description: string;
+  /**
+   * Whether the service needs this key with the given settings (e.g. only
+   * when that provider is picked). Absent = always needed. A key that isn't
+   * needed is still passed to the handler when it's set.
+   */
+  neededWhen?: (settings: Record<string, string>) => boolean;
+}
+
+/** One choice an admin makes for a service, e.g. which provider it uses. */
+export interface ServiceSettingSpec {
+  label: string;
+  /** One line on what it changes. */
+  description: string;
+  /** The values an admin picks from. */
+  options: readonly { value: string; label: string }[];
+  /** Used when nothing is stored. Absent = unset until an admin picks. */
+  default?: string;
+  /** The service isn't set up until this has a value. */
+  required?: boolean;
 }
 
 /**
- * A secret stored per Skynet user (e.g. their Zoho API key), encrypted at
- * rest with the backend's system key so it can be used while they are
- * logged out. Values are write-only: no API ever returns one.
+ * A key stored per Skynet user (e.g. their company-issued Zoho token),
+ * encrypted at rest with the backend's system key so it can be used while
+ * they are logged out. Only admins set it, in Admin → Services; the user
+ * never sees or changes it. Values are write-only: no API ever returns one.
  */
 export interface UserSecretSpec {
-  /** Shown next to the input in Preferences or the admin user modal. */
+  /** Shown next to each person in Admin → Services. */
   label: string;
   description?: string;
   /**
-   * "user": the user sets, replaces or clears it in Preferences → Services
-   * (admins can too). "admin": only admins can set or clear it, from the
-   * admin user modal; the user's own UI and API never mention it, so a
-   * company-issued key stays invisible to them.
+   * Optional instance key of this same service (a name in `secrets`) used
+   * for people with no value of their own, e.g. a company-wide default.
+   * Declare it there with `neededWhen: () => false`.
    */
-  managedBy: "user" | "admin";
-  /**
-   * Optional backend env var to use when the user has no value stored,
-   * e.g. a company-wide default key.
-   */
-  fallbackEnv?: string;
+  fallbackKey?: string;
 }
 
 /** The Skynet user a request is acting for. */
@@ -89,8 +103,13 @@ export interface ServiceContext {
   host: { id: string; idNum: number };
   /** Attachments, keyed by the slot name declared in `attachments`. */
   attachments: Record<string, ServiceAttachment>;
-  /** Values of the env vars named in `secrets`, all guaranteed non-empty. */
+  /**
+   * The service's instance keys from the key store: every key it needs with
+   * the current settings (guaranteed non-empty), plus any other set ones.
+   */
   secrets: Record<string, string>;
+  /** The service's settings, defaults applied ("" when unset). */
+  settings: Record<string, string>;
   /**
    * The user the request acts for. Set when the service declares
    * `userSecrets`; see README "Whose request is it?".
@@ -119,7 +138,9 @@ export interface ServiceDefinition<
 > {
   /** Service name agents put in the request envelope. kebab-case. */
   name: string;
-  /** One line for logs and docs. */
+  /** What an admin calls it in Admin → Services, e.g. "Phone calls". */
+  title: string;
+  /** One line for logs, docs and Admin → Services. */
   description: string;
   /**
    * Input schema. Use `z.strictObject(...)` so a mistyped field fails as
@@ -129,13 +150,28 @@ export interface ServiceDefinition<
   /** Named attachment slots. Requests naming any other slot are `malformed`. */
   attachments?: Record<string, AttachmentSpec>;
   /**
-   * Instance keys the handler needs, keyed by an UPPER_SNAKE name (read from
-   * the env var of that name). If any is unset the engine answers
-   * `not_configured` without calling the handler. A service never shares a
-   * key with the app's own voice features; an operator who wants one account
-   * behind both enters it in both places.
+   * Instance keys the handler needs, keyed by an UPPER_SNAKE name. An admin
+   * sets them in Admin → Services; they are never read from the environment.
+   * If a needed one is unset the engine answers `not_configured` without
+   * calling the handler. A service never shares a key with the app's own
+   * voice features; an operator who wants one account behind both enters it
+   * in both places.
    */
   secrets?: Record<string, InstanceKeySpec>;
+  /**
+   * Choices an admin makes in Admin → Services, keyed by a lower_snake name
+   * (e.g. which provider). A required one without a value leaves the service
+   * not set up (`not_configured`).
+   */
+  settings?: Record<string, ServiceSettingSpec>;
+  /**
+   * Failure codes this service returns when the service itself is at fault
+   * (a rejected key, a provider that is down or refusing), as opposed to a
+   * bad request or an outcome that is no failure (nobody picked up). The
+   * last of these, unless followed by a success, shows the service as
+   * failing. `internal` always counts.
+   */
+  faultCodes?: readonly string[];
   /**
    * Per-user secrets, keyed by an UPPER_SNAKE name. Declaring any makes the
    * engine work out which user the request acts for (ctx.user) and load
@@ -205,6 +241,7 @@ export type EngineErrorCode =
   | "expired"
   | "queue_full"
   | "not_configured"
+  | "not_enabled"
   | "internal"
   // acting-user resolution (services with userSecrets)
   | "ambiguous_user"

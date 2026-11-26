@@ -1617,6 +1617,8 @@ if (process.env.VITEST !== "true") {
         now: () => Date.now(),
       });
 
+      const { catalogForMachine } = await import("./distributor/full-catalog.js");
+      const { enabledServices } = await import("./agent-services/admin/grants.js");
       const substrateOrch = createServerSubstrateOrchestrator({
         listSubstrateHosts: () =>
           listSubstrateHostsFn({ getDb: getDbForSubstrate }),
@@ -1633,6 +1635,9 @@ if (process.env.VITEST !== "true") {
         persistentFailureThreshold: 3,
         harnessReconciler,
         machinePeopleFile: machinePeopleFileFor,
+        // Agent services install only where they're switched on.
+        catalogFor: async (host) =>
+          catalogForMachine(await enabledServices(host.machineId ?? host.id)),
       });
 
       // Populate the singleton so the host-create route (75-06) can reach it.
@@ -1910,7 +1915,7 @@ if (process.env.VITEST !== "true") {
     // =========================================================================
     {
       const { startAgentServices } = await import("./agent-services/boot.js");
-      startAgentServices();
+      await startAgentServices();
     }
 
     // Initialize log level from database settings

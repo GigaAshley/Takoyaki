@@ -47,6 +47,7 @@ export function createImageGenService(
 ) {
   return defineService({
     name: "image-gen",
+    title: "Image generation",
     description: "Generate images from a prompt with OpenAI gpt-image-1.5",
     input: imageGenInput,
     attachments: {
@@ -61,6 +62,8 @@ export function createImageGenService(
         description: "platform.openai.com → API keys",
       },
     },
+    // A rejected key comes back from the adapter as "unknown" (401).
+    faultCodes: ["provider_unavailable", "rate_limited", "unknown"],
     ttlMs: 5 * 60 * 1000,
     concurrency: 5,
     rateLimitPerMinute: () => imageGenRpmFromEnv(),

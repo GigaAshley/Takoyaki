@@ -2,15 +2,12 @@
  * stt — speech to text. The agent sends an audio file and gets the
  * transcript back.
  *
- * Transcription goes through the instance's existing STT provider
- * (src/backend/voice/stt-provider.ts), the same one voice input uses:
- * STT_PROVIDER picks bedrock (default), elevenlabs, mistral or groq, with
- * the same keys, STT_MODEL and STT_LANGUAGE, and STT_FALLBACK_PROVIDER takes
- * over when it fails. No separate provider config.
- *
- * It borrows the provider from the app's own voice features, so it declares
- * no keys of its own; until it gets its own provider and key, the keys it
- * uses are voice's. (agent-phone does the same for transcribing replies.)
+ * It has its own setup, set in Admin → Services (setup.ts): a provider
+ * (Amazon, ElevenLabs, Mistral or Groq), an optional backup tried when it
+ * fails or is slow, a language, and the keys those providers need. It runs
+ * through the voice STT code (src/backend/voice/stt-provider.ts) but never
+ * uses voice's provider or keys. agent-phone transcribes replies with this
+ * same setup.
  *
  * Agent side: bin/stt (wrapper over fleet-service) and skill/SKILL.md, both
  * in this folder.
@@ -30,6 +27,7 @@ import {
   type SttProvider,
 } from "../../../voice/stt-provider.js";
 import { SttNotConfiguredError } from "../../../voice/stt-errors.js";
+import { STT_SECRETS, STT_SETTINGS, sttEnv } from "./setup.js";
 
 /** Same cap as POST /voice/transcribe uploads. */
 export const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
@@ -57,7 +55,7 @@ const MIME_BY_EXT: Record<string, string> = {
 /** Formats every provider accepts (Bedrock transcodes them with ffmpeg). */
 export const AUDIO_EXTENSIONS = Object.keys(MIME_BY_EXT);
 
-/** No options: model and language are instance settings (STT_MODEL, STT_LANGUAGE). */
+/** No options: provider and language are the service's settings. */
 export const sttInput = z.strictObject({});
 
 /** SKYNET_STT_RPM, default 30, floor 1. */
@@ -69,18 +67,22 @@ export function sttRpmFromEnv(
 }
 
 export interface SttServiceDeps {
-  /** Selected provider, then STT_FALLBACK_PROVIDER on failure. */
-  transcribe?: (input: SttInput, reqId: string) => Promise<SttOutcome>;
+  /** The setup's provider, then its backup on failure. */
+  transcribe?: (input: SttInput, reqId: string, env: NodeJS.ProcessEnv) => Promise<SttOutcome>;
 }
 
 export function createSttService({
-  transcribe = (input, reqId) =>
-    transcribeWithFallback(input, { reqId, caller: "stt-service" }),
+  transcribe = (input, reqId, env) =>
+    transcribeWithFallback(input, { reqId, caller: "stt-service", env }),
 }: SttServiceDeps = {}) {
   return defineService({
     name: "stt",
-    description: "Transcribe an audio file with the instance's STT provider",
+    title: "Speech to text",
+    description: "Transcribe an audio file",
     input: sttInput,
+    settings: STT_SETTINGS,
+    secrets: STT_SECRETS,
+    faultCodes: ["provider_rejected", "provider_unavailable"],
     attachments: {
       audio: {
         extensions: AUDIO_EXTENSIONS,
@@ -106,6 +108,7 @@ export function createSttService({
             timeoutMs: STT_ATTEMPT_TIMEOUT_MS,
           },
           ctx.requestId.slice(0, 8),
+          sttEnv(ctx.settings, ctx.secrets),
         );
         provider = outcome.provider;
         if (outcome.kind === "failed") throw outcome.err;
@@ -128,8 +131,8 @@ export function createSttService({
           provider?.isUnavailable(err)
         ) {
           return fail(
-            "not_configured",
-            "the backend's speech-to-text provider is not configured, rejected its credentials, or is out of credit",
+            "provider_rejected",
+            "the speech-to-text provider rejected the backend's key or is out of credit",
           );
         }
         if (provider?.isRetriable(err)) {

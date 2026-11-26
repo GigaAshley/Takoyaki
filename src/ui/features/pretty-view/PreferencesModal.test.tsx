@@ -5,7 +5,7 @@
  *   (c) each side-list item shows its section; gated sections hide
  *   (d) Esc closes
  *   (e) every open starts on the account
- *   (f–k) Phone and Services gating / flows
+ *   (f–k) Phone gating / flows; no Services section
  *   (i) About: pinned last, branded name, source link, licence page
  *   (l) Log out lives in the account section and asks first
  *   (m) side list: account card leads; no General / Log out items; no Close foot
@@ -93,17 +93,6 @@ vi.mock("@/api/user-phone-api", async (importOriginal) => {
   };
 });
 
-// Services section gating — the modal lists user-managed service secrets.
-const { getMyServiceSecretsMock, setMyServiceSecretMock } = vi.hoisted(() => ({
-  getMyServiceSecretsMock: vi.fn(),
-  setMyServiceSecretMock: vi.fn(),
-}));
-vi.mock("@/api/service-secrets-api", () => ({
-  getMyServiceSecrets: () => getMyServiceSecretsMock(),
-  setMyServiceSecret: (...a: unknown[]) => setMyServiceSecretMock(...a),
-  clearMyServiceSecret: vi.fn().mockResolvedValue(undefined),
-}));
-
 // Notifications section gating — the modal probes GET /push-subscriptions/telegram
 // on open; any failure (403 when the user lacks notifications access) hides it.
 const { getTelegramStatusMock } = vi.hoisted(() => ({
@@ -175,8 +164,6 @@ describe("PreferencesModal", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     getMyPhoneMock.mockResolvedValue(null);
-    getMyServiceSecretsMock.mockResolvedValue([]);
-    setMyServiceSecretMock.mockResolvedValue(undefined);
     getTelegramStatusMock.mockResolvedValue({ setUp: false, linked: false });
     listGlobalFilesMock.mockResolvedValue({
       files: [{ path: "~/.claude/CLAUDE.md" }],
@@ -329,47 +316,10 @@ describe("PreferencesModal", () => {
     ).toBe("+17165550100");
   });
 
-  it("(j) hides the Services section when there are no user-managed secrets", async () => {
+  it("(j) has no Services section: service keys are set by admins only", async () => {
     render(<PreferencesModal {...defaultProps} open={true} />);
-    await waitFor(() => expect(getMyServiceSecretsMock).toHaveBeenCalled());
+    await screen.findByTestId("preferences-nav-voice");
     expect(screen.queryByTestId("preferences-nav-services")).toBeNull();
-  });
-
-  it("(k) shows Services, saves a key write-only and refreshes the status", async () => {
-    const secret = {
-      service: "notes",
-      serviceDescription: "Notes service",
-      name: "NOTES_KEY",
-      label: "Notes API key",
-      managedBy: "user",
-      hasFallback: false,
-      isSet: false,
-      updatedAt: null,
-    };
-    getMyServiceSecretsMock
-      .mockResolvedValueOnce([secret])
-      .mockResolvedValue([
-        { ...secret, isSet: true, updatedAt: "2026-10-08T00:00:00Z" },
-      ]);
-    const user = userEvent.setup();
-    render(<PreferencesModal {...defaultProps} open={true} />);
-    await user.click(await screen.findByTestId("preferences-nav-services"));
-    const input = screen.getByTestId(
-      "service-secret-notes-NOTES_KEY-input",
-    ) as HTMLInputElement;
-    expect(input.type).toBe("password");
-    await user.type(input, "abc123");
-    await user.click(screen.getByTestId("service-secret-notes-NOTES_KEY-save"));
-    expect(setMyServiceSecretMock).toHaveBeenCalledWith(
-      expect.objectContaining({ service: "notes", name: "NOTES_KEY" }),
-      "abc123",
-    );
-    await waitFor(() =>
-      expect(
-        screen.getByTestId("service-secret-notes-NOTES_KEY-status").textContent,
-      ).toMatch(/^Set/),
-    );
-    expect(input.value).toBe("");
   });
 
   it("(h) removing the number hides the Phone section and returns to the account", async () => {
@@ -561,7 +511,6 @@ describe("PreferencesModal mobile drill-in", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     getMyPhoneMock.mockResolvedValue(null);
-    getMyServiceSecretsMock.mockResolvedValue([]);
     getTelegramStatusMock.mockResolvedValue({ setUp: false, linked: false });
     // Below `sm` — the modal is fullscreen.
     window.matchMedia = vi.fn().mockImplementation((query: string) => ({

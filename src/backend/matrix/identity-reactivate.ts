@@ -4,6 +4,12 @@
  *
  * Asked for by the agent-supervisor on the identity's host when it picks up
  * an `.unarchive-requested` flag (front end and agents drop the same flag).
+ *
+ * Not an agent service: it is the app's own machinery. It rides the agent
+ * services' request files (the supervisor drops a `fleet-service` request
+ * named "identity-reactivate") and the engine answers it as a core handler,
+ * for every machine, never switched, listed or recorded. Wired in
+ * agent-services/boot.ts.
  * The chat admin credentials never leave the backend; this is the one narrow
  * thing a host may ask of them.
  *
@@ -26,20 +32,20 @@
 
 import { randomBytes } from "node:crypto";
 import { z } from "zod";
-import { defineService, fail, ok } from "../../engine/types.js";
+import { defineService, fail, ok } from "../agent-services/engine/types.js";
 import {
   createOrUpdateUser,
   getRoomMembershipOf,
   getUserAccountStatus,
   setUserDisplayName,
-} from "../../../matrix/matrix-admin-client.js";
-import { getMatrixAdminCreds } from "../../../matrix/matrix-admin-creds-store.js";
-import { extractServerName } from "../../../matrix/username-to-mxid.js";
+} from "./matrix-admin-client.js";
+import { getMatrixAdminCreds } from "./matrix-admin-creds-store.js";
+import { extractServerName } from "./username-to-mxid.js";
 import {
   getAgentsRegistryRoomId,
   getHumansRegistryRoomId,
   joinAgentToAgentsRegistry,
-} from "../../../relay-sessions/registry-rooms.js";
+} from "../relay-sessions/registry-rooms.js";
 
 /** Matrix localparts are lowercase; the server part is checked separately. */
 const ACCOUNT_RE = /^@([a-z0-9._=\-/]{1,200}):([A-Za-z0-9.\-:[\]]{1,255})$/;
@@ -97,6 +103,7 @@ export function createIdentityReactivateService(
 ) {
   return defineService({
     name: "identity-reactivate",
+    title: "Identity reactivate",
     description: "Reactivate an archived agent's chat account for un-archive",
     input: identityReactivateInput,
     ttlMs: 5 * 60 * 1000,

@@ -42,7 +42,9 @@ The helper waits up to 9 minutes, under the Bash tool's 10-minute limit, and cle
 | malformed | Read `message`: usually an unsupported file type (`attachment audio ...`) or a file over 25 MB. Convert or split, then retry. |
 | transcription_failed | The provider could not transcribe the file. Check it actually contains audio (`ffprobe <file>`); re-encode it (e.g. to ogg/opus) and retry once. |
 | provider_unavailable | The provider is busy or unreachable (the backend already retried). Retry after a brief delay. |
-| not_configured | Escalate to the operator: the backend's speech-to-text provider isn't set up, its key was rejected, or it is out of credit. |
+| provider_rejected | The provider rejected the backend's key or is out of credit. Escalate to the operator. |
+| not_configured | Speech to text isn't set up yet (no provider or key). Escalate to the operator: an admin sets it up in Admin → Services. |
+| not_enabled | Speech to text isn't switched on for this machine. Not agent-retriable: tell the user an admin can switch it on in Admin → Services. |
 | expired | The request waited in the queue past 2 minutes. Retry; the fleet may be busy. |
 | timeout | The backend accepted the request but did not answer within 9 minutes. Retry with a shorter file. |
 | not_picked_up | The backend never picked up the request; it may be down or not managing this host. Escalate to the operator. |

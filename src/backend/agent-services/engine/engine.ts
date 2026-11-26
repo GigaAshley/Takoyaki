@@ -3,13 +3,19 @@
  * response files.
  *
  * intake(), per claimed request, at scan time:
- *   envelope parse → service lookup → input schema → attachments → enqueue
+ *   envelope parse → service lookup → switched on for this machine? →
+ *   input schema → attachments → enqueue
  * Any failure there is answered straight away (malformed, unknown_service,
- * queue_full) without queueing.
+ * not_enabled, queue_full) without queueing.
  *
  * Queued job, per request:
- *   TTL → env secrets present → acting user + their secrets (services with
- *   userSecrets) → rate limit → handle() → write response
+ *   TTL → settings and keys from the stores (not_configured when a required
+ *   one is missing) → acting user + their keys (services with userSecrets)
+ *   → rate limit → handle() → write response
+ *
+ * Core handlers (identity-reactivate) ride the same request files but are
+ * the app's own machinery, not services: never switched, never recorded.
+ * Every service response is recorded (agent-services/admin/usage.ts).
  *
  * Every request gets exactly one response file unless the write itself
  * fails, in which case the agent's helper times out.
@@ -40,6 +46,8 @@ import type {
 interface RequestHost {
   id: string;
   idNum: number;
+  /** The machine behind the host row (hosts.machine_id); grants are per machine. */
+  machineId: string;
 }
 
 export type ActingUserResolution =
@@ -51,8 +59,26 @@ export type ActingUserResolution =
     };
 
 export interface EngineDeps {
+  /** The services: switched per machine, set up in Admin → Services. */
   services: readonly ServiceDefinition[];
+  /** The app's own request handlers: answered for every machine, never listed. */
+  coreHandlers?: readonly ServiceDefinition[];
   writeResponse: ResponseWriter;
+  /** Whether `service` is switched on for `machineId`. */
+  isEnabled(service: string, machineId: string): Promise<boolean>;
+  /** A service's instance key from the key store, or null. */
+  getKey(service: string, name: string): Promise<string | null>;
+  /** A service's settings, defaults applied ("" when unset). */
+  getSettings(def: ServiceDefinition): Promise<Record<string, string>>;
+  /** Called once per service response. Must not throw. */
+  recordUsage?: (r: {
+    service: string;
+    machineId: string;
+    hostId: number;
+    ok: boolean;
+    code: string | null;
+    fault: boolean;
+  }) => Promise<void>;
   /**
    * Work out which user a request from `hostIdNum` acts for, optionally
    * named by the envelope's `as_user`. Required if any service declares
@@ -69,7 +95,6 @@ export interface EngineDeps {
     name: string,
   ) => Promise<string | null>;
   now?: () => number;
-  env?: Record<string, string | undefined>;
   createTokenBucket?: (rpm: number) => TokenBucket;
 }
 
@@ -90,17 +115,25 @@ const USER_SECRET_NAME_RE = /^[A-Z][A-Z0-9_]{0,63}$/;
 
 interface ServiceRuntime {
   def: ServiceDefinition;
+  /** A core handler: no switch, no usage record. */
+  core: boolean;
   queue: JobQueue;
   bucket: TokenBucket | null;
 }
 
+/** What an admin does to fix a missing key or setting. */
+const ADMIN_FIX = "an admin can set it up in Admin → Services";
+
 export function createAgentServiceEngine(deps: EngineDeps): AgentServiceEngine {
   const now = deps.now ?? (() => Date.now());
-  const env = deps.env ?? process.env;
   const makeBucket = deps.createTokenBucket ?? createTokenBucket;
 
   const runtimes = new Map<string, ServiceRuntime>();
-  for (const def of deps.services) {
+  const all = [
+    ...deps.services.map((def) => ({ def, core: false })),
+    ...(deps.coreHandlers ?? []).map((def) => ({ def, core: true })),
+  ];
+  for (const { def, core } of all) {
     if (runtimes.has(def.name))
       throw new Error(`duplicate agent service: ${def.name}`);
     for (const name of Object.keys(def.userSecrets ?? {})) {
@@ -118,6 +151,7 @@ export function createAgentServiceEngine(deps: EngineDeps): AgentServiceEngine {
     const rpm = def.rateLimitPerMinute?.();
     runtimes.set(def.name, {
       def,
+      core,
       bucket: rpm !== undefined ? makeBucket(Math.max(1, rpm)) : null,
       queue: new JobQueue({
         concurrency: def.concurrency ?? 1,
@@ -138,6 +172,20 @@ export function createAgentServiceEngine(deps: EngineDeps): AgentServiceEngine {
     service: string | null,
     result: ServiceResult | EngineFailure,
   ): Promise<void> {
+    const rt = service ? runtimes.get(service) : undefined;
+    if (rt && !rt.core && deps.recordUsage) {
+      const code = result.ok === true ? null : result.code;
+      await deps.recordUsage({
+        service: rt.def.name,
+        machineId: host.machineId,
+        hostId: host.idNum,
+        ok: result.ok === true,
+        code,
+        fault:
+          code !== null &&
+          (code === "internal" || (rt.def.faultCodes ?? []).includes(code)),
+      });
+    }
     const files: OutgoingFile[] = [];
     if (result.ok === true) {
       (result.files ?? []).forEach((f, i) =>
@@ -191,22 +239,56 @@ export function createAgentServiceEngine(deps: EngineDeps): AgentServiceEngine {
       return;
     }
 
-    const secrets: Record<string, string> = {};
-    for (const name of Object.keys(def.secrets ?? {})) {
-      const value = env[name];
-      if (!value) {
-        await respond(
-          host,
-          uuid,
-          def.name,
-          engineFailure(
-            "not_configured",
-            `${name} is not set on the backend`,
-          ),
-        );
+    const notConfigured = (what: string) =>
+      respond(
+        host,
+        uuid,
+        def.name,
+        engineFailure(
+          "not_configured",
+          `${def.name} isn't set up yet: it needs ${what}; ${ADMIN_FIX}`,
+        ),
+      );
+    const lookupFailed = (what: string, err: unknown) =>
+      respond(
+        host,
+        uuid,
+        def.name,
+        engineFailure(
+          "internal",
+          `${what} lookup failed: ${err instanceof Error ? err.message : String(err)}`,
+        ),
+      );
+
+    let settings: Record<string, string>;
+    try {
+      settings = await deps.getSettings(def);
+    } catch (err) {
+      await lookupFailed("settings", err);
+      return;
+    }
+    for (const [name, spec] of Object.entries(def.settings ?? {})) {
+      if (spec.required && !settings[name]) {
+        await notConfigured(`a choice of ${spec.label.toLowerCase()}`);
         return;
       }
-      secrets[name] = value;
+    }
+
+    const secrets: Record<string, string> = {};
+    for (const [name, spec] of Object.entries(def.secrets ?? {})) {
+      let value: string | null;
+      try {
+        value = await deps.getKey(def.name, name);
+      } catch (err) {
+        await lookupFailed("key", err);
+        return;
+      }
+      if (value) {
+        secrets[name] = value;
+      } else if (spec.neededWhen?.(settings) ?? true) {
+        await notConfigured(`its ${spec.label}`);
+        return;
+      }
     }
 
     let user: ActingUser | undefined;
@@ -250,19 +332,15 @@ export function createAgentServiceEngine(deps: EngineDeps): AgentServiceEngine {
           );
           return;
         }
-        if (!value && spec.fallbackEnv) value = env[spec.fallbackEnv] || null;
+        if (!value && spec.fallbackKey) value = secrets[spec.fallbackKey] || null;
         if (!value) {
-          const who =
-            spec.managedBy === "admin"
-              ? "an admin needs to set it for them"
-              : "they can add it under Preferences → Services";
           await respond(
             host,
             uuid,
             def.name,
             engineFailure(
               "no_user_secret",
-              `${user.username} has no ${spec.label} for ${def.name}; ${who}`,
+              `${user.username} has no ${spec.label} for ${def.name}; an admin can set it for them in Admin → Services`,
             ),
           );
           return;
@@ -284,6 +362,7 @@ export function createAgentServiceEngine(deps: EngineDeps): AgentServiceEngine {
       host,
       attachments,
       secrets,
+      settings,
       user,
       userSecrets,
       now,
@@ -341,6 +420,35 @@ export function createAgentServiceEngine(deps: EngineDeps): AgentServiceEngine {
       return;
     }
     const { def } = rt;
+    if (!rt.core) {
+      let enabled: boolean;
+      try {
+        enabled = await deps.isEnabled(def.name, host.machineId);
+      } catch (err) {
+        await respond(
+          host,
+          uuid,
+          def.name,
+          engineFailure(
+            "internal",
+            `switch lookup failed: ${err instanceof Error ? err.message : String(err)}`,
+          ),
+        );
+        return;
+      }
+      if (!enabled) {
+        await respond(
+          host,
+          uuid,
+          def.name,
+          engineFailure(
+            "not_enabled",
+            `${def.name} isn't switched on for this machine; an admin can switch it on in Admin → Services`,
+          ),
+        );
+        return;
+      }
+    }
     const malformed = (message: string) =>
       respond(host, uuid, def.name, engineFailure("malformed", message));
 

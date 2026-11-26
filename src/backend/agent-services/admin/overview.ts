@@ -1,0 +1,226 @@
+/**
+ * agent-services/admin/overview.ts — what Admin → Services shows, built
+ * from the service definitions and the stores. Never carries a key value.
+ *
+ * State, in order:
+ *   not_set_up  a required setting has no value, or a key the service needs
+ *               with its settings isn't set;
+ *   failing     the last success-or-fault record was a fault (usage.ts);
+ *   ready.
+ */
+
+import type { ServiceDefinition } from "../engine/types.js";
+import type { InstanceKeyStore } from "./key-store.js";
+import type { ServiceHealth, UsageSummary } from "./usage.js";
+
+export type ServiceState = "not_set_up" | "ready" | "failing";
+
+export interface AgentMachine {
+  machineId: string;
+  name: string;
+  /** Every host row for the machine, for reachability. */
+  hostIds: string[];
+}
+
+export interface OverviewDeps {
+  keyStore: InstanceKeyStore;
+  effectiveSettings(service: string, specs: ServiceDefinition["settings"]): Promise<Record<string, string>>;
+  storedSettings(service: string): Promise<Record<string, string>>;
+  enabledMachines(service: string): Promise<Set<string>>;
+  listAgentMachines(): Promise<AgentMachine[]>;
+  serviceHealth(service: string): Promise<ServiceHealth>;
+  usageSummary(service: string): Promise<UsageSummary>;
+  /** When the scan stopped reaching a host row (ms), or null. */
+  unreachableSince(hostId: string): number | null;
+  listUsers(): Promise<Array<{ id: string; username: string }>>;
+  listPersonKeyStatus(service: string): Promise<Array<{ userId: string; name: string; updatedAt: string }>>;
+}
+
+export interface KeyView {
+  name: string;
+  label: string;
+  description: string;
+  /** Needed with the current settings (else optional, e.g. another provider's). */
+  needed: boolean;
+  isSet: boolean;
+  updatedAt: string | null;
+}
+
+export interface SettingView {
+  name: string;
+  label: string;
+  description: string;
+  options: Array<{ value: string; label: string }>;
+  required: boolean;
+  /** Current value, default applied; "" when unset. */
+  value: string;
+}
+
+export interface ServiceSummary {
+  name: string;
+  title: string;
+  description: string;
+  state: ServiceState;
+  /** Missing pieces, when not set up: key labels and setting labels. */
+  missing: string[];
+  lastUsedAt: string | null;
+  machinesOn: number;
+  machinesTotal: number;
+}
+
+export interface MachineView {
+  machineId: string;
+  name: string;
+  enabled: boolean;
+  /** ISO time the services system stopped reaching it, or null. */
+  unreachableSince: string | null;
+}
+
+export interface ServiceDetail extends ServiceSummary {
+  keys: KeyView[];
+  settings: SettingView[];
+  machines: MachineView[];
+  usage: UsageSummary & {
+    byMachine: Array<UsageSummary["byMachine"][number] & { name: string }>;
+    recentErrors: Array<UsageSummary["recentErrors"][number] & { name: string }>;
+  };
+  lastFault: ServiceHealth["lastFault"];
+  /** Null when the service has no per-person keys. */
+  personKeys: null | {
+    keys: Array<{ name: string; label: string; description: string | null; hasFallback: boolean }>;
+    people: Array<{ userId: string; username: string; set: Record<string, string | null> }>;
+  };
+}
+
+async function keysAndSettings(def: ServiceDefinition, deps: OverviewDeps) {
+  const settings = await deps.effectiveSettings(def.name, def.settings);
+  const status = await deps.keyStore.status(def.name);
+  const keys: KeyView[] = Object.entries(def.secrets ?? {}).map(([name, spec]) => {
+    const s = status.find((k) => k.name === name);
+    return {
+      name,
+      label: spec.label,
+      description: spec.description,
+      needed: spec.neededWhen?.(settings) ?? true,
+      isSet: Boolean(s),
+      updatedAt: s?.updatedAt ?? null,
+    };
+  });
+  const settingViews: SettingView[] = Object.entries(def.settings ?? {}).map(([name, spec]) => ({
+    name,
+    label: spec.label,
+    description: spec.description,
+    options: spec.options.map((o) => ({ value: o.value, label: o.label })),
+    required: spec.required ?? false,
+    value: settings[name] ?? "",
+  }));
+  const missing = [
+    ...settingViews.filter((s) => s.required && !s.value).map((s) => s.label),
+    ...keys.filter((k) => k.needed && !k.isSet).map((k) => k.label),
+  ];
+  return { keys, settings: settingViews, missing };
+}
+
+export async function summarize(
+  def: ServiceDefinition,
+  deps: OverviewDeps,
+  machines: AgentMachine[],
+): Promise<ServiceSummary & { keys: KeyView[]; settings: SettingView[]; lastFault: ServiceHealth["lastFault"] }> {
+  const { keys, settings, missing } = await keysAndSettings(def, deps);
+  const health = await deps.serviceHealth(def.name);
+  const on = await deps.enabledMachines(def.name);
+  const state: ServiceState = missing.length > 0 ? "not_set_up" : health.failing ? "failing" : "ready";
+  return {
+    name: def.name,
+    title: def.title,
+    description: def.description,
+    state,
+    missing,
+    lastUsedAt: health.lastUsedAt,
+    machinesOn: machines.filter((m) => on.has(m.machineId)).length,
+    machinesTotal: machines.length,
+    keys,
+    settings,
+    lastFault: health.lastFault,
+  };
+}
+
+export async function listServices(services: readonly ServiceDefinition[], deps: OverviewDeps): Promise<ServiceSummary[]> {
+  const machines = await deps.listAgentMachines();
+  const out: ServiceSummary[] = [];
+  for (const def of services) {
+    const s = await summarize(def, deps, machines);
+    out.push({
+      name: s.name,
+      title: s.title,
+      description: s.description,
+      state: s.state,
+      missing: s.missing,
+      lastUsedAt: s.lastUsedAt,
+      machinesOn: s.machinesOn,
+      machinesTotal: s.machinesTotal,
+    });
+  }
+  return out;
+}
+
+export async function serviceDetail(def: ServiceDefinition, deps: OverviewDeps): Promise<ServiceDetail> {
+  const machines = await deps.listAgentMachines();
+  const summary = await summarize(def, deps, machines);
+  const on = await deps.enabledMachines(def.name);
+  const nameOf = new Map(machines.map((m) => [m.machineId, m.name]));
+  // A machine removed since its requests were recorded.
+  const machineName = (id: string) => nameOf.get(id) ?? "a removed machine";
+
+  const machineViews: MachineView[] = machines.map((m) => {
+    const since = m.hostIds.map((id) => deps.unreachableSince(id));
+    // Unreachable only when no row of it is being reached.
+    const down = since.length > 0 && since.every((t) => t !== null);
+    return {
+      machineId: m.machineId,
+      name: m.name,
+      enabled: on.has(m.machineId),
+      unreachableSince: down ? new Date(Math.max(...(since as number[]))).toISOString() : null,
+    };
+  });
+
+  const usage = await deps.usageSummary(def.name);
+  const personSpecs = Object.entries(def.userSecrets ?? {});
+  let personKeys: ServiceDetail["personKeys"] = null;
+  if (personSpecs.length > 0) {
+    const status = await deps.listPersonKeyStatus(def.name);
+    const users = await deps.listUsers();
+    personKeys = {
+      keys: personSpecs.map(([name, spec]) => ({
+        name,
+        label: spec.label,
+        description: spec.description ?? null,
+        hasFallback: Boolean(spec.fallbackKey && summary.keys.find((k) => k.name === spec.fallbackKey)?.isSet),
+      })),
+      people: users
+        .slice()
+        .sort((a, b) => a.username.localeCompare(b.username))
+        .map((u) => ({
+          userId: u.id,
+          username: u.username,
+          set: Object.fromEntries(
+            personSpecs.map(([name]) => [
+              name,
+              status.find((s) => s.userId === u.id && s.name === name)?.updatedAt ?? null,
+            ]),
+          ),
+        })),
+    };
+  }
+
+  return {
+    ...summary,
+    machines: machineViews,
+    usage: {
+      ...usage,
+      byMachine: usage.byMachine.map((m) => ({ ...m, name: machineName(m.machineId) })),
+      recentErrors: usage.recentErrors.map((e) => ({ ...e, name: machineName(e.machineId) })),
+    },
+    personKeys,
+  };
+}
