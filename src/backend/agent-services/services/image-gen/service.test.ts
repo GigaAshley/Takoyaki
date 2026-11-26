@@ -62,7 +62,8 @@ describe("image-gen service", () => {
       { prompt: "a cat", n: 2 },
       ctx(),
     );
-    expect(call).toHaveBeenCalledWith({ prompt: "a cat", n: 2 }, undefined);
+    // The key the engine read from the key store reaches the provider call.
+    expect(call).toHaveBeenCalledWith({ prompt: "a cat", n: 2 }, undefined, "k");
     expect(result).toEqual({
       ok: true,
       result: {
@@ -93,6 +94,7 @@ describe("image-gen service", () => {
     expect(call).toHaveBeenCalledWith(
       { prompt: "edit", ref: "u.in.ref.jpg" },
       ref.bytes,
+      "k",
     );
   });
 

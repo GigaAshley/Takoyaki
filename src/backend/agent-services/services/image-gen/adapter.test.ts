@@ -43,17 +43,14 @@ const VALID_BODY: ImageGenRequestBody = {
   requested_at: "2026-09-18T00:00:00Z",
 };
 
-let originalKey: string | undefined;
+/** The service's key, as the engine hands it over from the key store. */
+const KEY = "sk-test-1234567890";
 
 beforeEach(() => {
-  originalKey = process.env.OPENAI_API_KEY;
-  process.env.OPENAI_API_KEY = "sk-test-1234567890";
   vi.clearAllMocks();
 });
 
 afterEach(() => {
-  if (originalKey === undefined) delete process.env.OPENAI_API_KEY;
-  else process.env.OPENAI_API_KEY = originalKey;
   vi.unstubAllGlobals();
 });
 
@@ -105,7 +102,7 @@ describe("adapter — happy path", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
 
-    const result = await callOpenAiImageGen(VALID_BODY);
+    const result = await callOpenAiImageGen(VALID_BODY, undefined, KEY);
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.images.length).toBe(1);
@@ -131,7 +128,7 @@ describe("adapter — happy path", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
 
-    const result = await callOpenAiImageGen({ ...VALID_BODY, n: 3 });
+    const result = await callOpenAiImageGen({ ...VALID_BODY, n: 3 }, undefined, KEY);
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.images.length).toBe(3);
@@ -146,7 +143,7 @@ describe("adapter — provider error mapping", () => {
   it("E1: 429 → rate_limited (D-23)", async () => {
     const fetchMock = vi.fn().mockResolvedValueOnce(makeResponse({ ok: false, status: 429, json: {} }));
     vi.stubGlobal("fetch", fetchMock);
-    const result = await callOpenAiImageGen(VALID_BODY);
+    const result = await callOpenAiImageGen(VALID_BODY, undefined, KEY);
     expect(result).toEqual({ ok: false, reason: "rate_limited" });
   });
 
@@ -155,7 +152,7 @@ describe("adapter — provider error mapping", () => {
       makeResponse({ ok: false, status: 429, json: {}, headers: { "Retry-After": "30" } }),
     );
     vi.stubGlobal("fetch", fetchMock);
-    const result = await callOpenAiImageGen(VALID_BODY);
+    const result = await callOpenAiImageGen(VALID_BODY, undefined, KEY);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.reason).toBe("rate_limited");
@@ -166,7 +163,7 @@ describe("adapter — provider error mapping", () => {
   it("E1b: 429 with no Retry-After → rate_limited, no message", async () => {
     const fetchMock = vi.fn().mockResolvedValueOnce(makeResponse({ ok: false, status: 429, json: {} }));
     vi.stubGlobal("fetch", fetchMock);
-    const result = await callOpenAiImageGen(VALID_BODY);
+    const result = await callOpenAiImageGen(VALID_BODY, undefined, KEY);
     expect(result).toEqual({ ok: false, reason: "rate_limited" });
   });
 
@@ -175,7 +172,7 @@ describe("adapter — provider error mapping", () => {
       makeResponse({ ok: false, status: 429, json: {}, headers: { "Retry-After": "later" } }),
     );
     vi.stubGlobal("fetch", fetchMock);
-    const result = await callOpenAiImageGen(VALID_BODY);
+    const result = await callOpenAiImageGen(VALID_BODY, undefined, KEY);
     expect(result).toEqual({ ok: false, reason: "rate_limited" });
   });
 
@@ -187,7 +184,7 @@ describe("adapter — provider error mapping", () => {
       makeResponse({ ok: false, status: 429, json: {}, headers: { "Retry-After": future } }),
     );
     vi.stubGlobal("fetch", fetchMock);
-    const result = await callOpenAiImageGen(VALID_BODY);
+    const result = await callOpenAiImageGen(VALID_BODY, undefined, KEY);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.reason).toBe("rate_limited");
@@ -205,7 +202,7 @@ describe("adapter — provider error mapping", () => {
       makeResponse({ ok: false, status: 429, json: {}, headers: { "retry-after": "5" } }),
     );
     vi.stubGlobal("fetch", fetchMock);
-    const result = await callOpenAiImageGen(VALID_BODY);
+    const result = await callOpenAiImageGen(VALID_BODY, undefined, KEY);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.reason).toBe("rate_limited");
@@ -216,49 +213,49 @@ describe("adapter — provider error mapping", () => {
   it("E1f: 408 (Request Timeout) → provider_unavailable (D-24)", async () => {
     const fetchMock = vi.fn().mockResolvedValueOnce(makeResponse({ ok: false, status: 408, json: {} }));
     vi.stubGlobal("fetch", fetchMock);
-    const result = await callOpenAiImageGen(VALID_BODY);
+    const result = await callOpenAiImageGen(VALID_BODY, undefined, KEY);
     expect(result).toEqual({ ok: false, reason: "provider_unavailable" });
   });
 
   it("E1g: 425 (Too Early) → provider_unavailable (D-24)", async () => {
     const fetchMock = vi.fn().mockResolvedValueOnce(makeResponse({ ok: false, status: 425, json: {} }));
     vi.stubGlobal("fetch", fetchMock);
-    const result = await callOpenAiImageGen(VALID_BODY);
+    const result = await callOpenAiImageGen(VALID_BODY, undefined, KEY);
     expect(result).toEqual({ ok: false, reason: "provider_unavailable" });
   });
 
   it("E2b: 502 (Bad Gateway) → provider_unavailable", async () => {
     const fetchMock = vi.fn().mockResolvedValueOnce(makeResponse({ ok: false, status: 502, json: {} }));
     vi.stubGlobal("fetch", fetchMock);
-    const result = await callOpenAiImageGen(VALID_BODY);
+    const result = await callOpenAiImageGen(VALID_BODY, undefined, KEY);
     expect(result).toEqual({ ok: false, reason: "provider_unavailable" });
   });
 
   it("E2c: 504 (Gateway Timeout) → provider_unavailable", async () => {
     const fetchMock = vi.fn().mockResolvedValueOnce(makeResponse({ ok: false, status: 504, json: {} }));
     vi.stubGlobal("fetch", fetchMock);
-    const result = await callOpenAiImageGen(VALID_BODY);
+    const result = await callOpenAiImageGen(VALID_BODY, undefined, KEY);
     expect(result).toEqual({ ok: false, reason: "provider_unavailable" });
   });
 
   it("E2d: 522 (Cloudflare origin timeout) → provider_unavailable", async () => {
     const fetchMock = vi.fn().mockResolvedValueOnce(makeResponse({ ok: false, status: 522, json: {} }));
     vi.stubGlobal("fetch", fetchMock);
-    const result = await callOpenAiImageGen(VALID_BODY);
+    const result = await callOpenAiImageGen(VALID_BODY, undefined, KEY);
     expect(result).toEqual({ ok: false, reason: "provider_unavailable" });
   });
 
   it("E2: 500 → provider_unavailable (D-24)", async () => {
     const fetchMock = vi.fn().mockResolvedValueOnce(makeResponse({ ok: false, status: 500, json: {} }));
     vi.stubGlobal("fetch", fetchMock);
-    const result = await callOpenAiImageGen(VALID_BODY);
+    const result = await callOpenAiImageGen(VALID_BODY, undefined, KEY);
     expect(result).toEqual({ ok: false, reason: "provider_unavailable" });
   });
 
   it("E3: 503 → provider_unavailable (D-24)", async () => {
     const fetchMock = vi.fn().mockResolvedValueOnce(makeResponse({ ok: false, status: 503, json: {} }));
     vi.stubGlobal("fetch", fetchMock);
-    const result = await callOpenAiImageGen(VALID_BODY);
+    const result = await callOpenAiImageGen(VALID_BODY, undefined, KEY);
     expect(result).toEqual({ ok: false, reason: "provider_unavailable" });
   });
 
@@ -271,7 +268,7 @@ describe("adapter — provider error mapping", () => {
       }),
     );
     vi.stubGlobal("fetch", fetchMock);
-    const result = await callOpenAiImageGen(VALID_BODY);
+    const result = await callOpenAiImageGen(VALID_BODY, undefined, KEY);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.reason).toBe("content_blocked");
@@ -288,7 +285,7 @@ describe("adapter — provider error mapping", () => {
       }),
     );
     vi.stubGlobal("fetch", fetchMock);
-    const result = await callOpenAiImageGen(VALID_BODY);
+    const result = await callOpenAiImageGen(VALID_BODY, undefined, KEY);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.reason).toBe("malformed");
@@ -299,7 +296,7 @@ describe("adapter — provider error mapping", () => {
   it("E5b: 400 with empty body → malformed with fallback message", async () => {
     const fetchMock = vi.fn().mockResolvedValueOnce(makeResponse({ ok: false, status: 400, jsonThrows: true }));
     vi.stubGlobal("fetch", fetchMock);
-    const result = await callOpenAiImageGen(VALID_BODY);
+    const result = await callOpenAiImageGen(VALID_BODY, undefined, KEY);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.reason).toBe("malformed");
@@ -318,7 +315,7 @@ describe("adapter — provider error mapping", () => {
       throw err;
     });
     vi.stubGlobal("fetch", fetchMock);
-    const result = await callOpenAiImageGen(VALID_BODY);
+    const result = await callOpenAiImageGen(VALID_BODY, undefined, KEY);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.reason).toBe("provider_unavailable");
@@ -326,11 +323,12 @@ describe("adapter — provider error mapping", () => {
     }
   });
 
-  it("E7: missing OPENAI_API_KEY → not_configured, NO fetch call", async () => {
-    delete process.env.OPENAI_API_KEY;
+  it("E7: missing OPENAI_API_KEY → not_configured, NO fetch call, and never the environment's", async () => {
+    process.env.OPENAI_API_KEY = "sk-voice-copy";
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
-    const result = await callOpenAiImageGen(VALID_BODY);
+    const result = await callOpenAiImageGen(VALID_BODY, undefined, undefined);
+    delete process.env.OPENAI_API_KEY;
     expect(result).toEqual({ ok: false, reason: "not_configured" });
     expect(fetchMock).not.toHaveBeenCalled();
   });
@@ -338,7 +336,7 @@ describe("adapter — provider error mapping", () => {
   it("E8: 401 → unknown 'status 401' (NOT not_configured — Pitfall 4)", async () => {
     const fetchMock = vi.fn().mockResolvedValueOnce(makeResponse({ ok: false, status: 401, json: {} }));
     vi.stubGlobal("fetch", fetchMock);
-    const result = await callOpenAiImageGen(VALID_BODY);
+    const result = await callOpenAiImageGen(VALID_BODY, undefined, KEY);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.reason).toBe("unknown");
@@ -349,7 +347,7 @@ describe("adapter — provider error mapping", () => {
   it("E9: 200 with malformed JSON body → unknown", async () => {
     const fetchMock = vi.fn().mockResolvedValueOnce(makeResponse({ ok: true, status: 200, jsonThrows: true }));
     vi.stubGlobal("fetch", fetchMock);
-    const result = await callOpenAiImageGen(VALID_BODY);
+    const result = await callOpenAiImageGen(VALID_BODY, undefined, KEY);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.reason).toBe("unknown");
@@ -372,7 +370,7 @@ describe("adapter — refImage multipart path", () => {
       ...VALID_BODY,
       ref: "abcdef01-2345-6789-abcd-ef0123456789.ref.png",
     };
-    const result = await callOpenAiImageGen(bodyWithRef, refImage);
+    const result = await callOpenAiImageGen(bodyWithRef, refImage, KEY);
     expect(result.ok).toBe(true);
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -442,7 +440,7 @@ describe("adapter — no secret leakage", () => {
   it("S1: logger receives no Authorization header or API key values", async () => {
     const fetchMock = vi.fn().mockResolvedValueOnce(makeResponse({ ok: false, status: 429, json: {} }));
     vi.stubGlobal("fetch", fetchMock);
-    await callOpenAiImageGen(VALID_BODY);
+    await callOpenAiImageGen(VALID_BODY, undefined, KEY);
     const info = systemLogger.info as unknown as { mock: { calls: unknown[][] } };
     const warn = systemLogger.warn as unknown as { mock: { calls: unknown[][] } };
     const allCalls = [...info.mock.calls, ...warn.mock.calls];

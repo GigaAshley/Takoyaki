@@ -74,6 +74,7 @@ export function createImageGenService(
       const result = await callOpenAi(
         { ...input, ...(ref ? { ref: ref.filename } : {}) },
         ref?.bytes,
+        ctx.secrets.OPENAI_API_KEY,
       );
       if (result.ok === false) return fail(result.reason, result.message);
       return ok(

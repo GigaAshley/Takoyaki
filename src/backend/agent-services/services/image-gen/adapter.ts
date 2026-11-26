@@ -164,13 +164,14 @@ function buildMultipartEditBody(body: ImageGenRequestBody, refImage: Buffer): Fo
  */
 export async function callOpenAiImageGen(
   body: ImageGenRequestBody,
-  refImage?: Buffer,
+  refImage: Buffer | undefined,
+  /** The service's own key from Admin → Services; never the environment's. */
+  apiKey: string | undefined,
 ): Promise<AdapterResult> {
   // -----------------------------------------------------------------------
   // Missing-key check runs FIRST (Pitfall 4 + D-25). Do NOT start the
   // AbortController timer or prepare a request body if we cannot call.
   // -----------------------------------------------------------------------
-  const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     systemLogger.warn("image-gen adapter: OPENAI_API_KEY not configured", {
       operation: "image_gen_openai_not_configured",
