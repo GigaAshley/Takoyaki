@@ -255,7 +255,7 @@ describe("Admin → Services routes", () => {
 
   beforeEach(async () => {
     resweep.mockClear();
-    sqlite.prepare("INSERT INTO users (id, username) VALUES ('u-admin', 'ashley'), ('u-zoey', 'zoey')").run();
+    sqlite.prepare("INSERT INTO users (id, username) VALUES ('u-admin', 'pat'), ('u-zoey', 'zoey')").run();
     machine(1, "t1000");
     machine(2, "thenasty", 2);
     machine(3, "thenasty (zoey)", 2, "u-zoey"); // same machine, Zoey's row
@@ -410,7 +410,7 @@ describe("Admin → Services routes", () => {
     expect(detail.personKeys).toEqual({
       keys: [{ name: "ZOHO_TOKEN", label: "Zoho token", description: null, hasFallback: false }],
       people: [
-        { userId: "u-admin", username: "ashley", set: { ZOHO_TOKEN: null } },
+        { userId: "u-admin", username: "pat", set: { ZOHO_TOKEN: null } },
         { userId: "u-zoey", username: "zoey", set: { ZOHO_TOKEN: null } },
       ],
     });

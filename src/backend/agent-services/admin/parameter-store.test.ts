@@ -281,7 +281,7 @@ describe("choosing the store from the server settings", () => {
   });
 
   it("refuses AWS's own encryption keys, which every managed machine can use", () => {
-    for (const key of ["alias/aws/ssm", "arn:aws:kms:us-east-1:662442740806:alias/aws/ssm"]) {
+    for (const key of ["alias/aws/ssm", "arn:aws:kms:us-east-1:123456789012:alias/aws/ssm"]) {
       const s = chooseKeyStore(
         { AGENT_SERVICES_PARAMETER_STORE_PATH: "/takoyaki/t1000", AGENT_SERVICES_PARAMETER_STORE_KMS_KEY: key },
         makeClient,
