@@ -1416,9 +1416,6 @@ crown, then gear.
   - **Phone** (only when the user has a number on file) — the number,
     editable in place (**Save** appears once it's changed), and **Remove
     phone number**.
-  - **Services** (only when the user has keys of their own to manage) —
-    keys their agents use for outside services: set, replace or remove,
-    never shown back.
   - **About** — pinned at the bottom: the instance's own name and logo,
     its version, a **Source code** link, and **Licence** / **Included
     components**, each one level deeper.
