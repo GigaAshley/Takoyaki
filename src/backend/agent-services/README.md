@@ -13,11 +13,16 @@ host: ~/fleet/service-requests/            backend
 ```
 
 Services today: `agent-phone` (Twilio calls), `image-gen` (OpenAI
-gpt-image-1.5), `stt` (speech to text through the instance's voice-input
-provider, `src/backend/voice/stt-provider.ts`), `identity-reactivate` (brings
-an archived agent's chat account back for un-archive; asked by the
-agent-supervisor, not by agents, and has no wrapper script or skill). Identity
-births (`spawn-requests/`) predate this and still have their own scanner.
+gpt-image-1.5), `stt` (speech to text, with its own provider). Admins run
+them from **Admin → Services**: keys, settings, which machines may use each
+one, usage and errors (`admin/`).
+
+Identity reactivate (`src/backend/matrix/identity-reactivate.ts`) rides the
+same request files but is not a service: it's the app's own machinery (the
+agent-supervisor asks it to bring an archived agent's chat account back). The
+engine answers it as a core handler, for every machine, never switched,
+listed or recorded. Identity births (`spawn-requests/`) predate this and
+still have their own scanner.
 
 ## Layout
 
@@ -33,7 +38,13 @@ births (`spawn-requests/`) predate this and still have their own scanner.
 | `registry.ts`                 | Finds the services by reading `services/`                                    |
 | `distribution.ts`             | Turns each service's `skill/` and `bin/` into distributor rows               |
 | `services/<name>/`            | One service each: everything about it lives in its folder                    |
-| `user-secrets/`               | Per-user secrets: encrypted store, acting-user resolution, routes            |
+| `user-secrets/`               | Per-person keys: encrypted store, acting-user resolution                     |
+| `admin/key-store.ts`          | Where instance keys live (swappable; the database today), encrypted          |
+| `admin/settings-store.ts`     | Services' settings (e.g. which provider)                                     |
+| `admin/grants.ts`             | Which machines each service is switched on for (none, until an admin says)   |
+| `admin/usage.ts`              | One record per answer (no content), for state, usage and recent errors       |
+| `admin/upgrade.ts`            | The one-time move of service keys out of the server settings                 |
+| `admin/routes.ts`             | Admin → Services' routes (`/users/admin/services…`)                          |
 
 Host side: `substrate/scripts/fleet-service` is the shared client every
 service's wrapper calls. It belongs to no service, so it stays in the
@@ -52,21 +63,25 @@ services/<name>/
 
 - **The server finds it.** `registry.ts` loads every folder under
   `services/`. Nothing else in the app lists services.
-- **Hosts get its skill and wrapper.** The distributor pushes `skill/` to
-  `~/.claude/skills/<name>/` and each file in `bin/` to
-  `~/.local/bin/<file>` on every managed host, next to its hand-kept catalog
-  (`src/backend/distributor/full-catalog.ts`). The backend build copies
-  these files beside the compiled code (`scripts/copy-service-assets.mjs`).
+- **Switched-on machines get its skill and wrapper.** The distributor pushes
+  `skill/` to `~/.claude/skills/<name>/` and each file in `bin/` to
+  `~/.local/bin/<file>` on every machine the service is switched on for,
+  next to its hand-kept catalog (`src/backend/distributor/full-catalog.ts`),
+  and removes them from the rest. Requests from a machine it isn't switched
+  on for are refused with `not_enabled`. Every service starts off on every
+  machine. The backend build copies these files beside the compiled code
+  (`scripts/copy-service-assets.mjs`).
 - **A broken folder is skipped, never fatal.** Examples: no `service.ts`,
   a `name` that isn't the folder name, a script that isn't executable, a
   key without a label. The server starts without that service and logs
   `agent_services_service_skipped` with the reason. `registry.test.ts`
   fails on any broken folder in the repo, so one shouldn't ship.
-- **A service's keys are its own.** It never shares a key with the app's own
-  voice features. An operator who wants one account behind both enters it
-  in both places. Two exceptions remain for now: `stt`, and agent-phone's
-  transcription of the callee's reply, both use the voice-input provider and
-  its keys.
+- **A service's keys are its own.** An admin sets them in Admin → Services;
+  they are never read from the environment. A service never shares a key or
+  a setting with the app's own voice features: an operator who wants one
+  account behind both enters it in both places. (`stt` runs through the
+  voice STT code with its own setup, and agent-phone transcribes replies
+  with `stt`'s setup.)
 - **Wrapper headers say `substrate/scripts/<name>`.** That's where the
   wrappers used to live. Leave the line alone: changing a wrapper's bytes
   re-pushes it to every host.
@@ -83,6 +98,7 @@ import { defineService, fail, ok } from "../../engine/types.js";
 
 export default defineService({
   name: "sms",
+  title: "Text messages",
   description: "Text a Skynet user",
   input: z.strictObject({
     to_user: z.string().min(1).max(200),
@@ -98,6 +114,8 @@ export default defineService({
       description: "Twilio console → Account info",
     },
   },
+  // Twilio's own trouble, so Admin → Services shows the service as failing.
+  faultCodes: ["provider_error"],
   ttlMs: 2 * 60 * 1000,
   concurrency: 4,
 
@@ -110,7 +128,9 @@ export default defineService({
 });
 ```
 
-That's the service: the server picks it up on its next start.
+That's the service: the server picks it up on its next start, and it shows
+in Admin → Services, off on every machine, until an admin sets its keys and
+switches it on.
 
 **2. Host side.** Agents can call it right away with the shared client:
 
@@ -123,8 +143,7 @@ For a nicer interface, add a wrapper at `services/sms/bin/sms` (copy
 text; make it executable) and a skill at `services/sms/skill/SKILL.md`. The
 distributor installs both on every managed host. There is nothing to
 register, and nothing to document elsewhere: each key's label and note in
-`secrets` say what it is and where to get it, and its name is the server
-setting it's read from.
+`secrets` say what it is and where to get it, in Admin → Services.
 
 **3. Test it.** Call `handle()` directly with a fake context (see
 `services/agent-phone/service.test.ts`). `end-to-end.test.ts` shows how to
@@ -136,8 +155,11 @@ drive a real wrapper script against the real engine.
 | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `input`              | Zod schema. Failures go back as `malformed` with the field path. Use `z.strictObject` so typos are caught.                                                                       |
 | `attachments`        | Named file slots (`{ ref: { extensions, maxBytes, required? } }`). The agent sends them with `--attach ref=path`; the handler gets `ctx.attachments.ref.bytes`.                  |
-| `secrets`            | Instance keys, `{ NAME: { label, description } }`: the label an admin recognises and one line on where to get it. Read from the env var `NAME`; any unset → `not_configured`, handler not called. |
-| `userSecrets`        | Per-user secrets (see below). The handler gets `ctx.user` and `ctx.userSecrets`.                                                                                                 |
+| `title`              | What an admin calls it in Admin → Services ("Text messages").                                                                                                                     |
+| `secrets`            | Instance keys, `{ NAME: { label, description, neededWhen? } }`: the label an admin recognises and one line on where to get it. Set in Admin → Services, never read from the environment. A needed one unset → `not_configured`, handler not called. `neededWhen(settings)` makes a key needed only for some settings (stt: only the chosen provider's). |
+| `settings`           | Admin choices, `{ name: { label, description, options, default?, required? } }`. The handler gets `ctx.settings`; a required one unset → `not_configured`.                       |
+| `faultCodes`         | Failure codes that mean the service itself is at fault (rejected key, provider down), so Admin → Services shows it failing until the next success. `internal` always counts.   |
+| `userSecrets`        | Per-person keys (see below). The handler gets `ctx.user` and `ctx.userSecrets`.                                                                                                  |
 | `ttlMs`              | Requests older than this when they reach the front of the queue → `expired`. Keep it at or under the wrapper's timeout so the backend never does work for a caller that gave up. |
 | `concurrency`        | Max simultaneous requests for this service (default 1).                                                                                                                          |
 | `serializeBy`        | Requests with the same key never overlap (agent-phone: one call per recipient).                                                                                                  |
@@ -153,22 +175,19 @@ checks, as agent-phone does with `userHasRegisteredHost`. The backend knows
 which host a request came from because it read the file off that host itself;
 there is no credential for an agent to forge.
 
-## Per-user secrets
+## Per-person keys
 
 Some services need a key per person rather than one for the whole instance:
-a company-issued Zoho token, say, or someone's own API key. Declare them on
-the service:
+a company-issued Zoho token, say. Declare them on the service:
 
 ```ts
 export default defineService({
   name: "zoho",
+  title: "Zoho CRM",
   description: "Read and update Zoho CRM records",
   input: z.strictObject({ query: z.string() }),
   userSecrets: {
-    ZOHO_TOKEN: {
-      label: "Zoho API token",
-      managedBy: "admin", // company-issued: the user never sees or edits it
-    },
+    ZOHO_TOKEN: { label: "Zoho API token" },
   },
   ttlMs: 2 * 60 * 1000,
   async handle(input, ctx) {
@@ -179,21 +198,19 @@ export default defineService({
 
 That's all the service does. The rest is automatic:
 
+- **Admins only.** An admin sets, replaces or removes each person's key in
+  Admin → Services, on the service's page. People never see or set their
+  own; there is no user-facing screen or route for it.
 - **Storage.** `agent_service_user_secrets`, encrypted with the backend's
   system key (not the user's login-derived key) so agents can use it while
   the user is logged out. Each value is bound to its user, service and name.
-- **Write-only everywhere.** No route returns a value, to users or admins.
-  The UI shows "Set · updated <date>" and offers Replace and Remove.
-- **`managedBy: "user"`.** Shows up in the user's Preferences → Services,
-  where they can set, replace or clear it. Admins can too.
-- **`managedBy: "admin"`.** Only the admin user modal ("Agent service keys")
-  can set or clear it. The user's UI and `/users/me/service-secrets` never
-  mention it; PUT/DELETE on it from `/me` gets the same 404 as a name that
-  doesn't exist.
-- **`fallbackEnv`.** Optional env var used for users with no value of their
-  own (e.g. a shared default key).
+- **Write-only everywhere.** No route returns a value, to admins either. The
+  panel shows "Set · updated <date>" and offers Replace and Remove.
+- **`fallbackKey`.** Optional: one of the service's own instance keys used
+  for people with no value of their own (a company-wide default). Declare it
+  in `secrets` with `neededWhen: () => false`.
 - **Missing value.** The agent gets `no_user_secret`, with a message saying
-  whether the user can add it in Preferences or needs an admin.
+  an admin can set it in Admin → Services.
 
 ### Whose request is it?
 
@@ -230,7 +247,9 @@ signal, so an abandoned request is never picked up later. The scan deletes
 leftovers older than a day.
 
 Error codes any service can return, from the engine: `malformed`,
-`unknown_service`, `expired`, `queue_full`, `not_configured`, `internal`;
+`unknown_service`, `not_enabled` (not switched on for this machine),
+`expired`, `queue_full`, `not_configured` (a key or required setting
+missing), `internal`;
 for services with `userSecrets`, also `ambiguous_user`, `unknown_user`,
 `not_permitted` and `no_user_secret`.
 From the client: `not_picked_up` (never claimed) and `timeout` (claimed, no
