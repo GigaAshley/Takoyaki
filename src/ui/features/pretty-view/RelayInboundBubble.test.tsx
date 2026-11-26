@@ -271,3 +271,25 @@ describe("RelayInboundBubble — relay-source view (plain chat bubble)", () => {
     expect(screen.getByTestId("relay-inbound-header").getAttribute("role")).toBeNull();
   });
 });
+
+describe("RelayInboundBubble — web addresses become links", () => {
+  it("room view: a bare address in someone else's message is a new-tab link", () => {
+    renderHarness({
+      alwaysExpanded: true,
+      body: "look https://www.example.com/share/r/1A?x=y, nice",
+    });
+    const link = screen.getByRole("link");
+    expect(link).toHaveAttribute("href", "https://www.example.com/share/r/1A?x=y");
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link).toHaveAttribute("rel", "noopener noreferrer");
+    expect(screen.getByTestId("relay-inbound-body").textContent).toBe(
+      "look https://www.example.com/share/r/1A?x=y, nice",
+    );
+  });
+
+  it("folded card: the opened body links too", () => {
+    renderHarness({ body: "see https://example.com/a" });
+    fireEvent.click(screen.getByTestId("relay-inbound-header"));
+    expect(screen.getByRole("link")).toHaveAttribute("href", "https://example.com/a");
+  });
+});

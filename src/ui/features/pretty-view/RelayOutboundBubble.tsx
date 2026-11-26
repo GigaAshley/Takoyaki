@@ -10,6 +10,7 @@ import { useRelayRoomMembers } from "./relay-room-members";
 import { RelayChatBubble, RelayDmCard, RelayToYouBubble } from "./RelayBubbleParts";
 import { RoomFileChip } from "./RoomFileChip";
 import { buildRoomFileUrl } from "./room-file";
+import { linkifyText } from "./linkify-text";
 
 // RelayOutboundBubble — a relay message this pane's agent sent. Harness view
 // renders a folded RelayDmCard ("Aster → Tina [DM]"). The recipient comes
@@ -107,7 +108,7 @@ export function RelayOutboundBubble({
       : null;
   const text =
     body !== null ? (
-      body
+      linkifyText(body)
     ) : (
       <div className="text-xs italic text-[color:var(--k-t3)] whitespace-normal">
         {sender.name} sent a message here, but its text couldn't be shown.

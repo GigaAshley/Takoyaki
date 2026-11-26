@@ -12,6 +12,7 @@ import { useRelayRoomMembers } from "./relay-room-members";
 import { RelayChatBubble, RelayDmCard } from "./RelayBubbleParts";
 import { RoomFileChip } from "./RoomFileChip";
 import type { RoomFileRef } from "@/api/claude-session-api";
+import { linkifyText } from "./linkify-text";
 
 // RelayInboundBubble — a relay message this pane's agent received (harness
 // view, folded RelayDmCard: "Tina → Aster [DM]"), or a message from someone
@@ -23,7 +24,8 @@ import type { RoomFileRef } from "@/api/claude-session-api";
 // pointer line itself — only the quoted preview, as a fallback if the fetch
 // fails.
 //
-// Security: body / fetched text render as React text children, never
+// Security: body / fetched text render as React text children (web
+// addresses as plain anchors via linkifyText), never
 // dangerouslySetInnerHTML. /relay-pointer's backend whitelist is the
 // authoritative path gate; encodeURIComponent guards the query string.
 
@@ -131,10 +133,10 @@ export function RelayInboundBubble({
     <RoomFileChip file={roomFile} onOpenEditor={onOpenEditor} dragOrigin={fileDragOrigin} />
   ) : pointer ? (
     fetchState.kind === "done" ? (
-      fetchState.text
+      linkifyText(fetchState.text)
     ) : fetchState.kind === "error" ? (
       <>
-        {shortText}
+        {linkifyText(shortText)}
         <div className="mt-1.5 text-xs italic text-[rgba(232,228,216,0.5)] whitespace-normal">
           Couldn't load the rest of this message.
         </div>
@@ -143,7 +145,7 @@ export function RelayInboundBubble({
       <span className="text-xs italic text-[rgba(232,228,216,0.5)]">Loading…</span>
     )
   ) : (
-    body
+    linkifyText(body)
   );
 
   const speak = { speakState, onClick: (e: MouseEvent) => { void onSpeakClick(e); } };
