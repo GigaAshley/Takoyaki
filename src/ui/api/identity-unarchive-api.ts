@@ -1,5 +1,6 @@
 import axios from "axios";
 import { authApi, handleApiError } from "@/main-axios";
+import { inMachineOrder, newRequestId } from "@/api/machine-changes-api";
 
 // ─── Phase 143 Plan 143-05 (D-03 / D-17) — unarchiveIdentity ────────────────
 //
@@ -70,7 +71,7 @@ interface Unarchive409Body {
 // response body carries a `reason` field, throws an UnarchiveError. Otherwise
 // rethrows the error unchanged so the caller can pass it to handleApiError.
 
-function parseUnarchive409OrRethrow(error: unknown): never {
+export function parseUnarchive409OrRethrow(error: unknown): never {
   if (axios.isAxiosError(error) && error.response?.status === 409) {
     const body = error.response.data as Unarchive409Body;
     const reason = body?.reason;
@@ -96,7 +97,7 @@ function parseUnarchive409OrRethrow(error: unknown): never {
         undefined,
       );
     }
-    if (reason === "refused") {
+    if (reason === "refused" || reason === "identity_unreadable") {
       throw new UnarchiveError(
         body.message || "the un-archive was refused",
         "refused",
@@ -117,36 +118,116 @@ function parseUnarchive409OrRethrow(error: unknown): never {
 
 // ─── unarchiveIdentity ────────────────────────────────────────────────────────
 
-/** Backend waits up to 2 min for the supervisor; leave headroom past that. */
-const UNARCHIVE_REQUEST_TIMEOUT_MS = 180_000;
+/** When a click that's still waiting is told "still working on it" (the server's usual wait). */
+const STILL_WORKING_MS = 15_000;
+/** How long one un-archive request may take on the server. */
+const UNARCHIVE_REQUEST_TIMEOUT_MS = 60_000;
+/** How long an agent un-archive is followed up after the machine accepted it. */
+const AGENT_UNARCHIVE_FOLLOW_MS = 2 * 60 * 1000;
 
 export type UnarchiveOutcome = "restored" | "pending";
 
+/**
+ * Send one un-archive (agent, role or app) to its machine, in the order this
+ * machine's changes were clicked, and read the answer: restored, still
+ * pending, or an UnarchiveError (a refusal with its reason, or the connection
+ * dropping — the server may already have acted).
+ */
+export function sendUnarchive(
+  hostId: number,
+  url: string,
+  body: Record<string, unknown>,
+  operation: string,
+  requestId: string = newRequestId(),
+  onStillWorking?: () => void,
+): Promise<{ ok: true; outcome: UnarchiveOutcome }> {
+  return inMachineOrder(hostId, async () => {
+    // "Still working on it" once the machine has taken longer than its usual answer.
+    const still = onStillWorking ? setTimeout(onStillWorking, STILL_WORKING_MS) : undefined;
+    try {
+      const response = await authApi.post(url, { ...body, requestId }, { timeout: UNARCHIVE_REQUEST_TIMEOUT_MS });
+      const data = response.data as { ok: true; outcome?: UnarchiveOutcome };
+      return { ok: true as const, outcome: data.outcome === "pending" ? ("pending" as const) : ("restored" as const) };
+    } catch (error) {
+      if (axios.isAxiosError(error) && !error.response) {
+        throw new UnarchiveError(
+          `connection lost during un-archive (${error.code ?? "no response"})`,
+          "connection_lost",
+        );
+      }
+      try {
+        parseUnarchive409OrRethrow(error);
+      } catch (typed) {
+        if (typed instanceof UnarchiveError) throw typed;
+        handleApiError(typed, operation);
+      }
+    } finally {
+      clearTimeout(still);
+    }
+  });
+}
+
+/**
+ * Un-archive an agent. The machine accepts it in click order; bringing the
+ * chat account and folder back takes a minute or so, followed up here by the
+ * request's id — outside the machine's click order, so it holds nothing else
+ * up. Resolves restored, or pending if it still isn't back after two minutes.
+ */
 export async function unarchiveIdentity(
   hostId: number,
   identityKey: string,
+  onStillWorking?: () => void,
 ): Promise<{ ok: true; outcome: UnarchiveOutcome }> {
-  const url = `/identities/${encodeURIComponent(identityKey)}/unarchive`;
-  try {
-    const response = await authApi.post(
-      url,
-      { hostId },
-      { timeout: UNARCHIVE_REQUEST_TIMEOUT_MS },
-    );
-    const data = response.data as { ok: true; outcome?: UnarchiveOutcome };
-    return { ok: true, outcome: data.outcome === "restored" ? "restored" : "pending" };
-  } catch (error) {
-    if (axios.isAxiosError(error) && !error.response) {
+  const requestId = newRequestId();
+  let told = false;
+  const tell = () => {
+    if (told) return;
+    told = true;
+    onStillWorking?.();
+  };
+  const first = await sendUnarchive(
+    hostId,
+    `/identities/${encodeURIComponent(identityKey)}/unarchive`,
+    { hostId },
+    "un-archive identity",
+    requestId,
+    tell,
+  );
+  if (first.outcome === "restored") return first;
+  tell();
+  const deadline = Date.now() + AGENT_UNARCHIVE_FOLLOW_MS;
+  while (Date.now() < deadline) {
+    let status: number;
+    let data: { code?: string; error?: string; result?: { missingRoles?: string[] } };
+    try {
+      const response = await authApi.get(`/machine-changes/${hostId}/${encodeURIComponent(requestId)}`, {
+        timeout: UNARCHIVE_REQUEST_TIMEOUT_MS,
+      });
+      status = response.status;
+      data = response.data as typeof data;
+    } catch (error) {
+      if (axios.isAxiosError(error) && error.response && error.response.status !== 401 && error.response.status !== 403) {
+        status = error.response.status;
+        data = (error.response.data ?? {}) as typeof data;
+      } else if (axios.isAxiosError(error) && !error.response) {
+        await new Promise((r) => setTimeout(r, 2000)); // a dropped follow-up: ask again shortly
+        continue;
+      } else {
+        handleApiError(error, "un-archive identity");
+      }
+    }
+    if (status === 200) return { ok: true, outcome: "restored" };
+    if (status === 202) continue;
+    if (status === 409) {
+      const code = data.code ?? "";
+      const missing = data.result?.missingRoles;
       throw new UnarchiveError(
-        `connection lost during un-archive (${error.code ?? "no response"})`,
-        "connection_lost",
+        data.error || "the un-archive was refused",
+        code === "missing_roles" || code === "name_collision" || code === "archive_not_found" ? code : "refused",
+        Array.isArray(missing) ? missing : undefined,
       );
     }
-    try {
-      parseUnarchive409OrRethrow(error);
-    } catch (typed) {
-      if (typed instanceof UnarchiveError) throw typed;
-      handleApiError(typed, "un-archive identity");
-    }
+    throw new UnarchiveError(data.error || "the un-archive failed", "unknown");
   }
+  return { ok: true, outcome: "pending" };
 }

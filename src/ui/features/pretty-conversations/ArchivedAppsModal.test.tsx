@@ -232,7 +232,7 @@ describe("Phase 143 Plan 143-06 Task 1 — ArchivedAppsModal", () => {
     expect(item).toHaveAttribute("aria-disabled", "true");
     fireEvent.click(item);
     expect(unarchiveAppMock).toHaveBeenCalledTimes(1);
-    expect(unarchiveAppMock).toHaveBeenCalledWith(1, "notes-app");
+    expect(unarchiveAppMock).toHaveBeenCalledWith(1, "notes-app", expect.any(Function));
 
     await act(async () => {
       resolveUnarchive();
@@ -251,7 +251,7 @@ describe("Phase 143 Plan 143-06 Task 1 — ArchivedAppsModal", () => {
     const label = await screen.findByText("notes-app");
     fireEvent.contextMenu(label, { clientX: 120, clientY: 80 });
     await user.click(await screen.findByRole("menuitem", { name: "Un-archive" }));
-    await waitFor(() => expect(unarchiveAppMock).toHaveBeenCalledWith(1, "notes-app"));
+    await waitFor(() => expect(unarchiveAppMock).toHaveBeenCalledWith(1, "notes-app", expect.any(Function)));
     await waitFor(() => expect(screen.queryByText("notes-app")).toBeNull());
     expect(noticeTexts(alertSpy)[0]).toContain("Un-archiving notes-app");
   });

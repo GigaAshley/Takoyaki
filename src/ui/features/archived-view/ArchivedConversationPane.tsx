@@ -34,7 +34,7 @@ const BACK_CHECK_MS = 5_000;
 
 type UnarchiveState =
   | { phase: "idle" }
-  | { phase: "working" }
+  | { phase: "working"; slow?: boolean }
   /** Done or handed off — waiting for the agent to show up live. */
   | { phase: "returning"; slow: boolean }
   | { phase: "failed"; title: string; body: string };
@@ -138,7 +138,9 @@ export function ArchivedConversationPane({
     setUnarchive({ phase: "working" });
     console.info(`[archived-view] unarchive start hostId=${hostId} identity=${identityKey}`);
     try {
-      const { outcome } = await unarchiveIdentity(hostId, identityKey);
+      const { outcome } = await unarchiveIdentity(hostId, identityKey, () =>
+        setUnarchive((u) => (u.phase === "working" ? { phase: "working", slow: true } : u)),
+      );
       console.info(`[archived-view] unarchive outcome=${outcome} hostId=${hostId} identity=${identityKey}`);
       setUnarchive({ phase: "returning", slow: outcome === "pending" });
     } catch (err) {
@@ -178,7 +180,9 @@ export function ArchivedConversationPane({
   // ── The strip where the compose box would be ─────────────────────────────
   const statusLine =
     unarchive.phase === "working"
-      ? "Un-archiving…"
+      ? unarchive.slow
+        ? "Still un-archiving — the machine is still working on it."
+        : "Un-archiving…"
       : unarchive.phase === "returning"
         ? unarchive.slow
           ? "Still un-archiving — this conversation opens as soon as it's back."

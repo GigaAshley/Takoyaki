@@ -549,7 +549,9 @@ describe("role view — ⋯ menu", () => {
     await openRole();
     const menu = await openMenu("role-view-menu");
     fireEvent.click(within(menu).getByTestId("role-view-archive"));
-    await waitFor(() => expect(m.archiveRole).toHaveBeenCalledWith(HOST_ID, "box-maintainer"));
+    // The list is the machine's (other-host's agent isn't on it), and the archive takes exactly it.
+    await waitFor(() => expect(m.archiveRole).toHaveBeenCalledWith(HOST_ID, "box-maintainer", ["tabitha", "rex"], expect.any(Function)));
+    expect(m.getRoleArchivePreflight).toHaveBeenCalledWith(HOST_ID, "box-maintainer");
     expect(dialogs.calls).toHaveLength(1);
     expect(dialogs.calls[0].opts.title).toBe("Archive Box Maintainer?");
     expect(dialogs.calls[0].opts.body).toBe("This also archives the 2 agents holding it:\n• Fix the printer\n• Rex");
@@ -593,6 +595,28 @@ describe("role view — ⋯ menu", () => {
     expect(String(dialogs.calls[0].opts.body)).toMatch(/^No agents hold it\./);
     expect(m.archiveRole).not.toHaveBeenCalled();
     expect(screen.getByTestId("role-view-facts")).toBeTruthy();
+  });
+
+  it("when who holds it changed, nothing is archived and the confirm comes back with the new list", async () => {
+    store.identities = [agent("tabitha", ["box-maintainer"], HOST_ID, "Fix the printer")];
+    const { MachineChangeError } = await import("@/api/machine-changes-api");
+    m.archiveRole.mockRejectedValueOnce(
+      new MachineChangeError("changed", 409, "contents_changed", {
+        role: "box-maintainer",
+        agents: [
+          { name: "tabitha", displayName: "Tabitha", task: "Fix the printer" },
+          { name: "newbie", displayName: "Newbie", task: "" },
+        ],
+      }),
+    );
+    const dialogs = autoAnswerKitDialogs({ confirm: true });
+    await openRole();
+    fireEvent.click(within(await openMenu("role-view-menu")).getByTestId("role-view-archive"));
+    await waitFor(() => expect(m.archiveRole).toHaveBeenCalledTimes(2));
+    expect(dialogs.calls).toHaveLength(2);
+    expect(dialogs.calls[1].opts.title).toBe("Who holds Box Maintainer changed — archive it?");
+    expect(dialogs.calls[1].opts.body).toBe("This also archives the 2 agents holding it:\n• Fix the printer\n• Newbie");
+    expect(m.archiveRole.mock.calls[1][2]).toEqual(["tabitha", "newbie"]);
   });
 
   it("a failed archive shows the kit alert and stays", async () => {

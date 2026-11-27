@@ -27,7 +27,7 @@ vi.mock("../ssh/tmux-helper.js", () => ({
     }),
 }));
 
-import { frontDoorHttp, parseFrontDoorLine, requestIdFrom, submitFrontDoor } from "./front-door.js";
+import { frontDoorHttp, frontDoorStatus, parseFrontDoorLine, requestIdFrom, submitFrontDoor } from "./front-door.js";
 
 const FLEET_CHANGE = path.join(__dirname, "..", "..", "..", "substrate", "scripts", "fleet-change");
 const remote = {} as SSHClientType;
@@ -82,6 +82,46 @@ describe("submitFrontDoor — this backend's own machine (bind mount)", () => {
   it("reports the machine still updating when fleet-change isn't installed", async () => {
     const r = await submitFrontDoor(null, "project-contents", { slug: "garden" }, { id: "c2", waitS: 0.1 });
     expect(r).toEqual({ state: "not_installed", id: "c2" });
+  });
+});
+
+describe("archives on this backend's own machine", () => {
+  function agent(name: string, roles = ""): void {
+    fs.mkdirSync(path.join(home, "fleet", "identities", name), { recursive: true });
+    fs.writeFileSync(path.join(home, "fleet", "identities", name, `${name}.md`), `---\nroles: [${roles}]\n---\n`);
+  }
+
+  it("an agent archive is done once claimed, and says it's still finishing until the folder moves", async () => {
+    install();
+    agent("finch");
+    await submitFrontDoor(null, "agent-archive", { name: "finch" }, { id: "a1", waitS: 0 });
+    serveOnce();
+    const r = await submitFrontDoor(null, "agent-archive", { name: "finch" }, { id: "a1", waitS: 1 });
+    expect(r).toMatchObject({ state: "done", finishing: { pending: ["finch"] } });
+    // A claim failing for over ten minutes says why.
+    const claim = path.join(home, "fleet", "identities", "finch", ".archiving");
+    const c = JSON.parse(fs.readFileSync(claim, "utf8")) as Record<string, unknown>;
+    fs.writeFileSync(claim, JSON.stringify({ ...c, failing_since: Date.now() / 1000 - 700, last_error: "couldn't switch the chat account off" }));
+    expect(await frontDoorStatus(null, "a1", 0)).toMatchObject({ finishing: { pending: ["finch"], stuck: { finch: "couldn't switch the chat account off" } } });
+    fs.mkdirSync(path.join(home, "fleet", "identities-archive"), { recursive: true });
+    fs.renameSync(path.join(home, "fleet", "identities", "finch"), path.join(home, "fleet", "identities-archive", "finch"));
+    const after = await frontDoorStatus(null, "a1", 0);
+    expect(after).toMatchObject({ state: "done" });
+    expect(after && "finishing" in after ? after.finishing : undefined).toBeUndefined();
+  });
+
+  it("an agent un-archive reads as still finishing until the supervisor answers it", async () => {
+    install();
+    fs.mkdirSync(path.join(home, "fleet", "identities-archive", "wren"), { recursive: true });
+    fs.writeFileSync(path.join(home, "fleet", "identities-archive", "wren", "wren.md"), "---\nroles: []\n---\n");
+    await submitFrontDoor(null, "agent-unarchive", { name: "wren" }, { id: "u1", waitS: 0 });
+    serveOnce();
+    expect(await frontDoorStatus(null, "u1", 0)).toMatchObject({ state: "pending", stage: "finishing" });
+    execFileSync("python3", [FLEET_CHANGE, "finish", "u1", "done", "--result", '{"name":"wren"}'], {
+      env: { ...process.env, HOME: home, FLEET_CHANGE_FLEET_DIR: path.join(home, "fleet") },
+      stdio: "pipe",
+    });
+    expect(await frontDoorStatus(null, "u1", 0)).toMatchObject({ state: "done", result: { name: "wren" } });
   });
 });
 

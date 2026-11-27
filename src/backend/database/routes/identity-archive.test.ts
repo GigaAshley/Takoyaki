@@ -1,396 +1,140 @@
 /**
- * Phase 115 Plan 115-03: Tests for the identity-archive route.
- *
- * Tests exercise POST /identities/:key/archive via a bare Express app using
- * Node's built-in http module (mirrors identity-no-dormancy.test.ts pattern,
- * which mirrors identity-exists-on-host.test.ts).
- *
- * Auth middleware is mocked. writeIdentityFile, resolveHostById, connectOneShotWithRetry,
- * and isLocalHostId are mocked so tests can exercise every branch without
- * touching real disk or SSH.
- *
- * Test coverage (8 tests per plan behavior block):
- *   1: Happy LOCAL — writeIdentityFile called with correct args, 200 { ok: true }
- *   2: Happy REMOTE — connectOneShotWithRetry + writeIdentityFile with conn, conn.end() called, 200
- *   3: Invalid identityKey → 400, writeIdentityFile NOT called
- *   4: Missing hostId → 400, writeIdentityFile NOT called
- *   5: hostId not owned (resolveHostById → null) → 404, writeIdentityFile NOT called
- *   6: REMOTE host unreachable (connectOneShotWithRetry throws) → 504, writeIdentityFile NOT called
- *   7: writeIdentityFile throws → 500 generic message, conn.end() still called (REMOTE)
- *   8: Unauthenticated (no JWT) → 401, writeIdentityFile NOT called
+ * POST /identities/:key/archive — a request to the machine's front door
+ * (fleet-change agent-archive). Auth, the machine connection and the front
+ * door are mocked; the front door's own behaviour is fleet-change.test.sh's.
  */
-
-import {
-  describe,
-  it,
-  expect,
-  beforeEach,
-  afterEach,
-  vi,
-  type Mock,
-} from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from "vitest";
 import express from "express";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 
-// ---------------------------------------------------------------------------
-// Auth manager mock — matches identity-no-dormancy.test.ts pattern
-// ---------------------------------------------------------------------------
-
 let mockUserId: string | null = "1";
-
-vi.mock("../../utils/auth-manager.js", () => {
-  const AuthManager = {
+vi.mock("../../utils/auth-manager.js", () => ({
+  AuthManager: {
     getInstance: () => ({
-      createAuthMiddleware: () =>
-        (
-          req: express.Request,
-          res: express.Response,
-          next: express.NextFunction,
-        ) => {
-          if (mockUserId === null) {
-            return res.status(401).json({ error: "Unauthorized" });
-          }
+      createAuthMiddleware:
+        () => (req: express.Request, res: express.Response, next: express.NextFunction) => {
+          if (mockUserId === null) return res.status(401).json({ error: "Unauthorized" });
           (req as express.Request & { userId: string }).userId = mockUserId;
           next();
         },
     }),
-  };
-  return { AuthManager };
+  },
+}));
+vi.mock("../../utils/logger.js", () => ({
+  databaseLogger: { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() },
+  sshLogger: { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() },
+}));
+vi.mock("../../fleet-change/front-door.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../fleet-change/front-door.js")>()),
+  submitFrontDoor: vi.fn(),
+  submitAndFollow: vi.fn(),
+}));
+vi.mock("../../sharing/host-conn.js", () => {
+  class HttpError extends Error {
+    constructor(readonly status: number, message: string) {
+      super(message);
+    }
+  }
+  return { HttpError, withHost: vi.fn() };
 });
 
-// Mute logger during tests (avoid noisy stderr on the T-115-03-03 500 path).
-vi.mock("../../utils/logger.js", () => ({
-  databaseLogger: {
-    info: vi.fn(),
-    error: vi.fn(),
-    warn: vi.fn(),
-    debug: vi.fn(),
-  },
-}));
+import { submitAndFollow, submitFrontDoor } from "../../fleet-change/front-door.js";
+import { HttpError, withHost } from "../../sharing/host-conn.js";
+import router from "./identity-archive.js";
 
-// ---------------------------------------------------------------------------
-// Mock SSH primitives + writeIdentityFile BEFORE importing the module under test
-// ---------------------------------------------------------------------------
-
-vi.mock("../../ssh/ssh-one-shot.js", () => ({
-  connectOneShotWithRetry: vi.fn(),
-}));
-
-vi.mock("../../ssh/host-resolver.js", () => ({
-  resolveHostById: vi.fn(),
-}));
-
-vi.mock("../../claude-session/identity-artifact-reader.js", () => ({
-  stringifyColorHueForYaml: (obj: Record<string, unknown>) => (typeof obj.colorHue === "number" ? { ...obj, colorHue: String(obj.colorHue) } : obj),
-  isLocalHostId: vi.fn(),
-  IDENTITY_KEY_RE: /^[a-z0-9_-]{1,64}$/,
-}));
-
-vi.mock("../../claude-session/per-identity-file.js", () => ({
-  writeIdentityFile: vi.fn(),
-}));
-
-// ---------------------------------------------------------------------------
-// Import mocked modules AFTER vi.mock() declarations
-// ---------------------------------------------------------------------------
-
-import { connectOneShotWithRetry } from "../../ssh/ssh-one-shot.js";
-import { resolveHostById } from "../../ssh/host-resolver.js";
-import { isLocalHostId } from "../../claude-session/identity-artifact-reader.js";
-import { writeIdentityFile } from "../../claude-session/per-identity-file.js";
-
-// ---------------------------------------------------------------------------
-// HTTP request helper
-// ---------------------------------------------------------------------------
-
-function httpRequest(
-  server: http.Server,
-  opts: {
-    method: string;
-    path: string;
-    headers?: Record<string, string>;
-    body?: unknown;
-  },
-): Promise<{ status: number; body: unknown }> {
+function call(server: http.Server, method: string, path: string, body?: unknown): Promise<{ status: number; body: Record<string, unknown> }> {
   return new Promise((resolve, reject) => {
     const { port } = server.address() as AddressInfo;
-    const bodyStr =
-      opts.body !== undefined ? JSON.stringify(opts.body) : undefined;
-
-    const headers: Record<string, string> = {
-      ...(opts.headers ?? {}),
-    };
-    if (bodyStr !== undefined) {
-      headers["Content-Type"] = "application/json";
-      headers["Content-Length"] = String(Buffer.byteLength(bodyStr));
-    }
-
     const req = http.request(
-      {
-        hostname: "127.0.0.1",
-        port,
-        method: opts.method,
-        path: opts.path,
-        headers,
-      },
+      { hostname: "127.0.0.1", port, method, path, headers: { "content-type": "application/json" } },
       (res) => {
-        let data = "";
-        res.on("data", (chunk: Buffer) => {
-          data += chunk.toString();
-        });
-        res.on("end", () => {
-          let body: unknown;
-          try {
-            body = JSON.parse(data);
-          } catch {
-            body = data;
-          }
-          resolve({ status: res.statusCode ?? 0, body });
-        });
+        let out = "";
+        res.on("data", (c: Buffer) => (out += c.toString()));
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, body: out ? JSON.parse(out) : {} }));
       },
     );
     req.on("error", reject);
-    if (bodyStr !== undefined) {
-      req.write(bodyStr);
-    }
-    req.end();
+    req.end(body === undefined ? undefined : JSON.stringify(body));
   });
 }
 
-// ---------------------------------------------------------------------------
-// Stubs — SSH connection object + host record
-// ---------------------------------------------------------------------------
-
-const stubConn = {
-  end: vi.fn(),
-  exec: vi.fn(),
-};
-
-const stubHost = {
-  id: 5,
-  ip: "10.0.0.5",
-  port: 22,
-  username: "ubuntu",
-  authType: "password" as const,
-  password: "secret",
-};
-
-// ---------------------------------------------------------------------------
-// Import the router under test — AFTER all vi.mock() calls
-// ---------------------------------------------------------------------------
-
-import router from "./identity-archive.js";
-
 let server: http.Server;
+const conn = { fake: "conn" };
+
+function serve(base: string, router: express.Router): Promise<void> {
+  const app = express();
+  app.use(express.json());
+  app.use(base, router);
+  server = app.listen(0);
+  return new Promise((r) => server.once("listening", () => r()));
+}
+
+function answer(outcome: Record<string, unknown>): void {
+  const impl = async (_c: unknown, _k: string, _a: unknown, o: { id: string }) => ({ id: o.id, seq: 1, ...outcome });
+  (submitFrontDoor as Mock).mockImplementation(impl);
+  (submitAndFollow as Mock).mockImplementation(impl);
+}
 
 beforeEach(() => {
   vi.clearAllMocks();
-
-  // Default: user owns host 5 (local) and host 7 (remote); host 99 not owned
-  (resolveHostById as Mock).mockImplementation((hostId: number) => {
-    if (hostId === 5 || hostId === 7) return Promise.resolve(stubHost);
-    return Promise.resolve(null);
-  });
-
-  // Default: hostId 5 is local, hostId 7 is remote
-  (isLocalHostId as Mock).mockImplementation((hostId: number) => hostId === 5);
-
-  // Default: SSH connect resolves to stubConn
-  (connectOneShotWithRetry as Mock).mockResolvedValue(stubConn);
-
-  // Default: writeIdentityFile succeeds
-  (writeIdentityFile as Mock).mockResolvedValue(undefined);
-
-  // Rebuild app per test
-  const app = express();
-  app.use(express.json());
-  app.use("/identities", router);
-
-  server = http.createServer(app);
-  server.listen(0);
-});
-
-afterEach(() => {
   mockUserId = "1";
-  return new Promise<void>((resolve) => server.close(() => resolve()));
+  (withHost as Mock).mockImplementation(async (_h: number, _u: string, fn: (c: unknown) => Promise<unknown>) => fn(conn));
+  answer({ state: "done", result: {} });
 });
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+afterEach(() => server?.close());
 
 describe("POST /identities/:key/archive", () => {
-  // -------------------------------------------------------------------------
-  // Test 1: happy LOCAL — 200 { ok: true }; writeIdentityFile called with
-  //         (key, ".archive-requested", "", { hostId, conn: null })
-  // -------------------------------------------------------------------------
+  beforeEach(() => serve("/identities", router));
 
-  it("Test 1: happy LOCAL → 200 { ok: true }; writeIdentityFile called with local conn=null", async () => {
-    const res = await httpRequest(server, {
-      method: "POST",
-      path: "/identities/wren/archive",
-      body: { hostId: 5 },
-    });
-
-    expect(res.status).toBe(200);
-    expect(res.body).toEqual({ ok: true });
-    expect(writeIdentityFile).toHaveBeenCalledTimes(1);
-    expect(writeIdentityFile).toHaveBeenCalledWith(
-      "wren",
-      ".archive-requested",
-      "",
-      { hostId: 5, conn: null },
-    );
-    // LOCAL branch must not open an SSH connection
-    expect(connectOneShotWithRetry).not.toHaveBeenCalled();
+  it("sends the archive to the front door with the click's request id", async () => {
+    answer({ state: "done", result: { name: "alpha", claimed: ["alpha"] }, finishing: { pending: ["alpha"] } });
+    const r = await call(server, "POST", "/identities/alpha/archive", { hostId: 5, requestId: "click-1" });
+    expect(r.status).toBe(200);
+    expect(r.body).toMatchObject({ ok: true, requestId: "click-1", finishing: { pending: ["alpha"] } });
+    expect(withHost).toHaveBeenCalledWith(5, "1", expect.any(Function));
+    expect(submitFrontDoor).toHaveBeenCalledWith(conn, "agent-archive", { name: "alpha" }, { id: "click-1", hostId: 5 });
   });
 
-  // -------------------------------------------------------------------------
-  // Test 2: happy REMOTE — 200 { ok: true }; connectOneShotWithRetry opened, conn
-  //         passed to writeIdentityFile, conn.end() called afterwards
-  // -------------------------------------------------------------------------
-
-  it("Test 2: happy REMOTE → 200; conn passed to writeIdentityFile + conn.end() called", async () => {
-    const res = await httpRequest(server, {
-      method: "POST",
-      path: "/identities/wren/archive",
-      body: { hostId: 7 },
-    });
-
-    expect(res.status).toBe(200);
-    expect(res.body).toEqual({ ok: true });
-
-    expect(connectOneShotWithRetry).toHaveBeenCalledTimes(1);
-    expect(writeIdentityFile).toHaveBeenCalledTimes(1);
-    expect(writeIdentityFile).toHaveBeenCalledWith(
-      "wren",
-      ".archive-requested",
-      "",
-      { hostId: 7, conn: stubConn },
-    );
-    // Finally block must close the SSH connection
-    expect(stubConn.end).toHaveBeenCalledTimes(1);
+  it("passes a refusal on with the machine's reason", async () => {
+    answer({ state: "refused", code: "archive_slot_taken", reason: "an archived agent named 'alpha' is already in the archive" });
+    const r = await call(server, "POST", "/identities/alpha/archive", { hostId: 5 });
+    expect(r.status).toBe(409);
+    expect(r.body).toMatchObject({ code: "archive_slot_taken", error: "an archived agent named 'alpha' is already in the archive" });
   });
 
-  // -------------------------------------------------------------------------
-  // Test 3: invalid identityKey → 400; writeIdentityFile NOT called
-  // -------------------------------------------------------------------------
-
-  it("Test 3: invalid identityKey (contains dot) → 400; writeIdentityFile NOT called", async () => {
-    // "bad.key" fails IDENTITY_KEY_RE = /^[a-z0-9_-]{1,64}$/ (dot not allowed)
-    const res = await httpRequest(server, {
-      method: "POST",
-      path: "/identities/bad.key/archive",
-      body: { hostId: 5 },
-    });
-
-    expect(res.status).toBe(400);
-    expect((res.body as { error: string }).error).toMatch(
-      /identity key must match/,
-    );
-    expect(writeIdentityFile).not.toHaveBeenCalled();
-    expect(connectOneShotWithRetry).not.toHaveBeenCalled();
+  it("answers 202 while it's still waiting its turn", async () => {
+    answer({ state: "pending", stage: "queued" });
+    const r = await call(server, "POST", "/identities/alpha/archive", { hostId: 5 });
+    expect(r.status).toBe(202);
+    expect(r.body).toMatchObject({ pending: true });
   });
 
-  // -------------------------------------------------------------------------
-  // Test 4: missing hostId → 400; writeIdentityFile NOT called
-  // -------------------------------------------------------------------------
-
-  it("Test 4: missing hostId (body: {}) → 400; writeIdentityFile NOT called", async () => {
-    const res = await httpRequest(server, {
-      method: "POST",
-      path: "/identities/wren/archive",
-      body: {},
-    });
-
-    expect(res.status).toBe(400);
-    expect((res.body as { error: string }).error).toMatch(/hostId is required/);
-    expect(writeIdentityFile).not.toHaveBeenCalled();
-    expect(connectOneShotWithRetry).not.toHaveBeenCalled();
+  it("says the machine is updating when the front door isn't there yet", async () => {
+    (submitFrontDoor as Mock).mockResolvedValue({ state: "not_installed", id: "x" });
+    const r = await call(server, "POST", "/identities/alpha/archive", { hostId: 5 });
+    expect(r.status).toBe(503);
+    expect(r.body).toMatchObject({ code: "updating" });
   });
 
-  // -------------------------------------------------------------------------
-  // Test 5: hostId not owned by caller → 404; writeIdentityFile NOT called
-  // -------------------------------------------------------------------------
-
-  it("Test 5: cross-user / unknown hostId → 404; writeIdentityFile NOT called", async () => {
-    const res = await httpRequest(server, {
-      method: "POST",
-      path: "/identities/wren/archive",
-      body: { hostId: 99 },
-    });
-
-    expect(res.status).toBe(404);
-    expect((res.body as { error: string }).error).toMatch(/Host not found/);
-    expect(writeIdentityFile).not.toHaveBeenCalled();
-    expect(connectOneShotWithRetry).not.toHaveBeenCalled();
+  it("validates before touching the machine", async () => {
+    expect((await call(server, "POST", "/identities/alpha/archive", {})).status).toBe(400);
+    expect((await call(server, "POST", "/identities/alpha/archive", { hostId: -1 })).status).toBe(400);
+    expect((await call(server, "POST", "/identities/Bad.Key/archive", { hostId: 5 })).status).toBe(400);
+    expect(withHost).not.toHaveBeenCalled();
   });
 
-  // -------------------------------------------------------------------------
-  // Test 6: REMOTE host unreachable (connectOneShotWithRetry throws) → 504; no
-  //         writeIdentityFile call
-  // -------------------------------------------------------------------------
-
-  it("Test 6: REMOTE connectOneShotWithRetry throws → 504 { error: 'Host unreachable' }; writeIdentityFile NOT called", async () => {
-    (connectOneShotWithRetry as Mock).mockRejectedValue(
-      new Error("Connect timeout after 3000ms"),
-    );
-
-    const res = await httpRequest(server, {
-      method: "POST",
-      path: "/identities/wren/archive",
-      body: { hostId: 7 },
-    });
-
-    expect(res.status).toBe(504);
-    expect(res.body).toEqual({ error: "Host unreachable" });
-    expect(writeIdentityFile).not.toHaveBeenCalled();
-    // No conn was ever created, so no end() to check
+  it("maps an unknown host and an unreachable one", async () => {
+    (withHost as Mock).mockRejectedValueOnce(new HttpError(404, "Host not found"));
+    expect((await call(server, "POST", "/identities/alpha/archive", { hostId: 5 })).status).toBe(404);
+    (withHost as Mock).mockRejectedValueOnce(new HttpError(504, "Host unreachable"));
+    expect((await call(server, "POST", "/identities/alpha/archive", { hostId: 5 })).status).toBe(504);
   });
 
-  // -------------------------------------------------------------------------
-  // Test 7: writeIdentityFile throws → 500 generic message; conn.end() still
-  //         called via finally (REMOTE branch)
-  // -------------------------------------------------------------------------
-
-  it("Test 7: writeIdentityFile throws → 500 generic; conn.end() still called (REMOTE)", async () => {
-    (writeIdentityFile as Mock).mockRejectedValue(
-      new Error("ENOSPC: no space left on device — sensitive fs path leak"),
-    );
-
-    const res = await httpRequest(server, {
-      method: "POST",
-      path: "/identities/wren/archive",
-      body: { hostId: 7 },
-    });
-
-    expect(res.status).toBe(500);
-    expect(res.body).toEqual({ error: "failed to drop archive sentinel" });
-    // T-115-03-03: the underlying error text must NOT reach the client
-    expect(JSON.stringify(res.body)).not.toContain("ENOSPC");
-    expect(JSON.stringify(res.body)).not.toContain("sensitive fs path leak");
-    // finally { conn.end() } must still fire even on writeIdentityFile throw
-    expect(stubConn.end).toHaveBeenCalledTimes(1);
-  });
-
-  // -------------------------------------------------------------------------
-  // Test 8: unauthenticated (JWT missing) → 401; writeIdentityFile NOT called;
-  //         no downstream calls (resolveHostById, connectOneShotWithRetry untouched).
-  // -------------------------------------------------------------------------
-
-  it("Test 8: 401 without JWT; writeIdentityFile NOT called; no downstream calls", async () => {
+  it("refuses an unauthenticated caller", async () => {
     mockUserId = null;
-
-    const res = await httpRequest(server, {
-      method: "POST",
-      path: "/identities/wren/archive",
-      body: { hostId: 5 },
-    });
-
-    expect(res.status).toBe(401);
-    expect(writeIdentityFile).not.toHaveBeenCalled();
-    expect(resolveHostById).not.toHaveBeenCalled();
-    expect(connectOneShotWithRetry).not.toHaveBeenCalled();
+    expect((await call(server, "POST", "/identities/alpha/archive", { hostId: 5 })).status).toBe(401);
+    expect(submitFrontDoor).not.toHaveBeenCalled();
   });
 });

@@ -4,11 +4,10 @@
 # (SC2317 false positive: test functions are called indirectly via run_test)
 # (SC2030/SC2031 intentional: env exports live inside per-test ( ... ) subshells)
 #
-# Test driver for the un-archive host-side shape's three scanners in
-# agent-supervisor.sh:
-#   - scan_identity_unarchive_requested_sentinels()
-#   - scan_role_unarchive_requested_sentinels()      (added by shape task 3)
-#   - scan_app_unarchive_requested_sentinels()       (added by shape task 4)
+# Test driver for the agent un-archive's supervisor part in agent-supervisor.sh
+# (finish_returning_identities: the front door accepted the un-archive, the
+# supervisor brings the agent back and answers the request). Role and app
+# un-archives are the front door's own (fleet-change.test.sh).
 #
 # Also unit tests _extract_frontmatter_roles() across the three permitted
 # YAML shapes (scalar, flow list, block list).
@@ -145,6 +144,10 @@ _source_supervisor_unarchive() {
   # Never the real fleet-service (a live backend answers it).
   export AGENT_FLEET_SERVICE="${TEST_FLEET_SERVICE:-$SCRIPT_DIR/fixtures/fake-fleet-service}"
   export FAKE_SERVICE_DIR="${scratch}-requests"
+  # The front door's part is a stand-in that records what it was asked (fleet-change finish).
+  export AGENT_CHANGES_DIR="${scratch}-changes"
+  export AGENT_FLEET_CHANGE_BIN="$SCRIPT_DIR/fixtures/fake-fleet-change"
+  export FAKE_FLEET_CHANGE_LOG="${scratch}-changes/calls"
   export AGENT_SUPERVISOR_LIB_ONLY=1
   # shellcheck disable=SC1090
   source "$SUPERVISOR" 2>/dev/null || true
@@ -154,7 +157,7 @@ _source_supervisor_unarchive() {
 setup_unarchive_scratch() {
   local s; s=$(mktemp -d)
   mkdir -p "$s/.state" "${s}-archive" "${s}-roles" "${s}-roles-archive" \
-           "${s}-apps" "${s}-apps-archive" "${s}-requests"
+           "${s}-apps" "${s}-apps-archive" "${s}-requests" "${s}-changes/returning"
   printf '%s' "$s"
 }
 
@@ -167,6 +170,7 @@ teardown_unarchive_scratch() {
   [ -n "$s" ] && [ -d "${s}-apps" ] && rm -rf "${s}-apps"
   [ -n "$s" ] && [ -d "${s}-apps-archive" ] && rm -rf "${s}-apps-archive"
   [ -n "$s" ] && [ -d "${s}-requests" ] && rm -rf "${s}-requests"
+  [ -n "$s" ] && [ -d "${s}-changes" ] && rm -rf "${s}-changes"
 }
 
 # Create an archived identity fixture under $IDENTITIES_ARCHIVE_DIR.
@@ -250,8 +254,9 @@ fixture_archived_identity() {
   fi
 
   $no_dormancy && touch "$d/.no-dormancy"
-  # Always drop the .unarchive-requested sentinel — that's what the scanner scans for.
   touch "$d/.unarchive-requested"
+  # The front door accepted the un-archive (request req-<name>); the supervisor finishes it.
+  printf '{"name":"%s","ids":["req-%s"]}\n' "$name" "$name" > "${scratch}-changes/returning/$name.json"
 }
 
 # Create a live role folder at $ROLES_DIR/<role>/.
@@ -429,16 +434,19 @@ test_extract_roles_malformed() {
 }
 
 # ============================================================
-# scan_identity_unarchive_requested_sentinels — behavior tests
+# finish_returning_identities — behavior tests
 # ============================================================
 
-# _tick <scratch> — one reconcile tick of the identity scanner (fresh source,
-# like the real supervisor's next pass). Prints the scanner's log output.
+# _tick <scratch> — one reconcile pass of the un-archive finisher (fresh source,
+# like the real supervisor's next pass). Prints its log output.
 _tick() {
   local scratch="$1"
   ( _source_supervisor_unarchive "$scratch"
-    scan_identity_unarchive_requested_sentinels 2>&1 ) || true
+    finish_returning_identities 2>&1 ) || true
 }
+
+# _finished <scratch> <name> — the outcome the front door was given for req-<name>, if any.
+_finished() { grep "^finish req-$2 " "${1}-changes/calls" 2>/dev/null | head -1; }
 
 # _point_relay <scratch> <name> — aim the fixture relay.json at the stub.
 _point_relay() {
@@ -481,6 +489,8 @@ _assert_refused() {
   assert_file   "$d/.unarchive-refused"        "$label: refusal note written"
   assert_grep "$pat" "$(cat "$d/.unarchive-refused" 2>/dev/null)" "$label: refusal note names the reason"
   assert_eq "0" "$(_all_request_files_count "$scratch")" "$label: no service-request files left behind"
+  assert_grep "^finish req-$name refused" "$(_finished "$scratch" "$name")" "$label: the request is answered refused"
+  assert_nofile "${scratch}-changes/returning/$name.json" "$label: let go"
 }
 
 # _assert_completed <scratch> <name> <label>
@@ -492,6 +502,8 @@ _assert_completed() {
   assert_nofile "$scratch/$name/.unarchive-reactivate" "$label: progress state cleared"
   assert_nofile "$scratch/$name/.unarchive-refused"    "$label: no refusal note"
   assert_grep "You were unarchived at" "$(cat "$scratch/$name/$name.md" 2>/dev/null)" "$label: banner present"
+  assert_grep "^finish req-$name done" "$(_finished "$scratch" "$name")" "$label: the request is answered done"
+  assert_nofile "${scratch}-changes/returning/$name.json" "$label: let go"
 }
 
 # --- pre-flight refusals ---
@@ -1238,360 +1250,46 @@ test_identity_banner_prepended_on_happy_path() {
   teardown_unarchive_scratch "$scratch"
 }
 
-# ============================================================
-# scan_role_unarchive_requested_sentinels — behavior tests
-# ============================================================
 
-# Create an archived role fixture at $ROLES_ARCHIVE_DIR/<name>/.
-# Usage: fixture_archived_role <scratch> <role_name> [--no-sentinel]
-fixture_archived_role() {
-  local scratch="$1" role_name="$2"
-  shift 2
-  local no_sentinel=false
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      --no-sentinel) no_sentinel=true ;;
-    esac
-    shift
-  done
-  local d="${scratch}-roles-archive/$role_name"
-  mkdir -p "$d"
-  printf 'archived-role-marker\n' > "$d/role.md"
-  if ! $no_sentinel; then
-    touch "$d/.unarchive-requested"
-  fi
-}
+# --- the front door's part: waiting, already back, roles being archived ---
 
-test_role_happy_path() {
+test_identity_waits_for_an_unfinished_archive() {
   local scratch; scratch=$(setup_unarchive_scratch)
-  fixture_archived_role "$scratch" "cool-role"
+  mkdir -p "$scratch/omega"; printf -- '---\nroles: []\n---\n' > "$scratch/omega/omega.md"
+  : > "$scratch/omega/.archiving"
+  printf '{"name":"omega","ids":["req-omega"]}\n' > "${scratch}-changes/returning/omega.json"
 
-  local out
-  out=$( _source_supervisor_unarchive "$scratch"
-         scan_role_unarchive_requested_sentinels 2>&1 ) || true
+  local out; out=$(_tick "$scratch")
 
-  assert_file   "${scratch}-roles/cool-role"                     "role happy: live folder present"
-  assert_file   "${scratch}-roles/cool-role/role.md"             "role happy: role.md moved with folder"
-  assert_nofile "${scratch}-roles-archive/cool-role"             "role happy: archive folder gone"
-  assert_nofile "${scratch}-roles/cool-role/.unarchive-requested" "role happy: sentinel gone from live tree"
-  assert_grep "role 'cool-role' un-archive COMPLETE" "$out"
+  assert_file "${scratch}-changes/returning/omega.json" "waits: still held"
+  assert_eq "" "$(_finished "$scratch" omega)" "waits: not answered yet"
+  assert_nogrep "un-archive REFUSED" "$out" "waits: not refused"
   teardown_unarchive_scratch "$scratch"
 }
 
-test_role_name_collision_refuses() {
+test_identity_already_back_is_answered_done() {
   local scratch; scratch=$(setup_unarchive_scratch)
-  fixture_archived_role "$scratch" "collide-role"
-  # Pre-existing live role with same name.
-  mkdir -p "${scratch}-roles/collide-role"
-  printf 'existing live role\n' > "${scratch}-roles/collide-role/role.md"
+  mkdir -p "$scratch/omega"; printf -- '---\nroles: []\n---\n' > "$scratch/omega/omega.md"
+  printf '{"name":"omega","ids":["req-omega","req-omega-2"]}\n' > "${scratch}-changes/returning/omega.json"
 
-  local out
-  out=$( _source_supervisor_unarchive "$scratch"
-         scan_role_unarchive_requested_sentinels 2>&1 ) || true
+  _tick "$scratch" >/dev/null
 
-  # Live role's contents preserved (marker text stays "existing live role").
-  local live_content; live_content=$(cat "${scratch}-roles/collide-role/role.md")
-  assert_eq "existing live role" "$live_content" "role collision: live role untouched"
-  # Archive folder retained (mv did NOT happen), sentinel deleted.
-  assert_file   "${scratch}-roles-archive/collide-role"                        "role collision: archive retained"
-  assert_nofile "${scratch}-roles-archive/collide-role/.unarchive-requested"  "role collision: sentinel deleted"
-  assert_grep "REFUSED: live role already exists" "$out"
+  assert_grep "^finish req-omega done" "$(_finished "$scratch" omega)" "already back: answered done"
+  assert_grep "^finish req-omega-2 done" "$(grep '^finish req-omega-2 ' "${scratch}-changes/calls")" "every waiting request answered"
+  assert_nofile "${scratch}-changes/returning/omega.json" "already back: let go"
   teardown_unarchive_scratch "$scratch"
 }
 
-test_role_no_sentinel_noop() {
+test_identity_role_being_archived_counts_as_missing() {
   local scratch; scratch=$(setup_unarchive_scratch)
-  fixture_archived_role "$scratch" "silent-role" --no-sentinel
+  fixture_live_role "$scratch" box-maintainer
+  : > "${scratch}-roles/box-maintainer/.archiving"
+  fixture_archived_identity "$scratch" mu "scalar:box-maintainer"
 
-  local out
-  out=$( _source_supervisor_unarchive "$scratch"
-         scan_role_unarchive_requested_sentinels 2>&1 ) || true
+  _tick "$scratch" >/dev/null
 
-  assert_file   "${scratch}-roles-archive/silent-role"   "role no-sentinel: archive untouched"
-  assert_nofile "${scratch}-roles/silent-role"           "role no-sentinel: no folder moved"
-  assert_nogrep "user-initiated un-archive" "$out"       "role no-sentinel: no log line fires"
-  teardown_unarchive_scratch "$scratch"
-}
-
-# Create an archived app fixture at $APPS_ARCHIVE_DIR/<slug>/.
-# Usage: fixture_archived_app <scratch> <slug> <port> [--no-stash] [--no-port]
-#   --no-stash  : don't write the .archived unit file (simulates missing stash)
-#   --no-port   : write a stash but with no Environment=PORT= line
-fixture_archived_app() {
-  local scratch="$1" slug="$2" port="$3"
-  shift 3
-  local no_stash=false no_port=false
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      --no-stash) no_stash=true ;;
-      --no-port) no_port=true ;;
-    esac
-    shift
-  done
-  local d="${scratch}-apps-archive/$slug"
-  mkdir -p "$d"
-  printf 'archived-app-marker\n' > "$d/README.md"
-  if ! $no_stash; then
-    local stash="$d/app-$slug.service.archived"
-    if $no_port; then
-      cat > "$stash" <<UNIT_EOF
-[Unit]
-Description=$slug app
-[Service]
-ExecStart=/bin/true
-[Install]
-WantedBy=default.target
-UNIT_EOF
-    else
-      cat > "$stash" <<UNIT_EOF
-[Unit]
-Description=$slug app
-[Service]
-Environment=PORT=$port
-ExecStart=/bin/true
-[Install]
-WantedBy=default.target
-UNIT_EOF
-    fi
-  fi
-  touch "$d/.unarchive-requested"
-}
-
-# Create a live app fixture with a systemd unit file at the specified port.
-# Used to seed a port-collision scenario.
-fixture_live_app_on_port() {
-  local scratch="$1" slug="$2" port="$3"
-  local ud="${scratch}-systemd-units"
-  mkdir -p "$ud" "${scratch}-apps/$slug"
-  cat > "$ud/app-$slug.service" <<UNIT_EOF
-[Unit]
-Description=$slug live app
-[Service]
-Environment=PORT=$port
-ExecStart=/bin/true
-[Install]
-WantedBy=default.target
-UNIT_EOF
-}
-
-# Write a stub systemctl at <path>. Records every call to a per-call log file
-# ($stub-calls-log — one line per invocation, args space-separated), and
-# always returns success. Tests can assert against the calls log.
-fixture_stub_systemctl() {
-  local path="$1"
-  local log="$path-calls-log"
-  cat > "$path" <<STUB
-#!/usr/bin/env bash
-# stub systemctl — records args to $log, always exits 0.
-printf '%s\n' "\$*" >> "$log"
-exit 0
-STUB
-  chmod +x "$path"
-  : > "$log"
-  printf '%s' "$log"
-}
-
-test_role_no_cascade_to_identities() {
-  # Un-archiving a role must NOT resurrect identities that were retired
-  # alongside during archive. This test proves that: archive identities
-  # holding the un-archived role remain archived after the role scanner runs.
-  local scratch; scratch=$(setup_unarchive_scratch)
-  fixture_archived_role "$scratch" "restored-role"
-  # Pretend two identities were retired during that role's earlier archive.
-  # They're in the identity-archive tree, holding "roles: restored-role".
-  mkdir -p "${scratch}-archive/orphan-a" "${scratch}-archive/orphan-b"
-  printf -- '---\nroles: restored-role\n---\nbody\n' > "${scratch}-archive/orphan-a/orphan-a.md"
-  printf -- '---\nroles: restored-role\n---\nbody\n' > "${scratch}-archive/orphan-b/orphan-b.md"
-
-  ( _source_supervisor_unarchive "$scratch"
-    scan_role_unarchive_requested_sentinels >/dev/null 2>&1 ) || true
-
-  # Role moved to live.
-  assert_file "${scratch}-roles/restored-role"           "no-cascade: role folder in live tree"
-  # Identities remain archived.
-  assert_file   "${scratch}-archive/orphan-a"            "no-cascade: orphan-a still archived"
-  assert_file   "${scratch}-archive/orphan-b"            "no-cascade: orphan-b still archived"
-  assert_nofile "$scratch/orphan-a"                      "no-cascade: orphan-a NOT resurrected to live"
-  assert_nofile "$scratch/orphan-b"                      "no-cascade: orphan-b NOT resurrected to live"
-  teardown_unarchive_scratch "$scratch"
-}
-
-# ============================================================
-# scan_app_unarchive_requested_sentinels — behavior tests
-# ============================================================
-
-test_app_happy_path() {
-  local scratch; scratch=$(setup_unarchive_scratch)
-  local systemctl_stub="$scratch/stub-systemctl"
-  local calls_log; calls_log=$(fixture_stub_systemctl "$systemctl_stub")
-  fixture_archived_app "$scratch" "cool-app" 3040
-
-  local out
-  out=$( _source_supervisor_unarchive "$scratch" "$systemctl_stub"
-         scan_app_unarchive_requested_sentinels 2>&1 ) || true
-
-  assert_file   "${scratch}-apps/cool-app"                                   "app happy: live folder present after mv"
-  assert_file   "${scratch}-apps/cool-app/README.md"                         "app happy: folder contents travelled"
-  assert_nofile "${scratch}-apps-archive/cool-app"                           "app happy: archive folder gone"
-  assert_file   "${scratch}-systemd-units/app-cool-app.service"              "app happy: unit installed"
-  assert_nofile "${scratch}-apps/cool-app/app-cool-app.service.archived"     "app happy: stash removed after install"
-  assert_nofile "${scratch}-apps/cool-app/.unarchive-requested"              "app happy: sentinel gone"
-
-  local port; port=$(grep '^Environment=PORT=' "${scratch}-systemd-units/app-cool-app.service" | sed 's/^Environment=PORT=//')
-  assert_eq "3040" "$port" "app happy: installed unit carries the archived port"
-
-  # Systemctl was called for daemon-reload + enable + is-active.
-  local sysctl_calls; sysctl_calls=$(cat "$calls_log")
-  assert_grep "--user daemon-reload"                       "$sysctl_calls" "app happy: daemon-reload invoked"
-  assert_grep "--user enable --now app-cool-app.service"   "$sysctl_calls" "app happy: enable --now invoked"
-  assert_grep "--user is-active --quiet app-cool-app.service" "$sysctl_calls" "app happy: is-active check invoked"
-
-  assert_grep "app 'cool-app' un-archive COMPLETE" "$out"
-  assert_grep "systemd unit active .running. on port 3040" "$out" "app happy: active log line with port"
-  teardown_unarchive_scratch "$scratch"
-}
-
-test_app_live_folder_collision_refuses() {
-  local scratch; scratch=$(setup_unarchive_scratch)
-  local systemctl_stub="$scratch/stub-systemctl"
-  fixture_stub_systemctl "$systemctl_stub" > /dev/null
-  fixture_archived_app "$scratch" "collide-app" 3041
-  # Pre-existing live folder with same slug.
-  mkdir -p "${scratch}-apps/collide-app"
-  printf 'existing live app\n' > "${scratch}-apps/collide-app/README.md"
-
-  local out
-  out=$( _source_supervisor_unarchive "$scratch" "$systemctl_stub"
-         scan_app_unarchive_requested_sentinels 2>&1 ) || true
-
-  # Live folder untouched.
-  local content; content=$(cat "${scratch}-apps/collide-app/README.md")
-  assert_eq "existing live app" "$content" "app live-collision: live folder untouched"
-  assert_file   "${scratch}-apps-archive/collide-app"                            "app live-collision: archive retained"
-  assert_nofile "${scratch}-apps-archive/collide-app/.unarchive-requested"       "app live-collision: sentinel deleted"
-  assert_grep "REFUSED: live folder already exists" "$out"
-  teardown_unarchive_scratch "$scratch"
-}
-
-test_app_unit_file_collision_refuses() {
-  local scratch; scratch=$(setup_unarchive_scratch)
-  local systemctl_stub="$scratch/stub-systemctl"
-  fixture_stub_systemctl "$systemctl_stub" > /dev/null
-  fixture_archived_app "$scratch" "unit-collide" 3042
-  # Pre-existing unit file (but no live app folder — an orphan unit).
-  mkdir -p "${scratch}-systemd-units"
-  cat > "${scratch}-systemd-units/app-unit-collide.service" <<UEOF
-[Unit]
-Description=orphan unit
-[Service]
-Environment=PORT=9999
-ExecStart=/bin/true
-UEOF
-
-  local out
-  out=$( _source_supervisor_unarchive "$scratch" "$systemctl_stub"
-         scan_app_unarchive_requested_sentinels 2>&1 ) || true
-
-  assert_file   "${scratch}-apps-archive/unit-collide"                       "app unit-collide: archive retained"
-  assert_nofile "${scratch}-apps-archive/unit-collide/.unarchive-requested"  "app unit-collide: sentinel deleted"
-  assert_grep "REFUSED: systemd unit already installed" "$out"
-  teardown_unarchive_scratch "$scratch"
-}
-
-test_app_missing_stashed_unit_refuses() {
-  local scratch; scratch=$(setup_unarchive_scratch)
-  local systemctl_stub="$scratch/stub-systemctl"
-  fixture_stub_systemctl "$systemctl_stub" > /dev/null
-  fixture_archived_app "$scratch" "no-stash-app" 3043 --no-stash
-
-  local out
-  out=$( _source_supervisor_unarchive "$scratch" "$systemctl_stub"
-         scan_app_unarchive_requested_sentinels 2>&1 ) || true
-
-  assert_file   "${scratch}-apps-archive/no-stash-app"                       "app no-stash: archive retained"
-  assert_nofile "${scratch}-apps-archive/no-stash-app/.unarchive-requested"  "app no-stash: sentinel deleted"
-  assert_grep "REFUSED: no stashed unit" "$out"
-  teardown_unarchive_scratch "$scratch"
-}
-
-test_app_stash_without_port_refuses() {
-  local scratch; scratch=$(setup_unarchive_scratch)
-  local systemctl_stub="$scratch/stub-systemctl"
-  fixture_stub_systemctl "$systemctl_stub" > /dev/null
-  fixture_archived_app "$scratch" "no-port-app" 3044 --no-port
-
-  local out
-  out=$( _source_supervisor_unarchive "$scratch" "$systemctl_stub"
-         scan_app_unarchive_requested_sentinels 2>&1 ) || true
-
-  assert_file   "${scratch}-apps-archive/no-port-app"                       "app no-port: archive retained"
-  assert_nofile "${scratch}-apps-archive/no-port-app/.unarchive-requested"  "app no-port: sentinel deleted"
-  assert_grep "could not read PORT" "$out"
-  teardown_unarchive_scratch "$scratch"
-}
-
-test_app_port_collision_refuses() {
-  local scratch; scratch=$(setup_unarchive_scratch)
-  local systemctl_stub="$scratch/stub-systemctl"
-  fixture_stub_systemctl "$systemctl_stub" > /dev/null
-  # Live app 'incumbent' on port 3050.
-  fixture_live_app_on_port "$scratch" "incumbent" 3050
-  # Archived app 'newcomer' wants the same port 3050.
-  fixture_archived_app "$scratch" "newcomer" 3050
-
-  local out
-  out=$( _source_supervisor_unarchive "$scratch" "$systemctl_stub"
-         scan_app_unarchive_requested_sentinels 2>&1 ) || true
-
-  # Incumbent untouched.
-  assert_file "${scratch}-apps/incumbent"                              "port-collision: incumbent live folder untouched"
-  assert_file "${scratch}-systemd-units/app-incumbent.service"         "port-collision: incumbent unit untouched"
-  # Newcomer archive retained; sentinel deleted; newcomer NOT moved.
-  assert_file   "${scratch}-apps-archive/newcomer"                     "port-collision: newcomer archive retained"
-  assert_nofile "${scratch}-apps-archive/newcomer/.unarchive-requested" "port-collision: newcomer sentinel deleted"
-  assert_nofile "${scratch}-apps/newcomer"                             "port-collision: newcomer NOT moved to live"
-  assert_grep "port 3050 is now in use" "$out"
-  teardown_unarchive_scratch "$scratch"
-}
-
-test_app_mv_failure_after_sentinel_delete_retains_folder() {
-  # rc-44 path: pre-flight passes, sentinel gets deleted inside the lock,
-  # then mv fails. Force mv to fail by making $APPS_DIR a plain file (not a
-  # directory) — mv can't create $APPS_DIR/<slug> when $APPS_DIR is a file.
-  local scratch; scratch=$(setup_unarchive_scratch)
-  local systemctl_stub="$scratch/stub-systemctl"
-  fixture_stub_systemctl "$systemctl_stub" > /dev/null
-  fixture_archived_app "$scratch" "unmovable" 3070
-  # Replace $APPS_DIR with a file so the mv fails.
-  rm -rf "${scratch}-apps"
-  : > "${scratch}-apps"
-
-  local out
-  out=$( _source_supervisor_unarchive "$scratch" "$systemctl_stub"
-         scan_app_unarchive_requested_sentinels 2>&1 ) || true
-
-  # Archive folder retained (mv failed), sentinel deleted (pre-mv).
-  assert_file   "${scratch}-apps-archive/unmovable"                       "mv-fail: archive folder retained"
-  assert_nofile "${scratch}-apps-archive/unmovable/.unarchive-requested"  "mv-fail: sentinel deleted before mv"
-  assert_grep "mv archive.live FAILED" "$out" "mv-fail: LOUD error log"
-  teardown_unarchive_scratch "$scratch"
-}
-
-test_app_no_sentinel_noop() {
-  local scratch; scratch=$(setup_unarchive_scratch)
-  local systemctl_stub="$scratch/stub-systemctl"
-  fixture_stub_systemctl "$systemctl_stub" > /dev/null
-  # Archived app WITHOUT the un-archive sentinel.
-  mkdir -p "${scratch}-apps-archive/quiet-app"
-  printf 'archived\n' > "${scratch}-apps-archive/quiet-app/README.md"
-
-  local out
-  out=$( _source_supervisor_unarchive "$scratch" "$systemctl_stub"
-         scan_app_unarchive_requested_sentinels 2>&1 ) || true
-
-  assert_file   "${scratch}-apps-archive/quiet-app"    "app no-sentinel: archive untouched"
-  assert_nofile "${scratch}-apps/quiet-app"            "app no-sentinel: not moved"
-  assert_nogrep "user-initiated un-archive" "$out"
+  _assert_refused "$scratch" mu "role\\(s\\) box-maintainer first" "role being archived"
+  assert_grep '"missingRoles":\["box-maintainer"\]' "$(_finished "$scratch" mu)" "names the role in the result"
   teardown_unarchive_scratch "$scratch"
 }
 
@@ -1641,20 +1339,11 @@ run_test test_identity_login_5xx_retries
 run_test test_identity_refusal_forgets_pending_request
 run_test test_identity_no_sentinel_noop
 run_test test_identity_banner_prepended_on_happy_path
+run_test test_identity_waits_for_an_unfinished_archive
+run_test test_identity_already_back_is_answered_done
+run_test test_identity_role_being_archived_counts_as_missing
 
-run_test test_role_happy_path
-run_test test_role_name_collision_refuses
-run_test test_role_no_sentinel_noop
-run_test test_role_no_cascade_to_identities
 
-run_test test_app_happy_path
-run_test test_app_live_folder_collision_refuses
-run_test test_app_unit_file_collision_refuses
-run_test test_app_missing_stashed_unit_refuses
-run_test test_app_stash_without_port_refuses
-run_test test_app_port_collision_refuses
-run_test test_app_mv_failure_after_sentinel_delete_retains_folder
-run_test test_app_no_sentinel_noop
 
 printf '===============================\n'
 printf 'PASS: %d  FAIL: %d\n' "$PASS" "$FAIL"

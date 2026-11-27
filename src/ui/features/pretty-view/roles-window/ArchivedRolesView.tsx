@@ -18,6 +18,8 @@ import {
 import type { ArchivedRoleListEntry } from "@/api/roles-archive-list-api";
 import { unarchiveRole } from "@/api/role-unarchive-api";
 import { UnarchiveError } from "@/api/identity-unarchive-api";
+import { reasonSentence } from "@/api/machine-changes-api";
+import { toast } from "sonner";
 import { roleDisplayName } from "@/lib/role-display-name";
 import type { TabState } from "../IdentityFileTab";
 import { ROLE_FALLBACK_HUE, roleAvatarColor } from "./RolesWindow";
@@ -44,7 +46,9 @@ export function ArchivedRolesView({
 
   const restore = (entry: ArchivedRoleListEntry): void => {
     setState((s) => ({ ...s, [entry.name]: "restoring" }));
-    unarchiveRole(hostId, entry.name)
+    unarchiveRole(hostId, entry.name, () => {
+      toast(`Still un-archiving ${roleDisplayName(entry.name)}`, { description: "The machine is still working on it." });
+    })
       .then(() => {
         console.info({ operation: "role_unarchive_requested", hostId, roleName: entry.name });
         setState((s) => ({ ...s, [entry.name]: "restored" }));
@@ -74,7 +78,9 @@ export function ArchivedRolesView({
           body:
             err instanceof UnarchiveError && err.reason === "name_collision"
               ? "A live role with that name already exists."
-              : "Try again in a moment.",
+              : err instanceof UnarchiveError && err.reason === "refused"
+                ? reasonSentence(err.message)
+                : "Try again in a moment.",
         });
       });
   };

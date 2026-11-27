@@ -2,8 +2,8 @@
  * identity-reactivate — bring an archived agent's chat (Matrix) account back
  * to life so the identity can be un-archived.
  *
- * Asked for by the agent-supervisor on the identity's host when it picks up
- * an `.unarchive-requested` flag (front end and agents drop the same flag).
+ * Asked for by the agent-supervisor on the identity's host when it brings an
+ * agent back (an un-archive the machine's front door accepted).
  *
  * Not an agent service: it is the app's own machinery. It rides the agent
  * services' requests (the supervisor sends a `fleet-service` request named

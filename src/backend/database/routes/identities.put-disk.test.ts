@@ -49,6 +49,10 @@ import yaml from "js-yaml";
 
 let mockUserId: string | null = "test-user";
 
+vi.mock("../../claude-session/per-identity-file.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../claude-session/per-identity-file.js")>()),
+  assertNotBeingArchived: vi.fn(async () => undefined),
+}));
 vi.mock("../../utils/auth-manager.js", () => {
   const AuthManager = {
     getInstance: () => ({

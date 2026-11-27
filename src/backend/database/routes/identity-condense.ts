@@ -33,7 +33,11 @@ import {
   isLocalHostId,
   IDENTITY_KEY_RE,
 } from "../../claude-session/identity-artifact-reader.js";
-import { writeIdentityFile } from "../../claude-session/per-identity-file.js";
+import {
+  assertNotBeingArchived,
+  IdentityBeingArchivedError,
+  writeIdentityFile,
+} from "../../claude-session/per-identity-file.js";
 
 /** Remote SSH work holds one per-host semaphore slot; local disk work needs none. */
 function withHostSlot<T>(hostId: number, fn: () => Promise<T>): Promise<T> {
@@ -109,6 +113,7 @@ router.post(
         }
       }
       try {
+        await assertNotBeingArchived(key, { hostId, conn });
         await writeIdentityFile(key, ".compact-requested", guidance, {
           hostId,
           conn,
@@ -122,6 +127,7 @@ router.post(
         });
         return res.json({ ok: true });
       } catch (err) {
+        if (err instanceof IdentityBeingArchivedError) return res.status(409).json({ error: "it's being archived", code: "being_archived" });
         databaseLogger.error("identity condense: request write failed", undefined, {
           operation: "identity_condense_write_failed",
           userId,

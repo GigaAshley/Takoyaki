@@ -487,6 +487,19 @@ describe("PUT /identities/:key/no-dormancy", () => {
     expect(cmd).not.toContain("mkdir");
   });
 
+  it("Test 7a: an agent being archived → 409, nothing changed", async () => {
+    (execCommand as Mock).mockResolvedValue("ARCHIVING");
+    const res = await httpRequest(server, {
+      method: "PUT",
+      path: "/identities/moxie/no-dormancy?hostId=7",
+      body: { present: true },
+    });
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: "it's being archived", code: "being_archived" });
+    const [, cmd] = (execCommand as Mock).mock.calls[0] as [unknown, string];
+    expect(cmd).toContain(`if [ -e "$HOME/fleet/identities/moxie/.archiving" ]; then echo ARCHIVING;`);
+  });
+
   it("Test 7b: SSH branch — nonexistent identity → 500 (parity with local ENOENT), no ghost dir", async () => {
     (execCommand as Mock).mockResolvedValue("MISSING");
     const res = await httpRequest(server, {

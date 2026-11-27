@@ -590,7 +590,7 @@ export function RoleView({
   };
 
   const handleArchive = async (): Promise<void> => {
-    if (await confirmAndArchiveRole({ hostId, name, label, agents })) onArchived();
+    if (await confirmAndArchiveRole({ hostId, name, label })) onArchived();
   };
 
   const menuItems: RowKebabMenuItem[] = [

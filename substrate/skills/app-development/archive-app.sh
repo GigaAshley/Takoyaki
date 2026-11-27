@@ -3,15 +3,16 @@
 #
 # Steps:
 #   1. Stash the app's systemd units INSIDE the app folder as
-#      <unit>.archived (app-units.sh stash) so the un-archive path
-#      (agent-supervisor's scan_app_unarchive_requested_sentinels) can
-#      reinstall them later with the same port. This is what makes restore
-#      stable across archive/restore cycles.
+#      <unit>.archived (app-units.sh stash) so un-archiving (the machine's
+#      front door, fleet-change app-unarchive) can reinstall them later with
+#      the same port. This is what makes restore stable across archive/restore
+#      cycles.
 #   2. Stop, disable and remove the units (app-units.sh uninstall).
 #   3. Move ~/fleet/apps/<slug>/ to ~/fleet/apps-archive/<slug>/.
 #
 # Sidebar apps only. Conversation apps are archived together with their
-# conversation (the agent-supervisor's identity retire path).
+# conversation (the agent-supervisor's identity retire path). Run by the
+# machine's front door (fleet-change app-archive), under the create lock.
 #
 # Refuses if there's already an archived copy at the same slug — that would
 # either indicate a name collision or a botched previous archive. In either

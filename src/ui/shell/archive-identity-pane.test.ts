@@ -75,7 +75,7 @@ describe("confirmAndArchiveIdentityPane — wake-ups", () => {
     kitConfirmSpy.mockImplementationOnce(async () => true);
     const closePane = vi.fn();
     confirmAndArchiveIdentityPane({ hostId: 3, identityKey: "wren", label: "Wren", closePane });
-    await vi.waitFor(() => expect(archiveIdentitySpy).toHaveBeenCalledWith(3, "wren"));
+    await vi.waitFor(() => expect(archiveIdentitySpy).toHaveBeenCalledWith(3, "wren", expect.any(Function)));
     expect((await kitConfirmSpy.mock.calls[0][0].ready)?.body).toContain("Couldn't check this agent's scheduled wake-ups");
     expect(closePane).toHaveBeenCalled();
   });

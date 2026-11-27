@@ -1,61 +1,26 @@
 /**
- * Phase 133 Plan 133-01: /roles/:name/archive — user-initiated role archive
- * gesture. Drops the `.archive-requested` sentinel on the role folder so the
- * agent-supervisor's reconcile tick (Wave C) picks it up on its next scan and
- * runs the role cascade (retire every identity holding the role, then move
- * the role folder to ~/fleet/roles-archive/<name>/ per D-16).
+ * Role archive, through the machine's front door (fleet-change).
  *
- * POST /roles/:name/archive  body: { hostId: number }
- *   → 200 { ok: true }
+ * GET /roles/:name/archive-preflight?hostId=  — who archiving the role would
+ *   take, as the machine sees it right now (role-contents). The confirm lists
+ *   exactly these agents.
+ *   → 200 { ok: true, requestId, result: { role, displayName, agents: [{ name, displayName, task }] } }
+ *   → 409 { error, code: "not_found" }  not a live role (or already being archived)
  *
- * Semantic contract (per Phase 133 CONTEXT):
- *   - D-01: single sentinel drop from the frontend; cascade complexity lives
- *     entirely inside the supervisor.
- *   - D-05: sentinel filename is exactly `.archive-requested` (parallel to
- *     the identity archive sentinel, disambiguated by root directory —
- *     ~/fleet/roles/<name>/ vs ~/fleet/identities/<key>/).
- *   - D-16: archive location `~/fleet/roles-archive/<name>/` is handled by
- *     the supervisor, NOT this endpoint. This endpoint only drops the
- *     sentinel at `~/fleet/roles/<name>/.archive-requested`.
- *   - D-19: one-way — no un-archive gesture. Route is POST-only; no
- *     GET/DELETE counterpart.
- *
- * Route mirrors identity-archive.ts byte-for-byte in shape (that being the
- * direct prior art the CONTEXT canonical-refs section names as "the model
- * this shape clones"):
- *   authenticateJWT → ROLE_NAME_PATTERN gate → resolveHostById filter →
- *   LOCAL/REMOTE branch on isLocalHostId → writeRoleFile with
- *   {hostId, conn} opts → try/finally conn.end().
- *
- * Security (Phase 133 Plan 133-01 threat register — full STRIDE table in
- * the plan's <threat_model> block):
- *   - T-133-01-01 (EoP, unauth caller drops sentinel on another user's role):
- *     authenticateJWT middleware runs first; resolveHostById(hostId, userId)
- *     filters hosts to the caller's own — unknown/cross-user hostId returns
- *     404, NOT 403, to avoid probe info leak (mirrors T-115-03-01).
- *   - T-133-01-02 (Tampering, path traversal via role name):
- *     ROLE_NAME_PATTERN = /^[a-z0-9-]+$/ gate at top of handler. Any name
- *     that fails the regex is rejected with 400 before any disk or SSH
- *     activity. Primitive-layer writeRoleFile also re-validates
- *     (belt-and-suspenders).
- *   - T-133-01-03 (Information Disclosure, 500 error text leak):
- *     500 responses return a generic `{ error: "failed to drop archive
- *     sentinel" }` — the underlying error text is logged server-side via
- *     databaseLogger.error but never sent to the client.
- *   - T-133-01-04 (DoS, archive-request flood): accepted per plan — each
- *     archive gesture is idempotent (same empty file at same path); the
- *     supervisor consumes the sentinel within one reconcile tick.
- *   - T-133-01-05 (Repudiation): JWT auth + audit log
- *     `databaseLogger.info("role archive requested: userId=X, hostId=Y,
- *     name=Z")` on success (mirrors T-115-03-05 shape).
- *   - T-133-01-06 (Concurrent archives race writeRoleFile): accepted per plan
- *     — both writes produce the same empty file at the same path; tmp+rename
- *     is atomic on both branches.
- *
- * Mounted in database.ts BEFORE the three existing /roles routers (mirrors
- * Phase 115 Plan 115-03 precedent at database.ts:2033) so /roles/:name/archive
- * resolves here and does not fall through to any future generic /:roleName
- * handler in rolesRoutes.
+ * POST /roles/:name/archive  body: { hostId, expected: { agents: [names] }, requestId? }
+ *   Claims the role and every agent holding it, in arrival order with the
+ *   machine's other changes; the supervisor finishes them in the background
+ *   (agents first, then the role's folder). Refused — nothing archived — when
+ *   the agents holding it are no longer the ones the user confirmed
+ *   (contents_changed, with the current list as result), when an agent holding
+ *   it is still being un-archived (agent_returning), or when an archived role
+ *   of the same name is in the way.
+ *   → 200 { ok: true, requestId, result: { role, claimed }, finishing? }
+ *   → 202 { pending: true, requestId }
+ *   → 409 { error, code, result? }
+ *   → 409 { code: "instance_wide" }  a shared role comes off machines through its machine list
+ *   → 503 { code: "updating" }  the machine's update hasn't finished
+ *   → 400 bad hostId / name / expected; 404 not the caller's host; 504 unreachable
  */
 
 import type { AuthenticatedRequest } from "../../../types/index.js";
@@ -63,155 +28,82 @@ import { getInstanceWide, syncedMachineForHostRow } from "../../instance-wide/pr
 import express from "express";
 import type { Request, Response } from "express";
 import { AuthManager } from "../../utils/auth-manager.js";
-import { databaseLogger } from "../../utils/logger.js";
 import { resolveHostById } from "../../ssh/host-resolver.js";
-import { connectOneShot } from "../../ssh/ssh-one-shot.js";
-import { getHostSemaphore } from "../../ssh/host-semaphore-registry.js";
-import { isLocalHostId } from "../../claude-session/identity-artifact-reader.js";
 import { ROLE_NAME_PATTERN } from "../../utils/role-name-pattern.js";
-import { writeRoleFile } from "../../claude-session/per-role-file.js";
+import { requestIdFrom } from "../../fleet-change/front-door.js";
+import { answerFromFrontDoor, parseHostId } from "../../fleet-change/front-door-route.js";
 
 const router = express.Router();
 const authManager = AuthManager.getInstance();
 const authenticateJWT = authManager.createAuthMiddleware();
 
-/** SSH connect timeout — matches sibling identity-archive.ts. */
-const SSH_CONNECT_TIMEOUT_MS = 3000;
+const AGENT_NAME_RE = /^[a-z0-9_-]{1,64}$/;
 
-/**
- * POST /:name/archive  body: { hostId: number }
- *
- * Drops `.archive-requested` on the role folder via the per-role-file
- * primitive. Returns 200 { ok: true } on success.
- *
- * Errors:
- *   - 400 { error: "hostId is required" }              — missing hostId
- *   - 400 { error: "hostId must be a positive integer" } — malformed hostId
- *   - 400 { error: "role name must match [a-z0-9-]" }  — bad name
- *   - 404 { error: "Host not found" }                  — unknown / cross-user hostId
- *   - 504 { error: "Host unreachable" }                — SSH connect failure (REMOTE)
- *   - 500 { error: "failed to drop archive sentinel" } — disk write failure
- */
-router.post(
-  "/:name/archive",
-  authenticateJWT,
-  async (req: Request, res: Response) => {
-    const userId = (req as AuthenticatedRequest).userId;
+router.get("/:name/archive-preflight", authenticateJWT, async (req: Request, res: Response) => {
+  const userId = (req as AuthenticatedRequest).userId;
+  const hostId = parseHostId(req.query.hostId);
+  if (hostId === null) {
+    return res.status(400).json({ error: "hostId must be a positive integer" });
+  }
+  const name = String(req.params.name ?? "");
+  if (!ROLE_NAME_PATTERN.test(name)) {
+    return res.status(400).json({ error: "role name must match [a-z0-9-]" });
+  }
+  return answerFromFrontDoor(res, {
+    hostId,
+    userId,
+    kind: "role-contents",
+    args: { name },
+    requestId: requestIdFrom(undefined),
+    operation: "role_archive_preflight",
+    totalS: 30,
+  });
+});
 
-    // 1. Parse + validate hostId (body).
-    const rawHostId = (req.body as { hostId?: unknown } | undefined)?.hostId;
-    if (rawHostId === undefined || rawHostId === null || rawHostId === "") {
-      return res.status(400).json({ error: "hostId is required" });
-    }
-    const hostId =
-      typeof rawHostId === "number"
-        ? rawHostId
-        : parseInt(String(rawHostId), 10);
-    if (!Number.isFinite(hostId) || hostId <= 0 || !Number.isInteger(hostId)) {
-      return res
-        .status(400)
-        .json({ error: "hostId must be a positive integer" });
-    }
+router.post("/:name/archive", authenticateJWT, async (req: Request, res: Response) => {
+  const userId = (req as AuthenticatedRequest).userId;
+  const body = (req.body ?? {}) as { hostId?: unknown; expected?: unknown; requestId?: unknown };
+  if (body.hostId === undefined || body.hostId === null || body.hostId === "") {
+    return res.status(400).json({ error: "hostId is required" });
+  }
+  const hostId = parseHostId(body.hostId);
+  if (hostId === null) {
+    return res.status(400).json({ error: "hostId must be a positive integer" });
+  }
+  const name = String(req.params.name ?? "");
+  if (!ROLE_NAME_PATTERN.test(name)) {
+    return res.status(400).json({ error: "role name must match [a-z0-9-]" });
+  }
+  const agents = (body.expected as { agents?: unknown } | undefined)?.agents;
+  if (!Array.isArray(agents) || !agents.every((a) => typeof a === "string" && AGENT_NAME_RE.test(a))) {
+    return res.status(400).json({ error: "expected.agents (the agents the user confirmed) is required" });
+  }
 
-    // 2. Validate role name via ROLE_NAME_PATTERN (T-133-01-02 gate).
-    const name = String(req.params.name ?? "");
-    if (!name || !ROLE_NAME_PATTERN.test(name)) {
-      return res
-        .status(400)
-        .json({ error: "role name must match [a-z0-9-]" });
-    }
-
-    // 3. Verify host ownership (T-133-01-01 gate). Returns null for cross-user
-    // or unknown hostId → 404 (same shape as sibling identity-archive route
-    // to avoid a 403-vs-404 probe distinguisher).
+  // A shared role that goes to this machine would be restored by the sync
+  // if archived here; it comes off machines via its machine list or
+  // "Delete from every machine". On a machine it doesn't go to, a
+  // same-named role is the machine's own.
+  const engine = getInstanceWide();
+  if (engine) {
     const host = await resolveHostById(hostId, userId);
-    if (!host) {
-      return res.status(404).json({ error: "Host not found" });
-    }
-
-    // A shared role that goes to this machine would be restored by the sync
-    // if archived here; it comes off machines via its machine list or
-    // "Delete from every machine". On a machine it doesn't go to, a
-    // same-named role is the machine's own.
-    const engine = getInstanceWide();
-    const machine = engine
-      ? await syncedMachineForHostRow(hostId, async () => (host as { username?: unknown }).username)
-      : null;
-    if (engine && machine && (await engine.isSharedOn("role", name, machine.machineId))) {
+    if (!host) return res.status(404).json({ error: "Host not found" });
+    const machine = await syncedMachineForHostRow(hostId, async () => (host as { username?: unknown }).username);
+    if (machine && (await engine.isSharedOn("role", name, machine.machineId))) {
       return res.status(409).json({
         error: "this role is shared — take this machine off its list instead",
         code: "instance_wide",
       });
     }
+  }
 
-    // 4. Branch on LOCAL vs REMOTE. LOCAL branch passes conn=null; REMOTE
-    // branch opens a one-shot SSH connection whose lifetime is scoped to the
-    // writeRoleFile call by the try/finally below.
-    // SSH work (connect + execs/writes + conn.end) runs under the per-host
-    // semaphore on the REMOTE branch (verify:ssh-cap). LOCAL touches the
-    // bind-mount only and bypasses it.
-    const doWork = async () => {
-      let conn: Awaited<ReturnType<typeof connectOneShot>> | null = null;
-      if (!isLocalHostId(hostId)) {
-        try {
-          conn = await connectOneShot(
-            host as unknown as Parameters<typeof connectOneShot>[0],
-            SSH_CONNECT_TIMEOUT_MS,
-          );
-        } catch {
-          // Connect failure → 504 with generic message (T-133-01-03).
-          return res.status(504).json({ error: "Host unreachable" });
-        }
-      }
-
-      // 5. Drop the sentinel via the per-role-file primitive. The primitive
-      // re-validates name + relPath before touching disk (belt-and-suspenders).
-      try {
-        await writeRoleFile(name, ".archive-requested", "", {
-          hostId,
-          conn,
-        });
-        // Audit log per T-133-01-05 (repudiation): who requested archive on what.
-        databaseLogger.info(
-          `role archive requested: userId=${userId}, hostId=${hostId}, name=${name}`,
-        );
-        return res.json({ ok: true });
-      } catch (err) {
-        // Log server-side; return generic message to the client (T-133-01-03).
-        databaseLogger.error(
-          `failed to drop .archive-requested sentinel for role name=${name} hostId=${hostId}: ${err instanceof Error ? err.message : String(err)}`,
-        );
-        return res
-          .status(500)
-          .json({ error: "failed to drop archive sentinel" });
-      } finally {
-        if (conn) {
-          try {
-            conn.end();
-          } catch {
-            /* ignore */
-          }
-        }
-      }
-    };
-    return isLocalHostId(hostId)
-      ? doWork()
-      : getHostSemaphore(hostId).run(doWork);
-  },
-);
-
-// Generic 500 fallback error handler (mirrors sibling identity-archive.ts).
-router.use(
-  (
-    err: Error,
-    _req: Request,
-    res: Response,
-    _next: express.NextFunction,
-  ) => {
-    return res
-      .status(500)
-      .json({ error: err?.message ?? "role-archive route error" });
-  },
-);
+  return answerFromFrontDoor(res, {
+    hostId,
+    userId,
+    kind: "role-archive",
+    args: { name, expected: { agents } },
+    requestId: requestIdFrom(body.requestId),
+    operation: "role_archive_request",
+  });
+});
 
 export default router;

@@ -231,6 +231,8 @@ vi.mock("../../claude-session/identity-artifact-reader.js", () => ({
 const identityFileExistsMock = vi.fn();
 
 vi.mock("../../claude-session/per-identity-file.js", () => ({
+  assertNotBeingArchived: vi.fn(async () => undefined),
+  IdentityBeingArchivedError: class IdentityBeingArchivedError extends Error {},
   identityFileExists: (name: string, relPath: string, opts: unknown) =>
     identityFileExistsMock(name, relPath, opts),
   writeIdentityFile: vi.fn(),

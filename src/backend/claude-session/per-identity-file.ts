@@ -25,10 +25,9 @@
  *   divergence class of bug (loose write vs strict read).
  *
  * relPath whitelist:
- *   ALLOWED_REL_PATHS = { "relay.json", ".pinned", ".archive-requested",
+ *   ALLOWED_REL_PATHS = { "relay.json", ".pinned",
  *   ".compact-requested" } — bounded to the file basenames callers touch
- *   (D-01 filename lock; Phase 115 D-08 archive-requested lock, `.hidden`
- *   retired per D-21; `.compact-requested` is the condense request, its
+ *   (D-01 filename lock; `.compact-requested` is the condense request, its
  *   contents the guidance).
  *   Any other value throws before I/O — belt-and-suspenders vs identityKey
  *   traversal (the reader regex already excludes `.` and `/` characters).
@@ -78,17 +77,14 @@ export { IDENTITY_KEY_RE };
 
 /**
  * The bounded set of basenames the per-identity file primitive is allowed to
- * touch. Any other value throws before I/O. Kept intentionally tiny — only
- * "relay.json" (identity-birth Step 8), ".pinned" (pin action, Plan 92-02),
- * and ".archive-requested" (archive-intent sentinel, Phase 115 Plan 115-01,
- * D-08) are legitimate targets under D-05's one-audit-surface rule. The
- * former `.hidden` sentinel from Phase 107 Plan 107-01 is retired here per
- * Phase 115 D-21. // (D-01 filename lock; Phase 115 D-08/D-21)
+ * touch. Any other value throws before I/O. Kept intentionally tiny —
+ * "relay.json" (identity-birth Step 8), ".pinned" (pin action) and
+ * ".compact-requested" (Compact conversation). Archiving is a request to the
+ * machine's front door, not a file the server drops.
  */
 export const ALLOWED_REL_PATHS: ReadonlySet<string> = new Set([
   "relay.json",
   ".pinned",
-  ".archive-requested",
   ".compact-requested",
 ]);
 
@@ -388,6 +384,35 @@ async function remoteStatExists(
   } finally {
     sftp.end();
   }
+}
+
+// ---------------------------------------------------------------------------
+// Public: assertNotBeingArchived
+// ---------------------------------------------------------------------------
+
+/** The agent's archive is claimed: the machine's front door marked its folder
+ *  (`.archiving`), so it's archived from every point of view and nothing more
+ *  is written into it. */
+export class IdentityBeingArchivedError extends Error {
+  constructor(name: string) {
+    super(`'${name}' is being archived`);
+    this.name = "IdentityBeingArchivedError";
+  }
+}
+
+/** Throws IdentityBeingArchivedError when the agent's archive is claimed. A stat
+ *  that fails for any other reason reads as not claimed (the write that follows
+ *  reports its own errors). */
+export async function assertNotBeingArchived(name: string, opts: IdentityFileExistsOpts): Promise<void> {
+  assertValidIdentityKey(name);
+  let claimed: boolean;
+  if (isLocalHostId(opts.hostId)) {
+    claimed = await fs.stat(localTargetPath(name, ".archiving")).then(() => true, () => false);
+  } else {
+    if (opts.conn === null) throw new Error("conn required for remote host");
+    claimed = await remoteStatExists(opts.conn, remoteTargetPath(name, ".archiving"));
+  }
+  if (claimed) throw new IdentityBeingArchivedError(name);
 }
 
 // ---------------------------------------------------------------------------

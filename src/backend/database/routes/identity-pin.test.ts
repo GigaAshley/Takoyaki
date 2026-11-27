@@ -84,6 +84,8 @@ vi.mock("../../fleet-status/subscription-registry.js", () => ({
 }));
 
 vi.mock("../../claude-session/per-identity-file.js", () => ({
+  assertNotBeingArchived: vi.fn(async () => undefined),
+  IdentityBeingArchivedError: class IdentityBeingArchivedError extends Error {},
   writeIdentityFile: vi.fn(),
   removeIdentityFile: vi.fn(),
 }));
@@ -244,6 +246,15 @@ describe("PUT /identities/:key/pinned", () => {
     expect(writeIdentityFile).toHaveBeenCalledWith("wren", ".pinned", "", { hostId: 5, conn: null });
     expect(removeIdentityFile).not.toHaveBeenCalled();
     expect(connectOneShot).not.toHaveBeenCalled();
+  });
+
+  it("an agent being archived can't be pinned: 409, nothing written", async () => {
+    const { assertNotBeingArchived, IdentityBeingArchivedError } = await import("../../claude-session/per-identity-file.js");
+    (assertNotBeingArchived as unknown as Mock).mockRejectedValueOnce(new IdentityBeingArchivedError("wren"));
+    const res = await httpRequest(server, { method: "PUT", path: "/identities/wren/pinned", body: { hostId: 5, pinned: true } });
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: "it's being archived", code: "being_archived" });
+    expect(writeIdentityFile).not.toHaveBeenCalled();
   });
 
   it("pinned:false on REMOTE host removes .pinned over SSH and closes the conn", async () => {

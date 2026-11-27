@@ -2,6 +2,7 @@
 // archived conversation tab.
 
 import { UnarchiveError } from "@/api/identity-unarchive-api";
+import { reasonSentence } from "@/api/machine-changes-api";
 
 export function unarchiveFailureNotice(err: unknown): { title: string; body: string } {
   if (err instanceof UnarchiveError && err.reason === "missing_roles") {
@@ -11,7 +12,7 @@ export function unarchiveFailureNotice(err: unknown): { title: string; body: str
     };
   }
   if (err instanceof UnarchiveError && err.reason === "refused") {
-    return { title: "Couldn't un-archive this conversation", body: err.message };
+    return { title: "Couldn't un-archive this conversation", body: reasonSentence(err.message) };
   }
   if (err instanceof UnarchiveError && err.reason === "name_collision") {
     return { title: "Couldn't un-archive this conversation", body: "There's already a live conversation with the same name." };

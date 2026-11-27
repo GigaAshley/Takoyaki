@@ -763,7 +763,7 @@ test_retire_step1_recovers_after_transient_5xx() {
   _retire_test_preamble || { PASS=$((PASS + 1)); return; }
   local scratch; scratch=$(setup_scratch)
   fixture_identity "$scratch" zeta --cursor-age-days 200
-  touch "$scratch/zeta/.archive-requested"
+  touch "$scratch/zeta/.archiving"
   fixture_relay_json "$scratch/zeta" "http://127.0.0.1:STUB_PORT/_matrix/client/v3" "@zeta:test" "pw" "tok"
   start_stub_homeserver "500,500,200" || { teardown_scratch "$scratch"; return; }
   sed -i "s|STUB_PORT|$STUB_PORT|" "$scratch/zeta/relay.json"
@@ -804,7 +804,7 @@ test_retire_step1_terminal_after_3_5xx() {
   _retire_test_preamble || { PASS=$((PASS + 1)); return; }
   local scratch; scratch=$(setup_scratch)
   fixture_identity "$scratch" theta --cursor-age-days 200
-  touch "$scratch/theta/.archive-requested"
+  touch "$scratch/theta/.archiving"
   fixture_relay_json "$scratch/theta" "http://127.0.0.1:STUB_PORT/_matrix/client/v3" "@theta:test" "pw" "tok"
   start_stub_homeserver 500 || { teardown_scratch "$scratch"; return; }
   sed -i "s|STUB_PORT|$STUB_PORT|" "$scratch/theta/relay.json"
@@ -819,7 +819,7 @@ test_retire_step1_terminal_after_3_5xx() {
   # Live folder retained; step 4a (sentinel delete) never reached because step 1 aborted.
   assert_file "$scratch/theta" \
     "step 1 terminal: live folder must remain (step 4b never reached)"
-  assert_file "$scratch/theta/.archive-requested" \
+  assert_file "$scratch/theta/.archiving" \
     "step 1 terminal: sentinel must remain (step 4a not reached)"
   assert_grep "attempt 1/3 transient failure" "$out" \
     "step 1 terminal: log records attempt 1/3"
@@ -844,7 +844,7 @@ test_retire_step1_permanent_400_no_retry() {
   _retire_test_preamble || { PASS=$((PASS + 1)); return; }
   local scratch; scratch=$(setup_scratch)
   fixture_identity "$scratch" omicron --cursor-age-days 200
-  touch "$scratch/omicron/.archive-requested"
+  touch "$scratch/omicron/.archiving"
   fixture_relay_json "$scratch/omicron" "http://127.0.0.1:STUB_PORT/_matrix/client/v3" "@omicron:test" "pw" "tok"
   start_stub_homeserver 400 || { teardown_scratch "$scratch"; return; }
   sed -i "s|STUB_PORT|$STUB_PORT|" "$scratch/omicron/relay.json"
@@ -874,7 +874,7 @@ test_retire_step4b_state3_collision_no_retry() {
   _retire_test_preamble || { PASS=$((PASS + 1)); return; }
   local scratch; scratch=$(setup_scratch)
   fixture_identity "$scratch" pi --cursor-age-days 200
-  touch "$scratch/pi/.archive-requested"
+  touch "$scratch/pi/.archiving"
   fixture_relay_json "$scratch/pi" "http://127.0.0.1:STUB_PORT/_matrix/client/v3" "@pi:test" "pw" "tok"
   # Pre-create archive/pi/ to force State 3 collision on step 4b's mv attempt.
   mkdir -p "${scratch}-archive/pi"
@@ -900,13 +900,13 @@ test_scanner_no_longer_writes_counter_or_retire_stuck() {
   _retire_test_preamble || { PASS=$((PASS + 1)); return; }
   local scratch; scratch=$(setup_scratch)
   fixture_identity "$scratch" sigma --cursor-age-days 200
-  touch "$scratch/sigma/.archive-requested"
+  touch "$scratch/sigma/.archiving"
   fixture_relay_json "$scratch/sigma" "http://127.0.0.1:STUB_PORT/_matrix/client/v3" "@sigma:test" "pw" "tok"
   start_stub_homeserver 500 || { teardown_scratch "$scratch"; return; }
   sed -i "s|STUB_PORT|$STUB_PORT|" "$scratch/sigma/relay.json"
   local out
   out=$( _source_supervisor "$scratch"
-         scan_archive_requested_sentinels 2>&1 ) || true
+         finish_archiving_identities 2>&1 ) || true
   stop_stub_homeserver
   # Legacy counter files: neither user-path nor daily-path counter is written.
   assert_nofile "$scratch/.state/retire-fail-count-user-sigma" \
@@ -917,7 +917,7 @@ test_scanner_no_longer_writes_counter_or_retire_stuck() {
   assert_nofile "${scratch}-archive/sigma/retire-stuck" \
     "scanner D-14: legacy retire-stuck sentinel MUST NOT be dropped in archive/"
   # Terminal ERROR log line from scan_archive_requested_sentinels.
-  assert_grep "ERROR: 'sigma' user-initiated archive: retire_identity FAILED" "$out" \
+  assert_grep "ERROR: 'sigma' archive not finished yet" "$out" \
     "scanner D-14: terminal ERROR log line fires on retire failure"
   teardown_scratch "$scratch"
 }
@@ -928,7 +928,7 @@ test_scanner_bypasses_legacy_retire_stuck_sentinel() {
   _retire_test_preamble || { PASS=$((PASS + 1)); return; }
   local scratch; scratch=$(setup_scratch)
   fixture_identity "$scratch" nu --cursor-age-days 200
-  touch "$scratch/nu/.archive-requested"
+  touch "$scratch/nu/.archiving"
   fixture_relay_json "$scratch/nu" "http://127.0.0.1:STUB_PORT/_matrix/client/v3" "@nu:test" "pw" "tok"
   # Pre-create legacy retire-stuck sentinel in the archive folder — pre-Phase-133 boxes
   # can have these lying around (D-21 archaeology). The new scanner must NOT skip on it.
@@ -957,11 +957,11 @@ test_scanner_bypasses_legacy_retire_stuck_sentinel() {
   # detected, invoking retire_identity" — which the old guard would have SKIPPED. Its
   # presence proves the guard is gone.
   out=$( _source_supervisor "$scratch"
-         scan_archive_requested_sentinels 2>&1 ) || rc=$?
+         finish_archiving_identities 2>&1 ) || rc=$?
   stop_stub_homeserver
   # The key assertion: the scanner INVOKED retire_identity despite the legacy sentinel.
   # (Old guard would have `continue`'d before this log line fired.)
-  assert_grep "'nu' user-initiated archive: .archive-requested detected, invoking retire_identity" "$out" \
+  assert_grep "'nu' archive: finishing the claimed archive" "$out" \
     "guard-gone: scanner MUST invoke retire_identity even with legacy retire-stuck sentinel present"
   # Retire itself will hit State 3 collision (both live nu/ and archive/nu/ exist), but
   # that's incidental — the point is the retire was ATTEMPTED (not skipped).
@@ -1085,7 +1085,7 @@ _114_setup_identity() {
   shift 3
   local passthru=("$@")
   fixture_identity "$scratch" "$name" "${passthru[@]}"
-  touch "$scratch/$name/.archive-requested"
+  touch "$scratch/$name/.archiving"
   # Placeholder base URL; sed-substituted after we know the port.
   fixture_relay_json "$scratch/$name" "http://127.0.0.1:STUB_PORT/_matrix/client/v3" "@$name:test" "pw" "tok"
   start_stub_homeserver "$http_code" || return 1
@@ -1102,7 +1102,7 @@ test_sentinel_scan_triggers_retire() {
   _114_setup_identity "$scratch" alpha 200 || { teardown_scratch "$scratch"; return; }
   local out
   out=$( _source_supervisor "$scratch"
-         scan_archive_requested_sentinels 2>&1 ) || true
+         finish_archiving_identities 2>&1 ) || true
   local req_log_snapshot=""
   [ -n "$STUB_REQ_LOG" ] && [ -f "$STUB_REQ_LOG" ] && req_log_snapshot=$(cat "$STUB_REQ_LOG")
   stop_stub_homeserver
@@ -1121,7 +1121,7 @@ test_sentinel_scan_triggers_retire() {
   assert_grep "retire step 3" "$out" "sentinel-scan retire: step 3 log line present"
   assert_grep "retire step 4a" "$out" "sentinel-scan retire: step 4a log line present"
   # user-initiated diagnostic present.
-  assert_grep "user-initiated archive" "$out" \
+  assert_grep "finishing the claimed archive" "$out" \
     "sentinel-scan retire: user-initiated diagnostic present"
   # Stub captured the deactivate POST body — path + mxid should appear.
   assert_grep "/_matrix/client/v3/account/deactivate" "$req_log_snapshot" \
@@ -1148,7 +1148,7 @@ test_sentinel_scan_bypasses_all_guards() {
 
   local out
   out=$( _source_supervisor "$scratch"
-         scan_archive_requested_sentinels 2>&1 ) || true
+         finish_archiving_identities 2>&1 ) || true
   local req_log_snapshot=""
   [ -n "$STUB_REQ_LOG" ] && [ -f "$STUB_REQ_LOG" ] && req_log_snapshot=$(cat "$STUB_REQ_LOG")
   stop_stub_homeserver
@@ -1211,7 +1211,7 @@ test_retire_step_order_observable() {
 
   local out
   out=$( _source_supervisor "$scratch"
-         scan_archive_requested_sentinels 2>&1 ) || true
+         finish_archiving_identities 2>&1 ) || true
   stop_stub_homeserver
 
   # Extract the FIRST matching line number for each step (log lines all include "retire step N").
@@ -1228,15 +1228,15 @@ test_retire_step_order_observable() {
     teardown_scratch "$scratch"
     return
   fi
-  # Monotonic ordering: 1 < 2 < 3 < 4a < 4b.
-  if [ "$line_s1" -ge "$line_s2" ]; then
-    fail "retire step order: step 1 (line $line_s1) must precede step 2 (line $line_s2)"
-  fi
+  # Ordering: the agent stops first (2 < 3), then its account goes off (3 < 1), then 4a < 4b.
   if [ "$line_s2" -ge "$line_s3" ]; then
     fail "retire step order: step 2 (line $line_s2) must precede step 3 (line $line_s3)"
   fi
-  if [ "$line_s3" -ge "$line_s4a" ]; then
-    fail "retire step order: step 3 (line $line_s3) must precede step 4a (line $line_s4a)"
+  if [ "$line_s3" -ge "$line_s1" ]; then
+    fail "retire step order: step 3 (line $line_s3) must precede step 1 (line $line_s1)"
+  fi
+  if [ "$line_s1" -ge "$line_s4a" ]; then
+    fail "retire step order: step 1 (line $line_s1) must precede step 4a (line $line_s4a)"
   fi
   if [ "$line_s4a" -ge "$line_s4b" ]; then
     fail "retire step order: step 4a (line $line_s4a) must precede step 4b (line $line_s4b)"
@@ -1248,13 +1248,8 @@ test_retire_step_order_observable() {
 # deleted along with the cross-tick counter + stuck-sentinel mechanism it exercised.
 # See tests A-F above for the new inline-retry contract.
 
-# Test 6: sentinel-delete-before-move safety on collision-abort (State 3).
-# Pre-create archive/epsilon so step 4b's mv aborts. Step 4a runs BEFORE step 4b, so the
-# sentinel is already deleted when the collision-abort fires. Documents observed behavior:
-# after step 4a but before a step-4b failure, the sentinel is gone and next-tick retry
-# WILL NOT re-fire (this is intentional — State 3 collision-abort is a hard-abort, not
-# a transient crash). Phase 133 D-14: retire returns 1 but the scanner no longer writes a
-# counter file — the terminal ERROR is logged and the identity is left for operator triage.
+# Test 6: a collision at the folder move (State 3) — pre-create archive/epsilon so step 4b's mv
+# aborts. The claim stays, with the reason written into it, and the next pass retries.
 test_sentinel_delete_before_move_collision() {
   _retire_test_preamble || { PASS=$((PASS + 1)); return; }
   local scratch; scratch=$(setup_scratch)
@@ -1265,7 +1260,7 @@ test_sentinel_delete_before_move_collision() {
 
   local out
   out=$( _source_supervisor "$scratch"
-         scan_archive_requested_sentinels 2>&1 ) || true
+         finish_archiving_identities 2>&1 ) || true
   local req_log_snapshot=""
   [ -n "$STUB_REQ_LOG" ] && [ -f "$STUB_REQ_LOG" ] && req_log_snapshot=$(cat "$STUB_REQ_LOG")
   stop_stub_homeserver
@@ -1273,9 +1268,11 @@ test_sentinel_delete_before_move_collision() {
   # Step 1 fired: matrix deactivate reached the stub.
   assert_grep "/_matrix/client/v3/account/deactivate" "$req_log_snapshot" \
     "sentinel-delete-before-move: step 1 (deactivate) hit the stub before step 4b failed (Content-Length request_body_log)"
-  # Step 4a ran BEFORE step 4b's collision-abort — sentinel deleted.
-  assert_nofile "$scratch/epsilon/.archive-requested" \
-    "sentinel-delete-before-move: sentinel DELETED before the move (step 4a ran)"
+  # The claim stays, with what's in the way written into it, so the next pass retries.
+  assert_file "$scratch/epsilon/.archiving" \
+    "collision: claim kept for the next pass"
+  assert_grep "is in the way in the archive" "$(cat "$scratch/epsilon/.archiving" 2>/dev/null)" \
+    "collision: the claim says what's in the way"
   # Step 4b aborted: live folder still exists.
   assert_file "$scratch/epsilon" \
     "sentinel-delete-before-move: live folder retained (step 4b collision-abort, State 3)"
@@ -1304,7 +1301,7 @@ test_ambient_monitor_graceful_shutdown_observable_minimal() {
 
   local out
   out=$( _source_supervisor "$scratch"
-         scan_archive_requested_sentinels 2>&1 ) || true
+         finish_archiving_identities 2>&1 ) || true
   stop_stub_homeserver
 
   # (a) step 2 emits its log line (the ambient-monitor cleanup happens inside this step;
@@ -1330,11 +1327,11 @@ test_sentinel_scan_on_malformed_identity_does_not_crash() {
   local scratch; scratch=$(setup_scratch)
   # Malformed: identity dir + sentinel exist, but no md file and no relay.json.
   mkdir -p "$scratch/deleted"
-  touch "$scratch/deleted/.archive-requested"
+  touch "$scratch/deleted/.archiving"
 
   local out rc=0
   out=$( _source_supervisor "$scratch"
-         scan_archive_requested_sentinels 2>&1 ) || rc=$?
+         finish_archiving_identities 2>&1 ) || rc=$?
 
   # scan_archive_requested_sentinels() itself does not return non-zero on per-identity failure;
   # it just logs the error via retire_identity. The critical assertion is "did not crash".
@@ -1343,7 +1340,7 @@ test_sentinel_scan_on_malformed_identity_does_not_crash() {
   assert_grep "relay.json not found" "$out" \
     "malformed-identity sentinel-scan: step 1 must log 'relay.json not found' (LOUD error)"
   # Sentinel retained (step 4a never reached).
-  assert_file "$scratch/deleted/.archive-requested" \
+  assert_file "$scratch/deleted/.archiving" \
     "malformed-identity sentinel-scan: sentinel retained on step-1 failure"
   # Phase 133 D-14: no legacy counter file written.
   assert_nofile "$scratch/.state/retire-fail-count-user-deleted" \
@@ -1421,7 +1418,7 @@ test_retire_kills_live_tmux_session() {
   out=$( _source_supervisor "$scratch"
          declare -A SESSIONS_SNAPSHOT
          SESSIONS_SNAPSHOT["$ident_lc"]="$ident"
-         scan_archive_requested_sentinels 2>&1 ) || true
+         finish_archiving_identities 2>&1 ) || true
   stop_stub_homeserver
 
   # Primary assertion: the session is gone. `has-session` exits non-zero iff the session does
@@ -1451,9 +1448,9 @@ test_retire_kills_live_tmux_session() {
   if [ -z "$line_s1" ] || [ -z "$line_s2" ] || [ -z "$line_s3" ] || [ -z "$line_s4b" ]; then
     fail "real-tmux teardown: at least one of steps 1/2/3/4b log lines missing (s1=$line_s1 s2=$line_s2 s3=$line_s3 s4b=$line_s4b)"
   else
-    [ "$line_s1" -ge "$line_s2" ]  && fail "real-tmux teardown: step 1 (line $line_s1) must precede step 2 (line $line_s2)"
     [ "$line_s2" -ge "$line_s3" ]  && fail "real-tmux teardown: step 2 (line $line_s2) must precede step 3 (line $line_s3)"
-    [ "$line_s3" -ge "$line_s4b" ] && fail "real-tmux teardown: step 3 (line $line_s3) must precede step 4b (line $line_s4b)"
+    [ "$line_s3" -ge "$line_s1" ]  && fail "real-tmux teardown: step 3 (line $line_s3) must precede step 1 (line $line_s1)"
+    [ "$line_s1" -ge "$line_s4b" ] && fail "real-tmux teardown: step 1 (line $line_s1) must precede step 4b (line $line_s4b)"
   fi
 
   # Idempotent teardown: retire SHOULD have killed the session, but if the test failed above

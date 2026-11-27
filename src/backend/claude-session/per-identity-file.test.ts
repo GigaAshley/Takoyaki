@@ -10,8 +10,8 @@
 //        This is the H1 fix: same regex writer + readers = no silent
 //        write-succeeds-read-fails divergence.
 //   (T2) relPath gate is a bounded whitelist: exactly three literals
-//        ("relay.json", ".pinned", and ".archive-requested" — Phase 115
-//        Plan 115-01 swapped ".hidden" → ".archive-requested" per D-08/D-21).
+//        ("relay.json", ".pinned", and ".compact-requested" — Phase 115
+//        Plan 115-01 swapped ".hidden" → ".compact-requested" per D-08/D-21).
 //   (T3-T4) LOCAL + REMOTE happy-path writes.
 //   (T5-T6) LOCAL + REMOTE removes are idempotent (ENOENT swallowed).
 //   (T7-T8) LOCAL + REMOTE exists returns true/false, fail-closed on error.
@@ -74,6 +74,8 @@ import {
   ALLOWED_REL_PATHS,
   dropIdentityInboxMessage,
   makeInboxMessageName,
+  assertNotBeingArchived,
+  IdentityBeingArchivedError,
   INBOX_MSG_NAME_RE,
   IdentityGoneError,
 } from "./per-identity-file.js";
@@ -275,13 +277,13 @@ describe("writeIdentityFile — relPath whitelist (D-01 filename lock)", () => {
     expect(sftp.writeFile).not.toHaveBeenCalled();
   });
 
-  it("whitelist is exactly {relay.json, .pinned, .archive-requested, .compact-requested} — Phase 115 Plan 115-01 swapped .hidden→.archive-requested (D-08/D-21); condense added .compact-requested", () => {
+  it("whitelist is exactly {relay.json, .pinned, .compact-requested} — archiving is a request to the machine's front door, not a file", () => {
     expect(ALLOWED_REL_PATHS).toBeInstanceOf(Set);
-    expect(ALLOWED_REL_PATHS.size).toBe(4);
+    expect(ALLOWED_REL_PATHS.size).toBe(3);
     expect(ALLOWED_REL_PATHS.has(".compact-requested")).toBe(true);
     expect(ALLOWED_REL_PATHS.has("relay.json")).toBe(true);
     expect(ALLOWED_REL_PATHS.has(".pinned")).toBe(true);
-    expect(ALLOWED_REL_PATHS.has(".archive-requested")).toBe(true);
+    expect(ALLOWED_REL_PATHS.has(".archive-requested")).toBe(false);
     // Phase 115 D-21: .hidden retired from the allowlist (former Phase 107 entry).
     expect(ALLOWED_REL_PATHS.has(".hidden")).toBe(false);
   });
@@ -678,37 +680,37 @@ describe("H1 lock — primitive IDENTITY_KEY_RE parity with identity-artifact-re
 });
 
 // ──────────────────────────────────────────────────────────────────────
-// Phase 115 Plan 115-01: .archive-requested sentinel primitive coverage
+// Phase 115 Plan 115-01: .compact-requested sentinel primitive coverage
 // ──────────────────────────────────────────────────────────────────────
 //
-// Mirrors the existing .pinned test coverage for the new .archive-requested
+// Mirrors the existing .pinned test coverage for the new .compact-requested
 // relPath. Replaces the Phase 107 Plan 107-01 .hidden coverage in the same
 // file (D-21: .hidden code path fully retired). Tests A-01 through A-10:
-//   A-01: whitelist admission (write/remove/exists accept ".archive-requested")
-//   A-02: whitelist still bounded (".archive-requested.old", "archive-requested" without dot still rejected)
-//   A-03: LOCAL write of ".archive-requested" preserves zero-byte body (presence-is-meaning)
-//   A-04: REMOTE write of ".archive-requested" delegates to writeMarkdownFileAtomic with relative-path (home-resolved) + empty body
-//   A-05: LOCAL remove of ".archive-requested" — idempotent ENOENT swallow
-//   A-06: REMOTE remove of ".archive-requested" — idempotent SSH_FX_NO_SUCH_FILE swallow
+//   A-01: whitelist admission (write/remove/exists accept ".compact-requested")
+//   A-02: whitelist still bounded (".compact-requested.old", "archive-requested" without dot still rejected)
+//   A-03: LOCAL write of ".compact-requested" preserves zero-byte body (presence-is-meaning)
+//   A-04: REMOTE write of ".compact-requested" delegates to writeMarkdownFileAtomic with relative-path (home-resolved) + empty body
+//   A-05: LOCAL remove of ".compact-requested" — idempotent ENOENT swallow
+//   A-06: REMOTE remove of ".compact-requested" — idempotent SSH_FX_NO_SUCH_FILE swallow
 //   A-07: LOCAL identityFileExists — true/false + fail-closed
 //   A-08: REMOTE identityFileExists — true/false + fail-closed
-//   A-09: no chmod applied to ".archive-requested" (opts.chmod omitted — mirrors .pinned treatment)
-//   A-10: identityKey gate STILL applies to ".archive-requested" — widening relPath does NOT loosen key gate
+//   A-09: no chmod applied to ".compact-requested" (opts.chmod omitted — mirrors .pinned treatment)
+//   A-10: identityKey gate STILL applies to ".compact-requested" — widening relPath does NOT loosen key gate
 //   A-11 (NEW): negative test — writeIdentityFile(name, ".hidden", ...) rejects. Pins the deletion so a future regression cannot silently re-add .hidden to the allowlist. (Phase 115 Plan 115-01 <action>(c) requirement.)
 
-describe("Phase 115 Plan 115-01: .archive-requested sentinel primitive coverage", () => {
+describe("Phase 115 Plan 115-01: .compact-requested sentinel primitive coverage", () => {
   // ── A-01: whitelist admission ──────────────────────────────────────────
 
-  it("A-01: writeIdentityFile / removeIdentityFile / identityFileExists accept '.archive-requested' (no invalid-relPath throw)", async () => {
+  it("A-01: writeIdentityFile / removeIdentityFile / identityFileExists accept '.compact-requested' (no invalid-relPath throw)", async () => {
     const writeFileMock = fsMod.writeFile as unknown as ReturnType<typeof vi.fn>;
     const renameMock = fsMod.rename as unknown as ReturnType<typeof vi.fn>;
     const unlinkMock = fsMod.unlink as unknown as ReturnType<typeof vi.fn>;
     const statMock = fsMod.stat as unknown as ReturnType<typeof vi.fn>;
     statMock.mockResolvedValueOnce({ size: 0 });
 
-    // writeIdentityFile must NOT throw at assertValidRelPath for ".archive-requested"
+    // writeIdentityFile must NOT throw at assertValidRelPath for ".compact-requested"
     await expect(
-      writeIdentityFile("tina", ".archive-requested", "", {
+      writeIdentityFile("tina", ".compact-requested", "", {
         hostId: LOCAL_HOST_ID,
         conn: null,
       }),
@@ -716,17 +718,17 @@ describe("Phase 115 Plan 115-01: .archive-requested sentinel primitive coverage"
     expect(writeFileMock).toHaveBeenCalledTimes(1);
     expect(renameMock).toHaveBeenCalledTimes(1);
 
-    // removeIdentityFile must NOT throw at assertValidRelPath for ".archive-requested"
+    // removeIdentityFile must NOT throw at assertValidRelPath for ".compact-requested"
     await expect(
-      removeIdentityFile("tina", ".archive-requested", {
+      removeIdentityFile("tina", ".compact-requested", {
         hostId: LOCAL_HOST_ID,
         conn: null,
       }),
     ).resolves.toBeUndefined();
     expect(unlinkMock).toHaveBeenCalledTimes(1);
 
-    // identityFileExists must NOT throw at assertValidRelPath for ".archive-requested"
-    const exists = await identityFileExists("tina", ".archive-requested", {
+    // identityFileExists must NOT throw at assertValidRelPath for ".compact-requested"
+    const exists = await identityFileExists("tina", ".compact-requested", {
       hostId: LOCAL_HOST_ID,
       conn: null,
     });
@@ -735,10 +737,10 @@ describe("Phase 115 Plan 115-01: .archive-requested sentinel primitive coverage"
 
   // ── A-02: whitelist still bounded ─────────────────────────────────────
 
-  it("A-02: '.archive-requested.old' and 'archive-requested' (without dot) still throw 'invalid relPath' — whitelist bound preserved", async () => {
-    // .archive-requested.old — suffix variant
+  it("A-02: '.compact-requested.old' and 'archive-requested' (without dot) still throw 'invalid relPath' — whitelist bound preserved", async () => {
+    // .compact-requested.old — suffix variant
     await expect(
-      writeIdentityFile("tina", ".archive-requested.old", "", {
+      writeIdentityFile("tina", ".compact-requested.old", "", {
         hostId: LOCAL_HOST_ID,
         conn: null,
       }),
@@ -752,9 +754,9 @@ describe("Phase 115 Plan 115-01: .archive-requested sentinel primitive coverage"
       }),
     ).rejects.toThrow(/invalid relPath/);
 
-    // .archive-requestedx — extended version still rejected
+    // .compact-requestedx — extended version still rejected
     await expect(
-      writeIdentityFile("tina", ".archive-requestedx", "", {
+      writeIdentityFile("tina", ".compact-requestedx", "", {
         hostId: LOCAL_HOST_ID,
         conn: null,
       }),
@@ -763,24 +765,24 @@ describe("Phase 115 Plan 115-01: .archive-requested sentinel primitive coverage"
 
   // ── A-03: LOCAL write — zero-byte body preserved ──────────────────────
 
-  it("A-03: LOCAL write of '.archive-requested' with empty string produces zero-byte file (presence-is-meaning)", async () => {
+  it("A-03: LOCAL write of '.compact-requested' with empty string produces zero-byte file (presence-is-meaning)", async () => {
     const writeFileMock = fsMod.writeFile as unknown as ReturnType<typeof vi.fn>;
     const renameMock = fsMod.rename as unknown as ReturnType<typeof vi.fn>;
 
-    await writeIdentityFile("tina", ".archive-requested", "", {
+    await writeIdentityFile("tina", ".compact-requested", "", {
       hostId: LOCAL_HOST_ID,
       conn: null,
     });
 
     expect(writeFileMock).toHaveBeenCalledTimes(1);
-    // tmp path must end with .archive-requested.tmp
+    // tmp path must end with .compact-requested.tmp
     const tmpPath = writeFileMock.mock.calls[0][0] as string;
     const expectedFinal = path.join(
       os.homedir(),
       "fleet",
       "identities",
       "tina",
-      ".archive-requested",
+      ".compact-requested",
     );
     expect(tmpPath).toBe(expectedFinal + ".tmp");
     // Empty contents threaded through unchanged — zero-byte body (NO contents || fallback)
@@ -795,10 +797,10 @@ describe("Phase 115 Plan 115-01: .archive-requested sentinel primitive coverage"
 
   // ── A-04: REMOTE write — writeMarkdownFileAtomic + relative-path (home-resolved) + empty body ──
 
-  it("A-04: REMOTE write of '.archive-requested' delegates to writeMarkdownFileAtomic with relative-path (home-resolved) path and empty body (byte-shape parity)", async () => {
+  it("A-04: REMOTE write of '.compact-requested' delegates to writeMarkdownFileAtomic with relative-path (home-resolved) path and empty body (byte-shape parity)", async () => {
     const { conn, sftp, renameCalls } = buildMockConn();
 
-    await writeIdentityFile("tina", ".archive-requested", "", {
+    await writeIdentityFile("tina", ".compact-requested", "", {
       hostId: REMOTE_HOST_ID,
       conn,
     });
@@ -810,12 +812,12 @@ describe("Phase 115 Plan 115-01: .archive-requested sentinel primitive coverage"
     // Byte-shape invariant (Phase 107 hotfix): SFTP path is RELATIVE (home-resolved
     // by SFTP), not `$HOME/...` literal.
     expect(renameCalls).toHaveLength(1);
-    expect(renameCalls[0].to).toBe("fleet/identities/tina/.archive-requested");
+    expect(renameCalls[0].to).toBe("fleet/identities/tina/.compact-requested");
 
     // sftp.writeFile invoked with the .tmp target BEFORE the rename
     expect(sftp.writeFile).toHaveBeenCalledTimes(1);
     const writeArgs = sftp.writeFile.mock.calls[0];
-    expect(writeArgs[0]).toBe("fleet/identities/tina/.archive-requested.tmp");
+    expect(writeArgs[0]).toBe("fleet/identities/tina/.compact-requested.tmp");
     // Empty contents threaded through (presence-is-meaning — zero-byte)
     const writtenBuf = writeArgs[1] as Buffer;
     expect(Buffer.isBuffer(writtenBuf)).toBe(true);
@@ -824,7 +826,7 @@ describe("Phase 115 Plan 115-01: .archive-requested sentinel primitive coverage"
 
   // ── A-05: LOCAL remove — idempotent ENOENT swallow ────────────────────
 
-  it("A-05: LOCAL removeIdentityFile of '.archive-requested' swallows ENOENT silently (idempotent — sentinel already consumed)", async () => {
+  it("A-05: LOCAL removeIdentityFile of '.compact-requested' swallows ENOENT silently (idempotent — sentinel already consumed)", async () => {
     const unlinkMock = fsMod.unlink as unknown as ReturnType<typeof vi.fn>;
     const enoent = Object.assign(new Error("ENOENT: no such file"), {
       code: "ENOENT",
@@ -833,14 +835,14 @@ describe("Phase 115 Plan 115-01: .archive-requested sentinel primitive coverage"
 
     // Should resolve silently even when file doesn't exist
     await expect(
-      removeIdentityFile("tina", ".archive-requested", {
+      removeIdentityFile("tina", ".compact-requested", {
         hostId: LOCAL_HOST_ID,
         conn: null,
       }),
     ).resolves.toBeUndefined();
 
     // When file exists — succeeds and unlinks at the correct path
-    await removeIdentityFile("tina", ".archive-requested", {
+    await removeIdentityFile("tina", ".compact-requested", {
       hostId: LOCAL_HOST_ID,
       conn: null,
     });
@@ -849,7 +851,7 @@ describe("Phase 115 Plan 115-01: .archive-requested sentinel primitive coverage"
       "fleet",
       "identities",
       "tina",
-      ".archive-requested",
+      ".compact-requested",
     );
     expect(unlinkMock.mock.calls[1][0]).toBe(expectedFinal);
   });
@@ -863,7 +865,7 @@ describe("Phase 115 Plan 115-01: .archive-requested sentinel primitive coverage"
     });
     const { conn: conn1 } = buildMockConn({ unlinkErr: sshNoSuchFile });
     await expect(
-      removeIdentityFile("tina", ".archive-requested", {
+      removeIdentityFile("tina", ".compact-requested", {
         hostId: REMOTE_HOST_ID,
         conn: conn1,
       }),
@@ -875,7 +877,7 @@ describe("Phase 115 Plan 115-01: .archive-requested sentinel primitive coverage"
     });
     const { conn: conn2 } = buildMockConn({ unlinkErr: permErr });
     await expect(
-      removeIdentityFile("tina", ".archive-requested", {
+      removeIdentityFile("tina", ".compact-requested", {
         hostId: REMOTE_HOST_ID,
         conn: conn2,
       }),
@@ -884,12 +886,12 @@ describe("Phase 115 Plan 115-01: .archive-requested sentinel primitive coverage"
 
   // ── A-07: LOCAL identityFileExists — true/false + fail-closed ─────────
 
-  it("A-07: LOCAL identityFileExists('.archive-requested') — true when file exists, false on ENOENT, false on any other error (fail-closed)", async () => {
+  it("A-07: LOCAL identityFileExists('.compact-requested') — true when file exists, false on ENOENT, false on any other error (fail-closed)", async () => {
     const statMock = fsMod.stat as unknown as ReturnType<typeof vi.fn>;
 
     // Returns true when fs.stat resolves
     statMock.mockResolvedValueOnce({ size: 0 });
-    const existsTrue = await identityFileExists("tina", ".archive-requested", {
+    const existsTrue = await identityFileExists("tina", ".compact-requested", {
       hostId: LOCAL_HOST_ID,
       conn: null,
     });
@@ -899,14 +901,14 @@ describe("Phase 115 Plan 115-01: .archive-requested sentinel primitive coverage"
       "fleet",
       "identities",
       "tina",
-      ".archive-requested",
+      ".compact-requested",
     );
     expect(statMock.mock.calls[0][0]).toBe(expectedFinal);
 
     // Returns false on ENOENT
     const enoent = Object.assign(new Error("ENOENT"), { code: "ENOENT" });
     statMock.mockRejectedValueOnce(enoent);
-    const existsEnoent = await identityFileExists("tina", ".archive-requested", {
+    const existsEnoent = await identityFileExists("tina", ".compact-requested", {
       hostId: LOCAL_HOST_ID,
       conn: null,
     });
@@ -914,7 +916,7 @@ describe("Phase 115 Plan 115-01: .archive-requested sentinel primitive coverage"
 
     // Fail-closed: returns false on permission error (never over-report archive-requested)
     statMock.mockRejectedValueOnce(new Error("EACCES: permission denied"));
-    const existsEacces = await identityFileExists("tina", ".archive-requested", {
+    const existsEacces = await identityFileExists("tina", ".compact-requested", {
       hostId: LOCAL_HOST_ID,
       conn: null,
     });
@@ -923,10 +925,10 @@ describe("Phase 115 Plan 115-01: .archive-requested sentinel primitive coverage"
 
   // ── A-08: REMOTE identityFileExists — true/false + fail-closed ────────
 
-  it("A-08: REMOTE identityFileExists('.archive-requested') — true on successful sftp.stat, false on any stat error (fail-closed)", async () => {
+  it("A-08: REMOTE identityFileExists('.compact-requested') — true on successful sftp.stat, false on any stat error (fail-closed)", async () => {
     // Returns true on successful sftp.stat
     const { conn: conn1 } = buildMockConn(); // default: stat returns { size: 0 }
-    const existsTrue = await identityFileExists("tina", ".archive-requested", {
+    const existsTrue = await identityFileExists("tina", ".compact-requested", {
       hostId: REMOTE_HOST_ID,
       conn: conn1,
     });
@@ -935,22 +937,22 @@ describe("Phase 115 Plan 115-01: .archive-requested sentinel primitive coverage"
     // Returns false on stat error regardless of error code (fail-closed)
     const statErr = Object.assign(new Error("No such file"), { code: 2 });
     const { conn: conn2 } = buildMockConn({ statResult: { err: statErr } });
-    const existsFalse = await identityFileExists("tina", ".archive-requested", {
+    const existsFalse = await identityFileExists("tina", ".compact-requested", {
       hostId: REMOTE_HOST_ID,
       conn: conn2,
     });
     expect(existsFalse).toBe(false);
   });
 
-  // ── A-09: no chmod applied to ".archive-requested" ────────────────────
+  // ── A-09: no chmod applied to ".compact-requested" ────────────────────
 
-  it("A-09: writeIdentityFile('.archive-requested') with opts.chmod OMITTED does NOT invoke execCommand or fs.chmod", async () => {
+  it("A-09: writeIdentityFile('.compact-requested') with opts.chmod OMITTED does NOT invoke execCommand or fs.chmod", async () => {
     const execMock = execCommand as unknown as ReturnType<typeof vi.fn>;
     const chmodMock = fsMod.chmod as unknown as ReturnType<typeof vi.fn>;
 
     // REMOTE branch — no chmod
     const { conn } = buildMockConn();
-    await writeIdentityFile("tina", ".archive-requested", "", {
+    await writeIdentityFile("tina", ".compact-requested", "", {
       hostId: REMOTE_HOST_ID,
       conn,
       // opts.chmod deliberately OMITTED
@@ -965,7 +967,7 @@ describe("Phase 115 Plan 115-01: .archive-requested sentinel primitive coverage"
     vi.clearAllMocks();
 
     // LOCAL branch — no chmod
-    await writeIdentityFile("tina", ".archive-requested", "", {
+    await writeIdentityFile("tina", ".compact-requested", "", {
       hostId: LOCAL_HOST_ID,
       conn: null,
       // opts.chmod deliberately OMITTED
@@ -978,12 +980,12 @@ describe("Phase 115 Plan 115-01: .archive-requested sentinel primitive coverage"
     expect(chmodExecCallsLocal).toHaveLength(0);
   });
 
-  // ── A-10: identityKey gate STILL applies to ".archive-requested" ──────
+  // ── A-10: identityKey gate STILL applies to ".compact-requested" ──────
 
-  it("A-10: writeIdentityFile throws at identityKey gate for '.archive-requested' with invalid keys — widening relPath does NOT loosen the key gate", async () => {
+  it("A-10: writeIdentityFile throws at identityKey gate for '.compact-requested' with invalid keys — widening relPath does NOT loosen the key gate", async () => {
     // Uppercase rejected (MUST throw BEFORE reaching the whitelist gate)
     await expect(
-      writeIdentityFile("Tina", ".archive-requested", "", {
+      writeIdentityFile("Tina", ".compact-requested", "", {
         hostId: LOCAL_HOST_ID,
         conn: null,
       }),
@@ -991,7 +993,7 @@ describe("Phase 115 Plan 115-01: .archive-requested sentinel primitive coverage"
 
     // Dot-containing key rejected
     await expect(
-      writeIdentityFile("tina.core", ".archive-requested", "", {
+      writeIdentityFile("tina.core", ".compact-requested", "", {
         hostId: LOCAL_HOST_ID,
         conn: null,
       }),
@@ -999,7 +1001,7 @@ describe("Phase 115 Plan 115-01: .archive-requested sentinel primitive coverage"
 
     // Slash-containing key rejected
     await expect(
-      writeIdentityFile("tina/sub", ".archive-requested", "", {
+      writeIdentityFile("tina/sub", ".compact-requested", "", {
         hostId: LOCAL_HOST_ID,
         conn: null,
       }),
@@ -1007,7 +1009,7 @@ describe("Phase 115 Plan 115-01: .archive-requested sentinel primitive coverage"
 
     // Empty string rejected
     await expect(
-      writeIdentityFile("", ".archive-requested", "", {
+      writeIdentityFile("", ".compact-requested", "", {
         hostId: LOCAL_HOST_ID,
         conn: null,
       }),
@@ -1165,5 +1167,27 @@ describe("condense: .compact-requested request file", () => {
     await expect(
       writeIdentityFile("tina", ".compact-requested.old", "", { hostId: LOCAL_HOST_ID, conn: null }),
     ).rejects.toThrow(/invalid relPath/);
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// assertNotBeingArchived — an agent whose archive is claimed takes no edits
+// ──────────────────────────────────────────────────────────────────────
+
+describe("assertNotBeingArchived", () => {
+  it("LOCAL: throws IdentityBeingArchivedError when the folder has a claim, else nothing", async () => {
+    const statMock = fsMod.stat as unknown as ReturnType<typeof vi.fn>;
+    statMock.mockResolvedValueOnce({});
+    await expect(assertNotBeingArchived("tina", { hostId: LOCAL_HOST_ID, conn: null })).rejects.toBeInstanceOf(IdentityBeingArchivedError);
+    expect(statMock.mock.calls[0][0]).toBe(path.join(os.homedir(), "fleet", "identities", "tina", ".archiving"));
+    statMock.mockRejectedValueOnce(Object.assign(new Error("ENOENT"), { code: "ENOENT" }));
+    await expect(assertNotBeingArchived("tina", { hostId: LOCAL_HOST_ID, conn: null })).resolves.toBeUndefined();
+  });
+
+  it("REMOTE: stats the claim over SFTP", async () => {
+    const { conn, sftp } = buildMockConn();
+    (sftp.stat as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce((_p: string, cb: (e: Error | null) => void) => cb(null));
+    await expect(assertNotBeingArchived("tina", { hostId: 7, conn })).rejects.toThrow("'tina' is being archived");
+    expect((sftp.stat as unknown as ReturnType<typeof vi.fn>).mock.calls[0][0]).toBe("fleet/identities/tina/.archiving");
   });
 });

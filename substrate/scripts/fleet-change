@@ -21,6 +21,7 @@ Usage:
   fleet-change serve [--until-idle]
   fleet-change kinds
   fleet-change hold-lock --parent <pid>
+  fleet-change finish <id> done|refused|failed [--code <c>] [--reason <r>] [--result <json>]
 
   submit   send a request and wait up to --wait seconds (default 15) for its
            outcome. --id is chosen by the caller; sending the same id again
@@ -33,13 +34,20 @@ Usage:
   hold-lock  take the change lock, print "held", and keep it until killed or
            until <pid> exits. How the agent-supervisor (a shell script, which
            can't keep a lock out of the processes it starts) takes its turn.
+  finish   write the outcome of a request that was finished in the background
+           (an un-archive: the supervisor brings the agent back, then finishes it).
 
 Output (submit / status): one JSON line on stdout.
   finished:  {"id","seq","kind","state":"done"|"refused"|"failed",
               "code"?,"reason"?,"result"?}
   not yet:   {"id","kind"?,"seq"?,"state":"received"|"queued"|"running",
-              "ahead"?}
+              "ahead"?,"stage"?}
              "received" = written down but the listener hasn't taken it in yet.
+             "stage":"finishing" = accepted, being finished in the background.
+  An archive is done once it has claimed what it takes; while the supervisor
+  is still finishing that, a done outcome carries
+  "finishing": {"pending": [names], "stuck"?: {name: reason}} ("stuck" =
+  failing for 10 minutes or more; it is still being retried).
   unknown:   {"id","state":"unknown"}  (status only: never seen, or pruned)
 Exit status: 0 for any of the above, 2 for usage errors (message on stderr).
 
@@ -50,13 +58,30 @@ Request kinds:
   project-archive   {"slug", "expected":{"projects":[...],"agents":[...],"apps":[...]}}
                     refused with code contents_changed (and the current
                     contents as result) when the machine's contents no longer
-                    match what the user confirmed.
+                    match what the user confirmed. Its agents are claimed.
+  agent-archive     {"name", "dormant"?: true, "by"?: "agent"|"scheduled"}
+                    claims the agent (.archiving in its folder): from then on it's
+                    gone from every list, never launched, and stopped; the
+                    supervisor finishes the archive in the background.
+                    "dormant" = the 180-day sleep sweep (its guards are checked).
+  agent-unarchive   {"name"}  quick checks, then handed to the supervisor, which
+                    brings the chat account and the folder back and finishes the
+                    request. Waits for an archive of the same agent to finish.
+  role-contents     {"name"}  the agents archiving the role would take
+  role-archive      {"name", "expected"?: {"agents": [...]}}  claims the role and
+                    its agents (contents_changed as for projects). Without
+                    "expected" (a note left by an agent) it takes who holds it.
+  role-unarchive    {"name"}
+  app-archive       {"slug"}  a sidebar app (archive-app.sh)
+  app-unarchive     {"slug"}  back into the sidebar on its old port
 
 On disk, all under ~/fleet/.changes/:
   incoming/<ns>-<id>.json   a request as written by submit (atomic rename)
   journal/<seq>-<id>.json   taken in by the listener and numbered; removed
                             once its outcome is written
   outcomes/<id>.json        the outcome, kept for OUTCOME_KEEP_S
+  background/<id>.json      a request handed to the supervisor to finish
+  returning/<name>.json     an agent un-archive under way: {"name","ids":[...]}
   next-seq                  the next request number
   .serve.lock               held by the one running listener
 
@@ -85,11 +110,25 @@ CREATE_LOCK = os.path.join(FLEET, ".create-lock")
 PROJECTS = os.path.join(FLEET, "projects")
 PROJECTS_ARCHIVE = os.path.join(PROJECTS, "archive")
 IDENTITIES = os.path.join(FLEET, "identities")
+IDENTITIES_ARCHIVE = os.path.join(FLEET, "identities-archive")
+ROLES = os.path.join(FLEET, "roles")
+ROLES_ARCHIVE = os.path.join(FLEET, "roles-archive")
 APPS = os.path.join(FLEET, "apps")
 APPS_ARCHIVE = os.path.join(FLEET, "apps-archive")
+BACKGROUND = os.path.join(ROOT, "background")
+RETURNING = os.path.join(ROOT, "returning")
 SKILL_DIR = os.path.join(os.path.expanduser("~"), ".claude", "skills", "app-development")
 APP_UNITS = os.environ.get("FLEET_CHANGE_APP_UNITS") or os.path.join(SKILL_DIR, "app-units.sh")
 MOVE_APP = os.environ.get("FLEET_CHANGE_MOVE_APP") or os.path.join(SKILL_DIR, "move-app.sh")
+ARCHIVE_APP = os.environ.get("FLEET_CHANGE_ARCHIVE_APP") or os.path.join(SKILL_DIR, "archive-app.sh")
+UNIT_DIR = os.environ.get("FLEET_CHANGE_UNIT_DIR") or os.path.join(os.path.expanduser("~"), ".config", "systemd", "user")
+SYSTEMCTL = os.environ.get("FLEET_CHANGE_SYSTEMCTL") or "systemctl"
+# An agent or role whose archive has been claimed carries this; the supervisor finishes the
+# archive in the background and the mark goes into the archive with the folder.
+CLAIM = ".archiving"
+# Touched (renamed into place) to end the supervisor's between-pass wait early.
+SUPERVISOR_WAKE = os.path.join(IDENTITIES, ".supervisor-wake")
+STUCK_AFTER_S = 600
 
 POLL_S = float(os.environ.get("FLEET_CHANGE_POLL_S", "0.1"))
 OUTCOME_KEEP_S = 7 * 24 * 3600
@@ -100,9 +139,12 @@ MAX_WAIT_S = 600.0
 
 ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
 SLUG_RE = re.compile(r"^[a-z0-9-]{1,64}$")
+NAME_RE = re.compile(r"^[a-z0-9_-]{1,64}$")
+ROLE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 APP_SLUG_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 USER_RE = re.compile(r"^[^,\s]+$")
-KINDS = ("app-move", "project-contents", "project-archive")
+KINDS = ("app-move", "project-contents", "project-archive", "agent-archive", "agent-unarchive",
+         "role-contents", "role-archive", "role-unarchive", "app-archive", "app-unarchive")
 
 
 def log(msg):
@@ -110,7 +152,7 @@ def log(msg):
 
 
 def ensure_dirs():
-    for d in (ROOT, INCOMING, JOURNAL, OUTCOMES):
+    for d in (ROOT, INCOMING, JOURNAL, OUTCOMES, BACKGROUND, RETURNING):
         os.makedirs(d, exist_ok=True)
 
 
@@ -256,7 +298,7 @@ def project_contents(slug):
         names = []
     for name in names:
         fm = frontmatter(os.path.join(IDENTITIES, name, name + ".md"))
-        if fm and fm.get("project") in in_tree:
+        if fm and fm.get("project") in in_tree and not agent_claimed(name):
             agents.append({
                 "name": name,
                 "displayName": fm.get("displayName") or name,
@@ -311,6 +353,153 @@ def project_label(slug):
     return (fm or {}).get("displayName") or slug
 
 
+def fm_roles(path):
+    """The roles an agent file's frontmatter names (`roles: [a, b]`, `roles: a` or a block list)."""
+    try:
+        with open(path, encoding="utf-8-sig", errors="replace") as f:
+            lines = f.read(65536).replace("\r\n", "\n").split("\n")
+    except OSError:
+        return []
+    if not lines or lines[0].strip() != "---":
+        return []
+    try:
+        end = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
+    except StopIteration:
+        return []
+
+    def clean(v):
+        return re.sub(r"\s+#.*$", "", v).strip().strip("\"'").strip()
+
+    raw = []
+    for i in range(1, end):
+        m = re.match(r"^roles:(.*)$", lines[i])
+        if not m:
+            continue
+        inline = re.sub(r"(^|\s)#.*$", "", m.group(1)).strip()
+        if inline in ("~", "null", "Null", "NULL"):
+            break
+        if inline:
+            if inline.startswith("[") and inline.endswith("]"):
+                inline = inline[1:-1]
+            raw = [clean(v) for v in inline.split(",")]
+        else:
+            for j in range(i + 1, end):
+                t = lines[j].strip()
+                if not t or t.startswith("#"):
+                    continue
+                m2 = re.match(r"^-\s*(.*)$", t)
+                if not m2:
+                    break
+                raw.append(clean(m2.group(1)))
+        break
+    out = []
+    for r in raw:
+        if r and ROLE_RE.match(r) and r not in out:
+            out.append(r)
+    return out
+
+
+def claim_of(path):
+    """The claim mark in a folder, as a dict, or None when there is none."""
+    if not os.path.exists(os.path.join(path, CLAIM)):
+        return None
+    c = read_json(os.path.join(path, CLAIM))
+    return c if isinstance(c, dict) else {}
+
+
+def agent_claimed(name):
+    return claim_of(os.path.join(IDENTITIES, name)) is not None
+
+
+def live_agent(name):
+    """A live agent whose archive hasn't been claimed."""
+    return os.path.isfile(os.path.join(IDENTITIES, name, name + ".md")) and not agent_claimed(name)
+
+
+def agent_card(name, fm):
+    return {"name": name, "displayName": fm.get("displayName") or name, "task": fm.get("task") or ""}
+
+
+def claim(path, rid, by, extra=None):
+    """Mark a folder as being archived. A folder already claimed keeps its first claim."""
+    if claim_of(path) is not None:
+        return False
+    mark = {"id": rid, "by": by, "claimed_at": time.time()}
+    mark.update(extra or {})
+    write_json_atomic(os.path.join(path, CLAIM), mark)
+    try:
+        os.unlink(os.path.join(path, ".archive-requested"))
+    except OSError:
+        pass
+    return True
+
+
+def wake_supervisor():
+    """End the supervisor's wait so it starts on what was claimed now, not up to 15s later."""
+    try:
+        tmp = "%s.tmp.%d" % (SUPERVISOR_WAKE, os.getpid())
+        with open(tmp, "w") as f:
+            f.write("%f\n" % time.time())
+        os.replace(tmp, SUPERVISOR_WAKE)
+    except OSError:
+        pass
+
+
+def returning(name):
+    """The un-archive under way for `name`, or None."""
+    r = read_json(os.path.join(RETURNING, name + ".json"))
+    return r if isinstance(r, dict) else None
+
+
+def returning_roles(name):
+    """The roles of an agent being un-archived (from wherever its folder is right now)."""
+    for d in (os.path.join(IDENTITIES_ARCHIVE, name), os.path.join(IDENTITIES, name)):
+        if os.path.isfile(os.path.join(d, name + ".md")):
+            return fm_roles(os.path.join(d, name + ".md"))
+    return []
+
+
+def role_contents(name):
+    """Who archiving the role `name` takes right now, or None when it isn't a live role."""
+    d = os.path.join(ROLES, name)
+    if not os.path.isdir(d) or claim_of(d) is not None:
+        return None
+    fm = frontmatter(os.path.join(d, name + ".md")) or {}
+    agents = []
+    try:
+        names = sorted(os.listdir(IDENTITIES))
+    except OSError:
+        names = []
+    for a in names:
+        path = os.path.join(IDENTITIES, a, a + ".md")
+        if NAME_RE.match(a) and live_agent(a) and name in fm_roles(path):
+            agents.append(agent_card(a, frontmatter(path) or {}))
+    return {"role": name, "displayName": fm.get("displayName") or name, "agents": agents}
+
+
+def finishing(names, role=None):
+    """Of the agents (and role) an archive claimed, the ones whose clean-up isn't finished, and
+    the reasons of those that have been failing for a while."""
+    pending, stuck = [], {}
+    targets = [(n, os.path.join(IDENTITIES, n)) for n in names]
+    if role:
+        targets.append((role, os.path.join(ROLES, role)))
+    for n, d in targets:
+        c = claim_of(d)
+        if c is None:
+            continue
+        pending.append(n)
+        since = c.get("failing_since")
+        if isinstance(since, (int, float)) and time.time() - since >= STUCK_AFTER_S and c.get("last_error"):
+            stuck[n] = c["last_error"]
+    if not pending:
+        return None
+    out = {"pending": pending}
+    if stuck:
+        out["stuck"] = stuck
+    return out
+
+
 def run(argv, timeout=60):
     """Run a helper; one that runs out of time gets SIGTERM (so its own rollback runs), then SIGKILL."""
     try:
@@ -344,6 +533,11 @@ class Failed(Exception):
     def __init__(self, code, reason):
         super().__init__(reason)
         self.code, self.reason = code, reason
+
+
+class HandedOff(Exception):
+    """The request was accepted and is being finished in the background (by the supervisor),
+    which writes its outcome with `fleet-change finish`. Until then it reads as running."""
 
 
 # ---------------------------------------------------------------------------
@@ -407,7 +601,7 @@ def plan_extras(plan):
         idents = []
     for name in idents:
         fm = frontmatter(os.path.join(IDENTITIES, name, name + ".md"))
-        if fm and fm.get("project") in remaining and name not in plan["agents"]:
+        if fm and fm.get("project") in remaining and name not in plan["agents"] and not agent_claimed(name):
             extras.append("the agent '%s'" % name)
     return extras
 
@@ -447,10 +641,10 @@ def do_project_archive(args, entry, save_plan):
                 raise Failed("changed_during_restart",
                              "the archive was cut off, and since then %s appeared in it; "
                              "nothing more was archived" % ", ".join(extras[:5]))
-        return archive_by_plan(plan, save_plan)
+        return archive_by_plan(plan, save_plan, entry["id"], slug)
 
 
-def archive_by_plan(plan, save_plan):
+def archive_by_plan(plan, save_plan, rid, slug):
     # 1. Stop every app in the tree before any folder moves, so a failure here leaves the
     #    whole project as it was (the apps already stopped are started again).
     for app in plan["apps"]:
@@ -492,18 +686,20 @@ def archive_by_plan(plan, save_plan):
         save_plan(plan)
         log("project '%s' archived as archive/%s" % (p, name))
 
-    # 3. Agents go through the agent archive route the app uses (the supervisor retires them).
+    # 3. Its agents are claimed, as an agent archive claims one; the supervisor finishes them.
+    claimed = []
     for name in plan["agents"]:
         d = os.path.join(IDENTITIES, name)
         if os.path.isfile(os.path.join(d, name + ".md")):
-            try:
-                open(os.path.join(d, ".archive-requested"), "a").close()
-            except OSError as e:
-                log("WARN: couldn't ask for agent '%s' to be archived: %s" % (name, e))
+            claim(d, rid, "project:%s" % slug)
+            claimed.append(name)
+    if claimed:
+        wake_supervisor()
     return {
         "projects": [{"slug": p, "archivedAs": plan["archivedAs"].get(p)} for p in plan["projects"]],
         "agents": plan["agents"],
         "apps": plan["apps"],
+        "claimed": claimed,
     }
 
 
@@ -592,6 +788,8 @@ def do_app_move(args, entry, save_plan):
     rel = os.path.relpath(src, IDENTITIES)
     if not rel.startswith(".."):
         owner = rel.split(os.sep, 1)[0]
+        if agent_claimed(owner):
+            raise Refused("being_archived", "its conversation is being archived")
     title = app_title(src, slug)
     # Its port, kept with the request: if this is cut off midway, carrying on can finish it.
     rc, out = run(["bash", APP_UNITS, "port", slug])
@@ -619,10 +817,261 @@ def do_app_move(args, entry, save_plan):
     return {"slug": slug, "to": to, "path": dest}
 
 
+def check_name(args, key="name", pattern=NAME_RE, what="name"):
+    v = args.get(key)
+    if not isinstance(v, str) or not pattern.match(v):
+        raise Refused("bad_request", "%s must match %s" % (what, pattern.pattern.strip("^$")))
+    return v
+
+
+def do_agent_archive(args, entry, save_plan):
+    name = check_name(args)
+    d = os.path.join(IDENTITIES, name)
+    if agent_claimed(name):
+        return {"name": name, "claimed": [name], "already": True}
+    if returning(name) is not None:
+        raise Refused("returning", "it's still being un-archived; try again in a minute")
+    if not os.path.isfile(os.path.join(d, name + ".md")):
+        if os.path.isdir(os.path.join(IDENTITIES_ARCHIVE, name)):
+            return {"name": name, "claimed": [], "alreadyArchived": True}
+        raise Refused("not_found", "there's no agent '%s' on this machine" % name)
+    by = "user"
+    if args.get("dormant") is True:
+        # The 180-day sleep sweep: its guards are checked again now, not when it looked.
+        by = "dormant"
+        fm = frontmatter(os.path.join(d, name + ".md")) or {}
+        if os.path.exists(os.path.join(d, ".pinned")) or os.path.exists(os.path.join(d, ".no-dormancy")) \
+                or str(fm.get("coordinator", "")).lower() == "true":
+            raise Refused("guarded", "it's pinned, always-on or a coordinator")
+    elif args.get("by") in ("agent", "scheduled"):
+        by = args["by"]
+    if os.path.exists(os.path.join(IDENTITIES_ARCHIVE, name)):
+        raise Refused("archive_slot_taken", "an archived agent named '%s' is already in the archive" % name)
+    claim(d, entry["id"], by)
+    wake_supervisor()
+    log("agent '%s' archive claimed (%s); the supervisor finishes it" % (name, by))
+    return {"name": name, "claimed": [name]}
+
+
+def do_agent_unarchive(args, entry, save_plan):
+    name = check_name(args)
+    live, arch = os.path.join(IDENTITIES, name), os.path.join(IDENTITIES_ARCHIVE, name)
+    r = returning(name)
+    if r is not None:
+        # Already coming back: this request is answered with the same outcome.
+        r.setdefault("ids", [])
+        if entry["id"] not in r["ids"]:
+            r["ids"].append(entry["id"])
+            write_json_atomic(os.path.join(RETURNING, name + ".json"), r)
+        raise HandedOff()
+    still_archiving = agent_claimed(name)
+    if os.path.isdir(live) and not still_archiving:
+        if not os.path.isdir(arch):
+            return {"name": name, "already": True}
+        raise Refused("name_collision", "a live agent named '%s' already exists on this machine" % name)
+    if not still_archiving and not os.path.isdir(arch):
+        raise Refused("archive_not_found", "'%s' isn't in the archive" % name)
+    md = os.path.join(live if still_archiving else arch, name + ".md")
+    if not os.path.isfile(md):
+        raise Refused("identity_unreadable", "the archived agent file %s.md is missing" % name)
+    missing = [ro for ro in fm_roles(md) if not os.path.isdir(os.path.join(ROLES, ro)) or claim_of(os.path.join(ROLES, ro)) is not None]
+    if missing:
+        raise Refused("missing_roles", "un-archive role(s) %s first; this agent depends on them" % ", ".join(missing),
+                      {"missingRoles": missing})
+    write_json_atomic(os.path.join(RETURNING, name + ".json"),
+                      {"name": name, "ids": [entry["id"]], "accepted_at": time.time()})
+    try:
+        os.unlink(os.path.join(arch, ".unarchive-refused"))
+    except OSError:
+        pass
+    wake_supervisor()
+    log("agent '%s' un-archive accepted%s; the supervisor brings it back"
+        % (name, " (waits for its archive to finish)" if still_archiving else ""))
+    raise HandedOff()
+
+
+def do_role_contents(args, entry, save_plan):
+    name = check_name(args, pattern=ROLE_RE)
+    c = role_contents(name)
+    if c is None:
+        raise Refused("not_found", "that role doesn't exist or is already archived")
+    return c
+
+
+def do_role_archive(args, entry, save_plan):
+    name = check_name(args, pattern=ROLE_RE)
+    d = os.path.join(ROLES, name)
+    if claim_of(d) is not None:
+        return {"role": name, "claimed": [], "already": True}
+    if not os.path.isdir(d):
+        if os.path.isdir(os.path.join(ROLES_ARCHIVE, name)):
+            return {"role": name, "claimed": [], "alreadyArchived": True}
+        raise Refused("not_found", "there's no role '%s' on this machine" % name)
+    if os.path.exists(os.path.join(ROLES_ARCHIVE, name)):
+        raise Refused("archive_slot_taken", "an archived role named '%s' is already in the archive" % name)
+    try:
+        back = sorted(n[:-5] for n in os.listdir(RETURNING) if n.endswith(".json"))
+    except OSError:
+        back = []
+    for a in back:
+        if name in returning_roles(a):
+            raise Refused("agent_returning", "'%s' is still being un-archived; try again in a minute" % a)
+    current = role_contents(name)
+    expected = args.get("expected")
+    if expected is not None:
+        if not isinstance(expected, dict) or not isinstance(expected.get("agents"), list):
+            raise Refused("bad_request", "expected must be {\"agents\": [...]}")
+        want = sorted(a["name"] if isinstance(a, dict) else a for a in expected["agents"])
+        if want != sorted(a["name"] for a in current["agents"]):
+            raise Refused("contents_changed", "the agents holding this role changed since you looked; check the list again",
+                          current)
+    agents = [a["name"] for a in current["agents"]]
+    for a in agents:
+        claim(os.path.join(IDENTITIES, a), entry["id"], "role:%s" % name)
+    claim(d, entry["id"], "user" if expected is not None else "note", {"agents": agents})
+    wake_supervisor()
+    log("role '%s' archive claimed with %d agent(s); the supervisor finishes it" % (name, len(agents)))
+    return {"role": name, "claimed": agents}
+
+
+def do_role_unarchive(args, entry, save_plan):
+    name = check_name(args, pattern=ROLE_RE)
+    live, arch = os.path.join(ROLES, name), os.path.join(ROLES_ARCHIVE, name)
+    if not os.path.isdir(arch):
+        if os.path.isdir(live) and claim_of(live) is None:
+            return {"role": name, "already": True}
+        if os.path.isdir(live):
+            raise Refused("still_archiving", "it's still being archived; try again in a minute")
+        raise Refused("archive_not_found", "'%s' isn't in the archive" % name)
+    if os.path.exists(live):
+        raise Refused("name_collision", "a live role named '%s' already exists on this machine" % name)
+    for n in (CLAIM, ".unarchive-requested", ".unarchive-refused", ".archive-requested"):
+        try:
+            os.unlink(os.path.join(arch, n))
+        except OSError:
+            pass
+    os.makedirs(ROLES, exist_ok=True)
+    os.rename(arch, live)
+    log("role '%s' un-archived" % name)
+    return {"role": name}
+
+
+def do_app_archive(args, entry, save_plan):
+    slug = check_name(args, "slug", APP_SLUG_RE, "slug")
+    d = os.path.join(APPS, slug)
+    if not os.path.isdir(d):
+        if os.path.isdir(os.path.join(APPS_ARCHIVE, slug)):
+            return {"slug": slug, "alreadyArchived": True}
+        where = find_app(slug)
+        if where and os.path.realpath(where).startswith(os.path.realpath(PROJECTS) + os.sep):
+            raise Refused("project_app", "a project's apps are archived with the project")
+        if where:
+            raise Refused("conversation_app", "a conversation's apps are archived with the conversation")
+        raise Refused("not_found", "there's no app '%s' on this machine" % slug)
+    if os.path.exists(os.path.join(APPS_ARCHIVE, slug)):
+        raise Refused("archive_slot_taken", "an archived app named '%s' is already in the archive" % slug)
+    if not os.path.isfile(ARCHIVE_APP):
+        raise Failed("archive_app_missing", "archive-app.sh is missing on this machine")
+    with Lock(CREATE_LOCK, "the app create lock"):
+        rc, out = run(["bash", ARCHIVE_APP, slug], timeout=90)
+    for line in out.splitlines():
+        if line.strip():
+            log("  archive-app.sh[%s]: %s" % (slug, line))
+    if rc != 0:
+        tail = [ln for ln in out.splitlines() if ln.strip()]
+        raise Failed("archive_failed", tail[-1] if tail else "archive-app.sh failed (%d)" % rc)
+    try:
+        os.unlink(os.path.join(APPS_ARCHIVE, slug, ".archive-requested"))
+    except OSError:
+        pass
+    return {"slug": slug}
+
+
+def unit_lines(pattern):
+    """Every line of the installed unit files matching `pattern` (a glob in UNIT_DIR)."""
+    import glob
+    out = set()
+    for f in glob.glob(os.path.join(UNIT_DIR, pattern)):
+        try:
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                out.update(ln.rstrip("\n") for ln in fh)
+        except OSError:
+            pass
+    return out
+
+
+def do_app_unarchive(args, entry, save_plan):
+    slug = check_name(args, "slug", APP_SLUG_RE, "slug")
+    live, arch = os.path.join(APPS, slug), os.path.join(APPS_ARCHIVE, slug)
+    if not os.path.isdir(arch):
+        if os.path.isdir(live):
+            return {"slug": slug, "already": True}
+        raise Refused("archive_not_found", "'%s' isn't in the archive" % slug)
+    if os.path.exists(live):
+        raise Refused("name_collision", "a live app named '%s' already exists on this machine" % slug)
+    sock = os.path.join(arch, "app-%s.socket.archived" % slug)
+    svc = os.path.join(arch, "app-%s.service.archived" % slug)
+    current_style = os.path.isfile(sock)
+    if current_style:
+        if os.path.exists(os.path.join(UNIT_DIR, "app-%s.socket" % slug)) or \
+                os.path.exists(os.path.join(UNIT_DIR, "app-%s.service" % slug)):
+            raise Refused("units_installed", "units for app-%s are already installed" % slug)
+        m = None
+        with open(sock, encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                m = m or re.match(r"^ListenStream=127\.0\.0\.1:(\d+)$", ln.strip())
+    else:
+        if os.path.exists(os.path.join(UNIT_DIR, "app-%s.service" % slug)):
+            raise Refused("units_installed", "units for app-%s are already installed" % slug)
+        if not os.path.isfile(svc):
+            raise Refused("no_stash", "its saved units are missing, so its port can't be restored")
+        m = None
+        with open(svc, encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                m = m or re.match(r"^Environment=PORT=(\d+)$", ln.strip())
+    if not m:
+        raise Refused("no_stash", "its port can't be read from its saved units")
+    port = m.group(1)
+    with Lock(CREATE_LOCK, "the app create lock"):
+        if ("ListenStream=127.0.0.1:%s" % port) in unit_lines("app-*.socket") or \
+                ("Environment=PORT=%s" % port) in unit_lines("app-*.service"):
+            raise Refused("port_in_use", "its port %s is now used by another app on this machine" % port)
+        for n in (".unarchive-requested", ".unarchive-refused", ".archive-requested"):
+            try:
+                os.unlink(os.path.join(arch, n))
+            except OSError:
+                pass
+        os.makedirs(APPS, exist_ok=True)
+        os.rename(arch, live)
+        if not current_style:
+            os.makedirs(UNIT_DIR, exist_ok=True)
+            import shutil
+            shutil.copyfile(os.path.join(live, os.path.basename(svc)), os.path.join(UNIT_DIR, "app-%s.service" % slug))
+            os.unlink(os.path.join(live, os.path.basename(svc)))
+    if current_style:
+        rc, out = run(["bash", APP_UNITS, "restore", slug, live], timeout=60)
+        if rc != 0:
+            raise Failed("restore_failed", "it's back but couldn't be started: %s" % (out.strip()[-200:] or rc))
+    else:
+        run([SYSTEMCTL, "--user", "daemon-reload"])
+        rc, out = run([SYSTEMCTL, "--user", "enable", "--now", "app-%s.service" % slug])
+        if rc != 0:
+            raise Failed("restore_failed", "it's back but couldn't be started: %s" % (out.strip()[-200:] or rc))
+    log("app '%s' un-archived on port %s" % (slug, port))
+    return {"slug": slug, "port": int(port)}
+
+
 HANDLERS = {
     "app-move": do_app_move,
     "project-contents": do_project_contents,
     "project-archive": do_project_archive,
+    "agent-archive": do_agent_archive,
+    "agent-unarchive": do_agent_unarchive,
+    "role-contents": do_role_contents,
+    "role-archive": do_role_archive,
+    "role-unarchive": do_role_unarchive,
+    "app-archive": do_app_archive,
+    "app-unarchive": do_app_unarchive,
 }
 
 
@@ -660,6 +1109,7 @@ def known_ids():
         i = id_of(name)
         if i:
             ids.add(i)
+    ids.update(n[:-5] for n in list_json(BACKGROUND))
     return ids
 
 
@@ -714,8 +1164,8 @@ def carry_out(name):
         return
     rid = entry["id"]
     out_path = os.path.join(OUTCOMES, rid + ".json")
-    if os.path.exists(out_path):
-        os.unlink(path)  # finished before a restart; only the clean-up was left
+    if os.path.exists(out_path) or os.path.exists(os.path.join(BACKGROUND, rid + ".json")):
+        os.unlink(path)  # finished (or handed off) before a restart; only the clean-up was left
         return
     resumed = entry.get("state") == "running"
 
@@ -733,6 +1183,13 @@ def carry_out(name):
             write_json_atomic(path, entry)
             result = HANDLERS[entry["kind"]](entry["args"], entry, save_plan)
         outcome.update(state="done", result=result)
+    except HandedOff:
+        entry["state"] = "finishing"
+        entry["handed_off_at"] = time.time()
+        write_json_atomic(os.path.join(BACKGROUND, rid + ".json"), entry)
+        os.unlink(path)
+        log("request #%d %s accepted in %.1fs; finishing in the background" % (entry["seq"], entry["kind"], time.time() - t0))
+        return
     except Refused as e:
         outcome.update(state="refused", code=e.code, reason=e.reason)
         if e.result is not None:
@@ -800,7 +1257,16 @@ def where_is(rid):
     outcome = read_json(os.path.join(OUTCOMES, rid + ".json"))
     if isinstance(outcome, dict):
         outcome.pop("finished_at", None)
+        res = outcome.get("result")
+        if outcome.get("state") == "done" and isinstance(res, dict) and isinstance(res.get("claimed"), list):
+            # An archive is done once claimed; its clean-up may still be running.
+            f = finishing(res["claimed"], res.get("role") if outcome.get("kind") == "role-archive" else None)
+            if f:
+                outcome["finishing"] = f
         return outcome
+    bg = read_json(os.path.join(BACKGROUND, rid + ".json"))
+    if isinstance(bg, dict):
+        return {"id": rid, "seq": bg.get("seq"), "kind": bg.get("kind"), "state": "running", "stage": "finishing"}
     journal = list_json(JOURNAL)
     for i, name in enumerate(journal):
         if id_of(name) == rid:
@@ -880,6 +1346,44 @@ def status(argv):
     print(json.dumps(wait_for(argv[0], wait_s), separators=(",", ":")))
 
 
+def finish(argv):
+    """fleet-change finish <id> done|refused|failed [--code C] [--reason R] [--result JSON]
+    The outcome of a request that was finished in the background."""
+    opts = {}
+    for key in ("--code", "--reason", "--result"):
+        if key in argv:
+            i = argv.index(key)
+            if i + 1 >= len(argv):
+                usage("%s needs a value" % key)
+            opts[key[2:]] = argv[i + 1]
+            del argv[i:i + 2]
+    if len(argv) != 2 or not ID_RE.match(argv[0]) or argv[1] not in ("done", "refused", "failed"):
+        usage("finish takes a request id and done|refused|failed")
+    rid, state = argv
+    out_path = os.path.join(OUTCOMES, rid + ".json")
+    bg_path = os.path.join(BACKGROUND, rid + ".json")
+    if os.path.exists(out_path):
+        print(json.dumps(where_is(rid), separators=(",", ":")))
+        return
+    bg = read_json(bg_path)
+    if not isinstance(bg, dict):
+        usage("there's no request %s being finished in the background" % rid)
+    outcome = {"id": rid, "seq": bg.get("seq"), "kind": bg.get("kind"), "state": state}
+    if state != "done":
+        outcome["code"] = opts.get("code") or state
+        outcome["reason"] = opts.get("reason") or ""
+    if "result" in opts:
+        try:
+            outcome["result"] = json.loads(opts["result"])
+        except ValueError:
+            usage("--result isn't valid JSON")
+    outcome["finished_at"] = time.time()
+    ensure_dirs()
+    write_json_atomic(out_path, outcome)
+    os.unlink(bg_path)
+    print(json.dumps(where_is(rid), separators=(",", ":")))
+
+
 def hold_lock(argv):
     if len(argv) != 2 or argv[0] != "--parent" or not argv[1].isdigit():
         usage("hold-lock takes --parent <pid>")
@@ -912,6 +1416,8 @@ def main():
         serve(until_idle=bool(rest))
     elif cmd == "hold-lock":
         hold_lock(rest)
+    elif cmd == "finish":
+        finish(rest)
     elif cmd == "kinds":
         print(json.dumps({"kinds": list(KINDS)}))
     else:

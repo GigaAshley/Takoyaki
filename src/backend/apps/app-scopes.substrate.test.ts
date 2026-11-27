@@ -8,7 +8,8 @@
  *     move note to the front door, its turn at the change lock, and stopping
  *     the apps of an archived project.
  *   - fleet-change.test.sh: the front door — requests in arrival order, one
- *     at a time under the change lock; app moves and project archives.
+ *     at a time under the change lock; app moves, project archives, and
+ *     archiving and un-archiving agents, roles and apps.
  */
 
 import { execFileSync } from "node:child_process";

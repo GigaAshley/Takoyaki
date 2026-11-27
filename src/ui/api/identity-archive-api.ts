@@ -1,32 +1,24 @@
-import { authApi, handleApiError } from "@/main-axios";
+import { inMachineOrder, sendMachineChange, type MachineChangeAnswer } from "@/api/machine-changes-api";
 
-// ─── Phase 115 Plan 115-06 (D-07 / D-08 / D-17) — archiveIdentity ───────────
-//
-// One-shot POST that drops the `.archive-requested` intent sentinel on the
-// identity's home host. The backend route (115-03) handles the fanout via
-// writeIdentityFile; this frontend helper is a thin fetch wrapper mirroring
-// the sibling identities-api.ts shape.
-//
-// Endpoint:  POST /identities/:key/archive
-// Body:      { hostId: number }
-// Response:  { ok: true }
-//
-// Errors are surfaced through handleApiError (main-axios.ts) so the caller
-// sees the same ApiError / message shape every other API surface produces —
-// keeps the panel's catch-and-log path uniform.
-//
-// No un-archive companion by design (D-05). No batch shape. One identity,
-// one call. If the user needs to archive N identities she clicks N times.
-
-export async function archiveIdentity(
+/**
+ * Archive an agent. The machine's front door takes it in the order this
+ * machine's changes were clicked (sent one after another) and claims it at
+ * once — from then on it's gone everywhere and stopped; the machine finishes
+ * the rest in the background. Resolves with the machine's answer (done, or
+ * `done: false` if it was still waiting its turn after asking again); a
+ * refusal rejects with a MachineChangeError carrying the machine's reason.
+ */
+export function archiveIdentity(
   hostId: number,
   identityKey: string,
-): Promise<{ ok: true }> {
-  try {
-    const url = `/identities/${encodeURIComponent(identityKey)}/archive`;
-    const response = await authApi.post(url, { hostId });
-    return response.data as { ok: true };
-  } catch (error) {
-    handleApiError(error, "archive identity");
-  }
+  onStillWorking?: () => void,
+): Promise<MachineChangeAnswer<unknown>> {
+  return inMachineOrder(hostId, () =>
+    sendMachineChange(
+      hostId,
+      { method: "post", url: `/identities/${encodeURIComponent(identityKey)}/archive`, body: { hostId } },
+      "archive the agent",
+      { followUp: "status", onStillWorking },
+    ),
+  );
 }

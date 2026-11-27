@@ -79,9 +79,10 @@ describe("Phase 143 Plan 143-05 Task 1 — unarchiveRole", () => {
     expect(authApi.post).toHaveBeenCalledTimes(1);
     expect(authApi.post).toHaveBeenCalledWith(
       "/roles/ops-oncall/unarchive",
-      { hostId: 42 },
+      { hostId: 42, requestId: expect.any(String) },
+      { timeout: 60_000 },
     );
-    expect(result).toEqual({ ok: true });
+    expect(result).toEqual({ ok: true, outcome: "restored" });
   });
 
   // Test 2 (409 name_collision): live role with same name exists.

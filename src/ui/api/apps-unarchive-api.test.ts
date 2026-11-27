@@ -77,8 +77,8 @@ describe("Phase 143 Plan 143-05 Task 1 — unarchiveApp", () => {
     const result = await unarchiveApp(42, "my-app");
 
     expect(authApi.post).toHaveBeenCalledTimes(1);
-    expect(authApi.post).toHaveBeenCalledWith("/apps/42/my-app/unarchive");
-    expect(result).toEqual({ ok: true });
+    expect(authApi.post).toHaveBeenCalledWith("/apps/42/my-app/unarchive", { requestId: expect.any(String) }, { timeout: 60_000 });
+    expect(result).toEqual({ ok: true, outcome: "restored" });
   });
 
   // Test 2 (409 name_collision): live app with same slug exists on this host.

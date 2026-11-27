@@ -64,7 +64,11 @@ import { isRecognizedVoiceId } from "../../voice/tts-provider.js";
 // Plan 92-02 Task 1: per-identity `.pinned` sentinel probe. identityFileExists is
 // the read-side of the D-05 wire — a fail-closed stat against
 // `~/fleet/identities/<identityKey>/.pinned` on the identity's host.
-import { identityFileExists } from "../../claude-session/per-identity-file.js";
+import {
+  assertNotBeingArchived,
+  IdentityBeingArchivedError,
+  identityFileExists,
+} from "../../claude-session/per-identity-file.js";
 import { getHostSemaphore } from "../../ssh/host-semaphore-registry.js";
 
 import { getAvatarVersion, forgetAvatarVersion } from "../../fleet-status/avatar-version-registry.js";
@@ -725,6 +729,8 @@ router.put(
       }
 
       try {
+        // An agent whose archive is claimed is archived from every point of view: no edits.
+        await assertNotBeingArchived(identityKey, { hostId, conn });
         // ---- Read the existing on-disk identity file ----
         const { markdown: existing } = await readIdentityFile(conn, identityKey);
         if (!existing || existing.length === 0) {
@@ -984,6 +990,9 @@ router.put(
           ),
         );
       } catch (e) {
+        if (e instanceof IdentityBeingArchivedError) {
+          return res.status(409).json({ error: "it's being archived", code: "being_archived" });
+        }
         databaseLogger.error("Failed to update identity on disk", e, {
           operation: "update_identity_disk_write",
           userId,

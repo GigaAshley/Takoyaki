@@ -76,8 +76,8 @@ describe("Phase 143 Plan 143-05 Task 1 — unarchiveIdentity", () => {
   });
 
   // Test 1 (happy): unarchiveIdentity issues POST /identities/wren/unarchive
-  //                 with body { hostId } and returns the parsed response.
-  it("Test 1 (happy): unarchiveIdentity(42, 'wren') POSTs /identities/wren/unarchive with body { hostId: 42 } and a long timeout, and returns the outcome", async () => {
+  //                 with body { hostId, requestId } and returns the outcome.
+  it("Test 1 (happy): unarchiveIdentity(42, 'wren') POSTs /identities/wren/unarchive with { hostId: 42, requestId }, and returns the outcome", async () => {
     vi.mocked(authApi.post).mockResolvedValueOnce({ data: { ok: true, outcome: "restored" } });
 
     const result = await unarchiveIdentity(42, "wren");
@@ -85,15 +85,32 @@ describe("Phase 143 Plan 143-05 Task 1 — unarchiveIdentity", () => {
     expect(authApi.post).toHaveBeenCalledTimes(1);
     expect(authApi.post).toHaveBeenCalledWith(
       "/identities/wren/unarchive",
-      { hostId: 42 },
-      { timeout: 180_000 },
+      { hostId: 42, requestId: expect.any(String) },
+      { timeout: 60_000 },
     );
     expect(result).toEqual({ ok: true, outcome: "restored" });
   });
 
-  it("Test 1b (pending): an outcome other than restored comes back as pending", async () => {
+  it("Test 1b (pending): once accepted it's followed up by id until it's back", async () => {
     vi.mocked(authApi.post).mockResolvedValueOnce({ data: { ok: true, outcome: "pending" } });
-    expect(await unarchiveIdentity(42, "wren")).toEqual({ ok: true, outcome: "pending" });
+    vi.mocked(authApi.get)
+      .mockResolvedValueOnce({ status: 202, data: { pending: true } })
+      .mockResolvedValueOnce({ status: 200, data: { ok: true } });
+    expect(await unarchiveIdentity(42, "wren")).toEqual({ ok: true, outcome: "restored" });
+    const id = (vi.mocked(authApi.post).mock.calls[0][1] as { requestId: string }).requestId;
+    expect(authApi.get).toHaveBeenCalledWith(`/machine-changes/42/${id}`, { timeout: 60_000 });
+  });
+
+  it("Test 1d (refused after acceptance): the machine's later refusal comes back as an UnarchiveError", async () => {
+    vi.mocked(authApi.post).mockResolvedValueOnce({ data: { ok: true, outcome: "pending" } });
+    vi.mocked(authApi.get).mockRejectedValueOnce(
+      makeAxiosError(409, { code: "refused", error: "the backend refused to reactivate the chat account (not_agent)" }),
+    );
+    await expect(unarchiveIdentity(42, "wren")).rejects.toMatchObject({
+      name: "UnarchiveError",
+      reason: "refused",
+      message: "the backend refused to reactivate the chat account (not_agent)",
+    });
   });
 
   it("Test 1c (409 refused): throws UnarchiveError reason 'refused' carrying the supervisor's message", async () => {

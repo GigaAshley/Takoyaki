@@ -120,71 +120,12 @@ test_restore_only_touches_stashed_apps() {
   rm -rf "$s"
 }
 
-stash_current_style() {   # <archive-dir> <slug> <port>
-  printf '[Socket]\nListenStream=127.0.0.1:%s\n' "$3" > "$1/app-$2.socket.archived"
-  printf '[Service]\nEnvironment=PORT=%s\n' "$(( $3 + 10000 ))" > "$1/app-$2.service.archived"
-}
-
-test_unarchive_current_style_moves_and_restores() {
-  local s; s=$(setup)
-  mkdir -p "$s/apps-archive/tally"
-  stash_current_style "$s/apps-archive/tally" tally 9510
-  : > "$s/apps-archive/tally/.unarchive-requested"
-  ( source_supervisor "$s"; scan_app_unarchive_requested_sentinels >/dev/null 2>&1 )
-  assert_exists "$s/apps/tally" "folder moved to live"
-  assert_absent "$s/apps-archive/tally" "archive slot emptied"
-  assert_absent "$s/apps/tally/.unarchive-requested" "sentinel deleted"
-  assert_eq "restore tally $s/apps/tally" "$(cat "$s/calls")" "restore called"
-  rm -rf "$s"
-}
-
-test_unarchive_current_style_refuses_taken_port() {
-  local s; s=$(setup)
-  mkdir -p "$s/apps-archive/tally"
-  stash_current_style "$s/apps-archive/tally" tally 9510
-  : > "$s/apps-archive/tally/.unarchive-requested"
-  printf '[Socket]\nListenStream=127.0.0.1:9510\n' > "$s/units/app-other.socket"
-  ( source_supervisor "$s"; scan_app_unarchive_requested_sentinels >/dev/null 2>&1 )
-  assert_exists "$s/apps-archive/tally" "folder stays archived"
-  assert_absent "$s/apps-archive/tally/.unarchive-requested" "sentinel deleted (permanent refuse)"
-  assert_eq "" "$(cat "$s/calls")" "no restore"
-  rm -rf "$s"
-}
-
-test_unarchive_current_style_refuses_old_style_port_holder() {
-  local s; s=$(setup)
-  mkdir -p "$s/apps-archive/tally"
-  stash_current_style "$s/apps-archive/tally" tally 9510
-  : > "$s/apps-archive/tally/.unarchive-requested"
-  printf '[Service]\nEnvironment=PORT=9510\n' > "$s/units/app-legacy.service"
-  ( source_supervisor "$s"; scan_app_unarchive_requested_sentinels >/dev/null 2>&1 )
-  assert_exists "$s/apps-archive/tally" "folder stays archived"
-  assert_eq "" "$(cat "$s/calls")" "no restore"
-  rm -rf "$s"
-}
-
-test_unarchive_old_style_does_not_use_app_units() {
-  local s; s=$(setup)
-  mkdir -p "$s/apps-archive/legacy"
-  printf '[Service]\nWorkingDirectory=%s\nEnvironment=PORT=9520\n' "$s/apps/legacy" > "$s/apps-archive/legacy/app-legacy.service.archived"
-  : > "$s/apps-archive/legacy/.unarchive-requested"
-  ( source_supervisor "$s"; scan_app_unarchive_requested_sentinels >/dev/null 2>&1 )
-  assert_exists "$s/apps/legacy" "folder moved to live"
-  assert_exists "$s/units/app-legacy.service" "old-style unit installed by the existing path"
-  assert_eq "" "$(cat "$s/calls")" "app-units.sh untouched"
-  rm -rf "$s"
-}
-
 printf 'agent-supervisor convo-apps tests\n'
 run_test test_retire_stashes_and_uninstalls_each_app
 run_test test_retire_uninstalls_even_when_stash_fails
 run_test test_retire_without_apps_is_a_noop
 run_test test_retire_skips_invalid_folder_names
 run_test test_restore_only_touches_stashed_apps
-run_test test_unarchive_current_style_moves_and_restores
-run_test test_unarchive_current_style_refuses_taken_port
-run_test test_unarchive_current_style_refuses_old_style_port_holder
-run_test test_unarchive_old_style_does_not_use_app_units
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 if [ "$FAIL" -gt 0 ]; then

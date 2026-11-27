@@ -15,7 +15,7 @@
 //      bounded whitelist — future entries must be added deliberately).
 //   T5 REMOTE with null conn throws "conn required for remote host" verbatim.
 //   T6 ALLOWED_APP_REL_PATHS stays minimal — exactly two entries
-//      (".archive-requested", "app.json"). Pins the whitelist so a future
+//      ("app.json", "app.json"). Pins the whitelist so a future
 //      shape adding more entries has to update this test deliberately.
 //   T7 LOCAL honors APPS_HOST_DIR env override (containerized-Skynet
 //      bind-mount case — mirrors per-identity-file's IDENTITIES_HOST_DIR
@@ -141,16 +141,16 @@ afterEach(async () => {
 // ──────────────────────────────────────────────────────────────────────
 
 describe("writeAppFile — LOCAL branch", () => {
-  it("Test 1: writes empty .archive-requested at <APPS_HOST_DIR>/<slug>/ via tmp+rename; tmp gone after", async () => {
+  it("Test 1: writes empty app.json at <APPS_HOST_DIR>/<slug>/ via tmp+rename; tmp gone after", async () => {
     const appDir = path.join(scratchRoot, "my-app");
     await fs.mkdir(appDir, { recursive: true });
 
-    await writeAppFile("my-app", ".archive-requested", "", {
+    await writeAppFile("my-app", "app.json", "", {
       hostId: LOCAL_HOST_ID,
       conn: null,
     });
 
-    const finalPath = path.join(appDir, ".archive-requested");
+    const finalPath = path.join(appDir, "app.json");
     const stat = await fs.stat(finalPath);
     expect(stat.isFile()).toBe(true);
     expect(stat.size).toBe(0);
@@ -171,7 +171,7 @@ describe("writeAppFile — REMOTE branch", () => {
   it("Test 2: delegates to writeMarkdownFileAtomic with RELATIVE fleet/apps/<slug>/<relPath> path", async () => {
     const { conn, sftp, renameCalls } = buildMockConn();
 
-    await writeAppFile("my-app", ".archive-requested", "", {
+    await writeAppFile("my-app", "app.json", "", {
       hostId: REMOTE_HOST_ID,
       conn,
     });
@@ -181,13 +181,13 @@ describe("writeAppFile — REMOTE branch", () => {
 
     expect(renameCalls).toHaveLength(1);
     expect(renameCalls[0].to).toBe(
-      "fleet/apps/my-app/.archive-requested",
+      "fleet/apps/my-app/app.json",
     );
 
     expect(sftp.writeFile).toHaveBeenCalledTimes(1);
     const writeArgs = sftp.writeFile.mock.calls[0];
     expect(writeArgs[0]).toBe(
-      "fleet/apps/my-app/.archive-requested.tmp",
+      "fleet/apps/my-app/app.json.tmp",
     );
     const writtenBuf = writeArgs[1] as Buffer;
     expect(Buffer.isBuffer(writtenBuf)).toBe(true);
@@ -204,14 +204,14 @@ describe("writeAppFile — slug gate (APP_SLUG_RE /^[a-z0-9-]{1,64}$/)", () => {
     const { conn, sftp } = buildMockConn();
 
     await expect(
-      writeAppFile("BadSlug!", ".archive-requested", "", {
+      writeAppFile("BadSlug!", "app.json", "", {
         hostId: REMOTE_HOST_ID,
         conn,
       }),
     ).rejects.toThrow(/invalid app slug/);
 
     await expect(
-      writeAppFile("BadSlug!", ".archive-requested", "", {
+      writeAppFile("BadSlug!", "app.json", "", {
         hostId: REMOTE_HOST_ID,
         conn,
       }),
@@ -225,7 +225,7 @@ describe("writeAppFile — slug gate (APP_SLUG_RE /^[a-z0-9-]{1,64}$/)", () => {
     const writeSpy = vi.spyOn(fs, "writeFile");
 
     await expect(
-      writeAppFile("../etc/passwd", ".archive-requested", "", {
+      writeAppFile("../etc/passwd", "app.json", "", {
         hostId: LOCAL_HOST_ID,
         conn: null,
       }),
@@ -257,7 +257,7 @@ describe("writeAppFile — relPath gate (ALLOWED_APP_REL_PATHS bounded whitelist
         hostId: REMOTE_HOST_ID,
         conn,
       }),
-    ).rejects.toThrow(/\.archive-requested/);
+    ).rejects.toThrow(/\app.json/);
 
     expect(writeSpy).not.toHaveBeenCalled();
     expect(sftp.writeFile).not.toHaveBeenCalled();
@@ -288,7 +288,7 @@ describe("writeAppFile — relPath gate (ALLOWED_APP_REL_PATHS bounded whitelist
 describe("writeAppFile — REMOTE null conn contract", () => {
   it("Test 5: throws 'conn required for remote host' when REMOTE hostId + null conn", async () => {
     await expect(
-      writeAppFile("my-app", ".archive-requested", "", {
+      writeAppFile("my-app", "app.json", "", {
         hostId: REMOTE_HOST_ID,
         conn: null,
       }),
@@ -301,11 +301,10 @@ describe("writeAppFile — REMOTE null conn contract", () => {
 // ──────────────────────────────────────────────────────────────────────
 
 describe("ALLOWED_APP_REL_PATHS — bounded-scope discipline", () => {
-  it("Test 6: whitelist contains exactly '.archive-requested' and 'app.json'", () => {
+  it("Test 6: whitelist contains exactly 'app.json' (archiving is a request to the machine's front door)", () => {
     expect(ALLOWED_APP_REL_PATHS).toBeInstanceOf(Set);
-    expect(ALLOWED_APP_REL_PATHS.size).toBe(2);
-    expect([...ALLOWED_APP_REL_PATHS]).toEqual([".archive-requested", "app.json"]);
-    expect(ALLOWED_APP_REL_PATHS.has(".archive-requested")).toBe(true);
+    expect([...ALLOWED_APP_REL_PATHS]).toEqual(["app.json"]);
+    expect(ALLOWED_APP_REL_PATHS.has(".archive-requested")).toBe(false);
     // Anti-drift check — identity/role-scoped entries MUST NOT be in the
     // app whitelist.
     expect(ALLOWED_APP_REL_PATHS.has(".pinned")).toBe(false);
@@ -322,12 +321,12 @@ describe("writeAppFile — LOCAL env-honoring path resolution", () => {
     const appDir = path.join(scratchRoot, "my-app");
     await fs.mkdir(appDir, { recursive: true });
 
-    await writeAppFile("my-app", ".archive-requested", "", {
+    await writeAppFile("my-app", "app.json", "", {
       hostId: LOCAL_HOST_ID,
       conn: null,
     });
 
-    const finalPath = path.join(scratchRoot, "my-app", ".archive-requested");
+    const finalPath = path.join(scratchRoot, "my-app", "app.json");
     const stat = await fs.stat(finalPath);
     expect(stat.isFile()).toBe(true);
 
@@ -336,7 +335,7 @@ describe("writeAppFile — LOCAL env-honoring path resolution", () => {
       "fleet",
       "apps",
       "my-app",
-      ".archive-requested",
+      "app.json",
     );
     if (homedirFallback !== finalPath) {
       await expect(fs.stat(homedirFallback)).rejects.toThrow(/ENOENT/);

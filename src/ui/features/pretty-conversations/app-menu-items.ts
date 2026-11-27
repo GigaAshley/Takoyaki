@@ -258,11 +258,11 @@ export function buildAppMenuItems(
         markPendingAppArchive(app.hostId, app.slug);
         publishAppGone(app.hostId, app.slug);
         onArchive?.(Number(app.hostId), app.slug, app.title);
-        // errMessage flows from handleApiError; the backend archive endpoint
-        // redacts internal errors (generic 500 body), so the alert stays at
-        // transport-level granularity. If that contract widens, review.
+        // A refusal or failure carries the machine's reason (MachineChangeError).
         try {
-          await archiveApp(Number(app.hostId), app.slug);
+          await archiveApp(Number(app.hostId), app.slug, () => {
+            toast(`Still archiving "${app.title}"`, { description: "The machine is still working on it." });
+          });
         } catch (err) {
           // Rollback: the next fleet-status pulse re-inserts the tile. Closed
           // panes are NOT re-opened — the alert lets the user do it by hand.
@@ -274,7 +274,10 @@ export function buildAppMenuItems(
             slug: app.slug,
             errMessage,
           });
-          void kitAlert({ title: `Couldn't archive "${app.title}"`, body: errMessage });
+          void kitAlert({
+            title: `Couldn't archive "${app.title}"`,
+            body: err instanceof MachineChangeError ? reasonSentence(errMessage) : errMessage,
+          });
         }
       },
     },

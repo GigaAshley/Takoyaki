@@ -31,6 +31,7 @@ export const m = {
   listArchivedRoles: vi.fn(),
   unarchiveRole: vi.fn(),
   archiveRole: vi.fn(),
+  getRoleArchivePreflight: vi.fn(),
   // role file
   getRoleFileByName: vi.fn(),
   updateRoleFileByName: vi.fn(),
@@ -91,7 +92,15 @@ export function resetRolesWindowMocks(): void {
   m.removeInstanceWide.mockResolvedValue({ hostCount: 4 });
   m.listArchivedRoles.mockResolvedValue([]);
   m.unarchiveRole.mockResolvedValue({ ok: true });
-  m.archiveRole.mockResolvedValue({ ok: true });
+  m.archiveRole.mockResolvedValue({ done: true, requestId: "r", result: {} });
+  // The machine's answer to "who holds this role": the store's agents on that machine.
+  m.getRoleArchivePreflight.mockImplementation(async (hostId: number, name: string) => ({
+    role: name,
+    displayName: name,
+    agents: store.identities
+      .filter((i) => i.hostId === hostId && Array.isArray(i.roles) && (i.roles as string[]).includes(name))
+      .map((i) => ({ name: i.identityKey, displayName: i.displayName, task: i.task ?? "" })),
+  }));
   m.getRoleFileByName.mockResolvedValue({ markdown: DEFAULT_ROLE_FILE });
   m.updateRoleFileByName.mockImplementation(async (_name: string, _hostId: number, markdown: string) => ({ markdown }));
   m.listRoleSkills.mockResolvedValue([]);
@@ -151,7 +160,10 @@ export async function roleUnarchiveApi(orig: Orig): Promise<Record<string, unkno
 }
 
 export function roleArchiveApi(): Record<string, unknown> {
-  return { archiveRole: (...a: unknown[]) => m.archiveRole(...a) };
+  return {
+    archiveRole: (...a: unknown[]) => m.archiveRole(...a),
+    getRoleArchivePreflight: (...a: unknown[]) => m.getRoleArchivePreflight(...a),
+  };
 }
 
 export async function claudeSessionApi(orig: Orig): Promise<Record<string, unknown>> {

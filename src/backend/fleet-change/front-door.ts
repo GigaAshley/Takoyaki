@@ -2,7 +2,7 @@
  * front-door.ts — send a change to a machine's front door (fleet-change) and
  * wait for its outcome.
  *
- * Every change to projects and apps on a machine is a request to fleet-change
+ * Every change to projects, apps, agents and roles on a machine is a request to fleet-change
  * (substrate/scripts/fleet-change): written down, numbered in arrival order
  * and carried out one at a time by the machine's listener. A remote machine is
  * reached with the short command over the SSH connection the route already
@@ -28,12 +28,27 @@ export const FRONT_DOOR_WAIT_S = 15;
 const EXEC_GRACE_MS = 10_000;
 const LOCAL_POLL_MS = 100;
 
-export type FrontDoorKind = "app-move" | "project-contents" | "project-archive";
+export type FrontDoorKind =
+  | "app-move"
+  | "project-contents"
+  | "project-archive"
+  | "agent-archive"
+  | "agent-unarchive"
+  | "role-contents"
+  | "role-archive"
+  | "role-unarchive"
+  | "app-archive"
+  | "app-unarchive";
+
+/** An archive is done once claimed; while the machine is still finishing it, what's left and
+ *  (for anything failing 10 minutes or more) why. */
+export type FrontDoorFinishing = { pending: string[]; stuck?: Record<string, string> };
 
 export type FrontDoorOutcome =
-  | { state: "done"; id: string; seq: number | null; result: unknown }
+  | { state: "done"; id: string; seq: number | null; result: unknown; finishing?: FrontDoorFinishing }
   | { state: "refused" | "failed"; id: string; seq: number | null; code: string; reason: string; result?: unknown }
-  | { state: "pending"; id: string; seq: number | null; stage: "received" | "queued" | "running" }
+  /** "finishing" = accepted, and being finished in the background (an agent un-archive). */
+  | { state: "pending"; id: string; seq: number | null; stage: "received" | "queued" | "running" | "finishing" }
   /** fleet-change isn't on the machine yet: its update after a deploy hasn't finished. */
   | { state: "not_installed"; id: string };
 
@@ -58,8 +73,10 @@ export function parseFrontDoorLine(id: string, line: string): FrontDoorOutcome {
   }
   const seq = typeof raw.seq === "number" ? raw.seq : null;
   switch (raw.state) {
-    case "done":
-      return { state: "done", id, seq, result: raw.result ?? null };
+    case "done": {
+      const f = raw.finishing as FrontDoorFinishing | undefined;
+      return { state: "done", id, seq, result: raw.result ?? null, ...(f && Array.isArray(f.pending) ? { finishing: f } : {}) };
+    }
     case "refused":
     case "failed":
       return {
@@ -73,7 +90,7 @@ export function parseFrontDoorLine(id: string, line: string): FrontDoorOutcome {
     case "received":
     case "queued":
     case "running":
-      return { state: "pending", id, seq, stage: raw.state };
+      return { state: "pending", id, seq, stage: raw.stage === "finishing" ? "finishing" : raw.state };
     case "not_installed":
       return { state: "not_installed", id };
     default:
@@ -181,13 +198,62 @@ function idOf(name: string): string | null {
   return i < 0 ? null : name.slice(i + 1, -".json".length);
 }
 
+/** Of the agents (and role) a done archive claimed, those whose clean-up isn't finished —
+ *  as fleet-change status works it out, from the claims in their folders. */
+async function localFinishing(outcome: Record<string, unknown>): Promise<FrontDoorFinishing | null> {
+  const res = outcome.result as { claimed?: unknown; role?: unknown } | null | undefined;
+  if (outcome.state !== "done" || !res || !Array.isArray(res.claimed)) return null;
+  const fleet = path.join(localHome(), "fleet");
+  const targets: [string, string][] = res.claimed
+    .filter((n): n is string => typeof n === "string" && /^[a-z0-9_-]{1,64}$/.test(n))
+    .map((n) => [n, path.join(fleet, "identities", n)]);
+  if (outcome.kind === "role-archive" && typeof res.role === "string" && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(res.role)) {
+    targets.push([res.role, path.join(fleet, "roles", res.role)]);
+  }
+  const pending: string[] = [];
+  const stuck: Record<string, string> = {};
+  for (const [name, dir] of targets) {
+    let claim: string;
+    try {
+      claim = await fs.readFile(path.join(dir, ".archiving"), "utf8");
+    } catch {
+      continue;
+    }
+    pending.push(name);
+    try {
+      const c = JSON.parse(claim) as { failing_since?: number; last_error?: string };
+      if (typeof c.failing_since === "number" && Date.now() / 1000 - c.failing_since >= 600 && c.last_error) {
+        stuck[name] = c.last_error;
+      }
+    } catch {
+      /* an empty or unreadable claim still counts as pending */
+    }
+  }
+  if (pending.length === 0) return null;
+  return Object.keys(stuck).length > 0 ? { pending, stuck } : { pending };
+}
+
 /** Where a request is: its outcome line, or how far it has got, or null when unseen. */
 async function whereIs(id: string): Promise<string | null> {
   const root = changesRoot();
   try {
-    return await fs.readFile(path.join(root, "outcomes", `${id}.json`), "utf8");
+    const line = await fs.readFile(path.join(root, "outcomes", `${id}.json`), "utf8");
+    try {
+      const outcome = JSON.parse(line) as Record<string, unknown>;
+      const finishing = await localFinishing(outcome);
+      if (finishing) return JSON.stringify({ ...outcome, finishing });
+    } catch {
+      /* parseFrontDoorLine reports an unreadable outcome */
+    }
+    return line;
   } catch {
     /* not finished */
+  }
+  try {
+    const bg = JSON.parse(await fs.readFile(path.join(root, "background", `${id}.json`), "utf8")) as { seq?: number; kind?: string };
+    return JSON.stringify({ id, seq: bg.seq ?? null, kind: bg.kind, state: "running", stage: "finishing" });
+  } catch {
+    /* not handed off */
   }
   for (const name of await listJson(path.join(root, "journal"))) {
     if (idOf(name) !== id) continue;
@@ -268,11 +334,39 @@ export async function frontDoorStatus(
   return line === null ? null : parseFrontDoorLine(id, line);
 }
 
+/**
+ * Send a request and keep asking about it, by its id, until it's finished or `totalS` has
+ * passed (then it comes back pending; the machine carries on with it).
+ */
+export async function submitAndFollow(
+  conn: SSHClientType | null,
+  kind: FrontDoorKind,
+  args: Record<string, unknown>,
+  opts: { id: string; hostId?: number; totalS: number },
+): Promise<FrontDoorOutcome> {
+  const deadline = Date.now() + opts.totalS * 1000;
+  let outcome = await submitFrontDoor(conn, kind, args, {
+    id: opts.id,
+    hostId: opts.hostId,
+    waitS: Math.min(FRONT_DOOR_WAIT_S, opts.totalS),
+  });
+  while (outcome.state === "pending" && Date.now() < deadline) {
+    const waitS = Math.max(1, Math.min(FRONT_DOOR_WAIT_S, Math.ceil((deadline - Date.now()) / 1000)));
+    const next = await frontDoorStatus(conn, opts.id, waitS);
+    if (next === null) break;
+    outcome = next;
+  }
+  return outcome;
+}
+
 /** The HTTP answer for an outcome a route doesn't treat specially. */
 export function frontDoorHttp(outcome: FrontDoorOutcome): { status: number; body: Record<string, unknown> } {
   switch (outcome.state) {
     case "done":
-      return { status: 200, body: { ok: true, requestId: outcome.id, result: outcome.result } };
+      return {
+        status: 200,
+        body: { ok: true, requestId: outcome.id, result: outcome.result, ...(outcome.finishing ? { finishing: outcome.finishing } : {}) },
+      };
     case "refused":
       return {
         status: 409,

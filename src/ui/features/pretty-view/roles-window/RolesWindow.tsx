@@ -384,7 +384,6 @@ export function RolesWindow({
             hostId: id,
             name: role.name,
             label: roleDisplayName(role.name, role.displayName),
-            agents: agentsHolding(role),
           }).then((ok) => {
             if (ok) noteArchived(role.name);
           });

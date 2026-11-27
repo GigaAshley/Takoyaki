@@ -54,6 +54,8 @@ import {
   getLocalIdentitiesRoot,
 } from "../../claude-session/identity-artifact-reader.js";
 
+const BEING_ARCHIVED = { error: "it's being archived", code: "being_archived" };
+
 const router = express.Router();
 const authManager = AuthManager.getInstance();
 const authenticateJWT = authManager.createAuthMiddleware();
@@ -202,6 +204,10 @@ router.put(
     if (isLocalHostId(hostId)) {
       // LOCAL BRANCH: write or remove the sentinel file
       const filePath = path.join(getLocalIdentitiesRoot(), key, ".no-dormancy");
+      // An agent whose archive is claimed takes no more changes (the machine's front door).
+      if (await fs.stat(path.join(getLocalIdentitiesRoot(), key, ".archiving")).then(() => true, () => false)) {
+        return res.status(409).json(BEING_ARCHIVED);
+      }
       try {
         if (present) {
           // Create or overwrite (idempotent)
@@ -234,9 +240,11 @@ router.put(
           // writeFile fails ENOENT (→ 500) for a nonexistent identity; a
           // `mkdir -p` here used to mint a ghost identity folder instead.
           // The sentinel prints MISSING when the identity dir is absent.
+          // A claimed archive (.archiving) prints ARCHIVING and changes nothing.
+          const claimed = `[ -e "$HOME/fleet/identities/${key}/.archiving" ]`;
           const cmd = present
-            ? `if [ -d "$HOME/fleet/identities/${key}" ]; then touch "$HOME/fleet/identities/${key}/.no-dormancy" && echo OK; else echo MISSING; fi`
-            : `rm -f "$HOME/fleet/identities/${key}/.no-dormancy"`;
+            ? `if ${claimed}; then echo ARCHIVING; elif [ -d "$HOME/fleet/identities/${key}" ]; then touch "$HOME/fleet/identities/${key}/.no-dormancy" && echo OK; else echo MISSING; fi`
+            : `if ${claimed}; then echo ARCHIVING; else rm -f "$HOME/fleet/identities/${key}/.no-dormancy"; fi`;
 
           const output = await Promise.race([
             execCommand(conn, cmd),
@@ -251,6 +259,9 @@ router.put(
             ),
           ]);
 
+          if (output.trim() === "ARCHIVING") {
+            return res.status(409).json(BEING_ARCHIVED);
+          }
           if (present && output.trim() === "MISSING") {
             databaseLogger.warn(
               `[identity-no-dormancy] identity dir missing on remote host hostId=${hostId} key=${key}`,

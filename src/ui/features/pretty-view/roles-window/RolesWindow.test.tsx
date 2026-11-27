@@ -358,7 +358,7 @@ describe("roles window — archived roles", () => {
     await openArchived();
     const callsBefore = m.listRolesForHost.mock.calls.length;
     fireEvent.click(screen.getByTestId("roles-window-unarchive-old-maintainer"));
-    expect(m.unarchiveRole).toHaveBeenCalledWith(HOST_ID, "old-maintainer");
+    expect(m.unarchiveRole).toHaveBeenCalledWith(HOST_ID, "old-maintainer", expect.any(Function));
     // In flight: the button is busy, nothing claimed yet.
     expect((screen.getByTestId("roles-window-unarchive-old-maintainer") as HTMLButtonElement).disabled).toBe(true);
     expect(screen.queryByText(/On its way back/)).toBeNull();

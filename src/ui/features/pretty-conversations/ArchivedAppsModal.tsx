@@ -39,6 +39,8 @@ import {
   type ArchivedAppListEntry,
 } from "@/api/apps-archive-list-api";
 import { unarchiveApp, UnarchiveError } from "@/api/apps-unarchive-api";
+import { reasonSentence } from "@/api/machine-changes-api";
+import { toast } from "sonner";
 import { clearPendingAppArchive } from "@/state/app-tiles-store";
 import {
   RowKebabContextMenuSurface,
@@ -100,7 +102,9 @@ export function ArchivedAppsModal({
 
     try {
       // STEP 1: endpoint first — row MUST NOT be removed before this resolves.
-      await unarchiveApp(entry.hostId, entry.slug);
+      await unarchiveApp(entry.hostId, entry.slug, () => {
+        toast(`Still un-archiving ${label}`, { description: "The machine is still working on it." });
+      });
       // Release any optimistic-archive mark this tab still holds for the
       // app, so the reconciler's restore re-surfaces the tile here too.
       clearPendingAppArchive(String(entry.hostId), entry.slug);
@@ -135,8 +139,11 @@ export function ArchivedAppsModal({
         err instanceof UnarchiveError && err.reason === "name_collision"
           ? // D-17 name_collision: distinct wording so the user knows what's blocking.
             "A live app with the same slug already exists."
-          : // D-17 generic fallback.
-            "Try again in a moment.";
+          : err instanceof UnarchiveError && err.reason === "refused"
+            ? // The machine's own reason (e.g. its port is now used by another app).
+              reasonSentence(err.message)
+            : // D-17 generic fallback.
+              "Try again in a moment.";
 
       await kitAlert({ title: `Couldn't un-archive ${label}`, body });
     } finally {

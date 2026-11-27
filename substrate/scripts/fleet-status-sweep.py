@@ -1439,6 +1439,10 @@ def _enumerate_identities(home):
                 if not SAFE_NAME_RE.match(name):
                     _log("identity_name_skipped", name=name[:40])
                     continue
+                # Its archive is claimed (the machine's front door): gone from every
+                # list now, while the supervisor finishes moving it into the archive.
+                if os.path.exists(os.path.join(entry.path, ".archiving")):
+                    continue
                 dormant = os.path.exists(os.path.join(entry.path, ".dormant"))
                 # Condense: the agent or the app drops .compact-requested;
                 # the supervisor holds .compacting while /compact runs.

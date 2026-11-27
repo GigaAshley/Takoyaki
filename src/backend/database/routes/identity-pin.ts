@@ -44,6 +44,8 @@ import { getHostSemaphore } from "../../ssh/host-semaphore-registry.js";
 import { getSubscriptionRegistry } from "../../fleet-status/subscription-registry.js";
 import {
   writeIdentityFile,
+  assertNotBeingArchived,
+  IdentityBeingArchivedError,
   removeIdentityFile,
 } from "../../claude-session/per-identity-file.js";
 
@@ -155,6 +157,7 @@ router.put(
       }
 
       try {
+        await assertNotBeingArchived(key, { hostId, conn });
         if (pinned) {
           await writeIdentityFile(key, ".pinned", "", { hostId, conn });
           await clearProjectOnPin(conn, key, hostId, userId);
@@ -170,6 +173,7 @@ router.put(
         });
         return res.json({ pinned });
       } catch (err) {
+        if (err instanceof IdentityBeingArchivedError) return res.status(409).json({ error: "it's being archived", code: "being_archived" });
         databaseLogger.error("identity pin write failed", err, {
           operation: "identity_pin_set_failed",
           userId,

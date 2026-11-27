@@ -181,10 +181,11 @@ if [ -e "$SYSTEMCTL_CALLS" ]; then fail "systemctl called: $(cat "$SYSTEMCTL_CAL
 
 CURRENT_TEST="T-10 retire_identity stops the desktop before the folder move"
 body="$(fn_body retire_identity)"
-stop_ln="$(printf '%s\n' "$body" | grep -n 'stop_identity_desktop "\$name" "retire"' | head -1 | cut -d: -f1)"
-mv_ln="$(printf '%s\n' "$body" | grep -n 'mv "\$iddir" "\$archdir"' | head -1 | cut -d: -f1)"
-if [ -n "$stop_ln" ] && [ -n "$mv_ln" ] && [ "$stop_ln" -lt "$mv_ln" ]; then pass
-else fail "stop line '$stop_ln' not before mv line '$mv_ln'"; fi
+prep_ln="$(printf '%s\n' "$body" | grep -n '_retire_identity_prepare ' | head -1 | cut -d: -f1)"
+mv_ln="$(printf '%s\n' "$body" | grep -n '_retire_identity_move ' | head -1 | cut -d: -f1)"
+stop_ln="$(fn_body _retire_identity_prepare | grep -n 'stop_identity_desktop "\$name" "retire"' | head -1 | cut -d: -f1)"
+if [ -n "$stop_ln" ] && [ -n "$prep_ln" ] && [ -n "$mv_ln" ] && [ "$prep_ln" -lt "$mv_ln" ]; then pass
+else fail "desktop stop (in prepare: '$stop_ln', called at '$prep_ln') not before the move ('$mv_ln')"; fi
 
 CURRENT_TEST="T-11 do_kill_dormant stops the desktop unless it is in use"
 body="$(fn_body do_kill_dormant)"

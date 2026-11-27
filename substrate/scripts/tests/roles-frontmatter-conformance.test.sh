@@ -20,9 +20,7 @@
 #   person-files       person-files.py parse_roles_frontmatter
 #   agent-supervisor   agent-supervisor.sh _extract_frontmatter_roles (sourced
 #                      with AGENT_SUPERVISOR_LIB_ONLY=1; stdout JSON compared)
-#   identity-unarchive src/backend/database/routes/identity-unarchive.ts
-#                      EXTRACT_ROLES_PYTHON (line array regexed out of the TS
-#                      source, joined, run as `python3 -c <src> <path>`)
+#   fleet-change       fleet-change fm_roles (the front door: role archive, un-archive)
 #
 # Every case is written byte-exact (CRLF preserved) to a temp file, since most
 # copies take a path. Prints PASS/FAIL per parser per case; exits 0 on
@@ -121,15 +119,6 @@ def extract_defs(path, names):
     return ns
 
 
-def ts_python(path):
-    src = open(path, encoding="utf-8").read()
-    m = re.search(r"const EXTRACT_ROLES_PYTHON = \[(.*?)\]\.join\(\"\\n\"\);", src, re.S)
-    if not m:
-        raise RuntimeError("EXTRACT_ROLES_PYTHON array not found in %s" % path)
-    inner = re.sub(r",\s*$", "", m.group(1).strip())
-    return "\n".join(json.loads("[" + inner + "]"))
-
-
 parsers = {}
 setup_errors = {}
 
@@ -182,22 +171,19 @@ def _person_files():
     return lambda path: mod.parse_roles_frontmatter(open(path, encoding="utf-8", newline="").read())
 
 
+def _fleet_change():
+    import importlib.machinery
+    loader = importlib.machinery.SourceFileLoader("fleet_change", os.path.join(scripts, "fleet-change"))
+    spec = importlib.util.spec_from_loader("fleet_change", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod.fm_roles
+
+
 def _supervisor():
     def run(path):
         out_path = path[:-3] + ".supervisor.out"
         return json.loads(open(out_path, encoding="utf-8").read() or "null")
-    return run
-
-
-def _unarchive_ts():
-    code = ts_python(os.path.join(repo, "src", "backend", "database", "routes",
-                                  "identity-unarchive.ts"))
-
-    def run(path):
-        p = subprocess.run(["python3", "-c", code, path], capture_output=True, text=True)
-        if p.returncode != 0:
-            raise RuntimeError("exit %d: %s" % (p.returncode, p.stderr.strip()[-200:]))
-        return json.loads(p.stdout.strip() or "[]")
     return run
 
 
@@ -208,10 +194,10 @@ register("file-watch", _rfw)
 register("id-load-context", _idload)
 register("person-files", _person_files)
 register("agent-supervisor", _supervisor)
-register("identity-unarchive", _unarchive_ts)
+register("fleet-change", _fleet_change)
 
 names = ["reference", "fleet-status-sweep", "ambient-monitor", "file-watch",
-         "id-load-context", "person-files", "agent-supervisor", "identity-unarchive"]
+         "id-load-context", "person-files", "agent-supervisor", "fleet-change"]
 npass = nfail = 0
 failures = []
 for name in names:

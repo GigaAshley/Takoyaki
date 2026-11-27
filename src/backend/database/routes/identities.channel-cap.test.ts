@@ -149,6 +149,8 @@ vi.mock("../../claude-session/identity-artifact-reader.js", () => ({
 }));
 
 vi.mock("../../claude-session/per-identity-file.js", () => ({
+  assertNotBeingArchived: vi.fn(async () => undefined),
+  IdentityBeingArchivedError: class IdentityBeingArchivedError extends Error {},
   identityFileExists: () => channel(false),
   writeIdentityFile: vi.fn(),
   removeIdentityFile: vi.fn(),

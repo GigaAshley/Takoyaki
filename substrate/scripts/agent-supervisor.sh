@@ -51,26 +51,14 @@ ROLES_ARCHIVE_DIR="${AGENT_ROLES_ARCHIVE_DIR:-$HOME/fleet/roles-archive}"
 # test hermeticity (same discipline as AGENT_IDENTITIES_DIR / AGENT_ROLES_DIR).
 APPS_DIR="${AGENT_APPS_DIR:-$HOME/fleet/apps}"
 APPS_ARCHIVE_DIR="${AGENT_APPS_ARCHIVE_DIR:-$HOME/fleet/apps-archive}"
-# app-archive shape: absolute path to the archive-app.sh script distributed
-# to every managed host by the fleet substrate distributor. Env-overridable
-# for test hermeticity (tests stub the script).
-APP_ARCHIVE_SCRIPT="${AGENT_APP_ARCHIVE_SCRIPT:-$HOME/.claude/skills/app-development/archive-app.sh}"
 # convo-scoped apps: app-units.sh owns how an app is run under systemd (install /
 # uninstall / stash / restore). Used to stop + stash a conversation's apps when the
-# identity retires, restore them when it is un-archived, and restore current-style
-# (socket + relay + marker) sidebar apps on un-archive.
+# identity retires and restore them when it is un-archived.
 APP_UNITS_SCRIPT="${AGENT_APP_UNITS_SCRIPT:-$HOME/.claude/skills/app-development/app-units.sh}"
-# project-scoped apps: move-app.sh carries out "Move to" (sidebar ↔ project, out of a
-# conversation) when the app drops .move-requested into the app's folder.
-APP_MOVE_SCRIPT="${AGENT_APP_MOVE_SCRIPT:-$HOME/.claude/skills/app-development/move-app.sh}"
-# un-archive host-side shape: systemctl binary + user-systemd unit dir + the
-# lock file shared with create-app.sh so port-collision checks are safe
-# against concurrent creates. Used by scan_app_unarchive_requested_sentinels
-# only; env-overridable for test hermeticity (tests stub the binary + unit
-# dir; the lock file can point at a scratch path).
+# systemctl binary + user-systemd unit dir; env-overridable for test hermeticity (tests stub
+# the binary + unit dir).
 SYSTEMCTL_BIN="${AGENT_SYSTEMCTL_BIN:-systemctl}"
 SYSTEMD_UNIT_DIR="${AGENT_SYSTEMD_UNIT_DIR:-$HOME/.config/systemd/user}"
-APP_CREATE_LOCK="${AGENT_APP_CREATE_LOCK:-$HOME/fleet/.create-lock}"
 SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*"; }
 
@@ -713,6 +701,7 @@ resolve_identities() {
     [ -d "$d" ] || continue
     name="$(basename "$d")"
     [ -f "$d/$name.md" ] || continue
+    [ -e "$d/.archiving" ] && continue             # archive claimed: never launched or woken again
     IDENTITIES+=("$name")
   done
 }
@@ -886,21 +875,6 @@ is_coordinator() {
   local identity_file="$1"
   [ -f "$identity_file" ] || return 1
   awk '/^---$/{f++} f==1 && /^coordinator: true$/{found=1; exit} END{exit !found}' "$identity_file"
-}
-
-# ---- Phase 133 D-07: identity_has_role <identity_file_path> <role_name> ----
-# Returns 0 IFF <role_name> is one of the roles listed under the identity
-# file's `roles:` frontmatter key, as parsed by _extract_frontmatter_roles (the
-# canonical parser — see substrate/scripts/tests/fixtures/
-# roles_frontmatter_reference.py). The singular `role:` key is NOT read.
-# Membership is EXACT list-element equality, so "foo" does NOT match
-# "foo-bar" nor vice-versa (Pitfall 2 substring-safety).
-identity_has_role() {
-  local identity_file="$1" want_role="$2"
-  [ -f "$identity_file" ] || return 1
-  _extract_frontmatter_roles "$identity_file" 2>/dev/null \
-    | python3 -c 'import sys, json; sys.exit(0 if sys.argv[1] in json.load(sys.stdin) else 1)' "$want_role" \
-    2>/dev/null
 }
 
 # ---- archive scan (Phase 94) — freshness signal reader ----
@@ -1274,21 +1248,20 @@ clean_workspace_dependency_dirs() {
 # ---- retire action (Phase 94 base; Phase 115 reorder) ----
 # retire_identity(name)
 #
-# Executes the four-step retire in the Phase 115 D-13 order:
+# Finishes a claimed archive (the front door's agent-archive put .archiving in the folder).
+# The agent is stopped first, then its chat account is switched off, then its folder moves:
 #   STEP 0: stop the ambient monitor + its watcher children (so nothing injects mid-retire)
-#   STEP 1: matrix deactivate  (was Phase 94 step 3)
-#   STEP 2: graceful harness exit  (NEW in Phase 115)
-#   STEP 3: tmux kill-session  (was Phase 94 step 2)
-#   STEP 4a: delete .archive-requested sentinel  (Phase 115 D-12 option b — BEFORE folder move)
-#   STEP 4b: move folder to archive/  (was Phase 94 step 1)
+#   STEP 2: graceful harness exit
+#   STEP 3: tmux kill-session
+#   STEP 1: matrix deactivate — after the agent has stopped: the archive is claimed, so the agent
+#           must not keep running while this is retried
+#   STEP 4a–4b (under the change lock): stop its desktop and apps, clean its workspace, move
+#           the folder to archive/ (the claim goes with it)
 #
-# Rationale (D-13): the old order (move → kill → matrix) was a hard-stop sequence — folder-move
-# starved watchers into death, tmux kill terminated the pane cold. The new order lets each layer
-# flush BEFORE the next tears it down: matrix deactivate first (idempotent per Synapse; can be
-# re-tried from top on failure without racing anything since the identity is still on disk);
-# then a graceful harness exit that lets ambient-monitor's _harness_watch fire, SIGTERM its four
-# watcher children (including recv.sh, which flushes its cursor to disk); then a bounded tmux
-# kill-session as the hard-stop backstop; then sentinel-delete + folder-move to seal the retire.
+# Each layer flushes before the next tears it down: the graceful exit lets ambient-monitor's
+# _harness_watch fire and SIGTERM its watcher children (recv.sh flushes its cursor); tmux
+# kill-session is the hard-stop backstop. A failure sets RETIRE_ERROR (the reason, for the claim)
+# and returns 1; the claim stays and the next pass retries from the top.
 #
 # The graceful-exit step (STEP 2) sends /exit (bracketed paste + Enter), SIGTERMs any survivors
 # on the pane tty, and waits an ADDITIONAL GRACE_WAIT seconds (= ambient-monitor.py:81 GRACE_SECONDS + 1) so
@@ -1303,19 +1276,11 @@ clean_workspace_dependency_dirs() {
 #   - sentinel delete: silent if not present.
 #   - folder move: State 2 (already in archive/) → skip; State 3 (collision) → abort.
 #
-# Return contract: 0 on full success; 1 on {step 1 fatal, step 3 not applicable — no-op is
-# still success, step 4b collision/anomaly}. STEP 2 is best-effort and NEVER gates the retire
-# (a stuck harness could otherwise block retire forever; STEP 3 is the hard-stop backstop).
-#
-# Phase 133 D-13/D-13a/D-14 refactor: retire_identity() is atomic from the caller's perspective.
+# Return contract: 0 on full success; 1 on step 1 failing or a step 4b collision/anomaly.
+# STEP 2 is best-effort and NEVER gates the retire (STEP 3 is the hard-stop backstop).
 # Steps 1 (matrix deactivate) and 4b (folder move) carry inline 3-attempt exponential-backoff
-# retries (2s / 4s sleeps between attempts — worst-case per-step wall-time ~6s of sleep + 3
-# curl/mv attempts). Steps 2 and 3 keep single-attempt behavior (step 2 already carries an 11s
-# GRACE_WAIT; step 3 is idempotent no-op when the session is gone). The retire either succeeds
-# outright (having recovered inline from transient failures) or fails terminally in one call,
-# with no cross-tick state written by this function or its callers. The former cross-tick
-# failure counters (in $DORMANCY_STATE_DIR) and the sentinel drop after N consecutive failures
-# in the callers are all removed per Phase 133 D-14.
+# retries (2s / 4s sleeps between attempts) for transient failures; past those, the caller
+# records RETIRE_ERROR in the claim and the next pass tries again.
 # wait_ambient_monitor_exit <name> <max-seconds>: block until no ambient-monitor for <name> is
 # running, polling every 0.5s, for at most <max-seconds>. Matches on the launch argv shape
 # (`ambient-monitor <dir> --inject-to`), so a name that prefixes another identity's never
@@ -1532,6 +1497,8 @@ retire_deactivate_account() {
 # monitor was running, and STOPPED_MONITOR_OUTCOME to a short phrase for the caller's log line.
 # Never fails.
 STOPPED_MONITOR_SESSION=""
+# Why the last retire_identity failed (set by the step that failed; written into the claim).
+RETIRE_ERROR=""
 STOPPED_MONITOR_OUTCOME=""
 stop_ambient_monitor() {
   local name="$1" max="$2" pattern pid pids child
@@ -1558,45 +1525,24 @@ stop_ambient_monitor() {
   return 0
 }
 
-retire_identity() {
+# retire_stop_agent <name> — retire_identity steps 0, 2 and 3: stop the agent's ambient monitor,
+# let its harness exit, kill its tmux session. Run for every claimed agent at once, as soon as
+# its archive is claimed (finish_archiving_identities), and again at the top of its retire (a
+# no-op by then).
+retire_stop_agent() {
   local name="$1"
-  local iddir="$IDENTITIES_DIR/$name"
-  local archdir="$IDENTITIES_ARCHIVE_DIR/$name"
-
-  # A birth that landed mid-pass launches now, not after every queued retire (see helper).
-  launch_newborns_midtick
 
   # =============================================================================================
-  # STEP 0: stop the ambient monitor (and with it every watcher child) BEFORE the account goes off.
+  # STEP 0: stop the ambient monitor (and with it every watcher child) first.
   # =============================================================================================
-  # Step 1 kills the agent's chat token; a receiver still running would see M_UNKNOWN_TOKEN, fail
-  # its relogin and inject an "AUTH DEAD" event — which landed in the compose box together with
-  # step 2's /exit paste, so the harness got "/exit<task-notification>…" as one ordinary message,
-  # never exited, and every archived conversation ended on it. With the monitor gone first,
-  # nothing can inject into the pane during the retire. The monitor is never restarted while the
-  # harness runs during a retire (the alive-check's repair skips .archive-requested identities), so if step 1 fails we restart it ourselves
-  # — otherwise the agent would sit deaf until the next retry succeeds.
-  # The restart is rate-limited to once per 15 minutes: the scan retries a failed retire every
-  # tick, and each fresh monitor resets its children's own alert limits (recv.sh's AUTH DEAD is
-  # once per 15 min per process) and truncates ambient-monitor.log. Between restarts a retire
-  # that keeps failing leaves the agent deaf — it is being archived, so that is the lesser cost.
-  local _s0_restarted="$DORMANCY_STATE_DIR/$name.retire-monitor-restarted"
+  # A receiver still running when step 1 kills the agent's chat token would see M_UNKNOWN_TOKEN,
+  # fail its relogin and inject an "AUTH DEAD" event — which once landed in the compose box
+  # together with step 2's /exit paste, so the harness never exited. With the monitor gone
+  # first, nothing can inject into the pane during the retire. The archive is claimed, so the
+  # monitor is never started again (the alive-check skips claimed identities).
+  # =============================================================================================
   stop_ambient_monitor "$name" 20
   log "'$name' retire step 0 (stop ambient monitor): ${STOPPED_MONITOR_OUTCOME}"
-
-  if ! retire_deactivate_account; then
-    if [ -n "$STOPPED_MONITOR_SESSION" ]; then
-      if [ -n "$(find "$_s0_restarted" -mmin -15 2>/dev/null)" ]; then
-        log "'$name' retire step 1 failed — ambient monitor NOT restarted (already restarted after a failed retire in the last 15 min); agent is deaf until the retire succeeds or the next restart"
-      else
-        log "'$name' retire step 1 failed — restarting ambient monitor so the agent keeps hearing until the retry"
-        mkdir -p "$DORMANCY_STATE_DIR" 2>/dev/null; touch "$_s0_restarted" 2>/dev/null
-        start_ambient_monitor "$name" "$STOPPED_MONITOR_SESSION" || true
-      fi
-    fi
-    return 1
-  fi
-  rm -f "$_s0_restarted" 2>/dev/null
 
   # =============================================================================================
   # STEP 2 (Phase 115 D-13/D-14 NEW): Graceful harness exit.
@@ -1677,27 +1623,41 @@ retire_identity() {
   else
     log "'$name' retire step 3 (tmux kill-session) success: no tmux session found (no-op)"
   fi
+}
 
-  # Steps 4a–4b change what the front door reads (the identity's folder and its conversation
-  # apps), so they run as one change under the change lock. Steps 0–3 — the account, the
-  # graceful exit, the tmux kill, with their waits — come before it and don't hold it, so
-  # requests aren't kept waiting for them. No lock: the sentinel stays and the next pass retries.
+retire_identity() {
+  local name="$1"
+  local iddir="$IDENTITIES_DIR/$name"
+  local archdir="$IDENTITIES_ARCHIVE_DIR/$name"
+
+  # A birth that landed mid-pass launches now, not after every queued retire (see helper).
+  launch_newborns_midtick
+
+  retire_stop_agent "$name"
+
+  # =============================================================================================
+  # STEP 1: switch the chat account off. After the agent has stopped (steps 0–3): the archive was
+  # claimed, so the agent is archived from every point of view and must not keep running while
+  # this is retried. A failure here leaves the claim in place; the next pass retries from step 0
+  # (each step is a no-op once done).
+  # =============================================================================================
+  if ! retire_deactivate_account; then
+    [ -n "$RETIRE_ERROR" ] || RETIRE_ERROR="couldn't switch the chat account off"
+    return 1
+  fi
+
+  # The slow folder steps (desktop, apps, leftover processes, workspace clean-up) don't change
+  # what the front door reads — the claim already refuses anything aimed at this agent — so they
+  # run without the change lock. Only the folder move (step 4b) takes it, briefly. No lock: the
+  # claim stays and the next pass retries.
+  _retire_identity_prepare "$name" "$iddir"
   with_change_lock _retire_identity_move "$name" "$iddir" "$archdir"
 }
 
-# _retire_identity_move <name> <iddir> <archdir> — retire_identity steps 4a–4b (see above).
-_retire_identity_move() {
-  local name="$1" iddir="$2" archdir="$3"
-
-  # =============================================================================================
-  # STEP 4a (Phase 115 D-12 option b): Delete the .archive-requested sentinel BEFORE folder move.
-  # =============================================================================================
-  # Deleting the sentinel BEFORE the move means a mid-move crash leaves the sentinel in place for
-  # the next tick to retry the whole retire from step 1 (D-15 retry semantics). Silent if not
-  # present (the 180-day dormancy path never wrote it, so this is a no-op for that trigger path).
-  rm -f "$iddir/.archive-requested" 2>/dev/null || true
-  log "'$name' retire step 4a: sentinel .archive-requested deleted (if present)"
-
+# _retire_identity_prepare <name> <iddir> — retire_identity steps 4a¼–4a½, before the folder move
+# and outside the change lock. Each never blocks the retire.
+_retire_identity_prepare() {
+  local name="$1" iddir="$2"
   # STEP 4a¼: stop the identity's virtual desktop while its folder (state dir, serve.pid) is still
   # in place. Never blocks retire; reap_desktops catches a failed stop on a later tick.
   stop_identity_desktop "$name" "retire"
@@ -1721,6 +1681,20 @@ _retire_identity_move() {
   # =============================================================================================
   clean_workspace_repos "$name" "$iddir"
   clean_workspace_dependency_dirs "$name" "$iddir"
+}
+
+# _retire_identity_move <name> <iddir> <archdir> — retire_identity steps 4a and 4b, the folder move
+# (under the change lock; see above).
+_retire_identity_move() {
+  local name="$1" iddir="$2" archdir="$3"
+
+  # =============================================================================================
+  # STEP 4a: drop any leftover archive note. The claim (.archiving) is what keeps the archive
+  # going until the folder has moved; it goes into the archive with the folder, where the caller
+  # removes it.
+  # =============================================================================================
+  rm -f "$iddir/.archive-requested" 2>/dev/null || true
+  log "'$name' retire step 4a: holding the change lock for the folder move"
 
   # =============================================================================================
   # STEP 4b (Phase 115 D-13; was Phase 94 step 1): Move identity folder to archive sibling.
@@ -1757,11 +1731,12 @@ _retire_identity_move() {
       # State 3 (collision — impossible per D-16 since un-archive is out of scope, but planner-defensive):
       # both active and archive/ exist. NOT transient — abort on the first attempt.
       log "ERROR: '$name' retire step 4b (folder move) FAILED: collision — both active and archive/ folders exist; refusing to mv"
-      restore_identity_apps "$name" "$iddir"   # identity stays live → so do its apps
+      RETIRE_ERROR="an archived agent named '$name' is in the way in the archive"
       return 1
     else
       # State 4 (anomaly): active absent, archive absent — nothing to retire. NOT transient.
       log "ERROR: '$name' retire step 4b (folder move) FAILED: neither active nor archive/ folder exists (anomaly)"
+      RETIRE_ERROR="its folder is missing"
       return 1
     fi
 
@@ -1772,8 +1747,8 @@ _retire_identity_move() {
     fi
   done
   if [ "$_step4b_ok" != 1 ]; then
-    log "ERROR: '$name' retire step 4b (folder move) FAILED after 3 attempts — sentinel already deleted, live folder remains"
-    restore_identity_apps "$name" "$iddir"   # identity stays live → so do its apps
+    log "ERROR: '$name' retire step 4b (folder move) FAILED after 3 attempts — claim kept, next pass retries"
+    RETIRE_ERROR="couldn't move its folder into the archive"
     return 1
   fi
 
@@ -1830,13 +1805,18 @@ run_archive_scan() {
     # D-15 carve-out: the RETIRE event IS worth naming in the log (diagnostic plumbing).
     log "archive-scan: '$name' dormant for $((age / 86400))d — retiring"
 
-    # Phase 133 D-14: no cross-tick counter, no stuck-sentinel drop. retire_identity is atomic
-    # from this caller's POV — it either succeeds outright (having recovered inline from
-    # transient failures per D-13a) or fails terminally in one call.
-    if retire_identity "$name"; then
-      log "archive-scan: '$name' retire succeeded"
+    # An archive request like any other: the front door checks the guards again when it runs
+    # and claims it; finish_archiving_identities then retires it (retried until done).
+    if [ ! -f "$FLEET_CHANGE_BIN" ]; then
+      log "archive-scan: '$name' left for the next daily pass — $FLEET_CHANGE_BIN isn't installed yet"
+      continue
+    fi
+    local out
+    if out="$(fleet_change submit agent-archive "{\"name\":\"$name\",\"dormant\":true}" \
+        --id "dormant-$name-$(date -u +%Y%m%d)" --wait 0 2>&1)"; then
+      log "archive-scan: '$name' archive requested at the front door"
     else
-      log "ERROR: archive-scan: '$name' retire FAILED — will retry next daily pass"
+      log "ERROR: archive-scan: '$name' couldn't be handed to the front door — next daily pass retries: $out"
     fi
   done
   log "archive-scan: scan complete"
@@ -1866,230 +1846,166 @@ run_archive_scan_if_due() {
   touch "$ARCHIVE_SCAN_MARKER"   # UNCONDITIONAL — Pitfall 5 lock (cadence gate, not success gate)
 }
 
-# ---- user-initiated archive scan (Phase 115 D-10/D-11/D-15) ----
-# scan_archive_requested_sentinels()
+# ---- archive and un-archive: the supervisor's part ----
+# Archives and un-archives are requests to the front door (fleet-change), carried out in click
+# order with every other change. An agent or role archive is claimed there at once (.archiving in
+# its folder): from then on it's gone from every list and never launched. This pass finishes it —
+# stops the agent, switches its chat account off, moves its folder — and retries every pass until
+# it's done. A pass that fails writes what failed into the claim (failing_since, last_error), so
+# the front door can say what it's stuck on. An agent un-archive is accepted at the front door
+# and finished here too (finish_returning_identities, below).
 #
-# Sibling of run_archive_scan_if_due(). Walks $IDENTITIES_DIR/*/ every reconcile tick (~15s
-# cadence, NOT gated by the 24h ARCHIVE_SCAN_INTERVAL) and invokes retire_identity(name)
-# on any identity whose folder contains a `.archive-requested` sentinel.
-#
-# Phase 115 D-11: BYPASSES the .pinned/.no-dormancy/is_coordinator/freshness guards that
-# gate the 180-day run_archive_scan() daily path. Rationale: those guards protect against
-# AUTOMATED retire from surprising the user. A direct click on "Archive" in the app's
-# context menu is not automated — if the user clicked archive on a pinned/coordinator/
-# no-dormancy identity, they meant it. Guard bypass lives at the CALLER (this function
-# doesn't call the four guards); retire_identity() itself remains guard-agnostic so no
-# force-flag parameter is added to it (RESEARCH §3 recommendation).
-#
-# Phase 133 D-14 failure semantics: on any step failure inside retire_identity(), the
-# .archive-requested sentinel is retained (step 4a's rm -f is inside retire_identity and only
-# runs after steps 1-3 succeed AND step 4a itself; on earlier abort the sentinel stays put).
-# The former cross-tick per-user counter file (in $DORMANCY_STATE_DIR) and the stuck-sentinel
-# drop after 3 consecutive per-tick failures are REMOVED — retire_identity() recovers inline
-# from transient failures via per-step exponential backoff (D-13a on steps 1 + 4b), so a
-# failure here is terminal (permanent 4xx, State 3 collision, or 3 exhausted transient
-# attempts). The next reconcile tick re-fires the scanner and picks the identity up again
-# from the on-disk .archive-requested sentinel — no counter bookkeeping, no cross-tick state.
-# The former stuck-sentinel skip guard (which read a legacy sentinel in the archive folder
-# to short-circuit hammering a known-broken retire) is also REMOVED per D-14: legacy
-# stuck-sentinels on pre-Phase-133 boxes are archaeology (D-21) and the operator's fresh
-# click drops a fresh .archive-requested that should retry regardless.
-scan_archive_requested_sentinels() {
-  local d name
+# Notes left the old way — `.archive-requested` in a live agent, role or sidebar app folder,
+# `.unarchive-requested` in an archived one (an agent running /id archive, a scheduled
+# conversation, a tab from before the front door) — are handed to the front door as requests.
+# The note's path and age, hashed, make the request id, so a note handed over twice (a crash
+# before the rm) is still one request. Until fleet-change is installed a note is left for a
+# later pass.
+FLEET_DIR="$(dirname "$IDENTITIES_DIR")"
+CHANGES_DIR="${AGENT_CHANGES_DIR:-$FLEET_DIR/.changes}"
+ARCHIVE_RETRY_GAP_SECS="${AGENT_ARCHIVE_RETRY_GAP_SECS:-60}"   # a failing archive is retried at most this often
+
+# fleet_change <args...>: the front door's command, pointed at this supervisor's fleet folder.
+fleet_change() {
+  FLEET_CHANGE_FLEET_DIR="$FLEET_DIR" FLEET_CHANGE_LOCK="$CHANGE_LOCK" python3 "$FLEET_CHANGE_BIN" "$@"
+}
+
+# hand_note_to_front_door <note> <kind> <args-json> <label>
+hand_note_to_front_door() {
+  local f="$1" kind="$2" req="$3" label="$4" id out
+  [ -f "$FLEET_CHANGE_BIN" ] || return 0
+  id="note-$(printf '%s:%s' "$f" "$(stat -c %Y "$f" 2>/dev/null)" | sha1sum | cut -c1-20)"
+  if out="$(fleet_change submit "$kind" "$req" --id "$id" --wait 0 2>&1)"; then
+    rm -f "$f"
+    log "$label: ${f##*/} handed to the front door as $id ($kind $req)"
+  else
+    log "ERROR: $label: couldn't hand ${f##*/} to the front door — kept for the next pass: $out"
+  fi
+}
+
+scan_archive_notes() {
+  local f d n
+  for f in "$IDENTITIES_DIR"/*/.archive-requested; do
+    [ -f "$f" ] || continue; d="${f%/*}"; n="${d##*/}"
+    [[ "$n" =~ ^[a-z0-9_-]{1,64}$ ]] || continue
+    hand_note_to_front_door "$f" agent-archive "{\"name\":\"$n\",\"by\":\"agent\"}" "'$n' archive"
+  done
+  for f in "$ROLES_DIR"/*/.archive-requested; do
+    [ -f "$f" ] || continue; d="${f%/*}"; n="${d##*/}"
+    [[ "$n" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]] || continue
+    hand_note_to_front_door "$f" role-archive "{\"name\":\"$n\"}" "role '$n' archive"
+  done
+  for f in "$APPS_DIR"/*/.archive-requested; do
+    [ -f "$f" ] || continue; d="${f%/*}"; n="${d##*/}"
+    [[ "$n" =~ ^[a-z][a-z0-9-]{0,63}$ ]] || continue
+    hand_note_to_front_door "$f" app-archive "{\"slug\":\"$n\"}" "app '$n' archive"
+  done
+  for f in "$IDENTITIES_ARCHIVE_DIR"/*/.unarchive-requested; do
+    [ -f "$f" ] || continue; d="${f%/*}"; n="${d##*/}"
+    [[ "$n" =~ ^[a-z0-9_-]{1,64}$ ]] || continue
+    hand_note_to_front_door "$f" agent-unarchive "{\"name\":\"$n\"}" "'$n' un-archive"
+  done
+  for f in "$ROLES_ARCHIVE_DIR"/*/.unarchive-requested; do
+    [ -f "$f" ] || continue; d="${f%/*}"; n="${d##*/}"
+    [[ "$n" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]] || continue
+    hand_note_to_front_door "$f" role-unarchive "{\"name\":\"$n\"}" "role '$n' un-archive"
+  done
+  for f in "$APPS_ARCHIVE_DIR"/*/.unarchive-requested; do
+    [ -f "$f" ] || continue; d="${f%/*}"; n="${d##*/}"
+    [[ "$n" =~ ^[a-z][a-z0-9-]{0,63}$ ]] || continue
+    hand_note_to_front_door "$f" app-unarchive "{\"slug\":\"$n\"}" "app '$n' un-archive"
+  done
+}
+
+# _claim_failed <claim-file> <reason>: write into a claim that finishing it failed this pass.
+_claim_failed() {
+  python3 - "$1" "$2" <<'PY' 2>/dev/null || true
+import json, os, sys, time
+p, reason = sys.argv[1], sys.argv[2]
+try:
+    c = json.load(open(p))
+except Exception:
+    c = {}
+if not isinstance(c, dict):
+    c = {}
+now = time.time()
+c.setdefault("failing_since", now)
+c["last_error"] = reason[:300]
+c["last_try"] = now
+tmp = "%s.tmp.%d" % (p, os.getpid())
+with open(tmp, "w") as f:
+    json.dump(c, f)
+os.replace(tmp, p)
+PY
+}
+
+# _claim_retry_due <claim-file>: false while a failing claim's last try is under ARCHIVE_RETRY_GAP_SECS
+# old, so an archive stuck on a slow failure (a chat server that's down) doesn't hold up every pass.
+_claim_retry_due() {
+  local last
+  last="$(jq -r '(.last_try // 0) | floor' "$1" 2>/dev/null)"
+  [[ "$last" =~ ^[0-9]+$ ]] || return 0
+  [ $(( $(date +%s) - last )) -ge "$ARCHIVE_RETRY_GAP_SECS" ]
+}
+
+# finish_archiving_identities: first stop every claimed agent that still has a session, all at
+# once (a role archive claims many; none should keep running while the others' slower steps run),
+# then finish each claimed archive (retire_identity) in name order; a failure is written into the
+# claim and retried.
+finish_archiving_identities() {
+  local d name pids=()
   for d in "$IDENTITIES_DIR"/*/; do
-    [ -d "$d" ] || continue                          # guard against nullglob miss (no match → literal *)
-    name="$(basename "$d")"
-    [ -f "$d/.archive-requested" ] || continue
-
-    # D-11: BYPASS guards. Do NOT check .pinned, .no-dormancy, is_coordinator, or freshness.
-    # A direct user click is not automated — the guards exist to protect against AUTOMATED
-    # retire surprises. If the user clicked archive on a pinned identity, they meant it.
-    log "'$name' user-initiated archive: .archive-requested detected, invoking retire_identity"
-
-    # Phase 133 D-14: no cross-tick counter, no stuck-sentinel drop. retire_identity is atomic
-    # from this caller's POV — it either succeeds outright (having recovered inline from
-    # transient failures per D-13a) or fails terminally in one call. A terminal failure keeps
-    # the .archive-requested sentinel in place, so the next reconcile tick retries naturally.
+    d="${d%/}"; name="${d##*/}"
+    [ -e "$d/.archiving" ] || continue
+    [ -n "$(match_session "$(slug "$name")" 2>/dev/null)" ] || continue
+    log "'$name' archive claimed: stopping it now"
+    retire_stop_agent "$name" &
+    pids+=("$!")
+  done
+  if [ "${#pids[@]}" -gt 0 ]; then
+    wait "${pids[@]}" 2>/dev/null
+    snapshot_sessions
+  fi
+  for d in "$IDENTITIES_DIR"/*/; do
+    d="${d%/}"; name="${d##*/}"
+    [ -e "$d/.archiving" ] || continue
+    _claim_retry_due "$d/.archiving" || continue
+    log "'$name' archive: finishing the claimed archive"
+    RETIRE_ERROR=""
     if retire_identity "$name"; then
-      log "'$name' user-initiated archive: retire_identity succeeded"
+      rm -f "$IDENTITIES_ARCHIVE_DIR/$name/.archiving"
+      log "'$name' archive finished"
     else
-      log "ERROR: '$name' user-initiated archive: retire_identity FAILED — sentinel retained; next tick will retry"
+      [ -e "$d/.archiving" ] && _claim_failed "$d/.archiving" "${RETIRE_ERROR:-see the retire log lines above}"
+      log "ERROR: '$name' archive not finished yet (${RETIRE_ERROR:-see above}) — claim kept; retried in ${ARCHIVE_RETRY_GAP_SECS}s"
     fi
   done
 }
 
-# ---- user-initiated role archive scanner (Phase 133 D-01/D-05/D-06/D-07/D-08/D-09/D-10/D-12) ----
-# scan_role_archive_requested_sentinels()
-#
-# Sibling of scan_archive_requested_sentinels. Walks $ROLES_DIR/*/ every
-# reconcile tick (~15s cadence). For each role folder carrying a
-# `.archive-requested` sentinel:
-#
-#   1. FRESH ENUMERATION (D-07): walk $IDENTITIES_DIR/*/ and collect every
-#      identity whose `roles:` frontmatter lists <role_name> via
-#      identity_has_role(). No snapshot; the disk walk IS the state.
-#
-#   2. FAIL-SOFT CASCADE (D-08): invoke retire_identity(name) on each
-#      enumerated identity. Do NOT abort on individual failures — try every
-#      identity, accumulate failures. Guards (.pinned / .no-dormancy /
-#      coordinator: true) are BYPASSED (D-10) — the scanner doesn't check
-#      them, uniform with the user-initiated identity archive path.
-#
-#   3. CONDITIONAL FOLDER MOVE (D-09): if ALL enumerated identities retired
-#      cleanly, mv $ROLES_DIR/<name>/ to $ROLES_ARCHIVE_DIR/<name>/ and
-#      clean up the sentinel that travelled with the folder. If ANY failed,
-#      keep the role folder in the live tree; emit a LOUD ERROR: log line
-#      naming each failed identity (mirrors the D-15 silent-by-design
-#      carve-out that the removed retire-stuck logging used to occupy).
-#
-#   4. SENTINEL ALWAYS DELETED (D-06): whether cascade succeeded, partially
-#      succeeded, or fully failed, remove the sentinel at end-of-tick. No
-#      cross-tick persistence of the archival intent. Operator retries via a
-#      fresh UI click (D-11), which drops a fresh sentinel and the scanner
-#      naturally picks up only identities not-yet-retired.
-#
-# D-12: empty cascade is the same code path — zero identities → for-loop is
-# zero-iteration → failed stays 0 → folder move happens immediately.
-#
-# D-18: per-box scope — no cross-box coordination. Scanner runs on the box
-# holding the role.
-#
-# D-15 silent discipline exception: the LOUD ERROR: log lines on partial
-# failure are the ONE explicit carve-out (same status as the removed
-# retire-stuck logging in the D-14 refactor). Underlying per-step error
-# details live inside retire_identity()'s own per-step ERROR: log lines,
-# already emitted upstream — cascade partial-failure line references those
-# rather than re-emitting the text ("see per-step retire logs above").
-scan_role_archive_requested_sentinels() {
-  local d role_name identity_dir identity_name
+# finish_archiving_roles: a claimed role's folder moves into the archive once every agent its
+# claim took has moved out of the live tree.
+finish_archiving_roles() {
+  local d role a waiting
   for d in "$ROLES_DIR"/*/; do
-    [ -d "$d" ] || continue                          # nullglob-miss guard
-    role_name="$(basename "$d")"
-    [ -f "$d/.archive-requested" ] || continue
-
-    log "role '$role_name' archive: .archive-requested detected — cascading"
-
-    # Destination guard — checked BEFORE the cascade so nothing is retired
-    # when the move can't happen. `mv dir/ existing-dir` nests the role
-    # inside the old archive (roles-archive/<name>/<name>/) and reports
-    # success. An archived role of the same name blocks this archive; the
-    # user has to un-archive or remove the old one first.
-    if [ -e "$ROLES_ARCHIVE_DIR/$role_name" ]; then
-      log "ERROR: role '$role_name' archive REFUSED: $ROLES_ARCHIVE_DIR/$role_name already exists (an archived role with this name). No identities retired; role stays live. Sentinel deleted."
-      rm -f "$d/.archive-requested" 2>/dev/null
+    d="${d%/}"; role="${d##*/}"
+    [ -e "$d/.archiving" ] || continue
+    waiting=""
+    while IFS= read -r a; do
+      [ -n "$a" ] && [ -d "$IDENTITIES_DIR/$a" ] && waiting="$waiting $a"
+    done < <(jq -r '.agents[]? // empty' "$d/.archiving" 2>/dev/null)
+    [ -z "$waiting" ] || continue
+    if [ -e "$ROLES_ARCHIVE_DIR/$role" ]; then
+      _claim_failed "$d/.archiving" "an archived role named '$role' is in the way in the archive"
+      log "ERROR: role '$role' archive: $ROLES_ARCHIVE_DIR/$role already exists — claim kept"
       continue
     fi
-
-    # D-07: fresh enumeration on every scan.
-    local to_retire=()
-    for identity_dir in "$IDENTITIES_DIR"/*/; do
-      [ -d "$identity_dir" ] || continue
-      identity_name="$(basename "$identity_dir")"
-      [ -f "$identity_dir/$identity_name.md" ] || continue
-      if identity_has_role "$identity_dir/$identity_name.md" "$role_name"; then
-        to_retire+=("$identity_name")
-      fi
-    done
-
-    log "role '$role_name' cascade: ${#to_retire[@]} identities hold this role"
-
-    # D-08 fail-soft cascade + D-10 guards bypassed (scanner doesn't check them).
-    local failed=0 total=${#to_retire[@]} failed_names=""
-    local ident
-    if [ "$total" -gt 0 ]; then
-      for ident in "${to_retire[@]}"; do
-        if retire_identity "$ident"; then
-          log "role '$role_name' cascade: identity '$ident' retired cleanly"
-        else
-          failed=$((failed + 1))
-          failed_names="$failed_names $ident"
-          log "ERROR: role '$role_name' cascade: identity '$ident' FAILED to retire (see per-step retire logs above)"
-        fi
-      done
-    fi
-
-    # D-09: folder moves only if ALL identities retired cleanly.
-    # D-06: sentinel deleted regardless of cascade outcome.
-    # D-12: empty cascade — failed=0 total=0 → folder move fires immediately.
-    if [ "$failed" -eq 0 ]; then
-      mkdir -p "$ROLES_ARCHIVE_DIR" 2>/dev/null
-      if with_change_lock mv "$d" "$ROLES_ARCHIVE_DIR/$role_name" 2>/dev/null; then
-        # Sentinel travelled with the folder into the archive — clean it up there.
-        rm -f "$ROLES_ARCHIVE_DIR/$role_name/.archive-requested" 2>/dev/null
-        log "role '$role_name' cascade complete: $total identities retired, folder moved to archive"
-      else
-        # All-clean cascade but move failed — anomaly. Log LOUD, still delete the live sentinel (D-06).
-        log "ERROR: role '$role_name' cascade: all identities retired but folder move FAILED — role folder retained in live tree"
-        rm -f "$d/.archive-requested" 2>/dev/null
-      fi
+    mkdir -p "$ROLES_ARCHIVE_DIR" 2>/dev/null
+    if with_change_lock mv "$d" "$ROLES_ARCHIVE_DIR/$role" 2>/dev/null; then
+      rm -f "$ROLES_ARCHIVE_DIR/$role/.archiving" "$ROLES_ARCHIVE_DIR/$role/.archive-requested"
+      log "role '$role' archive finished: folder moved to archive"
     else
-      # D-09 partial failure — role folder stays live; sentinel still deleted (D-06).
-      log "ERROR: role '$role_name' cascade PARTIAL: $failed/$total identities failed:${failed_names}. Role folder retained in live tree. Retry via UI."
-      rm -f "$d/.archive-requested" 2>/dev/null
-    fi
-  done
-}
-
-# ---- user-initiated app archive scanner (app-archive shape) ----
-# scan_app_archive_requested_sentinels()
-#
-# Sibling of scan_archive_requested_sentinels + scan_role_archive_requested_sentinels.
-# Walks $APPS_DIR/*/ every reconcile tick and invokes archive-app.sh on any
-# app folder carrying a `.archive-requested` sentinel.
-#
-# The heavy lifting (stop + disable systemd unit, stash unit inside folder,
-# move folder to $APPS_ARCHIVE_DIR/<slug>/) lives entirely in
-# $APP_ARCHIVE_SCRIPT (~/.claude/skills/app-development/archive-app.sh) —
-# this scanner is just the trigger. archive-app.sh's own preconditions
-# (no existing archive slot at target, folder must exist) still apply.
-#
-# Failure semantics parallel to identity + role archive:
-#   - Sentinel retained on any failure (archive-app.sh non-zero exit) so
-#     the next reconcile tick retries.
-#   - Sentinel deleted only after archive-app.sh reports success.
-#     archive-app.sh moves the folder as its final step, so on success the
-#     sentinel travels with the folder into the archive tree — we then
-#     rm it from $APPS_ARCHIVE_DIR/<slug>/ to keep the archived tree clean
-#     (parallel to the role-archive rm in scan_role_archive_requested_sentinels).
-#   - No cross-tick counter; no stuck-sentinel drop. archive-app.sh is
-#     idempotent enough that a repeated invocation on a partial state is
-#     safe (the "already archived" precondition check fires and refuses,
-#     which surfaces the anomaly).
-scan_app_archive_requested_sentinels() {
-  local d slug rc output
-  for d in "$APPS_DIR"/*/; do
-    [ -d "$d" ] || continue
-    slug="$(basename "$d")"
-    [ -f "$d/.archive-requested" ] || continue
-
-    if [ ! -x "$APP_ARCHIVE_SCRIPT" ]; then
-      log "ERROR: '$slug' user-initiated app archive: archive-app.sh not found or not executable at $APP_ARCHIVE_SCRIPT — sentinel retained; next tick will retry"
-      continue
-    fi
-
-    log "'$slug' user-initiated app archive: .archive-requested detected, invoking archive-app.sh"
-    rc=0
-    output="$(with_change_lock "$APP_ARCHIVE_SCRIPT" "$slug" 2>&1)" || rc=$?
-    if [ -n "$output" ]; then
-      while IFS= read -r line; do
-        [ -z "$line" ] && continue
-        log "  archive-app.sh[$slug]: $line"
-      done <<< "$output"
-    fi
-    if [ "$rc" -eq 0 ]; then
-      # archive-app.sh's atomic final step is `mv $APPS_DIR/$slug $APPS_ARCHIVE_DIR/$slug`
-      # (see substrate/skills/app-development/archive-app.sh). mv preserves
-      # hidden files, so the .archive-requested sentinel travels with the
-      # folder into the archive tree — this rm cleans it up there. If a
-      # future refactor of archive-app.sh changes the folder-relocation
-      # semantics to something that DROPS hidden files (rsync without
-      # --exclude=none, for instance), the sentinel would fail to arrive
-      # and this rm would become a no-op — harmless but the semantics
-      # should be re-verified in that case.
-      rm -f "$APPS_ARCHIVE_DIR/$slug/.archive-requested" 2>/dev/null || true
-      log "'$slug' user-initiated app archive: archive-app.sh succeeded"
-    else
-      log "ERROR: '$slug' user-initiated app archive: archive-app.sh FAILED (rc=$rc) — sentinel retained; next tick will retry"
+      _claim_failed "$d/.archiving" "couldn't move the role folder into the archive"
+      log "ERROR: role '$role' archive: folder move failed — claim kept; next pass retries"
     fi
   done
 }
@@ -2195,16 +2111,10 @@ _retire_archived_project_app() {
 }
 
 # ============================================================================
-# UN-ARCHIVE HOST-SIDE SHAPE — three scanners paralleling the archive scanners.
+# UN-ARCHIVE — the agent un-archive's supervisor part (finish_returning_identities).
 # ============================================================================
-# Reverse of the archive gesture: an operator (agent hand-drop today, UI +
-# endpoint later per shape 2) leaves `.unarchive-requested` inside the target
-# ARCHIVE folder (`~/fleet/identities-archive/<name>/`, `~/fleet/roles-archive/
-# <name>/`, or `~/fleet/apps-archive/<slug>/`), and the corresponding scanner
-# runs the type-specific reverse-of-archive body on the next reconcile tick.
-#
-# Shape governance: shape-unarchive-host-side.md alongside the campaign
-# artifact. Endpoints + frontend live in shape-unarchive-frontend-backend.
+# Role and app un-archives are carried out by the front door itself; an agent's needs its chat
+# account brought back first, which can take several passes, so the front door hands it here.
 
 # ---- extract frontmatter roles from an identity file ----
 # _account_profile_code <base> <mxid> [token]
@@ -2343,7 +2253,7 @@ PYEOF
 # _prepend_unarchive_banner(path, ts)
 #
 # Prepend a one-line un-archive banner to an identity file's body (right after
-# the YAML frontmatter block). Called by scan_identity_unarchive_requested_sentinels
+# the YAML frontmatter block). Called by _unarchive_identity
 # as Step 7, after the folder has been moved back to the live tree.
 #
 # Shape rationale (shape-unarchive-wake-up-smoothing.md): the agent coming back
@@ -2415,13 +2325,13 @@ except Exception:
 PYEOF
 }
 
-# ---- user-initiated identity un-archive scanner (one-path un-archive shape) ----
-# scan_identity_unarchive_requested_sentinels()
+# ---- agent un-archive: finishing what the front door accepted ----
+# finish_returning_identities()
 #
-# Walks $IDENTITIES_ARCHIVE_DIR/*/ every reconcile tick and un-archives any
-# archived identity whose folder carries a `.unarchive-requested` flag. The flag
-# is the ONLY trigger: the front-end button and agents drop the same one. See
-# .planning/campaigns/un-archiving/shape-unarchive-one-path-supervisor-reactivation.md.
+# The front door's agent-unarchive runs the quick checks and writes
+# $CHANGES_DIR/returning/<name>.json ({"name","ids"}); every pass, this brings each such agent
+# back and then writes the outcome of every request in "ids" (fleet-change finish). An agent
+# whose archive is still being finished waits for it. The folder move takes the change lock.
 #
 # Archiving switches the chat (Matrix) account off, which erases its password on
 # the chat server. Only the backend holds the chat admin credentials, so the
@@ -2473,14 +2383,38 @@ PYEOF
 FLEET_SERVICE_CMD="${AGENT_FLEET_SERVICE:-$HOME/.local/bin/fleet-service}"
 UNARCHIVE_SERVICE_WAIT_SECS="${AGENT_UNARCHIVE_SERVICE_WAIT_SECS:-10}"
 
-# _unarchive_refuse <archive-dir> <name> <reason>
+# _unarchive_refuse <archive-dir> <name> <reason> [code] [result-json]
+# Refuses the un-archive in hand: the reason goes into .unarchive-refused (agents read it) and
+# into the outcome of every request waiting on it.
 _unarchive_refuse() {
-  local d="$1" name="$2" reason="$3"
+  local d="$1" name="$2" reason="$3" code="${4:-refused}" result="${5:-}"
   log "ERROR: '$name' un-archive REFUSED: $reason"
-  rm -f "${d:?}/.unarchive-reactivate"
-  printf '%s\n' "$reason" > "$d/.unarchive-refused.tmp.$$" \
-    && mv -f "$d/.unarchive-refused.tmp.$$" "$d/.unarchive-refused"
-  rm -f "${d:?}/.unarchive-requested"
+  if [ -d "$d" ]; then
+    rm -f "${d:?}/.unarchive-reactivate"
+    printf '%s\n' "$reason" > "$d/.unarchive-refused.tmp.$$" \
+      && mv -f "$d/.unarchive-refused.tmp.$$" "$d/.unarchive-refused"
+    rm -f "${d:?}/.unarchive-requested"
+  fi
+  if [ -n "$result" ]; then
+    _unarchive_finish refused --code "$code" --reason "$reason" --result "$result"
+  else
+    _unarchive_finish refused --code "$code" --reason "$reason"
+  fi
+}
+
+# _unarchive_finish <done|refused|failed> [--code c] [--reason r] [--result json]: answer every
+# request waiting on the un-archive in hand ($UNARCHIVE_RETURNING), then let it go.
+UNARCHIVE_RETURNING=""
+_unarchive_finish() {
+  local rf="$UNARCHIVE_RETURNING" id
+  [ -n "$rf" ] && [ -f "$rf" ] || return 0
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    if ! fleet_change finish "$id" "$@" >/dev/null 2>&1; then
+      log "WARN: couldn't write the outcome of un-archive request $id"
+    fi
+  done < <(jq -r '.ids[]? // empty' "$rf" 2>/dev/null)
+  with_change_lock rm -f "$rf"
 }
 
 # _unarchive_relay_set <relay.json> [jq args...] <jq-filter> — atomic 0600 rewrite.
@@ -2700,350 +2634,108 @@ _unarchive_take_answer() {
   esac
 }
 
-scan_identity_unarchive_requested_sentinels() {
-  local d name
-  for d in "$IDENTITIES_ARCHIVE_DIR"/*/; do
-    [ -d "$d" ] || continue                          # nullglob-miss guard
-    d="${d%/}"
-    name="$(basename "$d")"
-    [ -f "$d/.unarchive-requested" ] || continue
-
-    log "'$name' un-archive: .unarchive-requested detected"
-    # A refusal note from an earlier attempt no longer applies.
-    rm -f "${d:?}/.unarchive-refused"
-
-    # Pre-flight 1: name collision.
-    if [ -e "$IDENTITIES_DIR/$name" ]; then
-      _unarchive_refuse "$d" "$name" "a live identity named '$name' already exists on this box"
+# finish_returning_identities: finish every agent un-archive the front door accepted
+# ($CHANGES_DIR/returning/<name>.json), then answer each request waiting on it.
+finish_returning_identities() {
+  local rf name
+  for rf in "$CHANGES_DIR"/returning/*.json; do
+    [ -f "$rf" ] || continue
+    name="$(jq -r '.name // empty' "$rf" 2>/dev/null)"
+    if ! [[ "$name" =~ ^[a-z0-9_-]{1,64}$ ]]; then
+      log "ERROR: unreadable un-archive $rf — dropped"
+      rm -f "$rf"
       continue
     fi
-
-    # Pre-flight 2: every role the identity held must be live.
-    local ident_file="$d/$name.md"
-    if [ ! -f "$ident_file" ]; then
-      _unarchive_refuse "$d" "$name" "the archived identity file $name.md is missing"
-      continue
-    fi
-    local roles_json
-    if ! roles_json=$(_extract_frontmatter_roles "$ident_file"); then
-      _unarchive_refuse "$d" "$name" "couldn't read the roles in $name.md"
-      continue
-    fi
-    local missing=() role
-    while IFS= read -r role; do
-      [ -z "$role" ] && continue
-      [ -d "$ROLES_DIR/$role" ] || missing+=("$role")
-    done < <(printf '%s' "$roles_json" | jq -r '.[]?' 2>/dev/null)
-    if [ "${#missing[@]}" -gt 0 ]; then
-      _unarchive_refuse "$d" "$name" "un-archive role(s) ${missing[*]} first — this identity depends on them"
-      continue
-    fi
-
-    # Account step (may span several ticks).
-    if ! _unarchive_account_step "$d" "$name"; then continue; fi
-
-    # Step 4: Conditional .dormant write (preserve pre-archive .no-dormancy).
-    # Checked write: moving the identity live without .dormant would defeat the
-    # "un-archive comes back dormant" invariant — abort with the flag retained.
-    if [ -f "$d/.no-dormancy" ]; then
-      log "'$name' un-archive step 4: .no-dormancy present in archive — always-on intent preserved, skipping .dormant write"
-    else
-      if ! : > "$d/.dormant"; then
-        log "ERROR: '$name' un-archive step 4 (.dormant write) FAILED at $d/.dormant — flag retained; next tick will retry"
-        continue
-      fi
-      log "'$name' un-archive step 4: .dormant written in archive folder"
-    fi
-
-    # Step 5: clear the flag, progress state and any old refusal note BEFORE
-    # the mv (archive-side discipline).
-    rm -f "${d:?}/.unarchive-refused" "${d:?}/.unarchive-reactivate" "${d:?}/.unarchive-requested"
-
-    # Step 6: mv archive → live.
-    mkdir -p "$IDENTITIES_DIR" 2>/dev/null || true
-    if ! mv "$d" "$IDENTITIES_DIR/$name"; then
-      log "ERROR: '$name' un-archive step 6 (mv archive→live) FAILED — flag already deleted; identity retained in archive tree with its chat account live + .dormant written. Investigate manually; drop a fresh .unarchive-requested to retry once the collision is resolved."
-      continue
-    fi
-    log "'$name' un-archive COMPLETE: folder moved to live tree"
-    restore_identity_apps "$name" "$IDENTITIES_DIR/$name"
-
-    # Step 7: Prepend un-archive banner (non-fatal).
-    local live_ident_file="$IDENTITIES_DIR/$name/$name.md"
-    local unarchive_ts
-    unarchive_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    if _prepend_unarchive_banner "$live_ident_file" "$unarchive_ts"; then
-      log "'$name' un-archive step 7: in-session banner prepended to identity file (ts=$unarchive_ts)"
-    else
-      log "WARN: '$name' un-archive step 7 (banner prepend) FAILED — un-archive is otherwise complete; agent won't see the in-session un-archive banner. Investigate: $live_ident_file"
-    fi
+    UNARCHIVE_RETURNING="$rf"
+    _unarchive_identity "$name"
+    UNARCHIVE_RETURNING=""
   done
 }
 
-# ---- user-initiated role un-archive scanner (un-archive host-side shape) ----
-# scan_role_unarchive_requested_sentinels()
-#
-# Sibling of scan_role_archive_requested_sentinels. Walks $ROLES_ARCHIVE_DIR/*/
-# every reconcile tick and reverses the archive for any archived role whose
-# folder carries a `.unarchive-requested` sentinel.
-#
-# Body is simple by design: no cascade to identities (identities retired
-# alongside the role during archive stay retired until independently
-# un-archived per shape scope).
-#
-#   Pre-flight (name collision, permanent-refuse):
-#     If $ROLES_DIR/$name already exists → LOUD ERROR log, delete the
-#     `.unarchive-requested` sentinel, skip. Operator resolves manually.
-#
-#   Body:
-#     rm .unarchive-requested (archive-side discipline: sentinel deleted
-#     BEFORE the mv, mirroring role-archive scanner's D-06 posture) →
-#     mv $ROLES_ARCHIVE_DIR/$name $ROLES_DIR/$name.
-scan_role_unarchive_requested_sentinels() {
-  local d name
-  for d in "$ROLES_ARCHIVE_DIR"/*/; do
-    [ -d "$d" ] || continue                          # nullglob-miss guard
-    name="$(basename "$d")"
-    [ -f "$d/.unarchive-requested" ] || continue
-
-    log "role '$name' user-initiated un-archive: .unarchive-requested detected"
-
-    # Pre-flight: name collision refuse.
-    if [ -e "$ROLES_DIR/$name" ]; then
-      log "ERROR: role '$name' un-archive REFUSED: live role already exists at $ROLES_DIR/$name — resolve the collision manually. Sentinel deleted."
-      rm -f "$d/.unarchive-requested"
-      continue
+_unarchive_identity() {
+  local name="$1" d="$IDENTITIES_ARCHIVE_DIR/$1" live="$IDENTITIES_DIR/$1"
+  # Still being archived: that finishes first, then this carries on.
+  [ -e "$live/.archiving" ] && return 0
+  if [ ! -d "$d" ]; then
+    if [ -f "$live/$name.md" ]; then
+      # Back already (a pass cut off after the folder move).
+      _unarchive_finish done --result "{\"name\":\"$name\"}"
+    else
+      _unarchive_refuse "$d" "$name" "'$name' isn't in the archive" archive_not_found
     fi
-
-    # Delete sentinel BEFORE mv (mirrors archive-side ordering discipline).
-    rm -f "$d/.unarchive-requested"
-
-    # mkdir -p guards against a fresh box / test scratch dir where $ROLES_DIR
-    # doesn't exist yet; parity with retire_identity + the app un-archive scanner.
-    mkdir -p "$ROLES_DIR" 2>/dev/null || true
-    if ! mv "$d" "$ROLES_DIR/$name"; then
-      log "ERROR: role '$name' un-archive: mv archive→live FAILED — sentinel already deleted; role retained in archive tree. Investigate manually; drop a fresh .unarchive-requested to retry once the collision is resolved."
-      continue
-    fi
-    log "role '$name' un-archive COMPLETE: folder moved to live tree"
-  done
-}
-
-# ---- user-initiated app un-archive scanner (un-archive host-side shape) ----
-# scan_app_unarchive_requested_sentinels()
-#
-# Sibling of scan_app_archive_requested_sentinels. Walks $APPS_ARCHIVE_DIR/*/
-# every reconcile tick and reverses the archive for any archived app whose
-# folder carries a `.unarchive-requested` sentinel.
-#
-# Folds the standalone restore-app.sh's logic into the supervisor (the script
-# is removed from the app-development skill in the same shape). Preserves the
-# flock discipline against concurrent create-app.sh port grabs.
-#
-# Per-app flow:
-#
-#   Pre-flight (permanent-refuse — LOUD log + sentinel deleted):
-#     - Live folder collision at $APPS_DIR/$slug
-#     - Unit-file collision at $SYSTEMD_UNIT_DIR/app-$slug.service
-#     - Stashed unit missing at $arch_dir/app-$slug.service.archived
-#       (can't reconstruct the port without it — the operator may need to
-#       re-create fresh instead of restoring)
-#     - Stashed unit doesn't declare PORT= (same reason)
-#
-#   Under $APP_CREATE_LOCK (flock -x, 30s wait):
-#     Port collision check → sentinel delete → mv archive→live → install
-#     unit file (cp stash → $SYSTEMD_UNIT_DIR, rm stash from moved-back
-#     folder). Same locked sequence create-app.sh + archive-app.sh use so
-#     concurrent create-and-restore cannot race on port assignment.
-#
-#   Outside lock (best-effort — folder is live either way):
-#     daemon-reload → enable+start → is-active check → WARN log on any
-#     failure. Sentinel is already gone by this point (deleted inside the
-#     lock, before the mv, mirroring the identity + role un-archive scanner
-#     discipline).
-# unarchive_current_style_app <slug> <archive-dir> — un-archive a sidebar app whose stash
-# holds the current five-unit layout. Same discipline as the old-style path below:
-# pre-flight refusals delete the sentinel; under the create lock, refuse a port another
-# installed app now holds, delete the sentinel, move the folder back, then let
-# app-units.sh reinstall + start every unit on the stashed port.
-unarchive_current_style_app() {
-  local slug="$1" d="$2" live_dir="$APPS_DIR/$1" port
-  if [ -e "$live_dir" ]; then
-    log "ERROR: app '$slug' un-archive REFUSED: live folder already exists at $live_dir. Sentinel deleted."
-    rm -f "$d/.unarchive-requested"; return 0
+    return 0
   fi
-  if [ -e "$SYSTEMD_UNIT_DIR/app-$slug.socket" ] || [ -e "$SYSTEMD_UNIT_DIR/app-$slug.service" ]; then
-    log "ERROR: app '$slug' un-archive REFUSED: units for app-$slug are already installed. Sentinel deleted."
-    rm -f "$d/.unarchive-requested"; return 0
+  log "'$name' un-archive: bringing it back"
+  # A claim left by an archive cut off after its folder move, and a refusal note from an
+  # earlier attempt (it no longer applies).
+  rm -f "${d:?}/.archiving" "${d:?}/.unarchive-refused"
+
+  # Pre-flight 1: name collision.
+  if [ -e "$live" ]; then
+    _unarchive_refuse "$d" "$name" "a live identity named '$name' already exists on this box" name_collision
+    return 0
   fi
-  port=$(sed -n 's/^ListenStream=127\.0\.0\.1:\([0-9][0-9]*\)$/\1/p' "$d/app-$slug.socket.archived" | head -1)
-  if [ -z "$port" ]; then
-    log "ERROR: app '$slug' un-archive REFUSED: could not read the port from $d/app-$slug.socket.archived. Sentinel deleted."
-    rm -f "$d/.unarchive-requested"; return 0
+
+  # Pre-flight 2: every role the identity held must be live (and not being archived).
+  local ident_file="$d/$name.md"
+  if [ ! -f "$ident_file" ]; then
+    _unarchive_refuse "$d" "$name" "the archived identity file $name.md is missing" identity_unreadable
+    return 0
   fi
-  local rc=0
-  (
-    exec 200>"$APP_CREATE_LOCK"
-    flock -x -w 30 200 || exit 42
-    if cat "$SYSTEMD_UNIT_DIR"/app-*.socket 2>/dev/null | grep -Fxq -- "ListenStream=127.0.0.1:$port" \
-       || cat "$SYSTEMD_UNIT_DIR"/app-*.service 2>/dev/null | grep -Fxq -- "Environment=PORT=$port"; then
-      exit 43
-    fi
-    rm -f "$d/.unarchive-requested"
-    mkdir -p "$APPS_DIR" 2>/dev/null || true
-    mv "$d" "$live_dir" || exit 44
-    exit 0
-  )
-  rc=$?
-  case "$rc" in
-    0) ;;
-    42) log "ERROR: app '$slug' un-archive: could not acquire $APP_CREATE_LOCK within 30s. Sentinel retained; next tick will retry."; return 0 ;;
-    43) log "ERROR: app '$slug' un-archive REFUSED: port $port is now in use by another app on this box. Sentinel deleted."; rm -f "$d/.unarchive-requested"; return 0 ;;
-    44) log "ERROR: app '$slug' un-archive: mv archive→live FAILED — sentinel already deleted; folder retained in archive tree."; return 0 ;;
-    *)  log "ERROR: app '$slug' un-archive: locked sequence rc=$rc (unexpected) — investigate."; return 0 ;;
-  esac
-  if bash "$APP_UNITS_SCRIPT" restore "$slug" "$live_dir" >/dev/null 2>&1; then
-    log "app '$slug' un-archive COMPLETE: folder moved back, units restored on port $port"
+  local roles_json
+  if ! roles_json=$(_extract_frontmatter_roles "$ident_file"); then
+    _unarchive_refuse "$d" "$name" "couldn't read the roles in $name.md" identity_unreadable
+    return 0
+  fi
+  local missing=() role
+  while IFS= read -r role; do
+    [ -z "$role" ] && continue
+    { [ -d "$ROLES_DIR/$role" ] && [ ! -e "$ROLES_DIR/$role/.archiving" ]; } || missing+=("$role")
+  done < <(printf '%s' "$roles_json" | jq -r '.[]?' 2>/dev/null)
+  if [ "${#missing[@]}" -gt 0 ]; then
+    _unarchive_refuse "$d" "$name" "un-archive role(s) ${missing[*]} first — this identity depends on them" missing_roles \
+      "$(printf '%s\n' "${missing[@]}" | jq -Rnc '{missingRoles: [inputs]}')"
+    return 0
+  fi
+
+  # Account step (may span several passes).
+  if ! _unarchive_account_step "$d" "$name"; then return 0; fi
+
+  # Step 4: Conditional .dormant write (preserve pre-archive .no-dormancy).
+  # Checked write: moving the identity live without .dormant would defeat the
+  # "un-archive comes back dormant" invariant — wait for the next pass.
+  if [ -f "$d/.no-dormancy" ]; then
+    log "'$name' un-archive step 4: .no-dormancy present in archive — always-on intent preserved, skipping .dormant write"
   else
-    log "WARN: app '$slug' un-archive: folder moved back but app-units.sh restore failed — run it by hand: app-units.sh restore $slug $live_dir"
+    if ! : > "$d/.dormant"; then
+      log "ERROR: '$name' un-archive step 4 (.dormant write) FAILED at $d/.dormant — next pass retries"
+      return 0
+    fi
+    log "'$name' un-archive step 4: .dormant written in archive folder"
   fi
-}
 
-scan_app_unarchive_requested_sentinels() {
-  local d slug
-  for d in "$APPS_ARCHIVE_DIR"/*/; do
-    [ -d "$d" ] || continue                          # nullglob-miss guard
-    slug="$(basename "$d")"
-    [ -f "$d/.unarchive-requested" ] || continue
+  # Step 5: clear the flag, progress state and any old refusal note BEFORE the mv.
+  rm -f "${d:?}/.unarchive-refused" "${d:?}/.unarchive-reactivate" "${d:?}/.unarchive-requested"
 
-    log "app '$slug' user-initiated un-archive: .unarchive-requested detected"
+  # Step 6: mv archive → live, as one change under the change lock.
+  mkdir -p "$IDENTITIES_DIR" 2>/dev/null || true
+  if ! with_change_lock mv "$d" "$live"; then
+    log "ERROR: '$name' un-archive step 6 (mv archive→live) FAILED — its chat account is live and .dormant written; next pass retries"
+    return 0
+  fi
+  log "'$name' un-archive COMPLETE: folder moved to live tree"
+  restore_identity_apps "$name" "$live"
 
-    local live_dir="$APPS_DIR/$slug"
-    local unit_file="$SYSTEMD_UNIT_DIR/app-$slug.service"
-    local stashed_unit="$d/app-$slug.service.archived"
-
-    # Current-style apps (socket + relay + marker watch + boot check) stash a .socket;
-    # app-units.sh restores all of their units. Old-style apps continue below.
-    if [ -f "$d/app-$slug.socket.archived" ]; then
-      unarchive_current_style_app "$slug" "${d%/}"
-      continue
-    fi
-
-    # -----------------------------------------------------------------------
-    # Pre-flight — every failure is permanent-refuse (sentinel deleted).
-    # -----------------------------------------------------------------------
-    if [ -e "$live_dir" ]; then
-      log "ERROR: app '$slug' un-archive REFUSED: live folder already exists at $live_dir. Sentinel deleted."
-      rm -f "$d/.unarchive-requested"
-      continue
-    fi
-    if [ -e "$unit_file" ]; then
-      log "ERROR: app '$slug' un-archive REFUSED: systemd unit already installed at $unit_file. Sentinel deleted."
-      rm -f "$d/.unarchive-requested"
-      continue
-    fi
-    if [ ! -f "$stashed_unit" ]; then
-      log "ERROR: app '$slug' un-archive REFUSED: no stashed unit at $stashed_unit — cannot reconstruct port. Sentinel deleted. Operator may need to re-create the app fresh."
-      rm -f "$d/.unarchive-requested"
-      continue
-    fi
-    local archived_port
-    archived_port=$(grep -m1 '^Environment=PORT=' "$stashed_unit" | sed 's/^Environment=PORT=//' | tr -d '\r\n' || true)
-    if [ -z "$archived_port" ]; then
-      log "ERROR: app '$slug' un-archive REFUSED: could not read PORT from $stashed_unit. Sentinel deleted."
-      rm -f "$d/.unarchive-requested"
-      continue
-    fi
-
-    # -----------------------------------------------------------------------
-    # Locked sequence: port-collision → sentinel-delete → mv → install.
-    # Exits:
-    #   0  ok
-    #   42 lock timeout (transient — sentinel retained for next-tick retry)
-    #   43 port collision (permanent-refuse — sentinel deleted by handler)
-    #   44 mv failed after sentinel-delete (sentinel already gone, folder
-    #      still in archive; operator investigates)
-    #   45 install (cp) failed after mv (folder moved, unit not installed;
-    #      operator investigates)
-    # -----------------------------------------------------------------------
-    local lock_rc=0
-    (
-      exec 200>"$APP_CREATE_LOCK"
-      if ! flock -x -w 30 200; then
-        exit 42
-      fi
-      # Port collision check. -Fxq (literal + exact-line + quiet) so a
-      # port like "3040" isn't ever interpreted as a BRE pattern (safe
-      # against latent surprises if unit files ever grow non-numeric ports).
-      if compgen -G "$SYSTEMD_UNIT_DIR/app-*.service" > /dev/null; then
-        local used_ports
-        used_ports=$(grep -h '^Environment=PORT=' "$SYSTEMD_UNIT_DIR"/app-*.service 2>/dev/null \
-                     | sed 's/^Environment=PORT=//' | sort -u)
-        if printf '%s\n' "$used_ports" | grep -Fxq -- "$archived_port"; then
-          exit 43
-        fi
-      fi
-      # Sentinel delete BEFORE mv (archive-side discipline).
-      rm -f "$d/.unarchive-requested"
-      mkdir -p "$APPS_DIR" 2>/dev/null || true
-      if ! mv "$d" "$live_dir"; then
-        exit 44
-      fi
-      # Install unit file: cp from moved-back folder, rm the stash.
-      local moved_stash="$live_dir/app-$slug.service.archived"
-      mkdir -p "$SYSTEMD_UNIT_DIR" 2>/dev/null || true
-      if ! cp "$moved_stash" "$unit_file"; then
-        exit 45
-      fi
-      rm -f "$moved_stash"
-      exit 0
-    )
-    lock_rc=$?
-    case "$lock_rc" in
-      0)
-        log "app '$slug' un-archive: folder moved, unit installed at $unit_file (port $archived_port)"
-        ;;
-      42)
-        log "ERROR: app '$slug' un-archive: could not acquire $APP_CREATE_LOCK within 30s. Sentinel retained; next tick will retry."
-        continue
-        ;;
-      43)
-        log "ERROR: app '$slug' un-archive REFUSED: port $archived_port is now in use by another app on this box. Archive that one first or delete the archived app. Sentinel deleted."
-        rm -f "$d/.unarchive-requested"
-        continue
-        ;;
-      44)
-        log "ERROR: app '$slug' un-archive: mv archive→live FAILED — sentinel already deleted; folder retained in archive tree. Drop a fresh .unarchive-requested to retry once the collision is resolved."
-        continue
-        ;;
-      45)
-        log "ERROR: app '$slug' un-archive: install unit file FAILED — folder already moved to live tree, unit NOT installed. Investigate manually; the app cannot start until $unit_file is present."
-        continue
-        ;;
-      *)
-        log "ERROR: app '$slug' un-archive: locked-sequence subshell rc=$lock_rc (unexpected). Sentinel state may be inconsistent — investigate."
-        continue
-        ;;
-    esac
-
-    # -----------------------------------------------------------------------
-    # Best-effort systemd wiring — folder is live either way at this point.
-    # -----------------------------------------------------------------------
-    if ! "$SYSTEMCTL_BIN" --user daemon-reload 2>/dev/null; then
-      log "WARN: app '$slug' un-archive: systemctl daemon-reload failed. Operator may need to run it manually."
-    fi
-    if ! "$SYSTEMCTL_BIN" --user enable --now "app-$slug.service" 2>/dev/null; then
-      log "WARN: app '$slug' un-archive: systemctl enable --now failed. Operator may need to systemctl --user enable --now app-$slug.service manually."
-    fi
-    sleep 2
-    if "$SYSTEMCTL_BIN" --user is-active --quiet "app-$slug.service" 2>/dev/null; then
-      log "app '$slug' un-archive: systemd unit active (running) on port $archived_port"
-    else
-      log "WARN: app '$slug' un-archive: systemd unit did NOT reach active state on port $archived_port — check journalctl --user -u app-$slug -n 50 --no-pager"
-    fi
-
-    log "app '$slug' un-archive COMPLETE"
-  done
+  # Step 7: Prepend un-archive banner (non-fatal).
+  local live_ident_file="$live/$name.md"
+  local unarchive_ts
+  unarchive_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  if _prepend_unarchive_banner "$live_ident_file" "$unarchive_ts"; then
+    log "'$name' un-archive step 7: in-session banner prepended to identity file (ts=$unarchive_ts)"
+  else
+    log "WARN: '$name' un-archive step 7 (banner prepend) FAILED — un-archive is otherwise complete; agent won't see the in-session un-archive banner. Investigate: $live_ident_file"
+  fi
+  _unarchive_finish done --result "{\"name\":\"$name\"}"
 }
 
 # Find the ACTUAL existing tmux session name matching $1 CASE-INSENSITIVELY (tmux names are
@@ -3511,6 +3203,7 @@ MONITOR_REPAIR_MINUTES="${MONITOR_REPAIR_MINUTES:-10}"
 repair_ambient_monitor() {
   local name="$1" sess="$2" hpid p
   [ -e "$IDENTITIES_DIR/$name/.archive-requested" ] && return 0
+  [ -e "$IDENTITIES_DIR/$name/.archiving" ] && return 0
   # Cheap path: the snapshot has a monitor whose harness is still alive. A monitor outlives its
   # harness by ~1s at most (its own harness-watch), so a live bound PID means it's this harness's.
   for p in ${AMBIENT_MONITOR_SNAPSHOT[$name]:-}; do
@@ -5118,14 +4811,12 @@ reconcile() {
   snapshot_ambient_monitors                        # one ps per tick; repair_ambient_monitor reads from AMBIENT_MONITOR_SNAPSHOT.
   ensure_fleet_changes_up                          # the front door's listener (fleet-changes.service) is running
   run_archive_scan_if_due                          # Phase 94: daily archive-scan branch (24h gate; fast-path no-op on most ticks)
-  scan_archive_requested_sentinels                 # Phase 115 D-10: user-initiated archive-scan (every tick, no gate, bypasses .pinned/.no-dormancy/coordinator/freshness)
-  scan_role_archive_requested_sentinels            # Phase 133 D-01/D-05: user-initiated ROLE archive (every tick, no gate, cascades retire_identity per D-08, moves role folder per D-09 if all-clean)
-  scan_app_archive_requested_sentinels             # app-archive shape: user-initiated APP archive (every tick, invokes archive-app.sh from the app-development skill on any folder carrying .archive-requested)
-  scan_identity_unarchive_requested_sentinels      # one-path un-archive: flag → backend reactivates chat account → login → .dormant + mv archive→live
-  scan_role_unarchive_requested_sentinels          # un-archive host-side shape: user-initiated role UN-archive (folder mv only, no identity cascade)
+  scan_archive_notes                               # archive / un-archive notes left the old way, handed to the front door (fleet-change)
+  finish_archiving_identities                      # claimed agent archives: stop the agent, switch its chat account off, move its folder (retried until done)
+  finish_archiving_roles                           # claimed role archives: the folder moves once its agents have
+  finish_returning_identities                      # accepted agent un-archives: chat account back, folder back, answer the requests
   scan_app_move_requested_sentinels                # project-scoped apps: leftover Move to notes handed to the front door (fleet-change)
   retire_archived_project_apps                     # project-scoped apps: stop + stash the apps of a project that was archived
-  scan_app_unarchive_requested_sentinels           # un-archive host-side shape: user-initiated app UN-archive (folded-in restore-app.sh: port-collision check under create-lock, mv archive→live, systemd reinstall + enable+start)
   reap_desktops                                    # stop agent-desktop@ units of gone identities, and of dormant ones nobody is viewing
   reap_archived_strays                             # kill processes still working inside an archived identity's folder
   resolve_identities
@@ -5296,6 +4987,7 @@ launch_newborns() {
     [ -f "$IDENTITIES_DIR/$name/$name.md" ] || continue
     [ -e "$IDENTITIES_DIR/$name/.dormant" ] && continue
     [ -e "$IDENTITIES_DIR/$name/.archive-requested" ] && continue
+    [ -e "$IDENTITIES_DIR/$name/.archiving" ] && continue
     sess="$(slug "$name")"
     timeout -k 5 10 tmux ls -F '#{session_name}' 2>/dev/null | tr '[:upper:]' '[:lower:]' | grep -qxF "$(_lower "$sess")" && continue
     [ "$n" -gt 0 ] && sleep "${STAGGER_SECONDS:-8}"
@@ -5360,7 +5052,10 @@ wait_for_next_tick() {
         EARLY_WAKE_NAMES="$(new_identity_since_tick)"; [ -n "$EARLY_WAKE_NAMES" ] || EARLY_WAKE_NAMES="$f"
         log "new identity '$f' appeared — next pass now (early wake)"; break ;; esac ;;
     esac
-    # a plain file or dot-dir at the top level — not a birth; keep waiting out the interval
+    # The front door claimed an archive or accepted an un-archive: start on it now.
+    # (Its temporary copy counts too: the rename can land while the watch is being re-armed.)
+    case "$f" in .supervisor-wake*) log "front door has work for this pass — next pass now (early wake)"; break ;; esac
+    # any other plain file or dot-dir at the top level — not a birth; keep waiting out the interval
   done
   rm -f "$out" "$err"
   return 0

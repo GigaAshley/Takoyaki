@@ -2014,9 +2014,11 @@ export function PrettyConversationsPanel({
 
   // The archive call itself, after the row is already gone from the sidebar.
   // On failure the row comes back and the user is told.
-  const commitArchive = async (hostIdNum: number, identityKey: string, undoRemove: () => void) => {
+  const commitArchive = async (hostIdNum: number, identityKey: string, undoRemove: () => void, label?: string) => {
     try {
-      await archiveIdentity(hostIdNum, identityKey);
+      await archiveIdentity(hostIdNum, identityKey, () => {
+        toast(`Still archiving "${label ?? identityKey}"`, { description: "The machine is still working on it." });
+      });
       // Archived: every open copy of the conversation in this window closes.
       announceAgentArchived(hostIdNum, identityKey);
     } catch (err) {
@@ -2030,7 +2032,7 @@ export function PrettyConversationsPanel({
       });
       void kitAlert({
         title: "Couldn't archive",
-        body: err instanceof Error ? err.message : String(err),
+        body: err instanceof MachineChangeError ? sentenceOf(err.message) : err instanceof Error ? err.message : String(err),
       });
     }
   };
@@ -2072,7 +2074,7 @@ export function PrettyConversationsPanel({
     // frame that races with the removes below is silent-dropped rather than
     // re-inserting the row.
     const undoRemove = optimisticArchiveRemove(hostIdNum, identityKey, identityKey);
-    await commitArchive(hostIdNum, identityKey, undoRemove);
+    await commitArchive(hostIdNum, identityKey, undoRemove, label);
   };
 
   // Swipe-to-archive on touch (shape-sidebar): no confirm. The row leaves at
@@ -2129,7 +2131,7 @@ export function PrettyConversationsPanel({
         if (check.status === "unknown" && !checkFailureShown) {
           toast(`Archived "${label}"`, { description: "Couldn't check its scheduled wake-ups first — any it had have stopped." });
         }
-        void commitArchive(hostIdNum, identityKey, undoRemove);
+        void commitArchive(hostIdNum, identityKey, undoRemove, label);
       });
     };
     const undo = () => {

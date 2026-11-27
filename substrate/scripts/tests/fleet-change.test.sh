@@ -8,6 +8,9 @@
 #   - project-contents / project-archive: the machine decides what a project
 #     archive takes; a stale confirm list is refused with the current contents
 #   - a request left running when the listener stopped is carried on
+#   - agent / role archives are claimed at once and finished by the supervisor;
+#     agent un-archives are accepted and finished by it; role and app archives
+#     and un-archives are carried out here
 #
 # move-app.sh is a stub that moves the folder (move-app.sh itself is covered by
 # app-units.test.sh). app-units.sh is a stub: `find` mirrors the real lookup,
@@ -71,7 +74,16 @@ case "\$1" in
     rm -f "$s/units/app-\$2.socket"; exit 0 ;;
 esac
 STUB
-  chmod +x "$s/move-app.sh" "$s/app-units.sh"
+  cat > "$s/archive-app.sh" <<STUB
+#!/usr/bin/env bash
+printf 'archive-app %s\n' "\$*" >> "$s/calls"
+mkdir -p "$s/fleet/apps-archive"; mv "$s/fleet/apps/\$1" "$s/fleet/apps-archive/\$1"
+STUB
+  cat > "$s/systemctl" <<STUB
+#!/usr/bin/env bash
+printf 'systemctl %s\n' "\$*" >> "$s/calls"
+STUB
+  chmod +x "$s/move-app.sh" "$s/app-units.sh" "$s/archive-app.sh" "$s/systemctl"
   : > "$s/calls"
   printf '%s' "$s"
 }
@@ -79,6 +91,7 @@ STUB
 fc() {
   local s="$1"; shift
   FLEET_CHANGE_FLEET_DIR="$s/fleet" FLEET_CHANGE_APP_UNITS="$s/app-units.sh" FLEET_CHANGE_MOVE_APP="$s/move-app.sh" \
+    FLEET_CHANGE_ARCHIVE_APP="$s/archive-app.sh" FLEET_CHANGE_UNIT_DIR="$s/units" FLEET_CHANGE_SYSTEMCTL="$s/systemctl" \
     FLEET_CHANGE_POLL_S=0.02 python3 "$FC" "$@"
 }
 serve_once() { fc "$1" serve --until-idle >> "$1/serve.log" 2>&1; }
@@ -91,10 +104,16 @@ project() {  # project <s> <slug> <displayName> [parent]
   { printf -- '---\ndisplayName: %s\n' "$3"; [ -n "${4:-}" ] && printf 'parent: %s\n' "$4"; printf -- '---\n'; } > "$1/fleet/projects/$2/project.md"
 }
 app() { mkdir -p "$1"; printf '{"title": "%s"}\n' "${2:-Tally}" > "$1/app.json"; }
-agent() {  # agent <s> <name> <project>
+agent() {  # agent <s> <name> <project> [roles]
   mkdir -p "$1/fleet/identities/$2"
-  printf -- '---\nroles: []\ntask: "Doing %s"\nproject: %s\n---\n' "$2" "$3" > "$1/fleet/identities/$2/$2.md"
+  printf -- '---\nroles: [%s]\ntask: "Doing %s"\nproject: %s\n---\n' "${4:-}" "$2" "$3" > "$1/fleet/identities/$2/$2.md"
 }
+role() { mkdir -p "$1/fleet/roles/$2"; printf -- '---\ndisplayName: %s\n---\n' "${3:-$2}" > "$1/fleet/roles/$2/$2.md"; }
+archived_agent() {  # archived_agent <s> <name> [roles]
+  mkdir -p "$1/fleet/identities-archive/$2"
+  printf -- '---\nroles: [%s]\n---\n' "${3:-}" > "$1/fleet/identities-archive/$2/$2.md"
+}
+submit() { fc "$1" submit "$2" "$3" --id "$4" --wait 0 >/dev/null; }
 
 # The Aither sequence: two apps moved out of a sub-project, then the sub-project archived.
 # In arrival order: both moves happen first, the contents question sees them gone, the
@@ -160,7 +179,7 @@ test_stale_confirm_list_is_refused_with_current_contents() {
   assert_eq contents_changed "$(field "$a" code)" "code"
   assert_eq finch "$(field "$a" result.agents.0.name)" "current list returned"
   assert_exists "$s/fleet/projects/garden/project.md" "nothing archived"
-  assert_absent "$s/fleet/identities/finch/.archive-requested" "agent untouched"
+  assert_absent "$s/fleet/identities/finch/.archiving" "agent untouched"
   rm -rf "$s"
 }
 
@@ -177,8 +196,8 @@ test_archive_takes_subtree_agents_and_stops_apps() {
   assert_eq done "$(field "$(fc "$s" status a1)" state)" "archive done"
   assert_exists "$s/fleet/projects/archive/garden/project.md" "garden archived"
   assert_exists "$s/fleet/projects/archive/beds/apps/tally/app.json" "beds archived with its app"
-  assert_exists "$s/fleet/identities/finch/.archive-requested" "agent in sub-project archived"
-  assert_absent "$s/fleet/identities/wren/.archive-requested" "agent elsewhere untouched"
+  assert_exists "$s/fleet/identities/finch/.archiving" "agent in sub-project claimed"
+  assert_absent "$s/fleet/identities/wren/.archiving" "agent elsewhere untouched"
   assert_exists "$s/fleet/projects/other/project.md" "other project untouched"
   grep -q 'units uninstall tally' "$s/calls" || fail "app units removed"
   rm -rf "$s"
@@ -270,7 +289,7 @@ test_running_request_is_carried_on_after_restart() {
   local a; a=$(fc "$s" status a1)
   assert_eq done "$(field "$a" state)" "finished"
   assert_exists "$s/fleet/projects/archive/garden/project.md" "garden archived"
-  assert_exists "$s/fleet/identities/finch/.archive-requested" "agent handed over"
+  assert_exists "$s/fleet/identities/finch/.archiving" "agent claimed"
   grep -q 'carried on after a restart' "$s/serve.log" || fail "logged as carried on"
   rm -rf "$s"
 }
@@ -320,7 +339,7 @@ test_carry_on_refuses_what_appeared_since() {
   local a; a=$(fc "$s" status a1)
   assert_eq changed_during_restart "$(field "$a" code)" "refused to take the newcomer"
   assert_exists "$s/fleet/projects/garden/project.md" "garden left live"
-  assert_absent "$s/fleet/identities/newcomer/.archive-requested" "newcomer untouched"
+  assert_absent "$s/fleet/identities/newcomer/.archiving" "newcomer untouched"
   rm -rf "$s"
 }
 
@@ -334,6 +353,178 @@ test_move_cut_off_after_the_folder_moved_is_finished() {
   serve_once "$s"
   assert_eq done "$(field "$(fc "$s" status m1)" state)" "done"
   grep -q "units install tally $s/fleet/projects/garden/apps/tally 9123" "$s/calls" || fail "started again on its port: $(cat "$s/calls")"
+  rm -rf "$s"
+}
+
+# ---- archive and un-archive of agents, roles and apps ----
+
+test_agent_archive_claims_at_once() {
+  local s; s=$(setup)
+  agent "$s" finch ""; mkdir -p "$s/fleet/identities/finch/apps/tally"; app "$s/fleet/identities/finch/apps/tally"
+  : > "$s/fleet/identities/finch/.archive-requested"
+  submit "$s" agent-archive '{"name":"finch"}' a1
+  submit "$s" app-move '{"slug":"tally","to":"sidebar","users":null}' m1
+  serve_once "$s"
+  local a; a=$(fc "$s" status a1)
+  assert_eq done "$(field "$a" state)" "archive done at the claim"
+  assert_eq '["finch"]' "$(field "$a" finishing.pending)" "still finishing"
+  assert_eq a1 "$(field "$(cat "$s/fleet/identities/finch/.archiving")" id)" "claim carries the request"
+  assert_absent "$s/fleet/identities/finch/.archive-requested" "old note dropped"
+  assert_exists "$s/fleet/identities/.supervisor-wake" "supervisor woken"
+  local m; m=$(fc "$s" status m1)
+  assert_eq being_archived "$(field "$m" code)" "its app can't be moved out"
+  assert_exists "$s/fleet/identities/finch/apps/tally/app.json" "app stayed"
+  # Once the supervisor has moved it, the same status reads as finished.
+  mkdir -p "$s/fleet/identities-archive"; mv "$s/fleet/identities/finch" "$s/fleet/identities-archive/finch"
+  assert_eq "None" "$(field "$(fc "$s" status a1)" finishing)" "finished"
+  rm -rf "$s"
+}
+
+test_agent_archive_refusals() {
+  local s; s=$(setup)
+  agent "$s" finch ""; agent "$s" wren ""; : > "$s/fleet/identities/wren/.pinned"
+  archived_agent "$s" finch
+  submit "$s" agent-archive '{"name":"finch"}' a1
+  submit "$s" agent-archive '{"name":"wren","dormant":true}' a2
+  submit "$s" agent-archive '{"name":"nobody"}' a3
+  serve_once "$s"
+  assert_eq archive_slot_taken "$(field "$(fc "$s" status a1)" code)" "slot taken"
+  assert_eq guarded "$(field "$(fc "$s" status a2)" code)" "sleep sweep respects pins"
+  assert_eq not_found "$(field "$(fc "$s" status a3)" code)" "unknown agent"
+  assert_absent "$s/fleet/identities/finch/.archiving" "nothing claimed"
+  assert_absent "$s/fleet/identities/wren/.archiving" "nothing claimed"
+  rm -rf "$s"
+}
+
+test_stuck_archive_says_why() {
+  local s; s=$(setup)
+  agent "$s" finch ""
+  submit "$s" agent-archive '{"name":"finch"}' a1; serve_once "$s"
+  python3 - "$s/fleet/identities/finch/.archiving" <<'PY'
+import json, sys, time
+p = sys.argv[1]; c = json.load(open(p))
+c.update(failing_since=time.time() - 700, last_error="couldn't switch the chat account off")
+json.dump(c, open(p, "w"))
+PY
+  assert_eq "couldn't switch the chat account off" "$(field "$(fc "$s" status a1)" finishing.stuck.finch)" "stuck reason"
+  rm -rf "$s"
+}
+
+test_role_archive_uses_the_machines_list() {
+  local s; s=$(setup)
+  role "$s" eng "Engineer"; agent "$s" ann "" eng; agent "$s" bob "" "ops, eng"; agent "$s" cat "" ops
+  submit "$s" role-contents '{"name":"eng"}' c1; serve_once "$s"
+  assert_eq '["ann", "bob"]' "$(python3 -c 'import json,sys; print(json.dumps([a["name"] for a in json.loads(sys.argv[1])["result"]["agents"]]))' "$(fc "$s" status c1)")" "who holds it"
+  submit "$s" role-archive '{"name":"eng","expected":{"agents":["ann"]}}' r1; serve_once "$s"
+  local r; r=$(fc "$s" status r1)
+  assert_eq contents_changed "$(field "$r" code)" "stale list refused"
+  assert_absent "$s/fleet/identities/ann/.archiving" "nothing claimed"
+  submit "$s" role-archive '{"name":"eng","expected":{"agents":["bob","ann"]}}' r2; serve_once "$s"
+  r=$(fc "$s" status r2)
+  assert_eq done "$(field "$r" state)" "archived"
+  assert_eq '["ann", "bob", "eng"]' "$(field "$r" finishing.pending)" "role and agents finishing"
+  assert_exists "$s/fleet/identities/ann/.archiving" "ann claimed"
+  assert_exists "$s/fleet/identities/bob/.archiving" "bob claimed"
+  assert_absent "$s/fleet/identities/cat/.archiving" "cat untouched"
+  assert_eq '["ann", "bob"]' "$(field "$(cat "$s/fleet/roles/eng/.archiving")" agents)" "role claim lists its agents"
+  rm -rf "$s"
+}
+
+test_role_archive_refused_while_an_agent_is_coming_back() {
+  local s; s=$(setup)
+  role "$s" eng; archived_agent "$s" ann eng
+  submit "$s" agent-unarchive '{"name":"ann"}' u1
+  submit "$s" role-archive '{"name":"eng","expected":{"agents":[]}}' r1
+  serve_once "$s"
+  local r; r=$(fc "$s" status r1)
+  assert_eq agent_returning "$(field "$r" code)" "refused"
+  assert_eq "'ann' is still being un-archived; try again in a minute" "$(field "$r" reason)" "names the agent"
+  assert_absent "$s/fleet/roles/eng/.archiving" "nothing archived"
+  rm -rf "$s"
+}
+
+test_agent_unarchive_is_finished_in_the_background() {
+  local s; s=$(setup)
+  role "$s" eng; archived_agent "$s" ann eng; archived_agent "$s" zed gone
+  submit "$s" agent-unarchive '{"name":"ann"}' u1
+  submit "$s" agent-unarchive '{"name":"ann"}' u2
+  submit "$s" agent-unarchive '{"name":"zed"}' u3
+  serve_once "$s"
+  local u; u=$(fc "$s" status u1)
+  assert_eq running "$(field "$u" state)" "accepted, not done"
+  assert_eq finishing "$(field "$u" stage)" "finishing in the background"
+  assert_eq '["u1", "u2"]' "$(field "$(cat "$s/fleet/.changes/returning/ann.json")" ids)" "both clicks wait on one un-archive"
+  u=$(fc "$s" status u3)
+  assert_eq missing_roles "$(field "$u" code)" "missing role refused at once"
+  assert_eq '["gone"]' "$(field "$u" result.missingRoles)" "names it"
+  submit "$s" agent-archive '{"name":"ann"}' a1; serve_once "$s"
+  assert_eq returning "$(field "$(fc "$s" status a1)" code)" "can't be archived while coming back"
+  fc "$s" finish u1 done --result '{"name":"ann"}' >/dev/null
+  assert_eq done "$(field "$(fc "$s" status u1)" state)" "finished by the supervisor"
+  rm -rf "$s"
+}
+
+test_agent_unarchive_waits_for_an_unfinished_archive() {
+  local s; s=$(setup)
+  agent "$s" ann ""
+  submit "$s" agent-archive '{"name":"ann"}' a1
+  submit "$s" agent-unarchive '{"name":"ann"}' u1
+  serve_once "$s"
+  assert_eq done "$(field "$(fc "$s" status a1)" state)" "archive claimed"
+  assert_eq running "$(field "$(fc "$s" status u1)" state)" "un-archive accepted, waiting"
+  assert_exists "$s/fleet/.changes/returning/ann.json" "held for the supervisor"
+  rm -rf "$s"
+}
+
+test_role_and_app_unarchive() {
+  local s; s=$(setup)
+  mkdir -p "$s/fleet/roles-archive/eng"; : > "$s/fleet/roles-archive/eng/.unarchive-requested"
+  mkdir -p "$s/fleet/roles/ops" "$s/fleet/roles-archive/ops"
+  app "$s/fleet/apps-archive/tally"; printf 'ListenStream=127.0.0.1:9200\n' > "$s/fleet/apps-archive/tally/app-tally.socket.archived"
+  app "$s/fleet/apps-archive/old"; printf 'Environment=PORT=9300\n' > "$s/fleet/apps-archive/old/app-old.service.archived"
+  app "$s/fleet/apps-archive/clash"; printf 'ListenStream=127.0.0.1:9400\n' > "$s/fleet/apps-archive/clash/app-clash.socket.archived"
+  printf 'ListenStream=127.0.0.1:9400\n' > "$s/units/app-other.socket"
+  app "$s/fleet/apps-archive/clash2"; printf 'ListenStream=127.0.0.1:9500\n' > "$s/fleet/apps-archive/clash2/app-clash2.socket.archived"
+  printf 'Environment=PORT=9500\n' > "$s/units/app-legacy.service"
+  app "$s/fleet/apps-archive/nostash"
+  submit "$s" role-unarchive '{"name":"eng"}' r1
+  submit "$s" role-unarchive '{"name":"ops"}' r2
+  submit "$s" app-unarchive '{"slug":"tally"}' p1
+  submit "$s" app-unarchive '{"slug":"old"}' p2
+  submit "$s" app-unarchive '{"slug":"clash"}' p3
+  submit "$s" app-unarchive '{"slug":"clash2"}' p4
+  submit "$s" app-unarchive '{"slug":"nostash"}' p5
+  serve_once "$s"
+  assert_eq done "$(field "$(fc "$s" status r1)" state)" "role back"
+  assert_exists "$s/fleet/roles/eng" "role folder live"
+  assert_absent "$s/fleet/roles/eng/.unarchive-requested" "note dropped"
+  assert_eq name_collision "$(field "$(fc "$s" status r2)" code)" "live role in the way"
+  assert_eq 9200 "$(field "$(fc "$s" status p1)" result.port)" "app back on its port"
+  grep -q "units restore tally $s/fleet/apps/tally" "$s/calls" || fail "units restored: $(cat "$s/calls")"
+  assert_eq done "$(field "$(fc "$s" status p2)" state)" "old-style app back"
+  assert_exists "$s/units/app-old.service" "its unit reinstalled"
+  grep -q "systemctl --user enable --now app-old.service" "$s/calls" || fail "started: $(cat "$s/calls")"
+  assert_eq port_in_use "$(field "$(fc "$s" status p3)" code)" "port taken refused"
+  assert_exists "$s/fleet/apps-archive/clash" "stays archived"
+  assert_eq port_in_use "$(field "$(fc "$s" status p4)" code)" "port held by an old-style app refused"
+  assert_eq no_stash "$(field "$(fc "$s" status p5)" code)" "no saved units refused"
+  if grep -q "units restore old" "$s/calls"; then fail "old-style app went through app-units.sh"; fi
+  rm -rf "$s"
+}
+
+test_app_archive() {
+  local s; s=$(setup)
+  app "$s/fleet/apps/tally"; : > "$s/fleet/apps/tally/.archive-requested"
+  project "$s" garden "Garden"; app "$s/fleet/projects/garden/apps/beds"
+  submit "$s" app-archive '{"slug":"tally"}' p1
+  submit "$s" app-archive '{"slug":"beds"}' p2
+  submit "$s" app-archive '{"slug":"tally"}' p3
+  serve_once "$s"
+  assert_eq done "$(field "$(fc "$s" status p1)" state)" "archived"
+  assert_exists "$s/fleet/apps-archive/tally/app.json" "in the archive"
+  assert_absent "$s/fleet/apps-archive/tally/.archive-requested" "note dropped"
+  assert_eq project_app "$(field "$(fc "$s" status p2)" code)" "a project's app goes with its project"
+  assert_eq True "$(field "$(fc "$s" status p3)" result.alreadyArchived)" "second click: already archived"
   rm -rf "$s"
 }
 
@@ -355,6 +546,15 @@ run_test test_change_lock_is_held_while_a_request_runs
 run_test test_app_that_wont_stop_leaves_the_project_as_it_was
 run_test test_carry_on_refuses_what_appeared_since
 run_test test_move_cut_off_after_the_folder_moved_is_finished
+run_test test_agent_archive_claims_at_once
+run_test test_agent_archive_refusals
+run_test test_stuck_archive_says_why
+run_test test_role_archive_uses_the_machines_list
+run_test test_role_archive_refused_while_an_agent_is_coming_back
+run_test test_agent_unarchive_is_finished_in_the_background
+run_test test_agent_unarchive_waits_for_an_unfinished_archive
+run_test test_role_and_app_unarchive
+run_test test_app_archive
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 if [ "$FAIL" -gt 0 ]; then

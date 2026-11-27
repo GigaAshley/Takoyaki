@@ -19,18 +19,15 @@ import rbacRoutes from "./routes/rbac.js";
 import openTabsRoutes from "./routes/open-tabs.js";
 import identitiesRoutes from "./routes/identities.js";
 import appsRoutes from "./routes/apps.js";
-// app-archive shape: POST /apps/:hostId/:slug/archive drops `.archive-requested`
-// on the app folder via the per-app-file primitive. Mirrors identity-archive
-// and role-archive mount discipline (mounted before the generic /apps router).
+// POST /apps/:hostId/:slug/archive — a request to the machine's front door.
+// Mounted before the generic /apps router.
 import appsArchiveRoutes from "./routes/apps-archive.js";
 // Phase 143 Plan 143-03 (D-05/D-07): GET /apps-archive — fleet-wide list of
 // archived app slugs across the caller's own hosts. Mirrors the fan-out shape
 // of identities-archive-list.ts, substituting listArchivedAppsOnHost (plan 143-02).
 import appsArchiveListRoutes from "./routes/apps-archive-list.js";
-// Phase 143 Plan 143-04 (D-01): POST /apps/:hostId/:slug/unarchive — drops
-// .unarchive-requested sentinel inside the archive folder after two fast-path
-// preconditions (archive-exists, name-collision). Mounted AFTER appsArchiveRoutes
-// under "/apps" — POST sub-paths are distinct so no handler shadowing occurs.
+// POST /apps/:hostId/:slug/unarchive — a request to the machine's front door.
+// Mounted AFTER appsArchiveRoutes under "/apps" — POST sub-paths are distinct.
 import appsUnarchiveRoutes from "./routes/apps-unarchive.js";
 // app-rename shape: PATCH /apps/:hostId/:slug — rewrites app.json `title`.
 import appsRenameRoutes from "./routes/apps-rename.js";
@@ -59,15 +56,13 @@ import identityAvatarBatchRoutes from "./routes/identity-avatar-batch.js";
 import identityExistsOnHostRoutes from "./routes/identity-exists-on-host.js";
 import identityNoDormancyRoutes from "./routes/identity-no-dormancy.js";
 import identityPinRoutes from "./routes/identity-pin.js";
-// Phase 115 Plan 115-03 (D-17): user-initiated archive — POST
-// /identities/:key/archive drops the `.archive-requested` sentinel on the
-// identity's host. Mounted BEFORE the generic /identities router so the
-// :key/archive sub-route isn't intercepted by the generic /:identityKey handler.
+// POST /identities/:key/archive — a request to the machine's front door.
+// Mounted BEFORE the generic /identities router so the :key/archive sub-route
+// isn't intercepted by the generic /:identityKey handler.
 import identityArchiveRoutes from "./routes/identity-archive.js";
 import identityCondenseRoutes from "./routes/identity-condense.js";
-// Phase 143 Plan 143-04 (D-01/D-02/D-03/D-04): POST /identities/:key/unarchive
-// drops `.unarchive-requested` inside `~/fleet/identities-archive/<key>/` after
-// three fast-path preconditions (archive-exists, name-collision, all-roles-live).
+// POST /identities/:key/unarchive — a request to the machine's front door; the
+// supervisor finishes it.
 // Mounted alongside identity-archive; coexists under "/identities" because the
 // POST sub-paths are distinct (:key/archive vs :key/unarchive).
 import identityUnarchiveRoutes from "./routes/identity-unarchive.js";
@@ -103,17 +98,12 @@ import rolesCreateRoutes from "./routes/roles-create.js";
 // create routers; the depth difference (`/` vs `/:name/avatar`) keeps them
 // from colliding under Express's chained-router mount.
 import rolesRoutes from "./routes/roles.js";
-// Phase 133 Plan 133-01 (D-01, D-05, D-16, D-19): user-initiated role archive
-// endpoint — POST /roles/:name/archive drops `.archive-requested` on the role
-// folder via the per-role-file primitive. Mounted BEFORE the three existing
-// /roles routers so /:name/archive isn't shadowed by any future generic
-// /:roleName handler (mirrors the identity-archive mount discipline).
+// GET /roles/:name/archive-preflight + POST /roles/:name/archive — requests to
+// the machine's front door. Mounted BEFORE the three existing /roles routers so
+// /:name/archive isn't shadowed by any future generic /:roleName handler.
 import roleArchiveRoutes from "./routes/role-archive.js";
-// Phase 143 Plan 143-04 (D-01/D-02/D-03/D-04): POST /roles/:name/unarchive
-// drops `.unarchive-requested` inside `~/fleet/roles-archive/<name>/` after two
-// fast-path preconditions (archive-exists, name-collision). Coexists with
-// role-archive under "/roles" — POST sub-paths distinct (:name/archive vs
-// :name/unarchive).
+// POST /roles/:name/unarchive — a request to the machine's front door.
+// Coexists with role-archive under "/roles" — POST sub-paths distinct.
 import roleUnarchiveRoutes from "./routes/role-unarchive.js";
 // Phase 143 Plan 143-03 (D-05/D-07): GET /roles-archive?hostId=<n> — host-scoped
 // list of archived role names. Mirrors roles-list-for-host.ts shape, substituting
@@ -2084,22 +2074,17 @@ app.use("/identities", identityNoDormancyRoutes);
 // Single-identity .pinned toggle (PUT /identities/:key/pinned) — same
 // mount-before-generic discipline as no-dormancy.
 app.use("/identities", identityPinRoutes);
-// Phase 115 Plan 115-03 (D-17): user-initiated archive endpoint — POST
-// /identities/:key/archive drops `.archive-requested` on the identity's host
-// via the per-identity-file primitive. Mounted alongside the sibling
-// no-dormancy sub-route BEFORE the generic /identities router so the
-// :key/archive sub-route isn't intercepted by identitiesRoutes's /:identityKey
-// handlers. Same discipline as the exists-on-host + no-dormancy mounts above.
+// POST /identities/:key/archive — a request to the machine's front door.
+// Mounted alongside the sibling no-dormancy sub-route BEFORE the generic
+// /identities router so the :key/archive sub-route isn't intercepted by
+// identitiesRoutes's /:identityKey handlers.
 app.use("/identities", identityArchiveRoutes);
 // POST /identities/:key/condense drops `.compact-requested` (Condense
 // conversation); the agent-supervisor carries it out. Same mount discipline
 // as identity-archive — before the generic /identities router.
 app.use("/identities", identityCondenseRoutes);
-// Phase 143 Plan 143-04 (D-01): POST /identities/:key/unarchive drops
-// `.unarchive-requested` sentinel in the archive folder with three preconditions
-// (D-02: archive-exists, name-collision, all-roles-live). Coexists with
-// identity-archive under "/identities" — distinct sub-paths (:key/archive vs
-// :key/unarchive) prevent any handler shadowing.
+// POST /identities/:key/unarchive — a request to the machine's front door.
+// Coexists with identity-archive under "/identities" — distinct sub-paths.
 app.use("/identities", identityUnarchiveRoutes);
 // Phase 143 Plan 143-03 (D-05/D-06/D-07): GET /identities-archive — fleet-wide
 // list of archived identity keys. Standalone base path (no overlap with
@@ -2119,18 +2104,12 @@ app.use("/conversation-search", conversationSearchRoutes);
 // subscription-registry.publishProjectListChanged so connected WS clients
 // re-hydrate the sidebar's projects zone.
 app.use("/identities", sessionProjectWriteRoutes);
-// Phase 133 Plan 133-01 (D-01, D-05): role archive route — POST
-// /roles/:name/archive drops the `.archive-requested` sentinel on the role
-// folder. Mounted BEFORE the three existing /roles routers below so
-// /:name/archive is not shadowed by any future generic /:roleName handler
-// in rolesRoutes (mirrors the identity-archive mount discipline at
-// database.ts:2033). Same match-precedence pattern: specific /:name/action
-// sub-routes MUST mount ahead of generic /:name handlers.
+// Role archive (preflight + archive) — requests to the machine's front door.
+// Mounted BEFORE the three existing /roles routers below: specific
+// /:name/action sub-routes MUST mount ahead of generic /:name handlers.
 app.use("/roles", roleArchiveRoutes);
-// Phase 143 Plan 143-04 (D-01): POST /roles/:name/unarchive drops
-// `.unarchive-requested` sentinel in the role archive folder with two
-// preconditions (D-02: archive-exists, name-collision). Coexists with
-// roleArchiveRoutes under "/roles" — sub-paths are distinct.
+// POST /roles/:name/unarchive — a request to the machine's front door.
+// Coexists with roleArchiveRoutes under "/roles" — sub-paths are distinct.
 app.use("/roles", roleUnarchiveRoutes);
 // Phase 143 Plan 143-03 (D-05/D-07): GET /roles-archive?hostId=<n> — host-scoped
 // archived-role list. Standalone base path; must mount BEFORE any generic
@@ -2216,11 +2195,9 @@ app.use("/pretty-view", prettyViewFetchTailnetUrlRoutes);
 app.use("/pretty-view", prettyViewFetchHostFileRoutes);
 app.use("/", fileUrlRoutes);
 app.use("/identities", identitiesRoutes);
-// app-archive shape: POST /apps/:hostId/:slug/archive — drops
-// `.archive-requested` on the target host's ~/fleet/apps/<slug>/ folder via
-// the per-app-file primitive. Mounted BEFORE the generic /apps router so the
-// POST sub-route is not shadowed by any future generic /:hostId/:slug POST
-// handler (mirrors identity-archive + role-archive mount discipline).
+// POST /apps/:hostId/:slug/archive and /unarchive — requests to the machine's
+// front door. Mounted BEFORE the generic /apps router so the POST sub-routes
+// are not shadowed by any future generic /:hostId/:slug POST handler.
 app.use("/apps", appsArchiveRoutes);
 app.use("/apps", appsUnarchiveRoutes); // Phase 143 D-01
 app.use("/apps", appsRenameRoutes); // app-rename shape

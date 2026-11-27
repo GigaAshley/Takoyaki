@@ -70,7 +70,11 @@ import {
   // a session-field write (which does not change the list itself).
 } from "../../claude-session/identity-artifact-reader.js";
 import { getSubscriptionRegistry } from "../../fleet-status/subscription-registry.js";
-import { removeIdentityFile } from "../../claude-session/per-identity-file.js";
+import {
+  assertNotBeingArchived,
+  IdentityBeingArchivedError,
+  removeIdentityFile,
+} from "../../claude-session/per-identity-file.js";
 import { getHostSemaphore } from "../../ssh/host-semaphore-registry.js";
 import yaml from "js-yaml";
 
@@ -281,8 +285,13 @@ router.post(
 
       try {
         try {
+          await assertNotBeingArchived(key, { hostId, conn });
           await writeSessionProjectFieldPreservingNewline(conn, key, project);
         } catch (err) {
+          if (err instanceof IdentityBeingArchivedError) {
+            res.status(409).json({ error: "it's being archived", code: "being_archived" });
+            return;
+          }
           // Log server-side; return generic message (T-117-05-06 no leak).
           databaseLogger.error(
             `failed to write session project field key=${key} hostId=${hostId} project=${project ?? "null"}: ${

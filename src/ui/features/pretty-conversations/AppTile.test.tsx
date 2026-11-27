@@ -610,7 +610,7 @@ describe("AppTile — app-archive shape: Archive menu item", () => {
     expect(kitText(c[1])).toMatch(/can't undo/i);
     expect(c[1].destructive).toBe(true);
 
-    expect(archiveApp).toHaveBeenCalledWith(7, "scratch");
+    expect(archiveApp).toHaveBeenCalledWith(7, "scratch", expect.any(Function));
     // No failure alert on happy path
     await flush();
     expect(alerts(dialogs)).toHaveLength(0);

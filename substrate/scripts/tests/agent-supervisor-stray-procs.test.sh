@@ -152,10 +152,10 @@ fi
 # ---- T-08 ----
 CURRENT_TEST="T-08 static: retire kills strays before the move; reconcile runs the reaper"
 body="$(declare -f retire_identity)"
-kill_line="$(printf '%s\n' "$body" | grep -n 'kill_procs_under "\$iddir"' | head -1 | cut -d: -f1)"
-move_line="$(printf '%s\n' "$body" | grep -n 'mv ' | head -1 | cut -d: -f1)"
-if [ -z "$kill_line" ]; then fail "retire_identity never calls kill_procs_under \"\$iddir\""
-elif [ -z "$move_line" ] || [ "$kill_line" -ge "$move_line" ]; then fail "kill (line $kill_line) is not before the folder move (line ${move_line:-?})"
+prep_line="$(printf '%s\n' "$body" | grep -n '_retire_identity_prepare ' | head -1 | cut -d: -f1)"
+move_line="$(printf '%s\n' "$body" | grep -n '_retire_identity_move ' | head -1 | cut -d: -f1)"
+if ! declare -f _retire_identity_prepare | grep -q 'kill_procs_under "\$iddir"'; then fail "the steps before the folder move never call kill_procs_under \"\$iddir\""
+elif [ -z "$prep_line" ] || [ -z "$move_line" ] || [ "$prep_line" -ge "$move_line" ]; then fail "the kill (line ${prep_line:-?}) is not before the folder move (line ${move_line:-?})"
 elif ! declare -f reconcile | grep -q 'reap_archived_strays'; then fail "reconcile does not call reap_archived_strays"
 else pass; fi
 

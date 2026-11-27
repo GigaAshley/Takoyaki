@@ -431,6 +431,22 @@ test_case_10_condense_sentinels() {
   done
 }
 
+# Case 11: an agent whose archive is claimed (.archiving) is gone from the
+# sweep at once, while the supervisor finishes moving it into the archive.
+test_case_11_claimed_agent_left_out() {
+  make_live_identity "staying" "---
+---
+"
+  make_live_identity "leaving" "---
+---
+"
+  printf '{"id":"a1"}' > "$FIXTURE/fleet/identities/leaving/.archiving"
+  local out
+  out=$(run_sweep)
+  assert_identity_line_count "$out" "1"
+  assert_identity_field "$out" "staying" "archived" 'false'
+}
+
 # ============================================================
 # MAIN
 # ============================================================
@@ -449,6 +465,7 @@ run_test test_case_07_name_collision_both_trees
 run_test test_case_08_project_parent
 run_test test_case_09_project_parent_yaml_scalars_and_long_frontmatter
 run_test test_case_10_condense_sentinels
+run_test test_case_11_claimed_agent_left_out
 
 printf '\n===============================\n'
 printf 'PASS: %s  FAIL: %s\n' "$PASS" "$FAIL"

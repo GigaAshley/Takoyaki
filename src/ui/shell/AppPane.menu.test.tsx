@@ -160,7 +160,7 @@ describe("AppPane bar menu", () => {
       />,
     );
     clickItem(await openKebab(container), "Archive");
-    await vi.waitFor(() => expect(archiveApp).toHaveBeenCalledWith(1, "todo"));
+    await vi.waitFor(() => expect(archiveApp).toHaveBeenCalledWith(1, "todo", expect.any(Function)));
     expect(onArchiveApp).toHaveBeenCalledWith(1, "todo", "Todo");
     expect(dialogs.calls.filter((c) => c.kind === "confirm")).toHaveLength(2);
   });

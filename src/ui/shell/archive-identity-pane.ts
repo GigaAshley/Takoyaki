@@ -13,7 +13,9 @@ import {
   clearPendingArchive,
   removeFleetSession,
 } from "@/state/conversation-store";
+import { toast } from "sonner";
 import { archiveIdentity } from "@/api/identity-archive-api";
+import { MachineChangeError, reasonSentence } from "@/api/machine-changes-api";
 import { kitAlert, kitConfirm } from "@/components/kit";
 import {
   ARCHIVE_AGENT_BODY,
@@ -67,7 +69,9 @@ async function confirmThenArchive(args: {
   applyIdentityChange(null, identityKey, hostId);
   void (async () => {
     try {
-      await archiveIdentity(hostId, identityKey);
+      await archiveIdentity(hostId, identityKey, () => {
+        toast(`Still archiving "${label}"`, { description: "The machine is still working on it." });
+      });
       // Archived: every other open copy in this window closes too.
       announceAgentArchived(hostId, identityKey);
     } catch (err) {
@@ -80,7 +84,7 @@ async function confirmThenArchive(args: {
       });
       void kitAlert({
         title: "Couldn't archive",
-        body: err instanceof Error ? err.message : String(err),
+        body: err instanceof MachineChangeError ? reasonSentence(err.message) : err instanceof Error ? err.message : String(err),
       });
     }
   })();

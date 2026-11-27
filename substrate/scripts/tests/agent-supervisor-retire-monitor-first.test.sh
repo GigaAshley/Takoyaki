@@ -9,11 +9,11 @@
 #           and reports the session from the monitor's own --inject-to argument
 #   T-02  — a monitor that ignores SIGTERM is SIGKILLed after the cap, with its child's group
 #   T-03  — retire_identity: the monitor is already gone when the account switch-off runs
-#   T-04  — retire_identity: a failed switch-off restarts the monitor on the session it was
-#           injecting into, and returns 1
-#   T-05  — a second failed switch-off within 15 minutes does NOT restart it again
+#   T-04  — retire_identity: a failed switch-off leaves the monitor stopped (the archive is
+#           claimed; the agent must not keep hearing) and returns 1
+#   T-05  — a failed switch-off records why (RETIRE_ERROR, written into the claim)
 #   T-06  — no monitor running (sleeping agent): a failed switch-off restarts nothing
-#   T-07  — a successful switch-off restarts nothing and clears the restart marker
+#   T-07  — a successful switch-off restarts nothing
 #   T-08  — the real retire_deactivate_account (split out of retire_identity) returns 1 with no
 #           relay.json, so retire_identity returns 1
 #
@@ -141,18 +141,17 @@ retire_identity alice
 got="$(cat "$SCRATCH/at-deactivate" 2>/dev/null)"
 if [ "$got" = gone ]; then pass; else fail "monitor at switch-off was '${got:-not called}'"; fi
 
-CURRENT_TEST="T-04 failed switch-off restarts the monitor on its own session, returns 1"
+CURRENT_TEST="T-04 failed switch-off: the monitor stays stopped (the archive is claimed), returns 1"
 reset; start_fake_monitor alice sess-a; MON_PID=$FAKE_PID
 retire_identity alice; rc=$?
-got="$(cat "$START_CALLS" 2>/dev/null)"
-if [ "$rc" = 1 ] && [ "$got" = "alice sess-a" ] && [ -f "$MARKER" ]; then pass
-else fail "rc=$rc restart calls='$got' marker=$([ -f "$MARKER" ] && echo yes || echo no)"; fi
+if [ "$rc" = 1 ] && [ ! -e "$START_CALLS" ] && ! alive "$MON_PID"; then pass
+else fail "rc=$rc restart calls='$(cat "$START_CALLS" 2>/dev/null)' monitor alive=$(alive "$MON_PID" && echo yes || echo no)"; fi
 
-CURRENT_TEST="T-05 a second failure within 15 minutes does not restart again"
-rm -f "$START_CALLS"; start_fake_monitor alice sess-a; MON_PID=$FAKE_PID
+CURRENT_TEST="T-05 failed switch-off records why"
+reset; RETIRE_ERROR=""
 retire_identity alice; rc=$?
-if [ "$rc" = 1 ] && [ ! -e "$START_CALLS" ]; then pass
-else fail "rc=$rc restart calls='$(cat "$START_CALLS" 2>/dev/null)'"; fi
+if [ "$rc" = 1 ] && [ "$RETIRE_ERROR" = "couldn't switch the chat account off" ]; then pass
+else fail "rc=$rc RETIRE_ERROR='$RETIRE_ERROR'"; fi
 
 CURRENT_TEST="T-06 no monitor running: a failed switch-off restarts nothing"
 reset
@@ -160,18 +159,15 @@ retire_identity alice; rc=$?
 if [ "$rc" = 1 ] && [ ! -e "$START_CALLS" ]; then pass
 else fail "rc=$rc restart calls='$(cat "$START_CALLS" 2>/dev/null)'"; fi
 
-CURRENT_TEST="T-07 successful switch-off restarts nothing and clears the marker"
-reset; touch "$MARKER"; DEACT_RC=0
+CURRENT_TEST="T-07 successful switch-off restarts nothing and leaves the monitor stopped"
+reset; DEACT_RC=0
 mkdir -p "$AGENT_IDENTITIES_DIR/bob"; : > "$AGENT_IDENTITIES_DIR/bob/bob.md"
-MARKER="$DORMANCY_STATE_DIR/bob.retire-monitor-restarted"; touch "$MARKER"
 start_fake_monitor bob sess-bob; MON_PID=$FAKE_PID
 retire_identity bob >/dev/null 2>&1
 ok=1
 [ -e "$START_CALLS" ] && { ok=0; fail "restart called: $(cat "$START_CALLS")"; }
-[ -e "$MARKER" ] && { ok=0; fail "marker not cleared"; }
 alive "$MON_PID" && { ok=0; fail "monitor still running"; }
 [ "$ok" = 1 ] && pass
-MARKER="$DORMANCY_STATE_DIR/alice.retire-monitor-restarted"
 
 CURRENT_TEST="T-08 real step-1 function: no relay.json → retire_identity returns 1"
 reset
