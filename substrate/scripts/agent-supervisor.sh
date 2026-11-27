@@ -74,6 +74,67 @@ APP_CREATE_LOCK="${AGENT_APP_CREATE_LOCK:-$HOME/fleet/.create-lock}"
 SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*"; }
 
+# ---- the front door (fleet-change) ----
+# Every change to projects and apps on this machine is a request to fleet-change, carried out
+# one at a time, in arrival order, by the fleet-changes.service listener while it holds the
+# change lock. The supervisor takes the same lock for each change its own pass makes
+# (with_change_lock), and lets go in between, so a request never runs alongside one of them.
+# Bash can't keep a lock out of the processes it starts (a tmux server started while locked
+# would hold it forever), so the lock is held by a small `fleet-change hold-lock` process.
+FLEET_CHANGE_BIN="${AGENT_FLEET_CHANGE_BIN:-$HOME/.local/bin/fleet-change}"
+CHANGE_LOCK="${AGENT_CHANGE_LOCK:-$(dirname "$IDENTITIES_DIR")/.change-lock}"
+FLEET_CHANGES_UNIT="fleet-changes.service"
+CHANGE_LOCK_DEPTH=0
+CHANGE_LOCK_HOLDER=""
+CHANGE_LOCK_WARNED=0
+
+# change_lock_take: wait (up to 120s) for the change lock. Re-entrant: a change inside a change
+# (a role archive retiring its agents) keeps the one lock.
+change_lock_take() {
+  if [ "$CHANGE_LOCK_DEPTH" -gt 0 ]; then CHANGE_LOCK_DEPTH=$((CHANGE_LOCK_DEPTH + 1)); return 0; fi
+  if [ ! -f "$FLEET_CHANGE_BIN" ]; then
+    # Not installed yet (a first sweep in progress): nothing else can be making changes.
+    [ "$CHANGE_LOCK_WARNED" = 1 ] || log "WARN: $FLEET_CHANGE_BIN is missing — changes run without the change lock until it is installed"
+    CHANGE_LOCK_WARNED=1; CHANGE_LOCK_DEPTH=1; CHANGE_LOCK_HOLDER=""
+    return 0
+  fi
+  local ready i=0
+  ready="$(mktemp)" || return 1
+  FLEET_CHANGE_LOCK="$CHANGE_LOCK" python3 "$FLEET_CHANGE_BIN" hold-lock --parent "$$" >"$ready" 2>/dev/null </dev/null &
+  CHANGE_LOCK_HOLDER=$!
+  until grep -q '^held' "$ready" 2>/dev/null; do
+    if ! kill -0 "$CHANGE_LOCK_HOLDER" 2>/dev/null || [ "$i" -ge 2400 ]; then
+      kill "$CHANGE_LOCK_HOLDER" 2>/dev/null; wait "$CHANGE_LOCK_HOLDER" 2>/dev/null
+      rm -f "$ready"; CHANGE_LOCK_HOLDER=""
+      log "ERROR: couldn't take the change lock ($CHANGE_LOCK) within 120s — this change waits for the next pass"
+      return 1
+    fi
+    sleep 0.05; i=$((i + 1))
+  done
+  rm -f "$ready"
+  CHANGE_LOCK_DEPTH=1
+}
+
+change_lock_give() {
+  [ "$CHANGE_LOCK_DEPTH" -gt 0 ] || return 0
+  CHANGE_LOCK_DEPTH=$((CHANGE_LOCK_DEPTH - 1))
+  [ "$CHANGE_LOCK_DEPTH" -eq 0 ] || return 0
+  if [ -n "$CHANGE_LOCK_HOLDER" ]; then
+    kill "$CHANGE_LOCK_HOLDER" 2>/dev/null; wait "$CHANGE_LOCK_HOLDER" 2>/dev/null
+  fi
+  CHANGE_LOCK_HOLDER=""
+}
+
+# with_change_lock <cmd...>: run one change holding the change lock; returns the command's status
+# (1 without running it when the lock couldn't be had).
+with_change_lock() {
+  change_lock_take || return 1
+  "$@"
+  local rc=$?
+  change_lock_give
+  return "$rc"
+}
+
 # Per-tick snapshot of all tmux session names, populated once by snapshot_sessions() at the top of
 # reconcile() and consumed by match_session() as an in-memory lookup. Replaces 88× per-tick
 # `tmux ls` invocations with a single call. Keys are lowercased session names; values are the
@@ -678,9 +739,28 @@ PROJECT_FRONTMATTER_CAP="${PROJECT_FRONTMATTER_CAP:-4096}"
 sync_project_members() {
   [ -d "$FLEET_PROJECTS_DIR" ] || return 0
   local out
-  out=$(python3 - "$IDENTITIES_DIR" "$FLEET_PROJECTS_DIR" "${DRY_RUN:-0}" "$PROJECT_FRONTMATTER_CAP" <<'PY' 2>&1
-import os, re, sys
+  out=$(python3 - "$IDENTITIES_DIR" "$FLEET_PROJECTS_DIR" "${DRY_RUN:-0}" "$PROJECT_FRONTMATTER_CAP" "$CHANGE_LOCK" <<'PY' 2>&1
+import fcntl, os, re, sys, time
 ident_dir, proj_dir, dry_run, cap = sys.argv[1], sys.argv[2], sys.argv[3] == "1", int(sys.argv[4])
+change_lock = sys.argv[5]
+
+def take_change_lock():
+    """The change lock the front door holds while it runs a request (a project archive moves
+    project folders); None when it can't be had within 30s, so this write waits a tick."""
+    try:
+        fd = os.open(change_lock, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+    except OSError:
+        return None
+    deadline = time.time() + 30
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.time() > deadline:
+                os.close(fd)
+                return None
+            time.sleep(0.05)
 SLUG = re.compile(r"^[a-z0-9-]{1,64}$")
 NOTE = "  # auto-maintained by agent-supervisor from identities' project: — edits are overwritten"
 
@@ -765,6 +845,10 @@ for slug in slugs:
     if dry_run:
         print("DRY_RUN would set project '%s' members=%s" % (slug, ",".join(want) or "(none)"))
         continue
+    lock_fd = take_change_lock()
+    if lock_fd is None:
+        print("project '%s' members: change lock busy — retrying next tick" % slug)
+        continue
     tmp = path + ".members.tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
@@ -784,6 +868,8 @@ for slug in slugs:
         try: os.remove(tmp)
         except OSError: pass
         print("ERROR project '%s' members write failed: %s" % (slug, e))
+    finally:
+        os.close(lock_fd)
 PY
 )
   [ -n "$out" ] && while IFS= read -r _l; do log "project-members: $_l"; done <<< "$out"
@@ -1473,12 +1559,16 @@ stop_ambient_monitor() {
 }
 
 retire_identity() {
+  # A birth that landed mid-pass launches now, not after every queued retire (see helper) — and
+  # outside the change lock, so the newborn's processes never hold it.
+  launch_newborns_midtick
+  with_change_lock _retire_identity_locked "$@"
+}
+
+_retire_identity_locked() {
   local name="$1"
   local iddir="$IDENTITIES_DIR/$name"
   local archdir="$IDENTITIES_ARCHIVE_DIR/$name"
-
-  # A birth that landed mid-pass launches now, not after every queued retire (see helper).
-  launch_newborns_midtick
 
   # =============================================================================================
   # STEP 0: stop the ambient monitor (and with it every watcher child) BEFORE the account goes off.
@@ -1916,7 +2006,7 @@ scan_role_archive_requested_sentinels() {
     # D-12: empty cascade — failed=0 total=0 → folder move fires immediately.
     if [ "$failed" -eq 0 ]; then
       mkdir -p "$ROLES_ARCHIVE_DIR" 2>/dev/null
-      if mv "$d" "$ROLES_ARCHIVE_DIR/$role_name" 2>/dev/null; then
+      if with_change_lock mv "$d" "$ROLES_ARCHIVE_DIR/$role_name" 2>/dev/null; then
         # Sentinel travelled with the folder into the archive — clean it up there.
         rm -f "$ROLES_ARCHIVE_DIR/$role_name/.archive-requested" 2>/dev/null
         log "role '$role_name' cascade complete: $total identities retired, folder moved to archive"
@@ -1972,7 +2062,7 @@ scan_app_archive_requested_sentinels() {
 
     log "'$slug' user-initiated app archive: .archive-requested detected, invoking archive-app.sh"
     rc=0
-    output="$("$APP_ARCHIVE_SCRIPT" "$slug" 2>&1)" || rc=$?
+    output="$(with_change_lock "$APP_ARCHIVE_SCRIPT" "$slug" 2>&1)" || rc=$?
     if [ -n "$output" ]; then
       while IFS= read -r line; do
         [ -z "$line" ] && continue
@@ -2000,15 +2090,15 @@ scan_app_archive_requested_sentinels() {
 # ---- project-scoped apps: Move to + archived projects ----
 # scan_app_move_requested_sentinels()
 #
-# Every reconcile tick, walks every live app folder — sidebar ($APPS_DIR/*/), conversation
-# ($IDENTITIES_DIR/*/apps/*/) and project ($FLEET_PROJECTS_DIR/*/apps/*/, not the archive
-# folder) — for a `.move-requested` file the app drops when someone picks Move to. It holds
-# one JSON object: {"to":"sidebar","users":[...]|null} or {"to":"project","project":"<slug>"}.
-# The file is removed before the move runs (a failed move is not retried every tick); the
-# failure reason lands in `.move-failed` in the app's folder. After a conversation app moves
-# away, its agent is told in its conversation (inbox event).
+# Moves are requests to the front door (fleet-change app-move), carried out in arrival order.
+# A `.move-requested` note in an app folder — left from before the front door, or dropped by
+# an agent still using the old way — is handed to the front door as a request and removed, so
+# none is stranded. It holds one JSON object: {"to":"sidebar","users":[...]|null} or
+# {"to":"project","project":"<slug>"}. The note's own path and age make the request id, so a
+# note handed over twice (a crash before the rm) is still one request. Until fleet-change is
+# installed the note is left where it is for a later pass.
 scan_app_move_requested_sentinels() {
-  local f d slug owner args rc output title dest_label line
+  local f d slug req id out
   for f in "$APPS_DIR"/*/.move-requested "$IDENTITIES_DIR"/*/apps/*/.move-requested \
            "$FLEET_PROJECTS_DIR"/*/apps/*/.move-requested; do
     [ -f "$f" ] || continue
@@ -2016,63 +2106,42 @@ scan_app_move_requested_sentinels() {
     d="${f%/.move-requested}"
     slug="$(basename "$d")"
     [[ "$slug" =~ ^[a-z][a-z0-9-]*$ ]] || { rm -f "$f"; continue; }
-    owner=""
-    case "$d" in "$IDENTITIES_DIR"/*/apps/*) owner="${d#"$IDENTITIES_DIR"/}"; owner="${owner%%/*}" ;; esac
 
-    # One argument per line: the destination words for move-app.sh, or nothing on a bad file.
-    args="$(python3 - "$f" <<'PY' 2>/dev/null
+    # The app-move request, or nothing on a bad note.
+    req="$(python3 - "$f" "$slug" <<'PY' 2>/dev/null
 import json, re, sys
 try:
-    req = json.load(open(sys.argv[1]))
+    note = json.load(open(sys.argv[1]))
 except Exception:
     sys.exit(0)
-if not isinstance(req, dict):
+if not isinstance(note, dict):
     sys.exit(0)
-to = req.get("to")
+to, out = note.get("to"), {"slug": sys.argv[2]}
 if to == "sidebar":
-    print("sidebar")
-    users = req.get("users")
-    if isinstance(users, list) and users and all(isinstance(u, str) and re.fullmatch(r"[^,\s]+", u) for u in users):
-        print("--users")
-        print(",".join(users))
-    elif users is None:
-        print("--everyone")
+    users = note.get("users")
+    if users is None or (isinstance(users, list) and users and all(isinstance(u, str) and re.fullmatch(r"[^,\s]+", u) for u in users)):
+        out.update(to="sidebar", users=users)
     else:
         sys.exit(0)
-elif to == "project" and isinstance(req.get("project"), str) and re.fullmatch(r"[a-z0-9-]{1,64}", req["project"]) and req["project"] != "archive":
-    print("project")
-    print(req["project"])
+elif to == "project" and isinstance(note.get("project"), str) and re.fullmatch(r"[a-z0-9-]{1,64}", note["project"]) and note["project"] != "archive":
+    out.update(to="project", project=note["project"])
+else:
+    sys.exit(0)
+print(json.dumps(out, separators=(",", ":")))
 PY
 )"
-    rm -f "$f"
-    if [ -z "$args" ]; then
+    if [ -z "$req" ]; then
       log "ERROR: app '$slug' move: unreadable .move-requested — dropped"
+      rm -f "$f"
       continue
     fi
-    if [ ! -f "$APP_MOVE_SCRIPT" ]; then
-      log "ERROR: app '$slug' move: $APP_MOVE_SCRIPT missing — request dropped"
-      printf 'move-app.sh is missing on this machine\n' > "$d/.move-failed" 2>/dev/null || true
-      continue
-    fi
-    title="$(python3 -c 'import json,sys; print(str(json.load(open(sys.argv[1])).get("title") or sys.argv[2]))' "$d/app.json" "$slug" 2>/dev/null || printf '%s' "$slug")"
-    local -a argv=()
-    mapfile -t argv <<< "$args"
-    log "app '$slug' move: .move-requested detected (to: ${argv[*]})"
-    rc=0
-    output="$(bash "$APP_MOVE_SCRIPT" "$slug" "${argv[@]}" 2>&1)" || rc=$?
-    while IFS= read -r line; do [ -n "$line" ] && log "  move-app.sh[$slug]: $line"; done <<< "$output"
-    if [ "$rc" -ne 0 ]; then
-      log "ERROR: app '$slug' move FAILED (rc=$rc) — the app stays where it was"
-      printf '%s\n' "$output" | tail -5 > "$d/.move-failed" 2>/dev/null || true
-      continue
-    fi
-    rm -f "$APPS_DIR/$slug/.move-failed" "$FLEET_PROJECTS_DIR"/*/apps/"$slug"/.move-failed 2>/dev/null || true
-    log "app '$slug' move COMPLETE"
-    if [ -n "$owner" ] && [ -d "$IDENTITIES_DIR/$owner" ]; then
-      if [ "${argv[0]}" = project ]; then dest_label="the project '${argv[1]}'"; else dest_label="the sidebar"; fi
-      title="$(printf '%s' "$title" | tr '<>\r\n' '    ' | cut -c1-120)"
-      inbox_drop "$owner" "$(printf '<task-notification>\n<summary>App moved — delivered by the app</summary>\n<event>[app %s] Your conversation app "%s" was moved to %s from its menu. It is no longer one of your conversation apps; its address and data are unchanged. Nothing for you to do.</event>\n</task-notification>' "$slug" "$title" "$dest_label")" \
-        || log "WARN: app '$slug' move: could not tell '$owner' its app moved"
+    [ -f "$FLEET_CHANGE_BIN" ] || continue
+    id="note-$slug-$(stat -c %Y "$f" 2>/dev/null || date +%s)"
+    if out="$(python3 "$FLEET_CHANGE_BIN" submit app-move "$req" --id "$id" --wait 0 2>&1)"; then
+      rm -f "$f"
+      log "app '$slug' move: .move-requested handed to the front door as $id ($req)"
+    else
+      log "ERROR: app '$slug' move: couldn't hand .move-requested to the front door — kept for the next pass: $out"
     fi
   done
 }
@@ -2102,15 +2171,20 @@ retire_archived_project_apps() {
       [ -d "$cand" ] && found="$cand"
     done
     [ -n "$found" ] || continue
-    if ! bash "$APP_UNITS_SCRIPT" stash "$slug" "$found" >/dev/null 2>&1; then
-      log "WARN: project app '$slug' (archived with its project): could not stash units into $found; uninstalling anyway"
-    fi
-    if bash "$APP_UNITS_SCRIPT" uninstall "$slug" >/dev/null 2>&1; then
-      log "project app '$slug' archived with its project: stopped, units stashed in $found"
-    else
-      log "WARN: project app '$slug' archived with its project: could not uninstall — run app-units.sh uninstall $slug by hand"
-    fi
+    with_change_lock _retire_archived_project_app "$slug" "$found"
   done
+}
+
+_retire_archived_project_app() {
+  local slug="$1" found="$2"
+  if ! bash "$APP_UNITS_SCRIPT" stash "$slug" "$found" >/dev/null 2>&1; then
+    log "WARN: project app '$slug' (archived with its project): could not stash units into $found; uninstalling anyway"
+  fi
+  if bash "$APP_UNITS_SCRIPT" uninstall "$slug" >/dev/null 2>&1; then
+    log "project app '$slug' archived with its project: stopped, units stashed in $found"
+  else
+    log "WARN: project app '$slug' archived with its project: could not uninstall — run app-units.sh uninstall $slug by hand"
+  fi
 }
 
 # ============================================================================
@@ -5014,6 +5088,19 @@ do_wake() {
   fi
 }
 
+# ensure_fleet_changes_up: the front door's listener runs as its own user unit (restarted by
+# systemd if it dies); this puts it back if it was stopped or never started.
+ensure_fleet_changes_up() {
+  [ "${DRY_RUN:-0}" = 1 ] && return 0
+  [ -f "$SYSTEMD_UNIT_DIR/$FLEET_CHANGES_UNIT" ] || return 0
+  "$SYSTEMCTL_BIN" --user is-active --quiet "$FLEET_CHANGES_UNIT" 2>/dev/null && return 0
+  if "$SYSTEMCTL_BIN" --user start "$FLEET_CHANGES_UNIT" 2>/dev/null; then
+    log "front door: $FLEET_CHANGES_UNIT was not running — started it"
+  else
+    log "ERROR: front door: $FLEET_CHANGES_UNIT is not running and would not start — check: journalctl --user -u $FLEET_CHANGES_UNIT"
+  fi
+}
+
 reconcile() {
   rotate_if_big "$METRICS_LOG"                     # keep the append-only jsonl logs bounded
   rotate_if_big "$MEM_SAMPLES_LOG"
@@ -5022,13 +5109,14 @@ reconcile() {
   snapshot_claude_running                          # one ps + one tmux list-panes -a per tick; claude_running_cached reads from CLAUDE_RUNNING_SNAPSHOT.
   snapshot_procs                                   # one ps per tick; remind_background_work finds each claude's child shells from it.
   snapshot_ambient_monitors                        # one ps per tick; repair_ambient_monitor reads from AMBIENT_MONITOR_SNAPSHOT.
+  ensure_fleet_changes_up                          # the front door's listener (fleet-changes.service) is running
   run_archive_scan_if_due                          # Phase 94: daily archive-scan branch (24h gate; fast-path no-op on most ticks)
   scan_archive_requested_sentinels                 # Phase 115 D-10: user-initiated archive-scan (every tick, no gate, bypasses .pinned/.no-dormancy/coordinator/freshness)
   scan_role_archive_requested_sentinels            # Phase 133 D-01/D-05: user-initiated ROLE archive (every tick, no gate, cascades retire_identity per D-08, moves role folder per D-09 if all-clean)
   scan_app_archive_requested_sentinels             # app-archive shape: user-initiated APP archive (every tick, invokes archive-app.sh from the app-development skill on any folder carrying .archive-requested)
   scan_identity_unarchive_requested_sentinels      # one-path un-archive: flag → backend reactivates chat account → login → .dormant + mv archive→live
   scan_role_unarchive_requested_sentinels          # un-archive host-side shape: user-initiated role UN-archive (folder mv only, no identity cascade)
-  scan_app_move_requested_sentinels                # project-scoped apps: Move to (sidebar ↔ project, out of a conversation) via move-app.sh
+  scan_app_move_requested_sentinels                # project-scoped apps: leftover Move to notes handed to the front door (fleet-change)
   retire_archived_project_apps                     # project-scoped apps: stop + stash the apps of a project that was archived
   scan_app_unarchive_requested_sentinels           # un-archive host-side shape: user-initiated app UN-archive (folded-in restore-app.sh: port-collision check under create-lock, mv archive→live, systemd reinstall + enable+start)
   reap_desktops                                    # stop agent-desktop@ units of gone identities, and of dormant ones nobody is viewing

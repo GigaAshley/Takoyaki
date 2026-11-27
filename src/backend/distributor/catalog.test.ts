@@ -146,7 +146,8 @@ describe("FLEET_SUBSTRATE_CATALOG", () => {
     // -6 for the image-gen, agent-phone and stt skills and wrappers, which
     // now ship from their service folders (full-catalog.ts) — 87 → 81.
     // Adding a service never changes this count.
-    expect(FLEET_SUBSTRATE_CATALOG.length).toBe(81);
+    // +2 for the front door (fleet-change + fleet-changes.service) — 81 → 83.
+    expect(FLEET_SUBSTRATE_CATALOG.length).toBe(83);
   });
 
   it("Test 2: every bundled row's bundledPath starts with /app/fleet-substrate/skills/, /app/fleet-substrate/scripts/, or /app/fleet-substrate/user-onboarding/", () => {
@@ -216,6 +217,8 @@ describe("FLEET_SUBSTRATE_CATALOG", () => {
     //     (box-level relay MCP server).
     //   desktop-mcp-helper + desktop-mcp-service-unit → both bounce
     //     desktop-mcp.service (box-level desktop MCP server).
+    //   fleet-change + fleet-changes-service-unit → both bounce
+    //     fleet-changes.service (the front door's listener).
     const expected: Record<string, string> = {
       "agent-supervisor": "agent-supervisor.service",
       "agent-supervisor-service-unit": "agent-supervisor.service",
@@ -228,6 +231,8 @@ describe("FLEET_SUBSTRATE_CATALOG", () => {
       "relay-mcp-service-unit": "relay-mcp.service",
       "desktop-mcp-helper": "desktop-mcp.service",
       "desktop-mcp-service-unit": "desktop-mcp.service",
+      "fleet-change": "fleet-changes.service",
+      "fleet-changes-service-unit": "fleet-changes.service",
     };
     expect(withRestart.length).toBe(Object.keys(expected).length);
     for (const entry of withRestart) {
@@ -329,7 +334,8 @@ describe("FLEET_SUBSTRATE_CATALOG", () => {
     // + borrowable-roles-context (the roles a loading agent may borrow)
     // + person-files (SessionStart hook — the About you files of an agent's people)
     // -3 for the service wrappers, now in their service folders — 26 → 23.
-    expect(scriptRows.length).toBe(23);
+    // + fleet-change (the front door for changes to projects and apps) — 23 → 24.
+    expect(scriptRows.length).toBe(24);
     // user-onboarding files: agent-supervisor.service
     // + scheduled-agents-scheduler.service (this ship: move
     // scheduled-agents scheduler from in-process agent-supervisor child
@@ -339,7 +345,8 @@ describe("FLEET_SUBSTRATE_CATALOG", () => {
     // + relay-mcp.service (box-level relay MCP server)
     // + desktop-mcp.service (box-level desktop MCP server).
     // (interactive-messages-gc .service + .timer retired 2026-10-25 — 8 → 6)
-    expect(userOnboardingRows.length).toBe(6);
+    // + fleet-changes.service (the front door's listener) — 6 → 7.
+    expect(userOnboardingRows.length).toBe(7);
 
     // id has 4 entries (SKILL.md + 3 companions)
     const idRows = skillRows.filter((e) =>
@@ -493,7 +500,8 @@ describe("FLEET_SUBSTRATE_CATALOG", () => {
     // +6 for the app starter's JSON API — 80 → 86.
     // -6 for the service skills and wrappers, now in their service
     // folders — 86 → 80.
-    expect(bundled.length).toBe(80);
+    // +2 for the front door (fleet-change + fleet-changes.service) — 80 → 82.
+    expect(bundled.length).toBe(82);
     expect(runtime.length).toBe(1);
 
     // Every bundled row retains bundledPath under /app/fleet-substrate/

@@ -409,6 +409,20 @@ export const FLEET_SUBSTRATE_CATALOG: readonly CatalogEntry[] = [
     restartHook: "sensor-runner.service",
   },
 
+  // fleet-change: the machine's front door for changes to projects and apps.
+  // `fleet-change submit` is the one command the backend (over SSH) and agents
+  // use; `fleet-change serve` is the listener that carries requests out one at
+  // a time, owned by fleet-changes.service; agent-supervisor runs
+  // `fleet-change hold-lock` to take the same change lock for its own changes.
+  // A restart lets the request in hand finish; one cut off is carried on.
+  {
+    slug: "fleet-change",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/scripts/fleet-change",
+    installPath: "~/.local/bin/fleet-change",
+    restartHook: "fleet-changes.service",
+  },
+
   // agent-desktop: per-identity virtual desktop (Xvnc + openbox) — allocates
   // a stable display number, starts/stops it via the agent-desktop@ unit
   // below. On-demand executable, no restart hook; running desktops keep
@@ -665,6 +679,19 @@ export const FLEET_SUBSTRATE_CATALOG: readonly CatalogEntry[] = [
     bundledPath: "/app/fleet-substrate/user-onboarding/desktop-mcp.service",
     installPath: "~/.config/systemd/user/desktop-mcp.service",
     restartHook: "desktop-mcp.service",
+  },
+
+  // fleet-changes.service — box-level user unit running `fleet-change serve`.
+  // Not enabled at bootstrap; started by the first sweep's restart hook (a
+  // restart starts a stopped unit) and by agent-supervisor on every pass that
+  // finds it down. PartOf agent-supervisor.service, so it stops and restarts
+  // with it. Restart hook targets self.
+  {
+    slug: "fleet-changes-service-unit",
+    sourceKind: "bundled",
+    bundledPath: "/app/fleet-substrate/user-onboarding/fleet-changes.service",
+    installPath: "~/.config/systemd/user/fleet-changes.service",
+    restartHook: "fleet-changes.service",
   },
 
   // agent-desktop@.service — TEMPLATE unit, one instance per identity with a

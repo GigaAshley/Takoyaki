@@ -1,0 +1,828 @@
+#!/usr/bin/env python3
+"""fleet-change — the machine's front door for changes to fleet state.
+
+Canonical copy lives in the app's source repo at substrate/scripts/fleet-change
+and is distributed to every managed host by the fleet-substrate distributor
+(src/backend/distributor/catalog.ts). Installed per-box at
+~/.local/bin/fleet-change. Do NOT hand-edit the installed copy.
+
+Every change to projects and apps goes through here, whoever asks: the app's
+server (over the SSH connection it already holds, or the bind mount on its own
+machine) and agents on the machine run the same command. Requests are written
+down before anything happens, numbered in arrival order, and carried out one
+at a time by the listener (`fleet-change serve`, run by fleet-changes.service).
+While a request runs the listener holds ~/fleet/.change-lock; the
+agent-supervisor takes the same lock for each change its own pass makes, so a
+request and the supervisor never touch things at the same moment.
+
+Usage:
+  fleet-change submit <kind> <args-json> [--id <id>] [--wait <sec>]
+  fleet-change status <id> [--wait <sec>]
+  fleet-change serve [--until-idle]
+  fleet-change kinds
+  fleet-change hold-lock --parent <pid>
+
+  submit   send a request and wait up to --wait seconds (default 15) for its
+           outcome. --id is chosen by the caller; sending the same id again
+           never does the request twice, it just waits for (or returns) the
+           first one's outcome. Without --id a random one is used.
+  status   the outcome of an earlier request, waiting up to --wait (default 0).
+  serve    run the listener (fleet-changes.service). One per machine.
+           --until-idle stops once nothing is waiting (tests, manual runs).
+  kinds    print the request kinds this machine understands, one JSON line.
+  hold-lock  take the change lock, print "held", and keep it until killed or
+           until <pid> exits. How the agent-supervisor (a shell script, which
+           can't keep a lock out of the processes it starts) takes its turn.
+
+Output (submit / status): one JSON line on stdout.
+  finished:  {"id","seq","kind","state":"done"|"refused"|"failed",
+              "code"?,"reason"?,"result"?}
+  not yet:   {"id","kind"?,"seq"?,"state":"received"|"queued"|"running",
+              "ahead"?}
+             "received" = written down but the listener hasn't taken it in yet.
+  unknown:   {"id","state":"unknown"}  (status only: never seen, or pruned)
+Exit status: 0 for any of the above, 2 for usage errors (message on stderr).
+
+Request kinds:
+  app-move          {"slug", "to":"sidebar", "users":[...]|null}
+                    {"slug", "to":"project", "project":"<slug>"}
+  project-contents  {"slug"}  what archiving it would take, as the machine sees it
+  project-archive   {"slug", "expected":{"projects":[...],"agents":[...],"apps":[...]}}
+                    refused with code contents_changed (and the current
+                    contents as result) when the machine's contents no longer
+                    match what the user confirmed.
+
+On disk, all under ~/fleet/.changes/:
+  incoming/<ns>-<id>.json   a request as written by submit (atomic rename)
+  journal/<seq>-<id>.json   taken in by the listener and numbered; removed
+                            once its outcome is written
+  outcomes/<id>.json        the outcome, kept for OUTCOME_KEEP_S
+  next-seq                  the next request number
+  .serve.lock               held by the one running listener
+
+A request left running when the listener stopped is carried on when it starts
+again, from where its plan says it got to. Stdlib only; Python 3.8+.
+"""
+import fcntl
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+import uuid
+
+FLEET = os.environ.get("FLEET_CHANGE_FLEET_DIR") or os.path.join(os.path.expanduser("~"), "fleet")
+ROOT = os.path.join(FLEET, ".changes")
+INCOMING = os.path.join(ROOT, "incoming")
+JOURNAL = os.path.join(ROOT, "journal")
+OUTCOMES = os.path.join(ROOT, "outcomes")
+SEQ_FILE = os.path.join(ROOT, "next-seq")
+SERVE_LOCK = os.path.join(ROOT, ".serve.lock")
+CHANGE_LOCK = os.environ.get("FLEET_CHANGE_LOCK") or os.path.join(FLEET, ".change-lock")
+CREATE_LOCK = os.path.join(FLEET, ".create-lock")
+PROJECTS = os.path.join(FLEET, "projects")
+PROJECTS_ARCHIVE = os.path.join(PROJECTS, "archive")
+IDENTITIES = os.path.join(FLEET, "identities")
+APPS = os.path.join(FLEET, "apps")
+APPS_ARCHIVE = os.path.join(FLEET, "apps-archive")
+SKILL_DIR = os.path.join(os.path.expanduser("~"), ".claude", "skills", "app-development")
+APP_UNITS = os.environ.get("FLEET_CHANGE_APP_UNITS") or os.path.join(SKILL_DIR, "app-units.sh")
+MOVE_APP = os.environ.get("FLEET_CHANGE_MOVE_APP") or os.path.join(SKILL_DIR, "move-app.sh")
+
+POLL_S = float(os.environ.get("FLEET_CHANGE_POLL_S", "0.1"))
+OUTCOME_KEEP_S = 7 * 24 * 3600
+PRUNE_EVERY_S = 600
+LOCK_WAIT_WARN_S = 30
+DEFAULT_WAIT_S = 15.0
+MAX_WAIT_S = 600.0
+
+ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
+SLUG_RE = re.compile(r"^[a-z0-9-]{1,64}$")
+APP_SLUG_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+USER_RE = re.compile(r"^[^,\s]+$")
+KINDS = ("app-move", "project-contents", "project-archive")
+
+
+def log(msg):
+    print(time.strftime("%H:%M:%S") + " " + msg, flush=True)
+
+
+def ensure_dirs():
+    for d in (ROOT, INCOMING, JOURNAL, OUTCOMES):
+        os.makedirs(d, exist_ok=True)
+
+
+def write_json_atomic(path, obj):
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, separators=(",", ":"))
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def list_json(d):
+    try:
+        return sorted(n for n in os.listdir(d) if n.endswith(".json") and ".tmp." not in n)
+    except OSError:
+        return []
+
+
+def id_of(name):
+    """<prefix>-<id>.json → id (ids may themselves contain '-')."""
+    return name[:-5].split("-", 1)[1] if "-" in name else None
+
+
+class Lock:
+    """An exclusive flock on a file, opened close-on-exec so children never hold it."""
+
+    def __init__(self, path, what):
+        self.path, self.what, self.fd = path, what, None
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+        start = time.time()
+        warned = False
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except BlockingIOError:
+                if not warned and time.time() - start > LOCK_WAIT_WARN_S:
+                    log("WARN: still waiting for %s (%s) after %ds" % (self.what, self.path, LOCK_WAIT_WARN_S))
+                    warned = True
+                time.sleep(0.05)
+
+    def __exit__(self, *exc):
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self.fd)
+            self.fd = None
+
+
+# ---------------------------------------------------------------------------
+# Reading the machine
+# ---------------------------------------------------------------------------
+
+def frontmatter(path, cap=65536):
+    """Top-level `key: value` pairs of a markdown file's leading --- block."""
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            text = f.read(cap)
+    except OSError:
+        return None
+    lines = text.splitlines()
+    if not lines or lines[0].rstrip() != "---":
+        return {}
+    out = {}
+    for ln in lines[1:]:
+        if ln.rstrip() == "---":
+            break
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_-]*):\s*(.*?)\s*$", ln)
+        if not m:
+            continue
+        v = m.group(2)
+        if v and v[0] in "\"'" and v[-1:] == v[0] and len(v) >= 2:
+            v = v[1:-1]
+        else:
+            v = re.sub(r"\s+#.*$", "", v)
+        out[m.group(1)] = v
+    return out
+
+
+def live_projects():
+    """slug → {"slug","displayName","parent"} for every live project."""
+    out = {}
+    try:
+        names = os.listdir(PROJECTS)
+    except OSError:
+        return out
+    for slug in names:
+        if slug == "archive" or not SLUG_RE.match(slug):
+            continue
+        fm = frontmatter(os.path.join(PROJECTS, slug, "project.md"))
+        if fm is None:
+            continue
+        parent = fm.get("parent") or None
+        if parent is not None and not SLUG_RE.match(parent):
+            parent = None
+        out[slug] = {"slug": slug, "displayName": fm.get("displayName") or slug, "parent": parent}
+    return out
+
+
+def subtree(projects, slug):
+    """slug and every project beneath it, parent first."""
+    order, seen, frontier = [slug], {slug}, [slug]
+    while frontier:
+        nxt = []
+        for p in sorted(projects):
+            if p not in seen and projects[p]["parent"] in frontier:
+                seen.add(p)
+                order.append(p)
+                nxt.append(p)
+        frontier = nxt
+    return order
+
+
+def app_title(app_dir, slug):
+    card = read_json(os.path.join(app_dir, "app.json"))
+    if isinstance(card, dict) and isinstance(card.get("title"), str) and card["title"].strip():
+        return card["title"].strip()
+    return slug
+
+
+def project_contents(slug):
+    """What archiving `slug` takes right now, or None when it isn't a live project."""
+    projects = live_projects()
+    if slug not in projects:
+        return None
+    tree = subtree(projects, slug)
+    in_tree = set(tree)
+    agents = []
+    try:
+        names = sorted(os.listdir(IDENTITIES))
+    except OSError:
+        names = []
+    for name in names:
+        fm = frontmatter(os.path.join(IDENTITIES, name, name + ".md"))
+        if fm and fm.get("project") in in_tree:
+            agents.append({
+                "name": name,
+                "displayName": fm.get("displayName") or name,
+                "task": fm.get("task") or "",
+                "project": fm["project"],
+            })
+    apps = []
+    for p in tree:
+        apps_dir = os.path.join(PROJECTS, p, "apps")
+        try:
+            slugs = sorted(os.listdir(apps_dir))
+        except OSError:
+            continue
+        for a in slugs:
+            d = os.path.join(apps_dir, a)
+            if APP_SLUG_RE.match(a) and os.path.isdir(d):
+                apps.append({"slug": a, "title": app_title(d, a), "project": p})
+    return {
+        "project": slug,
+        "projects": [projects[p] for p in tree],
+        "agents": agents,
+        "apps": apps,
+    }
+
+
+def contents_key(c):
+    return (
+        sorted(p["slug"] if isinstance(p, dict) else p for p in c.get("projects", [])),
+        sorted(a["name"] if isinstance(a, dict) else a for a in c.get("agents", [])),
+        sorted(a["slug"] if isinstance(a, dict) else a for a in c.get("apps", [])),
+    )
+
+
+def archived_project_dir(slug):
+    """An archived copy of `slug` (plain or collision-suffixed), or None."""
+    try:
+        names = os.listdir(PROJECTS_ARCHIVE)
+    except OSError:
+        return None
+    pat = re.compile(r"^%s(-\d{8}T\d{6}Z)?$" % re.escape(slug))
+    for n in sorted(names, reverse=True):
+        if pat.match(n) and os.path.isdir(os.path.join(PROJECTS_ARCHIVE, n)):
+            return n
+    return None
+
+
+def project_label(slug):
+    fm = frontmatter(os.path.join(PROJECTS, slug, "project.md"))
+    if fm is None:
+        d = archived_project_dir(slug)
+        fm = frontmatter(os.path.join(PROJECTS_ARCHIVE, d, "project.md")) if d else None
+    return (fm or {}).get("displayName") or slug
+
+
+def run(argv, timeout=120):
+    try:
+        p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           stdin=subprocess.DEVNULL, timeout=timeout)
+        return p.returncode, p.stdout.decode("utf-8", "replace")
+    except subprocess.TimeoutExpired:
+        return 124, "timed out after %ds" % timeout
+    except OSError as e:
+        return 127, str(e)
+
+
+class Refused(Exception):
+    def __init__(self, code, reason, result=None):
+        super().__init__(reason)
+        self.code, self.reason, self.result = code, reason, result
+
+
+class Failed(Exception):
+    def __init__(self, code, reason):
+        super().__init__(reason)
+        self.code, self.reason = code, reason
+
+
+# ---------------------------------------------------------------------------
+# Request kinds — each runs under the change lock. `entry` is the journal
+# entry; a handler may save progress into entry["plan"] via save_plan so a
+# restart carries on instead of starting over.
+# ---------------------------------------------------------------------------
+
+def do_project_contents(args, entry, save_plan):
+    slug = args.get("slug")
+    if not isinstance(slug, str) or not SLUG_RE.match(slug) or slug == "archive":
+        raise Refused("bad_request", "slug must match [a-z0-9-]{1,64}")
+    c = project_contents(slug)
+    if c is None:
+        raise Refused("not_found", "that project doesn't exist or is already archived")
+    return c
+
+
+def stop_project_app(slug, app_dir):
+    """Stop an app that's being archived with its project; its units are kept in its folder."""
+    rc, out = run(["bash", APP_UNITS, "port", slug])
+    if rc != 0 or not out.strip():
+        return
+    rc, out = run(["bash", APP_UNITS, "stash", slug, app_dir])
+    if rc != 0:
+        log("WARN: project app '%s': couldn't stash its units (%s); stopping it anyway" % (slug, out.strip()[-200:]))
+    rc, out = run(["bash", APP_UNITS, "uninstall", slug])
+    if rc != 0:
+        raise Failed("app_stop_failed", "couldn't stop the app '%s': %s" % (slug, out.strip()[-300:]))
+    log("project app '%s' stopped, units kept in %s" % (slug, app_dir))
+
+
+def do_project_archive(args, entry, save_plan):
+    slug = args.get("slug")
+    if not isinstance(slug, str) or not SLUG_RE.match(slug) or slug == "archive":
+        raise Refused("bad_request", "slug must match [a-z0-9-]{1,64}")
+    plan = entry.get("plan")
+    if plan is None:
+        expected = args.get("expected")
+        if not isinstance(expected, dict):
+            raise Refused("bad_request", "expected (the contents the user confirmed) is required")
+        current = project_contents(slug)
+        if current is None:
+            raise Refused("not_found", "that project doesn't exist or is already archived")
+        if contents_key(current) != contents_key(expected):
+            raise Refused("contents_changed",
+                          "what's in \"%s\" changed since you looked; check the list again" % project_label(slug),
+                          current)
+        plan = {
+            "projects": [p["slug"] for p in current["projects"]],
+            "agents": [a["name"] for a in current["agents"]],
+            "apps": [{"slug": a["slug"], "project": a["project"]} for a in current["apps"]],
+            "archivedAs": {},
+        }
+        save_plan(plan)
+    else:
+        log("project archive '%s': carrying on from where it stopped" % slug)
+
+    # Deepest first, so a project is never archived with something still live beneath it.
+    for p in reversed(plan["projects"]):
+        src = os.path.join(PROJECTS, p)
+        if not os.path.isdir(src):
+            continue
+        apps_dir = os.path.join(src, "apps")
+        try:
+            app_slugs = sorted(os.listdir(apps_dir))
+        except OSError:
+            app_slugs = []
+        if app_slugs:
+            with Lock(CREATE_LOCK, "the app create lock"):
+                for a in app_slugs:
+                    d = os.path.join(apps_dir, a)
+                    if APP_SLUG_RE.match(a) and os.path.isdir(d):
+                        stop_project_app(a, d)
+        os.makedirs(PROJECTS_ARCHIVE, exist_ok=True)
+        name = p
+        if os.path.exists(os.path.join(PROJECTS_ARCHIVE, name)):
+            name = "%s-%s" % (p, time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()))
+            if os.path.exists(os.path.join(PROJECTS_ARCHIVE, name)):
+                raise Failed("archive_exists", "an archived copy of '%s' is in the way" % p)
+        os.rename(src, os.path.join(PROJECTS_ARCHIVE, name))
+        plan["archivedAs"][p] = name
+        save_plan(plan)
+        log("project '%s' archived as archive/%s" % (p, name))
+
+    # Agents go through the agent archive route the app uses (the supervisor retires them).
+    for name in plan["agents"]:
+        d = os.path.join(IDENTITIES, name)
+        if os.path.isfile(os.path.join(d, name + ".md")):
+            try:
+                open(os.path.join(d, ".archive-requested"), "a").close()
+            except OSError as e:
+                log("WARN: couldn't ask for agent '%s' to be archived: %s" % (name, e))
+    return {
+        "projects": [{"slug": p, "archivedAs": plan["archivedAs"].get(p)} for p in plan["projects"]],
+        "agents": plan["agents"],
+        "apps": plan["apps"],
+    }
+
+
+def find_app(slug):
+    rc, out = run(["bash", APP_UNITS, "find", slug])
+    path = out.strip().splitlines()[-1] if rc == 0 and out.strip() else ""
+    return path or None
+
+
+def archived_app_project(slug):
+    """The archived project an app went into the archive with, or None."""
+    try:
+        names = sorted(os.listdir(PROJECTS_ARCHIVE))
+    except OSError:
+        return None
+    for n in names:
+        if os.path.isdir(os.path.join(PROJECTS_ARCHIVE, n, "apps", slug)):
+            return n
+    return None
+
+
+def inbox_drop(owner, payload):
+    inbox = os.path.join(IDENTITIES, owner, "inbox")
+    os.makedirs(inbox, exist_ok=True)
+    fname = "%s%03d-%s.msg" % (time.strftime("%Y%m%dT%H%M%S", time.gmtime()), int(time.time() * 1000) % 1000,
+                               os.urandom(4).hex())
+    tmp = os.path.join(inbox, fname + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(payload)
+    os.replace(tmp, os.path.join(inbox, fname))
+
+
+def do_app_move(args, entry, save_plan):
+    slug = args.get("slug")
+    if not isinstance(slug, str) or not APP_SLUG_RE.match(slug) or len(slug) > 64:
+        raise Refused("bad_request", "slug must match [a-z][a-z0-9-]*")
+    to = args.get("to")
+    if to == "sidebar":
+        users = args.get("users")
+        if users is None:
+            argv, dest = ["sidebar", "--everyone"], os.path.join(APPS, slug)
+        elif isinstance(users, list) and users and all(isinstance(u, str) and USER_RE.match(u) for u in users):
+            argv, dest = ["sidebar", "--users", ",".join(users)], os.path.join(APPS, slug)
+        else:
+            raise Refused("bad_request", "users must be a list of usernames, or null for everyone")
+        dest_label = "the sidebar"
+    elif to == "project":
+        project = args.get("project")
+        if not isinstance(project, str) or not SLUG_RE.match(project) or project == "archive":
+            raise Refused("bad_request", "project must match [a-z0-9-]{1,64}")
+        argv, dest = ["project", project], os.path.join(PROJECTS, project, "apps", slug)
+        dest_label = "the project '%s'" % project
+    else:
+        raise Refused("bad_request", 'to must be "sidebar" or "project"')
+
+    src = find_app(slug)
+    if src is None:
+        gone_with = archived_app_project(slug)
+        if gone_with is not None:
+            raise Refused("archived", "it was archived with the project \"%s\"" % project_label(gone_with))
+        if os.path.isdir(os.path.join(APPS_ARCHIVE, slug)):
+            raise Refused("archived", "it's archived")
+        raise Refused("not_found", "there's no app '%s' on this machine" % slug)
+    if os.path.realpath(src) == os.path.realpath(dest):
+        # Already there — nothing to do, or an earlier run of this request finished.
+        return {"slug": slug, "to": to, "path": dest, "alreadyThere": True}
+    if to == "project" and not os.path.isfile(os.path.join(PROJECTS, args["project"], "project.md")):
+        if archived_project_dir(args["project"]) is not None:
+            raise Refused("project_archived", "\"%s\" is archived" % project_label(args["project"]))
+        raise Refused("project_not_found", "there's no project '%s' on this machine" % args["project"])
+
+    owner = None
+    rel = os.path.relpath(src, IDENTITIES)
+    if not rel.startswith(".."):
+        owner = rel.split(os.sep, 1)[0]
+    title = app_title(src, slug)
+    rc, out = run(["bash", MOVE_APP, slug] + argv, timeout=180)
+    for line in out.splitlines():
+        if line.strip():
+            log("  move-app.sh[%s]: %s" % (slug, line))
+    if rc != 0:
+        tail = [ln for ln in out.splitlines() if ln.strip()][-3:]
+        reason = re.sub(r"^\[move-app\] (ERROR: )?", "", tail[-1]) if tail else "move-app.sh failed (%d)" % rc
+        raise Failed("move_failed", reason)
+    if owner and os.path.isdir(os.path.join(IDENTITIES, owner)):
+        safe_title = re.sub(r"[<>\r\n]", " ", title)[:120]
+        try:
+            inbox_drop(owner, (
+                "<task-notification>\n<summary>App moved — delivered by the app</summary>\n"
+                "<event>[app %s] Your conversation app \"%s\" was moved to %s from its menu. It is no longer "
+                "one of your conversation apps; its address and data are unchanged. Nothing for you to do."
+                "</event>\n</task-notification>") % (slug, safe_title, dest_label))
+        except OSError as e:
+            log("WARN: app '%s' move: couldn't tell '%s' its app moved: %s" % (slug, owner, e))
+    return {"slug": slug, "to": to, "path": dest}
+
+
+HANDLERS = {
+    "app-move": do_app_move,
+    "project-contents": do_project_contents,
+    "project-archive": do_project_archive,
+}
+
+
+# ---------------------------------------------------------------------------
+# The listener
+# ---------------------------------------------------------------------------
+
+_stopping = False
+
+
+def _on_term(signum, frame):
+    global _stopping
+    _stopping = True
+    log("stop asked for — finishing the request in hand first")
+
+
+def next_seq():
+    try:
+        with open(SEQ_FILE, encoding="utf-8") as f:
+            n = int(f.read().strip() or "1")
+    except (OSError, ValueError):
+        n = 1
+    # Never reuse a number still in the journal.
+    for name in list_json(JOURNAL):
+        try:
+            n = max(n, int(name.split("-", 1)[0]) + 1)
+        except ValueError:
+            pass
+    return n
+
+
+def known_ids():
+    ids = set()
+    for name in list_json(JOURNAL):
+        i = id_of(name)
+        if i:
+            ids.add(i)
+    return ids
+
+
+def take_in():
+    """Number every new request in arrival order and move it into the journal."""
+    names = list_json(INCOMING)
+    if not names:
+        return 0
+    taken = 0
+    in_journal = known_ids()
+    seq = next_seq()
+    for name in names:
+        path = os.path.join(INCOMING, name)
+        req = read_json(path)
+        rid = req.get("id") if isinstance(req, dict) else None
+        if not isinstance(rid, str) or not ID_RE.match(rid):
+            log("dropped an unreadable request: %s" % name)
+            os.unlink(path)
+            continue
+        if rid in in_journal or os.path.exists(os.path.join(OUTCOMES, rid + ".json")):
+            os.unlink(path)  # the same request sent again
+            continue
+        kind, args = req.get("kind"), req.get("args")
+        if kind not in HANDLERS or not isinstance(args, dict):
+            write_json_atomic(os.path.join(OUTCOMES, rid + ".json"), {
+                "id": rid, "seq": None, "kind": kind if isinstance(kind, str) else None, "state": "refused",
+                "code": "unknown_kind" if kind not in HANDLERS else "bad_request",
+                "reason": "this machine doesn't know the request '%s'" % kind if kind not in HANDLERS
+                else "args must be an object",
+                "finished_at": time.time(),
+            })
+            os.unlink(path)
+            continue
+        entry = {"seq": seq, "id": rid, "kind": kind, "args": args,
+                 "received_at": req.get("received_at"), "taken_at": time.time(), "state": "queued"}
+        write_json_atomic(os.path.join(JOURNAL, "%010d-%s.json" % (seq, rid)), entry)
+        os.unlink(path)
+        in_journal.add(rid)
+        log("request #%d %s %s taken in (id %s)" % (seq, kind, json.dumps(args, separators=(",", ":"))[:300], rid))
+        seq += 1
+        taken += 1
+    write_json_atomic(SEQ_FILE, seq)
+    return taken
+
+
+def carry_out(name):
+    path = os.path.join(JOURNAL, name)
+    entry = read_json(path)
+    if not isinstance(entry, dict):
+        log("ERROR: journal entry %s unreadable — dropped" % name)
+        os.unlink(path)
+        return
+    rid = entry["id"]
+    out_path = os.path.join(OUTCOMES, rid + ".json")
+    if os.path.exists(out_path):
+        os.unlink(path)  # finished before a restart; only the clean-up was left
+        return
+    resumed = entry.get("state") == "running"
+    entry["state"] = "running"
+    entry["started_at"] = entry.get("started_at") or time.time()
+    write_json_atomic(path, entry)
+
+    def save_plan(plan):
+        entry["plan"] = plan
+        write_json_atomic(path, entry)
+
+    outcome = {"id": rid, "seq": entry["seq"], "kind": entry["kind"]}
+    t0 = time.time()
+    try:
+        with Lock(CHANGE_LOCK, "the change lock"):
+            result = HANDLERS[entry["kind"]](entry["args"], entry, save_plan)
+        outcome.update(state="done", result=result)
+    except Refused as e:
+        outcome.update(state="refused", code=e.code, reason=e.reason)
+        if e.result is not None:
+            outcome["result"] = e.result
+    except Failed as e:
+        outcome.update(state="failed", code=e.code, reason=e.reason)
+    except Exception as e:  # noqa: BLE001 — every request gets an outcome
+        outcome.update(state="failed", code="internal", reason="%s: %s" % (type(e).__name__, e))
+    outcome["finished_at"] = time.time()
+    write_json_atomic(out_path, outcome)
+    os.unlink(path)
+    log("request #%d %s %s%s in %.1fs%s" % (
+        entry["seq"], entry["kind"], outcome["state"], " (carried on after a restart)" if resumed else "",
+        time.time() - t0, (" — %s: %s" % (outcome.get("code"), outcome.get("reason"))) if outcome["state"] != "done" else ""))
+
+
+def prune():
+    cutoff = time.time() - OUTCOME_KEEP_S
+    for name in list_json(OUTCOMES):
+        p = os.path.join(OUTCOMES, name)
+        try:
+            if os.stat(p).st_mtime < cutoff:
+                os.unlink(p)
+        except OSError:
+            pass
+
+
+def serve(until_idle=False):
+    ensure_dirs()
+    signal.signal(signal.SIGTERM, _on_term)
+    signal.signal(signal.SIGINT, _on_term)
+    lock_fd = os.open(SERVE_LOCK, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log("another listener is already running on this machine — waiting for it to stop")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    log("fleet-change listener up (pid %d)" % os.getpid())
+    last_prune = 0.0
+    while not _stopping:
+        try:
+            take_in()
+            pending = list_json(JOURNAL)
+            if pending:
+                carry_out(pending[0])
+                continue
+            if until_idle and not list_json(INCOMING):
+                break
+            if time.time() - last_prune > PRUNE_EVERY_S:
+                prune()
+                last_prune = time.time()
+        except Exception as e:  # noqa: BLE001 — the listener must keep going
+            log("ERROR: %s: %s" % (type(e).__name__, e))
+            time.sleep(1)
+        time.sleep(POLL_S)
+    log("fleet-change listener stopped")
+
+
+# ---------------------------------------------------------------------------
+# The client side
+# ---------------------------------------------------------------------------
+
+def where_is(rid):
+    """The request's outcome, or how far it has got."""
+    outcome = read_json(os.path.join(OUTCOMES, rid + ".json"))
+    if isinstance(outcome, dict):
+        outcome.pop("finished_at", None)
+        return outcome
+    journal = list_json(JOURNAL)
+    for i, name in enumerate(journal):
+        if id_of(name) == rid:
+            entry = read_json(os.path.join(JOURNAL, name)) or {}
+            return {"id": rid, "seq": entry.get("seq"), "kind": entry.get("kind"),
+                    "state": "running" if entry.get("state") == "running" else "queued", "ahead": i}
+    for name in list_json(INCOMING):
+        if id_of(name) == rid:
+            return {"id": rid, "state": "received"}
+    return None
+
+
+def wait_for(rid, wait_s):
+    deadline = time.time() + wait_s
+    while True:
+        w = where_is(rid)
+        if w is not None and w["state"] in ("done", "refused", "failed"):
+            return w
+        if time.time() >= deadline:
+            return w or {"id": rid, "state": "unknown"}
+        time.sleep(POLL_S)
+
+
+def usage(msg=None):
+    if msg:
+        sys.stderr.write("fleet-change: %s\n" % msg)
+    sys.stderr.write(__doc__.split("Usage:", 1)[1].split("Output", 1)[0])
+    sys.exit(2)
+
+
+def parse_wait(argv, default):
+    if "--wait" not in argv:
+        return default
+    i = argv.index("--wait")
+    try:
+        w = float(argv[i + 1])
+    except (IndexError, ValueError):
+        usage("--wait needs a number of seconds")
+    del argv[i:i + 2]
+    return max(0.0, min(w, MAX_WAIT_S))
+
+
+def submit(argv):
+    wait_s = parse_wait(argv, DEFAULT_WAIT_S)
+    rid = None
+    if "--id" in argv:
+        i = argv.index("--id")
+        if i + 1 >= len(argv):
+            usage("--id needs a value")
+        rid = argv[i + 1]
+        del argv[i:i + 2]
+        if not ID_RE.match(rid):
+            usage("--id must match [A-Za-z0-9._-]{1,80}")
+    if len(argv) != 2:
+        usage("submit takes a kind and its args as JSON")
+    kind, raw = argv
+    if kind not in KINDS:
+        usage("unknown kind '%s' (known: %s)" % (kind, ", ".join(KINDS)))
+    try:
+        args = json.loads(raw)
+    except ValueError as e:
+        usage("args aren't valid JSON: %s" % e)
+    if not isinstance(args, dict):
+        usage("args must be a JSON object")
+    rid = rid or str(uuid.uuid4())
+    ensure_dirs()
+    if where_is(rid) is None:
+        write_json_atomic(os.path.join(INCOMING, "%020d-%s.json" % (time.time_ns(), rid)),
+                          {"id": rid, "kind": kind, "args": args, "received_at": time.time()})
+    print(json.dumps(wait_for(rid, wait_s), separators=(",", ":")))
+
+
+def status(argv):
+    wait_s = parse_wait(argv, 0.0)
+    if len(argv) != 1 or not ID_RE.match(argv[0]):
+        usage("status takes one request id")
+    print(json.dumps(wait_for(argv[0], wait_s), separators=(",", ":")))
+
+
+def hold_lock(argv):
+    if len(argv) != 2 or argv[0] != "--parent" or not argv[1].isdigit():
+        usage("hold-lock takes --parent <pid>")
+    parent = int(argv[1])
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    with Lock(CHANGE_LOCK, "the change lock"):
+        print("held", flush=True)
+        while True:
+            try:
+                os.kill(parent, 0)
+            except ProcessLookupError:
+                break
+            except PermissionError:
+                pass
+            time.sleep(0.2)
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv:
+        usage()
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "submit":
+        submit(rest)
+    elif cmd == "status":
+        status(rest)
+    elif cmd == "serve":
+        if rest not in ([], ["--until-idle"]):
+            usage("serve takes no arguments but --until-idle")
+        serve(until_idle=bool(rest))
+    elif cmd == "hold-lock":
+        hold_lock(rest)
+    elif cmd == "kinds":
+        print(json.dumps({"kinds": list(KINDS)}))
+    else:
+        usage("unknown command '%s'" % cmd)
+
+
+if __name__ == "__main__":
+    main()

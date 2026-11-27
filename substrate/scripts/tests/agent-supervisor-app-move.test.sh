@@ -3,8 +3,9 @@
 # shellcheck disable=SC2317,SC2030,SC2031
 #
 # Test driver for the project-scoped-apps additions to agent-supervisor.sh:
-#   - scan_app_move_requested_sentinels()  runs move-app.sh for a .move-requested in any
-#                                          live app folder; tells a conversation app's agent
+#   - scan_app_move_requested_sentinels()  hands a .move-requested note in any live app folder
+#                                          to the front door (fleet-change) as a request
+#   - change_lock_take / change_lock_give  the supervisor's turn at the change lock
 #   - retire_archived_project_apps()       stops + stashes the apps of an archived project
 #
 # move-app.sh and app-units.sh are stubs that record each call in $CALLS, so these tests
@@ -75,67 +76,112 @@ source_supervisor() {
 
 app() { mkdir -p "$1"; printf '{"title": "%s", "description": ""}\n' "${2:-Tally}" > "$1/app.json"; }
 
-test_move_sidebar_app_into_project() {
-  local s; s=$(setup)
+# fleet-change stub: records each submit and answers "received".
+fc_stub() {
+  cat > "$1/fleet-change-stub" <<STUB
+import json, sys
+open("$1/calls", "a").write("fleet-change " + " ".join(sys.argv[1:]) + "\\n")
+print(json.dumps({"id": sys.argv[sys.argv.index("--id") + 1], "state": "received"}))
+STUB
+  export AGENT_FLEET_CHANGE_BIN="$1/fleet-change-stub"
+}
+
+test_move_note_is_handed_to_the_front_door() {
+  local s; s=$(setup); fc_stub "$s"
   app "$s/apps/tally"
   printf '{"to":"project","project":"garden"}' > "$s/apps/tally/.move-requested"
+  local id="note-tally-$(stat -c %Y "$s/apps/tally/.move-requested")"
   ( source_supervisor "$s"; scan_app_move_requested_sentinels >/dev/null 2>&1 )
-  assert_eq "move-stub tally project garden" "$(cat "$s/calls")" "calls"
-  assert_absent "$s/apps/tally/.move-requested" "request consumed"
+  assert_eq "fleet-change submit app-move {\"slug\":\"tally\",\"to\":\"project\",\"project\":\"garden\"} --id $id --wait 0" "$(cat "$s/calls")" "calls"
+  assert_absent "$s/apps/tally/.move-requested" "note consumed"
   rm -rf "$s"
 }
 
-test_move_project_app_to_sidebar_with_users() {
-  local s; s=$(setup)
+test_move_note_with_users_keeps_the_list() {
+  local s; s=$(setup); fc_stub "$s"
   app "$s/projects/garden/apps/beds"
   printf '{"to":"sidebar","users":["ann","bob"]}' > "$s/projects/garden/apps/beds/.move-requested"
   ( source_supervisor "$s"; scan_app_move_requested_sentinels >/dev/null 2>&1 )
-  assert_eq "move-stub beds sidebar --users ann,bob" "$(cat "$s/calls")" "calls"
+  grep -q 'app-move {"slug":"beds","to":"sidebar","users":\["ann","bob"\]}' "$s/calls" || fail "users kept: $(cat "$s/calls")"
   rm -rf "$s"
 }
 
-test_move_conversation_app_tells_its_agent() {
+test_move_note_waits_until_front_door_is_installed() {
   local s; s=$(setup)
+  export AGENT_FLEET_CHANGE_BIN="$s/not-installed"
+  app "$s/apps/tally"
+  printf '{"to":"sidebar","users":null}' > "$s/apps/tally/.move-requested"
+  ( source_supervisor "$s"; scan_app_move_requested_sentinels >/dev/null 2>&1 )
+  assert_exists "$s/apps/tally/.move-requested" "note kept for later"
+  assert_eq "" "$(cat "$s/calls")" "nothing run on its own"
+  rm -rf "$s"
+}
+
+# End to end with the real front door: the note becomes a request, the listener moves the app
+# and tells the conversation's agent.
+test_move_note_end_to_end_through_the_real_front_door() {
+  local s; s=$(setup)
+  export AGENT_FLEET_CHANGE_BIN="$REPO_ROOT/substrate/scripts/fleet-change"
   app "$s/identities/alpha/apps/tally" 'My <Tally>'
   printf '{"to":"sidebar","users":null}' > "$s/identities/alpha/apps/tally/.move-requested"
-  ( source_supervisor "$s"; scan_app_move_requested_sentinels >/dev/null 2>&1 )
-  assert_eq "move-stub tally sidebar --everyone" "$(cat "$s/calls")" "no list → everyone"
+  cat > "$s/units-stub.sh" <<STUB
+#!/usr/bin/env bash
+[ "\$1" = find ] || exit 0
+for d in "$s/apps/\$2" "$s"/identities/*/apps/"\$2" "$s"/projects/*/apps/"\$2"; do [ -d "\$d" ] && { echo "\$d"; exit 0; }; done
+exit 1
+STUB
+  cat > "$s/mv-stub.sh" <<STUB
+#!/usr/bin/env bash
+printf 'move-app %s\\n' "\$*" >> "$s/calls"; mv "$s/identities/alpha/apps/\$1" "$s/apps/\$1"
+STUB
+  chmod +x "$s/units-stub.sh" "$s/mv-stub.sh"
+  ( export FLEET_CHANGE_FLEET_DIR="$s" FLEET_CHANGE_APP_UNITS="$s/units-stub.sh" FLEET_CHANGE_MOVE_APP="$s/mv-stub.sh"
+    source_supervisor "$s"; scan_app_move_requested_sentinels >/dev/null 2>&1
+    python3 "$AGENT_FLEET_CHANGE_BIN" serve --until-idle >/dev/null 2>&1 )
+  assert_eq "move-app tally sidebar --everyone" "$(cat "$s/calls")" "moved by the front door"
+  assert_exists "$s/apps/tally/app.json" "in the sidebar"
   local msg; msg=$(cat "$s"/identities/alpha/inbox/*.msg 2>/dev/null)
   printf '%s' "$msg" | grep -q 'App moved — delivered by the app' || fail "inbox event: $msg"
   printf '%s' "$msg" | grep -q '"My  Tally " was moved to the sidebar' || fail "title flattened, destination named: $msg"
   rm -rf "$s"
 }
 
-test_failed_move_records_reason_and_does_not_tell_agent() {
-  local s; s=$(setup)
-  app "$s/identities/alpha/apps/tally"
-  printf '{"to":"project","project":"garden"}' > "$s/identities/alpha/apps/tally/.move-requested"
-  ( export STUB_RC=1; source_supervisor "$s"; scan_app_move_requested_sentinels >/dev/null 2>&1 )
-  assert_exists "$s/identities/alpha/apps/tally/.move-failed" "reason kept"
-  assert_absent "$s/identities/alpha/apps/tally/.move-requested" "not retried every tick"
-  assert_absent "$s/identities/alpha/inbox" "agent not told"
-  rm -rf "$s"
-}
-
 test_bad_requests_are_dropped() {
-  local s; s=$(setup)
+  local s; s=$(setup); fc_stub "$s"
   app "$s/apps/a"; app "$s/apps/b"; app "$s/apps/c"; app "$s/apps/d"
   printf 'not json' > "$s/apps/a/.move-requested"
   printf '{"to":"conversation"}' > "$s/apps/b/.move-requested"
   printf '{"to":"project","project":"../x"}' > "$s/apps/c/.move-requested"
   printf '{"to":"project","project":"archive"}' > "$s/apps/d/.move-requested"
   ( source_supervisor "$s"; scan_app_move_requested_sentinels >/dev/null 2>&1 )
-  assert_eq "" "$(cat "$s/calls")" "nothing run"
+  assert_eq "" "$(cat "$s/calls")" "nothing sent"
   for x in a b c d; do assert_absent "$s/apps/$x/.move-requested" "$x dropped"; done
   rm -rf "$s"
 }
 
 test_archived_project_apps_are_ignored_by_move_scan() {
-  local s; s=$(setup)
+  local s; s=$(setup); fc_stub "$s"
   app "$s/projects/archive/old/apps/gone"
   printf '{"to":"sidebar"}' > "$s/projects/archive/old/apps/gone/.move-requested"
   ( source_supervisor "$s"; scan_app_move_requested_sentinels >/dev/null 2>&1 )
   assert_eq "" "$(cat "$s/calls")" "archived project's app not moved"
+  rm -rf "$s"
+}
+
+# The supervisor's turn and the front door's turn exclude each other.
+test_supervisor_change_lock_excludes_the_front_door() {
+  local s; s=$(setup)
+  export AGENT_FLEET_CHANGE_BIN="$REPO_ROOT/substrate/scripts/fleet-change"
+  (
+    source_supervisor "$s"
+    change_lock_take || { echo "take failed" > "$s/lock-result"; exit 0; }
+    if flock -n "$s/.change-lock" true; then echo "free while held" > "$s/lock-result"; fi
+    change_lock_take; change_lock_give        # re-entrant
+    if flock -n "$s/.change-lock" true; then echo "free while still held" >> "$s/lock-result"; fi
+    change_lock_give
+    flock -n "$s/.change-lock" true || echo "still held after give" >> "$s/lock-result"
+  )
+  assert_eq "" "$(cat "$s/lock-result" 2>/dev/null)" "lock held exactly while taken"
   rm -rf "$s"
 }
 
@@ -154,11 +200,12 @@ app-units-stub uninstall beds" "$(cat "$s/calls")" "only the archived project's 
 }
 
 printf 'agent-supervisor app move tests\n'
-run_test test_move_sidebar_app_into_project
-run_test test_move_project_app_to_sidebar_with_users
-run_test test_move_conversation_app_tells_its_agent
-run_test test_failed_move_records_reason_and_does_not_tell_agent
+run_test test_move_note_is_handed_to_the_front_door
+run_test test_move_note_with_users_keeps_the_list
+run_test test_move_note_waits_until_front_door_is_installed
+run_test test_move_note_end_to_end_through_the_real_front_door
 run_test test_bad_requests_are_dropped
+run_test test_supervisor_change_lock_excludes_the_front_door
 run_test test_archived_project_apps_are_ignored_by_move_scan
 run_test test_retire_archived_project_apps
 

@@ -4,9 +4,11 @@
  *
  *   - app-units.test.sh: where apps live (sidebar, project, conversation),
  *     slugs and ports they reserve, and move-app.sh (Move to) with rollback.
- *   - agent-supervisor-app-move.test.sh: the supervisor running a requested
- *     move, telling a conversation app's agent, and stopping the apps of an
- *     archived project.
+ *   - agent-supervisor-app-move.test.sh: the supervisor handing a leftover
+ *     move note to the front door, its turn at the change lock, and stopping
+ *     the apps of an archived project.
+ *   - fleet-change.test.sh: the front door — requests in arrival order, one
+ *     at a time under the change lock; app moves and project archives.
  */
 
 import { execFileSync } from "node:child_process";
@@ -29,6 +31,12 @@ function run(script: string): { ok: boolean; output: string } {
 describe("app-scope substrate suites", () => {
   it("app-units.test.sh passes", () => {
     const r = run("app-units.test.sh");
+    expect(r.output).toMatch(/ 0 failed/);
+    expect(r.ok).toBe(true);
+  }, 70_000);
+
+  it("fleet-change.test.sh passes", () => {
+    const r = run("fleet-change.test.sh");
     expect(r.output).toMatch(/ 0 failed/);
     expect(r.ok).toBe(true);
   }, 70_000);

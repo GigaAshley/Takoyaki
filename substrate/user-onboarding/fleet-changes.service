@@ -1,0 +1,18 @@
+[Unit]
+Description=Front door — carries out this box's changes to projects and apps, one at a time
+After=default.target
+PartOf=agent-supervisor.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.local/bin/fleet-change serve
+Restart=always
+RestartSec=2
+# A stop lets the request in hand finish (the listener exits between requests); one left
+# running past the timeout is carried on from its saved progress at the next start.
+KillMode=mixed
+TimeoutStopSec=120
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
