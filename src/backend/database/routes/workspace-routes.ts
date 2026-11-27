@@ -281,6 +281,12 @@ function sendSaveAnswer(res: Response, saved: SaveAnswer): void {
   res.status(saved.status).json({ error, ...(saved.version !== undefined ? { version: saved.version } : {}) });
 }
 
+/** A project's own file (reached from the admin's whole-machine browser): its member list is
+ *  the machine's, as in the project window. */
+function isProjectFile(homePath: string): boolean {
+  return /^fleet\/projects\/[a-z0-9-]{1,64}\/project\.md$/.test(homePath);
+}
+
 /** A save waits its turn at the machine's front door: longer than other Files-tab work. */
 const SAVE_OP_TIMEOUT_MS = 35_000;
 
@@ -928,7 +934,7 @@ workspaceRoutes.post(
                 filename,
                 extension,
                 // A save from the file window is written only over this version.
-                version: fileVersion(data),
+                version: fileVersion(data, isProjectFile(posix.relative(homeDir, resolved))),
               };
             }));
           },
@@ -1129,12 +1135,15 @@ workspaceRoutes.put(
               assertNotMachineOwned("create", [absolutePath, dest], homeDir);
 
               // Written at its turn at the machine's front door, only over the version opened.
+              const homePath = posix.relative(homeDir, dest);
               return await saveFileAtTurn(client, {
-                homePath: posix.relative(homeDir, dest),
+                homePath,
                 data: Buffer.from(content, "utf8"),
                 expect: expectVersion,
+                keepMembers: isProjectFile(homePath),
                 hostId: Number(hostId),
                 by: userId,
+                ...(target.kind === "host" ? { withoutFrontDoor: "check-then-write" as const } : {}),
               });
             }));
           },
@@ -1684,12 +1693,15 @@ workspaceRoutes.post(
               );
               assertNotMachineOwned("create", [absolutePath, dest], homeDir);
 
+              const homePath = posix.relative(homeDir, dest);
               return await saveFileAtTurn(client, {
-                homePath: posix.relative(homeDir, dest),
+                homePath,
                 data: fileBuffer,
                 expect: expectVersion,
+                keepMembers: isProjectFile(homePath),
                 hostId: Number(hostId),
                 by: userId,
+                ...(target.kind === "host" ? { withoutFrontDoor: "check-then-write" as const } : {}),
               });
             }));
           },

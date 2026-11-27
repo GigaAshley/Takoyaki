@@ -255,7 +255,8 @@ export async function updateProjectFile(
     const data = (axios.isAxiosError(error) ? error.response?.data : undefined) as
       | { code?: string; version?: string | null; error?: string }
       | undefined;
-    if (data?.code === "changed") throw new FileChangedError(data.version ?? null);
+    // "exists": it was missing when opened, and has been made since.
+    if (data?.code === "changed" || data?.code === "exists") throw new FileChangedError(data.version ?? null);
     handleApiError(error, "update project file");
   }
 }

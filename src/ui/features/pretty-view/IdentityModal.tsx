@@ -670,7 +670,7 @@ export function IdentityModal({
         payload,
         "identity:identity-file-updated",
       );
-      if (res.code === "changed") {
+      if (res.code === "changed" || res.code === "exists") {
         // The agent (or another device) wrote in it since it was opened.
         const changed = new FileChangedError(res.version ?? null);
         console.info({ operation: "identity_file_changed_since_opened", identityKey: identity.identityKey, hostId });

@@ -1345,7 +1345,7 @@ export function updateRoleFileByName(
         } catch {
           /* ignore */
         }
-        if (env.code === "changed") {
+        if (env.code === "changed" || env.code === "exists") {
           reject(new FileChangedError(env.version ?? null));
         } else if (env.error) {
           reject(new Error(env.error));

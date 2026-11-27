@@ -936,6 +936,80 @@ t=open(sys.argv[1]).read(); t=re.sub(r"members:\n(  - .*\n)*", "", t, count=1); 
   rm -rf "$s"
 }
 
+test_file_save_checks_at_its_turn_what_a_move_would() {
+  local s; s=$(setup)
+  project "$s" x "X"; project "$s" y "Y"
+  local f="$s/fleet/projects/x/project.md"
+  local v; v=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$f")
+  # Y was moved inside X after the editor's save was checked by the server, before its turn.
+  project "$s" y "Y" x
+  stage "$s" save-l "$(printf -- '---\ndisplayName: X\nparent: y\n---\n')"
+  submit "$s" file-save "{\"path\":\"fleet/projects/x/project.md\",\"upload\":\"save-l\",\"expect\":\"$v\",\"keepMembers\":true,\"project\":{\"slug\":\"x\"}}" l1
+  serve_once "$s"
+  assert_eq into_itself "$(field "$(fc "$s" status l1)" code)" "a loop is refused at its turn"
+  grep -q '^parent:' "$f" && fail "x was moved"
+  rm -rf "$s"
+}
+
+test_file_save_leaves_the_machines_own_files_and_claimed_folders_alone() {
+  local s; s=$(setup)
+  agent "$s" finch ""; mkdir -p "$s/fleet/apps/tally"
+  for p in fleet/apps/tally/.move-requested fleet/.changes/incoming/x.json fleet/identities/finch/.archiving; do
+    stage "$s" save-k 'x'
+    submit "$s" file-save "{\"path\":\"$p\",\"upload\":\"save-k\",\"expect\":\"absent\"}" "k$RANDOM"
+  done
+  serve_once "$s"
+  local n; n=$(for f in "$s"/fleet/.changes/outcomes/*.json; do field "$(cat "$f")" code; done | grep -c machine_file)
+  assert_eq 3 "$n" "the machine's own files refused"
+  printf '{"id":"x"}' > "$s/fleet/identities/finch/.archiving"
+  local v; v=$(sha256sum < "$s/fleet/identities/finch/finch.md" | cut -d' ' -f1)
+  stage "$s" save-c 'mine'
+  submit "$s" file-save "{\"path\":\"fleet/identities/finch/finch.md\",\"upload\":\"save-c\",\"expect\":\"$v\"}" c1
+  serve_once "$s"
+  assert_eq being_archived "$(field "$(fc "$s" status c1)" code)" "not into a folder being archived"
+  rm -rf "$s"
+}
+
+test_line_edits_keep_windows_line_ends() {
+  local s; s=$(setup)
+  mkdir -p "$s/fleet/roles/eng"
+  printf -- '---\r\ndisplayName: Eng\r\n---\r\nBody\r\n' > "$s/fleet/roles/eng/eng.md"
+  submit "$s" role-edit '{"name":"eng","set":{"colorHue":5}}' e1
+  serve_once "$s"
+  assert_eq "$(printf -- '---\r\ndisplayName: Eng\r\ncolorHue: '"'"'5'"'"'\r\n---\r\nBody\r\n' | od -c)" "$(od -c < "$s/fleet/roles/eng/eng.md")" "only the new line; the rest byte for byte"
+  rm -rf "$s"
+}
+
+test_waiting_saves_keep_their_staged_copy() {
+  local s; s=$(setup)
+  mkdir -p "$s/fleet/identities/finch/workspace"
+  stage "$s" save-w 'kept'; stage "$s" save-old 'stray'
+  touch -d '2 hours ago' "$s/fleet/.changes/uploads/save-w" "$s/fleet/.changes/uploads/save-old"
+  submit "$s" file-save '{"path":"fleet/identities/finch/workspace/w.txt","upload":"save-w","expect":"absent"}' w1
+  FLEET_CHANGE_FLEET_DIR="$s/fleet" python3 -c 'import importlib.machinery as m, importlib.util as u, sys
+l = m.SourceFileLoader("fc", sys.argv[1]); fc = u.module_from_spec(u.spec_from_loader("fc", l)); l.exec_module(fc); fc.take_in(); fc.prune()' "$FC"
+  assert_exists "$s/fleet/.changes/uploads/save-w" "a save still waiting keeps its copy"
+  assert_absent "$s/fleet/.changes/uploads/save-old" "a stray one goes"
+  serve_once "$s"
+  assert_eq kept "$(cat "$s/fleet/identities/finch/workspace/w.txt")" "and lands"
+  rm -rf "$s"
+}
+
+test_a_save_cut_off_after_writing_is_reported_saved() {
+  local s; s=$(setup)
+  mkdir -p "$s/fleet/identities/finch/workspace" "$s/fleet/.changes/journal"
+  printf 'written' > "$s/fleet/identities/finch/workspace/n.txt"
+  local v; v=$(printf 'written' | sha256sum | cut -d' ' -f1)
+  # The listener stopped after the file went in, before its outcome was written.
+  printf '{"seq":4,"id":"f1","kind":"file-save","args":{"path":"fleet/identities/finch/workspace/n.txt","upload":"save-f1","expect":"absent"},"state":"running","plan":{"writing":"%s"}}' "$v" \
+    > "$s/fleet/.changes/journal/0000000004-f1.json"
+  serve_once "$s"
+  local a; a=$(fc "$s" status f1)
+  assert_eq done "$(field "$a" state)" "saved, not 'didn't arrive'"
+  assert_eq "$v" "$(field "$a" result.version)" "with its version"
+  rm -rf "$s"
+}
+
 run_test test_aither_sequence_runs_in_click_order
 run_test test_archive_first_then_move_out_is_refused
 run_test test_move_into_archived_project_is_refused
@@ -983,6 +1057,11 @@ run_test test_role_edit_changes_only_its_lines
 run_test test_file_save_only_over_what_the_editor_opened
 run_test test_file_save_stays_inside_the_home_folder
 run_test test_project_file_save_keeps_the_machines_member_list
+run_test test_file_save_checks_at_its_turn_what_a_move_would
+run_test test_file_save_leaves_the_machines_own_files_and_claimed_folders_alone
+run_test test_line_edits_keep_windows_line_ends
+run_test test_waiting_saves_keep_their_staged_copy
+run_test test_a_save_cut_off_after_writing_is_reported_saved
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 if [ "$FAIL" -gt 0 ]; then

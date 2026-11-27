@@ -16,7 +16,7 @@ vi.mock("./front-door.js", async (orig) => ({
   ...(await orig<typeof import("./front-door.js")>()),
   submitFrontDoor: (...a: unknown[]) => submit(...a),
 }));
-const exec = vi.fn(async () => "");
+const exec = vi.fn(async (..._a: unknown[]) => "");
 vi.mock("../ssh/tmux-helper.js", () => ({ execCommand: (...a: unknown[]) => exec(...(a as [])) }));
 const writes: string[] = [];
 vi.mock("../claude-session/identity-artifact-reader.js", () => ({
@@ -116,5 +116,43 @@ describe("saving at the front door", () => {
   it("still waiting its turn: says so, never claims it was saved", async () => {
     submit.mockResolvedValue({ state: "pending", id: "r1", seq: 1, stage: "queued" });
     expect(await save()).toMatchObject({ ok: false, status: 202, code: "pending" });
+  });
+});
+
+describe("a machine that isn't one of the fleet's (no front door)", () => {
+  beforeEach(() => {
+    submit.mockReset();
+    exec.mockReset();
+    writes.length = 0;
+  });
+  const conn = {} as never;
+  const answers = (installed: boolean, sha: string) =>
+    exec.mockImplementation(async (_c: unknown, cmd: unknown) =>
+      String(cmd).includes(".local/bin/fleet-change") ? (installed ? "yes" : "no") : sha,
+    );
+  const save = (expect: string) =>
+    saveFileAtTurn(conn, { homePath: "notes/a.txt", data: Buffer.from("mine"), expect, withoutFrontDoor: "check-then-write", requestId: "r2" });
+
+  it("checks the version on the machine just before writing, and writes only over it", async () => {
+    answers(false, `${"a".repeat(64)}  -`);
+    expect(await save("a".repeat(64))).toEqual({ ok: true, version: fileVersion(Buffer.from("mine")), requestId: "r2" });
+    expect(writes).toEqual(["$HOME/notes/a.txt"]);
+    expect(submit).not.toHaveBeenCalled();
+  });
+
+  it("changed, gone, or already there: refused the same way the front door refuses", async () => {
+    answers(false, `${"c".repeat(64)}  -`);
+    expect(await save("a".repeat(64))).toMatchObject({ ok: false, code: "changed", version: "c".repeat(64) });
+    expect(await save("absent")).toMatchObject({ ok: false, code: "exists", version: "c".repeat(64) });
+    answers(false, "absent");
+    expect(await save("a".repeat(64))).toMatchObject({ ok: false, code: "changed", version: null });
+    expect(writes).toEqual([]);
+  });
+
+  it("a fleet machine still saves at its front door", async () => {
+    answers(true, "");
+    submit.mockResolvedValue({ state: "done", id: "r2", seq: 1, result: { version: "b".repeat(64) } });
+    expect(await save("a".repeat(64))).toMatchObject({ ok: true, version: "b".repeat(64) });
+    expect(submit).toHaveBeenCalled();
   });
 });

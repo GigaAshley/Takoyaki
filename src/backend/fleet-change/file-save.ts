@@ -135,9 +135,14 @@ export async function saveFileAtTurn(
     data: Buffer;
     expect: string;
     keepMembers?: boolean;
+    /** A project's own file: a changed parent line gets a move's guard rails at its turn. */
+    project?: { slug: string; asker?: string };
     hostId?: number;
     by?: string;
     requestId?: string;
+    /** A machine that isn't part of the fleet (the admin's file browser on any SSH host) has
+     *  no front door: there the same check is made just before the write instead. */
+    withoutFrontDoor?: "check-then-write";
   },
 ): Promise<SaveAnswer> {
   if (!isExpect(opts.expect)) {
@@ -145,6 +150,9 @@ export async function saveFileAtTurn(
   }
   if (!isHomePath(opts.homePath)) return { ok: false, status: 400, code: "bad_request", error: "invalid path" };
   const id = requestIdFrom(opts.requestId);
+  if (conn !== null && opts.withoutFrontDoor && !(await frontDoorInstalled(conn))) {
+    return saveWithoutFrontDoor(conn, opts.homePath, opts.data, opts.expect, id);
+  }
   const upload = `save-${id}`;
   const local = conn === null;
   const uploadsDir = path.join(path.dirname(getLocalIdentitiesRoot()), ".changes", "uploads");
@@ -155,7 +163,13 @@ export async function saveFileAtTurn(
   const outcome = await submitFrontDoor(
     conn,
     "file-save",
-    { path: opts.homePath, upload, expect: opts.expect, ...(opts.keepMembers ? { keepMembers: true } : {}) },
+    {
+      path: opts.homePath,
+      upload,
+      expect: opts.expect,
+      ...(opts.keepMembers ? { keepMembers: true } : {}),
+      ...(opts.project ? { project: opts.project } : {}),
+    },
     { id, hostId: opts.hostId, by: opts.by },
   );
   databaseLogger.info("file saved at the front door", {
@@ -203,4 +217,33 @@ export async function saveFileAtTurn(
       else await execCommand(conn, `rm -f "$HOME/fleet/.changes/uploads/${upload}"`).catch(() => undefined);
       return { ok: false, status: 503, code: "updating", error: "this machine is still updating, try again in a moment" };
   }
+}
+
+async function frontDoorInstalled(conn: SSHClientType): Promise<boolean> {
+  return (await execCommand(conn, `[ -f "$HOME/.local/bin/fleet-change" ] && echo yes || echo no`)).trim() === "yes";
+}
+
+/** No front door on this machine (it isn't one of the fleet's): the version is checked on the
+ *  machine just before the write — nothing else there takes turns to wait for. */
+async function saveWithoutFrontDoor(
+  conn: SSHClientType,
+  homePath: string,
+  data: Buffer,
+  expect: string,
+  requestId: string,
+): Promise<SaveAnswer> {
+  const f = `"$HOME"/${shellWord(homePath)}`;
+  const out = await execCommand(conn, `if [ -f ${f} ]; then sha256sum < ${f}; else echo absent; fi`);
+  const now = out.trim().split(/\s+/)[0] ?? "";
+  if (now !== ABSENT && !VERSION_RE.test(now)) return { ok: false, status: 502, code: "unreadable", error: "couldn't read the file" };
+  if (now === ABSENT && expect !== ABSENT) {
+    return { ok: false, status: 409, code: "changed", error: "it was deleted or moved since you opened it", version: null };
+  }
+  if (now !== ABSENT && expect === ABSENT) {
+    return { ok: false, status: 409, code: "exists", error: "there's already a file of that name", version: now };
+  }
+  if (now !== ABSENT && now !== expect) return { ok: false, status: 409, code: "changed", error: CHANGED_ERROR, version: now };
+  await writeBinaryFileAtomic(conn, `$HOME/${homePath}`, data);
+  databaseLogger.info("file saved without a front door", { operation: "file_save_direct", homePath, bytes: data.byteLength, requestId });
+  return { ok: true, version: fileVersion(data), requestId };
 }

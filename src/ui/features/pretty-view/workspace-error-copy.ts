@@ -132,6 +132,11 @@ export const WORKSPACE_ERROR_COPY: Record<string, WorkspaceErrorCopy> = {
     body: "This machine is still updating. Try again in a moment.",
   },
 
+  "version_unknown": {
+    heading: "Not saved",
+    body: "The machine didn't say which version of the file this is, so saving could overwrite changes you haven't seen. Close the file and open it again.",
+  },
+
   "file_exists": {
     heading: "Already there",
     body: "There's already a file with that name here.",

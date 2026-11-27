@@ -1209,10 +1209,22 @@ router.put(
         // the same guard rails as a move — the parent must exist, be visible
         // to the caller, and not be the project itself or one of its own
         // sub-projects (a loop could otherwise expose a restricted project).
+        // The machine checks the same again at the save's turn (a move queued meanwhile could
+        // otherwise make a loop), for the person asking.
         const nextParent = projectMetaFromMarkdown(slug, contents).parent;
+        let asker: string | null = null;
         if (nextParent !== null) {
           const { markdown: prevMarkdown } = await readProjectFile(conn, slug);
           if (projectMetaFromMarkdown(slug, prevMarkdown).parent !== nextParent) {
+            try {
+              asker = await askerFor(userId, hostId);
+            } catch (err) {
+              if (err instanceof HttpError) {
+                res.status(err.status).json({ error: err.message });
+                return;
+              }
+              throw err;
+            }
             const current = await listProjects(conn);
             const visible = await visibleSlugsForCaller(current, userId);
             const reject = (status: number, error: string, outcome: string) => {
@@ -1244,6 +1256,7 @@ router.put(
           data: Buffer.from(contents, "utf8"),
           expect: version,
           keepMembers: true,
+          project: { slug, ...(asker !== null ? { asker } : {}) },
           hostId,
           by: userId,
         });
@@ -1256,7 +1269,7 @@ router.put(
             code: saved.code,
           });
           res.status(saved.status).json({
-            error: saved.code === "changed" ? CHANGED_ERROR : saved.error,
+            error: saved.code === "changed" || saved.code === "exists" ? CHANGED_ERROR : saved.error,
             code: saved.code,
             ...(saved.version !== undefined ? { version: saved.version } : {}),
           });

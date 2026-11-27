@@ -2053,7 +2053,7 @@ export async function handleRoleUpdateFile(
     const at = roleFileAt(roleName);
     const saved = await saveFileAtTurn(c, { homePath: at.homePath, data: Buffer.from(contents, "utf8"), expect: expectVersion, hostId: hostIdNum, by: userId });
     if (saved.ok === false) {
-      refusal = { error: saved.code === "changed" ? CHANGED_ERROR : saved.error, code: saved.code, ...(saved.version !== undefined ? { version: saved.version } : {}) };
+      refusal = { error: saved.code === "changed" || saved.code === "exists" ? CHANGED_ERROR : saved.error, code: saved.code, ...(saved.version !== undefined ? { version: saved.version } : {}) };
       return { markdown: "" };
     }
     const r = await readForSave(c, at);
@@ -6294,6 +6294,7 @@ wss.on("connection", async (ws: WebSocket, req) => {
       let refusal = null as Refusal | null;
       let version = "";
       const saveAndRead = async (c: Parameters<typeof readForSave>[0]): Promise<{ markdown: string }> => {
+        if (Buffer.byteLength(contents, "utf-8") > IDMEDIT_MAX_MARKDOWN_BYTES) throw new Error("markdown payload exceeds IDMEDIT_MAX_MARKDOWN_BYTES");
         const at = agentFileAt(identityKey);
         const saved = await saveFileAtTurn(c, {
           homePath: at.homePath,
@@ -6303,7 +6304,7 @@ wss.on("connection", async (ws: WebSocket, req) => {
           by: userId,
         });
         if (saved.ok === false) {
-          refusal = { error: saved.code === "changed" ? CHANGED_ERROR : saved.error, code: saved.code, ...(saved.version !== undefined ? { version: saved.version } : {}) };
+          refusal = { error: saved.code === "changed" || saved.code === "exists" ? CHANGED_ERROR : saved.error, code: saved.code, ...(saved.version !== undefined ? { version: saved.version } : {}) };
           return { markdown: "" };
         }
         const r = await readForSave(c, at);

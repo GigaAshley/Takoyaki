@@ -295,20 +295,29 @@ function WorkspaceFileViewer({
   // Bumped by "Reload" after a refused save: read the file (and its version) again.
   const [reloadTick, setReloadTick] = useState(0);
 
-  // A file the viewer streams for itself (a PDF) still needs its version for a save.
+  // A file the viewer streams for itself (a PDF) still needs its version for a save — read
+  // first, and the viewer only loads the file once it's known, so what's shown is no older
+  // than the version a save goes over. Unknown (the machine didn't answer): no save.
+  const streamsItself = neverNeedsContent && !readOnly;
+  const [streamVersion, setStreamVersion] = useState<"loading" | "known" | "unknown">("loading");
   useEffect(() => {
-    if (!neverNeedsContent || readOnly) return;
+    if (!streamsItself) return;
     let cancelled = false;
+    setStreamVersion("loading");
     fetchFileVersion(target, hostId, file.relativePath)
       .then((v) => {
-        if (!cancelled) versionRef.current = v;
+        if (cancelled) return;
+        versionRef.current = v;
+        setStreamVersion("known");
       })
-      .catch(() => undefined);
+      .catch(() => {
+        if (!cancelled) setStreamVersion("unknown");
+      });
     return () => {
       cancelled = true;
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [targetDepKey(target), hostId, file.relativePath, neverNeedsContent, readOnly, reloadTick]);
+  }, [targetDepKey(target), hostId, file.relativePath, streamsItself, reloadTick]);
 
   useEffect(() => {
     if (skipFetch) return;
@@ -405,6 +414,7 @@ function WorkspaceFileViewer({
       setSaveError(null);
       setSaving(true);
       try {
+        if (streamsItself && streamVersion !== "known") throw new Error("version_unknown");
         const bytes = await draftToSave.getBytes();
         const saved = await uploadWorkspaceFile(
           target,
@@ -429,7 +439,7 @@ function WorkspaceFileViewer({
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [targetDepKey(target), hostId, file.relativePath, file.name, onChangedSinceOpened]
+    [targetDepKey(target), hostId, file.relativePath, file.name, onChangedSinceOpened, streamsItself, streamVersion]
   );
 
   // Close guard: confirm before discarding unsaved edits. One question at a
@@ -531,6 +541,8 @@ function WorkspaceFileViewer({
     body = (
       <ErrorBanner heading={copy.heading} body={copy.body} />
     );
+  } else if (streamsItself && streamVersion === "loading") {
+    body = <KitLoading className="px-2.5" />;
   } else if (isTooLarge) {
     body = (
       <FileUnavailableNotice
