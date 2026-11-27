@@ -1895,8 +1895,8 @@ open and copy.
   entry hides or shows that series.
 - **Tables.** Clicking a column heading sorts: low to high, then high to
   low, then back to the agent's order. The sort arrow shows while hovering
-  a heading, and stays on the sorted one. Tables longer than ten rows fold
-  behind **Show all N rows**. Wide tables scroll sideways. A **copy** button
+  a heading, and stays on the sorted one. Every row is always shown. Wide
+  tables scroll sideways. A **copy** button
   (pastes into a spreadsheet as cells) and a **download** button (a
   spreadsheet file) sit at the table's corner while hovering it, or always
   in a row under it on a phone. Both follow the sort on screen and include
