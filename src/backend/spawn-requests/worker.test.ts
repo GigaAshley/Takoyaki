@@ -1932,3 +1932,56 @@ describe("spawn-request worker", () => {
     });
   });
 });
+
+describe("direct-route births (a fleet-service request)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    __resetThrottleForTests();
+  });
+
+  it("the answer goes back on the call; nothing is written on the machine", async () => {
+    const respond = vi.fn();
+    const deps = buildTestDeps({ findBornByRequest: vi.fn().mockResolvedValue(null) });
+    await processBirth(makePendingBirth({ direct: true, respond }), deps);
+    expect(respond).toHaveBeenCalledTimes(1);
+    expect(respond.mock.calls[0][0]).toBe("success");
+    expect(JSON.parse(respond.mock.calls[0][1] as string)).toMatchObject({ name: "willow" });
+    expect(deps.writeMarkdownFileAtomic).not.toHaveBeenCalled();
+  });
+
+  it("the newborn's folder records the request that made it", async () => {
+    const deps = buildTestDeps({ findBornByRequest: vi.fn().mockResolvedValue(null) });
+    await processBirth(makePendingBirth({ direct: true, respond: vi.fn(), uuid: "req-1" }), deps);
+    expect((deps.birthIdentity as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({ birthRequestId: "req-1" });
+    // A request-folder birth (not the direct route) records nothing.
+    const plain = buildTestDeps();
+    await processBirth(makePendingBirth(), plain);
+    expect((plain.birthIdentity as ReturnType<typeof vi.fn>).mock.calls[0][0].birthRequestId).toBeUndefined();
+  });
+
+  it("the same request sent again answers with the agent it already made, never a second one", async () => {
+    const respond = vi.fn();
+    const deps = buildTestDeps({ findBornByRequest: vi.fn().mockResolvedValue("cedar") });
+    await processBirth(makePendingBirth({ direct: true, respond }), deps);
+    expect(deps.birthIdentity).not.toHaveBeenCalled();
+    expect(respond.mock.calls[0][0]).toBe("success");
+    expect(JSON.parse(respond.mock.calls[0][1] as string)).toMatchObject({ name: "cedar", already: true });
+  });
+
+  it("when the machine can't be checked, nothing is made and it says so", async () => {
+    const respond = vi.fn();
+    const deps = buildTestDeps({ findBornByRequest: vi.fn().mockRejectedValue(new Error("ssh down")) });
+    await processBirth(makePendingBirth({ direct: true, respond }), deps);
+    expect(deps.birthIdentity).not.toHaveBeenCalled();
+    expect(respond.mock.calls[0][0]).toBe("failure");
+    expect(JSON.parse(respond.mock.calls[0][1] as string)).toMatchObject({ reason: "peer_host_unreachable" });
+  });
+
+  it("a failure is answered on the call too", async () => {
+    const respond = vi.fn();
+    const deps = buildTestDeps({ findBornByRequest: vi.fn().mockResolvedValue(null), getVettedPool: vi.fn().mockReturnValue([]) });
+    await processBirth(makePendingBirth({ direct: true, respond }), deps);
+    expect(respond.mock.calls[0][0]).toBe("failure");
+    expect(JSON.parse(respond.mock.calls[0][1] as string)).toMatchObject({ reason: "pool_exhausted" });
+  });
+});

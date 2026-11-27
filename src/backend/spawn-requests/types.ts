@@ -118,6 +118,20 @@ export interface PendingBirth {
    * the identity fields above are left at their empty defaults.
    */
   roleRequest?: RoleRequestBody;
+
+  /**
+   * Sent over the machine's direct route (a `fleet-service` request) rather than
+   * dropped in the machine's request folder: `uuid` is the request's id, the
+   * newborn's folder records it (`.birth-request`), and the same request sent
+   * again answers with the agent it already made.
+   */
+  direct?: true;
+
+  /**
+   * Where the answer goes for a direct-route request: called once with what
+   * would otherwise be written to `<uuid>.success.json` / `<uuid>.failure.json`.
+   */
+  respond?: (kind: "success" | "failure", body: string) => void;
 }
 
 /**

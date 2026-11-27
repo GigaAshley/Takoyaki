@@ -1,6 +1,6 @@
 /**
- * spawn-requests/role-worker.ts — processes role requests: files in
- * `~/fleet/spawn-requests/` carrying `kind: "role"`. Drains through the same
+ * spawn-requests/role-worker.ts — processes role requests (`role-create` over
+ * the machine's direct route, direct-route.ts). Drains through the same
  * queue as identity births (starter.ts routes on `item.roleRequest`).
  *
  * Does what the new-role dialog does, minus the human picks:
@@ -11,7 +11,8 @@
  *   3. Provision the role folder via createRoleOnHost — same code path as
  *      POST /roles, including the creator auto-tag on multi-user hosts (the
  *      host owner stands in for the creator, as with identity spawns).
- *   4. Drop `<uuid>.success.json` {name, created_at} or `<uuid>.failure.json`.
+ *   4. Answer {name, created_at} or the failure (writeResponseFile hands it to
+ *      the request's caller).
  *
  * Identity births hold a global birth-throttle slot; role creation doesn't
  * (no Matrix account, no tmux session), so this path skips it.

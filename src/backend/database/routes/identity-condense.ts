@@ -1,56 +1,38 @@
 /**
- * /identities/:key/condense — the user pressed Condense conversation. Drops
- * the `.compact-requested` request on the identity's host; the agent-supervisor
- * carries it out on its next tick (waking a dormant agent through its inbox,
- * waiting for an awake one to be at rest), compacts the conversation, and then
- * delivers a "Compaction done" event so the agent takes a turn. The same file
- * is what an agent drops to compact itself, so the button and the agent share
- * one way in.
+ * /identities/:key/condense — the user pressed Compact conversation. Asks the
+ * machine's front door (fleet-change agent-compact), the same way an agent asks
+ * for its own compaction: refused while the agent's archive is claimed, and a
+ * second press while one is waiting is the same compaction. Once accepted the
+ * agent-supervisor carries it out on its next tick (waking a dormant agent
+ * through its inbox, waiting for an awake one to be at rest), then delivers a
+ * "Compaction done" event so the agent takes a turn.
  *
- * POST /identities/:key/condense  body: { hostId: number, guidance?: string }
- *   → 200 { ok: true }
+ * POST /identities/:key/condense  body: { hostId: number, guidance?: string, requestId?: string }
+ *   → 200 { ok: true, requestId, result }   accepted
+ *   → 202 { pending: true }                 still waiting its turn (it will be carried out)
+ *   → 409 { error, code }                   being_archived, archived, not_found
+ *   → 503 { code: "updating" }              the machine's update hasn't landed yet
+ *   → 400 bad hostId / key; 404 not the caller's host; 504 unreachable
  *
  * `guidance` is whatever the user had typed in the composer — passed to the
  * compaction as what the summary should keep. Whitespace (newlines included)
  * is collapsed, control characters dropped, and it is capped at
- * GUIDANCE_MAX_CHARS; empty means none.
- *
- * Same shape as identity-archive.ts: authenticateJWT → IDENTITY_KEY_RE gate →
- * resolveHostById (cross-user / unknown → 404) → LOCAL/REMOTE branch →
- * writeIdentityFile → conn.end(). 500s return a generic message; the guidance
- * text is never logged.
+ * GUIDANCE_MAX_CHARS; empty means none. The guidance text is never logged.
  */
 
 import type { AuthenticatedRequest } from "../../../types/index.js";
 import express from "express";
 import type { Request, Response } from "express";
 import { AuthManager } from "../../utils/auth-manager.js";
-import { databaseLogger } from "../../utils/logger.js";
-import { resolveHostById } from "../../ssh/host-resolver.js";
-import { connectOneShot } from "../../ssh/ssh-one-shot.js";
-import { getHostSemaphore } from "../../ssh/host-semaphore-registry.js";
-import {
-  isLocalHostId,
-  IDENTITY_KEY_RE,
-} from "../../claude-session/identity-artifact-reader.js";
-import {
-  assertNotBeingArchived,
-  IdentityBeingArchivedError,
-  writeIdentityFile,
-} from "../../claude-session/per-identity-file.js";
-
-/** Remote SSH work holds one per-host semaphore slot; local disk work needs none. */
-function withHostSlot<T>(hostId: number, fn: () => Promise<T>): Promise<T> {
-  return isLocalHostId(hostId) ? fn() : getHostSemaphore(hostId).run(fn);
-}
+import { IDENTITY_KEY_RE } from "../../claude-session/identity-artifact-reader.js";
+import { requestIdFrom } from "../../fleet-change/front-door.js";
+import { answerFromFrontDoor, parseHostId } from "../../fleet-change/front-door-route.js";
 
 const router = express.Router();
 const authManager = AuthManager.getInstance();
 const authenticateJWT = authManager.createAuthMiddleware();
 
-const SSH_CONNECT_TIMEOUT_MS = 3000;
-
-/** The supervisor caps it again (in bytes); this keeps the request file small. */
+/** The machine caps it again (in bytes). */
 export const GUIDANCE_MAX_CHARS = 1000;
 
 export function normalizeGuidance(raw: unknown): string {
@@ -58,7 +40,6 @@ export function normalizeGuidance(raw: unknown): string {
   // Whitespace (newlines included) collapses to single spaces; other control
   // characters are dropped — an ESC sequence could end the supervisor's
   // bracketed paste early.
-  // eslint-disable-next-line no-control-regex
   const flat = raw.replace(/\s+/g, " ").replace(/[\u0000-\u001f\u007f]/g, "").trim();
   return Array.from(flat).slice(0, GUIDANCE_MAX_CHARS).join("");
 }
@@ -69,14 +50,13 @@ router.post(
   async (req: Request, res: Response) => {
     const userId = (req as AuthenticatedRequest).userId;
 
-    const body = (req.body ?? {}) as { hostId?: unknown; guidance?: unknown };
+    const body = (req.body ?? {}) as { hostId?: unknown; guidance?: unknown; requestId?: unknown };
     const rawHostId = body.hostId;
     if (rawHostId === undefined || rawHostId === null || rawHostId === "") {
       return res.status(400).json({ error: "hostId is required" });
     }
-    const hostId =
-      typeof rawHostId === "number" ? rawHostId : parseInt(String(rawHostId), 10);
-    if (!Number.isFinite(hostId) || hostId <= 0 || !Number.isInteger(hostId)) {
+    const hostId = parseHostId(rawHostId);
+    if (hostId === null) {
       return res.status(400).json({ error: "hostId must be a positive integer" });
     }
 
@@ -87,64 +67,14 @@ router.post(
         .json({ error: "identity key must match [a-z0-9_-]{1,64}" });
     }
 
-    const host = await resolveHostById(hostId, userId);
-    if (!host) {
-      return res.status(404).json({ error: "Host not found" });
-    }
-
     const guidance = normalizeGuidance(body.guidance);
-
-    return withHostSlot(hostId, async () => {
-      let conn: Awaited<ReturnType<typeof connectOneShot>> | null = null;
-      if (!isLocalHostId(hostId)) {
-        try {
-          conn = await connectOneShot(
-            host as unknown as Parameters<typeof connectOneShot>[0],
-            SSH_CONNECT_TIMEOUT_MS,
-          );
-        } catch {
-          databaseLogger.warn("identity condense: host unreachable", {
-            operation: "identity_condense_unreachable",
-            userId,
-            hostId,
-            key,
-          });
-          return res.status(504).json({ error: "Host unreachable" });
-        }
-      }
-      try {
-        await assertNotBeingArchived(key, { hostId, conn });
-        await writeIdentityFile(key, ".compact-requested", guidance, {
-          hostId,
-          conn,
-        });
-        databaseLogger.info("identity condense requested", {
-          operation: "identity_condense_requested",
-          userId,
-          hostId,
-          key,
-          guidanceChars: guidance.length,
-        });
-        return res.json({ ok: true });
-      } catch (err) {
-        if (err instanceof IdentityBeingArchivedError) return res.status(409).json({ error: "it's being archived", code: "being_archived" });
-        databaseLogger.error("identity condense: request write failed", undefined, {
-          operation: "identity_condense_write_failed",
-          userId,
-          hostId,
-          key,
-          error: err instanceof Error ? err.message : String(err),
-        });
-        return res.status(500).json({ error: "failed to request condense" });
-      } finally {
-        if (conn) {
-          try {
-            conn.end();
-          } catch {
-            /* ignore */
-          }
-        }
-      }
+    return answerFromFrontDoor(res, {
+      hostId,
+      userId,
+      kind: "agent-compact",
+      args: guidance ? { name: key, guidance } : { name: key },
+      requestId: requestIdFrom(body.requestId),
+      operation: "identity_condense_requested",
     });
   },
 );

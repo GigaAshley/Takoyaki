@@ -22,10 +22,12 @@
 #
 # Hermetic environment contract:
 #   Each test creates a synthetic HOME_DIR via mktemp and passes
-#   HOME="$HOME_DIR" to python invocations. The scheduler's
-#   _drop_spawn_request uses os.path.expanduser("~"), so overriding HOME
-#   redirects spawn-request drops to the test's controlled dir. No test
-#   reads from or writes to the real ~/fleet/ tree.
+#   HOME="$HOME_DIR" to python invocations. A scheduled conversation's fire
+#   is sent with fleet-service; WAKEUP_FLEET_SERVICE points it at a stand-in
+#   (fake_fleet_service below) that writes each request it is sent to
+#   $HOME/fleet/spawn-requests/<id>.json and answers ok, so the tests read
+#   what was asked for there. No test reads from or writes to the real
+#   ~/fleet/ tree.
 #
 # Requirements: bash, python3.
 
@@ -47,6 +49,29 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
+# ---- stand-in for the direct route ----
+FAKE_FS_DIR="$(mktemp -d)"
+cat > "$FAKE_FS_DIR/fleet-service" <<'FAKE'
+#!/usr/bin/env python3
+# Records what a call sends ($HOME/fleet/spawn-requests/<id>.json) and answers ok.
+# FAKE_FLEET_SERVICE_ANSWER, when set, is printed instead (and nothing is recorded).
+import json, os, sys
+a = sys.argv[1:]
+ans = os.environ.get("FAKE_FLEET_SERVICE_ANSWER")
+if ans:
+    open(os.path.join(os.environ["HOME"], "fake-fs-calls"), "a").write(" ".join(a[:2]) + "\n")
+    print(ans); sys.exit(0 if '"ok":true' in ans.replace(" ", "") else 1)
+if a[0] == "call":
+    rid = a[a.index("--id") + 1]
+    body = json.load(open(a[a.index("--input-file") + 1]))
+    d = os.path.join(os.environ["HOME"], "fleet", "spawn-requests")
+    os.makedirs(d, exist_ok=True)
+    json.dump(body, open(os.path.join(d, rid + ".json"), "w"))
+print(json.dumps({"ok": True, "result": {"name": "newborn"}}))
+FAKE
+chmod +x "$FAKE_FS_DIR/fleet-service"
+export WAKEUP_FLEET_SERVICE="$FAKE_FS_DIR/fleet-service"
+
 # ---- test state ----
 PASS=0
 FAIL=0
@@ -67,6 +92,7 @@ cleanup() {
     [ -n "$_d" ] && [ -d "$_d" ] && rm -rf "$_d"
   done
   [ -n "$TEST_TMP_ROOT" ] && [ -d "$TEST_TMP_ROOT" ] && rm -rf "$TEST_TMP_ROOT"
+  [ -n "$FAKE_FS_DIR" ] && [ -d "$FAKE_FS_DIR" ] && rm -rf "$FAKE_FS_DIR"
 }
 trap cleanup EXIT
 
@@ -1100,8 +1126,7 @@ req_dir = os.path.join(sys.argv[2], "fleet", "spawn-requests")
 def fire(flag, **kw):
     spec = {"name": "box check", "roles": ["helper"], "prompt": "check the box", "_slug": "box-check"}
     if flag is not None: spec["archive_if_nothing_to_report"] = flag
-    _, path = m._drop_spawn_request(spec, sys.argv[2], **kw)
-    return json.load(open(path))["prompt"]
+    return m._spawn_body(spec, **kw)["prompt"]
 sec = m.ARCHIVE_IF_NOTHING_TO_REPORT_SECTION
 errs = []
 p = fire(True)
@@ -1140,8 +1165,7 @@ l = SourceFileLoader("eng", sys.argv[1]); m = importlib.util.module_from_spec(im
 def fire(project, **kw):
     spec = {"name": "box check", "roles": [], "prompt": "check the box", "_slug": "box-check"}
     if project is not None: spec["project"] = project
-    _, path = m._drop_spawn_request(spec, sys.argv[2], **kw)
-    return json.load(open(path))
+    return m._spawn_body(spec, **kw)
 errs = []
 if fire("skynet").get("project") != "skynet": errs.append("live project not carried")
 if fire("skynet", sensor_fire=("2026-10-18T00:00:00Z", "x", None)).get("project") != "skynet": errs.append("sensor fire not filed")
@@ -1389,6 +1413,60 @@ test_SA_G27_sensor_trip_switch_off_fails() {
 # triggers' fires folders every second, so a fire that lands mid-pass reaches
 # its agent within about a second; a trigger switched off since the pass never
 # delivers early; a sensor-fired scheduled task births promptly the same way.
+# ============================================================
+# SA-G29: a fire the server can't take now waits in the outbox and is sent
+# again every pass; a clock fire isn't added while the same scheduled
+# conversation's last one still waits (sensor fires all wait); a lost answer
+# is sent again under the same id; a real refusal is dropped.
+# ============================================================
+test_SA_G29_outbox_waits_for_the_server() {
+  local home_dir res
+  home_dir=$(make_tmpdir)
+  res=$(HOME="$home_dir" python3 - "$PY_SCRIPT" "$home_dir" <<'PY'
+import glob, importlib.util, json, os, sys
+from importlib.machinery import SourceFileLoader
+l = SourceFileLoader("eng", sys.argv[1]); m = importlib.util.module_from_spec(importlib.util.spec_from_loader(l.name, l)); l.exec_module(m)
+home = sys.argv[2]
+state = os.path.join(home, "fleet", "scheduled-agents", ".state"); os.makedirs(state)
+outbox = os.path.join(home, "fleet", "scheduled-agents", ".outbox")
+sent = os.path.join(home, "fleet", "spawn-requests")
+def answer(a):
+    if a is None: os.environ.pop("FAKE_FLEET_SERVICE_ANSWER", None)
+    else: os.environ["FAKE_FLEET_SERVICE_ANSWER"] = a
+def waiting(): return sorted(glob.glob(os.path.join(outbox, "*.json")))
+def entries(): return [json.load(open(p)) for p in waiting()]
+spec = {"name": "box check", "roles": [], "prompt": "check the box", "_slug": "box-check"}
+errs = []
+answer('{"ok":false,"error":{"code":"unreachable","message":"down"}}')
+first = m._request_new_agent(spec, state, clock=True)
+if len(waiting()) != 1: errs.append("unreachable: not kept (%d)" % len(waiting()))
+if m._request_new_agent(spec, state, clock=True) is not None or len(waiting()) != 1:
+    errs.append("a second clock fire was added while the first waits")
+m._request_new_agent(spec, state, sensor_fire=("2026-10-18T00:00:00Z", "x", None))
+if len(waiting()) != 2: errs.append("a sensor fire wasn't kept")
+answer('{"ok":false,"error":{"code":"timeout","message":"slow"}}')
+m._send_outbox(state)
+if not all(e["sent"] for e in entries()): errs.append("timeout: not marked as sent")
+answer('{"ok":false,"error":{"code":"lost","message":"gone"}}')
+m._send_outbox(state)
+if any(e["sent"] for e in entries()) or len(waiting()) != 2: errs.append("lost: not set to send again")
+answer(None)
+m._send_outbox(state)
+if waiting(): errs.append("answered: still waiting")
+got = sorted(os.path.basename(p)[:-5] for p in glob.glob(os.path.join(sent, "*.json")))
+if first not in got or len(got) != 2: errs.append("sent again under the same id: %r" % got)
+calls = open(os.path.join(home, "fake-fs-calls")).read().split("\n")
+if "collect " + first not in calls: errs.append("a timed-out send wasn't asked for again by id: %r" % calls)
+answer('{"ok":false,"error":{"code":"role_unknown","message":"no such role"}}')
+m._request_new_agent(dict(spec, _slug="other"), state, clock=True)
+if waiting(): errs.append("a refusal was kept")
+print("; ".join(errs) or "OK")
+PY
+)
+  res=$(printf '%s\n' "$res" | tail -n1)   # the refusal's own ⚠️ line comes first
+  assert_eq "OK" "$res" "SA-G29: outbox"
+}
+
 test_SA_G28_sensor_prompt_delivery() {
   local ident_dir home_dir out_log w sa_dir pid
   ident_dir=$(make_tmpdir); home_dir=$(make_tmpdir); out_log=$(make_tmpdir)/out.log
@@ -1470,6 +1548,7 @@ run_test test_SA_G25_sensor_trip_scheduled_task
 run_test test_SA_G26_sensor_controls_settings
 run_test test_SA_G27_sensor_trip_switch_off_fails
 run_test test_SA_G28_sensor_prompt_delivery
+run_test test_SA_G29_outbox_waits_for_the_server
 
 printf '\n===============================\n'
 printf 'PASS: %s  FAIL: %s\n' "$PASS" "$FAIL"

@@ -160,7 +160,7 @@ export type BackgroundTask = z.infer<typeof BackgroundTaskSchema>;
 // Condense replaced reset and the field was renamed.)
 //
 // Source: two sentinel files under `~/fleet/identities/<tmuxSession>/` on the
-// target host — `.compact-requested` (dropped by the agent or the app to ask
+// target host — `.compact-queued` (dropped by the agent or the app to ask
 // the supervisor for a compaction) and `.compacting` (held by the supervisor,
 // agent-supervisor.sh handle_compaction, while the compaction runs). The
 // agent is condensing while EITHER is present. Compaction happens in place:

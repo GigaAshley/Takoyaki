@@ -7,8 +7,8 @@ from one process file:
 
   (2) SCHEDULED AGENTS (--mode scheduled-agents) — fleet-level clock-scheduled
       entries that SPAWN a fresh identity per firing. No ⏰ line is printed;
-      instead a spawn-request file is dropped for the app's identity-birthing
-      pipeline to consume.
+      instead the app's server is asked for a new agent over the machine's
+      direct route.
 
 The two concepts historically shared the "wake-up" name; the fleet-level kind
 was renamed to "scheduled agents" to disambiguate. This script keeps its
@@ -139,17 +139,20 @@ Schedule specs live at `~/fleet/scheduled-agents/<slug>/scheduled-agent.json`
      "project": "skynet"}  # optional project slug — each newborn is born filed in it
                            # (left off the request while the project is missing)
 
-On a due entry the scheduled-agents scheduler drops a create-identity request
-file at `~/fleet/spawn-requests/<uuid>.json` (D-11) for the app's existing
-coordinator-birthing pipeline to consume:
+On a due entry the scheduled-agents scheduler asks the app's server for a new
+agent over the machine's direct route (`fleet-service call identity-birth`),
+with this request:
     {"roles": [...], "prompt": "...", "task": null,
      "users": [...],   # optional — spec-provided user tag for the newborn's
                        # frontmatter users: field (absent in spec ⇒ omitted)
      "project": "...", # optional — the spec's project, only while it exists
      "requested_at": "<ISO-8601 Z-suffixed>"}
 
-No ⏰ lines are printed; there is no running harness to receive them. The spawn-
-requests pipeline handles the actual identity birth.
+No ⏰ lines are printed; there is no running harness to receive them. The
+request waits in `~/fleet/scheduled-agents/.outbox/` until the server answers
+(sent again every pass while it can't be reached), so a fire during a server
+restart or outage runs late, never lost; a clock fire isn't added while the
+same scheduled conversation's last one still waits.
 
 State dir is `~/fleet/scheduled-agents/.state/` (D-10). All sentinel semantics
 (first-sight anchor, one-catch-up-on-missed-slot, `.fired` before delete for
@@ -164,6 +167,8 @@ Plan 03).
 
 Usage:  python3 wakeup-scheduler.py <folder> [--mode scheduled-agents]
 Env:    WAKEUP_POLL_SEC (default 30) — loop granularity.
+        WAKEUP_FLEET_SERVICE — the direct-route command (default ~/.local/bin/fleet-service).
+        WAKEUP_SEND_TIMEOUT_SEC (default 20) — how long one send waits for its answer.
         WAKEUP_FIRE_CHECK_SEC (default 1) — between passes, how often the fires
         folders of sensor triggers are listed so a waiting fire is delivered at
         once instead of on the next pass. Sensors never run more often for it.
@@ -1709,15 +1714,18 @@ def _live_project(slug):
     return slug if os.path.isdir(path) and not os.path.islink(path) else None
 
 
-def _drop_spawn_request(spec, state_dir, sensor_fire=None, sensor_broken_prompt=None,
-                        sensor_tripped_prompt=None):
-    """Drop a create-identity request file for the spawn-requests pipeline (D-11).
+def _request_new_agent(spec, state_dir, sensor_fire=None, sensor_broken_prompt=None,
+                       sensor_tripped_prompt=None, clock=False):
+    """Ask the app's server for a new agent for this fire, over the machine's direct route.
 
-    Writes ~/fleet/spawn-requests/<uuid>.json with the extended schema fields:
-    roles, prompt, task (null for scheduled-agent fires), requested_at (ISO-Z),
-    and project when the spec names a live one (see `_live_project`).
-    The UUID is 36 chars (standard uuid4) matching the scan-orchestrator's
-    ${#base} -eq 36 bash filter. The directory is created if absent (D-03 guard).
+    The request (roles, prompt, task, requested_at (ISO-Z), users, and project
+    when the spec names a live one — see `_live_project`) is kept in the outbox
+    (~/fleet/scheduled-agents/.outbox/) and sent at once; one the server can't
+    take now stays there and is sent again every pass until it answers (see
+    `_send_outbox`), so a server restart or outage makes a run late, never lost.
+    A clock fire (`clock`) is not added while an earlier clock fire of the same
+    scheduled conversation is still waiting: a missed slot catches up once, never
+    as a backlog. Sensor fires each carry their own findings and all wait.
 
     The `prompt` field is wrapped via `_wrap_prompt_as_preauthorized` before
     write, so the string that eventually lands in the newborn's identity file
@@ -1737,11 +1745,31 @@ def _drop_spawn_request(spec, state_dir, sensor_fire=None, sensor_broken_prompt=
     ARCHIVE_IF_NOTHING_TO_REPORT_SECTION after its prompt (before any sensor
     findings).
 
-    Returns (req_id, req_path) for caller logging.
+    Returns the request id, or None when it wasn't added.
     """
+    out_dir = _outbox_dir(state_dir)
+    slug = spec.get("_slug", "?")
+    if clock:
+        for entry_path, entry in _outbox_entries(out_dir):
+            if entry.get("slug") == slug and entry.get("clock"):
+                print("wakeup-scheduler: slug=%s fired while its last fire (%s) is still waiting for "
+                      "the server — that one runs; this one isn't added" % (slug, entry.get("id")),
+                      file=sys.stderr, flush=True)
+                return None
     req_id = str(_uuid.uuid4())
-    req_dir = os.path.join(os.path.expanduser("~"), "fleet", "spawn-requests")
-    os.makedirs(req_dir, exist_ok=True)
+    body = _spawn_body(spec, sensor_fire, sensor_broken_prompt, sensor_tripped_prompt)
+    os.makedirs(out_dir, exist_ok=True)
+    write_atomic_json(os.path.join(out_dir, "%020d-%s.json" % (time.time_ns(), req_id)),
+                      {"id": req_id, "slug": slug, "clock": bool(clock), "body": body,
+                       "queued_at": time.time(), "sent": False})
+    print("wakeup-scheduler: new agent asked for: request %s for slug=%s (roles=%s)"
+          % (req_id, slug, spec.get("roles", [])), file=sys.stderr, flush=True)
+    _send_outbox(state_dir)
+    return req_id
+
+
+def _spawn_body(spec, sensor_fire=None, sensor_broken_prompt=None, sensor_tripped_prompt=None):
+    """The new-agent request for one fire of `spec` (see `_request_new_agent`)."""
     fired_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     prompt = _wrap_prompt_as_preauthorized(spec.get("prompt", ""), spec.get("_slug", "?"), fired_at)
     if spec.get("archive_if_nothing_to_report") is True:
@@ -1789,15 +1817,111 @@ def _drop_spawn_request(spec, state_dir, sensor_fire=None, sensor_broken_prompt=
         print("wakeup-scheduler: project %r missing for slug=%s — newborn not filed"
               % (spec.get("project"), spec.get("_slug", "?")),
               file=sys.stderr, flush=True)
-    req_path = os.path.join(req_dir, req_id + ".json")
-    tmp_path = req_path + ".tmp"
-    with open(tmp_path, "w") as f:
-        json.dump(body, f)
-    os.rename(tmp_path, req_path)
-    print("wakeup-scheduler: dropped spawn-request %s for slug=%s (roles=%s)"
-          % (req_id, spec.get("_slug", "?"), spec.get("roles", [])),
-          file=sys.stderr, flush=True)
-    return req_id, req_path
+    return body
+
+
+FLEET_SERVICE = os.environ.get("WAKEUP_FLEET_SERVICE") or os.path.join(
+    os.path.expanduser("~"), ".local", "bin", "fleet-service")
+# How long one send waits for the server's answer before the next pass asks again by id.
+SEND_TIMEOUT_SEC = int(os.environ.get("WAKEUP_SEND_TIMEOUT_SEC", "20"))
+# The server can't be reached (or this machine has no credential yet): try again next pass.
+_SEND_LATER = ("unreachable", "not_set_up")
+# The server no longer has it (a restart; or it waited too long or its queue was full): send
+# it again. A new agent records the request that made it, so a resend never makes two.
+_SEND_AGAIN = ("lost", "expired", "queue_full")
+
+
+def _outbox_dir(state_dir):
+    return os.path.join(os.path.dirname(state_dir), ".outbox")
+
+
+def _outbox_entries(out_dir):
+    try:
+        names = sorted(n for n in os.listdir(out_dir) if n.endswith(".json"))
+    except OSError:
+        return []
+    out = []
+    for n in names:
+        p = os.path.join(out_dir, n)
+        try:
+            entry = json.load(open(p))
+        except Exception:
+            entry = None
+        out.append((p, entry))
+    return out
+
+
+def _send_outbox(state_dir):
+    """Send each waiting new-agent request, oldest first, and forget each one the server
+    has answered. Stops at the first one the server can't take now (it's down for all)."""
+    import subprocess
+    out_dir = _outbox_dir(state_dir)
+    for path, entry in _outbox_entries(out_dir):
+        if not isinstance(entry, dict) or not isinstance(entry.get("id"), str) \
+                or not isinstance(entry.get("body"), dict):
+            print("wakeup-scheduler: unreadable outbox entry %s — dropped" % path, file=sys.stderr, flush=True)
+            try: os.unlink(path)
+            except OSError: pass
+            continue
+        if not os.path.isfile(FLEET_SERVICE):
+            print("wakeup-scheduler: fleet-service isn't installed yet — %s waits" % entry["id"],
+                  file=sys.stderr, flush=True)
+            return
+        rid, slug = entry["id"], entry.get("slug", "?")
+        input_path = path + ".input"
+        if entry.get("sent"):
+            argv = [FLEET_SERVICE, "collect", rid, "--timeout", str(SEND_TIMEOUT_SEC)]
+        else:
+            with open(input_path, "w") as f:
+                json.dump(entry["body"], f)
+            argv = [FLEET_SERVICE, "call", "identity-birth", "--input-file", input_path,
+                    "--id", rid, "--timeout", str(SEND_TIMEOUT_SEC)]
+        try:
+            p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               stdin=subprocess.DEVNULL, timeout=SEND_TIMEOUT_SEC + 60)
+            lines = [ln for ln in p.stdout.decode("utf-8", "replace").splitlines() if ln.strip()]
+            resp = json.loads(lines[-1]) if lines else None
+        except (OSError, subprocess.TimeoutExpired, ValueError) as e:
+            print("wakeup-scheduler: couldn't send %s (slug=%s): %s — tried again next pass"
+                  % (rid, slug, e), file=sys.stderr, flush=True)
+            return
+        finally:
+            try: os.unlink(input_path)
+            except OSError: pass
+        if not isinstance(resp, dict):
+            print("wakeup-scheduler: no answer for %s (slug=%s, exit %d) — tried again next pass"
+                  % (rid, slug, p.returncode), file=sys.stderr, flush=True)
+            return
+        if resp.get("ok") is True:
+            result = resp.get("result") if isinstance(resp.get("result"), dict) else {}
+            print("wakeup-scheduler: slug=%s request %s → new agent %s%s"
+                  % (slug, rid, result.get("name"), " (already made)" if result.get("already") else ""),
+                  file=sys.stderr, flush=True)
+            try: os.unlink(path)
+            except OSError: pass
+            continue
+        err = resp.get("error") if isinstance(resp.get("error"), dict) else {}
+        code = err.get("code")
+        if code == "timeout":
+            if not entry.get("sent"):
+                entry["sent"] = True
+                write_atomic_json(path, entry)
+            continue
+        if code in _SEND_LATER:
+            print("wakeup-scheduler: the server can't take %s now (%s) — tried again next pass"
+                  % (rid, code), file=sys.stderr, flush=True)
+            return
+        if code in _SEND_AGAIN:
+            entry["sent"] = False
+            write_atomic_json(path, entry)
+            print("wakeup-scheduler: %s came back %s — sent again next pass" % (rid, code),
+                  file=sys.stderr, flush=True)
+            continue
+        print("⚠️ [wakeup-scheduler: %s] couldn't start its conversation: %s%s"
+              % (slug, code, (" — " + err["message"]) if isinstance(err.get("message"), str) else ""),
+              flush=True)
+        try: os.unlink(path)
+        except OSError: pass
 
 
 def _single_instance(state_dir, ident_dir):
@@ -1834,8 +1958,8 @@ def main():
                         "~/fleet/scheduled-agents root (scheduled-agents mode)")
     parser.add_argument("--mode", choices=["scheduled-agents"], default=None,
                         help="Run in scheduled-agents mode: reads nested "
-                             "slug-folder specs and drops spawn-request files "
-                             "on fire instead of printing ⏰ lines to a harness.")
+                             "slug-folder specs and asks the app's server for a "
+                             "new agent on fire instead of printing ⏰ lines to a harness.")
     # Replicate the original sys.exit(2) on missing positional arg — argparse already
     # exits 2 with usage on missing required positional, so no extra logic needed.
     args = parser.parse_args()
@@ -2004,7 +2128,7 @@ def main():
                 fired_utc = fire_time_utc(fp)
                 delivered = os.path.join(os.path.dirname(fp), "delivered", os.path.basename(fp))
                 if is_scheduled_agents_mode:
-                    _drop_spawn_request(spec, state_dir, sensor_fire=(fired_utc, findings, delivered))
+                    _request_new_agent(spec, state_dir, sensor_fire=(fired_utc, findings, delivered))
                 else:
                     _emit_sensor_wake(key, fired_utc, spec["instruction"], findings,
                                       spec["_state_dir"], delivered, once=True)
@@ -2116,7 +2240,7 @@ def main():
                 warned.add((key, "trip_record_failed"))
             return
         if is_scheduled_agents_mode:
-            _drop_spawn_request(spec, state_dir, sensor_tripped_prompt=_sensor_tripped_prompt(
+            _request_new_agent(spec, state_dir, sensor_tripped_prompt=_sensor_tripped_prompt(
                 key, spec.get("name"), utc, limit, n, evidence, d))
         else:
             _emit_sensor_tripped_wake(key, utc, limit, evidence)
@@ -2181,7 +2305,7 @@ def main():
                         warned.add((key, "bundle_write_failed"))
                     break
             if is_scheduled_agents_mode:
-                _drop_spawn_request(spec, state_dir, sensor_fire=(fired_utc, findings, delivered))
+                _request_new_agent(spec, state_dir, sensor_fire=(fired_utc, findings, delivered))
             else:
                 _emit_sensor_wake(key, fired_utc, spec["instruction"], findings,
                                   spec["_state_dir"], delivered)
@@ -2224,7 +2348,7 @@ def main():
         except OSError:
             return
         if is_scheduled_agents_mode:
-            _drop_spawn_request(spec, state_dir, sensor_broken_prompt=_sensor_broken_prompt(
+            _request_new_agent(spec, state_dir, sensor_broken_prompt=_sensor_broken_prompt(
                 key, spec.get("name"), since, state, spec["_dir"], health_path))
         else:
             _emit_sensor_broken_wake(key, since, state, health_path)
@@ -2392,6 +2516,8 @@ def main():
 
     while True:
         exit_if_orphaned()
+        if is_scheduled_agents_mode:
+            _send_outbox(state_dir)          # fires still waiting for the server
         now_ts = time.time()
         specs = load_specs()
         spec_name = "scheduled-agent.json" if is_scheduled_agents_mode else "wakeup.json"
@@ -2474,7 +2600,7 @@ def main():
                 if now_ts >= at_ts and not held_for_fanout(key, at_ts, now_ts):
                     utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                     if is_scheduled_agents_mode:
-                        _drop_spawn_request(spec, state_dir)
+                        _request_new_agent(spec, state_dir, clock=True)
                     else:
                         _emit_wake(key, utc, spec["instruction"], spec["_state_dir"])
                     try:
@@ -2539,7 +2665,7 @@ def main():
                     continue
                 utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                 if is_scheduled_agents_mode:
-                    _drop_spawn_request(spec, state_dir)
+                    _request_new_agent(spec, state_dir, clock=True)
                 else:
                     _emit_wake(key, utc, spec["instruction"], spec["_state_dir"])
                 set_last(spec, now_ts)

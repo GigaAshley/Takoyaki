@@ -4,9 +4,9 @@
 # (SC2317: test functions are called indirectly via run_test)
 #
 # Test driver for the supervisor's side of archives going through the front door:
-#   - scan_archive_notes: `.archive-requested` / `.unarchive-requested` notes left the
-#     old way (an agent's /id archive, a scheduled conversation, a tab from before the
-#     front door) are handed to fleet-change as requests, and removed once handed over
+#   - bounce_old_notes: `.archive-requested` / `.unarchive-requested` notes left the old way
+#     are never carried out: removed, and answered (the agent told, or a reply beside it);
+#     a request file left in ~/fleet/spawn-requests/ is answered with a failure file
 #   - run_archive_scan: the 180-day sleep sweep asks the front door instead of retiring
 #   - resolve_identities: an agent whose archive is claimed is never launched
 #   - wait_for_next_tick: the front door's wake file ends the wait early
@@ -57,6 +57,7 @@ source_supervisor() {
   export AGENT_ROLES_ARCHIVE_DIR="$s/fleet/roles-archive"
   export AGENT_APPS_DIR="$s/fleet/apps"
   export AGENT_APPS_ARCHIVE_DIR="$s/fleet/apps-archive"
+  export AGENT_FLEET_PROJECTS_DIR="$s/fleet/projects"
   export AGENT_FLEET_CHANGE_BIN="$SCRIPT_DIR/fixtures/fake-fleet-change"
   export FAKE_FLEET_CHANGE_LOG="$s/calls"
   export DORMANCY_STATE_DIR="$s/.state"
@@ -68,7 +69,7 @@ source_supervisor() {
 
 agent() { mkdir -p "$1/fleet/identities/$2"; printf -- '---\nroles: []\n---\n' > "$1/fleet/identities/$2/$2.md"; }
 
-test_notes_are_handed_to_the_front_door() {
+test_old_notes_are_never_carried_out() {
   local s; s=$(setup)
   agent "$s" finch; : > "$s/fleet/identities/finch/.archive-requested"
   mkdir -p "$s/fleet/roles/eng"; : > "$s/fleet/roles/eng/.archive-requested"
@@ -76,33 +77,44 @@ test_notes_are_handed_to_the_front_door() {
   mkdir -p "$s/fleet/identities-archive/wren"; : > "$s/fleet/identities-archive/wren/.unarchive-requested"
   mkdir -p "$s/fleet/roles-archive/ops"; : > "$s/fleet/roles-archive/ops/.unarchive-requested"
   mkdir -p "$s/fleet/apps-archive/beds"; : > "$s/fleet/apps-archive/beds/.unarchive-requested"
-  ( source_supervisor "$s"; scan_archive_notes ) >/dev/null 2>&1
-  local calls; calls="$(cat "$s/calls" 2>/dev/null)"
-  local want
-  for want in 'submit agent-archive {"name":"finch","by":"agent"}' 'submit role-archive {"name":"eng"}' \
-              'submit app-archive {"slug":"tally"}' 'submit agent-unarchive {"name":"wren"}' \
-              'submit role-unarchive {"name":"ops"}' 'submit app-unarchive {"slug":"beds"}'; do
-    printf '%s\n' "$calls" | grep -qF -- "$want --id note-" || fail "not handed over: $want (calls: $calls)"
+  ( source_supervisor "$s"; bounce_old_notes ) >/dev/null 2>&1
+  assert_absent "$s/calls" "nothing handed to the front door"
+  local f
+  for f in identities/finch/.archive-requested roles/eng/.archive-requested apps/tally/.archive-requested \
+           identities-archive/wren/.unarchive-requested roles-archive/ops/.unarchive-requested \
+           apps-archive/beds/.unarchive-requested; do
+    assert_absent "$s/fleet/$f" "note removed: $f"
   done
-  assert_absent "$s/fleet/identities/finch/.archive-requested" "agent note removed"
-  assert_absent "$s/fleet/apps-archive/beds/.unarchive-requested" "app note removed"
+  # The agent's own note: answered in its conversation.
+  grep -qF "fleet-change submit agent-archive '{\"name\":\"finch\",\"by\":\"agent\"}' --by agent:finch" \
+    "$s/fleet/identities/finch/inbox/"*.msg 2>/dev/null || fail "finch wasn't told what to run"
+  assert_absent "$s/fleet/identities/finch/.not-carried-out" "no reply file for an agent told directly"
+  # Any other: a reply beside it.
+  grep -qF "fleet-change submit role-archive '{\"name\":\"eng\"}'" "$s/fleet/roles/eng/.not-carried-out" || fail "role reply"
+  grep -qF "fleet-change submit app-archive '{\"slug\":\"tally\"}'" "$s/fleet/apps/tally/.not-carried-out" || fail "app reply"
+  grep -qF "fleet-change submit agent-unarchive '{\"name\":\"wren\"}'" "$s/fleet/identities-archive/wren/.not-carried-out" || fail "agent un-archive reply"
+  grep -qF "fleet-change submit role-unarchive '{\"name\":\"ops\"}'" "$s/fleet/roles-archive/ops/.not-carried-out" || fail "role un-archive reply"
+  grep -qF "fleet-change submit app-unarchive '{\"slug\":\"beds\"}'" "$s/fleet/apps-archive/beds/.not-carried-out" || fail "app un-archive reply"
   rm -rf "$s"
 }
 
-test_note_is_kept_when_the_front_door_fails() {
+test_old_new_agent_requests_are_answered() {
   local s; s=$(setup)
-  agent "$s" finch; : > "$s/fleet/identities/finch/.archive-requested"
-  ( source_supervisor "$s"; FAKE_FLEET_CHANGE_RC=1 scan_archive_notes ) >/dev/null 2>&1
-  assert_exists "$s/fleet/identities/finch/.archive-requested" "kept for the next pass"
-  rm -rf "$s"
-}
-
-test_same_note_gets_the_same_request_id() {
-  local s; s=$(setup)
-  agent "$s" finch; : > "$s/fleet/identities/finch/.archive-requested"
-  touch -d '2026-01-01 00:00' "$s/fleet/identities/finch/.archive-requested"
-  ( source_supervisor "$s"; FAKE_FLEET_CHANGE_RC=1 scan_archive_notes; FAKE_FLEET_CHANGE_RC=1 scan_archive_notes ) >/dev/null 2>&1
-  assert_eq 1 "$(grep -o 'note-[0-9a-f]*' "$s/calls" | sort -u | wc -l | tr -d ' ')" "one id for one note"
+  mkdir -p "$s/fleet/spawn-requests"
+  printf '{"roles":[],"task":"t","prompt":"p","requested_at":"x"}' > "$s/fleet/spawn-requests/aaa.json"
+  printf '{"kind":"role","name":"Gardener","description":"d","requested_at":"x"}' > "$s/fleet/spawn-requests/bbb.json"
+  printf '{"name":"x"}' > "$s/fleet/spawn-requests/ccc.success.json"
+  printf '{}' > "$s/fleet/spawn-requests/ddd.claimed.json"
+  ( source_supervisor "$s"; bounce_old_notes ) >/dev/null 2>&1
+  assert_absent "$s/fleet/spawn-requests/aaa.json" "request removed"
+  assert_absent "$s/fleet/spawn-requests/bbb.json" "role request removed"
+  python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["reason"]=="retired" and "identity-birth" in d["message"], d' \
+    "$s/fleet/spawn-requests/aaa.failure.json" 2>/dev/null || fail "new-agent request not answered: $(cat "$s/fleet/spawn-requests/aaa.failure.json" 2>/dev/null)"
+  python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["reason"]=="retired" and "role-create" in d["message"], d' \
+    "$s/fleet/spawn-requests/bbb.failure.json" 2>/dev/null || fail "role request not answered"
+  assert_exists "$s/fleet/spawn-requests/ccc.success.json" "answers left alone"
+  assert_exists "$s/fleet/spawn-requests/ddd.claimed.json" "claimed files left alone"
+  assert_absent "$s/fleet/spawn-requests/ccc.success.failure.json" "an answer isn't answered"
   rm -rf "$s"
 }
 
@@ -167,9 +179,8 @@ test_wake_during_the_pass_is_not_lost() {
 }
 
 printf 'agent-supervisor archive notes tests\n'
-run_test test_notes_are_handed_to_the_front_door
-run_test test_note_is_kept_when_the_front_door_fails
-run_test test_same_note_gets_the_same_request_id
+run_test test_old_notes_are_never_carried_out
+run_test test_old_new_agent_requests_are_answered
 run_test test_sleep_sweep_asks_the_front_door
 run_test test_claimed_agent_is_never_launched
 run_test test_wake_file_ends_the_wait_early

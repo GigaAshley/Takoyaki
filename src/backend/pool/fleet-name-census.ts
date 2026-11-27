@@ -105,6 +105,14 @@ export class FleetNameCensus {
     st.lastSeenInHostListAt = this.now();
   }
 
+  /** Whether claimRefresh would say yes now, without marking anything. */
+  isRefreshDue(machineKey: string): boolean {
+    const st = this.machines.get(machineKey);
+    if (!st || st.lastAttemptAt === 0) return true;
+    const wait = st.lastAttemptFailed ? RETRY_AFTER_FAILURE_MS : REFRESH_INTERVAL_MS;
+    return this.now() - st.lastAttemptAt >= wait;
+  }
+
   /**
    * Is this machine due for a refresh? If yes, marks the attempt as started
    * (so a second host row for the same machine on the same tick is not due).

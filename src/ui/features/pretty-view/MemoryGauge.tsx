@@ -49,6 +49,11 @@ export function condenseFailureMessage(err: unknown, hostName?: string): string 
     return `Couldn't reach ${hostName ? hostName : "this agent's machine"} — try again in a moment`;
   }
   if (status === 404) return "Couldn't find this agent's machine — it may have been removed";
+  if (status === 409) {
+    const reason = (err as { response?: { data?: { error?: unknown } } }).response?.data?.error;
+    return typeof reason === "string" && reason ? `Couldn't compact — ${reason}` : "Couldn't compact this agent right now";
+  }
+  if (status === 503) return "This machine is still updating — try again in a moment";
   return "Couldn't compact — something went wrong on the server";
 }
 

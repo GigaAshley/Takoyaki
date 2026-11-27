@@ -55,10 +55,7 @@ import path from "node:path";
 import type { Client as SSHClient } from "ssh2";
 import yaml from "js-yaml";
 import {
-  MIME_TO_AVATAR_EXT,
-  type AvatarExt,
   getLocalIdentitiesRoot,
-  getLocalRolesRoot,
   getLocalProjectsRoot,
   stringifyColorHueForYaml,
   execWithTimeout,
@@ -264,6 +261,14 @@ export interface BirthOptions {
    * at this seam or downstream).
    */
   users?: string[];
+  /**
+   * The request that asked for this agent over the machine's direct route
+   * (a scheduled conversation's fire, or an agent's request). Written into the
+   * newborn's folder as `.birth-request`, so the same request sent again after
+   * its answer was lost (a server restart) finds this agent instead of making
+   * a second one. Matches [A-Za-z0-9._-]{1,80}.
+   */
+  birthRequestId?: string;
   /**
    * Phase 80 Plan 80-03b A1 lock: when true, MXID composition follows the
    * DIVERGE shape (`<pool-name>-<role>[-N]` lowercase-hyphenated) — identity
@@ -1343,6 +1348,7 @@ function buildPeerCommitScript(args: {
   identityFileBody: string;
   relayJsonBody: string;
   fleetRoot: string;
+  birthRequestId?: string;
 }): string {
   // roles + identityFolderName are already regex-gated (ROLE_NAME_PATTERN
   // and IDENTITY_KEY_RE) before we reach this builder, so shell
@@ -1350,6 +1356,11 @@ function buildPeerCommitScript(args: {
   const { roles, identityFolderName, fleetRoot } = args;
   const identityFileBodyB64 = Buffer.from(args.identityFileBody, "utf-8").toString("base64");
   const relayJsonBodyB64 = Buffer.from(args.relayJsonBody, "utf-8").toString("base64");
+  // Regex-gated, so safe to interpolate; anything else is left out.
+  const birthRequestLine =
+    args.birthRequestId !== undefined && /^[A-Za-z0-9._-]{1,80}$/.test(args.birthRequestId)
+      ? `printf '%s\\n' '${args.birthRequestId}' > "$STAGING/.birth-request" || { echo "peer_birth_request_write_failed" >&2; exit 93; }\n`
+      : "";
 
   return `set -e
 FLEET_ROOT="${fleetRoot}"
@@ -1392,7 +1403,7 @@ touch "$STAGING/handoff.md" || { echo "peer_handoff_touch_failed" >&2; exit 93; 
 # the mv into place.
 printf '%s' '${relayJsonBodyB64}' | base64 -d > "$STAGING/relay.json" || { echo "peer_relay_json_write_failed" >&2; exit 93; }
 chmod 600 "$STAGING/relay.json" || { echo "peer_relay_json_chmod_failed" >&2; exit 93; }
-
+${birthRequestLine}
 # Atomic commit
 mv "$STAGING" "$FLEET_ROOT/identities/$KEY" || { echo "peer_commit_mv_failed" >&2; exit 94; }
 
@@ -1854,6 +1865,7 @@ export async function birthIdentity(
       identityFileBody,
       relayJsonBody,
       fleetRoot,
+      birthRequestId: opts.birthRequestId,
     });
 
     await runStep(8, async () => {

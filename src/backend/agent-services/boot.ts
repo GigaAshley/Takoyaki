@@ -7,8 +7,9 @@
  * The key store is the one the instance chose in its server settings
  * (admin/choose-store.ts), picked on first use. The engine reads keys,
  * settings and machine switches from the stores in admin/, and records each
- * answer there. Identity reactivate is the app's own machinery riding the
- * same requests: a core handler, answered for every machine.
+ * answer there. Identity reactivate, and new agents and roles
+ * (spawn-requests/direct-route.ts), are the app's own machinery riding the
+ * same requests: core handlers, answered for every machine.
  */
 
 import fs from "fs/promises";
@@ -28,6 +29,8 @@ import { AGENT_SERVICES } from "./registry.js";
 import { resolveActingUser } from "./user-secrets/acting-user.js";
 import { getUserSecret } from "./user-secrets/store.js";
 import identityReactivate from "../matrix/identity-reactivate.js";
+import { createDirectBirthServices, setDirectRouteDeps } from "../spawn-requests/direct-route.js";
+import { enqueue as enqueueBirth } from "../spawn-requests/queue.js";
 import { getKeyStore } from "./admin/key-store.js";
 import { effectiveSettings } from "./admin/settings-store.js";
 import { isEnabled } from "./admin/grants.js";
@@ -95,9 +98,19 @@ export async function startAgentServices(): Promise<void> {
   getKeyStore();
   await warnOrphanedGrants();
 
+  const directRouteDeps = {
+    enqueue: enqueueBirth,
+    connDetailsFor: async (hostId: string) => {
+      const hosts = await listSubstrateHosts({ getDb });
+      return hosts.find((h) => h.id === hostId)?._connDetails ?? null;
+    },
+  };
+  setDirectRouteDeps(directRouteDeps);
+  const directBirth = createDirectBirthServices(directRouteDeps);
+  const coreHandlers = [identityReactivate, ...directBirth];
   const engine = createAgentServiceEngine({
     services: AGENT_SERVICES,
-    coreHandlers: [identityReactivate],
+    coreHandlers,
     isEnabled,
     getKey: (service, name) => getKeyStore().get(service, name),
     getSettings: (def) => effectiveSettings(def.name, def.settings),
@@ -107,7 +120,7 @@ export async function startAgentServices(): Promise<void> {
   });
   const jobs = createJobStore();
   const sweepTimer = setInterval(() => jobs.sweep(), JOB_SWEEP_INTERVAL_MS);
-  setServiceRuntime({ engine, jobs, services: [...AGENT_SERVICES, identityReactivate] });
+  setServiceRuntime({ engine, jobs, services: [...AGENT_SERVICES, ...coreHandlers] });
 
   delivery = createCredentialDelivery({
     listHosts: () => listSubstrateHosts({ getDb }),

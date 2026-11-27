@@ -735,6 +735,26 @@ test_agent_edit_changes_only_its_lines() {
   rm -rf "$s"
 }
 
+test_agent_compact_is_accepted_at_its_turn() {
+  local s; s=$(setup)
+  agent "$s" finch ""; agent "$s" wren ""
+  submit "$s" agent-compact '{"name":"finch","guidance":"keep the\nfailing \u001b[201~ test"}' c1
+  submit "$s" agent-compact '{"name":"finch"}' c2
+  submit "$s" agent-compact '{"name":"wren"}' c3
+  submit "$s" agent-archive '{"name":"wren"}' a1
+  submit "$s" agent-compact '{"name":"wren"}' c4
+  submit "$s" agent-compact '{"name":"nobody"}' c5
+  serve_once "$s"
+  assert_eq done "$(field "$(fc "$s" status c1)" state)" "accepted"
+  assert_eq "keep the failing [201~ test" "$(cat "$s/fleet/identities/finch/.compact-queued")" "guidance on one line, no control characters"
+  assert_eq True "$(field "$(fc "$s" status c2)" result.already)" "a second one while one waits is the same one"
+  assert_eq done "$(field "$(fc "$s" status c3)" state)" "before the archive: accepted"
+  assert_eq being_archived "$(field "$(fc "$s" status c4)" code)" "after the archive's claim: refused"
+  assert_eq not_found "$(field "$(fc "$s" status c5)" code)" "no such agent"
+  assert_exists "$s/fleet/identities/.supervisor-wake" "the supervisor is woken for it"
+  rm -rf "$s"
+}
+
 test_agent_changes_refused_while_its_archive_is_claimed() {
   local s; s=$(setup)
   project "$s" garden "Garden"; agent "$s" finch ""
@@ -1049,6 +1069,7 @@ run_test test_pin_then_move_lands_as_the_last_click_says
 run_test test_new_agent_into_a_gone_project_lands_in_conversations
 run_test test_agent_edit_changes_only_its_lines
 run_test test_agent_changes_refused_while_its_archive_is_claimed
+run_test test_agent_compact_is_accepted_at_its_turn
 run_test test_odd_usernames_and_names_stay_strings
 run_test test_a_file_without_frontmatter_gets_one
 run_test test_move_to_a_hidden_project_answers_like_a_gone_one

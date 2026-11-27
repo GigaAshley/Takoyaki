@@ -1180,7 +1180,7 @@ describe("session-working-store (Phase 52 Plan 01): dormant axis (Axis D) + useS
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Phase 53 Plan 02 — Condensing axis (Axis E) + useSessionIsCondensing hook.
-// Source: ~/fleet/identities/<tmuxSession>/.compact-requested OR .compacting on
+// Source: ~/fleet/identities/<tmuxSession>/.compact-queued OR .compacting on
 // the target host (agent's context being condensed in place). Boolean strict
 // (`condensing: boolean` default false in WorkingRecord).
 //

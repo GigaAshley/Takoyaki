@@ -1,62 +1,35 @@
 /**
- * spawn-requests/scan-orchestrator.ts — Always-on spawn-request scanner.
+ * spawn-requests/scan-orchestrator.ts — the always-on visit to every machine
+ * that keeps the fleet name census current.
  *
- * ## Why this module exists (bounty fleet-status-orchestrator-coupling-with-spawn-request-scanning)
- * Pre-fix: `scanSpawnRequests` piggybacked on the fleet-status per-host poll
- * loop in `ssh-poll-orchestrator.ts`. The fleet-status orchestrator uses a
- * lazy-start pattern gated on WS subscribers (start on first, stop on last).
- * When no browser subscribed, spawn-request scanning also stopped — coord-
- * driven spawn-request drops sat unclaimed until a browser reconnected. The
- * whole point of coord-driven spawns is that they run out-of-band from browser
- * presence, so the coupling was a real functional bug.
- *
- * Post-fix: this module runs an always-on tick that enumerates every
- * `runsFleetSubstrate:true` host via the session-less CSKEK path
- * (`list-substrate-hosts.ts`), acquires an SSH channel per host, calls
- * `scanSpawnRequests` (unchanged — atomic `mv` claim is still the correctness
- * primitive), and enqueues claimed requests via `queue.enqueue`. Independent of
- * `/fleet-status/ws` subscribers.
+ * It used to collect new-agent and new-role requests from each machine's
+ * request folder too. Those now come over the machine's direct route
+ * (direct-route.ts), and a file left in the folder the old way is answered on
+ * the machine itself (the agent-supervisor writes its failure file pointing at
+ * the direct route), so nothing collects from the folder any more.
  *
  * ## Architecture
- * Mirrors `distributor/server-substrate-orchestrator.ts` (Phase 75 Plan 02):
  *   - Factory-shape module with fully injected deps (testable with
  *     `vi.useFakeTimers()` + `vi.fn()` — no real SSH, no real DB).
  *   - Session-less host enumeration via `listSubstrateHosts` — no browser
- *     subscriber required, no per-user DEK. Same host filter as substrate
- *     (`enableSsh=true AND runsFleetSubstrate=true`), which is the correct
- *     set for spawn-requests since spawn drops land at `~/fleet/spawn-requests/`
- *     on identity-hosting hosts and identity-hosting = runsFleetSubstrate.
+ *     subscriber required, no per-user DEK (`enableSsh=true AND
+ *     runsFleetSubstrate=true`, the machines that host agents).
  *   - Own per-host `hostClients` map (independent of fleet-status +
  *     substrate — never contaminate each others' lifecycles).
- *   - Per-host in-flight guard (quick-260820-tm0 wilma pattern) — if a slow
- *     host's `scanSpawnRequests` is still awaiting when the next tick fires,
- *     that tick skips this host and continues to the next. Prevents SSH
- *     session pileup that trashed target `MaxSessions` in the wilma incident.
+ *   - Per-host in-flight guard (quick-260820-tm0 wilma pattern) — a slow host
+ *     still being visited when the next tick fires is skipped that tick.
+ *     Prevents SSH session pileup.
+ *   - A machine is only connected to when its census refresh is due.
  *   - Never-throw contract on `start()`/`stop()` (defense-in-depth try/catch
  *     around the tick body).
  *
  * ## Cadence
- * Default 10s tick. Rationale: spawn-requests are rare (coordinator-driven,
- * measured in per-minute-at-most), and coordinator's own timeouts are 30-60s.
- * 10s is well inside coord's response window while keeping SSH cost negligible.
- *
- * ## What stays with ssh-poll-orchestrator.ts
- * The fleet-status orchestrator's `enqueueSpawnRequest` dep + the piggybacked
- * `scanSpawnRequests` calls are REMOVED in the same commit that adds this
- * module. Only this module runs the scan going forward. See starter.ts wiring
- * and the ssh-poll-orchestrator diff for the removals.
+ * Default 10s tick; the census decides how often each machine is actually read.
  */
 
 import { systemLogger } from "../utils/logger.js";
-import {
-  scanSpawnRequests,
-  parseSpawnRequestBatch,
-} from "../fleet-status/ssh-poll-orchestrator.js";
 import type { SshChannel } from "../fleet-status/ssh-poll-orchestrator.js";
-import type { HostRecord } from "../fleet-status/host-id-resolver.js";
 import { isLocalHostId } from "../claude-session/identity-artifact-reader.js";
-import { scanLocalFleetFolder } from "../utils/local-fleet-scan.js";
-import type { PendingBirth } from "./types.js";
 import {
   CENSUS_REMOTE_CMD,
   censusMachineKey,
@@ -97,7 +70,7 @@ export interface SpawnScanCensusDeps {
 
 /**
  * Injected dependencies. Every runtime side-effect (DB enumeration, SSH,
- * timers, clock, enqueue) is behind a dep so the module is fully unit-testable
+ * timers, clock) is behind a dep so the module is fully unit-testable
  * with `vi.useFakeTimers()` + `vi.fn()`.
  */
 export interface SpawnScanOrchestratorDeps {
@@ -114,9 +87,6 @@ export interface SpawnScanOrchestratorDeps {
    * status orchestrators and to give tests an assertion hook.
    */
   releaseChannel(host: SpawnScanHostRecord, channel: SshChannel): void;
-
-  /** Enqueue a claimed spawn-request for async birth-worker processing. */
-  enqueue(item: PendingBirth): void;
 
   /** Timer factory (injectable for tests). */
   setInterval(fn: () => Promise<void> | void, ms: number): ReturnType<typeof setInterval>;
@@ -140,7 +110,7 @@ export interface SpawnScanOrchestratorDeps {
   /** Scan interval in ms. Default 10000. */
   scanIntervalMs?: number;
 
-  /** Fleet name census refresh. Absent = scanner does spawn-requests only. */
+  /** Fleet name census refresh. Absent = nothing to do on a visit. */
   census?: SpawnScanCensusDeps;
 
   /**
@@ -219,92 +189,27 @@ export function createSpawnScanOrchestrator(
   let stopped = false;
 
   /**
-   * Scan a single host: acquire channel → scanSpawnRequests → enqueue results
-   * → release channel. Never throws (defense-in-depth try/catch). Fails open
-   * on any SSH-side error (matches `scanSpawnRequests`' own fail-open contract).
-   *
-   * LOCAL bypass: when the host's numeric id is in IDENTITIES_LOCAL_HOST_IDS
-   * (e.g. Skynet's own hostId inside its container), SSH-to-self hangs
-   * indefinitely (acquireChannel never returns → per-host in-flight guard is
-   * held forever → every subsequent tick logs `skipping host with in-flight
-   * scan`). The bypass reads the request folder directly from the container-
-   * side bind-mount via `scanLocalFleetFolder`, with byte-identical semantics
-   * to the SSH SPAWN_REQUESTS_SCAN_CMD path (36-char basename filter, atomic
-   * mv-claim). Downstream parseSpawnRequestBatch handles the same malformed-
-   * enqueue path the SSH branch uses.
+   * Visit a single host for the fleet name census: acquire channel → refresh
+   * the census if due → release channel. Never throws (defense-in-depth
+   * try/catch). The machine's own host reads its bind mount instead (SSH to
+   * self hangs; see the census's readLocal).
    */
   async function scanOneHost(host: SpawnScanHostRecord): Promise<void> {
-    // LOCAL bypass — skip SSH entirely for the container's own host.
     const numericId = parseInt(host.id, 10);
     if (isLocalHostId(numericId)) {
-      try {
-        // preserveClaimed=true — atomic-claim renames to <uuid>.claimed.json
-        // instead of tmp+unlink, matching the SSH SPAWN_REQUESTS_SCAN_CMD
-        // change. Preserves in-flight state across container restart and gives
-        // operators queue visibility via `ls`.
-        const rawItems = await scanLocalFleetFolder("spawn-requests", {
-          preserveClaimed: true,
-        });
-        if (rawItems.length > 0) {
-          // Feed into the same parser the SSH path uses: build the same
-          // tab-separated stdout shape (`<filename>\t<contents>` per line)
-          // so parseSpawnRequestBatch's downstream contract stays 1:1.
-          const stdout = rawItems.map((r) => `${r.filename}\t${r.contents}`).join("\n");
-          // LOCAL branch: no hostConnDetails — writeResponseFile bypasses SSH
-          // via isLocalHostId + writeMarkdownFileAtomic bind-mount path
-          // (quick-260923-9x1). Omitting the third arg lands hostConnDetails
-          // as undefined on every emitted PendingBirth, which is exactly what
-          // writeResponseFile's LOCAL short-circuit needs.
-          const items = parseSpawnRequestBatch(stdout, host.id);
-          for (const item of items) {
-            deps.enqueue(item);
-          }
-          systemLogger.info("Spawn-scan: local exec complete", {
-            operation: "spawn_scan_local_exec_complete",
-            fleetHostId: host.id,
-            claimed: items.length,
-          });
-        }
-      } catch (err) {
-        // scanLocalFleetFolder is already never-throw; belt-and-suspenders.
-        systemLogger.warn(
-          "Spawn-scan: local per-host scan threw unexpectedly (should be unreachable)",
-          {
-            operation: "spawn_scan_local_host_threw",
-            fleetHostId: host.id,
-            hostName: host.name,
-            error: err instanceof Error ? err.message : "unknown",
-          },
-        );
-      }
       await refreshCensus(host, null);
       return;
     }
+    if (!deps.census || !deps.census.census.isRefreshDue(machineKeyOf(host))) return;
 
     let channel: SshChannel | null = null;
     try {
       channel = await deps.acquireChannel(host);
       if (channel === null) return; // acquireChannel logs its own failure
-      // scanSpawnRequests is defined in ssh-poll-orchestrator.ts (exported for
-      // reuse here). Same helper the pre-fix piggyback used — atomic mv claim,
-      // UUID length guard, per-line parseRequestBody validation, malformed-
-      // reason enqueue path, fail-open null-exec handling. Unchanged.
-      //
-      // quick-260923-9x1: the host's `_connDetails` bag (populated at CSKEK
-      // decrypt time by listSubstrateHosts) is now consumed by scanSpawnRequests
-      // and rides onto every emitted PendingBirth as `hostConnDetails`, which
-      // writeResponseFile's REMOTE branch uses directly (no per-user
-      // resolveHostById call needed).
-      const batch = await scanSpawnRequests(host as HostRecord, channel);
-      for (const item of batch) {
-        deps.enqueue(item);
-      }
       await refreshCensus(host, channel);
     } catch (err) {
-      // scanSpawnRequests + acquireChannel are already non-throwing; this
-      // catch is belt-and-suspenders against a future contract drift.
       systemLogger.warn(
-        "Spawn-scan: per-host scan threw unexpectedly (should be unreachable)",
+        "Spawn-scan: per-host census visit threw unexpectedly (should be unreachable)",
         {
           operation: "spawn_scan_host_threw",
           fleetHostId: host.id,
@@ -402,9 +307,8 @@ export function createSpawnScanOrchestrator(
   }
 
   /**
-   * Iterate every substrate host and scan for spawn-requests. Called on the
-   * interval AND once eagerly at start() so a coord-drop landing during boot
-   * gets picked up on the same tick.
+   * Visit every substrate host whose census is due. Called on the interval
+   * AND once eagerly at start().
    */
   async function scanAllHosts(): Promise<void> {
     if (stopped) return;
@@ -496,8 +400,7 @@ export function createSpawnScanOrchestrator(
     async start(): Promise<void> {
       stopped = false;
 
-      // Fire an immediate first scan so anything already in
-      // ~/fleet/spawn-requests/ at boot gets picked up without waiting for
+      // Fire an immediate first pass so the census fills without waiting for
       // the first interval tick. Awaited so start() completion means the
       // first pass finished.
       try {

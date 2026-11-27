@@ -47,7 +47,8 @@ export type FrontDoorKind =
   | "agent-pin"
   | "agent-edit"
   | "role-edit"
-  | "file-save";
+  | "file-save"
+  | "agent-compact";
 
 /** An archive is done once claimed; while the machine is still finishing it, what's left and
  *  (for anything failing 10 minutes or more) why. */

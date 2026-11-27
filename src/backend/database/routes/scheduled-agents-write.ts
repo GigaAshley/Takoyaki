@@ -9,8 +9,8 @@
  *   PATCH  /:slug                     → UPDATE (full-spec overwrite)
  *   PATCH  /:slug/toggle-enabled      → flip only the `enabled` field
  *   DELETE /:slug                     → hard delete + .fired sentinel cleanup
- *   POST   /:slug/run-now             → fire once now (drops a spawn-request;
- *                                        schedule state untouched)
+ *   POST   /:slug/run-now             → fire once now (straight into the birth
+ *                                        queue; schedule state untouched)
  *
  * D-01: HTTP REST endpoint style (mirrors roles-create.ts).
  * D-02: `host` param on writes — each request dispatches to exactly one host.
@@ -74,11 +74,11 @@ import {
   IDENTITY_SLUG_RE,
   isLocalHostId,
   getLocalScheduledAgentsRoot,
-  getLocalIdentitiesRoot,
   getLocalProjectsRoot,
 } from "../../claude-session/identity-artifact-reader.js";
 import { isProjectSlug } from "../../claude-session/scheduled-agent-project.js";
 import { listMachinePeople } from "../../distributor/machine-people.js";
+import { queueBirthFromServer } from "../../spawn-requests/direct-route.js";
 
 const router = express.Router();
 const authManager = AuthManager.getInstance();
@@ -482,11 +482,10 @@ export type RunNowBuildResult =
   | { ok: false; error: string };
 
 /**
- * Build the `~/fleet/spawn-requests/<uuid>.json` body for a manual fire from
- * the on-disk spec. Mirrors `_drop_spawn_request` in wakeup-scheduler.py field
- * for field (roles, wrapped prompt + archive section, `⏰ ` task, requested_at,
- * users, project) so the spawn-requests pipeline can't tell a manual fire from
- * a clock fire.
+ * Build the new-agent request for a manual fire from the on-disk spec. Mirrors
+ * `_spawn_body` in wakeup-scheduler.py field for field (roles, wrapped prompt +
+ * archive section, `⏰ ` task, requested_at, users, project) so the birth
+ * pipeline can't tell a manual fire from a clock fire.
  *
  * `projectExists` says whether the spec's project folder is live on the host.
  * A missing project is left off the request, so the newborn lands in
@@ -570,12 +569,6 @@ function logRunNowProjectMissing(hostId: number, slug: string, project: string):
   });
 }
 
-/** Absolute local path for the spawn-requests drop folder. LOCAL branch.
- *  Same fleet root the spawn-requests scan-orchestrator reads
- *  (local-fleet-scan.ts getLocalFleetRoot). */
-function localSpawnRequestsDir(): string {
-  return path.join(path.dirname(getLocalIdentitiesRoot()), "spawn-requests");
-}
 
 /**
  * A new task's "Shared with" choice: absent/null = everyone (no list, as
@@ -1364,8 +1357,8 @@ router.delete(
 // POST /scheduled-agents/:slug/run-now — fire once, outside the schedule
 // ---------------------------------------------------------------------------
 //
-// Reads the spec and drops a spawn-request file, exactly as the scheduler does
-// on a clock fire. Deliberately does NOT touch `.state/<slug>.last`: a manual
+// Reads the spec and starts the agent with the same request the scheduler sends
+// on a clock fire, straight into the server's birth queue. Deliberately does NOT touch `.state/<slug>.last`: a manual
 // run doesn't shift the regular schedule.
 
 router.post(
@@ -1436,20 +1429,15 @@ router.post(
             responded = true;
             return;
           }
-          const dir = localSpawnRequestsDir();
-          const targetPath = path.join(dir, `${requestId}.json`);
-          try {
-            await fs.mkdir(dir, { recursive: true });
-            // Atomic tmp+rename: the scanner only claims 36-char `<uuid>.json`
-            // basenames, so the `.json.tmp` intermediate is never picked up.
-            await writeMarkdownFileAtomic(null, targetPath, JSON.stringify(built.body));
-          } catch (err) {
-            sshLogger.error(
-              "scheduled-agents-run-now: local write failed",
-              err instanceof Error ? err : new Error(String(err)),
-              { operation: "scheduled_agents_run_now_local_write", hostId, slug, targetPath },
-            );
-            res.status(502).json({ error: "SFTP write failed" });
+          const queued = await queueBirthFromServer(hostId, requestId, built.body);
+          if (queued.ok === false) {
+            sshLogger.warn("scheduled-agents-run-now: couldn't start it", {
+              operation: "scheduled_agents_run_now_queue_failed",
+              hostId,
+              slug,
+              error: queued.error,
+            });
+            res.status(502).json({ error: queued.error });
             responded = true;
             return;
           }
@@ -1475,13 +1463,13 @@ router.post(
           return;
         }
 
-        // Read the spec and ensure the drop folder exists in one exec.
+        // Read the spec.
         // Slug is IDENTITY_SLUG_RE-validated → shell-safe interpolation.
         let stdout: string;
         try {
           stdout = await execWithTimeout(
             conn,
-            `mkdir -p "$HOME/fleet/spawn-requests" && (cat "$HOME/fleet/scheduled-agents/${slug}/scheduled-agent.json" 2>/dev/null || echo "__SCHEDULED_AGENT_MISSING__")`,
+            `cat "$HOME/fleet/scheduled-agents/${slug}/scheduled-agent.json" 2>/dev/null || echo "__SCHEDULED_AGENT_MISSING__"`,
           );
         } catch (err) {
           sshLogger.warn("scheduled-agents-run-now: read exec failed", {
@@ -1535,16 +1523,15 @@ router.post(
           responded = true;
           return;
         }
-        const targetPath = `$HOME/fleet/spawn-requests/${requestId}.json`;
-        try {
-          await writeMarkdownFileAtomic(conn, targetPath, JSON.stringify(built.body));
-        } catch (err) {
-          sshLogger.error(
-            "scheduled-agents-run-now: SFTP write failed",
-            err instanceof Error ? err : new Error(String(err)),
-            { operation: "scheduled_agents_run_now_sftp_write", hostId, slug, targetPath },
-          );
-          res.status(502).json({ error: "SFTP write failed" });
+        const queued = await queueBirthFromServer(hostId, requestId, built.body);
+        if (queued.ok === false) {
+          sshLogger.warn("scheduled-agents-run-now: couldn't start it", {
+            operation: "scheduled_agents_run_now_queue_failed",
+            hostId,
+            slug,
+            error: queued.error,
+          });
+          res.status(502).json({ error: queued.error });
           responded = true;
           return;
         }

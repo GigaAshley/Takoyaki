@@ -2079,8 +2079,8 @@ app.use("/identities", identityPinRoutes);
 // /identities router so the :key/archive sub-route isn't intercepted by
 // identitiesRoutes's /:identityKey handlers.
 app.use("/identities", identityArchiveRoutes);
-// POST /identities/:key/condense drops `.compact-requested` (Condense
-// conversation); the agent-supervisor carries it out. Same mount discipline
+// POST /identities/:key/condense — Compact conversation, a request to the
+// machine's front door; the agent-supervisor carries it out. Same mount discipline
 // as identity-archive — before the generic /identities router.
 app.use("/identities", identityCondenseRoutes);
 // POST /identities/:key/unarchive — a request to the machine's front door.

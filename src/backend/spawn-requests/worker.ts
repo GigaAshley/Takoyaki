@@ -25,6 +25,7 @@ import {
   extractCosmeticsFromFrontmatter,
   extractRolesFromMarkdown,
   IDENTITY_KEY_RE,
+  getLocalIdentitiesRoot,
   isLocalHostId,
   listIdentityKeysOnHost,
   listProjects,
@@ -64,9 +65,10 @@ import { getDb } from "../database/db/index.js";
 import { hosts } from "../database/db/schema.js";
 import { eq } from "drizzle-orm";
 import { promises as fsp } from "node:fs";
+import path from "node:path";
 import { exec as execCb } from "node:child_process";
 import { promisify } from "node:util";
-import type { PendingBirth, SpawnRequestBody, SuccessResponse, FailureResponse, FailureReason } from "./types.js";
+import type { PendingBirth, SuccessResponse, FailureResponse, FailureReason } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Module-level constants
@@ -219,6 +221,9 @@ export interface WorkerDeps {
   /** Project lister for a project's audience (unlimited request filed in a
    *  project); absent = the real listProjects. */
   listProjects?: typeof listProjects;
+  /** The agent (live or archived) an earlier send of this direct-route request
+   *  already made, or null; absent = the real check on the machine. */
+  findBornByRequest?: (item: PendingBirth) => Promise<string | null>;
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +287,12 @@ export async function writeResponseFile(
   kind: "success" | "failure",
   body: string,
 ): Promise<void> {
+  // A request over the direct route: the answer goes back on the caller's own
+  // connection, not into a file on the machine.
+  if (item.respond) {
+    item.respond(kind, body);
+    return;
+  }
   try {
     // LOCAL branch — hostId is in IDENTITIES_LOCAL_HOST_IDS. Skip
     // resolveHostById + connectOneShot entirely (resolveHostById fails on
@@ -349,6 +360,49 @@ export async function writeResponseFile(
       error: err instanceof Error ? err.message : String(err),
     });
   }
+}
+
+const BORN_CHECK_TIMEOUT_MS = 15_000;
+
+/** The agent, live or archived, whose folder records this request as the one that made it. */
+export async function findBornByRequest(item: PendingBirth): Promise<string | null> {
+  if (!/^[A-Za-z0-9._-]{1,80}$/.test(item.uuid)) return null;
+  if (isLocalHostId(item.hostIdNum)) {
+    const live = getLocalIdentitiesRoot();
+    for (const root of [live, path.join(path.dirname(live), "identities-archive")]) {
+      let names: string[] = [];
+      try {
+        names = await fsp.readdir(root);
+      } catch {
+        continue;
+      }
+      for (const n of names) {
+        if (!IDENTITY_KEY_RE.test(n)) continue;
+        try {
+          if ((await fsp.readFile(path.join(root, n, ".birth-request"), "utf8")).trim() === item.uuid) return n;
+        } catch {
+          /* none */
+        }
+      }
+    }
+    return null;
+  }
+  const hostDetails = item.hostConnDetails;
+  if (!hostDetails) throw new Error("no connection details for the machine");
+  const out = await getHostSemaphore(item.hostIdNum).run(async () => {
+    const conn = await connectOneShot(hostDetails as Parameters<typeof connectOneShot>[0], SSH_CONNECT_TIMEOUT_MS);
+    try {
+      return await execCommand(
+        conn,
+        `grep -lxF -- '${item.uuid}' "$HOME"/fleet/identities/*/.birth-request "$HOME"/fleet/identities-archive/*/.birth-request 2>/dev/null | head -n1; true`,
+        { timeoutMs: BORN_CHECK_TIMEOUT_MS },
+      );
+    } finally {
+      conn.end();
+    }
+  });
+  const m = /\/([a-z0-9_-]{1,64})\/\.birth-request\s*$/.exec(out.trim());
+  return m ? m[1] : null;
 }
 
 export async function writeFailureFile(
@@ -502,6 +556,33 @@ const doBirth = async (item: PendingBirth, deps: WorkerDeps): Promise<void> => {
       message: item.malformedReason,
     });
     return;
+  }
+
+  // 2b. The same direct-route request sent again (its first answer was lost in a
+  //     server restart): the agent it already made is the answer, never a second one.
+  if (item.direct) {
+    let already: string | null = null;
+    try {
+      already = await (deps.findBornByRequest ?? findBornByRequest)(item);
+    } catch (err) {
+      systemLogger.warn("spawn-request worker: couldn't check for an agent this request already made", {
+        operation: "spawn_request_born_check_failed",
+        uuid: item.uuid,
+        hostId: item.hostIdNum,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      await writeFailureFile(item, deps, { reason: "peer_host_unreachable" });
+      return;
+    }
+    if (already !== null) {
+      systemLogger.info("spawn-request worker: this request already made its agent", {
+        operation: "spawn_request_already_born",
+        uuid: item.uuid,
+        name: already,
+      });
+      await writeResponseFile(item, deps, "success", JSON.stringify({ name: already, birthed_at: deps.now().toISOString(), already: true }));
+      return;
+    }
   }
 
   // 3. Pre-flight checks — short-circuit before touching birthIdentity
@@ -946,6 +1027,7 @@ const doBirth = async (item: PendingBirth, deps: WorkerDeps): Promise<void> => {
       // "name it myself" path; everything else is pool-picked (Pattern 6).
       poolPicked: typedNameSlug === null,
       project: item.project,
+      ...(item.direct ? { birthRequestId: item.uuid } : {}),
     };
 
     // Reset per-attempt capture state so the previous attempt's residue doesn't

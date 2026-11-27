@@ -211,33 +211,32 @@ everything else.
   export it. Slug must be kebab-case. Title is optional; defaults to
   a title-cased slug if omitted. Prints the app's link when done.
 
-- **`move-app.sh <slug> sidebar --users a,b | --everyone` / `move-app.sh <slug> project <project>`**
-  — moves an app to the sidebar or into a project: stops it, moves the
-  folder (data, icon, marker and all), reinstalls its units on the SAME
-  port, checks it answers. Rolls back on failure. The box runs it for the
-  user's **Move to**; see § When an app is moved. A move to the sidebar must
-  say who may see it there. (`promote-app.sh <slug> …` is its old name for
-  `move-app.sh <slug> sidebar …`.)
+- **Moving an app** — `fleet-change submit app-move '{"slug":"<slug>","to":"project","project":"<project>"}'`
+  or `… '{"slug":"<slug>","to":"sidebar","users":["a","b"]}'` (`"users":null`
+  for everyone). The machine's front door moves it in its turn with every
+  other change and prints the outcome: stops it, moves the folder (data,
+  icon, marker and all), reinstalls its units on the SAME port, checks it
+  answers, rolls back on failure. The same as the user's **Move to**; see
+  § When an app is moved. A move to the sidebar must say who may see it
+  there. (`move-app.sh` and its old name `promote-app.sh` hand themselves to
+  the front door the same way.)
 
 - **`app-units.sh`** — the one place that knows how an app is run under
   systemd (see § How an app is run). The other helpers and the box's
   supervisor call it; you rarely need it directly. `app-units.sh find <slug>`
   prints an app's folder; `app-units.sh port <slug>` its public port.
 
-- **`archive-app.sh <slug>`** — sidebar apps only. Stashes the app's units
+- **Archiving an app** — `fleet-change submit app-archive '{"slug":"<slug>"}'`.
+  Sidebar apps only. In its turn the front door stashes the app's units
   inside its folder, stops and removes them, moves `~/fleet/apps/<slug>/` to
-  `~/fleet/apps-archive/<slug>/`. This is the default remove path. Users who
-  ask to delete something sometimes change their minds. Conversation and
-  project apps are never archived on their own — they go with the
-  conversation or the project.
+  `~/fleet/apps-archive/<slug>/`, and prints the outcome. This is the
+  default remove path. Users who ask to delete something sometimes change
+  their minds. Conversation and project apps are never archived on their
+  own — they go with the conversation or the project.
 
-- **Un-archive (agent gesture — no standalone script)** — inverse of
-  archive. Drop an empty `.unarchive-requested` sentinel inside
-  `~/fleet/apps-archive/<slug>/`. The box's `agent-supervisor` picks it
-  up on its next reconcile tick (~15s), moves the folder back from
-  `apps-archive/` to `apps/`, re-installs the systemd units from the
-  stashed copies inside the folder, and starts the app. Same disk
-  gesture pattern as archive from an agent's perspective.
+- **Un-archiving an app** — `fleet-change submit app-unarchive '{"slug":"<slug>"}'`:
+  the folder goes back from `apps-archive/` to `apps/`, its units are
+  reinstalled from the stashed copies on its old port, and it starts.
 
 - **`make-icon.sh`** — makes an icon in the house style (see step 8 of
   § Making a new app). `colors <slug>` lists the palette and which colors
@@ -638,8 +637,8 @@ Rules:
 ## When an app is moved
 
 Anyone who can see an app can move it to the sidebar or into a project from
-its menu (**Move to**), or by dragging it in the sidebar. The box does the
-move itself (`move-app.sh`, within about 15 seconds); no agent is asked. The
+its menu (**Move to**), or by dragging it in the sidebar. The machine's front
+door does the move itself; no agent is asked. The
 app keeps its name, address, data, icon and sleep setting, so chips and open
 panes keep working. A move to the sidebar keeps who could see the app: an app
 from a limited project or conversation gets those people as its "Shared with"
@@ -653,11 +652,11 @@ If it was one of your conversation apps, you're told afterwards:
     </task-notification>
 
 It's no longer yours — it leaves your Apps tab. If the user asks *you* to move
-an app, run `move-app.sh` yourself. A move to the sidebar must say who may see
-it there: `--users` naming the people who could see it where it was, or
-`--everyone` when everyone on the machine already could (always so on a
-machine one person uses). If you can't tell, ask the user to use **Move to**,
-which works that out.
+an app, use `fleet-change submit app-move` (§ Lifecycle — the helpers). A move to the
+sidebar must say who may see it there: `"users"` naming the people who could
+see it where it was, or `null` when everyone on the machine already could
+(always so on a machine one person uses). If you can't tell, ask the user to
+use **Move to**, which works that out.
 
 ## How the pane mounts your app — one rule to internalize
 
@@ -770,18 +769,16 @@ their minds. The archive path costs nothing and preserves the option.
 
 Conversation apps are not archived on their own — they are archived with
 the conversation (and come back if it is un-archived). Project apps are
-archived with their project. `archive-app.sh` refuses both; to archive one
+archived with their project. The front door refuses both; to archive one
 sooner, move it to the sidebar first.
 
-    bash ~/.claude/skills/app-development/archive-app.sh <slug>
+    fleet-change submit app-archive '{"slug":"<slug>"}'
 
 If the user later says "wait, I want that back":
 
-    touch ~/fleet/apps-archive/<slug>/.unarchive-requested
+    fleet-change submit app-unarchive '{"slug":"<slug>"}'
 
-The `agent-supervisor` picks the sentinel up on its next reconcile
-tick (~15s) and reverses the archive (folder mv back, unit reinstall
-from stash, `daemon-reload`, enable+start).
+Each prints its outcome once the machine has done it (or why it refused).
 
 Only if the user explicitly says "delete it, I don't want it recoverable"
 do you actually remove the folder from `apps-archive/`. Even then, mention
@@ -851,7 +848,7 @@ what you're doing — surprises here are worse than a moment of confirmation.
   app sleeps.
 - About to archive a conversation or project app on its own, or move an app
   between folders by hand → **stop.** It goes with its conversation or
-  project; moving it is `move-app.sh`, when the user asks.
+  project; moving it is `fleet-change submit app-move`, when the user asks.
 - About to `mv app.json.pending app.json` for a new sidebar app before it
   actually works end-to-end → **stop.** Publishing early flashes a
   broken app onto their sidebar. Verify step 7 first.
@@ -889,9 +886,8 @@ what you're doing — surprises here are worse than a moment of confirmation.
   then `mv app.json.pending app.json` (§ Making a new app step 9).
 - **How do I see archived apps?** `ls ~/fleet/apps-archive/`.
 - **How do I recover an archived app?**
-  `touch ~/fleet/apps-archive/<slug>/.unarchive-requested` — the box's
-  `agent-supervisor` picks it up on the next reconcile tick and reverses
-  the archive.
+  `fleet-change submit app-unarchive '{"slug":"<slug>"}'` — the machine
+  reverses the archive and prints the outcome.
 - **What if create-app fails partway through?** The helper is not perfectly
   transactional; if it crashes mid-way, check the app folder and
   `~/.config/systemd/user/app-<slug>*`. Remove any partial state

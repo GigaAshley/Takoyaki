@@ -539,7 +539,7 @@ export const GSD_MONITOR_STRIP_JQ =
  * runtime state: paths relative to each ~/fleet/identities/<name>/ folder,
  * files rm -f'd and folders rmdir'd only when empty. (`.recycled-at` is the
  * retired reset marker; a leftover `.recycle-requested` is NOT listed — the
- * supervisor takes it as a compaction request.)
+ * supervisor answers it: never carried out, the agent told to use the command.)
  *
  * CONTEXT_WATCH_RETIRED — the 90% "reset yourself" watcher, retired with
  * reset (Condense). Removed only once the installed ambient-monitor no

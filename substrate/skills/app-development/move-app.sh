@@ -7,9 +7,10 @@
 #   move-app.sh <slug> project <project>           becomes a project app in
 #                                                  ~/fleet/projects/<project>/apps/<slug>/
 #
-# Nothing moves INTO a conversation. Normally run by the machine's front door
-# (fleet-change app-move) when someone picks Move to in the app, in turn with
-# the machine's other changes; agents can run it directly too.
+# Nothing moves INTO a conversation. Run by the machine's front door
+# (fleet-change app-move), in turn with the machine's other changes. Run any
+# other way (an agent typing it), it hands the move to the front door and
+# prints the outcome: the same as `fleet-change submit app-move …`.
 #
 # A move to the sidebar must say who may see the app there: --users with the
 # people who could see it where it was (so it never shows to anyone new), or
@@ -62,6 +63,25 @@ case "$DEST_KIND" in
         ;;
     *) usage ;;
 esac
+
+# Not run by the front door: hand the move to it, so it takes its turn with the
+# machine's other changes, and print its outcome (one JSON line).
+if [ -z "${FLEET_CHANGE_RUNNING:-}" ]; then
+    FC="$(command -v fleet-change 2>/dev/null || true)"
+    [ -n "$FC" ] || FC="$HOME/.local/bin/fleet-change"
+    [ -f "$FC" ] || die "the machine's front door (fleet-change) isn't installed yet — try again in a few minutes"
+    REQ=$(python3 -c 'import json, sys
+slug, kind, users, has_users, project = sys.argv[1:6]
+out = {"slug": slug, "to": kind}
+if kind == "sidebar":
+    out["users"] = users.split(",") if has_users == "1" else None
+else:
+    out["project"] = project
+print(json.dumps(out, separators=(",", ":")))' "$SLUG" "$DEST_KIND" "$USERS" "$HAS_USERS" "$PROJECT")
+    OUT=$(python3 "$FC" submit app-move "$REQ" --wait 120 ${FLEET_IDENTITY:+--by "agent:$FLEET_IDENTITY"})
+    printf '%s\n' "$OUT"
+    case "$OUT" in *'"state":"done"'*) exit 0 ;; *) exit 1 ;; esac
+fi
 
 # Hold the create lock for the whole move — from finding the app until its
 # units are back (and through any rollback) — so a concurrent create-app.sh

@@ -843,6 +843,23 @@ describe("local branch (isLocalHostId=true)", () => {
     expect(mockExecCommand).not.toHaveBeenCalled();
   });
 
+  it("a direct-route birth records its request in the newborn's folder; others record nothing", async () => {
+    mockIsLocalHostId.mockReturnValue(true);
+    const execLocalMock = vi.fn().mockResolvedValue("birth_committed");
+    const deps = makeDeps({ execLocal: execLocalMock });
+    const p1 = birthIdentity({ ...makeOpts(), birthRequestId: "req-1.a" }, collectEvents().emit, deps);
+    await vi.runAllTimersAsync();
+    await p1;
+    expect(execLocalMock.mock.calls[0][0] as string).toContain(`printf '%s\\n' 'req-1.a' > "$STAGING/.birth-request"`);
+    const p2 = birthIdentity({ ...makeOpts(), birthRequestId: "bad id;rm" }, collectEvents().emit, deps);
+    await vi.runAllTimersAsync();
+    await p2;
+    const p3 = birthIdentity(makeOpts(), collectEvents().emit, deps);
+    await vi.runAllTimersAsync();
+    await p3;
+    for (const call of execLocalMock.mock.calls.slice(1)) expect(call[0] as string).not.toContain(".birth-request");
+  });
+
   it("peer script uses absolute fleet-root path (bind-mount parent), NOT $HOME", async () => {
     const { emit } = collectEvents();
     mockIsLocalHostId.mockReturnValue(true);

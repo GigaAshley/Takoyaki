@@ -216,7 +216,7 @@ export interface SessionState {
   // type. MUST stay in lockstep with the backend schema.
   dormant?: boolean | null;
   // The backend-authoritative condensing signal: `true` while the agent's
-  // context is being condensed in place — `.compact-requested` OR
+  // context is being condensed in place — `.compact-queued` OR
   // `.compacting` present under ~/fleet/identities/<tmuxSession>/ on the
   // target host. `false` = neither present, `null` = normalised-null in
   // transit, `undefined` = the emitting source does not stamp this axis (or

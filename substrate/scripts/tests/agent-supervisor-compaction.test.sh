@@ -20,7 +20,8 @@
 #   C-10 — a second request while one is in flight is dropped as a duplicate
 #   C-11 — in flight past the timeout with nothing landed → marker removed, no event
 #   C-12 — inbox file names match the inbox-watcher dropper contract
-#   C-13 — an old-style reset request (.recycle-requested) is taken as a compaction request
+#   C-13 — an old-style note (.compact-requested, .recycle-requested) is never carried out: it's
+#          removed and the agent is told to use the command
 #   C-14 — a request the agent never comes to rest for expires
 #   C-15 — control characters are stripped from the guidance
 #   C-16 — the dormancy check holds off while a compaction is asked for / under way / queued
@@ -64,6 +65,10 @@ D=""
 setup() {
   SCRATCH=$(mktemp -d)
   IDENTITIES_DIR="$SCRATCH"
+  # Everything the old-note bounce looks at, inside the scratch folder too.
+  ROLES_DIR="$SCRATCH/.x/roles"; ROLES_ARCHIVE_DIR="$SCRATCH/.x/roles-archive"; APPS_DIR="$SCRATCH/.x/apps"
+  APPS_ARCHIVE_DIR="$SCRATCH/.x/apps-archive"; IDENTITIES_ARCHIVE_DIR="$SCRATCH/.x/identities-archive"
+  FLEET_PROJECTS_DIR="$SCRATCH/.x/projects"; SPAWN_REQUESTS_DIR="$SCRATCH/.x/spawn-requests"
   D="$SCRATCH/$N"
   mkdir -p "$D"
   STUB_RUNNING=1; STUB_AT_REST=1; STUB_SESSION_FILE=""
@@ -80,40 +85,40 @@ teardown
 
 CURRENT_TEST="C-02 dormant request delivered"
 setup
-: > "$D/.dormant"; : > "$D/.compact-requested"
+: > "$D/.dormant"; : > "$D/.compact-queued"
 STUB_RUNNING=0
 handle_compaction "$N" ""
-if [ "$(inbox_count)" = 1 ] && [ "$(inbox_only)" = "/compact" ] && [ -s "$D/.compacting" ] && [ ! -e "$D/.compact-requested" ]; then pass
-else fail "inbox=$(inbox_count) body='$(inbox_only)' marker=$(cat "$D/.compacting" 2>/dev/null) req=$([ -e "$D/.compact-requested" ] && echo yes)"; fi
+if [ "$(inbox_count)" = 1 ] && [ "$(inbox_only)" = "/compact" ] && [ -s "$D/.compacting" ] && [ ! -e "$D/.compact-queued" ]; then pass
+else fail "inbox=$(inbox_count) body='$(inbox_only)' marker=$(cat "$D/.compacting" 2>/dev/null) req=$([ -e "$D/.compact-queued" ] && echo yes)"; fi
 teardown
 
 CURRENT_TEST="C-03 guidance flattened"
 setup
-printf 'keep the\nfailing   test details\n' > "$D/.compact-requested"
+printf 'keep the\nfailing   test details\n' > "$D/.compact-queued"
 handle_compaction "$N" "sess"
 if [ "$(inbox_only)" = "/compact keep the failing test details" ]; then pass; else fail "body='$(inbox_only)'"; fi
 teardown
 
 CURRENT_TEST="C-04 awake mid-turn waits"
 setup
-: > "$D/.compact-requested"; STUB_AT_REST=0
+: > "$D/.compact-queued"; STUB_AT_REST=0
 handle_compaction "$N" "sess"
-if [ "$(inbox_count)" = 0 ] && [ -e "$D/.compact-requested" ] && [ ! -e "$D/.compacting" ]; then pass; else fail "delivered while busy"; fi
+if [ "$(inbox_count)" = 0 ] && [ -e "$D/.compact-queued" ] && [ ! -e "$D/.compacting" ]; then pass; else fail "delivered while busy"; fi
 teardown
 
 CURRENT_TEST="C-05 awake at rest delivered"
 setup
-: > "$D/.compact-requested"
+: > "$D/.compact-queued"
 handle_compaction "$N" "sess"
 if [ "$(inbox_only)" = "/compact" ] && [ -e "$D/.compacting" ]; then pass; else fail "body='$(inbox_only)'"; fi
 teardown
 
 CURRENT_TEST="C-06 awake, harness down waits"
 setup
-: > "$D/.compact-requested"; STUB_RUNNING=0
+: > "$D/.compact-queued"; STUB_RUNNING=0
 handle_compaction "$N" "sess"
 handle_compaction "$N" ""
-if [ "$(inbox_count)" = 0 ] && [ -e "$D/.compact-requested" ]; then pass; else fail "delivered without a harness"; fi
+if [ "$(inbox_count)" = 0 ] && [ -e "$D/.compact-queued" ]; then pass; else fail "delivered without a harness"; fi
 teardown
 
 CURRENT_TEST="C-07 in flight, not landed"
@@ -153,9 +158,9 @@ teardown
 CURRENT_TEST="C-10 duplicate request dropped"
 setup
 printf '2026-10-25T15:00:00.000Z\n' > "$D/.compacting"
-: > "$D/.compact-requested"
+: > "$D/.compact-queued"
 handle_compaction "$N" "sess"
-if [ ! -e "$D/.compact-requested" ] && [ -e "$D/.compacting" ] && [ "$(inbox_count)" = 0 ]; then pass; else fail "duplicate not dropped"; fi
+if [ ! -e "$D/.compact-queued" ] && [ -e "$D/.compacting" ] && [ "$(inbox_count)" = 0 ]; then pass; else fail "duplicate not dropped"; fi
 teardown
 
 CURRENT_TEST="C-11 timeout"
@@ -176,24 +181,33 @@ done
 if [ "$bad" = 0 ] && [ "$(inbox_count)" = 2 ] && inbox_has_files "$N"; then pass; else fail "bad inbox names: $(ls "$D/inbox")"; fi
 teardown
 
-CURRENT_TEST="C-13 old-style reset request becomes a compaction request"
+CURRENT_TEST="C-13 an old-style note (.compact-queued, .recycle-requested) is never carried out"
 setup
-: > "$D/.recycle-requested"
+echo x > "$D/$N.md"
+echo 'keep it' > "$D/.compact-requested"
+bounce_old_notes
 handle_compaction "$N" "sess"
-if [ ! -e "$D/.recycle-requested" ] && [ "$(inbox_only)" = "/compact" ] && [ -e "$D/.compacting" ]; then pass
+if [ ! -e "$D/.compact-requested" ] && [ ! -e "$D/.compacting" ] && [ "$(inbox_count)" = 1 ] \
+   && inbox_only | grep -q "Note not carried out" && inbox_only | grep -q 'agent-compact .*"guidance":"keep it"'; then pass
+else fail "note=$([ -e "$D/.compact-requested" ] && echo kept) body='$(inbox_only)'"; fi
+rm -f "$D"/inbox/*.msg
+: > "$D/.recycle-requested"
+bounce_old_notes
+handle_compaction "$N" "sess"
+if [ ! -e "$D/.recycle-requested" ] && [ ! -e "$D/.compacting" ] && [ "$(inbox_count)" = 1 ]; then pass
 else fail "recycle=$([ -e "$D/.recycle-requested" ] && echo kept) body='$(inbox_only)'"; fi
 teardown
 
 CURRENT_TEST="C-14 stale request expires"
 setup
-: > "$D/.compact-requested"; touch -d '2 hours ago' "$D/.compact-requested"; STUB_AT_REST=0
+: > "$D/.compact-queued"; touch -d '2 hours ago' "$D/.compact-queued"; STUB_AT_REST=0
 handle_compaction "$N" "sess"
-if [ ! -e "$D/.compact-requested" ] && [ "$(inbox_count)" = 0 ]; then pass; else fail "stale request kept or delivered"; fi
+if [ ! -e "$D/.compact-queued" ] && [ "$(inbox_count)" = 0 ]; then pass; else fail "stale request kept or delivered"; fi
 teardown
 
 CURRENT_TEST="C-15 control characters stripped from guidance"
 setup
-printf 'keep\033[201~ this\001' > "$D/.compact-requested"
+printf 'keep\033[201~ this\001' > "$D/.compact-queued"
 handle_compaction "$N" "sess"
 if [ "$(inbox_only)" = "/compact keep[201~ this" ]; then pass; else fail "body='$(inbox_only | od -c | head -3)'"; fi
 teardown
@@ -203,7 +217,7 @@ setup
 schedule_peek() { return 1; }
 ok=1
 pending_check "$N" || ok=0
-: > "$D/.compact-requested"; pending_check "$N" && ok=0; rm -f "$D/.compact-requested"
+: > "$D/.compact-queued"; pending_check "$N" && ok=0; rm -f "$D/.compact-queued"
 : > "$D/.compacting"; pending_check "$N" && ok=0; rm -f "$D/.compacting"
 inbox_drop "$N" "x"; pending_check "$N" && ok=0
 if [ "$ok" = 1 ]; then pass; else fail "pending_check let the agent sleep"; fi

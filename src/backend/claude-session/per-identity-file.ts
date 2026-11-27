@@ -25,10 +25,8 @@
  *   divergence class of bug (loose write vs strict read).
  *
  * relPath whitelist:
- *   ALLOWED_REL_PATHS = { "relay.json", ".pinned",
- *   ".compact-requested" } — bounded to the file basenames callers touch
- *   (D-01 filename lock; `.compact-requested` is the condense request, its
- *   contents the guidance).
+ *   ALLOWED_REL_PATHS = { "relay.json", ".pinned" } — bounded to the file
+ *   basenames callers touch (D-01 filename lock).
  *   Any other value throws before I/O — belt-and-suspenders vs identityKey
  *   traversal (the reader regex already excludes `.` and `/` characters).
  *
@@ -78,14 +76,13 @@ export { IDENTITY_KEY_RE };
 /**
  * The bounded set of basenames the per-identity file primitive is allowed to
  * touch. Any other value throws before I/O. Kept intentionally tiny —
- * "relay.json" (identity-birth Step 8), ".pinned" (pin action) and
- * ".compact-requested" (Compact conversation). Archiving is a request to the
- * machine's front door, not a file the server drops.
+ * "relay.json" (identity-birth Step 8) and ".pinned" (pin action). Archiving
+ * and compacting are requests to the machine's front door, not files the
+ * server drops.
  */
 export const ALLOWED_REL_PATHS: ReadonlySet<string> = new Set([
   "relay.json",
   ".pinned",
-  ".compact-requested",
 ]);
 
 // ---------------------------------------------------------------------------

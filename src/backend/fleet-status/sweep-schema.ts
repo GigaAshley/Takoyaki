@@ -117,7 +117,7 @@ export interface SweepRawCosmetics {
  *
  * Field ↔ RESEARCH.md exec-site parity (see SWEEP_FIELD_PARITY):
  *   • dormant           ↔ B1 (`.dormant` sentinel present)
- *   • compact_requested ↔ B2 (`.compact-requested` sentinel present — the
+ *   • compact_requested ↔ B2 (`.compact-queued` sentinel present — the
  *                          agent or the app asked the supervisor to condense)
  *   • compacting        ↔ B3 (`.compacting` sentinel present — the supervisor
  *                          is running the compaction right now)

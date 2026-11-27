@@ -117,6 +117,17 @@ Request kinds:
                     keepMembers (a project file): the member list is the machine's — the
                     current one is kept, and it isn't part of the version. With "project":
                     {"slug", "asker"?} a changed parent: line gets a move's guard rails.
+  agent-compact     {"name", "guidance"?: "<what the summary should keep>"}  compact the
+                    agent's conversation once it's at rest (the supervisor delivers it and
+                    then a "Compaction done" event). Refused with being_archived while its
+                    archive is claimed; a second one while one is waiting is the same one.
+
+Agents use the same command for their own changes, e.g.
+  fleet-change submit agent-archive '{"name":"<me>","by":"agent"}' --by agent:<me>
+  fleet-change submit agent-project '{"name":"<me>","project":"<slug>"}' --by agent:<me>
+  fleet-change submit agent-compact '{"name":"<me>","guidance":"..."}' --by agent:<me>
+The notes agents used to leave (.archive-requested, .unarchive-requested, .move-requested,
+.compact-requested) are no longer acted on: the supervisor removes one and answers it.
 
 On disk, all under ~/fleet/.changes/:
   incoming/<ns>-<id>.json   a request as written by submit (atomic rename)
@@ -182,6 +193,10 @@ SYSTEMCTL = os.environ.get("FLEET_CHANGE_SYSTEMCTL") or "systemctl"
 # An agent or role whose archive has been claimed carries this; the supervisor finishes the
 # archive in the background and the mark goes into the archive with the folder.
 CLAIM = ".archiving"
+# An accepted compaction, holding its guidance (if any): the supervisor carries it out once the
+# agent is at rest.
+COMPACT_MARK = ".compact-queued"
+COMPACT_GUIDANCE_MAX = 2000
 # Touched (renamed into place) to end the supervisor's between-pass wait early.
 SUPERVISOR_WAKE = os.path.join(IDENTITIES, ".supervisor-wake")
 STUCK_AFTER_S = 600
@@ -208,7 +223,7 @@ EDITOR_KINDS = ("file-save", "role-edit")
 KINDS = ("app-move", "project-contents", "project-archive", "agent-archive", "agent-unarchive",
          "role-contents", "role-archive", "role-unarchive", "app-archive", "app-unarchive",
          "project-create", "project-rename", "project-move", "agent-project", "agent-pin", "agent-edit",
-         "role-edit", "file-save")
+         "role-edit", "file-save", "agent-compact")
 
 
 def log(msg):
@@ -583,9 +598,12 @@ def finishing(names, role=None):
 
 def run(argv, timeout=60):
     """Run a helper; one that runs out of time gets SIGTERM (so its own rollback runs), then SIGKILL."""
+    # The app helpers (move-app.sh, archive-app.sh) hand a direct run to this front door; run
+    # from here they do the work.
+    env = dict(os.environ, FLEET_CHANGE_RUNNING="1")
     try:
         p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             stdin=subprocess.DEVNULL, start_new_session=True)
+                             stdin=subprocess.DEVNULL, start_new_session=True, env=env)
     except OSError as e:
         return 127, str(e)
     try:
@@ -1556,6 +1574,26 @@ def do_agent_pin(args, entry, save_plan):
     return {"name": name, "pinned": pinned, "previousProject": previous}
 
 
+def do_agent_compact(args, entry, save_plan):
+    name = check_name(args)
+    guidance = args.get("guidance")
+    if guidance is not None and not isinstance(guidance, str):
+        raise Refused("bad_request", "guidance must be text")
+    # One line without control characters: the supervisor types it after /compact.
+    guidance = re.sub(r"\s+", " ", re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", guidance or "")).strip()
+    if len(guidance.encode("utf-8")) > COMPACT_GUIDANCE_MAX:
+        raise Refused("bad_request", "guidance must be at most %d bytes" % COMPACT_GUIDANCE_MAX)
+    agent_file(name)
+    d = os.path.join(IDENTITIES, name)
+    if os.path.exists(os.path.join(d, ".compacting")) or os.path.exists(os.path.join(d, COMPACT_MARK)):
+        # A second press while one is waiting or under way is the same compaction.
+        return {"name": name, "already": True}
+    write_text_atomic(os.path.join(d, COMPACT_MARK), guidance + ("\n" if guidance else ""))
+    wake_supervisor()
+    log("agent '%s' compaction accepted; the supervisor carries it out once it's at rest" % name)
+    return {"name": name}
+
+
 def drop_upload(upload):
     if isinstance(upload, str) and UPLOAD_RE.match(upload):
         try:
@@ -1720,7 +1758,8 @@ def file_version(data, keep_members=False):
 # written by an editor's save.
 MACHINE_MARKERS = (".move-requested", ".move-failed", ".archive-requested", ".archiving",
                    ".unarchive-requested", ".unarchive-refused", ".unarchive-reactivate",
-                   ".unarchive-finishing", ".unarchive-banner", ".change-lock", ".create-lock")
+                   ".unarchive-finishing", ".unarchive-banner", ".change-lock", ".create-lock",
+                   ".compact-queued", ".compacting", ".not-carried-out")
 
 
 def home_path(rel):
@@ -1884,6 +1923,7 @@ HANDLERS = {
     "agent-edit": do_agent_edit,
     "role-edit": do_role_edit,
     "file-save": do_file_save,
+    "agent-compact": do_agent_compact,
 }
 
 

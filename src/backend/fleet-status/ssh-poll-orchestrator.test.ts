@@ -16,7 +16,6 @@ import {
   expect,
   vi,
   beforeEach,
-  afterEach,
   type MockInstance,
 } from "vitest";
 import {
@@ -26,12 +25,9 @@ import {
   type SshChannelExecOptions,
   type OrchestratorDeps,
   __scanTailForNewestMessageAtForTests,
-  parseSpawnRequestBatch,
-  scanSpawnRequests,
   __resetSweepResultCacheForTests,
 } from "./ssh-poll-orchestrator.js";
 import { __resetSweepTailStoreForTests } from "./sweep-tail-store.js";
-import type { PendingBirth } from "../spawn-requests/types.js";
 import type { SubscriptionRegistry, ProjectListEntry } from "./subscription-registry.js";
 import type { AppState, SessionState } from "./wire-protocol.js";
 import type { HostRecord } from "./host-id-resolver.js";
@@ -534,12 +530,6 @@ function buildDeps(
   channel.setResponse("cat /proc/12345/environ", "TMUX_PANE=%2\0TMUX=/tmp/tmux\0");
   channel.setResponse("tmux display-message", "tina");
   channel.setResponse("cat ~/.claude/fleet-status/last-stop-payload.json", makeValidPayload());
-  // Note: the pre-fix "default empty response for the atomic spawn-request
-  // scan exec" is unnecessary now — pollOneHost no longer issues that exec
-  // (piggyback removed; see bounty fleet-status-orchestrator-coupling-with-
-  // spawn-request-scanning). The scanSpawnRequests helper is still exported
-  // and covered by the direct-call tests below; the always-on scanner lives
-  // in scan-orchestrator.ts and is tested separately.
 
   let currentTime = 0;
 
@@ -4229,7 +4219,7 @@ describe("dead channel after a host reboot — re-acquire", () => {
 // ==============================================================================
 // Condense — source B `condensing` axis (per-identity, PID-independent)
 //
-// condensing = `.compact-requested` (dropped by the agent or the app) ||
+// condensing = `.compact-queued` (dropped by the agent or the app) ||
 // `.compacting` (held by the supervisor while the compaction runs). Source B
 // is the SOLE publisher of the axis; source A omits it. Compaction happens in
 // place — the agent keeps its live PID — so source B lifts its live-PID skip
@@ -4282,13 +4272,13 @@ describe("Condense — source B condensing axis", () => {
     );
     channel.setResponse("discovered.jsonl", "");
     channel.setResponse("stat ~/fleet/identities/'tina'/.dormant", `${dormant}\n`);
-    setSentinel(channel, ".compact-requested", compactRequested);
+    setSentinel(channel, ".compact-queued", compactRequested);
     setSentinel(channel, ".compacting", compacting);
   }
 
   function setSentinel(
     channel: MockSshChannel,
-    file: ".compact-requested" | ".compacting",
+    file: ".compact-queued" | ".compacting",
     value: "yes" | "no" | null,
   ): void {
     channel.setResponse(
@@ -4327,7 +4317,7 @@ describe("Condense — source B condensing axis", () => {
   }
 
   it.each([
-    ["compactRequested", ".compact-requested"],
+    ["compactRequested", ".compact-queued"],
     ["compacting", ".compacting"],
   ] as const)(
     "no live PID + %s sentinel → source B publishes condensing:true",
@@ -4368,7 +4358,7 @@ describe("Condense — source B condensing axis", () => {
     expect(deps.registry.publishedStates[0].state.condensing).toBe(false);
   });
 
-  it("live PID + .compact-requested → source B publishes condensing:true alongside source A's frame, which omits the axis", async () => {
+  it("live PID + .compact-queued → source B publishes condensing:true alongside source A's frame, which omits the axis", async () => {
     const channel = new MockSshChannel();
     wireTina(channel, { compactRequested: "yes" });
     const deps = buildDeps({ acquireSshChannel: vi.fn().mockResolvedValue(channel) });
@@ -4436,9 +4426,9 @@ describe("Condense — source B condensing axis", () => {
     await createSshPollOrchestrator(deps).start();
     expect(sourceBFrames(deps.registry.publishedStates).map((s) => s.condensing)).toEqual([true]);
 
-    // Supervisor picks the request up: .compact-requested → .compacting.
+    // Supervisor picks the request up: .compact-queued → .compacting.
     // Still condensing → fingerprint unchanged → no new source-B frame.
-    setSentinel(channel, ".compact-requested", "no");
+    setSentinel(channel, ".compact-queued", "no");
     setSentinel(channel, ".compacting", "yes");
     await tick();
     expect(sourceBFrames(deps.registry.publishedStates).map((s) => s.condensing)).toEqual([true]);
@@ -4484,14 +4474,14 @@ describe("Condense — source B condensing axis", () => {
     expect(sourceBFrames(deps.registry.publishedStates).map((s) => s.condensing)).toEqual([false]);
   });
 
-  it("legacy source B probes .dormant / .compact-requested / .compacting once each per identity per tick — no retired sentinels, no transcript tail", async () => {
+  it("legacy source B probes .dormant / .compact-queued / .compacting once each per identity per tick — no retired sentinels, no transcript tail", async () => {
     const channel = new MockSshChannel();
     wireTina(channel, { livePid: false });
     const deps = buildDeps({ acquireSshChannel: vi.fn().mockResolvedValue(channel) });
     await createSshPollOrchestrator(deps).start();
 
     expect(channel.countCallsMatching("stat ~/fleet/identities/'tina'/.dormant")).toBe(1);
-    expect(channel.countCallsMatching("stat ~/fleet/identities/'tina'/.compact-requested")).toBe(1);
+    expect(channel.countCallsMatching("stat ~/fleet/identities/'tina'/.compact-queued")).toBe(1);
     expect(channel.countCallsMatching("stat ~/fleet/identities/'tina'/.compacting")).toBe(1);
     expect(channel.countCallsMatching(".recycle")).toBe(0);
     // No live PID → nothing should discover or tail tina's JSONL.
@@ -4790,7 +4780,7 @@ describe("Phase 55: session-file cache writes", () => {
     channel.setResponse("stat ~/fleet/identities/'aqua'/.dormant", "no\n");
     channel.setResponse("stat ~/fleet/identities/'aqua'/.compacting", "no\n");
     channel.setResponse(
-      "stat ~/fleet/identities/'aqua'/.compact-requested",
+      "stat ~/fleet/identities/'aqua'/.compact-queued",
       "no\n",
     );
 
@@ -6701,14 +6691,14 @@ describe("Phase 92 — batch sweep dispatch", () => {
     );
     // gamma is the dormant-only identity — no live PID → source B publishes.
     channel.setResponse("stat ~/fleet/identities/'gamma'/.dormant", "no\n");
-    // Condense sentinels (.compacting + .compact-requested) off for all three.
+    // Condense sentinels (.compacting + .compact-queued) off for all three.
     for (const name of IDENTITIES) {
       channel.setResponse(
         `stat ~/fleet/identities/'${name}'/.compacting`,
         "no\n",
       );
       channel.setResponse(
-        `stat ~/fleet/identities/'${name}'/.compact-requested`,
+        `stat ~/fleet/identities/'${name}'/.compact-queued`,
         "no\n",
       );
     }
@@ -7833,238 +7823,6 @@ describe("Phase 92 — batch sweep dispatch", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Spawn-request scan helpers (parseSpawnRequestBatch + scanSpawnRequests)
-//
-// These helpers stay defined in ssh-poll-orchestrator.ts and are exported for
-// reuse by the always-on `../spawn-requests/scan-orchestrator.ts` — the
-// pre-fix "piggybacked scan inside pollOneHost" wiring is gone (see bounty
-// fleet-status-orchestrator-coupling-with-spawn-request-scanning). Tests
-// here target the helpers directly; lifecycle-integration tests for the
-// always-on orchestrator live in scan-orchestrator.test.ts.
-// ---------------------------------------------------------------------------
-
-describe("spawn-request scan helpers", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
-  // parseSpawnRequestBatch — UUID-shape filter defense-in-depth
-  it("parseSpawnRequestBatch rejects non-UUID basenames (e.g. response filenames)", () => {
-    // Not a UUID
-    const result1 = parseSpawnRequestBatch("not-a-uuid.json\t{}\n", "host-1");
-    expect(result1).toHaveLength(0);
-
-    // *.success.json — basename after stripping .json is 43 chars, fails UUID_RE
-    const uuid = "12345678-1234-1234-1234-1234567890ab";
-    const successFile = `${uuid}.success.json\t${JSON.stringify({ role: "coordinator", task: null, requested_at: "2026-09-10T00:00:00Z" })}\n`;
-    const result2 = parseSpawnRequestBatch(successFile, "host-1");
-    expect(result2).toHaveLength(0);
-
-    // A genuine request file — 36-char UUID basename, should parse OK
-    const validLine = `${uuid}.json\t${JSON.stringify({ role: "coordinator", task: "test", requested_at: "2026-09-10T00:00:00Z" })}\n`;
-    const result3 = parseSpawnRequestBatch(validLine, "host-1");
-    expect(result3).toHaveLength(1);
-    expect(result3[0].uuid).toBe(uuid);
-  });
-
-  // scanSpawnRequests — null channel response → empty batch (fail-open)
-  it("scanSpawnRequests null channel response → empty batch (fail-open on SSH error)", async () => {
-    const channel = new MockSshChannel();
-    channel.setResponse("fleet/spawn-requests", null);
-    const host: HostRecord = { id: "host-1", name: "testhost" };
-
-    const result = await scanSpawnRequests(host, channel);
-    expect(result).toEqual([]);
-  });
-
-  // scanSpawnRequests — missing folder / empty stdout → empty batch (D-03)
-  it("scanSpawnRequests missing folder (empty stdout) → empty batch", async () => {
-    const channel = new MockSshChannel();
-    channel.setResponse("fleet/spawn-requests", "");
-    const host: HostRecord = { id: "host-1", name: "testhost" };
-
-    const result = await scanSpawnRequests(host, channel);
-    expect(result).toEqual([]);
-  });
-
-  // scanSpawnRequests — valid request file → PendingBirth item
-  it("scanSpawnRequests valid request file → PendingBirth item with roles/prompt/task/requested_at", async () => {
-    const channel = new MockSshChannel();
-    const uuid = "12345678-1234-1234-1234-1234567890ab";
-    const body = JSON.stringify({
-      roles: ["coordinator"],
-      prompt: "test prompt",
-      task: "test task",
-      requested_at: "2026-09-10T00:00:00Z",
-    });
-    channel.setResponse("fleet/spawn-requests", `${uuid}.json\t${body}\n`);
-    const host: HostRecord = { id: "host-1", name: "testhost" };
-
-    const result = await scanSpawnRequests(host, channel);
-    expect(result).toHaveLength(1);
-    const item = result[0] as PendingBirth;
-    expect(item.uuid).toBe(uuid);
-    expect(item.roles).toEqual(["coordinator"]);
-    expect(item.prompt).toBe("test prompt");
-    expect(item.task).toBe("test task");
-    expect(item.requested_at).toBe("2026-09-10T00:00:00Z");
-    // quick-260923-9x1: PendingBirth.userId removed; hostConnDetails is now
-    // threaded from the host record's _connDetails bag. This test passes a
-    // bare HostRecord without _connDetails, so hostConnDetails is undefined
-    // (the malformed-branch and normal-branch pushes both propagate the
-    // parameter's undefined value). Real production flow always passes a
-    // populated bag via scanSpawnRequests(host, channel).
-    expect(item.hostConnDetails).toBeUndefined();
-  });
-
-  // scanSpawnRequests — spec-provided users propagates onto PendingBirth so
-  // the worker's BirthOptions assembly can forward it to the orchestrator
-  // (news-watcher-riley-email → users:["riley"] → newborn's frontmatter).
-  it("scanSpawnRequests valid request file with users:[…] → PendingBirth.users carries the array verbatim", async () => {
-    const channel = new MockSshChannel();
-    const uuid = "deadbeef-dead-beef-dead-beefdeadbeef";
-    const body = JSON.stringify({
-      roles: ["news-watcher"],
-      prompt: "triage inbox",
-      task: null,
-      requested_at: "2026-09-30T00:00:00Z",
-      users: ["riley"],
-    });
-    channel.setResponse("fleet/spawn-requests", `${uuid}.json\t${body}\n`);
-    const host: HostRecord = { id: "host-1", name: "testhost" };
-
-    const result = await scanSpawnRequests(host, channel);
-    expect(result).toHaveLength(1);
-    const item = result[0] as PendingBirth;
-    expect(item.users).toEqual(["riley"]);
-  });
-
-  // Regression 260923-9x1 — scanSpawnRequests reads `_connDetails` off the
-  // host record (populated by list-substrate-hosts.ts on the CSKEK path) and
-  // forwards it onto every emitted PendingBirth as hostConnDetails. Both the
-  // valid-body branch AND the malformed branch propagate the same bag —
-  // the worker's response-write path consumes it directly without a
-  // per-user resolveHostById lookup.
-  it("Regression 260923-9x1: scanSpawnRequests threads host._connDetails onto every emitted PendingBirth (valid + malformed branches)", async () => {
-    const channel = new MockSshChannel();
-    const uuidGood = "12345678-1234-1234-1234-1234567890ab";
-    const uuidBad = "abcdef12-abcd-abcd-abcd-abcdef123456";
-    const bodyGood = JSON.stringify({
-      roles: ["coordinator"],
-      prompt: "test prompt",
-      task: "test task",
-      requested_at: "2026-09-10T00:00:00Z",
-    });
-    channel.setResponse(
-      "fleet/spawn-requests",
-      `${uuidGood}.json\t${bodyGood}\n${uuidBad}.json\t{not-json}\n`,
-    );
-    const connDetails = {
-      ip: "10.0.0.9",
-      port: 22,
-      username: "sweep-user",
-      authType: "password",
-      password: "sweep-secret",
-      key: null,
-      keyPassword: null,
-      keyType: null,
-    };
-    // Pass a HostRecord-shape that carries _connDetails (matches what
-    // list-substrate-hosts.ts + the fleet-status poll loop hand to
-    // scanSpawnRequests in production).
-    const host = {
-      id: "host-1",
-      name: "testhost",
-      _connDetails: connDetails,
-    } as unknown as HostRecord;
-
-    const result = await scanSpawnRequests(host, channel);
-    expect(result).toHaveLength(2);
-    // Both items — valid AND malformed — carry the sweep bag.
-    for (const item of result) {
-      expect(item.hostConnDetails).toEqual(connDetails);
-    }
-  });
-
-  // scanSpawnRequests — malformed JSON body → enqueued with malformedReason
-  // (M2/M3 code-review guard: malformed body is not silently dropped; worker
-  // still gets a PendingBirth with malformedReason so coord sees the failure.)
-  it("scanSpawnRequests malformed JSON body → PendingBirth with malformedReason set", async () => {
-    const channel = new MockSshChannel();
-    const uuid = "12345678-1234-1234-1234-1234567890ab";
-    channel.setResponse("fleet/spawn-requests", `${uuid}.json\t{not-json}\n`);
-    const host: HostRecord = { id: "host-1", name: "testhost" };
-
-    const result = await scanSpawnRequests(host, channel);
-    expect(result).toHaveLength(1);
-    const item = result[0] as PendingBirth;
-    expect(item.uuid).toBe(uuid);
-    expect(item.malformedReason).toBeDefined();
-    expect(String(item.malformedReason)).toMatch(/JSON/i);
-    expect(item.roles).toEqual([]);
-    expect(item.prompt).toBe("");
-    expect(item.task).toBeNull();
-  });
-
-  // scanSpawnRequests — roles element failing ROLE_NAME_PATTERN → malformedReason
-  it("scanSpawnRequests roles element failing ROLE_NAME_PATTERN → PendingBirth with malformedReason (roles field)", async () => {
-    const channel = new MockSshChannel();
-    const uuid = "12345678-1234-1234-1234-1234567890ab";
-    const body = JSON.stringify({
-      roles: ["INVALID ROLE WITH SPACES"],
-      prompt: "test prompt",
-      task: "test",
-      requested_at: "2026-09-10T00:00:00Z",
-    });
-    channel.setResponse("fleet/spawn-requests", `${uuid}.json\t${body}\n`);
-    const host: HostRecord = { id: "host-1", name: "testhost" };
-
-    const result = await scanSpawnRequests(host, channel);
-    expect(result).toHaveLength(1);
-    const item = result[0] as PendingBirth;
-    expect(item.uuid).toBe(uuid);
-    expect(item.malformedReason).toBeDefined();
-    expect(String(item.malformedReason)).toMatch(/role/i);
-  });
-
-  // scanSpawnRequests — multiple valid request files in one scan → all parsed
-  it("scanSpawnRequests multiple valid request files in one batch → all parsed", async () => {
-    const channel = new MockSshChannel();
-    const uuid1 = "12345678-1234-1234-1234-1234567890ab";
-    const uuid2 = "abcdef12-abcd-abcd-abcd-abcdef123456";
-    const body1 = JSON.stringify({ roles: ["coordinator"], prompt: "prompt one", task: "task one", requested_at: "2026-09-10T00:00:00Z" });
-    const body2 = JSON.stringify({ roles: ["executor"], prompt: "prompt two", task: "task two", requested_at: "2026-09-10T00:01:00Z" });
-    channel.setResponse(
-      "fleet/spawn-requests",
-      `${uuid1}.json\t${body1}\n${uuid2}.json\t${body2}\n`,
-    );
-    const host: HostRecord = { id: "host-1", name: "testhost" };
-
-    const result = await scanSpawnRequests(host, channel);
-    expect(result).toHaveLength(2);
-    const uuids = result.map((r) => r.uuid);
-    expect(uuids).toContain(uuid1);
-    expect(uuids).toContain(uuid2);
-  });
-
-  // Regression guard for the decoupling: pollOneHost NO LONGER issues the
-  // spawn-request scan exec. The `fleet/spawn-requests` command must not
-  // appear in the SSH channel's call log after orchestrator.start(). If it
-  // reappears, someone reintroduced the piggyback — the coupling bug this
-  // module was written to fix (see bounty
-  // fleet-status-orchestrator-coupling-with-spawn-request-scanning).
-  it("pollOneHost no longer issues the spawn-request scan exec (piggyback removed)", async () => {
-    const deps = buildDeps();
-    const orchestrator = createSshPollOrchestrator(deps);
-    await orchestrator.start();
-
-    const calls = deps.channel.getCalls();
-    const callCommands = calls.map((c) => c.command);
-    expect(callCommands.some((c) => c.includes("fleet/spawn-requests"))).toBe(false);
-  });
-});
-
-// ---------------------------------------------------------------------------
 // Phase 111 Plan 03 — appearance publish/suppress contract at both sources
 //
 // These tests pin the appearance axis end-to-end: resolve from sweep line,
@@ -8805,7 +8563,7 @@ describe("Phase 111 Plan 03 — appearance axis at both publish sources", () => 
     channel.setResponse("~/fleet/identities/ -mindepth", "tina\n");
     channel.setResponse("stat ~/fleet/identities/'tina'/.dormant", "no\n");
     channel.setResponse("stat ~/fleet/identities/'tina'/.compacting", "no\n");
-    channel.setResponse("stat ~/fleet/identities/'tina'/.compact-requested", "no\n");
+    channel.setResponse("stat ~/fleet/identities/'tina'/.compact-queued", "no\n");
 
     const deps = buildDeps({ acquireSshChannel: vi.fn().mockResolvedValue(channel) });
     const orchestrator = createSshPollOrchestrator(deps);

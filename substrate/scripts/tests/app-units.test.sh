@@ -200,7 +200,41 @@ test_project_apps_reserve_slugs_and_ports() {
   teardown
 }
 
-mv_() { MOVE_APP_KNOCK=0 bash "$MOVE" "$@" >/dev/null 2>&1; }
+# As the front door runs it (a direct run hands the move to the front door instead).
+mv_() { FLEET_CHANGE_RUNNING=1 MOVE_APP_KNOCK=0 bash "$MOVE" "$@" >/dev/null 2>&1; }
+
+test_direct_run_goes_to_front_door() {
+  setup
+  make_app "$S/fleet/identities/alpha/apps/tally" tally 9512
+  mkdir -p "$S/bin" "$S/fleet/projects/garden"
+  printf -- '---\ndisplayName: Garden\n---\n' > "$S/fleet/projects/garden/project.md"
+  # A stand-in front door: records what it was asked, answers done (or refused for "nope").
+  cat > "$S/bin/fleet-change" <<EOF
+#!/usr/bin/env python3
+import sys
+open("$S/asked", "a").write(" ".join(sys.argv[1:]) + "\\n")
+print('{"id":"x","state":"refused","code":"not_found","reason":"no"}' if "nope" in sys.argv[3] else '{"id":"x","state":"done"}')
+EOF
+  chmod +x "$S/bin/fleet-change"
+  local out rc
+  out=$(PATH="$S/bin:$PATH" FLEET_IDENTITY=alpha bash "$MOVE" tally sidebar --users ann,bo 2>&1); rc=$?
+  assert_eq "0" "$rc" "done answers 0"
+  assert_eq '{"id":"x","state":"done"}' "$out" "prints the outcome"
+  assert_eq 'submit app-move {"slug":"tally","to":"sidebar","users":["ann","bo"]} --wait 120 --by agent:alpha' "$(sed -n 1p "$S/asked")" "sidebar with users"
+  PATH="$S/bin:$PATH" env -u FLEET_IDENTITY bash "$MOVE" tally sidebar --everyone >/dev/null 2>&1
+  assert_eq 'submit app-move {"slug":"tally","to":"sidebar","users":null} --wait 120' "$(sed -n 2p "$S/asked")" "sidebar for everyone"
+  PATH="$S/bin:$PATH" env -u FLEET_IDENTITY bash "$MOVE" tally project garden >/dev/null 2>&1
+  assert_eq 'submit app-move {"slug":"tally","to":"project","project":"garden"} --wait 120' "$(sed -n 3p "$S/asked")" "into a project"
+  mkdir -p "$S/fleet/apps/nope"
+  PATH="$S/bin:$PATH" bash "$MOVE" nope sidebar --everyone >/dev/null 2>&1; rc=$?
+  assert_eq "1" "$rc" "a refusal answers 1"
+  # Nothing moved by the helper itself.
+  assert_exists "$S/fleet/identities/alpha/apps/tally/app.json" "the app is where it was"
+  # archive-app.sh hands over the same way.
+  out=$(PATH="$S/bin:$PATH" FLEET_IDENTITY=alpha bash "$REPO_ROOT/substrate/skills/app-development/archive-app.sh" tally 2>&1)
+  assert_eq 'submit app-archive {"slug":"tally"} --wait 120 --by agent:alpha' "$(sed -n 5p "$S/asked")" "archive handed over"
+  teardown
+}
 
 make_app() { # make_app <dir> <slug> <port> [app.json]
   mkdir -p "$1"
@@ -299,6 +333,7 @@ run_test test_move_into_project_drops_list
 run_test test_move_project_to_project_and_back_to_sidebar
 run_test test_move_refusals_leave_app_in_place
 run_test test_move_rolls_back_when_install_fails
+run_test test_direct_run_goes_to_front_door
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 if [ "$FAIL" -gt 0 ]; then

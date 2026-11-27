@@ -42,8 +42,9 @@ export function useAgentCondense(
     console.info(`[task-pill-condense] request hostId=${hostId} identityKey=${identityKey}`);
     try {
       const response = await authApi.post(`/identities/${encodeURIComponent(identityKey)}/condense`, { hostId });
-      const ok =
-        response?.data && typeof response.data === "object" && (response.data as { ok?: unknown }).ok === true;
+      const data = response?.data as { ok?: unknown; pending?: unknown } | undefined;
+      // Still waiting its turn at the machine's front door: it will be carried out.
+      const ok = data?.ok === true || data?.pending === true;
       if (ok) {
         markCompactRequested(sessionKey);
       } else {

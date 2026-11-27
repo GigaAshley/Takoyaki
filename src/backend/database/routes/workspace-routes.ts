@@ -214,6 +214,9 @@ const MACHINE_MARKERS = new Set([
   ".unarchive-banner",
   ".change-lock",
   ".create-lock",
+  ".compact-queued",
+  ".compacting",
+  ".not-carried-out",
 ]);
 /** An archived app's stashed service units. */
 const UNIT_STASH_RE = /^app-[^/]+\.archived$/;

@@ -397,7 +397,7 @@ for ln in sys.stdin:
   assert_eq "a=None,b=None,c=None,d=null,long=a,null=None" "$parents" "project-list parents (yaml scalars, long frontmatter)"
 }
 
-# Case 10: condense sentinels. `.compact-requested` (dropped by the agent or
+# Case 10: condense sentinels. `.compact-queued` (dropped by the agent or
 # the app) → compact_requested; `.compacting` (held by the supervisor while
 # /compact runs) → compacting. The retired recycle fields are no longer emitted.
 test_case_10_condense_sentinels() {
@@ -410,7 +410,7 @@ test_case_10_condense_sentinels() {
   make_live_identity "running" "---
 ---
 "
-  touch "$FIXTURE/fleet/identities/queued/.compact-requested"
+  touch "$FIXTURE/fleet/identities/queued/.compact-queued"
   touch "$FIXTURE/fleet/identities/running/.compacting"
   # Legacy sentinels must not leak into the new fields.
   touch "$FIXTURE/fleet/identities/idle/.recycle-requested"

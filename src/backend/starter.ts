@@ -26,7 +26,7 @@ import {
   setOrchestrator,
   getOrchestrator,
 } from "./fleet-status/orchestrator-holder.js";
-import { enqueue as enqueueSpawnRequest, setProcessBirth as setSpawnRequestProcessBirth } from "./spawn-requests/queue.js";
+import { setProcessBirth as setSpawnRequestProcessBirth } from "./spawn-requests/queue.js";
 import { processBirth as processSpawnRequestBirth, buildProductionDeps as buildSpawnRequestWorkerDeps } from "./spawn-requests/worker.js";
 import { processRoleRequest, buildProductionRoleWorkerDeps } from "./spawn-requests/role-worker.js";
 
@@ -1259,14 +1259,8 @@ if (process.env.VITEST !== "true") {
           staleSweepIntervalMs: 30000,
           hookPayloadPath: "~/.claude/fleet-status/last-stop-payload.json",
           hookPayloadWarnCooldownMs: 60000,
-          // Spawn-request scan is NO LONGER bundled into this orchestrator.
-          // See bounty fleet-status-orchestrator-coupling-with-spawn-request-
-          // scanning: the fleet-status orchestrator is gated on WS subscribers
-          // (start on first, stop on last), which meant scanning stopped when
-          // no browser was subscribed and coord-dropped requests sat unclaimed.
-          // A dedicated always-on `createSpawnScanOrchestrator` runs at
-          // container boot (wired below, alongside the substrate orchestrator)
-          // and owns spawn-request scanning independently of browser presence.
+          // New agents and roles come over the machines' direct route
+          // (spawn-requests/direct-route.ts), not through this orchestrator.
         });
 
         // Publish this user's orchestrator to the per-user holder so
@@ -1322,7 +1316,7 @@ if (process.env.VITEST !== "true") {
       // + D-20 no changes to identity-birth-orchestrator.ts — the worker is a
       // new caller of the existing birthIdentity export.)
       const spawnRequestWorkerDeps = buildSpawnRequestWorkerDeps();
-      // Role requests (`kind: "role"`) share the drop folder and queue.
+      // Role requests (`kind: "role"`) share the queue.
       const roleRequestWorkerDeps = buildProductionRoleWorkerDeps();
       setSpawnRequestProcessBirth((item) =>
         item.roleRequest
@@ -1863,7 +1857,6 @@ if (process.env.VITEST !== "true") {
         },
         acquireChannel: spawnScanAcquireChannel,
         releaseChannel: spawnScanReleaseChannel,
-        enqueue: enqueueSpawnRequest,
         setInterval,
         clearInterval,
         setTimeout,

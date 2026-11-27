@@ -25,7 +25,6 @@ vi.mock("../utils/logger.js", () => {
 vi.mock("../database/db/index.js", () => ({ getDb: vi.fn() }));
 
 import { parseRoleRequestBody, isRoleRequestBody } from "./parse-request-body.js";
-import { parseSpawnRequestBatch } from "../fleet-status/ssh-poll-orchestrator.js";
 import { processRoleRequest, DEFAULT_ROLE_VOICE, type RoleWorkerDeps } from "./role-worker.js";
 
 const UUID = "11111111-2222-3333-4444-555555555555";
@@ -94,29 +93,6 @@ describe("parseRoleRequestBody", () => {
   });
 });
 
-describe("parseSpawnRequestBatch — role dispatch", () => {
-  it("emits a roleRequest item for kind: role", () => {
-    const items = parseSpawnRequestBatch(`${UUID}.json\t${roleBody()}`, "6");
-    expect(items).toHaveLength(1);
-    expect(items[0].roleRequest?.name).toBe("Garden Keeper");
-    expect(items[0].malformedReason).toBeUndefined();
-    expect(items[0].hostIdNum).toBe(6);
-  });
-
-  it("emits a malformed item (no roleRequest) for a bad role request", () => {
-    const items = parseSpawnRequestBatch(`${UUID}.json\t${roleBody({ extra: 1 })}`, "6");
-    expect(items).toHaveLength(1);
-    expect(items[0].roleRequest).toBeUndefined();
-    expect(items[0].malformedReason).toMatch(/unknown field/);
-  });
-
-  it("leaves identity requests on the identity path", () => {
-    const body = JSON.stringify({ roles: ["general-purpose"], prompt: "hi", task: "t", requested_at: "x" });
-    const items = parseSpawnRequestBatch(`${UUID}.json\t${body}`, "6");
-    expect(items[0].roleRequest).toBeUndefined();
-    expect(items[0].roles).toEqual(["general-purpose"]);
-  });
-});
 
 // ---------------------------------------------------------------------------
 // processRoleRequest

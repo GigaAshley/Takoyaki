@@ -51,6 +51,9 @@ async function drainOne(): Promise<void> {
         uuid: item.uuid,
         error: err instanceof Error ? err.message : String(err),
       });
+    } finally {
+      // A direct-route request always gets an answer; once answered, this is ignored.
+      item.respond?.("failure", JSON.stringify({ reason: "birth_failed" }));
     }
   }
 }

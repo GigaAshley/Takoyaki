@@ -285,7 +285,7 @@ describe("wire-protocol", () => {
   });
 
   // Phase 53 Plan 01 — condensing is an optional, back-compat boolean field on
-  // SessionState. Source: ~/fleet/identities/<tmuxSession>/.compact-requested OR
+  // SessionState. Source: ~/fleet/identities/<tmuxSession>/.compact-queued OR
   // .compacting on the target host. Semantics: true → a compaction is queued or in
   // flight; false → neither present; null → normalised-null; undefined → not stamped.
   // Frontend treats undefined/null identically (both → false). FRAME_SCHEMA_VERSION

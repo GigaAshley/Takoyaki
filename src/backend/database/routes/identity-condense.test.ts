@@ -1,317 +1,134 @@
 /**
- * Tests for POST /identities/:key/condense — the Condense conversation button's
- * request. Same harness as identity-archive.test.ts: bare Express app, mocked
- * auth, SSH primitives and writeIdentityFile.
+ * POST /identities/:key/condense — Compact conversation, a request to the machine's front
+ * door (fleet-change agent-compact). Auth, the machine connection and the front door are
+ * mocked; the front door's own behaviour is fleet-change.test.sh's.
  */
-
-import {
-  describe,
-  it,
-  expect,
-  beforeEach,
-  afterEach,
-  vi,
-  type Mock,
-} from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from "vitest";
 import express from "express";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 
-// ---------------------------------------------------------------------------
-// Auth manager mock — matches identity-no-dormancy.test.ts pattern
-// ---------------------------------------------------------------------------
-
 let mockUserId: string | null = "1";
-
-vi.mock("../../utils/auth-manager.js", () => {
-  const AuthManager = {
+vi.mock("../../utils/auth-manager.js", () => ({
+  AuthManager: {
     getInstance: () => ({
-      createAuthMiddleware: () =>
-        (
-          req: express.Request,
-          res: express.Response,
-          next: express.NextFunction,
-        ) => {
-          if (mockUserId === null) {
-            return res.status(401).json({ error: "Unauthorized" });
-          }
+      createAuthMiddleware:
+        () => (req: express.Request, res: express.Response, next: express.NextFunction) => {
+          if (mockUserId === null) return res.status(401).json({ error: "Unauthorized" });
           (req as express.Request & { userId: string }).userId = mockUserId;
           next();
         },
     }),
-  };
-  return { AuthManager };
+  },
+}));
+vi.mock("../../utils/logger.js", () => ({
+  databaseLogger: { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() },
+  sshLogger: { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() },
+}));
+vi.mock("../../fleet-change/front-door.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../fleet-change/front-door.js")>()),
+  submitFrontDoor: vi.fn(),
+}));
+vi.mock("../../sharing/host-conn.js", () => {
+  class HttpError extends Error {
+    constructor(readonly status: number, message: string) {
+      super(message);
+    }
+  }
+  return { HttpError, withHost: vi.fn() };
 });
 
-// Mute logger during tests (avoid noisy stderr on the T-115-03-03 500 path).
-vi.mock("../../utils/logger.js", () => ({
-  databaseLogger: {
-    info: vi.fn(),
-    error: vi.fn(),
-    warn: vi.fn(),
-    debug: vi.fn(),
-  },
-}));
+import { submitFrontDoor } from "../../fleet-change/front-door.js";
+import { HttpError, withHost } from "../../sharing/host-conn.js";
+import router, { GUIDANCE_MAX_CHARS, normalizeGuidance } from "./identity-condense.js";
 
-// ---------------------------------------------------------------------------
-// Mock SSH primitives + writeIdentityFile BEFORE importing the module under test
-// ---------------------------------------------------------------------------
-
-vi.mock("../../ssh/ssh-one-shot.js", () => ({
-  connectOneShot: vi.fn(),
-}));
-
-vi.mock("../../ssh/host-resolver.js", () => ({
-  resolveHostById: vi.fn(),
-}));
-
-vi.mock("../../claude-session/identity-artifact-reader.js", () => ({
-  stringifyColorHueForYaml: (obj: Record<string, unknown>) => (typeof obj.colorHue === "number" ? { ...obj, colorHue: String(obj.colorHue) } : obj),
-  isLocalHostId: vi.fn(),
-  IDENTITY_KEY_RE: /^[a-z0-9_-]{1,64}$/,
-}));
-
-vi.mock("../../claude-session/per-identity-file.js", () => ({
-  assertNotBeingArchived: vi.fn(async () => undefined),
-  IdentityBeingArchivedError: class IdentityBeingArchivedError extends Error {},
-  writeIdentityFile: vi.fn(),
-}));
-
-// ---------------------------------------------------------------------------
-// Import mocked modules AFTER vi.mock() declarations
-// ---------------------------------------------------------------------------
-
-import { connectOneShot } from "../../ssh/ssh-one-shot.js";
-import { resolveHostById } from "../../ssh/host-resolver.js";
-import { isLocalHostId } from "../../claude-session/identity-artifact-reader.js";
-import { writeIdentityFile } from "../../claude-session/per-identity-file.js";
-
-// ---------------------------------------------------------------------------
-// HTTP request helper
-// ---------------------------------------------------------------------------
-
-function httpRequest(
-  server: http.Server,
-  opts: {
-    method: string;
-    path: string;
-    headers?: Record<string, string>;
-    body?: unknown;
-  },
-): Promise<{ status: number; body: unknown }> {
+function call(server: http.Server, path: string, body?: unknown): Promise<{ status: number; body: Record<string, unknown> }> {
   return new Promise((resolve, reject) => {
     const { port } = server.address() as AddressInfo;
-    const bodyStr =
-      opts.body !== undefined ? JSON.stringify(opts.body) : undefined;
-
-    const headers: Record<string, string> = {
-      ...(opts.headers ?? {}),
-    };
-    if (bodyStr !== undefined) {
-      headers["Content-Type"] = "application/json";
-      headers["Content-Length"] = String(Buffer.byteLength(bodyStr));
-    }
-
     const req = http.request(
-      {
-        hostname: "127.0.0.1",
-        port,
-        method: opts.method,
-        path: opts.path,
-        headers,
-      },
+      { hostname: "127.0.0.1", port, method: "POST", path, headers: { "content-type": "application/json" } },
       (res) => {
-        let data = "";
-        res.on("data", (chunk: Buffer) => {
-          data += chunk.toString();
-        });
-        res.on("end", () => {
-          let body: unknown;
-          try {
-            body = JSON.parse(data);
-          } catch {
-            body = data;
-          }
-          resolve({ status: res.statusCode ?? 0, body });
-        });
+        let out = "";
+        res.on("data", (c: Buffer) => (out += c.toString()));
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, body: out ? JSON.parse(out) : {} }));
       },
     );
     req.on("error", reject);
-    if (bodyStr !== undefined) {
-      req.write(bodyStr);
-    }
-    req.end();
+    req.end(body === undefined ? undefined : JSON.stringify(body));
   });
 }
 
-// ---------------------------------------------------------------------------
-// Stubs — SSH connection object + host record
-// ---------------------------------------------------------------------------
-
-const stubConn = {
-  end: vi.fn(),
-  exec: vi.fn(),
-};
-
-const stubHost = {
-  id: 5,
-  ip: "10.0.0.5",
-  port: 22,
-  username: "ubuntu",
-  authType: "password" as const,
-  password: "secret",
-};
-
-// ---------------------------------------------------------------------------
-// Import the router under test — AFTER all vi.mock() calls
-// ---------------------------------------------------------------------------
-
-import router, { GUIDANCE_MAX_CHARS, normalizeGuidance } from "./identity-condense.js";
-
 let server: http.Server;
+const conn = { fake: "conn" };
 
-beforeEach(() => {
+function answer(outcome: Record<string, unknown>): void {
+  (submitFrontDoor as Mock).mockImplementation(async (_c: unknown, _k: string, _a: unknown, o: { id: string }) => ({
+    id: o.id,
+    seq: 1,
+    ...outcome,
+  }));
+}
+
+beforeEach(async () => {
   vi.clearAllMocks();
-
-  // Default: user owns host 5 (local) and host 7 (remote); host 99 not owned
-  (resolveHostById as Mock).mockImplementation((hostId: number) => {
-    if (hostId === 5 || hostId === 7) return Promise.resolve(stubHost);
-    return Promise.resolve(null);
-  });
-
-  // Default: hostId 5 is local, hostId 7 is remote
-  (isLocalHostId as Mock).mockImplementation((hostId: number) => hostId === 5);
-
-  // Default: SSH connect resolves to stubConn
-  (connectOneShot as Mock).mockResolvedValue(stubConn);
-
-  // Default: writeIdentityFile succeeds
-  (writeIdentityFile as Mock).mockResolvedValue(undefined);
-
-  // Rebuild app per test
+  mockUserId = "1";
+  (withHost as Mock).mockImplementation(async (_h: number, _u: string, fn: (c: unknown) => Promise<unknown>) => fn(conn));
+  answer({ state: "done", result: { name: "alpha" } });
   const app = express();
   app.use(express.json());
   app.use("/identities", router);
-
-  server = http.createServer(app);
-  server.listen(0);
+  server = app.listen(0);
+  await new Promise<void>((r) => server.once("listening", () => r()));
 });
 
-afterEach(() => {
-  mockUserId = "1";
-  return new Promise<void>((resolve) => server.close(() => resolve()));
-});
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+afterEach(() => server?.close());
 
 describe("POST /identities/:key/condense", () => {
-  it("LOCAL: drops .compact-requested with no guidance → 200, no SSH", async () => {
-    const res = await httpRequest(server, {
-      method: "POST",
-      path: "/identities/wren/condense",
-      body: { hostId: 5 },
-    });
-    expect(res.status).toBe(200);
-    expect(res.body).toEqual({ ok: true });
-    expect(writeIdentityFile).toHaveBeenCalledWith("wren", ".compact-requested", "", {
-      hostId: 5,
-      conn: null,
-    });
-    expect(connectOneShot).not.toHaveBeenCalled();
+  it("asks the front door, with no guidance when none was typed", async () => {
+    const r = await call(server, "/identities/alpha/condense", { hostId: 5, requestId: "press-1" });
+    expect(r.status).toBe(200);
+    expect(r.body).toMatchObject({ ok: true, requestId: "press-1" });
+    expect(submitFrontDoor).toHaveBeenCalledWith(conn, "agent-compact", { name: "alpha" }, { id: "press-1", hostId: 5, by: "1" });
   });
 
-  it("REMOTE: guidance is flattened to one line and written; conn closed", async () => {
-    const res = await httpRequest(server, {
-      method: "POST",
-      path: "/identities/wren/condense",
-      body: { hostId: 7, guidance: "  keep the\nfailing   test details \n" },
-    });
-    expect(res.status).toBe(200);
-    expect(writeIdentityFile).toHaveBeenCalledWith(
-      "wren",
-      ".compact-requested",
-      "keep the failing test details",
-      { hostId: 7, conn: stubConn },
-    );
-    expect(stubConn.end).toHaveBeenCalledTimes(1);
+  it("guidance is flattened to one line", async () => {
+    await call(server, "/identities/alpha/condense", { hostId: 5, guidance: "keep the\nfailing   test" });
+    expect(submitFrontDoor).toHaveBeenCalledWith(conn, "agent-compact", { name: "alpha", guidance: "keep the failing test" }, expect.anything());
   });
 
   it("non-string guidance is ignored", async () => {
-    await httpRequest(server, {
-      method: "POST",
-      path: "/identities/wren/condense",
-      body: { hostId: 5, guidance: { evil: true } },
-    });
-    expect(writeIdentityFile).toHaveBeenCalledWith("wren", ".compact-requested", "", {
-      hostId: 5,
-      conn: null,
-    });
+    await call(server, "/identities/alpha/condense", { hostId: 5, guidance: 42 });
+    expect(submitFrontDoor).toHaveBeenCalledWith(conn, "agent-compact", { name: "alpha" }, expect.anything());
   });
 
-  it("invalid key → 400, nothing written", async () => {
-    const res = await httpRequest(server, {
-      method: "POST",
-      path: "/identities/bad.key/condense",
-      body: { hostId: 5 },
-    });
-    expect(res.status).toBe(400);
-    expect(writeIdentityFile).not.toHaveBeenCalled();
+  it("passes the machine's refusal on (being archived)", async () => {
+    answer({ state: "refused", code: "being_archived", reason: "it's being archived" });
+    const r = await call(server, "/identities/alpha/condense", { hostId: 5 });
+    expect(r.status).toBe(409);
+    expect(r.body).toMatchObject({ code: "being_archived", error: "it's being archived" });
   });
 
-  it("missing hostId → 400", async () => {
-    const res = await httpRequest(server, {
-      method: "POST",
-      path: "/identities/wren/condense",
-      body: {},
-    });
-    expect(res.status).toBe(400);
-    expect(writeIdentityFile).not.toHaveBeenCalled();
+  it("answers 202 while it waits its turn, 503 while the machine updates", async () => {
+    answer({ state: "pending", stage: "queued" });
+    expect((await call(server, "/identities/alpha/condense", { hostId: 5 })).body).toMatchObject({ pending: true });
+    (submitFrontDoor as Mock).mockImplementation(async (_c: unknown, _k: string, _a: unknown, o: { id: string }) => ({ id: o.id, state: "not_installed" }));
+    expect((await call(server, "/identities/alpha/condense", { hostId: 5 })).status).toBe(503);
   });
 
-  it("host not owned → 404", async () => {
-    const res = await httpRequest(server, {
-      method: "POST",
-      path: "/identities/wren/condense",
-      body: { hostId: 99 },
-    });
-    expect(res.status).toBe(404);
-    expect(writeIdentityFile).not.toHaveBeenCalled();
+  it("validates before touching the machine", async () => {
+    expect((await call(server, "/identities/alpha/condense", {})).status).toBe(400);
+    expect((await call(server, "/identities/alpha/condense", { hostId: 0 })).status).toBe(400);
+    expect((await call(server, "/identities/Bad.Key/condense", { hostId: 5 })).status).toBe(400);
+    expect(withHost).not.toHaveBeenCalled();
   });
 
-  it("REMOTE unreachable → 504", async () => {
-    (connectOneShot as Mock).mockRejectedValue(new Error("timeout"));
-    const res = await httpRequest(server, {
-      method: "POST",
-      path: "/identities/wren/condense",
-      body: { hostId: 7 },
-    });
-    expect(res.status).toBe(504);
-    expect(writeIdentityFile).not.toHaveBeenCalled();
-  });
-
-  it("write fails → 500 generic, conn still closed", async () => {
-    (writeIdentityFile as Mock).mockRejectedValue(new Error("ENOSPC secret path"));
-    const res = await httpRequest(server, {
-      method: "POST",
-      path: "/identities/wren/condense",
-      body: { hostId: 7 },
-    });
-    expect(res.status).toBe(500);
-    expect(res.body).toEqual({ error: "failed to request condense" });
-    expect(stubConn.end).toHaveBeenCalledTimes(1);
-  });
-
-  it("unauthenticated → 401", async () => {
+  it("maps an unknown host and an unreachable one; refuses no login", async () => {
+    (withHost as Mock).mockRejectedValueOnce(new HttpError(404, "Host not found"));
+    expect((await call(server, "/identities/alpha/condense", { hostId: 5 })).status).toBe(404);
+    (withHost as Mock).mockRejectedValueOnce(new HttpError(504, "Host unreachable"));
+    expect((await call(server, "/identities/alpha/condense", { hostId: 5 })).status).toBe(504);
     mockUserId = null;
-    const res = await httpRequest(server, {
-      method: "POST",
-      path: "/identities/wren/condense",
-      body: { hostId: 5 },
-    });
-    expect(res.status).toBe(401);
-    expect(resolveHostById).not.toHaveBeenCalled();
+    expect((await call(server, "/identities/alpha/condense", { hostId: 5 })).status).toBe(401);
   });
 });
 

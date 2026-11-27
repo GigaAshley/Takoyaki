@@ -80,7 +80,7 @@
 // `recycling`, for the retired agent reset), with direct swap-and-notify
 // semantics (like dormant Axis D). Publish path has an Axis E block below
 // Axis D; sourced from the backend-authoritative condense sentinels
-// (`.compact-requested` / `.compacting`, folded into one wire boolean by
+// (`.compact-queued` / `.compacting`, folded into one wire boolean by
 // source B); consumed via useSessionIsCondensing by every surface that shows
 // the agent is condensing, mounted pane or not (one source for all surfaces).
 //
@@ -124,7 +124,7 @@ type WorkingRecord = {
   dormant: boolean;
   // The backend-authoritative condensing signal mirrored from the
   // fleet-status wire frame (SessionState.condensing). `true` when the wire
-  // frame carried `condensing: true` (`.compact-requested` or `.compacting`
+  // frame carried `condensing: true` (`.compact-queued` or `.compacting`
   // present — the agent's context is being condensed in place, queued or in
   // flight). `false` when the wire frame carried `false`, `null`, or omitted
   // the field entirely (safe default — no false positives). Wire's
@@ -1017,11 +1017,11 @@ export function useSessionIsDormant(key: string | null): boolean {
  *   - Null key              → false (short-circuit; no useSyncExternalStore work).
  *   - Unknown key           → false (key never published — default-safe).
  *   - condensing === false  → false (no compaction queued or in flight).
- *   - condensing === true   → true  (`.compact-requested` or `.compacting`
+ *   - condensing === true   → true  (`.compact-queued` or `.compacting`
  *                                    present — the supervisor is condensing
  *                                    the agent's context in place).
  *
- * Source: ~/fleet/identities/<tmuxSession>/.compact-requested + .compacting,
+ * Source: ~/fleet/identities/<tmuxSession>/.compact-queued + .compacting,
  * folded into SessionState.condensing by ssh-poll-orchestrator source B.
  * Works for unmounted rows too — no pane needs to be open to publish it.
  */

@@ -68,7 +68,7 @@ Exec-site → emission mapping (parity with RESEARCH.md § "Current per-identity
     A12 tail -c 262144 <jsonlPath>               → SweepPidLine.jsonl_tail (+ _file/_end/_base; deltas)
     B0  find identities/                         → identity enumeration (this script)
     B1  stat identities/<name>/.dormant  (B)     → SweepIdentityLine.dormant
-    B2  stat identities/<name>/.compact-requested → SweepIdentityLine.compact_requested
+    B2  stat identities/<name>/.compact-queued → SweepIdentityLine.compact_requested
     B3  stat identities/<name>/.compacting       → SweepIdentityLine.compacting
                                                    (B2 || B3 = the agent is condensing:
                                                    a compaction is queued or in flight,
@@ -1444,10 +1444,10 @@ def _enumerate_identities(home):
                 if os.path.exists(os.path.join(entry.path, ".archiving")):
                     continue
                 dormant = os.path.exists(os.path.join(entry.path, ".dormant"))
-                # Condense: the agent or the app drops .compact-requested;
+                # Condense: the agent or the app drops .compact-queued;
                 # the supervisor holds .compacting while /compact runs.
                 compact_requested = os.path.exists(
-                    os.path.join(entry.path, ".compact-requested"),
+                    os.path.join(entry.path, ".compact-queued"),
                 )
                 compacting = os.path.exists(
                     os.path.join(entry.path, ".compacting"),

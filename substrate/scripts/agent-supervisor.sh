@@ -1855,12 +1855,6 @@ run_archive_scan_if_due() {
 # the front door can say what it's stuck on. An agent un-archive is accepted at the front door
 # and finished here too (finish_returning_identities, below).
 #
-# Notes left the old way — `.archive-requested` in a live agent, role or sidebar app folder,
-# `.unarchive-requested` in an archived one (an agent running /id archive, a scheduled
-# conversation, a tab from before the front door) — are handed to the front door as requests.
-# The note's path and age, hashed, make the request id, so a note handed over twice (a crash
-# before the rm) is still one request. Until fleet-change is installed a note is left for a
-# later pass.
 FLEET_DIR="$(dirname "$IDENTITIES_DIR")"
 CHANGES_DIR="${AGENT_CHANGES_DIR:-$FLEET_DIR/.changes}"
 ARCHIVE_RETRY_GAP_SECS="${AGENT_ARCHIVE_RETRY_GAP_SECS:-60}"   # a failing archive is retried at most this often
@@ -1870,50 +1864,118 @@ fleet_change() {
   FLEET_CHANGE_FLEET_DIR="$FLEET_DIR" FLEET_CHANGE_LOCK="$CHANGE_LOCK" python3 "$FLEET_CHANGE_BIN" "$@"
 }
 
-# hand_note_to_front_door <note> <kind> <args-json> <label>
-hand_note_to_front_door() {
-  local f="$1" kind="$2" req="$3" label="$4" id out
-  [ -f "$FLEET_CHANGE_BIN" ] || return 0
-  id="note-$(printf '%s:%s' "$f" "$(stat -c %Y "$f" 2>/dev/null)" | sha1sum | cut -c1-20)"
-  if out="$(fleet_change submit "$kind" "$req" --id "$id" --wait 0 2>&1)"; then
-    rm -f "$f"
-    log "$label: ${f##*/} handed to the front door as $id ($kind $req)"
+# ---- notes left the old way ----
+# Agents make their changes with the machine's command (fleet-change submit …), which takes its
+# turn and answers. The notes agents used to leave — `.archive-requested`, `.unarchive-requested`,
+# `.move-requested`, `.compact-requested` (and the older `.recycle-requested`) — are never carried
+# out: an agent still running on old instructions, or a script on another instance, may leave
+# one long after. bounce_old_notes removes each and answers it: a note in a live agent's own
+# folder (or one of its conversation apps) is answered in that agent's conversation; any other
+# gets a reply beside it, `.not-carried-out`, saying what to run instead.
+
+# _bounce_note <note> <command-to-use> [<agent-to-tell>]
+_bounce_note() {
+  local f="$1" cmd="$2" who="${3:-}" d note msg
+  d="${f%/*}"; note="${f##*/}"
+  msg="A $note note was left in $d. Notes are no longer acted on, so nothing was done and the note was removed. Make the change with the machine's command instead, which takes its turn and answers: $cmd"
+  if [ -n "$who" ] && [ -f "$IDENTITIES_DIR/$who/$who.md" ]; then
+    if ! inbox_drop "$who" "<task-notification>
+<summary>Note not carried out — delivered by agent-supervisor</summary>
+<event>$msg</event>
+</task-notification>"; then
+      log "ERROR: couldn't tell '$who' its $note wasn't carried out — kept for the next pass"
+      return 1
+    fi
   else
-    log "ERROR: $label: couldn't hand ${f##*/} to the front door — kept for the next pass: $out"
+    if ! { printf '%s\n%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$msg" > "$d/.not-carried-out.tmp" \
+           && mv "$d/.not-carried-out.tmp" "$d/.not-carried-out"; }; then
+      log "ERROR: couldn't write the reply to $f — kept for the next pass"
+      return 1
+    fi
   fi
+  rm -f "$f"
+  if [ -n "$who" ]; then log "old-style note $f not carried out — told '$who'"
+  else log "old-style note $f not carried out — reply left beside it"; fi
+  metric event=old-note-bounced note="$note"
 }
 
-scan_archive_notes() {
-  local f d n
+SPAWN_REQUESTS_DIR="${AGENT_SPAWN_REQUESTS_DIR:-$FLEET_DIR/spawn-requests}"
+
+# _bounce_spawn_request <file>: a new-agent or new-role request left in the request folder the
+# old way. Answered where its sender looks, <name>.failure.json, with reason "retired" and what
+# to run instead; the request itself is removed.
+_bounce_spawn_request() {
+  local f="$1" base
+  base="${f##*/}"; base="${base%.json}"
+  if ! python3 -c '
+import json, os, sys
+f, out = sys.argv[1], sys.argv[2]
+try:
+    body = json.load(open(f))
+except Exception:
+    body = {}
+role = isinstance(body, dict) and body.get("kind") == "role"
+how = ("fleet-service call role-create --input '"'"'{\"name\":...,\"description\":...}'"'"'" if role else
+       "fleet-service call identity-birth --input '"'"'{\"roles\":[...],\"task\":...,\"prompt\":...}'"'"'")
+msg = ("Requests left in ~/fleet/spawn-requests/ are no longer collected; nothing was made. Send it "
+       "straight to the app'"'"'s server instead and get the answer on the same call: " + how)
+with open(out + ".tmp", "w") as fh:
+    json.dump({"reason": "retired", "message": msg}, fh)
+os.replace(out + ".tmp", out)
+' "$f" "$SPAWN_REQUESTS_DIR/$base.failure.json" 2>/dev/null; then
+    log "ERROR: couldn't answer the old-style request $f — kept for the next pass"
+    return 1
+  fi
+  rm -f "$f"
+  log "old-style request $f not carried out — answered with $base.failure.json"
+  metric event=old-note-bounced note=spawn-request
+}
+
+bounce_old_notes() {
+  local f d n app guidance base
   for f in "$IDENTITIES_DIR"/*/.archive-requested; do
     [ -f "$f" ] || continue; d="${f%/*}"; n="${d##*/}"
-    [[ "$n" =~ ^[a-z0-9_-]{1,64}$ ]] || continue
-    hand_note_to_front_door "$f" agent-archive "{\"name\":\"$n\",\"by\":\"agent\"}" "'$n' archive"
+    _bounce_note "$f" "fleet-change submit agent-archive '{\"name\":\"$n\",\"by\":\"agent\"}' --by agent:$n" "$n"
+  done
+  for f in "$IDENTITIES_DIR"/*/.compact-requested "$IDENTITIES_DIR"/*/.recycle-requested; do
+    [ -f "$f" ] || continue; d="${f%/*}"; n="${d##*/}"
+    # Its guidance, if any, carried into the command to run (quotes and control characters dropped).
+    guidance="$(head -c 1000 "$f" 2>/dev/null | tr -d "\"'\\\\\000-\037\177" | sed -E 's/ +/ /g; s/^ //; s/ $//')"
+    _bounce_note "$f" "fleet-change submit agent-compact '{\"name\":\"$n\",\"guidance\":\"${guidance}\"}' --by agent:$n" "$n"
+  done
+  for f in "$IDENTITIES_DIR"/*/apps/*/.move-requested; do
+    [ -f "$f" ] || continue; d="${f%/*}"; app="${d##*/}"; n="${d%/apps/*}"; n="${n##*/}"
+    _bounce_note "$f" "fleet-change submit app-move '{\"slug\":\"$app\",\"to\":\"project\",\"project\":\"<slug>\"}' (or \"to\":\"sidebar\",\"users\":[...] or null) --by agent:$n" "$n"
+  done
+  for f in "$APPS_DIR"/*/.move-requested "$FLEET_PROJECTS_DIR"/*/apps/*/.move-requested; do
+    [ -f "$f" ] || continue; d="${f%/*}"; app="${d##*/}"
+    _bounce_note "$f" "fleet-change submit app-move '{\"slug\":\"$app\",\"to\":\"project\",\"project\":\"<slug>\"}' (or \"to\":\"sidebar\",\"users\":[...] or null)"
   done
   for f in "$ROLES_DIR"/*/.archive-requested; do
     [ -f "$f" ] || continue; d="${f%/*}"; n="${d##*/}"
-    [[ "$n" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]] || continue
-    hand_note_to_front_door "$f" role-archive "{\"name\":\"$n\"}" "role '$n' archive"
+    _bounce_note "$f" "fleet-change submit role-archive '{\"name\":\"$n\"}'"
   done
   for f in "$APPS_DIR"/*/.archive-requested; do
     [ -f "$f" ] || continue; d="${f%/*}"; n="${d##*/}"
-    [[ "$n" =~ ^[a-z][a-z0-9-]{0,63}$ ]] || continue
-    hand_note_to_front_door "$f" app-archive "{\"slug\":\"$n\"}" "app '$n' archive"
+    _bounce_note "$f" "fleet-change submit app-archive '{\"slug\":\"$n\"}'"
   done
   for f in "$IDENTITIES_ARCHIVE_DIR"/*/.unarchive-requested; do
     [ -f "$f" ] || continue; d="${f%/*}"; n="${d##*/}"
-    [[ "$n" =~ ^[a-z0-9_-]{1,64}$ ]] || continue
-    hand_note_to_front_door "$f" agent-unarchive "{\"name\":\"$n\"}" "'$n' un-archive"
+    _bounce_note "$f" "fleet-change submit agent-unarchive '{\"name\":\"$n\"}'"
   done
   for f in "$ROLES_ARCHIVE_DIR"/*/.unarchive-requested; do
     [ -f "$f" ] || continue; d="${f%/*}"; n="${d##*/}"
-    [[ "$n" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]] || continue
-    hand_note_to_front_door "$f" role-unarchive "{\"name\":\"$n\"}" "role '$n' un-archive"
+    _bounce_note "$f" "fleet-change submit role-unarchive '{\"name\":\"$n\"}'"
   done
   for f in "$APPS_ARCHIVE_DIR"/*/.unarchive-requested; do
     [ -f "$f" ] || continue; d="${f%/*}"; n="${d##*/}"
-    [[ "$n" =~ ^[a-z][a-z0-9-]{0,63}$ ]] || continue
-    hand_note_to_front_door "$f" app-unarchive "{\"slug\":\"$n\"}" "app '$n' un-archive"
+    _bounce_note "$f" "fleet-change submit app-unarchive '{\"slug\":\"$n\"}'"
+  done
+  # Request files, not their answers or one being written: <name>.json only.
+  for f in "$SPAWN_REQUESTS_DIR"/*.json; do
+    [ -f "$f" ] || continue; base="${f##*/}"
+    case "$base" in *.success.json|*.failure.json|*.claimed.json) continue ;; esac
+    _bounce_spawn_request "$f"
   done
 }
 
@@ -2011,64 +2073,6 @@ finish_archiving_roles() {
 }
 
 # ---- project-scoped apps: Move to + archived projects ----
-# scan_app_move_requested_sentinels()
-#
-# Moves are requests to the front door (fleet-change app-move), carried out in arrival order.
-# A `.move-requested` note in an app folder — left from before the front door, or dropped by
-# an agent still using the old way — is handed to the front door as a request and removed, so
-# none is stranded. It holds one JSON object: {"to":"sidebar","users":[...]|null} or
-# {"to":"project","project":"<slug>"}. The note's path and age, hashed, make the request id, so
-# a note handed over twice (a crash before the rm) is still one request. Until fleet-change is
-# installed the note is left where it is for a later pass.
-scan_app_move_requested_sentinels() {
-  local f d slug req id out
-  for f in "$APPS_DIR"/*/.move-requested "$IDENTITIES_DIR"/*/apps/*/.move-requested \
-           "$FLEET_PROJECTS_DIR"/*/apps/*/.move-requested; do
-    [ -f "$f" ] || continue
-    case "$f" in "$FLEET_PROJECTS_DIR"/archive/*) continue ;; esac
-    d="${f%/.move-requested}"
-    slug="$(basename "$d")"
-    [[ "$slug" =~ ^[a-z][a-z0-9-]*$ ]] || { rm -f "$f"; continue; }
-
-    # The app-move request, or nothing on a bad note.
-    req="$(python3 - "$f" "$slug" <<'PY' 2>/dev/null
-import json, re, sys
-try:
-    note = json.load(open(sys.argv[1]))
-except Exception:
-    sys.exit(0)
-if not isinstance(note, dict):
-    sys.exit(0)
-to, out = note.get("to"), {"slug": sys.argv[2]}
-if to == "sidebar":
-    users = note.get("users")
-    if users is None or (isinstance(users, list) and users and all(isinstance(u, str) and re.fullmatch(r"[^,\s]+", u) for u in users)):
-        out.update(to="sidebar", users=users)
-    else:
-        sys.exit(0)
-elif to == "project" and isinstance(note.get("project"), str) and re.fullmatch(r"[a-z0-9-]{1,64}", note["project"]) and note["project"] != "archive":
-    out.update(to="project", project=note["project"])
-else:
-    sys.exit(0)
-print(json.dumps(out, separators=(",", ":")))
-PY
-)"
-    if [ -z "$req" ]; then
-      log "ERROR: app '$slug' move: unreadable .move-requested — dropped"
-      rm -f "$f"
-      continue
-    fi
-    [ -f "$FLEET_CHANGE_BIN" ] || continue
-    id="note-$(printf '%s:%s' "$f" "$(stat -c %Y "$f" 2>/dev/null)" | sha1sum | cut -c1-20)"
-    if out="$(python3 "$FLEET_CHANGE_BIN" submit app-move "$req" --id "$id" --wait 0 2>&1)"; then
-      rm -f "$f"
-      log "app '$slug' move: .move-requested handed to the front door as $id ($req)"
-    else
-      log "ERROR: app '$slug' move: couldn't hand .move-requested to the front door — kept for the next pass: $out"
-    fi
-  done
-}
-
 # retire_archived_project_apps()
 #
 # Archiving a project moves its folder into $FLEET_PROJECTS_DIR/archive/, apps and all. Every
@@ -3224,12 +3228,11 @@ ambient_monitor_bound() {
 # a monitor bound to its CURRENT harness PID gets one started here.
 #   - Rate-limited to once per MONITOR_REPAIR_MINUTES per identity, so a monitor that keeps dying
 #     isn't restarted every tick (each start truncates ambient-monitor.log, wiping the evidence).
-#   - Skipped while .archive-requested is present: retire step 0 stops the monitor on purpose and
-#     owns its own rate-limited restart.
+#   - Skipped while the agent's archive is claimed (.archiving): retire step 0 stops the monitor on
+#     purpose and owns its own rate-limited restart.
 MONITOR_REPAIR_MINUTES="${MONITOR_REPAIR_MINUTES:-10}"
 repair_ambient_monitor() {
   local name="$1" sess="$2" hpid p
-  [ -e "$IDENTITIES_DIR/$name/.archive-requested" ] && return 0
   [ -e "$IDENTITIES_DIR/$name/.archiving" ] && return 0
   # Cheap path: the snapshot has a monitor whose harness is still alive. A monitor outlives its
   # harness by ~1s at most (its own harness-watch), so a live bound PID means it's this harness's.
@@ -3616,9 +3619,10 @@ drive() {
 }
 
 # COMPACTION (Condense): the one way an agent gets more room besides Claude Code's own automatic
-# compaction near the limit. The agent drops `<identity>/.compact-requested` itself, or the app
-# drops it when the user presses Condense conversation; its contents, if any, are the user's
-# guidance for what the summary should keep. The supervisor carries it out in two steps, both
+# compaction near the limit. The agent asks for it with the machine's command (fleet-change submit
+# agent-compact), and so does the app when the user presses Compact conversation; the front door
+# accepts it (refused while the agent's archive is claimed) by writing `<identity>/.compact-queued`,
+# whose contents, if any, are the guidance for what the summary should keep. The supervisor carries it out in two steps, both
 # through the identity's inbox so they serialize with every other paste into the pane (and so a
 # dormant identity is woken by the inbox wake trigger, the same tick):
 #   1. once the agent is at rest at its prompt (or asleep), deliver `/compact [guidance]` and
@@ -3627,8 +3631,8 @@ drive() {
 #      agent's session file, deliver the "Compaction done" event so the agent always takes a
 #      turn afterwards, then remove `.compacting`.
 # The event comes in the supervisor's event envelope, never as plain text, so the agent can't
-# mistake it for the user answering something. `.compact-requested` or `.compacting` present =
-# the app shows "Condensing…".
+# mistake it for the user answering something. `.compact-queued` or `.compacting` present =
+# the app shows "Compacting…".
 COMPACT_TIMEOUT_SECONDS="${COMPACT_TIMEOUT_SECONDS:-900}"
 # A request an awake agent never comes to rest for (or one stuck behind a dialog) is dropped
 # after this long, so the app's "Condensing…" and its disabled button can't hang forever.
@@ -3683,7 +3687,7 @@ compaction_done_event() {
 start_compaction() {
   local name="$1" d="$IDENTITIES_DIR/$1" guidance cmd since
   # Control characters are dropped (an ESC sequence could end the bracketed paste early).
-  guidance="$(head -c "$COMPACT_GUIDANCE_MAX_BYTES" "$d/.compact-requested" 2>/dev/null \
+  guidance="$(head -c "$COMPACT_GUIDANCE_MAX_BYTES" "$d/.compact-queued" 2>/dev/null \
     | iconv -f UTF-8 -t UTF-8 -c 2>/dev/null | tr '\r\n\t' '   ' | tr -d '\000-\037\177' \
     | sed -E 's/ +/ /g; s/^ //; s/ $//')"
   cmd="/compact"
@@ -3698,7 +3702,7 @@ start_compaction() {
     log "ERROR: '$name' compaction: inbox drop failed — request left for the next tick"
     return 1
   fi
-  rm -f "$d/.compact-requested"
+  rm -f "$d/.compact-queued"
   log "'$name' compaction: delivered /compact via inbox (guidance ${#guidance} chars, since $since)"
   metric event=compact-start identity="$name" guidance_chars="${#guidance}"
 }
@@ -3728,31 +3732,21 @@ compaction_progress() {
 # handle_compaction <name> <session-or-empty>: called once per identity per tick.
 handle_compaction() {
   local name="$1" sess="$2" d="$IDENTITIES_DIR/$1"
-  # An agent still running the old id skill asks for a reset by dropping .recycle-requested.
-  # Restarting is gone; treat it as a compaction request so the agent isn't left idle.
-  if [ -f "$d/.recycle-requested" ]; then
-    if [ -f "$d/.compact-requested" ] || [ -f "$d/.compacting" ]; then
-      rm -f "$d/.recycle-requested"
-    else
-      mv "$d/.recycle-requested" "$d/.compact-requested" 2>/dev/null || rm -f "$d/.recycle-requested"
-    fi
-    log "'$name' compaction: old-style reset request taken as a compaction request"
-  fi
   if [ -f "$d/.compacting" ]; then
     [ "${DRY_RUN:-0}" = 1 ] || compaction_progress "$name"
     # A request arriving while one is in flight is the same request (e.g. a double press).
-    if [ -f "$d/.compact-requested" ] && [ -f "$d/.compacting" ]; then
-      rm -f "$d/.compact-requested"
+    if [ -f "$d/.compact-queued" ] && [ -f "$d/.compacting" ]; then
+      rm -f "$d/.compact-queued"
       log "'$name' compaction: request while one is in flight — dropped as a duplicate"
     fi
     return 0
   fi
-  [ -f "$d/.compact-requested" ] || return 0
+  [ -f "$d/.compact-queued" ] || return 0
   if [ "${DRY_RUN:-0}" = 1 ]; then log "DRY_RUN would compact '$name'"; return 0; fi
   local req_age
-  req_age=$(( $(date +%s) - $(stat -c %Y "$d/.compact-requested" 2>/dev/null || date +%s) ))
+  req_age=$(( $(date +%s) - $(stat -c %Y "$d/.compact-queued" 2>/dev/null || date +%s) ))
   if [ "$req_age" -ge "$COMPACT_REQUEST_TIMEOUT_SECONDS" ]; then
-    rm -f "$d/.compact-requested"
+    rm -f "$d/.compact-queued"
     log "WARNING: '$name' compaction: request waited ${req_age}s without the agent coming to rest — dropped"
     metric event=compact-request-expired identity="$name" age_s="$req_age"
     return 0
@@ -4270,7 +4264,7 @@ pending_check() {
   schedule_peek "$name" && return 1
   # A compaction asked for or under way, or anything waiting in the inbox (the /compact itself,
   # the "Compaction done" event, a message): putting the agent to sleep now would lose it.
-  [ -e "$IDENTITIES_DIR/$name/.compact-requested" ] && return 1
+  [ -e "$IDENTITIES_DIR/$name/.compact-queued" ] && return 1
   [ -e "$IDENTITIES_DIR/$name/.compacting" ] && return 1
   inbox_has_files "$name" && return 1
   return 0
@@ -4838,11 +4832,10 @@ reconcile() {
   snapshot_ambient_monitors                        # one ps per tick; repair_ambient_monitor reads from AMBIENT_MONITOR_SNAPSHOT.
   ensure_fleet_changes_up                          # the front door's listener (fleet-changes.service) is running
   run_archive_scan_if_due                          # Phase 94: daily archive-scan branch (24h gate; fast-path no-op on most ticks)
-  scan_archive_notes                               # archive / un-archive notes left the old way, handed to the front door (fleet-change)
+  bounce_old_notes                                 # notes left the old way: never carried out — removed and answered with the command to use
   finish_archiving_identities                      # claimed agent archives: stop the agent, switch its chat account off, move its folder (retried until done)
   finish_archiving_roles                           # claimed role archives: the folder moves once its agents have
   finish_returning_identities                      # accepted agent un-archives: chat account back, folder back, answer the requests
-  scan_app_move_requested_sentinels                # project-scoped apps: leftover Move to notes handed to the front door (fleet-change)
   retire_archived_project_apps                     # project-scoped apps: stop + stash the apps of a project that was archived
   reap_desktops                                    # stop agent-desktop@ units of gone identities, and of dormant ones nobody is viewing
   reap_archived_strays                             # kill processes still working inside an archived identity's folder
@@ -5013,7 +5006,6 @@ launch_newborns() {
   for name in $names; do
     [ -f "$IDENTITIES_DIR/$name/$name.md" ] || continue
     [ -e "$IDENTITIES_DIR/$name/.dormant" ] && continue
-    [ -e "$IDENTITIES_DIR/$name/.archive-requested" ] && continue
     [ -e "$IDENTITIES_DIR/$name/.archiving" ] && continue
     sess="$(slug "$name")"
     timeout -k 5 10 tmux ls -F '#{session_name}' 2>/dev/null | tr '[:upper:]' '[:lower:]' | grep -qxF "$(_lower "$sess")" && continue

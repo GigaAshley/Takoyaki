@@ -12,7 +12,9 @@
 #
 # Sidebar apps only. Conversation apps are archived together with their
 # conversation (the agent-supervisor's identity retire path). Run by the
-# machine's front door (fleet-change app-archive), under the create lock.
+# machine's front door (fleet-change app-archive), under the create lock. Run
+# any other way (an agent typing it), it hands the archive to the front door
+# and prints the outcome: the same as `fleet-change submit app-archive …`.
 #
 # Refuses if there's already an archived copy at the same slug — that would
 # either indicate a name collision or a botched previous archive. In either
@@ -36,6 +38,17 @@ if ! [[ "$SLUG" =~ ^[a-z][a-z0-9-]*$ ]]; then
     die "invalid slug: '$SLUG'"
 fi
 
+# Not run by the front door: hand the archive to it, so it takes its turn with
+# the machine's other changes, and print its outcome (one JSON line).
+if [ -z "${FLEET_CHANGE_RUNNING:-}" ]; then
+    FC="$(command -v fleet-change 2>/dev/null || true)"
+    [ -n "$FC" ] || FC="$HOME/.local/bin/fleet-change"
+    [ -f "$FC" ] || die "the machine's front door (fleet-change) isn't installed yet — try again in a few minutes"
+    OUT=$(python3 "$FC" submit app-archive "{\"slug\":\"$SLUG\"}" --wait 120 ${FLEET_IDENTITY:+--by "agent:$FLEET_IDENTITY"})
+    printf '%s\n' "$OUT"
+    case "$OUT" in *'"state":"done"'*) exit 0 ;; *) exit 1 ;; esac
+fi
+
 APP_DIR="$HOME/fleet/apps/$SLUG"
 ARCHIVE_DIR="$HOME/fleet/apps-archive/$SLUG"
 UNITS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/app-units.sh"
@@ -44,7 +57,7 @@ UNITS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/app-units.sh"
 
 if [ ! -d "$APP_DIR" ] && OWNED_DIR=$(bash "$UNITS" find "$SLUG" 2>/dev/null); then
     case "$OWNED_DIR" in
-        */projects/*) die "'$SLUG' is a project app ($OWNED_DIR). Project apps are archived together with their project — to archive it sooner, move it to the sidebar (move-app.sh $SLUG sidebar) and archive it there." ;;
+        */projects/*) die "'$SLUG' is a project app ($OWNED_DIR). Project apps are archived together with their project — to archive it sooner, move it to the sidebar (fleet-change submit app-move) and archive it there." ;;
         *) die "'$SLUG' is a conversation app ($OWNED_DIR). Conversation apps are archived together with their conversation — there is no separate archive for them." ;;
     esac
 fi
@@ -75,4 +88,4 @@ if ! mv "$APP_DIR" "$ARCHIVE_DIR"; then
 fi
 log "moved $APP_DIR -> $ARCHIVE_DIR"
 
-log "done — $SLUG is archived. Recover by dropping .unarchive-requested inside ~/fleet/apps-archive/$SLUG/ if the user changes their mind."
+log "done — $SLUG is archived. Recover with: fleet-change submit app-unarchive '{\"slug\":\"$SLUG\"}'"

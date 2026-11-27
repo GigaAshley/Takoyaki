@@ -98,16 +98,6 @@ import {
   type RawCosmetics,
 } from "./identity-appearance.js";
 import type { IdentityAppearance } from "./wire-protocol.js";
-import type { PendingBirth } from "../spawn-requests/types.js";
-// Slim import — parse-request-body.ts is a dependency-free extraction that
-// avoids pulling worker.ts's heavy transitive graph (birthIdentity, matrix
-// admin, Skynet DB init, pool-loader) into the fleet-status test module
-// surface. See parse-request-body.ts header for the full rationale.
-import {
-  parseRequestBody,
-  isRoleRequestBody,
-  parseRoleRequestBody,
-} from "../spawn-requests/parse-request-body.js";
 
 // ---------------------------------------------------------------------------
 /** A sweep `changes` entry as the registry holds it (camelCase; gate-only fields kept for the filter). */
@@ -619,7 +609,7 @@ interface PidCacheEntry {
 //
 // Field semantics:
 //   dormant                   — `.dormant` sentinel stat; participates in fingerprint.
-//   condensing                — `.compact-requested` || `.compacting`: the
+//   condensing                — `.compact-queued` || `.compacting`: the
 //                                agent's context is being condensed in place
 //                                (queued or in flight); participates in fingerprint.
 //   lastPublishedFingerprint  — the (dormant|condensing|appearance|lastFinish)
@@ -887,7 +877,7 @@ interface PerIdentityFetchedState {
   name: string;
   /** B1 — `.dormant` sentinel */
   isDormant: boolean;
-  /** B2 — `.compact-requested` sentinel (agent or app asked to condense) */
+  /** B2 — `.compact-queued` sentinel (agent or app asked to condense) */
   isCompactRequested: boolean;
   /** B3 — `.compacting` sentinel (supervisor is compacting right now) */
   isCompacting: boolean;
@@ -1393,222 +1383,6 @@ function adaptAppLineToState(
 }
 
 // ---------------------------------------------------------------------------
-// Phase 99 — spawn-request scan helpers (D-01, D-02, D-03, D-17)
-//
-// One atomic read-and-delete exec per tick per host: lists
-// ~/fleet/spawn-requests/, reads + claims each *.json request file via `mv`
-// (atomic claim — Pitfall 7, RESEARCH Security Note), filters to UUID-shaped
-// basenames (36-char length guard prevents *.success.json / *.failure.json
-// from being claimed), and returns the parsed batch to pollOneHost.
-//
-// Missing folder → empty batch (D-03, not an error).
-// Null SSH return → empty batch, warn logged (fail-open, same as ls path).
-// ---------------------------------------------------------------------------
-
-/**
- * Atomic shell one-liner for the spawn-request scan (RESEARCH Pattern 2).
- *
- * - `cd ... || exit 0` — missing folder short-circuits cleanly (D-03).
- * - `[ -f "$f" ] || continue` — skip glob no-match (*.json expands to literal
- *   when folder is empty, which is guarded by the `[ -f ]` test).
- * - `base="${f%.json}"` then `[ ${#base} -eq 36 ] || continue` — UUID length
- *   guard: request filenames are <uuid>.json (36-char hex-and-dash). Response
- *   files (.success.json, .failure.json) AND in-flight markers (.claimed.json)
- *   have stripped bases of 44+ chars, all rejected here — so the scan never
- *   double-claims a request already in-flight or already resolved (Pitfall 7).
- * - `mv "$f" "$base.claimed.json" 2>/dev/null || continue` — atomic claim.
- *   Only one concurrent tick can win the mv; the loser skips. The renamed
- *   `.claimed.json` marker STAYS on disk as durable in-flight state:
- *     - Operators can `ls` the folder and see queue state at a glance
- *       (raw .json = awaiting scan; .claimed.json = birth in progress;
- *       .success.json / .failure.json = done).
- *     - If Skynet's in-memory queue is wiped by a container restart mid-drain,
- *       the .claimed.json file survives. Operator can manually rename it
- *       back to .json to re-drop rather than silently losing the request.
- *       (Pre-fix: `mv $f $tmp; cat $tmp; rm -f $tmp` deleted the file at
- *       claim time — request evaporated with the queue on restart.)
- * - `printf '%s\t' "$f"; cat "$base.claimed.json"; printf '\n'` — emit
- *   tab-separated `<filename><TAB><body><NEWLINE>`. `$f` is the ORIGINAL
- *   filename (`<uuid>.json`) because bash doesn't retroactively update it
- *   after the mv — parseSpawnRequestBatch's UUID_RE match still works.
- *   No shell quoting of the JSON body — raw bytes to stdout.
- */
-const SPAWN_REQUESTS_SCAN_CMD = [
-  "cd ~/fleet/spawn-requests 2>/dev/null || exit 0;",
-  "for f in *.json; do",
-  "[ -f \"$f\" ] || continue;",
-  "base=\"${f%.json}\";",
-  "[ ${#base} -eq 36 ] || continue;",
-  "mv \"$f\" \"$base.claimed.json\" 2>/dev/null || continue;",
-  "printf '%s\\t' \"$f\"; cat \"$base.claimed.json\"; printf '\\n';",
-  "done",
-].join(" ");
-
-/** UUID shape regex for defense-in-depth in the TS parser (RESEARCH Security Note). */
-const UUID_RE = /^[0-9a-f-]{36}$/i;
-
-/**
- * Parse the batched stdout from the atomic spawn-request scan exec into an
- * array of PendingBirth items.
- *
- * stdout format: one line per claimed file, tab-separated:
- *   <uuid>.json<TAB><json-body><NEWLINE>
- *
- * Skips:
- * - Lines without a TAB separator.
- * - Filenames whose UUID portion fails UUID_RE (e.g. response files).
- * - Lines with malformed JSON (warns + continues).
- *
- * `hostConnDetails` is the sweep-decrypted `_connDetails` bag threaded down
- * from `scanSpawnRequests` (which reads it off the substrate-host record
- * emitted by `list-substrate-hosts.ts`). Used by the worker's response-file
- * writer to SFTP responses back without a per-user resolver call (quick-
- * 260923-9x1 — closes the silent-response-file-failure regression where
- * `resolveHostById(hostId, "")` returned null and the worker gave up).
- * Optional at this seam because the LOCAL scan branch in
- * `scan-orchestrator.ts` legitimately has no SSH bag to pass (LOCAL response
- * writes go straight to the container bind-mount via `writeMarkdownFileAtomic`).
- */
-export function parseSpawnRequestBatch(
-  stdout: string,
-  hostId: string,
-  hostConnDetails?: Record<string, unknown>,
-): PendingBirth[] {
-  if (!stdout.trim()) return [];
-  const results: PendingBirth[] = [];
-  const hostIdNum = parseInt(hostId, 10);
-  for (const line of stdout.split("\n")) {
-    const tab = line.indexOf("\t");
-    if (tab === -1) continue;
-    const filename = line.slice(0, tab).trim();
-    const body = line.slice(tab + 1).trim();
-    const uuid = filename.replace(/\.json$/, "");
-    if (!UUID_RE.test(uuid)) continue;
-
-    // Role requests share the drop folder; `kind: "role"` routes them to the
-    // role worker (processRoleRequest) instead of an identity birth.
-    if (isRoleRequestBody(body)) {
-      const roleParsed = parseRoleRequestBody(body);
-      if (roleParsed.ok === false) {
-        systemLogger.warn("spawn-request-scan: role request malformed — enqueueing malformed failure", {
-          operation: "spawn_request_scan_malformed",
-          fleetHostId: hostId,
-          uuid,
-          kind: "role",
-          reason: roleParsed.message,
-        });
-        results.push({
-          hostId,
-          hostIdNum,
-          uuid,
-          roles: [], prompt: "",
-          task: null,
-          requested_at: "",
-          hostConnDetails,
-          malformedReason: roleParsed.message,
-        });
-        continue;
-      }
-      results.push({
-        hostId,
-        hostIdNum,
-        uuid,
-        roles: [], prompt: "",  // identity fields unused — roleRequest drives behavior
-        task: null,
-        requested_at: roleParsed.body.requested_at,
-        requested_by: roleParsed.body.requested_by,
-        hostConnDetails,
-        roleRequest: roleParsed.body,
-      });
-      continue;
-    }
-
-    // Full request-body validation via the worker's parseRequestBody helper.
-    // On failure, enqueue a PendingBirth with malformedReason so the worker
-    // drops a proper {reason:"malformed", message} failure file back to coord.
-    // (Post-code-review M2/M3: prior version silently dropped malformed
-    // requests via `continue`, leaving coord to time out.)
-    const parsed = parseRequestBody(uuid, body);
-    // Explicit `=== false` narrowing: `!parsed.ok` fails to narrow the
-    // discriminated union under tsconfig.node.json's strict setup (build tsc
-    // sees the full union inside the guard instead of just the ok:false
-    // variant). Same TS 6.0.3 workaround pattern used in identity-birth-
-    // orchestrator.ts mintResult/loginResult call sites.
-    if (parsed.ok === false) {
-      systemLogger.warn("spawn-request-scan: request body malformed — enqueueing malformed failure", {
-        operation: "spawn_request_scan_malformed",
-        fleetHostId: hostId,
-        uuid,
-        reason: parsed.message,
-      });
-      results.push({
-        hostId,
-        hostIdNum,
-        uuid,
-        roles: [], prompt: "",  // malformed-branch defaults (D-13 bridge — malformedReason drives behavior)
-        task: null,
-        requested_at: "",
-        hostConnDetails,
-        malformedReason: parsed.message,
-      });
-      continue;
-    }
-
-    results.push({
-      hostId,
-      hostIdNum,
-      uuid,
-      roles: parsed.body.roles,
-      prompt: parsed.body.prompt,
-      task: parsed.body.task,
-      requested_at: parsed.body.requested_at,
-      users: parsed.body.users,
-      name: parsed.body.name,
-      project: parsed.body.project,
-      requested_by: parsed.body.requested_by,
-      hostConnDetails,
-    });
-  }
-  return results;
-}
-
-/**
- * Issue the atomic scan exec on the per-host SSH channel and return parsed
- * PendingBirth items.
- *
- * Fails open on SSH error (null channel.exec return) — same pattern as the
- * ls listing inside pollOneHost. Missing folder returns empty batch (D-03).
- */
-export async function scanSpawnRequests(host: HostRecord, channel: SshChannel): Promise<PendingBirth[]> {
-  const stdout = await channel.exec(SPAWN_REQUESTS_SCAN_CMD);
-  if (stdout === null) {
-    systemLogger.warn("Spawn-scan: exec returned null (SSH error)", {
-      operation: "spawn_scan_exec_ssh_error",
-      fleetHostId: host.id,
-    });
-    return [];
-  }
-  if (!stdout.trim()) {
-    // Missing folder (cd ... || exit 0) OR empty folder — both non-errors per D-03.
-    return [];
-  }
-  // quick-260923-9x1: pull the sweep-decrypted _connDetails bag off the host
-  // record (populated by list-substrate-hosts.ts via the CSKEK path) so it
-  // rides onto every emitted PendingBirth as hostConnDetails. HostRecord's
-  // declared shape (host-id-resolver.ts:14) is {id, name}, but every call site
-  // in scan-orchestrator.ts and the fleet-status poll loop passes richer
-  // records that carry _connDetails — read it defensively here.
-  const hostConnDetails = (host as unknown as { _connDetails?: Record<string, unknown> })._connDetails;
-  const results = parseSpawnRequestBatch(stdout, host.id, hostConnDetails);
-  systemLogger.info("Spawn-scan: exec complete", {
-    operation: "spawn_scan_exec_complete",
-    fleetHostId: host.id,
-    claimed: results.length,
-  });
-  return results;
-}
-
-// ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
 
@@ -1852,18 +1626,6 @@ export function createSshPollOrchestrator(
    */
   const PROBE_TIMEOUT_MS = 5000;
 
-// ---------------------------------------------------------------------------
-// Phase 99 — spawn-request scan helpers (D-01, D-02, D-03, D-17)
-//
-// One atomic read-and-delete exec per tick per host: lists
-// ~/fleet/spawn-requests/, reads + claims each *.json request file via `mv`
-// (atomic claim — Pitfall 7, RESEARCH Security Note), filters to UUID-shaped
-// basenames (36-char length guard prevents *.success.json / *.failure.json
-// from being claimed), and returns the parsed batch to pollOneHost.
-//
-// Missing folder → empty batch (D-03, not an error).
-// Null SSH return → empty batch, warn logged (fail-open, same as ls path).
-
   /**
    * pollOneHost — dispatcher. See docblock above.
    */
@@ -2006,11 +1768,6 @@ export function createSshPollOrchestrator(
       const result = await pollOneHostBatch(hostState);
       if (result.ok) {
         noteSshSuccess(host.id);
-        // Spawn-request scan is NO LONGER piggybacked here — a dedicated
-        // always-on `createSpawnScanOrchestrator` in `../spawn-requests/
-        // scan-orchestrator.ts` runs at container boot and owns scanning
-        // independently of WS-subscriber lifecycle. See bounty
-        // fleet-status-orchestrator-coupling-with-spawn-request-scanning.
         systemLogger.info("Fleet-status poll end (batch)", {
           operation: "fleet_status_poll_end",
           fleetHostId: host.id,
@@ -2077,11 +1834,6 @@ export function createSshPollOrchestrator(
     // the SSH client via releaseSshChannel so the next tick reconnects fresh,
     // which is the only way to reclaim any semaphore slots the stuck execs are
     // still holding.
-    //
-    // Spawn-request scan is NO LONGER piggybacked inside this bound — see
-    // bounty fleet-status-orchestrator-coupling-with-spawn-request-scanning.
-    // A dedicated always-on scanner lives in `../spawn-requests/scan-
-    // orchestrator.ts`, wired at container boot.
     try {
       await Promise.race([
         pollOneHostLegacy(hostState),
@@ -2786,7 +2538,7 @@ export function createSshPollOrchestrator(
   //   - Phase 53 / quick-260823-73o: source B became the SOLE publisher of a
   //     second per-identity axis (then "recycling", for the retired agent
   //     reset). Source A omits the field.
-  //   - Condense: that axis is now `condensing` = `.compact-requested` ||
+  //   - Condense: that axis is now `condensing` = `.compact-queued` ||
   //     `.compacting`. The supervisor compacts the agent's context in place
   //     (agent-supervisor.sh handle_compaction); the agent may keep its live
   //     PID throughout, so the `liveTmuxSet.has(name)` skip is CONDITIONAL:
@@ -2795,7 +2547,7 @@ export function createSshPollOrchestrator(
   //     this tick (no conflict — source A never stamps the axis).
   //
   // Per-tick pipeline (per identity):
-  //   1. Parallel-stat the three sentinels (`.dormant`, `.compact-requested`,
+  //   1. Parallel-stat the three sentinels (`.dormant`, `.compact-queued`,
   //      `.compacting`) — 3 exec calls in parallel per identity (legacy path;
   //      the batch sweep emits them on the SweepIdentityLine).
   //   2. Compose isCondensing = compactRequested || compacting.
@@ -2862,7 +2614,7 @@ export function createSshPollOrchestrator(
             `stat ~/fleet/identities/${quotedName}/.dormant 2>/dev/null >/dev/null && echo yes || echo no`,
           ),
           channel.exec(
-            `stat ~/fleet/identities/${quotedName}/.compact-requested 2>/dev/null >/dev/null && echo yes || echo no`,
+            `stat ~/fleet/identities/${quotedName}/.compact-queued 2>/dev/null >/dev/null && echo yes || echo no`,
           ),
           channel.exec(
             `stat ~/fleet/identities/${quotedName}/.compacting 2>/dev/null >/dev/null && echo yes || echo no`,
