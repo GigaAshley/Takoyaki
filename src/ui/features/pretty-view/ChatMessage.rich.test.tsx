@@ -54,18 +54,11 @@ describe("tables", () => {
     expect(bodyColumn(0)).toEqual(["a", "b", "c"]);
   });
 
-  it("folds a long table behind 'show all' and unfolds it", () => {
+  it("shows every row of a long table, with no fold control", () => {
     const rows = Array.from({ length: 14 }, (_, i) => `| r${i} | ${i} |`);
     agent(["| name | n |", "| - | - |", ...rows].join("\n"));
-    expect(document.querySelectorAll("tbody tr")).toHaveLength(10);
-    fireEvent.click(screen.getByTestId("rich-table-fold"));
     expect(document.querySelectorAll("tbody tr")).toHaveLength(14);
-    expect(screen.getByTestId("rich-table-fold").textContent).toBe("Show fewer");
-  });
-
-  it("a short table gets no fold control", () => {
-    agent(TABLE);
-    expect(screen.queryByTestId("rich-table-fold")).toBeNull();
+    expect(screen.queryByText(/Show all|Show fewer/)).toBeNull();
   });
 
   it("copies every row in the order on screen, for a spreadsheet", async () => {
@@ -83,9 +76,12 @@ describe("tables", () => {
     expect(lines[1]).toBe("r11\t1");
   });
 
-  it("speaks as its size and headings, not every cell", () => {
+  it("speaks every row under its headings, in the agent's order even when sorted", () => {
     agent(TABLE);
-    const sr = within(screen.getByTestId("rich-table")).getByText("A table of 3 rows: host, disk.");
+    fireEvent.click(screen.getByRole("columnheader", { name: /disk/ }));
+    const sr = within(screen.getByTestId("rich-table")).getByText(
+      "A table of 3 rows. host b, disk 10. host a, disk 9. host c, disk 100.",
+    );
     expect(sr.className).toContain("sr-only");
   });
 

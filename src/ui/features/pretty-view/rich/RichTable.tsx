@@ -5,11 +5,10 @@ import { tableSpeech } from "./rich-speech";
 
 // Every ordinary table in an agent reply, made workable (shape-wealthy-text):
 // click a heading to sort (low→high, high→low, back to the agent's order),
-// long tables fold after FOLD_ROWS, and copy / download take it out as a
-// spreadsheet. Copy and download follow the sort on screen and always carry
-// every row. Nothing is remembered: a reload shows the agent's order.
-
-export const FOLD_ROWS = 10;
+// and copy / download take it out as a spreadsheet. Every row is always shown
+// and read aloud (shape-tables-in-full). Copy and download follow the sort on
+// screen; the spoken line keeps the agent's order. Nothing is remembered: a
+// reload shows the agent's order.
 
 type HastLike = { type?: string; tagName?: string; value?: string; children?: HastLike[] };
 type Dir = "asc" | "desc";
@@ -118,7 +117,6 @@ export function RichTable({ node, children, ...props }: { node?: unknown; childr
   }, [hast]);
 
   const [sort, setSort] = useState<{ col: number; dir: Dir } | null>(null);
-  const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
   const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -131,15 +129,13 @@ export function RichTable({ node, children, ...props }: { node?: unknown; childr
   const sortable = !!thead && rowEls.length === rows.length && headers.length > 0;
 
   const order = useMemo(() => (sort && sortable ? sortOrder(rows, sort.col, sort.dir) : rows.map((_, i) => i)), [sort, sortable, rows]);
-  const folded = !expanded && rows.length > FOLD_ROWS;
-  const shown = folded ? order.slice(0, FOLD_ROWS) : order;
   const orderedRows = order.map((i) => rows[i]);
 
   const onSort = (col: number) =>
     setSort((s) => (!s || s.col !== col ? { col, dir: "asc" } : s.dir === "asc" ? { col, dir: "desc" } : null));
 
   const headEl = thead && sortable ? cloneHead(thead, sort, onSort) : thead;
-  const bodyEl = tbody ? React.cloneElement(tbody, {}, shown.map((i) => rowEls[i] ?? null)) : null;
+  const bodyEl = tbody ? React.cloneElement(tbody, {}, order.map((i) => rowEls[i] ?? null)) : null;
 
   const onCopy = async () => {
     const tsv = toTsv(headers, orderedRows);
@@ -182,11 +178,6 @@ export function RichTable({ node, children, ...props }: { node?: unknown; childr
         </table>
       </div>
       <div className="pv-rich-table-bar" {...{ [SPEAK_SKIP_ATTR]: "" }}>
-        {rows.length > FOLD_ROWS && (
-          <button type="button" className="pv-rich-tool" data-testid="rich-table-fold" onClick={() => setExpanded((v) => !v)}>
-            {expanded ? "Show fewer" : `Show all ${rows.length} rows`}
-          </button>
-        )}
         <span className="pv-rich-table-tools">
           <button type="button" className="pv-rich-tool" data-testid="rich-table-copy" onClick={() => void onCopy()} title="Copy for a spreadsheet" aria-label="Copy table">
             {copied ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
@@ -196,7 +187,7 @@ export function RichTable({ node, children, ...props }: { node?: unknown; childr
           </button>
         </span>
       </div>
-      <span className="sr-only">{tableSpeech(headers, rows.length)}</span>
+      <span className="sr-only">{tableSpeech(headers, rows)}</span>
     </div>
   );
 }

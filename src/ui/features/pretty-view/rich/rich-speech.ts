@@ -72,11 +72,24 @@ export function diagramSpeech(lang: string, source: string): string {
 
 // ── Tables ──
 
-/** "A table of 12 rows: host, disk, memory." */
-export function tableSpeech(headings: string[], rowCount: number): string {
-  const heads = headings.map((h) => h.trim()).filter(Boolean);
-  const rows = `${rowCount} ${rowCount === 1 ? "row" : "rows"}`;
-  return `A table of ${rows}${heads.length ? `: ${heads.join(", ")}` : ""}.`;
+/**
+ * "A table of 2 rows. Host thenasty, Disk 62%. Host workstation, Disk 80%."
+ * Every row, in the agent's order, each cell after its column heading. Cells
+ * are read as written (shape-tables-in-full).
+ */
+export function tableSpeech(headings: string[], rows: string[][]): string {
+  const one = (s: string | undefined) => (s ?? "").replace(/\s+/g, " ").trim();
+  const count = `${rows.length} ${rows.length === 1 ? "row" : "rows"}`;
+  const spoken = rows
+    .map((cells) =>
+      cells
+        .map((cell, i) => `${one(headings[i])} ${one(cell)}`.trim())
+        .filter(Boolean)
+        .join(", "),
+    )
+    .filter(Boolean)
+    .map((row) => ` ${stripStop(row)}.`);
+  return `A table of ${count}.${spoken.join("")}`;
 }
 
 // ── Math ──
@@ -166,8 +179,10 @@ export function splitFences(markdown: string): Segment[] {
 
 const TABLE_DELIM = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/;
 
+/** A table line's cells; `\\|` is a pipe inside a cell, not a border. */
 function splitRow(line: string): string[] {
-  return line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => c.trim());
+  const cells = line.trim().replace(/^\|/, "").replace(/(?<!\\)\|$/, "").split(/(?<!\\)\|/);
+  return cells.map((c) => c.replace(/\\\|/g, "|").trim());
 }
 
 function speakTables(prose: string): string {
@@ -178,7 +193,8 @@ function speakTables(prose: string): string {
       const heads = splitRow(lines[i]).map(plainCell);
       let j = i + 2;
       while (j < lines.length && lines[j].includes("|") && lines[j].trim()) j++;
-      out.push(tableSpeech(heads, j - i - 2));
+      const rows = lines.slice(i + 2, j).map((l) => splitRow(l).map(plainCell));
+      out.push(tableSpeech(heads, rows));
       i = j - 1;
       continue;
     }
@@ -188,7 +204,10 @@ function speakTables(prose: string): string {
 }
 
 function plainCell(s: string): string {
-  return s.replace(/[*_`~]/g, "").replace(/\[([^\]]*)\]\([^)]*\)/g, "$1");
+  return s
+    .replace(/<br\s*\/?>/gi, " ")
+    .replace(/[*_`~]/g, "")
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1");
 }
 
 function speakMath(prose: string): string {
@@ -214,7 +233,7 @@ function speakFence(seg: Segment): string {
 
 /**
  * Voice mode's view of wealthy text: charts and diagrams become their spoken
- * line, tables their size and headings, formulas their words. A closed
+ * line, tables every row read under its headings, formulas their words. A closed
  * section is just its summary — everything inside it, code blocks and charts
  * included, stays silent; one written to start open is read in full. Other
  * code blocks are left for the caller.

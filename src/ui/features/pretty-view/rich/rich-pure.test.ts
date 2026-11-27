@@ -113,9 +113,18 @@ describe("table helpers", () => {
     expect(tableFilename(["", "x"])).toBe("table.csv");
   });
 
-  it("speaks its size and headings", () => {
-    expect(tableSpeech(["host", "disk"], 12)).toBe("A table of 12 rows: host, disk.");
-    expect(tableSpeech(["x"], 1)).toBe("A table of 1 row: x.");
+  it("speaks every row, each cell after its heading", () => {
+    expect(tableSpeech(["Host", "Disk", "Memory"], [["thenasty", "62%", "4 GB"], ["workstation", "80%", "8 GB"]])).toBe(
+      "A table of 2 rows. Host thenasty, Disk 62%, Memory 4 GB. Host workstation, Disk 80%, Memory 8 GB.",
+    );
+    expect(tableSpeech(["x"], [["1"]])).toBe("A table of 1 row. x 1.");
+    expect(tableSpeech(["a", "b"], [])).toBe("A table of 0 rows.");
+  });
+
+  it("reads cells as written: blanks, symbols, a blank heading, a closing full stop", () => {
+    expect(tableSpeech(["", "Done", "Notes"], [["step 1", "✓", ""], ["step 2", "—", "Waiting on it."]])).toBe(
+      "A table of 2 rows. step 1, Done ✓, Notes. step 2, Done —, Notes Waiting on it.",
+    );
   });
 });
 
@@ -161,7 +170,7 @@ describe("voice mode reads wealthy text as its spoken lines", () => {
     ].join("\n");
     const out = richSpeakable(md);
     expect(out).toContain("A pie chart: Disk.");
-    expect(out).toContain("A table of 2 rows: host, disk.");
+    expect(out).toContain("A table of 2 rows. host a, disk 1. host b, disk 2.");
     expect(out).toContain("A flowchart.");
     expect(out).toContain("Full logs.");
     expect(out).not.toContain("noisy");
@@ -260,5 +269,25 @@ describe("review fixes", () => {
     expect(open).toContain("x1");
     expect(open).toContain("B.");
     expect(open).not.toContain("x2");
+  });
+});
+
+describe("voice mode reads table cells", () => {
+  it("plain-words formatting and links, keeps escaped pipes in a cell, reads every row", () => {
+    const rows = Array.from({ length: 14 }, (_, i) => `| r${i} | ${i} |`);
+    const md = [
+      "| **Name** | Link |",
+      "| :-- | --: |",
+      "| `a\\|b` | [docs](https://example.com) |",
+      "| c<br>d | *x* |",
+      "",
+      "| name | n |",
+      "| - | - |",
+      ...rows,
+    ].join("\n");
+    const out = richSpeakable(md);
+    expect(out).toContain("A table of 2 rows. Name a|b, Link docs. Name c d, Link x.");
+    expect(out).toContain("A table of 14 rows. name r0, n 0.");
+    expect(out).toContain("name r13, n 13.");
   });
 });
