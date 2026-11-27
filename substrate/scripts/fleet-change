@@ -59,11 +59,12 @@ Request kinds:
                     refused with code contents_changed (and the current
                     contents as result) when the machine's contents no longer
                     match what the user confirmed. Its agents are claimed.
-  agent-archive     {"name", "dormant"?: true, "by"?: "agent"|"scheduled"}
+  agent-archive     {"name", "dormant"?: true, "idleFor"?: <s>, "by"?: "agent"|"scheduled"}
                     claims the agent (.archiving in its folder): from then on it's
                     gone from every list, never launched, and stopped; the
                     supervisor finishes the archive in the background.
-                    "dormant" = the 180-day sleep sweep (its guards are checked).
+                    "dormant" = the 180-day sleep sweep (its guards are checked,
+                    and it must still have been idle for idleFor seconds).
   agent-unarchive   {"name"}  quick checks, then handed to the supervisor, which
                     brings the chat account and the folder back and finishes the
                     request. Waits for an archive of the same agent to finish.
@@ -625,6 +626,7 @@ def do_project_archive(args, entry, save_plan):
                 raise Refused("contents_changed",
                               "what's in \"%s\" changed since you looked; check the list again" % project_label(slug),
                               current)
+            refuse_taken_agent_slots([a["name"] for a in current["agents"]])
             plan = {
                 "projects": [p["slug"] for p in current["projects"]],
                 "agents": [a["name"] for a in current["agents"]],
@@ -824,6 +826,15 @@ def check_name(args, key="name", pattern=NAME_RE, what="name"):
     return v
 
 
+def refuse_taken_agent_slots(names):
+    """An archive that takes several agents is refused, before anything is claimed, when any of
+    them has an archived agent of the same name in the way (its archive could never finish)."""
+    taken = [n for n in names if os.path.exists(os.path.join(IDENTITIES_ARCHIVE, n))]
+    if taken:
+        raise Refused("archive_slot_taken", "an archived agent named '%s' is already in the archive; "
+                      "nothing was archived" % taken[0])
+
+
 def do_agent_archive(args, entry, save_plan):
     name = check_name(args)
     d = os.path.join(IDENTITIES, name)
@@ -837,12 +848,23 @@ def do_agent_archive(args, entry, save_plan):
         raise Refused("not_found", "there's no agent '%s' on this machine" % name)
     by = "user"
     if args.get("dormant") is True:
-        # The 180-day sleep sweep: its guards are checked again now, not when it looked.
+        # The 180-day sleep sweep: its guards are checked again now, not when it looked —
+        # including how long it has been idle (it may have woken while this waited its turn).
         by = "dormant"
         fm = frontmatter(os.path.join(d, name + ".md")) or {}
         if os.path.exists(os.path.join(d, ".pinned")) or os.path.exists(os.path.join(d, ".no-dormancy")) \
                 or str(fm.get("coordinator", "")).lower() == "true":
             raise Refused("guarded", "it's pinned, always-on or a coordinator")
+        idle_for = args.get("idleFor")
+        if not isinstance(idle_for, (int, float)) or idle_for <= 0:
+            raise Refused("bad_request", "idleFor (seconds) is required with dormant")
+        cursor = os.path.join(d, "relay-state", "since")
+        try:
+            fresh = os.stat(cursor if os.path.exists(cursor) else d).st_mtime
+        except OSError:
+            fresh = 0
+        if time.time() - fresh < idle_for:
+            raise Refused("not_idle", "it has been active since the sleep sweep looked")
     elif args.get("by") in ("agent", "scheduled"):
         by = args["by"]
     if os.path.exists(os.path.join(IDENTITIES_ARCHIVE, name)):
@@ -919,13 +941,16 @@ def do_role_archive(args, entry, save_plan):
     current = role_contents(name)
     expected = args.get("expected")
     if expected is not None:
-        if not isinstance(expected, dict) or not isinstance(expected.get("agents"), list):
-            raise Refused("bad_request", "expected must be {\"agents\": [...]}")
-        want = sorted(a["name"] if isinstance(a, dict) else a for a in expected["agents"])
+        items = expected.get("agents") if isinstance(expected, dict) else None
+        if not isinstance(items, list) or not all(
+                isinstance(a, str) or (isinstance(a, dict) and isinstance(a.get("name"), str)) for a in items):
+            raise Refused("bad_request", "expected must be {\"agents\": [names]}")
+        want = sorted(a["name"] if isinstance(a, dict) else a for a in items)
         if want != sorted(a["name"] for a in current["agents"]):
             raise Refused("contents_changed", "the agents holding this role changed since you looked; check the list again",
                           current)
     agents = [a["name"] for a in current["agents"]]
+    refuse_taken_agent_slots(agents)
     for a in agents:
         claim(os.path.join(IDENTITIES, a), entry["id"], "role:%s" % name)
     claim(d, entry["id"], "user" if expected is not None else "note", {"agents": agents})
@@ -1000,35 +1025,62 @@ def unit_lines(pattern):
     return out
 
 
+def start_unarchived_app(slug, live):
+    """Put back and start the units of an app whose folder is back in the sidebar. Its saved
+    units stay in its folder until it has started, so a failed start can be tried again."""
+    sock = os.path.join(live, "app-%s.socket.archived" % slug)
+    svc = os.path.join(live, "app-%s.service.archived" % slug)
+    if os.path.isfile(sock):
+        rc, out = run(["bash", APP_UNITS, "restore", slug, live], timeout=60)
+        if rc != 0:
+            raise Failed("restore_failed", "it's back but couldn't be started: %s" % (out.strip()[-200:] or rc))
+        return
+    unit = os.path.join(UNIT_DIR, "app-%s.service" % slug)
+    if os.path.isfile(svc):
+        import shutil
+        os.makedirs(UNIT_DIR, exist_ok=True)
+        shutil.copyfile(svc, unit)
+    if not os.path.isfile(unit):
+        return  # nothing saved and nothing installed: not an app this can start
+    run([SYSTEMCTL, "--user", "daemon-reload"])
+    rc, out = run([SYSTEMCTL, "--user", "enable", "--now", "app-%s.service" % slug])
+    if rc != 0:
+        raise Failed("restore_failed", "it's back but couldn't be started: %s" % (out.strip()[-200:] or rc))
+    if os.path.isfile(svc):
+        os.unlink(svc)
+
+
 def do_app_unarchive(args, entry, save_plan):
     slug = check_name(args, "slug", APP_SLUG_RE, "slug")
     live, arch = os.path.join(APPS, slug), os.path.join(APPS_ARCHIVE, slug)
     if not os.path.isdir(arch):
         if os.path.isdir(live):
+            # Back already — an earlier try whose start failed is finished now.
+            if os.path.isfile(os.path.join(live, "app-%s.socket.archived" % slug)) or \
+                    os.path.isfile(os.path.join(live, "app-%s.service.archived" % slug)):
+                start_unarchived_app(slug, live)
+                log("app '%s' un-archive: started it on a later try" % slug)
             return {"slug": slug, "already": True}
         raise Refused("archive_not_found", "'%s' isn't in the archive" % slug)
     if os.path.exists(live):
         raise Refused("name_collision", "a live app named '%s' already exists on this machine" % slug)
     sock = os.path.join(arch, "app-%s.socket.archived" % slug)
     svc = os.path.join(arch, "app-%s.service.archived" % slug)
-    current_style = os.path.isfile(sock)
-    if current_style:
+    if os.path.isfile(sock):
         if os.path.exists(os.path.join(UNIT_DIR, "app-%s.socket" % slug)) or \
                 os.path.exists(os.path.join(UNIT_DIR, "app-%s.service" % slug)):
             raise Refused("units_installed", "units for app-%s are already installed" % slug)
-        m = None
-        with open(sock, encoding="utf-8", errors="replace") as f:
-            for ln in f:
-                m = m or re.match(r"^ListenStream=127\.0\.0\.1:(\d+)$", ln.strip())
+        stash, pattern = sock, r"^ListenStream=127\.0\.0\.1:(\d+)$"
     else:
         if os.path.exists(os.path.join(UNIT_DIR, "app-%s.service" % slug)):
             raise Refused("units_installed", "units for app-%s are already installed" % slug)
         if not os.path.isfile(svc):
             raise Refused("no_stash", "its saved units are missing, so its port can't be restored")
-        m = None
-        with open(svc, encoding="utf-8", errors="replace") as f:
-            for ln in f:
-                m = m or re.match(r"^Environment=PORT=(\d+)$", ln.strip())
+        stash, pattern = svc, r"^Environment=PORT=(\d+)$"
+    m = None
+    with open(stash, encoding="utf-8", errors="replace") as f:
+        for ln in f:
+            m = m or re.match(pattern, ln.strip())
     if not m:
         raise Refused("no_stash", "its port can't be read from its saved units")
     port = m.group(1)
@@ -1043,20 +1095,7 @@ def do_app_unarchive(args, entry, save_plan):
                 pass
         os.makedirs(APPS, exist_ok=True)
         os.rename(arch, live)
-        if not current_style:
-            os.makedirs(UNIT_DIR, exist_ok=True)
-            import shutil
-            shutil.copyfile(os.path.join(live, os.path.basename(svc)), os.path.join(UNIT_DIR, "app-%s.service" % slug))
-            os.unlink(os.path.join(live, os.path.basename(svc)))
-    if current_style:
-        rc, out = run(["bash", APP_UNITS, "restore", slug, live], timeout=60)
-        if rc != 0:
-            raise Failed("restore_failed", "it's back but couldn't be started: %s" % (out.strip()[-200:] or rc))
-    else:
-        run([SYSTEMCTL, "--user", "daemon-reload"])
-        rc, out = run([SYSTEMCTL, "--user", "enable", "--now", "app-%s.service" % slug])
-        if rc != 0:
-            raise Failed("restore_failed", "it's back but couldn't be started: %s" % (out.strip()[-200:] or rc))
+    start_unarchived_app(slug, live)
     log("app '%s' un-archived on port %s" % (slug, port))
     return {"slug": slug, "port": int(port)}
 

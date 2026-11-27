@@ -1812,7 +1812,7 @@ run_archive_scan() {
       continue
     fi
     local out
-    if out="$(fleet_change submit agent-archive "{\"name\":\"$name\",\"dormant\":true}" \
+    if out="$(fleet_change submit agent-archive "{\"name\":\"$name\",\"dormant\":true,\"idleFor\":$ARCHIVE_THRESHOLD_SECONDS}" \
         --id "dormant-$name-$(date -u +%Y%m%d)" --wait 0 2>&1)"; then
       log "archive-scan: '$name' archive requested at the front door"
     else
@@ -2406,15 +2406,31 @@ _unarchive_refuse() {
 # request waiting on the un-archive in hand ($UNARCHIVE_RETURNING), then let it go.
 UNARCHIVE_RETURNING=""
 _unarchive_finish() {
-  local rf="$UNARCHIVE_RETURNING" id
+  local rf="$UNARCHIVE_RETURNING" id ids
   [ -n "$rf" ] && [ -f "$rf" ] || return 0
+  # Read the waiting requests and let go of the un-archive in one step under the change lock:
+  # the front door adds a second click's id to this file under the same lock, so no id can
+  # arrive between the read and the removal and be left unanswered.
+  ids="$(mktemp)" || return 0
+  if ! with_change_lock _unarchive_take_ids "$rf" "$ids"; then
+    rm -f "$ids"
+    log "WARN: couldn't take the change lock to answer the un-archive in $rf — next pass"
+    return 0
+  fi
   while IFS= read -r id; do
     [ -n "$id" ] || continue
     if ! fleet_change finish "$id" "$@" >/dev/null 2>&1; then
       log "WARN: couldn't write the outcome of un-archive request $id"
     fi
-  done < <(jq -r '.ids[]? // empty' "$rf" 2>/dev/null)
-  with_change_lock rm -f "$rf"
+  done < "$ids"
+  rm -f "$ids"
+}
+
+# _unarchive_take_ids <returning-file> <ids-out>: (under the change lock) copy out its request
+# ids and remove it.
+_unarchive_take_ids() {
+  jq -r '.ids[]? // empty' "$1" > "$2" 2>/dev/null || return 1
+  rm -f "$1"
 }
 
 # _unarchive_relay_set <relay.json> [jq args...] <jq-filter> — atomic 0600 rewrite.
@@ -2658,7 +2674,8 @@ _unarchive_identity() {
   [ -e "$live/.archiving" ] && return 0
   if [ ! -d "$d" ]; then
     if [ -f "$live/$name.md" ]; then
-      # Back already (a pass cut off after the folder move).
+      # Back already: a pass cut off after the folder move. Finish what came after it.
+      [ -e "$live/.unarchive-finishing" ] && _unarchive_after_move "$name" "$live"
       _unarchive_finish done --result "{\"name\":\"$name\"}"
     else
       _unarchive_refuse "$d" "$name" "'$name' isn't in the archive" archive_not_found
@@ -2714,8 +2731,10 @@ _unarchive_identity() {
     log "'$name' un-archive step 4: .dormant written in archive folder"
   fi
 
-  # Step 5: clear the flag, progress state and any old refusal note BEFORE the mv.
+  # Step 5: clear the flag, progress state and any old refusal note BEFORE the mv, and mark
+  # what's left to do after it (apps, banner) so a pass cut off after the move still does it.
   rm -f "${d:?}/.unarchive-refused" "${d:?}/.unarchive-reactivate" "${d:?}/.unarchive-requested"
+  : > "$d/.unarchive-finishing"
 
   # Step 6: mv archive → live, as one change under the change lock.
   mkdir -p "$IDENTITIES_DIR" 2>/dev/null || true
@@ -2724,6 +2743,14 @@ _unarchive_identity() {
     return 0
   fi
   log "'$name' un-archive COMPLETE: folder moved to live tree"
+  _unarchive_after_move "$name" "$live"
+  _unarchive_finish done --result "{\"name\":\"$name\"}"
+}
+
+# _unarchive_after_move <name> <live-dir>: the steps after the folder is back — its apps, and the
+# "you were unarchived" banner — then the .unarchive-finishing mark goes.
+_unarchive_after_move() {
+  local name="$1" live="$2"
   restore_identity_apps "$name" "$live"
 
   # Step 7: Prepend un-archive banner (non-fatal).
@@ -2735,7 +2762,7 @@ _unarchive_identity() {
   else
     log "WARN: '$name' un-archive step 7 (banner prepend) FAILED — un-archive is otherwise complete; agent won't see the in-session un-archive banner. Investigate: $live_ident_file"
   fi
-  _unarchive_finish done --result "{\"name\":\"$name\"}"
+  rm -f "$live/.unarchive-finishing"
 }
 
 # Find the ACTUAL existing tmux session name matching $1 CASE-INSENSITIVELY (tmux names are
@@ -5022,6 +5049,13 @@ wait_for_next_tick() {
   fi
   local gap="$NEW_IDENTITY_MIN_GAP"; [ "$gap" -gt "$total" ] && gap="$total"
   sleep "$gap"
+  # The front door woke us during the pass (or the gap): nothing was watching then, so go now.
+  local woke
+  woke="$(stat -c %Y "$IDENTITIES_DIR/.supervisor-wake" 2>/dev/null || echo 0)"
+  if [ -n "${PASS_STARTED_AT:-}" ] && [ "$woke" -ge "$PASS_STARTED_AT" ]; then
+    log "front door has work for this pass (woke during the last one) — next pass now"
+    return 0
+  fi
   local deadline=$(( $(date +%s) + total - gap ))
   local out err pid rc remaining ev f i newname
   out="$(mktemp)"; err="$(mktemp)"
@@ -5103,6 +5137,6 @@ case "${1:-}" in
     # rm — a fresh supervisor process starts with a clean slate. belt-and-suspenders alongside the
     # freshness-timestamp check consumers use to distinguish this-wake from prior-wake.
     for d in "$IDENTITIES_DIR"/*/; do rm -f "$d/.resume-complete" 2>/dev/null; done
-    while :; do IDENTITY_LISTING_AT_TICK="$(identity_listing)"; launch_newborns; reconcile; wait_for_next_tick; done
+    while :; do PASS_STARTED_AT="$(date +%s)"; IDENTITY_LISTING_AT_TICK="$(identity_listing)"; launch_newborns; reconcile; wait_for_next_tick; done
     ;;
 esac

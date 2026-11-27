@@ -79,6 +79,8 @@ export function parseFrontDoorLine(id: string, line: string): FrontDoorOutcome {
     }
     case "refused":
     case "failed":
+      // A listener from before this kind existed refuses it: still updating, not a refusal.
+      if (raw.code === "unknown_kind") return { state: "not_installed", id };
       return {
         state: raw.state,
         id,
@@ -139,7 +141,9 @@ async function submitOverSsh(
   const fc = '"$HOME/.local/bin/fleet-change"';
   const cmd =
     `if [ -f ${fc} ]; then python3 ${fc} submit ${kind} ${shellWord(JSON.stringify(args))} ` +
-    `--id ${shellWord(id)} --wait ${waitS}; else echo '{"state":"not_installed"}'; fi`;
+    // An older fleet-change that doesn't know this kind exits with a usage error: the
+    // machine's update after a deploy hasn't finished.
+    `--id ${shellWord(id)} --wait ${waitS} || echo '{"state":"not_installed"}'; else echo '{"state":"not_installed"}'; fi`;
   let out: string;
   try {
     out = await execCommand(conn, cmd, { timeoutMs: waitS * 1000 + EXEC_GRACE_MS });

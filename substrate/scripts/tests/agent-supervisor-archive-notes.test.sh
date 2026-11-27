@@ -110,7 +110,7 @@ test_sleep_sweep_asks_the_front_door() {
   local s; s=$(setup)
   agent "$s" finch; touch -d '2025-01-01' "$s/fleet/identities/finch"
   ( source_supervisor "$s"; run_archive_scan ) >/dev/null 2>&1
-  grep -qF 'submit agent-archive {"name":"finch","dormant":true} --id dormant-finch-' "$s/calls" \
+  grep -qF 'submit agent-archive {"name":"finch","dormant":true,"idleFor":15552000} --id dormant-finch-' "$s/calls" \
     || fail "sweep didn't ask the front door: $(cat "$s/calls" 2>/dev/null)"
   assert_exists "$s/fleet/identities/finch/finch.md" "nothing retired directly"
   rm -rf "$s"
@@ -154,6 +154,18 @@ test_claimed_agents_are_all_stopped_at_once() {
   rm -rf "$s"
 }
 
+test_wake_during_the_pass_is_not_lost() {
+  local s; s=$(setup)
+  local t0 t1
+  printf 'x' > "$s/fleet/identities/.supervisor-wake"
+  t0=$(date +%s)
+  ( source_supervisor "$s"; CHECK_INTERVAL=20 NEW_IDENTITY_MIN_GAP=0 PASS_STARTED_AT=$((t0 - 1))
+    IDENTITY_LISTING_AT_TICK="$(identity_listing)"; wait_for_next_tick ) >/dev/null 2>&1
+  t1=$(date +%s)
+  [ $((t1 - t0)) -lt 5 ] || fail "waited $((t1 - t0))s for a wake that came during the pass"
+  rm -rf "$s"
+}
+
 printf 'agent-supervisor archive notes tests\n'
 run_test test_notes_are_handed_to_the_front_door
 run_test test_note_is_kept_when_the_front_door_fails
@@ -161,6 +173,7 @@ run_test test_same_note_gets_the_same_request_id
 run_test test_sleep_sweep_asks_the_front_door
 run_test test_claimed_agent_is_never_launched
 run_test test_wake_file_ends_the_wait_early
+run_test test_wake_during_the_pass_is_not_lost
 run_test test_claimed_agents_are_all_stopped_at_once
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

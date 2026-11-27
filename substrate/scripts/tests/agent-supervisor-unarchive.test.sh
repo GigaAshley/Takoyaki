@@ -502,6 +502,7 @@ _assert_completed() {
   assert_nofile "$scratch/$name/.unarchive-reactivate" "$label: progress state cleared"
   assert_nofile "$scratch/$name/.unarchive-refused"    "$label: no refusal note"
   assert_grep "You were unarchived at" "$(cat "$scratch/$name/$name.md" 2>/dev/null)" "$label: banner present"
+  assert_nofile "$scratch/$name/.unarchive-finishing" "$label: nothing left to finish"
   assert_grep "^finish req-$name done" "$(_finished "$scratch" "$name")" "$label: the request is answered done"
   assert_nofile "${scratch}-changes/returning/$name.json" "$label: let go"
 }
@@ -1280,6 +1281,20 @@ test_identity_already_back_is_answered_done() {
   teardown_unarchive_scratch "$scratch"
 }
 
+test_identity_cut_off_after_the_move_is_finished() {
+  local scratch; scratch=$(setup_unarchive_scratch)
+  mkdir -p "$scratch/omega"; printf -- '---\nroles: []\n---\nbody\n' > "$scratch/omega/omega.md"
+  : > "$scratch/omega/.unarchive-finishing"
+  printf '{"name":"omega","ids":["req-omega"]}\n' > "${scratch}-changes/returning/omega.json"
+
+  _tick "$scratch" >/dev/null
+
+  assert_grep "You were unarchived at" "$(cat "$scratch/omega/omega.md")" "the banner the cut-off pass didn't add"
+  assert_nofile "$scratch/omega/.unarchive-finishing" "mark gone"
+  assert_grep "^finish req-omega done" "$(_finished "$scratch" omega)" "answered done"
+  teardown_unarchive_scratch "$scratch"
+}
+
 test_identity_role_being_archived_counts_as_missing() {
   local scratch; scratch=$(setup_unarchive_scratch)
   fixture_live_role "$scratch" box-maintainer
@@ -1341,6 +1356,7 @@ run_test test_identity_no_sentinel_noop
 run_test test_identity_banner_prepended_on_happy_path
 run_test test_identity_waits_for_an_unfinished_archive
 run_test test_identity_already_back_is_answered_done
+run_test test_identity_cut_off_after_the_move_is_finished
 run_test test_identity_role_being_archived_counts_as_missing
 
 

@@ -155,6 +155,8 @@ describe("parseFrontDoorLine / frontDoorHttp / requestIdFrom", () => {
     expect(frontDoorHttp(parseFrontDoorLine("a", '{"state":"failed","code":"move_failed","reason":"boom"}')).status).toBe(500);
     expect(frontDoorHttp(parseFrontDoorLine("a", '{"state":"running","seq":4}'))).toMatchObject({ status: 202, body: { pending: true, stage: "running" } });
     expect(frontDoorHttp(parseFrontDoorLine("a", '{"state":"not_installed"}')).status).toBe(503);
+    // A listener from before a kind existed: the machine is still updating.
+    expect(parseFrontDoorLine("a", '{"state":"refused","code":"unknown_kind","reason":"x"}')).toEqual({ state: "not_installed", id: "a" });
     expect(() => parseFrontDoorLine("a", '{"state":"unknown"}')).toThrow(/lost the request/);
     expect(() => parseFrontDoorLine("a", "not json")).toThrow(/unreadable/);
   });

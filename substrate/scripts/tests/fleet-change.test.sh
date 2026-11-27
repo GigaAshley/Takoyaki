@@ -528,6 +528,56 @@ test_app_archive() {
   rm -rf "$s"
 }
 
+test_group_archives_refused_when_an_agents_slot_is_taken() {
+  local s; s=$(setup)
+  role "$s" eng; agent "$s" bob "" eng; archived_agent "$s" bob
+  project "$s" garden "Garden"; agent "$s" carol garden; archived_agent "$s" carol
+  submit "$s" role-archive '{"name":"eng","expected":{"agents":["bob"]}}' r1
+  submit "$s" project-archive '{"slug":"garden","expected":{"projects":["garden"],"agents":["carol"],"apps":[]}}' p1
+  serve_once "$s"
+  assert_eq archive_slot_taken "$(field "$(fc "$s" status r1)" code)" "role archive refused"
+  assert_eq archive_slot_taken "$(field "$(fc "$s" status p1)" code)" "project archive refused"
+  assert_absent "$s/fleet/identities/bob/.archiving" "bob not claimed"
+  assert_absent "$s/fleet/roles/eng/.archiving" "role not claimed"
+  assert_absent "$s/fleet/identities/carol/.archiving" "carol not claimed"
+  assert_exists "$s/fleet/projects/garden/project.md" "project not archived"
+  rm -rf "$s"
+}
+
+test_sleep_sweep_refused_when_the_agent_woke() {
+  local s; s=$(setup)
+  agent "$s" wren ""; touch -d '2025-01-01' "$s/fleet/identities/wren"
+  agent "$s" finch ""; mkdir -p "$s/fleet/identities/finch/relay-state"; : > "$s/fleet/identities/finch/relay-state/since"
+  touch -d '2025-01-01' "$s/fleet/identities/finch"
+  submit "$s" agent-archive '{"name":"wren","dormant":true,"idleFor":15552000}' a1
+  submit "$s" agent-archive '{"name":"finch","dormant":true,"idleFor":15552000}' a2
+  serve_once "$s"
+  assert_eq done "$(field "$(fc "$s" status a1)" state)" "still idle: archived"
+  assert_eq not_idle "$(field "$(fc "$s" status a2)" code)" "talked to since: refused"
+  rm -rf "$s"
+}
+
+test_app_unarchive_start_is_tried_again() {
+  local s; s=$(setup)
+  app "$s/fleet/apps-archive/old"; printf 'Environment=PORT=9300\n' > "$s/fleet/apps-archive/old/app-old.service.archived"
+  cat > "$s/systemctl" <<STUB
+#!/usr/bin/env bash
+printf 'systemctl %s\n' "\$*" >> "$s/calls"
+case "\$*" in *enable*) [ -e "$s/systemd-busy" ] && exit 1 ;; esac
+exit 0
+STUB
+  : > "$s/systemd-busy"
+  submit "$s" app-unarchive '{"slug":"old"}' p1; serve_once "$s"
+  assert_eq restore_failed "$(field "$(fc "$s" status p1)" code)" "first start failed"
+  assert_exists "$s/fleet/apps/old/app-old.service.archived" "saved unit kept for another try"
+  rm -f "$s/systemd-busy"
+  submit "$s" app-unarchive '{"slug":"old"}' p2; serve_once "$s"
+  assert_eq done "$(field "$(fc "$s" status p2)" state)" "second try"
+  assert_absent "$s/fleet/apps/old/app-old.service.archived" "saved unit used up once started"
+  assert_eq 2 "$(grep -c 'enable --now app-old.service' "$s/calls")" "started again"
+  rm -rf "$s"
+}
+
 printf 'fleet-change tests\n'
 run_test test_aither_sequence_runs_in_click_order
 run_test test_archive_first_then_move_out_is_refused
@@ -555,6 +605,9 @@ run_test test_agent_unarchive_is_finished_in_the_background
 run_test test_agent_unarchive_waits_for_an_unfinished_archive
 run_test test_role_and_app_unarchive
 run_test test_app_archive
+run_test test_group_archives_refused_when_an_agents_slot_is_taken
+run_test test_sleep_sweep_refused_when_the_agent_woke
+run_test test_app_unarchive_start_is_tried_again
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 if [ "$FAIL" -gt 0 ]; then
