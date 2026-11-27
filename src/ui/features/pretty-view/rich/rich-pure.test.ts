@@ -121,9 +121,9 @@ describe("table helpers", () => {
     expect(tableSpeech(["a", "b"], [])).toBe("A table of 0 rows.");
   });
 
-  it("reads cells as written: blanks, symbols, a blank heading, a closing full stop", () => {
-    expect(tableSpeech(["", "Done", "Notes"], [["step 1", "✓", ""], ["step 2", "—", "Waiting on it."]])).toBe(
-      "A table of 2 rows. step 1, Done ✓, Notes. step 2, Done —, Notes Waiting on it.",
+  it("reads cells as written, a blank one as \"blank\"; a blank heading leaves the value alone", () => {
+    expect(tableSpeech(["", "Done", "Notes"], [["step 1", "✓", ""], ["step 2", "—", "Waiting on it."], ["", "", ""]])).toBe(
+      "A table of 3 rows. step 1, Done ✓, Notes blank. step 2, Done —, Notes Waiting on it. Done blank, Notes blank.",
     );
   });
 });

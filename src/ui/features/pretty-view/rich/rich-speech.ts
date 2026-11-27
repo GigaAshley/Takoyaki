@@ -80,7 +80,7 @@ export function diagramSpeech(lang: string, source: string): string {
 /**
  * "A table of 2 rows. Host thenasty, Disk 62%. Host workstation, Disk 80%."
  * Every row, in the agent's order, each cell after its column heading. Cells
- * are read as written (shape-tables-in-full).
+ * are read as written (shape-tables-in-full); a blank one is "blank".
  */
 export function tableSpeech(headings: string[], rows: string[][]): string {
   const one = (s: string | undefined) => (s ?? "").replace(/\s+/g, " ").trim();
@@ -88,7 +88,8 @@ export function tableSpeech(headings: string[], rows: string[][]): string {
   const spoken = rows
     .map((cells) =>
       cells
-        .map((cell, i) => `${one(headings[i])} ${one(cell)}`.trim())
+        // A blank cell under a heading is said as "blank", so it doesn't sound cut off.
+        .map((cell, i) => `${one(headings[i])} ${one(cell) || (one(headings[i]) ? "blank" : "")}`.trim())
         .filter(Boolean)
         .join(", "),
     )
