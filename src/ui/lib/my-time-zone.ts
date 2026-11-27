@@ -34,8 +34,18 @@ export function browserTimeZone(): string | null {
   }
 }
 
-/** True for plain UTC under any of its names (UTC, Etc/UTC, GMT, Zulu, …). */
+// Plain UTC's names, lowercased. Listed outright because browsers differ on
+// whether they resolve these aliases to "UTC" (the server keeps the same list).
+const PLAIN_UTC_NAMES = new Set([
+  "utc", "etc/utc", "uct", "etc/uct", "universal", "etc/universal", "zulu", "etc/zulu",
+  "gmt", "etc/gmt", "gmt0", "gmt+0", "gmt-0", "etc/gmt0", "etc/gmt+0", "etc/gmt-0",
+  "greenwich", "etc/greenwich",
+]);
+
+/** True for plain UTC under any of its names (UTC, Etc/UTC, GMT, Zulu, …).
+ *  Fixed offsets like Etc/GMT+5 are not plain UTC. */
 export function isPlainUtc(zone: string): boolean {
+  if (PLAIN_UTC_NAMES.has(zone.toLowerCase())) return true;
   try {
     return new Intl.DateTimeFormat("en-US", { timeZone: zone }).resolvedOptions().timeZone === "UTC";
   } catch {
@@ -70,8 +80,14 @@ function setState(next: MyTimeZone): void {
   for (const l of listeners) l();
 }
 
+/** Bumped whenever the saved zone is set from somewhere other than a check
+ *  (a pin, a different person signing in): a check still waiting on the
+ *  server then drops its answer rather than undo that. */
+let generation = 0;
+
 /** Callers that change the zone (the Preferences pin) hand the answer back. */
 export function setMyTimeZone(next: MyTimeZone): void {
+  generation++;
   setState(next);
 }
 
@@ -106,6 +122,7 @@ export function __resetMyTimeZoneForTests(next?: Partial<State>): void {
   state = { timeZone: null, pinned: false, loaded: false, ...next };
   inFlight = null;
   followingUserId = null;
+  generation++;
   for (const l of listeners) l();
 }
 
@@ -114,19 +131,25 @@ export function __resetMyTimeZoneForTests(next?: Partial<State>): void {
 let inFlight: Promise<void> | null = null;
 
 /**
- * Compare this browser's zone with the saved one and report it when they
- * differ (loading the saved zone first if it isn't known yet). Never throws;
- * concurrent calls share one check.
+ * Re-read the saved zone (another tab or device may have pinned or moved
+ * it), then report this browser's zone when they differ. Reading isn't an
+ * update; the report goes out only when there's something to change. Never
+ * throws; concurrent calls share one check.
  */
 export function followBrowserTimeZone(): Promise<void> {
   if (inFlight) return inFlight;
-  inFlight = (async () => {
+  const gen = generation;
+  const check = (async () => {
     try {
-      if (!state.loaded) setState(await getMyTimeZone());
+      const saved = await getMyTimeZone();
+      if (gen !== generation) return;
+      setState(saved);
       const own = browserTimeZone();
-      if (!own || state.pinned || isPlainUtc(own) || own === state.timeZone) return;
+      if (!own || saved.pinned || isPlainUtc(own) || own === saved.timeZone) return;
+      const after = await reportBrowserTimeZone(own);
+      if (gen !== generation) return;
       const before = state.timeZone;
-      setState(await reportBrowserTimeZone(own));
+      setState(after);
       systemLogger.info("Time zone follows this browser", {
         operation: "time_zone_followed_browser",
         from: before,
@@ -139,10 +162,11 @@ export function followBrowserTimeZone(): Promise<void> {
         error: err instanceof Error ? err.message : String(err),
       });
     } finally {
-      inFlight = null;
+      if (inFlight === check) inFlight = null;
     }
   })();
-  return inFlight;
+  inFlight = check;
+  return check;
 }
 
 let followingUserId: string | null = null;
@@ -154,6 +178,8 @@ export function useFollowBrowserTimeZone(userId: string | null): void {
   useEffect(() => {
     if (!userId) return;
     if (followingUserId !== null && followingUserId !== userId) {
+      generation++;
+      inFlight = null;
       state = { timeZone: null, pinned: false, loaded: false };
       for (const l of listeners) l();
     }

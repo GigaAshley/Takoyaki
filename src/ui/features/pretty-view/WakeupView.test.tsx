@@ -16,11 +16,11 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, fireEvent, waitFor, cleanup, within } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, cleanup, within, act } from "@testing-library/react";
 import type { Wakeup } from "@/api/claude-session-api";
 
 // The person's saved time zone — "your time zone" in the forms.
-import { __resetMyTimeZoneForTests } from "@/lib/my-time-zone";
+import { __resetMyTimeZoneForTests, setMyTimeZone } from "@/lib/my-time-zone";
 
 import { WakeupView, type WakeupViewProps } from "./WakeupView";
 import type { LeaveGuard } from "./roles-window/RolesWindow";
@@ -186,6 +186,20 @@ describe("WakeupView — editing an existing wake-up", () => {
     pickKind("one_shot");
     expect(screen.queryByTestId("wakeup-view-tz")).toBeNull();
     expect(screen.getByText(/The time above is in your time zone \(Europe\/London\)/)).toBeTruthy();
+  });
+
+  it("5c: a one-time wake-up shows in your saved zone and keeps its fire time when the zone moves while open", async () => {
+    // Fires 09:00 in London (winter: UTC+0).
+    const s = renderExisting({
+      schedule: { type: "one_shot", at: "2027-01-15T09:00:00+00:00", timezone: "Europe/London" },
+    });
+    expect((screen.getByDisplayValue("2027-01-15T09:00") as HTMLInputElement).value).toBe("2027-01-15T09:00");
+    // Another tab pins Tokyo while this form is open.
+    act(() => setMyTimeZone({ timeZone: "Asia/Tokyo", pinned: true }));
+    rename();
+    fireEvent.click(saveButton());
+    const saved = (await savedUpdates(s.onSave)).schedule;
+    expect(new Date(saved.at as string).toISOString()).toBe("2027-01-15T09:00:00.000Z");
   });
 
   it("6: Save writes {name, schedule, instruction}; interval and daily schedules include the timezone", async () => {

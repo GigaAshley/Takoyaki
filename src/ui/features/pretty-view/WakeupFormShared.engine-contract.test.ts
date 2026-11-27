@@ -77,7 +77,7 @@ describe("schedule forms ↔ scheduler engine contract", () => {
       const spec = buildSchedule(form, tz);
       const err = scheduleError(spec);
       if (err !== null) violations.push({ form, spec, err });
-      const again = buildSchedule(hydrateFormSchedule(spec), tz);
+      const again = buildSchedule(hydrateFormSchedule(spec, tz), tz);
       // `start` may be filled in at build time (every > 1); after that it's stable.
       if (JSON.stringify(again) !== JSON.stringify(spec)) violations.push({ roundTrip: true, spec, again });
     }

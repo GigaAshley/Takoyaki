@@ -12,7 +12,7 @@
 //   - Delete wake-up… at the bottom (existing ones), Cancel / Save or
 //     Create at the foot. Leaving with unsaved changes asks first.
 
-import { useMyTimeZone } from "@/lib/my-time-zone";
+import { myTimeZone } from "@/lib/my-time-zone";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ModalFoot } from "@/components/modal";
 import {
@@ -90,7 +90,10 @@ export function WakeupView({
   gone,
 }: WakeupViewProps): JSX.Element {
   const isNew = !wakeup;
-  const detectedTz = useMyTimeZone();
+  // "Your time zone" as it was when the view opened: a one-time time is shown
+  // and saved in this one zone, so the saved zone moving meanwhile (another
+  // tab pinning, the browser following) can't shift what's written.
+  const [detectedTz] = useState(myTimeZone);
   const isSensor = !!wakeup && isSensorSchedule(wakeup.schedule);
 
   // Drafts start from the wake-up as it was when the view opened; the list's
@@ -100,7 +103,7 @@ export function WakeupView({
       name: wakeup?.name ?? "",
       instruction: wakeup?.instruction ?? "",
       tz: wakeup ? scheduleTimezone(wakeup.schedule) : "",
-      schedule: wakeup && !isSensor ? hydrateFormSchedule(wakeup.schedule) : ({ type: "daily", at: "09:00" } as FormSchedule),
+      schedule: wakeup && !isSensor ? hydrateFormSchedule(wakeup.schedule, detectedTz) : ({ type: "daily", at: "09:00" } as FormSchedule),
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps -- the starting point only
     [],
@@ -115,8 +118,8 @@ export function WakeupView({
   const [toggling, setToggling] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // A one-time wake-up's time carries this browser's offset, so its zone is
-  // always the browser's; the Time zone field is for the repeating kinds.
+  // A one-time wake-up's time is always in your time zone; the Time zone
+  // field is for the repeating kinds.
   // An existing schedule saved without a zone runs in its machine's zone; a
   // blank field keeps it that way instead of writing this browser's zone in.
   const blankIsMachine = !!wakeup && scheduleTimezone(wakeup.schedule) === "";

@@ -151,6 +151,20 @@ describe("following the browser", () => {
     expect(res.body).toEqual({ timeZone: null, pinned: false });
   });
 
+  it("stores a zone in its standard spelling, and keeps older names browsers report", async () => {
+    let res = await call("POST", "/me/time-zone/browser", { timeZone: "america/denver" });
+    expect(res.body).toEqual({ timeZone: "America/Denver", pinned: false });
+    res = await call("PUT", "/me/time-zone/pin", { timeZone: "europe/paris" });
+    expect(res.body).toEqual({ timeZone: "Europe/Paris", pinned: true });
+    res = await call("POST", "/me/time-zone/browser", { timeZone: "Asia/Calcutta" }, "robin");
+    expect(res.body).toEqual({ timeZone: "Asia/Calcutta", pinned: false });
+  });
+
+  it("knows plain UTC by every name, whatever the engine resolves it to", async () => {
+    for (const z of ["Etc/Zulu", "UCT", "Etc/UCT", "Greenwich", "GMT0"]) expect(isPlainUtc(z)).toBe(true);
+    expect(isPlainUtc("Etc/GMT+5")).toBe(false);
+  });
+
   it("refuses something that isn't a time zone", async () => {
     expect((await call("POST", "/me/time-zone/browser", { timeZone: "Nowhere/Special" })).status).toBe(400);
     expect((await call("POST", "/me/time-zone/browser", {})).status).toBe(400);

@@ -314,7 +314,10 @@ export function sensorScheduleLabel(sched: unknown): string {
 // Hydrate a form-side FormSchedule from a server-provided `wakeup.schedule`
 // object. Defaults gracefully when the input is unrecognized so entering
 // edit-mode never throws.
-export function hydrateFormSchedule(sched: unknown): FormSchedule {
+/** Form state for a saved schedule. A one-time `at` is shown as wall-clock
+ *  time in `zone` — pass the same zone to buildSchedule so saving reads it
+ *  back as the same instant. */
+export function hydrateFormSchedule(sched: unknown, zone: string = myTimeZone()): FormSchedule {
   if (typeof sched !== "object" || sched === null) {
     return { type: "daily", at: "09:00" };
   }
@@ -363,7 +366,7 @@ export function hydrateFormSchedule(sched: unknown): FormSchedule {
     if (typeof s.at === "string") {
       const d = new Date(s.at);
       if (!Number.isNaN(d.getTime())) {
-        return { type: "one_shot", at: formatLocalInput(d) };
+        return { type: "one_shot", at: formatLocalInput(d, zone) };
       }
     }
     // Default to one hour from now, rounded to the hour, in local time.
@@ -400,7 +403,7 @@ function emitTimes(at: Times): Times {
 export function buildSchedule(fs: FormSchedule, tz: string): Record<string, unknown> {
   if (fs.type === "one_shot") {
     // one_shot: convert local datetime string to ISO+offset.
-    return { type: "one_shot", at: toIsoWithOffset(fs.at), timezone: tz };
+    return { type: "one_shot", at: toIsoWithOffset(fs.at, tz || myTimeZone()), timezone: tz };
   }
   const base: Record<string, unknown> = { type: fs.type };
   if (fs.type === "interval") {

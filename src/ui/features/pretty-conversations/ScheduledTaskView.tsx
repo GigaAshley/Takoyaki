@@ -19,7 +19,7 @@
 // Round-trip: keys of the schedule the form doesn't show ride along in the
 // hydrated schedule, so an edit never drops them.
 
-import { useMyTimeZone } from "@/lib/my-time-zone";
+import { myTimeZone } from "@/lib/my-time-zone";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Check, Server } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -154,7 +154,10 @@ export function ScheduledTaskView({
 }: ScheduledTaskViewProps): JSX.Element {
   const { t } = useTranslation();
   const isNew = !task;
-  const detectedTz = useMyTimeZone();
+  // "Your time zone" as it was when the view opened: a one-time time is shown
+  // and saved in this one zone, so the saved zone moving meanwhile (another
+  // tab pinning, the browser following) can't shift what's written.
+  const [detectedTz] = useState(myTimeZone);
   const isSensor = !!task && isSensorSchedule(task.schedule);
 
   // Drafts start from the task as it was when the view opened; the list's
@@ -168,7 +171,7 @@ export function ScheduledTaskView({
       archive: task?.archive_if_nothing_to_report ?? false,
       project: task?.project ?? null,
       tz: task ? scheduleTimezone(task.schedule) : "",
-      schedule: task && !isSensor ? hydrateFormSchedule(task.schedule) : ({ type: "daily", at: "09:00" } as FormSchedule),
+      schedule: task && !isSensor ? hydrateFormSchedule(task.schedule, detectedTz) : ({ type: "daily", at: "09:00" } as FormSchedule),
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps -- the starting point only
     [],

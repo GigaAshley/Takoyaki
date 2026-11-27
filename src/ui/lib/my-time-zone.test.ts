@@ -12,6 +12,7 @@ import {
   getMyTimeZoneState,
   isPlainUtc,
   myTimeZone,
+  setMyTimeZone,
   wallClockAt,
   wallClockToInstant,
   zoneOffsetMinutes,
@@ -42,7 +43,8 @@ afterEach(() => {
 
 describe("plain UTC", () => {
   it("knows UTC under its other names, and not fixed offsets", () => {
-    for (const z of ["UTC", "Etc/UTC", "GMT", "Etc/GMT", "Zulu", "Universal"]) expect(isPlainUtc(z)).toBe(true);
+    for (const z of ["UTC", "Etc/UTC", "GMT", "Etc/GMT", "Zulu", "Universal", "Etc/Zulu", "UCT", "Greenwich"])
+      expect(isPlainUtc(z)).toBe(true);
     for (const z of ["Europe/London", "Etc/GMT+5", "America/Denver"]) expect(isPlainUtc(z)).toBe(false);
   });
 });
@@ -58,12 +60,43 @@ describe("following the browser", () => {
     expect(myTimeZone()).toBe("America/Denver");
   });
 
-  it("sends nothing when the browser already matches", async () => {
+  it("sends nothing when the browser already matches (each check only re-reads)", async () => {
     browserIn("America/Denver");
     getMock.mockResolvedValue({ timeZone: "America/Denver", pinned: false });
     await followBrowserTimeZone();
     await followBrowserTimeZone();
-    expect(getMock).toHaveBeenCalledTimes(1);
+    expect(getMock).toHaveBeenCalledTimes(2);
+    expect(reportMock).not.toHaveBeenCalled();
+  });
+
+  it("picks up a pin made in another tab or device", async () => {
+    browserIn("America/Denver");
+    getMock.mockResolvedValueOnce({ timeZone: "America/Denver", pinned: false });
+    await followBrowserTimeZone();
+    getMock.mockResolvedValueOnce({ timeZone: "Asia/Tokyo", pinned: true });
+    await followBrowserTimeZone();
+    expect(getMyTimeZoneState()).toMatchObject({ timeZone: "Asia/Tokyo", pinned: true });
+    expect(myTimeZone()).toBe("Asia/Tokyo");
+    expect(reportMock).not.toHaveBeenCalled();
+  });
+
+  it("takes the zone back when another browser elsewhere moved it", async () => {
+    browserIn("America/Denver");
+    getMock.mockResolvedValue({ timeZone: "Europe/Paris", pinned: false });
+    reportMock.mockResolvedValue({ timeZone: "America/Denver", pinned: false });
+    await followBrowserTimeZone();
+    expect(reportMock).toHaveBeenCalledWith("America/Denver");
+  });
+
+  it("drops a check's late answer when the person pinned meanwhile", async () => {
+    browserIn("America/Denver");
+    let answer!: (v: unknown) => void;
+    getMock.mockReturnValue(new Promise((r) => (answer = r)));
+    const check = followBrowserTimeZone();
+    setMyTimeZone({ timeZone: "Asia/Tokyo", pinned: true });
+    answer({ timeZone: "America/New_York", pinned: false });
+    await check;
+    expect(getMyTimeZoneState()).toMatchObject({ timeZone: "Asia/Tokyo", pinned: true });
     expect(reportMock).not.toHaveBeenCalled();
   });
 

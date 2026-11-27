@@ -285,9 +285,10 @@ describe("format v2 — buildSchedule", () => {
     });
   });
 
-  it("one_shot is unchanged", () => {
+  it("one_shot reads the typed time in the zone it's given", () => {
     const built = buildSchedule({ type: "one_shot", at: "2026-10-20T08:00" }, TZ);
-    expect(built).toEqual({ type: "one_shot", at: toIsoWithOffset("2026-10-20T08:00"), timezone: TZ });
+    expect(built).toEqual({ type: "one_shot", at: "2026-10-20T08:00:00-04:00", timezone: TZ });
+    expect(toIsoWithOffset("2026-10-20T08:00", TZ)).toBe("2026-10-20T08:00:00-04:00");
   });
 });
 

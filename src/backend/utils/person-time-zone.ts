@@ -19,12 +19,33 @@
  * zone with the saved one sees an exact match and has nothing to send.
  */
 
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { db } from "../database/db/index.js";
 import { users } from "../database/db/schema.js";
 
 const MAX_ZONE_LENGTH = 64;
 const ZONE_CHARS = /^[A-Za-z0-9_+\-/]+$/;
+
+let canonicalNames: Map<string, string> | null = null;
+
+/**
+ * The zone's standard spelling when this server lists it under another
+ * capitalisation ("america/new_york" → "America/New_York"), else as given —
+ * older names browsers still report (Asia/Calcutta) are kept as they are, so
+ * a browser comparing its own zone with the saved one sees an exact match.
+ */
+export function canonicalTimeZone(name: string): string {
+  if (!canonicalNames) {
+    canonicalNames = new Map();
+    try {
+      for (const z of Intl.supportedValuesOf("timeZone")) canonicalNames.set(z.toLowerCase(), z);
+    } catch {
+      // no list: keep names as given
+    }
+  }
+  const listed = canonicalNames.get(name.toLowerCase());
+  return listed && listed.toLowerCase() === name.toLowerCase() && listed !== name ? listed : name;
+}
 
 /** True when `name` is an IANA time zone this server can use. */
 export function isValidTimeZone(name: unknown): name is string {
@@ -38,12 +59,21 @@ export function isValidTimeZone(name: unknown): name is string {
   }
 }
 
+// Plain UTC's names, lowercased. Listed outright because engines differ on
+// whether they resolve these aliases to "UTC" (the web app keeps the same list).
+const PLAIN_UTC_NAMES = new Set([
+  "utc", "etc/utc", "uct", "etc/uct", "universal", "etc/universal", "zulu", "etc/zulu",
+  "gmt", "etc/gmt", "gmt0", "gmt+0", "gmt-0", "etc/gmt0", "etc/gmt+0", "etc/gmt-0",
+  "greenwich", "etc/greenwich",
+]);
+
 /**
  * True for plain UTC under any of its names (UTC, Etc/UTC, GMT, Zulu, …) —
  * the zones a browser reports when its computer has no real location.
  * Fixed offsets like Etc/GMT+5 are not plain UTC.
  */
 export function isPlainUtc(name: string): boolean {
+  if (PLAIN_UTC_NAMES.has(name.toLowerCase())) return true;
   try {
     return new Intl.DateTimeFormat("en-US", { timeZone: name }).resolvedOptions().timeZone === "UTC";
   } catch {
@@ -97,15 +127,27 @@ export async function applyBrowserTimeZone(
 ): Promise<TimeZoneChange> {
   const row = await readRow(userId);
   if (!row) return { result: { status: "no_such_person" }, changed: false };
-  if (row.timeZonePinned || isPlainUtc(browserZone) || row.timeZone === browserZone) {
+  const zone = canonicalTimeZone(browserZone);
+  if (row.timeZonePinned || isPlainUtc(zone) || row.timeZone === zone) {
     return { result: fromRow(row), changed: false };
   }
-  await db.update(users).set({ timeZone: browserZone }).where(eq(users.id, userId));
-  return { result: { status: "set", timeZone: browserZone, pinned: false }, changed: true };
+  // Only while still unpinned: a pin landing between the read and this write
+  // must win.
+  const written = db
+    .update(users)
+    .set({ timeZone: zone })
+    .where(and(eq(users.id, userId), eq(users.timeZonePinned, false)))
+    .run();
+  if (written.changes === 0) {
+    const now = await readRow(userId);
+    return { result: now ? fromRow(now) : { status: "no_such_person" }, changed: false };
+  }
+  return { result: { status: "set", timeZone: zone, pinned: false }, changed: true };
 }
 
 /** The person pins `zone` (validated by the caller); browsers stop changing it. */
-export async function pinTimeZone(userId: string, zone: string): Promise<TimeZoneChange> {
+export async function pinTimeZone(userId: string, picked: string): Promise<TimeZoneChange> {
+  const zone = canonicalTimeZone(picked);
   const row = await readRow(userId);
   if (!row) return { result: { status: "no_such_person" }, changed: false };
   const changed = row.timeZone !== zone || !row.timeZonePinned;
@@ -127,7 +169,7 @@ export async function unpinTimeZone(
   const row = await readRow(userId);
   if (!row) return { result: { status: "no_such_person" }, changed: false };
   const takeOver = browserZone !== null && !isPlainUtc(browserZone);
-  const nextZone = takeOver ? browserZone : row.timeZone;
+  const nextZone = takeOver ? canonicalTimeZone(browserZone) : row.timeZone;
   const changed = row.timeZonePinned || nextZone !== row.timeZone;
   if (changed) {
     await db
