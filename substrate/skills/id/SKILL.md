@@ -1370,7 +1370,11 @@ crown, then gear.
   and a line saying what it's for, and settings save as they change (no
   Close button — the ✕ closes).
   - **Account** (the card) — the picture (click it, or **Choose…** /
-    **Remove**) and **Log out**, which asks first.
+    **Remove**), the user's **time zone** (follows the browser they use
+    the app from, unless they pin one) and **Log out**, which asks first.
+    *Agent-side:* each person's time zone is in the "People on this
+    machine" list your session starts with; a change arrives as a
+    `📝 [time-zone: <user>]` line.
   - **About you** — content every one of the user's agents automatically
     sees. Good for shared preferences, info about the user, or anything
     they'd otherwise have to re-tell each agent. A **Machine** row picks
