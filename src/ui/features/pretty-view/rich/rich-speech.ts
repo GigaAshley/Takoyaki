@@ -5,7 +5,12 @@
 // Two readers use these: the bubble's speak button (which reads the drawn
 // bubble; each block carries its line as screen-reader text) and voice mode
 // (which reads the reply's markdown; `richSpeakable` rewrites the markdown).
+import { unified, type PluggableList } from "unified";
+import remarkParse from "remark-parse";
+import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
 import { CHART_LANGS, article, chartSpeech, parseChartBlock, stripStop } from "./chart-spec";
+import { remarkStrictMath } from "./remark-rich";
 
 // ── Diagrams ──
 
@@ -88,7 +93,7 @@ export function tableSpeech(headings: string[], rows: string[][]): string {
         .join(", "),
     )
     .filter(Boolean)
-    .map((row) => ` ${stripStop(row)}.`);
+    .map((row) => ` ${/[.!?]$/.test(row) ? row : `${row}.`}`);
   return `A table of ${count}.${spoken.join("")}`;
 }
 
@@ -177,37 +182,77 @@ export function splitFences(markdown: string): Segment[] {
   return out;
 }
 
-const TABLE_DELIM = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/;
+// Tables are found and split into cells by the same markdown parser that
+// draws them, so voice mode hears exactly the cells the speak button does.
+const tableParser = unified()
+  .use(remarkParse)
+  .use([remarkGfm, remarkMath, remarkStrictMath] as PluggableList);
 
-/** A table line's cells; `\\|` is a pipe inside a cell, not a border. */
-function splitRow(line: string): string[] {
-  const cells = line.trim().replace(/^\|/, "").replace(/(?<!\\)\|$/, "").split(/(?<!\\)\|/);
-  return cells.map((c) => c.replace(/\\\|/g, "|").trim());
+interface MdNode {
+  type: string;
+  value?: string;
+  children?: MdNode[];
+  position?: { start: { offset?: number }; end: { offset?: number } };
 }
 
-function speakTables(prose: string): string {
-  const lines = prose.split("\n");
-  const out: string[] = [];
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].includes("|") && i + 1 < lines.length && TABLE_DELIM.test(lines[i + 1]) && lines[i + 1].includes("-")) {
-      const heads = splitRow(lines[i]).map(plainCell);
-      let j = i + 2;
-      while (j < lines.length && lines[j].includes("|") && lines[j].trim()) j++;
-      const rows = lines.slice(i + 2, j).map((l) => splitRow(l).map(plainCell));
-      out.push(tableSpeech(heads, rows));
-      i = j - 1;
-      continue;
-    }
-    out.push(lines[i]);
+/** A cell's words as the drawn table shows them: text, code and formulas as written, pictures silent. */
+function cellText(n: MdNode): string {
+  switch (n.type) {
+    case "text":
+    case "inlineCode":
+    case "inlineMath":
+    case "html":
+      return n.value ?? "";
+    case "break":
+      return " ";
+    case "image":
+    case "imageReference":
+    case "footnoteReference":
+      return "";
+    default:
+      return (n.children ?? []).map(cellText).join("");
   }
-  return out.join("\n");
 }
 
-function plainCell(s: string): string {
-  return s
-    .replace(/<br\s*\/?>/gi, " ")
-    .replace(/[*_`~]/g, "")
-    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1");
+function collectTables(n: MdNode, out: MdNode[]): void {
+  for (const c of n.children ?? []) {
+    if (c.type === "table") out.push(c);
+    else collectTables(c, out);
+  }
+}
+
+/**
+ * Replaces each table in `prose` with its spoken line. With `held`, the line
+ * goes into `held` and a marker takes its place, so later clean-up of the
+ * reply's markdown can't reach into the cells (see `restoreHeld`).
+ */
+function speakTables(prose: string, held?: string[]): string {
+  if (!prose.includes("|")) return prose;
+  const tables: MdNode[] = [];
+  const tree = tableParser.parse(prose);
+  collectTables(tableParser.runSync(tree, prose) as unknown as MdNode, tables);
+  let out = prose;
+  for (const table of tables.reverse()) {
+    const start = table.position?.start.offset;
+    const end = table.position?.end.offset;
+    if (start === undefined || end === undefined) continue;
+    const [head, ...body] = (table.children ?? []).map((row) => (row.children ?? []).map(cellText));
+    const width = head?.length ?? 0;
+    // The drawn table pads short rows and drops extra cells; so does this.
+    const rows = body.map((cells) => Array.from({ length: width }, (_, i) => cells[i] ?? ""));
+    let line = tableSpeech(head ?? [], rows);
+    if (held) {
+      held.push(line);
+      line = `\uE000${held.length - 1}\uE001`;
+    }
+    out = `${out.slice(0, start)}${line}${out.slice(end)}`;
+  }
+  return out;
+}
+
+/** Puts back the table lines `richSpeakable` held aside. */
+export function restoreHeld(text: string, held: readonly string[]): string {
+  return text.replace(/\uE000(\d+)\uE001/g, (m, i: string) => held[Number(i)] ?? m);
 }
 
 function speakMath(prose: string): string {
@@ -236,9 +281,10 @@ function speakFence(seg: Segment): string {
  * line, tables every row read under its headings, formulas their words. A closed
  * section is just its summary — everything inside it, code blocks and charts
  * included, stays silent; one written to start open is read in full. Other
- * code blocks are left for the caller.
+ * code blocks are left for the caller. Pass `held` to get table lines back as
+ * markers (put back with `restoreHeld` once the caller's clean-up is done).
  */
-export function richSpeakable(markdown: string): string {
+export function richSpeakable(markdown: string, held?: string[]): string {
   const sections: boolean[] = []; // open flag per enclosing section, outermost first
   const hidden = (depth = sections.length) => sections.slice(0, depth).some((open) => !open);
   const parts: string[] = [];
@@ -264,7 +310,7 @@ export function richSpeakable(markdown: string): string {
       }
     }
     if (!hidden()) out += seg.raw.slice(last);
-    parts.push(speakMath(speakTables(out)));
+    parts.push(speakMath(speakTables(out, held)));
   }
   return parts.join("\n");
 }

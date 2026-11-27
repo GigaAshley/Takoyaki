@@ -273,7 +273,7 @@ describe("review fixes", () => {
 });
 
 describe("voice mode reads table cells", () => {
-  it("plain-words formatting and links, keeps escaped pipes in a cell, reads every row", () => {
+  it("plain-words formatting and links, keeps escaped pipes in a cell, leaves tags as written, reads every row", () => {
     const rows = Array.from({ length: 14 }, (_, i) => `| r${i} | ${i} |`);
     const md = [
       "| **Name** | Link |",
@@ -286,7 +286,7 @@ describe("voice mode reads table cells", () => {
       ...rows,
     ].join("\n");
     const out = richSpeakable(md);
-    expect(out).toContain("A table of 2 rows. Name a|b, Link docs. Name c d, Link x.");
+    expect(out).toContain("A table of 2 rows. Name a|b, Link docs. Name c<br>d, Link x.");
     expect(out).toContain("A table of 14 rows. name r0, n 0.");
     expect(out).toContain("name r13, n 13.");
   });

@@ -6,6 +6,7 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { render, screen, fireEvent, cleanup, waitFor, within, act } from "@testing-library/react";
 import { ChatMessage } from "./ChatMessage";
+import { toSpeakableText } from "./useVoiceMode";
 
 vi.mock("@/api/voice-api", () => ({
   postSpeakStream: vi.fn(),
@@ -83,6 +84,26 @@ describe("tables", () => {
       "A table of 3 rows. host b, disk 10. host a, disk 9. host c, disk 100.",
     );
     expect(sr.className).toContain("sr-only");
+  });
+
+  it("the speak button and voice mode read the same table the same way", () => {
+    const tables = [
+      ["| metric | value |", "| - | - |", "| p50 | <5 ms |", "| p99 | >200 ms |"],
+      ["| a | b |", "| - | - |", "| x < 5 | y > 3 |", "| <none> | <b>bold</b> |"],
+      ["| a | b |", "| - | - |", "| `x\\|y` | 1 |", "| snake_case_name | `my_var` |", "| ~5 GB | 2 \\* 3 |"],
+      ["| a | b |", "| - | - |", "| 1 | 2 | 3 |", "| 1 |"],
+      ["| a | b |", "| - | - |", "| R&amp;D | ![logo](x.png) |", "| https://example.com/x | [docs](https://example.com) |"],
+      ["| a | b |", "| - | - |", "| **bold** _it_ | ~~gone~~ |", "| Waiting... | ✓ |", "lazy line"],
+      ["| a | b |", "| - | - |", "| c<br>d | e<br/>f |"],
+    ];
+    for (const lines of tables) {
+      const md = ["Before.", "", ...lines, "", "After."].join("\n");
+      agent(md);
+      const spokenByButton = screen.getByTestId("rich-table").querySelector(".sr-only")!.textContent!;
+      const voice = toSpeakableText(md);
+      expect(voice).toContain(spokenByButton);
+      cleanup();
+    }
   });
 
   it("a user's own pasted table stays plain", () => {

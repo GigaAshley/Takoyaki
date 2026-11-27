@@ -130,6 +130,7 @@ export function RichTable({ node, children, ...props }: { node?: unknown; childr
 
   const order = useMemo(() => (sort && sortable ? sortOrder(rows, sort.col, sort.dir) : rows.map((_, i) => i)), [sort, sortable, rows]);
   const orderedRows = order.map((i) => rows[i]);
+  const speech = useMemo(() => tableSpeech(headers, rows), [headers, rows]);
 
   const onSort = (col: number) =>
     setSort((s) => (!s || s.col !== col ? { col, dir: "asc" } : s.dir === "asc" ? { col, dir: "desc" } : null));
@@ -187,7 +188,10 @@ export function RichTable({ node, children, ...props }: { node?: unknown; childr
           </button>
         </span>
       </div>
-      <span className="sr-only">{tableSpeech(headers, rows)}</span>
+      {/* The speak button's line. Hidden from screen readers, which read the table itself. */}
+      <span className="sr-only" aria-hidden="true">
+        {speech}
+      </span>
     </div>
   );
 }

@@ -99,7 +99,7 @@ import { registerVoiceModeActive } from "./voice-mode-registry";
 import { createVoiceModeCues, type VoiceModeCue, type VoiceModeCues } from "./voice-mode-cues";
 import { getVoiceModeSettings, VOICE_MODE_PAUSE_SECONDS_DEFAULT } from "./voice-mode-settings";
 import { describeMicTrack } from "./mic-level-monitor";
-import { richSpeakable } from "./rich/rich-speech";
+import { restoreHeld, richSpeakable } from "./rich/rich-speech";
 
 // ---------------------------------------------------------------------------
 // Tuning
@@ -334,7 +334,9 @@ export function toSpeakableText(markdown: string): string {
     });
   // Wealthy text reads as its spoken lines (shape-wealthy-text); runs before
   // the generic code-block drop so charts and diagrams aren't "omitted".
-  return richSpeakable(withAsk)
+  // Table lines are held aside so the clean-up below can't touch their cells.
+  const held: string[] = [];
+  const cleaned = richSpeakable(withAsk, held)
     .replace(/```[\s\S]*?(```|$)/g, " (code block omitted) ")
     .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
     .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
@@ -346,7 +348,8 @@ export function toSpeakableText(markdown: string): string {
     .replace(/^\s*\|?[-:\s|]+\|[-:\s|]*$/gm, "")
     .replace(/\|/g, ", ")
     .replace(/(\*\*|__|\*|_|~~)(?=\S)([^*_~]*?\S)\1/g, "$2")
-    .replace(/<[^>]+>/g, "")
+    .replace(/<[^>]+>/g, "");
+  return restoreHeld(cleaned, held)
     .replace(/[ \t]+/g, " ")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
