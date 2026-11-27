@@ -301,10 +301,10 @@ describe("writeAppFile — REMOTE null conn contract", () => {
 // ──────────────────────────────────────────────────────────────────────
 
 describe("ALLOWED_APP_REL_PATHS — bounded-scope discipline", () => {
-  it("Test 6: whitelist contains exactly '.archive-requested', 'app.json' and '.move-requested'", () => {
+  it("Test 6: whitelist contains exactly '.archive-requested' and 'app.json'", () => {
     expect(ALLOWED_APP_REL_PATHS).toBeInstanceOf(Set);
-    expect(ALLOWED_APP_REL_PATHS.size).toBe(3);
-    expect([...ALLOWED_APP_REL_PATHS]).toEqual([".archive-requested", "app.json", ".move-requested"]);
+    expect(ALLOWED_APP_REL_PATHS.size).toBe(2);
+    expect([...ALLOWED_APP_REL_PATHS]).toEqual([".archive-requested", "app.json"]);
     expect(ALLOWED_APP_REL_PATHS.has(".archive-requested")).toBe(true);
     // Anti-drift check — identity/role-scoped entries MUST NOT be in the
     // app whitelist.

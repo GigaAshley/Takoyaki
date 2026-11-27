@@ -81,8 +81,6 @@ import {
 export const ALLOWED_APP_REL_PATHS: ReadonlySet<string> = new Set([
   ".archive-requested",
   "app.json",
-  // project-scoped apps: the Move to request the agent-supervisor carries out.
-  ".move-requested",
 ]);
 
 // ---------------------------------------------------------------------------

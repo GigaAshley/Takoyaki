@@ -7,9 +7,9 @@
 #   move-app.sh <slug> project <project>           becomes a project app in
 #                                                  ~/fleet/projects/<project>/apps/<slug>/
 #
-# Nothing moves INTO a conversation. Normally run by the agent-supervisor when
-# someone picks Move to in the app (a .move-requested file in the app folder);
-# agents can run it directly too.
+# Nothing moves INTO a conversation. Normally run by the machine's front door
+# (fleet-change app-move) when someone picks Move to in the app, in turn with
+# the machine's other changes; agents can run it directly too.
 #
 # A move to the sidebar must say who may see the app there: --users with the
 # people who could see it where it was (so it never shows to anyone new), or
