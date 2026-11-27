@@ -5,6 +5,7 @@
 // identity badge menu so both prompt and fail the same way.
 
 import { updateIdentity } from "@/api/identities-api";
+import { reasonSentence } from "@/api/machine-changes-api";
 import { applyIdentityChange } from "@/state/identities-store";
 import { kitAlert, kitPrompt } from "@/components/kit";
 
@@ -46,7 +47,7 @@ export function promptAndRenameIdentity(args: {
       });
       void kitAlert({
         title: "Couldn't rename",
-        body: err instanceof Error ? err.message : String(err),
+        body: reasonSentence(err instanceof Error ? err.message : String(err)),
       });
     }
   })();

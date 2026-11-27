@@ -138,6 +138,8 @@ export interface PendingBirth {
 export interface SuccessResponse {
   name: string;       // identity folder name (lowercase) — the name to `/id` / DM by
   birthed_at: string; // ISO-Z audit timestamp
+  /** Asked into a project that was gone by the time it was filed: it's in Conversations, and why. */
+  notFiled?: string;
 }
 
 /**

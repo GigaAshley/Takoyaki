@@ -1054,6 +1054,7 @@ const doBirth = async (item: PendingBirth, deps: WorkerDeps): Promise<void> => {
     const successPayload: SuccessResponse = {
       name: bornName,
       birthed_at: deps.now().toISOString(),
+      ...(endedEvent.notFiled !== undefined ? { notFiled: endedEvent.notFiled } : {}),
     };
 
     systemLogger.info("spawn-request worker: birth success, writing success file", {

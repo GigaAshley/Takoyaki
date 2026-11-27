@@ -727,7 +727,7 @@ describe("nested projects: project menu", () => {
     const lastRows = mergeProjectsForHostSpy.mock.calls.at(-1)![1] as Array<{ slug: string; parent?: string | null }>;
     expect(lastRows.find((r) => r.slug === "design")?.parent).toBe("skynet");
     expect(dialogs.calls[0].kind).toBe("alert");
-    expect(String(dialogs.calls[0].opts.body)).toContain("parent project not found");
+    expect(String(dialogs.calls[0].opts.body)).toBe("Parent project not found.");
   });
 
   it("New sub-project creates the project inside the parent on the parent's host", async () => {

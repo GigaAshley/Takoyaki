@@ -78,22 +78,6 @@ describe("Phase 117 Plan 117-06 Task 1 — project-list-api", () => {
     await expect(listProjects(1)).rejects.toThrow(/list projects/i);
   });
 
-  // Test 3 — createProject happy path
-  it("Test 3 (createProject happy): POST /projects with body {hostId, displayName} returns { ok: true, slug }", async () => {
-    vi.mocked(authApi.post).mockResolvedValueOnce({
-      data: { ok: true, slug: "my-project" },
-    });
-
-    const result = await createProject(1, "My Project");
-
-    expect(authApi.post).toHaveBeenCalledTimes(1);
-    expect(authApi.post).toHaveBeenCalledWith("/projects", {
-      hostId: 1,
-      displayName: "My Project",
-    });
-    expect(result).toEqual({ ok: true, slug: "my-project" });
-  });
-
   // Test 4 — createProject 409 duplicate-slug: caller must be able to detect
   //          the collision from the propagated error (via handleApiError,
   //          which preserves the underlying axios error shape upstream —

@@ -3,9 +3,10 @@
  *
  * Endpoints:
  *   GET  /projects?hostId=<n>              → enumerate non-archived projects
- *   POST /projects                          → create project (backend-slugify)
+ *   POST /projects                          → create project (the machine's front door)
  *   POST /projects/:slug/archive            → archive it and everything in it (the machine's front door)
- *   POST /projects/:slug/parent             → nest under / un-nest a project
+ *   POST /projects/:slug/parent             → nest under / un-nest a project (front door)
+ *   POST /projects/:slug/rename             → change its name (front door)
  *   GET|PUT /projects/:slug/file            → raw project.md read / write
  *
  * Semantic contract (per Phase 117 CONTEXT):
@@ -14,10 +15,9 @@
  *            Nested projects: `parent` is the raw parent slug (or null);
  *            visibility inherits down the tree (filterVisibleProjectTree).
  *            archive/ subdir is excluded upstream (listProjects primitive).
- *   - D-25:  POST body {hostId, displayName}. Backend derives the slug
- *            (kebab-case, lowercased) via `normalizeToSlug` — Pitfall 1
- *            (backend is authoritative). Dupe slug rejected with 409 so the
- *            frontend modal can surface the collision to the user.
+ *   - D-25:  POST body {hostId, displayName}. The server derives the base
+ *            slug (derivePrettyNameSlug); the machine adds -2, -3, … until
+ *            it's free.
  *   - D-28+D-30: POST /:slug/archive body {hostId} moves the whole project
  *            directory into `~/fleet/projects/archive/<slug>/`.
  *   - D-36a: JSON body throughout (small sentinel-drop-shaped payloads; no
@@ -58,10 +58,8 @@ import {
   isLocalHostId,
   PROJECT_SLUG_RE,
   listProjects,
-  createProject,
   readProjectFile,
   writeProjectFile,
-  setProjectParentField,
   projectMetaFromMarkdown,
 } from "../../claude-session/identity-artifact-reader.js";
 import { getSubscriptionRegistry } from "../../fleet-status/subscription-registry.js";
@@ -85,15 +83,19 @@ import { derivePrettyNameSlug } from "../../utils/pretty-name-slug.js";
 // Nested projects: the gate inherits down the parent tree — a project shows
 // only if it and every ancestor present on the host pass.
 import {
-  audienceWidens,
-  effectiveProjectAudience,
   filterVisibleProjectTree,
   redactHiddenParents,
 } from "../../fleet-status/project-visibility-gate.js";
 import { getHostSemaphore } from "../../ssh/host-semaphore-registry.js";
-import { bornInProjectUsers } from "../../sharing/born-in-project.js";
 import { withHost } from "../../sharing/host-conn.js";
-import { frontDoorHttp, frontDoorStatus, requestIdFrom, submitFrontDoor } from "../../fleet-change/front-door.js";
+import {
+  frontDoorHttp,
+  frontDoorStatus,
+  requestIdFrom,
+  submitFrontDoor,
+  type FrontDoorKind,
+} from "../../fleet-change/front-door.js";
+import { answerFromFrontDoor } from "../../fleet-change/front-door-route.js";
 import { findProjectRooms, releaseProjectRooms } from "../../fleet-change/project-rooms.js";
 
 /** What a project archive takes, as the machine reports it (fleet-change project-contents). */
@@ -138,9 +140,8 @@ function withHostSlot<T>(hostId: number, fn: () => Promise<T>): Promise<T> {
 
 /**
  * Per-host write lock for project-file edits that check the host's project
- * list and then write (create, move, archive, raw file save). Without it two
- * moves at once can each pass the "not into its own sub-project" check and
- * together write a loop. Held OUTSIDE withHostSlot, so lock waiters don't
+ * list and then write (the archive preflight, raw file save). Create, move and
+ * rename go through the machine's front door instead, which takes them in turn. Held OUTSIDE withHostSlot, so lock waiters don't
  * occupy SSH slots. In-process only — every such write goes through this
  * backend.
  */
@@ -401,34 +402,91 @@ async function visibleSlugsForCaller(
 }
 
 
+/** Who the visibility checks are for: the caller's username, or null (no gate) when it can't
+ *  be looked up — the same fall-open as GET /. */
+async function askerFor(userId: string): Promise<string | null> {
+  try {
+    return await getUsernameForUserId(userId);
+  } catch (err) {
+    databaseLogger.warn(
+      `projects: caller username lookup threw — visibility gate open for write userId=${userId}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return null;
+  }
+}
+
+/**
+ * A project change through the machine's front door (create, rename, move): carried out in
+ * turn with the machine's other changes, its checks made there and then. Once done, every
+ * open tab gets the host's new project list.
+ */
+async function projectChange(
+  req: Request,
+  res: Response,
+  opts: { hostId: number; kind: FrontDoorKind; args: Record<string, unknown>; operation: string },
+): Promise<void> {
+  const userId = (req as AuthenticatedRequest).userId;
+  const host = await resolveHostById(opts.hostId, userId);
+  if (!host) {
+    res.status(404).json({ error: "Host not found" });
+    return;
+  }
+  // Projects live on SSH hosts — see gate on GET / for rationale.
+  if (host.enableSsh === false) {
+    res.status(400).json({ error: "SSH is not enabled on this host" });
+    return;
+  }
+  await answerFromFrontDoor(res, {
+    hostId: opts.hostId,
+    userId,
+    kind: opts.kind,
+    args: opts.args,
+    requestId: requestIdFrom((req.body as { requestId?: unknown } | undefined)?.requestId),
+    operation: opts.operation,
+    onDone: async (conn) => {
+      const registry = getSubscriptionRegistry();
+      if (!registry) {
+        databaseLogger.warn(
+          `project-list-changed publish skipped: subscription registry not initialized (hostId=${opts.hostId} op=${opts.kind})`,
+        );
+        return;
+      }
+      const current = await listProjects(conn);
+      registry.publishProjectListChanged(
+        String(opts.hostId),
+        enrichForWire(current, opts.hostId, host.name ?? String(opts.hostId)),
+      );
+    },
+  });
+}
+
+/**
+ * POST /projects  body { hostId, displayName, parent?, requestId? }
+ *   → 200 { ok: true, requestId, result: { slug, displayName, parent, users } }
+ *
+ * The slug comes from the name here (letters and dashes); the machine picks the first free
+ * one of base, base-2, base-3, … — a short name in use, archived, named as a parent or still
+ * named by an agent is never reused. On a machine several people share, the project starts
+ * shared with its creator (and, made inside a project, that project's people). A parent
+ * hidden from the caller answers like one that doesn't exist (409 parent_not_found).
+ */
 router.post(
   "/",
   authenticateJWT,
   async (req: Request, res: Response): Promise<void> => {
     const userId = (req as AuthenticatedRequest).userId;
-    const body = (req.body ?? {}) as {
-      hostId?: unknown;
-      displayName?: unknown;
-      parent?: unknown;
-    };
-
-    // 1. hostId gate.
+    const body = (req.body ?? {}) as { hostId?: unknown; displayName?: unknown; parent?: unknown };
     const parsedHost = parseHostId(body.hostId);
     if (!parsedHost.ok) {
       res.status(400).json({ error: parsedHost.error });
       return;
     }
     const { hostId } = parsedHost;
-
-    // 2. displayName gate + slug derivation via shared helper. Pure letters
-    // and dashes on success; input validation (empty, too long, unslugifiable)
-    // uniform across roles/identities/projects per the pretty-names shape.
     const rawDN = body.displayName;
     if (typeof rawDN !== "string") {
       res.status(400).json({ error: "displayName is required" });
       return;
     }
-    const trimmed = rawDN.trim();
     const derivation = derivePrettyNameSlug(rawDN);
     if (derivation.ok !== true) {
       const errorMsg =
@@ -440,10 +498,13 @@ router.post(
       res.status(400).json({ error: errorMsg });
       return;
     }
-    const baseSlug = derivation.slug;
-
-    // 3. Optional parent (nested projects). Format-checked here; existence
-    // is checked against the host's live list once connected.
+    if (/[\r\n]/.test(rawDN)) {
+      res.status(400).json({ error: "displayName must be on one line" });
+      return;
+    }
+    // Digits are spelled out, so a long name can make a long slug: cut it to leave room for
+    // the machine's -2, -3, ….
+    const baseSlug = derivation.slug.slice(0, 60).replace(/-+$/, "");
     let parent: string | null = null;
     if (body.parent !== undefined && body.parent !== null) {
       if (typeof body.parent !== "string" || !PROJECT_SLUG_RE.test(body.parent)) {
@@ -452,233 +513,27 @@ router.post(
       }
       parent = body.parent;
     }
-
-    // 4. Host ownership gate.
-    const host = await resolveHostById(hostId, userId);
-    if (!host) {
-      res.status(404).json({ error: "Host not found" });
-      return;
+    let multiUser = false;
+    try {
+      multiUser = await isHostMultiUser(hostId);
+    } catch (err) {
+      // Never blocks the create: a wrongly-open project is fixable, a blocked create isn't.
+      databaseLogger.warn(
+        `projects-create: isHostMultiUser probe failed — no users list userId=${userId} hostId=${hostId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
-
-    // Projects live on SSH hosts — see gate on GET / for rationale.
-    if (host.enableSsh === false) {
-      res.status(400).json({ error: "SSH is not enabled on this host" });
-      return;
-    }
-
-    // 5. LOCAL/REMOTE branch.
-    // SSH work (connect + execs + conn.end) runs under the per-host
-    // semaphore (verify:ssh-cap); local hosts bypass it.
-    return withProjectWriteLock(hostId, () => withHostSlot(hostId, async () => {
-      let conn: Awaited<ReturnType<typeof connectOneShot>> | null = null;
-      if (!isLocalHostId(hostId)) {
-        try {
-          conn = await connectOneShot(
-            host as unknown as Parameters<typeof connectOneShot>[0],
-            SSH_CONNECT_TIMEOUT_MS,
-          );
-        } catch {
-          res.status(504).json({ error: "Host unreachable" });
-          return;
-        }
-      }
-
-      // -----------------------------------------------------------------------
-      // Phase 130: auto-tag creator on multi-user hosts.
-      //
-      // On multi-user hosts (>1 distinct Skynet user with access), write the
-      // creator's Skynet username to the new project.md's `users:` frontmatter
-      // list. Single-user hosts stay silent — the file is byte-identical to a
-      // pre-130 project.md.
-      //
-      // Ordering invariants (mirror roles-create.ts L580-604):
-      //   - This branch runs BEFORE createProject so the auto-tag is baked into
-      //     the FIRST write (no separate rewrite pass, no live-file mutation).
-      //   - createProject itself is atomic + collision-safe (Phase 117 M2 fix
-      //     at identity-artifact-reader.ts:830-870): a race-loser sees EEXIST
-      //     and 409s without touching the winner's file. So no auto-tag can
-      //     ever overwrite an existing cohabitant's tag list.
-      //
-      // Fail-open on username-lookup failure (matches roles-create discipline):
-      // if getUsernameForUserId returns null on a multi-user host, we skip
-      // auto-tag and log loudly. A wrong-user auto-tag would be a shape §"would
-      // make it wrong" violation ("auto-tagged with the wrong user's name"), so
-      // we prefer to leave the file untagged and surface the failure in logs.
-      //
-      // Case preservation (Phase 129 Pitfall 7): getUsernameForUserId returns
-      // the case-preserved username as stored in the DB — we do NOT normalize.
-      // -----------------------------------------------------------------------
-      let autoTagUsers: string[] | null = null;
-      try {
-        const isMultiUser = await isHostMultiUser(hostId);
-        if (isMultiUser) {
-          const creatorUsername = await getUsernameForUserId(userId);
-          if (creatorUsername) {
-            autoTagUsers = [creatorUsername];
-            databaseLogger.info(
-              `projects-create: auto-tagged creator on multi-user host userId=${userId} hostId=${hostId} baseSlug=${baseSlug} creatorUsername=${creatorUsername}`,
-            );
-          } else {
-            databaseLogger.warn(
-              `projects-create: username lookup failed — auto-tag skipped userId=${userId} hostId=${hostId} baseSlug=${baseSlug}`,
-            );
-          }
-        }
-      } catch (autoTagErr) {
-        // Multi-user probe failure MUST NOT block the create — fall through
-        // without auto-tag. This matches Phase 129 fail-open discipline for
-        // write-side gate failures (a wrongly-open project is recoverable via
-        // a manual edit; a wrongly-BLOCKED create is not).
-        databaseLogger.warn(
-          `projects-create: isHostMultiUser probe failed — auto-tag skipped userId=${userId} hostId=${hostId} baseSlug=${baseSlug}: ${autoTagErr instanceof Error ? autoTagErr.message : String(autoTagErr)}`,
-        );
-      }
-
-      try {
-        // Slugs some live project already names as its parent (a leftover
-        // line from an archived or failed-archive parent) are taken too:
-        // creating one would silently adopt that project as a sub-project.
-        let existing: Awaited<ReturnType<typeof listProjects>> = [];
-        try {
-          existing = await listProjects(conn);
-        } catch (listErr) {
-          if (parent !== null) throw listErr;
-          databaseLogger.warn(
-            `projects-create: project list failed — parent-name check skipped hostId=${hostId} baseSlug=${baseSlug}: ${listErr instanceof Error ? listErr.message : String(listErr)}`,
-          );
-        }
-        const namedAsParent = new Set(
-          existing.map((p) => p.parent).filter((p): p is string => p !== null),
-        );
-        if (parent !== null) {
-          const visible = await visibleSlugsForCaller(existing, userId);
-          if (!existing.some((p) => p.slug === parent) || !visible.has(parent)) {
-            databaseLogger.warn("projects-create: parent not found", {
-              operation: "project_create_parent",
-              userId,
-              hostId,
-              baseSlug,
-              parent,
-              outcome: "parent_not_found",
-            });
-            res.status(400).json({ error: "parent project not found" });
-            return;
-          }
-          // Made inside a project: start shared with its people as well as
-          // the creator — or with everyone when it isn't limited.
-          if (autoTagUsers !== null) {
-            const shared = bornInProjectUsers(existing, parent, autoTagUsers[0]);
-            if (shared === "everyone") {
-              autoTagUsers = null;
-              databaseLogger.info("projects-create: parent isn't limited — no users list", {
-                operation: "project_create_parent_open",
-                hostId,
-                baseSlug,
-                parent,
-              });
-            } else if (shared !== null) {
-              autoTagUsers = shared;
-              databaseLogger.info("projects-create: shared with the parent's people", {
-                operation: "project_create_parent_shared",
-                hostId,
-                baseSlug,
-                parent,
-                userCount: shared.length,
-              });
-            }
-          }
-        }
-
-        // Pretty-names shape: collision auto-suffix. Try the base slug;
-        // on EEXIST retry with base-2, base-3, ... up to a sanity cap.
-        // Loop is race-safe because createProject's mkdir is atomic — a
-        // race-loser throws EEXIST without touching the winner's file, so
-        // every iteration is a fresh attempt at a distinct slug.
-        const MAX_COLLISION_ATTEMPTS = 100;
-        let slug = baseSlug;
-        let attempt = 0;
-        // eslint-disable-next-line no-constant-condition
-        while (true) {
-          try {
-            if (namedAsParent.has(slug)) {
-              const claimed = new Error(`slug ${slug} is named as a parent`);
-              (claimed as NodeJS.ErrnoException).code = "EEXIST";
-              throw claimed;
-            }
-            await createProject(conn, slug, trimmed, autoTagUsers, parent);
-            break;
-          } catch (err) {
-            const code = (err as NodeJS.ErrnoException).code;
-            const msg = err instanceof Error ? err.message : String(err);
-            if (code === "EEXIST" || /exists/i.test(msg)) {
-              attempt += 1;
-              if (attempt >= MAX_COLLISION_ATTEMPTS) {
-                databaseLogger.error(
-                  `project create collision cap exhausted hostId=${hostId} baseSlug=${baseSlug} attempts=${attempt}`,
-                );
-                res
-                  .status(500)
-                  .json({ error: "failed to create project" });
-                return;
-              }
-              slug = `${baseSlug}-${attempt + 1}`;
-              continue;
-            }
-            // Non-collision error is a real 500.
-            databaseLogger.error(
-              `failed to create project hostId=${hostId} slug=${slug}: ${msg}`,
-            );
-            res.status(500).json({ error: "failed to create project" });
-            return;
-          }
-        }
-
-        // 6. Post-write wire event (D-37) — rebuild the full projects list
-        // for this host and hand it to the singleton registry, scoped to
-        // this hostId (client merges by dropping existing entries for
-        // this hostId and splicing in the incoming rows).
-        try {
-          const registry = getSubscriptionRegistry();
-          if (registry) {
-            const current = await listProjects(conn);
-            registry.publishProjectListChanged(
-              String(hostId),
-              enrichForWire(current, hostId, host.name ?? String(hostId)),
-            );
-          } else {
-            // Phase 117 M8 fix (2026-09-18): getSubscriptionRegistry() returns
-            // null when the singleton hasn't been initialized yet (starter.ts
-            // wires it during bootstrap). In tests that's expected; in
-            // production it means a request landed BEFORE the registry was
-            // available — a startup-timing bug, not a silent success. Log
-            // a warning so the failure is visible instead of dropping the
-            // WS fanout silently.
-            databaseLogger.warn(
-              `project-list-changed publish skipped: subscription registry not initialized (hostId=${hostId} slug=${slug} op=create)`,
-            );
-          }
-        } catch (publishErr) {
-          // Publishing failure MUST NOT roll back the create. Log and continue.
-          databaseLogger.warn(
-            `project-list-changed publish failed after create hostId=${hostId} slug=${slug}: ${publishErr instanceof Error ? publishErr.message : String(publishErr)}`,
-          );
-        }
-
-        databaseLogger.info(
-        `project created: userId=${userId} hostId=${hostId} slug=${slug} baseSlug=${baseSlug} parent=${parent ?? "none"}`,
-        );
-        res.json({ ok: true, slug });
-        return;
-      } finally {
-        if (conn) {
-          try {
-            conn.end();
-          } catch {
-            /* ignore */
-          }
-        }
-      }
-    }));
+    await projectChange(req, res, {
+      hostId,
+      kind: "project-create",
+      args: {
+        baseSlug,
+        displayName: rawDN.trim(),
+        parent,
+        asker: await askerFor(userId),
+        multiUser,
+      },
+      operation: "project_create",
+    });
   },
 );
 
@@ -990,215 +845,82 @@ router.post(
   },
 );
 
-// ---------------------------------------------------------------------------
-// POST /projects/:slug/parent  body { hostId, parent: string | null }
-// ---------------------------------------------------------------------------
-//
-// Nested projects: nest a project under another on the same host, or move it
-// back to top level (parent: null). A one-line edit of project.md's `parent:`
-// line (setProjectParentField — line-based, every other byte preserved); the
-// folder never moves, and the subtree follows because children name this
-// project by slug.
-//
-// Guard rails:
-//   - slug + parent PROJECT_SLUG_RE gates BEFORE any I/O.
-//   - project must exist on the host (404), parent must exist on the host and
-//     not be archived (400) — listProjects excludes archive/.
-//   - parent must not be the project itself or any of its descendants (409),
-//     computed over the host's current parent links, cycle-safe.
-
 const MOVE_INTO_SELF_ERROR =
   "cannot move a project inside itself or its own sub-project";
+
+// ---------------------------------------------------------------------------
+// POST /projects/:slug/parent  body { hostId, parent: string | null, requestId? }
+// POST /projects/:slug/rename  body { hostId, displayName, requestId? }
+// ---------------------------------------------------------------------------
+//
+// Through the machine's front door, each changing only its own line of project.md, read
+// when its turn comes.
+//
+// parent: nest a project under another on the same host, or back to top level (null). The
+// folder never moves; the subtree follows because children name this project by slug.
+// Refused (409) when the project is hidden from the caller or gone (not_found), the parent
+// is (parent_not_found), or the parent is the project itself or beneath it (into_itself).
+// A move that would let more people see the project keeps its current audience in its own
+// users: list.
+//
+// rename: the displayName line only (the slug and folder stay).
 
 router.post(
   "/:slug/parent",
   authenticateJWT,
   async (req: Request, res: Response): Promise<void> => {
-    const userId = (req as AuthenticatedRequest).userId;
-
     const slug = String(req.params.slug ?? "");
     if (!slug || !PROJECT_SLUG_RE.test(slug)) {
       res.status(400).json({ error: "slug must match [a-z0-9-]{1,64}" });
       return;
     }
-
     const body = (req.body ?? {}) as { hostId?: unknown; parent?: unknown };
     const parsedHost = parseHostId(body.hostId);
     if (!parsedHost.ok) {
       res.status(400).json({ error: parsedHost.error });
       return;
     }
-    const { hostId } = parsedHost;
-
     const parent: string | null =
-      typeof body.parent === "string" && PROJECT_SLUG_RE.test(body.parent)
-        ? body.parent
-        : null;
+      typeof body.parent === "string" && PROJECT_SLUG_RE.test(body.parent) ? body.parent : null;
     if (body.parent !== null && parent === null) {
-      res
-        .status(400)
-        .json({ error: "parent must be null or match [a-z0-9-]{1,64}" });
+      res.status(400).json({ error: "parent must be null or match [a-z0-9-]{1,64}" });
       return;
     }
-
-    const logCtx = {
+    await projectChange(req, res, {
+      hostId: parsedHost.hostId,
+      kind: "project-move",
+      args: { slug, parent, asker: await askerFor((req as AuthenticatedRequest).userId) },
       operation: "project_set_parent",
-      userId,
-      hostId,
-      slug,
-      parent,
-    };
+    });
+  },
+);
 
-    if (parent === slug) {
-      databaseLogger.warn("project parent rejected: self", {
-        ...logCtx,
-        outcome: "rejected_self",
-      });
-      res.status(409).json({ error: MOVE_INTO_SELF_ERROR });
+router.post(
+  "/:slug/rename",
+  authenticateJWT,
+  async (req: Request, res: Response): Promise<void> => {
+    const slug = String(req.params.slug ?? "");
+    if (!slug || !PROJECT_SLUG_RE.test(slug)) {
+      res.status(400).json({ error: "slug must match [a-z0-9-]{1,64}" });
       return;
     }
-
-    const host = await resolveHostById(hostId, userId);
-    if (!host) {
-      res.status(404).json({ error: "Host not found" });
+    const body = (req.body ?? {}) as { hostId?: unknown; displayName?: unknown };
+    const parsedHost = parseHostId(body.hostId);
+    if (!parsedHost.ok) {
+      res.status(400).json({ error: parsedHost.error });
       return;
     }
-
-    // Projects live on SSH hosts — see gate on GET / for rationale.
-    if (host.enableSsh === false) {
-      res.status(400).json({ error: "SSH is not enabled on this host" });
+    const name = typeof body.displayName === "string" ? body.displayName.trim() : "";
+    if (!name || name.length > DISPLAY_NAME_MAX_LEN || /[\r\n]/.test(name)) {
+      res.status(400).json({ error: `displayName must be 1-${DISPLAY_NAME_MAX_LEN} characters on one line` });
       return;
     }
-
-    // SSH work (connect + execs + conn.end) runs under the per-host
-    // semaphore (verify:ssh-cap); local hosts bypass it.
-    return withProjectWriteLock(hostId, () => withHostSlot(hostId, async () => {
-      let conn: Awaited<ReturnType<typeof connectOneShot>> | null = null;
-      if (!isLocalHostId(hostId)) {
-        try {
-          conn = await connectOneShot(
-            host as unknown as Parameters<typeof connectOneShot>[0],
-            SSH_CONNECT_TIMEOUT_MS,
-          );
-        } catch {
-          res.status(504).json({ error: "Host unreachable" });
-          return;
-        }
-      }
-
-      try {
-        let current: Awaited<ReturnType<typeof listProjects>>;
-        try {
-          current = await listProjects(conn);
-        } catch (err) {
-          databaseLogger.error("project parent: failed to list projects", {
-            ...logCtx,
-            outcome: "list_failed",
-            error: err instanceof Error ? err.message : String(err),
-          });
-          res.status(500).json({ error: "failed to move project" });
-          return;
-        }
-
-        const visible = await visibleSlugsForCaller(current, userId);
-        if (!current.some((p) => p.slug === slug) || !visible.has(slug)) {
-          databaseLogger.warn("project parent rejected: project not found", {
-            ...logCtx,
-            outcome: "project_not_found",
-          });
-          res.status(404).json({ error: "Project not found" });
-          return;
-        }
-
-        if (parent !== null) {
-          if (!current.some((p) => p.slug === parent) || !visible.has(parent)) {
-            databaseLogger.warn("project parent rejected: parent not found", {
-              ...logCtx,
-              outcome: "parent_not_found",
-            });
-            res.status(400).json({ error: "parent project not found" });
-            return;
-          }
-          if (isSelfOrDescendant(current, parent, slug)) {
-            databaseLogger.warn("project parent rejected: descendant", {
-              ...logCtx,
-              outcome: "rejected_descendant",
-            });
-            res.status(409).json({ error: MOVE_INTO_SELF_ERROR });
-            return;
-          }
-        }
-
-        // A move never widens who can see the project (shape: a sub-project
-        // can narrow its audience, never widen it). Taking it out of a
-        // restricted parent, or under a less restricted one, would open it
-        // — and everything beneath it — to more users; instead its current
-        // audience is written into its own `users:` list in the same write.
-        const before = effectiveProjectAudience(current, slug);
-        const after = effectiveProjectAudience(current, slug, parent);
-        const keepUsers =
-          before !== null && audienceWidens(before, after) ? before : undefined;
-        if (keepUsers !== undefined) {
-          databaseLogger.info("project parent: audience kept on move", {
-            ...logCtx,
-            outcome: "audience_kept",
-            userCount: keepUsers.length,
-          });
-        }
-
-        try {
-          if (keepUsers === undefined) {
-            await setProjectParentField(conn, slug, parent);
-          } else {
-            await setProjectParentField(conn, slug, parent, keepUsers);
-          }
-        } catch (err) {
-          databaseLogger.error("project parent: write failed", {
-            ...logCtx,
-            outcome: "write_failed",
-            error: err instanceof Error ? err.message : String(err),
-          });
-          res.status(500).json({ error: "failed to move project" });
-          return;
-        }
-
-        // Post-write wire event (D-37 mirror) — same shape as create/archive.
-        // Publish failure MUST NOT roll back the write.
-        try {
-          const registry = getSubscriptionRegistry();
-          if (registry) {
-            const after = await listProjects(conn);
-            registry.publishProjectListChanged(
-              String(hostId),
-              enrichForWire(after, hostId, host.name ?? String(hostId)),
-            );
-          } else {
-            databaseLogger.warn(
-              `project-list-changed publish skipped: subscription registry not initialized (hostId=${hostId} slug=${slug} op=set-parent)`,
-            );
-          }
-        } catch (publishErr) {
-          databaseLogger.warn(
-            `project-list-changed publish failed after set-parent hostId=${hostId} slug=${slug}: ${publishErr instanceof Error ? publishErr.message : String(publishErr)}`,
-          );
-        }
-
-        databaseLogger.info("project parent set", {
-          ...logCtx,
-          outcome: "ok",
-        });
-        res.json({ ok: true });
-        return;
-      } finally {
-        if (conn) {
-          try {
-            conn.end();
-          } catch {
-            /* ignore */
-          }
-        }
-      }
-    }));
+    await projectChange(req, res, {
+      hostId: parsedHost.hostId,
+      kind: "project-rename",
+      args: { slug, displayName: name, asker: await askerFor((req as AuthenticatedRequest).userId) },
+      operation: "project_rename",
+    });
   },
 );
 

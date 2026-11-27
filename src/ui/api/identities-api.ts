@@ -1,4 +1,6 @@
+import axios from "axios";
 import { authApi, handleApiError } from "@/main-axios";
+import { inMachineOrder, MachineChangeError, newRequestId } from "@/api/machine-changes-api";
 import { stampedFetch } from "@/lib/stamped-fetch";
 
 export interface Identity {
@@ -95,6 +97,8 @@ export interface IdentityInput {
    *  present → set. Backend PUT /identities/:key overlays task through the
    *  same shape as title. */
   task?: string | null;
+  /** The change's id at the machine's front door (set by updateIdentity). */
+  requestId?: string;
 }
 
 function buildFormData(meta: IdentityInput, avatar: File | null): FormData {
@@ -189,20 +193,33 @@ export async function updateIdentity(
    *  handles them). hostId is still a body field in the multipart payload. */
   hostId: number,
 ): Promise<Identity> {
-  try {
-    const response = await authApi.put(
-      `/identities/${encodeURIComponent(identityKey)}`,
-      buildUpdateFormData(meta, avatar, hostId),
-      { headers: { "Content-Type": "multipart/form-data" } },
-    );
+  // A change at the machine's front door: in order with this machine's other changes, only
+  // the lines being changed written. A refusal (e.g. it's being archived) throws
+  // MachineChangeError with the machine's reason.
+  return inMachineOrder(hostId, async () => {
+    let response;
+    try {
+      response = await authApi.put(
+        `/identities/${encodeURIComponent(identityKey)}`,
+        buildUpdateFormData({ ...meta, requestId: newRequestId() }, avatar, hostId),
+        { headers: { "Content-Type": "multipart/form-data" } },
+      );
+    } catch (error) {
+      if (axios.isAxiosError(error) && (error.response?.status === 409 || error.response?.status === 503)) {
+        const data = (error.response.data ?? {}) as { error?: string; code?: string };
+        throw new MachineChangeError(data.error ?? "couldn't change it", error.response.status, data.code ?? null, null);
+      }
+      handleApiError(error, "update identity");
+    }
+    if (response.status === 202) {
+      throw new MachineChangeError("the machine is still working on it; it'll show once it's done", 202, "pending", null);
+    }
     // The PUT echo always reports `pinned: false` (it never reads the
     // `.pinned` sentinel), so drop it — applyIdentityChange then keeps the
     // store's real pin state instead of unpinning the row.
     const { pinned: _echoPinned, ...updated } = response.data as Identity;
     return updated;
-  } catch (error) {
-    handleApiError(error, "update identity");
-  }
+  });
 }
 
 
@@ -599,6 +616,8 @@ export type BirthEvent =
       failedStep?: number;
       identityId?: string;
       sessionName?: string;
+      /** Made into a project that was gone by its filing: it's in Conversations, and why. */
+      notFiled?: string;
     };
 
 export async function* openBirthStream(

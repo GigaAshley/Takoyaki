@@ -50,6 +50,7 @@
 import { useSyncExternalStore } from "react";
 import type { Host, HostFolder, Tab, TabType } from "@/types/ui-types";
 import { setIdentityPinned } from "@/api/user-preferences-api";
+import { MachineChangeError, reasonSentence } from "@/api/machine-changes-api";
 import type { Identity } from "@/api/identities-api";
 import type { RelayRoomFace } from "@/api/sessions-api";
 import { sessionMatchKey } from "@/features/terminal/session-hue";
@@ -3051,7 +3052,16 @@ function writePin(id: string, pinned: boolean): void {
         error: err instanceof Error ? err.message : String(err),
       });
       // Roll back — unless a newer click on this row already superseded us.
-      if (pendingPinIntents.get(id)?.seq === seq) setPinnedLocal(id, !pinned);
+      if (pendingPinIntents.get(id)?.seq === seq) {
+        setPinnedLocal(id, !pinned);
+        // The machine said no (e.g. it's being archived): say why.
+        if (err instanceof MachineChangeError) {
+          const title = pinned ? "Couldn't pin this conversation" : "Couldn't unpin this conversation";
+          const body = reasonSentence(err.message);
+          // Loaded when needed: the store doesn't otherwise depend on the dialogs.
+          void import("@/components/kit").then(({ kitAlert }) => kitAlert({ title, body })).catch(() => {});
+        }
+      }
       refreshIdentities().catch(() => {});
     })
     .finally(() => {

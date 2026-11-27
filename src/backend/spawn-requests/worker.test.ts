@@ -572,6 +572,16 @@ describe("spawn-request worker", () => {
       expect(parsed).not.toHaveProperty("mxid");
     });
 
+    it("Test 17a: made into a project that was gone by its filing → the success file says why", async () => {
+      const deps = buildTestDeps();
+      (deps.birthIdentity as ReturnType<typeof vi.fn>).mockImplementation(async (_opts, emit: (e: BirthEvent) => void) => {
+        emit({ type: "ended", ok: true, identityId: "willow", sessionName: "willow", notFiled: "that project is gone" });
+      });
+      await processBirth(makePendingBirth(), deps);
+      const [, , body] = (deps.writeMarkdownFileAtomic as ReturnType<typeof vi.fn>).mock.calls[0];
+      expect(JSON.parse(body as string)).toMatchObject({ name: "willow", notFiled: "that project is gone" });
+    });
+
     it("Test 17b: spec-provided users on PendingBirth threads through to BirthOptions.users verbatim", async () => {
       // Guards the plumbing added to carry a scheduled-agent spec's `users`
       // field from the spawn-request body (news-watcher-riley-email →

@@ -1,4 +1,5 @@
 import { authApi, handleApiError } from "@/main-axios";
+import { inMachineOrder, sendMachineChange } from "@/api/machine-changes-api";
 
 // ─── Phase 117 Plan 117-06 (D-05 / D-05a) — session-project-api ─────────────
 //
@@ -9,29 +10,37 @@ import { authApi, handleApiError } from "@/main-axios";
 // D-05a's read-modify-write discipline).
 //
 // Endpoints:
-//   POST /identities/:key/project           body { hostId, project }
-//                                             → { ok: true }
+//   POST /identities/:key/project           body { hostId, project, requestId }
+//                                             → the machine's answer (front door)
 //   POST /relay-rooms/:roomId/project       body { userMxid, project }
 //                                             → { ok: true }
 //
 // Byte-shape mirror of identity-archive-api.ts. authApi + handleApiError,
 // one try/catch per wrapper, no error swallowing.
 
+/**
+ * Move an agent into a project (or out of one, null): a change at the machine's front door,
+ * in order with the machine's other changes. Throws MachineChangeError with the machine's
+ * reason when refused (the project is gone, the agent is being archived).
+ */
 export async function setSessionProject(
   hostId: number,
   identityKey: string,
   projectSlug: string | null,
 ): Promise<{ ok: true }> {
-  try {
-    const url = `/identities/${encodeURIComponent(identityKey)}/project`;
-    const response = await authApi.post(url, {
+  await inMachineOrder(hostId, () =>
+    sendMachineChange(
       hostId,
-      project: projectSlug,
-    });
-    return response.data as { ok: true };
-  } catch (error) {
-    handleApiError(error, "set session project");
-  }
+      {
+        method: "post",
+        url: `/identities/${encodeURIComponent(identityKey)}/project`,
+        body: { hostId, project: projectSlug },
+      },
+      "move to project",
+      { followUp: "resend" },
+    ),
+  );
+  return { ok: true };
 }
 
 export async function setRelayRoomProject(

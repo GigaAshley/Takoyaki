@@ -81,7 +81,7 @@ function asError(error: unknown, operation: string): never {
  */
 export async function sendMachineChange<T>(
   hostId: number,
-  request: { method: "get" | "post"; url: string; body?: Record<string, unknown> },
+  request: { method: "get" | "post" | "put"; url: string; body?: Record<string, unknown> },
   operation: string,
   opts: { followUp: "status" | "resend" | "none"; onStillWorking?: () => void },
 ): Promise<MachineChangeAnswer<T>> {
@@ -91,14 +91,14 @@ export async function sendMachineChange<T>(
     const response =
       request.method === "get"
         ? await authApi.get(request.url)
-        : await authApi.post(request.url, { ...request.body, requestId });
+        : await authApi[request.method](request.url, { ...request.body, requestId });
     data = response.data as Body;
     if (response.status !== 202) return { done: true, requestId: data.requestId ?? requestId, result: data as T };
   } catch (error) {
     // No answer at all (the connection dropped): the change may well be under way on the
     // machine, so ask about it by id rather than treat it as failed. A read has nothing to
     // ask about — it just failed.
-    if (!(axios.isAxiosError(error) && !error.response && request.method === "post")) asError(error, operation);
+    if (!(axios.isAxiosError(error) && !error.response && request.method !== "get")) asError(error, operation);
     data = { requestId };
   }
   const id = data.requestId ?? requestId;
@@ -109,7 +109,7 @@ export async function sendMachineChange<T>(
       const response =
         opts.followUp === "status" || request.method === "get"
           ? await authApi.get(`/machine-changes/${hostId}/${encodeURIComponent(id)}`)
-          : await authApi.post(request.url, { ...request.body, requestId: id });
+          : await authApi[request.method](request.url, { ...request.body, requestId: id });
       if (response.status !== 202) return { done: true, requestId: id, result: response.data as T };
     } catch (error) {
       asError(error, operation);

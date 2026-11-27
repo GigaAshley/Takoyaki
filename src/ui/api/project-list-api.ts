@@ -9,25 +9,22 @@ import { inMachineOrder, sendMachineChange, type MachineChangeAnswer } from "@/a
 //
 // Endpoints:
 //   GET  /projects?hostId=<n>          → { projects: ProjectSummary[] }
-//   POST /projects                     body { hostId, displayName }
-//                                        → { ok: true, slug }
-//                                        (409 on duplicate slug → error
-//                                         propagated via handleApiError with
-//                                         the "create project" operation
-//                                         label so the modal can detect it
-//                                         and surface a specific message)
+//   POST /projects                     body { hostId, displayName, parent?, requestId }
+//                                        → { ok, requestId, result: { slug, … } }
+//                                        (the machine's front door; it picks
+//                                         a free slug)
 //   POST /projects/:slug/archive       body { hostId, expected, requestId }
 //                                        → { ok, requestId, result } (the
 //                                          machine's front door; see below)
-//   POST /projects/:slug/parent        body { hostId, parent|null }
-//                                        → { ok: true }
+//   POST /projects/:slug/parent        body { hostId, parent|null, requestId }
+//   POST /projects/:slug/rename        body { hostId, displayName, requestId }
+//                                        → { ok, requestId, result } (front door)
 //   GET  /projects/:slug/archive-preflight?hostId=<n>
 //                                        → { hiddenSubProjects: number }
 //
 // Backend-authoritative slug derivation (D-25, Pitfall 1 in RESEARCH):
-// createProject submits the raw displayName; the response body carries the
-// slug produced by the backend's normalizeToSlug. The frontend NEVER computes
-// the slug at runtime.
+// createProject submits the raw displayName; the answer carries the slug the
+// machine gave it. The frontend NEVER computes the slug at runtime.
 //
 // Errors flow through handleApiError (main-axios.ts) so callers see the same
 // ApiError / message shape every other API surface produces — keeps the
@@ -59,22 +56,40 @@ export async function listProjects(
   }
 }
 
+/**
+ * A quick project change at the machine's front door (create, rename, move), in order with
+ * the machine's other changes. Refusals throw MachineChangeError with the machine's reason;
+ * one still waiting its turn after the follow-ups throws too, saying so (the machine still
+ * carries it out, and the sidebar shows it when it lands).
+ */
+async function projectChange<T>(hostId: number, url: string, body: Record<string, unknown>, operation: string): Promise<T> {
+  const answer = await inMachineOrder(hostId, () =>
+    sendMachineChange<{ result: T }>(hostId, { method: "post", url, body: { hostId, ...body } }, operation, {
+      followUp: "resend",
+    }),
+  );
+  if (!answer.done) throw new Error("the machine is still working on it; it'll show once it's done");
+  return answer.result.result;
+}
+
 export async function createProject(
   hostId: number,
   displayName: string,
   parent?: string | null,
 ): Promise<{ ok: true; slug: string }> {
-  try {
-    const body: { hostId: number; displayName: string; parent?: string } = {
-      hostId,
-      displayName,
-    };
-    if (parent) body.parent = parent;
-    const response = await authApi.post("/projects", body);
-    return response.data as { ok: true; slug: string };
-  } catch (error) {
-    handleApiError(error, "create project");
-  }
+  const result = await projectChange<{ slug: string }>(
+    hostId,
+    "/projects",
+    { displayName, ...(parent ? { parent } : {}) },
+    "create project",
+  );
+  return { ok: true, slug: result.slug };
+}
+
+/** Change a project's name (its displayName line only). */
+export async function renameProject(hostId: number, slug: string, displayName: string): Promise<{ ok: true }> {
+  await projectChange(hostId, `/projects/${encodeURIComponent(slug)}/rename`, { displayName }, "rename project");
+  return { ok: true };
 }
 
 /** What a project archive takes, as the machine sees it. */
@@ -174,13 +189,8 @@ export async function setProjectParent(
   slug: string,
   parent: string | null,
 ): Promise<{ ok: true }> {
-  try {
-    const url = `/projects/${encodeURIComponent(slug)}/parent`;
-    const response = await authApi.post(url, { hostId, parent });
-    return response.data as { ok: true };
-  } catch (error) {
-    handleApiError(error, "move project");
-  }
+  await projectChange(hostId, `/projects/${encodeURIComponent(slug)}/parent`, { parent }, "move project");
+  return { ok: true };
 }
 
 /**

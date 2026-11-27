@@ -1,4 +1,5 @@
 import { authApi, handleApiError } from "@/main-axios";
+import { inMachineOrder, sendMachineChange } from "@/api/machine-changes-api";
 
 // Phase 15 (Wave 2) → Phase 92 Plan 04 (D-04) —
 // thin wrapper around PUT /user-preferences for the pinned slice.
@@ -42,24 +43,25 @@ export function toBareIdentityKey(id: string): string {
 }
 
 /**
- * Pin or unpin ONE identity — PUT /identities/:key/pinned writes/removes that
- * identity's `.pinned` sentinel on its host. This is the pin/unpin click path;
- * it replaces the whole-set putPinnedIds write, which let a stale tab clobber
- * another tab's pins and 400'd entirely on any unmappable id.
+ * Pin or unpin ONE identity — PUT /identities/:key/pinned, a change at the machine's front
+ * door (in order with this machine's other changes). Pinning takes it out of its project in
+ * the same change. Throws MachineChangeError with the machine's reason when it's refused
+ * (e.g. it's being archived). One still waiting its turn after the follow-ups resolves: the
+ * machine carries on with it.
  */
 export async function setIdentityPinned(
   identityKey: string,
   hostId: number,
   pinned: boolean,
 ): Promise<void> {
-  try {
-    await authApi.put(`/identities/${encodeURIComponent(identityKey)}/pinned`, {
+  await inMachineOrder(hostId, () =>
+    sendMachineChange(
       hostId,
-      pinned,
-    });
-  } catch (error) {
-    throw new Error(handleApiError(error, "set identity pin"));
-  }
+      { method: "put", url: `/identities/${encodeURIComponent(identityKey)}/pinned`, body: { hostId, pinned } },
+      pinned ? "pin" : "unpin",
+      { followUp: "resend" },
+    ),
+  );
 }
 
 export async function putPinnedIds(

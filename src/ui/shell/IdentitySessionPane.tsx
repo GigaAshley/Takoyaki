@@ -32,6 +32,8 @@ import { promptAndRenameIdentity } from "./rename-identity";
 // Badge-menu Move-to-project (2026-09-27): same wire the row menu uses via
 // PrettyConversationsPanel.handleRowMoveToProject.
 import { setSessionProject } from "@/api/session-project-api";
+import { reasonSentence } from "@/api/machine-changes-api";
+import { kitAlert } from "@/components/kit";
 import { hasNeutralLook, NEUTRAL_HUE } from "@/lib/identity-roles";
 import type { Tab, Host } from "@/types/ui-types";
 import type { SSHHost } from "@/types";
@@ -292,13 +294,15 @@ export const IdentitySessionPane = forwardRef<IdentityPaneHandle, IdentitySessio
               if (slug !== null) unpinLocal();
             })
             .catch((err: unknown) => {
+              const msg = err instanceof Error ? err.message : String(err);
               console.warn({
                 operation: "badge_menu_set_project_failed",
                 hostId: hostIdNum,
                 identityKey,
                 slug,
-                errMessage: err instanceof Error ? err.message : String(err),
+                errMessage: msg,
               });
+              void kitAlert({ title: "Couldn't move this conversation", body: reasonSentence(msg) });
             },
           );
         };

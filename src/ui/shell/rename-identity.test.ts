@@ -79,7 +79,7 @@ describe("promptAndRenameIdentity", () => {
     await vi.waitFor(() => expect(dialogs.calls.some((c) => c.kind === "alert")).toBe(true));
     const alert = dialogs.calls.find((c) => c.kind === "alert")!.opts as KitAlertOptions;
     expect(alert.title).toMatch(/rename/i);
-    expect(alert.body).toBe("boom");
+    expect(alert.body).toBe("Boom.");
     expect(applyIdentityChangeMock).not.toHaveBeenCalled();
   });
 });

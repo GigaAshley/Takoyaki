@@ -346,6 +346,9 @@ const archiveProjectSpy = vi.fn<
 const getProjectFileSpy = vi.fn<
   (hostId: number, slug: string) => Promise<{ markdown: string }>
 >(async () => ({ markdown: "---\ndisplayName: Alpha\n---\n" }));
+const renameProjectSpy = vi.fn<(hostId: number, slug: string, displayName: string) => Promise<{ ok: true }>>(
+  async () => ({ ok: true }),
+);
 const updateProjectFileSpy = vi.fn<
   (hostId: number, slug: string, contents: string) => Promise<{ markdown: string }>
 >(async (_h, _s, contents) => ({ markdown: contents }));
@@ -365,6 +368,7 @@ vi.mock("@/api/project-list-api", () => ({
     getProjectFileSpy(hostId, slug),
   updateProjectFile: (hostId: number, slug: string, contents: string) =>
     updateProjectFileSpy(hostId, slug, contents),
+  renameProject: (hostId: number, slug: string, displayName: string) => renameProjectSpy(hostId, slug, displayName),
   listProjects: vi.fn(async () => ({ projects: [] })),
   listRelayRoomProjectTags: vi.fn(async () => ({ assignments: [] })),
 }));
@@ -1838,16 +1842,13 @@ describe("PrettyConversationsPanel: archive-project cascade (117-09 Task 2)", ()
     await waitFor(() => expect(getProjectFileSpy).toHaveBeenCalledWith(3, "alpha"));
   });
 
-  it("A9 Test 7 (Rename flow): prompt with current name → getProjectFile → PUT rewritten markdown", async () => {
+  it("A9 Test 7 (Rename flow): prompt with current name → only the name goes to the machine", async () => {
     setSnapshot({
       projectSections: [{ slug: "alpha", displayName: "Alpha", rows: [] }],
     });
     mockProjects = [
       { slug: "alpha", displayName: "Alpha", hostId: "1", hostname: "hostA", archived: false },
     ];
-    getProjectFileSpy.mockResolvedValueOnce({
-      markdown: "---\ndisplayName: Alpha\n---\n\n# body\n",
-    });
     promptAnswer = "Bravo";
 
     const { container, getByText } = render(
@@ -1869,16 +1870,14 @@ describe("PrettyConversationsPanel: archive-project cascade (117-09 Task 2)", ()
     expect(promptOpts.validate?.("x".repeat(81))).toBe("Name must be 80 characters or fewer.");
     expect(promptOpts.validate?.("x".repeat(80))).toBeFalsy();
 
-    // Await microtasks so the async handler's fetch + PUT complete.
+    // Await microtasks so the async handler's request completes.
     await new Promise((r) => setTimeout(r, 0));
     await new Promise((r) => setTimeout(r, 0));
 
-    expect(getProjectFileSpy).toHaveBeenCalledWith(1, "alpha");
-    expect(updateProjectFileSpy).toHaveBeenCalledTimes(1);
-    const [hostId, slug, contents] = updateProjectFileSpy.mock.calls[0];
-    expect(hostId).toBe(1);
-    expect(slug).toBe("alpha");
-    expect(contents).toBe("---\ndisplayName: Bravo\n---\n\n# body\n");
+    // Its name changes at its turn on the machine; the file itself is never rewritten here.
+    expect(renameProjectSpy).toHaveBeenCalledWith(1, "alpha", "Bravo");
+    expect(getProjectFileSpy).not.toHaveBeenCalled();
+    expect(updateProjectFileSpy).not.toHaveBeenCalled();
   });
 
   it("A9 Test 8 (Rename cancel): prompt returns null → no PUT", async () => {
@@ -1930,48 +1929,6 @@ describe("PrettyConversationsPanel: archive-project cascade (117-09 Task 2)", ()
     await new Promise((r) => setTimeout(r, 0));
 
     expect(updateProjectFileSpy).not.toHaveBeenCalled();
-  });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// rewriteDisplayNameInFrontmatter helper — pure function tests
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("rewriteDisplayNameInFrontmatter", () => {
-  it("swaps the displayName value when the key exists inside the fence", async () => {
-    const { rewriteDisplayNameInFrontmatter } = await import(
-      "./PrettyConversationsPanel"
-    );
-    const input = "---\ndisplayName: Alpha\nother: keep\n---\n\nbody\n";
-    const out = rewriteDisplayNameInFrontmatter(input, "Bravo");
-    expect(out).toBe("---\ndisplayName: Bravo\nother: keep\n---\n\nbody\n");
-  });
-
-  it("injects displayName into an existing fence when the key is absent", async () => {
-    const { rewriteDisplayNameInFrontmatter } = await import(
-      "./PrettyConversationsPanel"
-    );
-    const input = "---\nother: keep\n---\n\nbody\n";
-    const out = rewriteDisplayNameInFrontmatter(input, "Bravo");
-    expect(out).toBe("---\nother: keep\ndisplayName: Bravo\n---\n\nbody\n");
-  });
-
-  it("prepends a fresh fence when the file has no frontmatter", async () => {
-    const { rewriteDisplayNameInFrontmatter } = await import(
-      "./PrettyConversationsPanel"
-    );
-    const input = "just body\n";
-    const out = rewriteDisplayNameInFrontmatter(input, "Bravo");
-    expect(out).toBe("---\ndisplayName: Bravo\n---\njust body\n");
-  });
-
-  it("YAML-quotes values with colon / special chars", async () => {
-    const { rewriteDisplayNameInFrontmatter } = await import(
-      "./PrettyConversationsPanel"
-    );
-    const input = "---\ndisplayName: Alpha\n---\n";
-    const out = rewriteDisplayNameInFrontmatter(input, "Team: East");
-    expect(out).toBe('---\ndisplayName: "Team: East"\n---\n');
   });
 });
 
@@ -2534,7 +2491,8 @@ describe("PrettyConversationsPanel: pinned and in-a-project are exclusive (Move-
       pinnedIds: new Set(["fleet::1::wren-session"]),
     });
     mockProjects = [{ slug: "alpha", displayName: "Alpha", hostId: "1", hostname: "hostA", archived: false }];
-    setSessionProjectSpy.mockRejectedValueOnce(new Error("500"));
+    setSessionProjectSpy.mockRejectedValueOnce(new Error("the project is gone"));
+    const dialogs = autoAnswerKitDialogs({});
     const { container } = render(
       <PrettyConversationsPanel isAdmin variant="desktop" hostTree={HOST_TREE_ONE} onNewConversation={() => {}} onDeactivateRow={() => {}} />,
     );
@@ -2543,6 +2501,13 @@ describe("PrettyConversationsPanel: pinned and in-a-project are exclusive (Move-
     expect(setSessionProjectSpy).toHaveBeenCalledWith(1, expect.any(String), "alpha");
     await new Promise((r) => setTimeout(r, 0));
     expect(unpinConversationSpy).not.toHaveBeenCalled();
+    // The machine's reason is shown.
+    await vi.waitFor(() =>
+      expect(dialogs.calls.find((c) => c.kind === "alert")?.opts).toMatchObject({
+        title: "Couldn't move this conversation",
+        body: "The project is gone.",
+      }),
+    );
 
     // Second attempt succeeds → unpin follows.
     await openMoveTo(container, "id-row-a");
@@ -2550,6 +2515,7 @@ describe("PrettyConversationsPanel: pinned and in-a-project are exclusive (Move-
     await vi.waitFor(() =>
       expect(unpinConversationSpy).toHaveBeenCalledWith("fleet::1::wren-session"),
     );
+    __resetKitDialogsForTests();
   });
 });
 

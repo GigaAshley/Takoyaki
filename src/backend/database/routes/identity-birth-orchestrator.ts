@@ -59,7 +59,11 @@ import {
   type AvatarExt,
   getLocalIdentitiesRoot,
   getLocalRolesRoot,
+  getLocalProjectsRoot,
   stringifyColorHueForYaml,
+  execWithTimeout,
+  readIdentityFile as readIdentityFileMd,
+  writeIdentityFile as writeIdentityFileMd,
 } from "../../claude-session/identity-artifact-reader.js";
 // Phase 92 Plan 92-01 Task 2 — per-identity file-touch primitive.
 // Step 8's relay.json write routes through this primitive (D-05 wire
@@ -75,6 +79,8 @@ import { writeIdentityFile } from "../../claude-session/per-identity-file.js";
 // in-process backfill safety net (backfill is fully manual, SSH-based).
 import { joinAgentToAgentsRegistry } from "../../relay-sessions/registry-rooms.js";
 import { databaseLogger } from "../../utils/logger.js";
+import { submitFrontDoor } from "../../fleet-change/front-door.js";
+import { getSubscriptionRegistry } from "../../fleet-status/subscription-registry.js";
 
 // ---------------------------------------------------------------------------
 // Nelly-verbatim constants (audited against agent-supervisor.sh + DM §1)
@@ -170,7 +176,16 @@ export { ROLE_NAME_PATTERN };
 // bullet 5 — same alert regardless of failure kind on the user-facing surface.
 export type BirthEvent =
   | { type: "step"; n: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8; phase: "started" | "completed" | "failed"; reason?: string }
-  | { type: "ended"; ok: boolean; failedStep?: number; reason?: string; identityId?: string; sessionName?: string };
+  | {
+      type: "ended";
+      ok: boolean;
+      failedStep?: number;
+      reason?: string;
+      identityId?: string;
+      sessionName?: string;
+      /** Made into a project that was gone by its filing: it's in Conversations, and why. */
+      notFiled?: string;
+    };
 
 export interface BirthOptions {
   // Patch #316: userId is the JWT subject (`users.id` = text() in schema,
@@ -300,6 +315,12 @@ export interface BirthOptions {
 }
 
 export interface BirthDeps {
+  /**
+   * A newborn made into a project is filed there through the machine's front door, in turn
+   * with the machine's other changes: a project gone by then leaves it in Conversations, and
+   * the answer says why. Absent = the real front door.
+   */
+  fileIntoProject?: (conn: SSHClient | null, name: string, project: string, hostId: number) => Promise<string | undefined>;
   /**
    * Called once the identity's folder is committed on the host — from then on
    * it exists whatever happens to the request (a closed tab, a supervisor
@@ -1392,6 +1413,80 @@ exit 0
  * @param emit   Callback receiving BirthEvent objects as each step runs
  * @param deps   Injected dependencies (testable; route provides real ones)
  */
+/** The real filing step: fleet-change agent-project with birth. Never throws — the agent is
+ *  already made. When the front door can't take it (the machine is still updating, or it
+ *  failed), the project is checked directly: gone → the agent is taken out of it here. */
+async function fileIntoProjectByFrontDoor(
+  conn: SSHClient | null,
+  name: string,
+  project: string,
+  hostId: number,
+): Promise<string | undefined> {
+  let notFiled: string | undefined;
+  let outcomeState = "error";
+  try {
+    const outcome = await submitFrontDoor(conn, "agent-project", { name, project, birth: true }, { hostId });
+    outcomeState = outcome.state;
+    if (outcome.state === "done") {
+      const r = (outcome.result as { notFiled?: unknown } | null)?.notFiled;
+      notFiled = typeof r === "string" ? r : undefined;
+    } else if (outcome.state !== "pending") {
+      // A pending one is carried out by the machine when its turn comes.
+      notFiled = await unfileIfProjectGone(conn, name, project);
+    }
+  } catch (err) {
+    databaseLogger.warn("identity birth: the front door couldn't file it into its project", {
+      operation: "identity_birth_project_filing_failed",
+      identityKey: name,
+      hostId,
+      project,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    notFiled = await unfileIfProjectGone(conn, name, project).catch(() => undefined);
+  }
+  databaseLogger.info("identity birth: filed into its project", {
+    operation: "identity_birth_project_filing",
+    identityKey: name,
+    hostId,
+    project,
+    outcome: outcomeState,
+    notFiled,
+  });
+  if (outcomeState === "done" || notFiled !== undefined) {
+    // Open sidebars put the row where it landed straight away.
+    getSubscriptionRegistry()?.publishSessionProjectChanged(name, hostId, notFiled !== undefined ? null : project);
+  }
+  return notFiled;
+}
+
+/** Without the front door: if the project is gone, take the newborn's project line out
+ *  (that line only) and say why. */
+async function unfileIfProjectGone(conn: SSHClient | null, name: string, project: string): Promise<string | undefined> {
+  let exists: boolean;
+  if (conn === null) {
+    exists = await fs
+      .access(path.join(getLocalProjectsRoot(), project, "project.md"))
+      .then(() => true)
+      .catch(() => false);
+  } else {
+    const out = await execWithTimeout(conn, `test -f "$HOME/fleet/projects/${project}/project.md" && echo yes || echo no`);
+    exists = out.trim() === "yes";
+  }
+  if (exists) return undefined;
+  const { markdown } = await readIdentityFileMd(conn, name);
+  const fm = markdown.match(/^(\uFEFF?---\r?\n)((?:[^\n]*\n)*?)(---(?:\r?\n|$))/);
+  if (fm) {
+    const lines = fm[2].match(/[^\n]*\n/g) ?? [];
+    const kept = lines.filter((l) => !/^project\s*:/.test(l));
+    if (kept.length !== lines.length) {
+      let next = fm[1] + kept.join("") + fm[3] + markdown.slice(fm[0].length);
+      if (conn !== null && !next.endsWith("\n")) next += "\n";
+      await writeIdentityFileMd(conn, name, next);
+    }
+  }
+  return "that project is gone";
+}
+
 export async function birthIdentity(
   opts: BirthOptions,
   emit: (e: BirthEvent) => void,
@@ -1765,6 +1860,18 @@ export async function birthIdentity(
       });
     }
 
+    // Filed into its project in turn with the machine's other changes (it was written with
+    // its project; a project archived meanwhile leaves it in Conversations instead).
+    let notFiled: string | undefined;
+    if (typeof opts.project === "string" && opts.project.length > 0) {
+      notFiled = await (deps.fileIntoProject ?? fileIntoProjectByFrontDoor)(
+        useLocal ? null : conn,
+        identityFolderName,
+        opts.project,
+        opts.hostId,
+      );
+    }
+
     // Best-effort: pre-create opts.path (frontend-supplied custom workspace
     // directory) AFTER the atomic commit. Failure here does NOT fail the
     // birth — the identity is already committed. Skipped when normalizedPath
@@ -1850,6 +1957,7 @@ export async function birthIdentity(
       ok: true,
       identityId: identityFolderName,
       sessionName: identityFolderName,
+      ...(notFiled !== undefined ? { notFiled } : {}),
     });
   } catch (e) {
     if (e instanceof BirthAborted) {

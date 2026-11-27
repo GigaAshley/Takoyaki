@@ -75,6 +75,28 @@ Request kinds:
   role-unarchive    {"name"}
   app-archive       {"slug"}  a sidebar app (archive-app.sh)
   app-unarchive     {"slug"}  back into the sidebar on its old port
+  project-create    {"baseSlug", "displayName", "parent"?, "asker"?, "multiUser"?}  a new project;
+                    the short name gets -2, -3... when it's in use, archived, named as a
+                    parent, or still named by an agent. On a machine with several people
+                    (multiUser) it starts shared with the asker (and its parent's people).
+  project-rename    {"slug", "displayName", "asker"?}  its displayName line only
+  project-move      {"slug", "parent": "<slug>"|null, "asker"?}  never into itself or its own
+                    sub-projects; a move that would let more people see it keeps its
+                    current audience in its own users: list
+                    "asker" (a username, or null) is who the visibility checks are for: a
+                    project hidden from them answers like one that doesn't exist.
+  agent-project     {"name", "project": "<slug>"|null, "birth"?: true}  Move to / Remove from
+                    project; moving in unpins. "birth": a new agent's filing — a project gone
+                    by now leaves it in Conversations (result notFiled says why).
+  agent-pin         {"name", "pinned": bool}  pinning takes it out of its project
+  agent-edit        {"name", "set": {displayName|title|task|colorHue|voice: value},
+                     "unset": [title|task|colorHue|voice|avatar],
+                     "avatar"?: {"upload": ".avatar-upload-<x>.<ext>", "ext"}}
+                    only those lines change. A new picture is saved in the agent's folder
+                    under the upload name first and put in place at its turn (removed when
+                    the change is refused).
+                    Every agent change is refused with being_archived while its archive is
+                    claimed.
 
 On disk, all under ~/fleet/.changes/:
   incoming/<ns>-<id>.json   a request as written by submit (atomic rename)
@@ -145,7 +167,8 @@ ROLE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 APP_SLUG_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 USER_RE = re.compile(r"^[^,\s]+$")
 KINDS = ("app-move", "project-contents", "project-archive", "agent-archive", "agent-unarchive",
-         "role-contents", "role-archive", "role-unarchive", "app-archive", "app-unarchive")
+         "role-contents", "role-archive", "role-unarchive", "app-archive", "app-unarchive",
+         "project-create", "project-rename", "project-move", "agent-project", "agent-pin", "agent-edit")
 
 
 def log(msg):
@@ -354,31 +377,37 @@ def project_label(slug):
     return (fm or {}).get("displayName") or slug
 
 
-def fm_roles(path):
-    """The roles an agent file's frontmatter names (`roles: [a, b]`, `roles: a` or a block list)."""
+def fm_list(path, key, pattern):
+    """The values a frontmatter list key names (`key: [a, b]`, `key: a` or a block list)."""
     try:
         with open(path, encoding="utf-8-sig", errors="replace") as f:
             lines = f.read(65536).replace("\r\n", "\n").split("\n")
     except OSError:
-        return []
+        return None
     if not lines or lines[0].strip() != "---":
-        return []
+        return None
     try:
         end = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
     except StopIteration:
-        return []
+        return None
 
     def clean(v):
-        return re.sub(r"\s+#.*$", "", v).strip().strip("\"'").strip()
+        v = v.strip()
+        if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+            try:
+                return json.loads(v)
+            except ValueError:
+                return v[1:-1]
+        return re.sub(r"\s+#.*$", "", v).strip().strip("'").strip()
 
-    raw = []
     for i in range(1, end):
-        m = re.match(r"^roles:(.*)$", lines[i])
+        m = re.match(r"^%s:(.*)$" % re.escape(key), lines[i])
         if not m:
             continue
         inline = re.sub(r"(^|\s)#.*$", "", m.group(1)).strip()
-        if inline in ("~", "null", "Null", "NULL"):
-            break
+        if inline in ("~", "null", "Null", "NULL", "[]"):
+            return None
+        raw = []
         if inline:
             if inline.startswith("[") and inline.endswith("]"):
                 inline = inline[1:-1]
@@ -392,12 +421,14 @@ def fm_roles(path):
                 if not m2:
                     break
                 raw.append(clean(m2.group(1)))
-        break
-    out = []
-    for r in raw:
-        if r and ROLE_RE.match(r) and r not in out:
-            out.append(r)
-    return out
+        out = [r for r in raw if r and pattern.match(r)]
+        return out or None
+    return None
+
+
+def fm_roles(path):
+    """The roles an agent file's frontmatter names (`roles: [a, b]`, `roles: a` or a block list)."""
+    return list(dict.fromkeys(fm_list(path, "roles", ROLE_RE) or []))
 
 
 def claim_of(path):
@@ -1100,6 +1131,431 @@ def do_app_unarchive(args, entry, save_plan):
     return {"slug": slug, "port": int(port)}
 
 
+# ---------------------------------------------------------------------------
+# Quick changes: projects (create, rename, move) and agents (Move to, pin, the agent
+# window's edits). Each changes only the lines it is about, read when its turn comes.
+# ---------------------------------------------------------------------------
+
+FM_RE = re.compile(r"^(﻿?---\r?\n)((?:[^\n]*\n)*?)(---(?:\r?\n|$))")
+USERNAME_RE = re.compile(r"^[^\s,\[\]#]{1,128}$")
+AVATAR_EXTS = ("webp", "png", "jpg", "gif", "svg")
+UPLOAD_RE = re.compile(r"^\.avatar-upload-[A-Za-z0-9._-]{1,100}\.(webp|png|jpg|gif|svg)$")
+VOICE_RE = re.compile(r"^[A-Za-z0-9._:-]{1,80}$")
+MOVE_INTO_SELF = "cannot move a project inside itself or its own sub-project"
+
+
+def read_text(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def write_text_atomic(path, text):
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    try:
+        os.chmod(tmp, os.stat(path).st_mode & 0o7777)
+    except OSError:
+        pass
+    os.replace(tmp, path)
+
+
+def yaml_str(v, quote=False):
+    """A one-line YAML scalar for a string: plain when that reads back as the same string."""
+    if not quote and re.match(r"^[A-Za-z0-9][A-Za-z0-9 _./()+-]*$", v) and not v.endswith(" ") \
+            and v.lower() not in ("true", "false", "yes", "no", "on", "off", "null", "y", "n") \
+            and not re.match(r"^[0-9][0-9._+-]*$", v):
+        return v
+    return json.dumps(v, ensure_ascii=False)
+
+
+def key_span(lines, key):
+    """(start, end) of a top-level key in frontmatter lines, with its continuation lines (indented
+    ones, a block list's items, and blank lines inside the value), or None."""
+    for i, ln in enumerate(lines):
+        if re.match(r"^%s\s*:" % re.escape(key), ln):
+            j = i + 1
+            while True:
+                if j < len(lines) and (re.match(r"^[ \t]", lines[j]) or re.match(r"^-(\s|$)", lines[j])):
+                    j += 1
+                    continue
+                k = j
+                while k < len(lines) and not lines[k].strip():
+                    k += 1
+                if k > j and k < len(lines) and re.match(r"^[ \t]", lines[k]):
+                    j = k
+                    continue
+                return i, j
+    return None
+
+
+def edit_frontmatter(text, changes, after=("displayName",)):
+    """`text` with each key in `changes` set to its rendered lines (a list) or removed (None).
+    A key that isn't there yet goes after the last of `after` present, else at the end.
+    None when the file has no closed frontmatter."""
+    m = FM_RE.match(text)
+    if not m:
+        return None
+    eol = "\r\n" if m.group(1).endswith("\r\n") else "\n"
+    lines = re.findall(r"[^\n]*\n", m.group(2))
+    after = list(after)
+    for key, new in changes.items():
+        span = key_span(lines, key)
+        block = [ln + eol for ln in new] if new is not None else []
+        if span is not None:
+            lines[span[0]:span[1]] = block
+        elif block:
+            at = len(lines)
+            for a in after:
+                sp = key_span(lines, a)
+                if sp is not None:
+                    at = sp[1]
+            lines[at:at] = block
+            after.append(key)
+    return m.group(1) + "".join(lines) + m.group(3) + text[m.end():]
+
+
+def users_block(users):
+    return ["users:"] + ["  - %s" % (u if re.match(r"^[A-Za-z0-9._@-]+$", u) else json.dumps(u)) for u in users]
+
+
+def fm_value(text, key):
+    m = FM_RE.match(text or "")
+    if not m:
+        return None
+    for ln in re.findall(r"[^\n]*\n", m.group(2)):
+        mm = re.match(r"^%s\s*:\s*(.*?)\s*$" % re.escape(key), ln)
+        if mm:
+            v = mm.group(1)
+            if v and v[0] in "\"'" and v[-1:] == v[0] and len(v) >= 2:
+                return v[1:-1]
+            return re.sub(r"\s+#.*$", "", v) or None
+    return None
+
+
+def projects_with_users():
+    """live_projects(), each with its own `users:` list (None = not limited)."""
+    projects = live_projects()
+    for slug, p in projects.items():
+        p["users"] = fm_list(os.path.join(PROJECTS, slug, "project.md"), "users", USERNAME_RE)
+    return projects
+
+
+def project_chain(projects, slug, parent_override=False, parent=None):
+    """slug and the projects above it (cycle-safe), nearest first."""
+    chain, node = [], slug
+    while isinstance(node, str) and node in projects and node not in chain:
+        chain.append(node)
+        node = parent if (node == slug and parent_override) else projects[node]["parent"]
+    return chain
+
+
+def visible_to(projects, slug, asker):
+    """A project shows to `asker` only if it and every project above it let them in."""
+    if asker is None:
+        return slug in projects
+    if slug not in projects:
+        return False
+    return all(not projects[s]["users"] or asker in projects[s]["users"] for s in project_chain(projects, slug))
+
+
+def audience(projects, slug, parent_override=False, parent=None):
+    """Who can see a project (the narrowing of every limited project from it up), None = everyone."""
+    out = None
+    for s in project_chain(projects, slug, parent_override, parent):
+        users = projects[s]["users"]
+        if users:
+            out = set(users) if out is None else out & set(users)
+    return None if out is None else sorted(out)
+
+
+def check_asker(args):
+    asker = args.get("asker")
+    if asker is not None and (not isinstance(asker, str) or not USERNAME_RE.match(asker)):
+        raise Refused("bad_request", "asker must be a username or null")
+    return asker
+
+
+def check_display_name(args, key="displayName"):
+    v = args.get(key)
+    if not isinstance(v, str) or not v.strip() or len(v.strip()) > 80 or re.search(r"[\r\n]", v):
+        raise Refused("bad_request", "%s must be 1-80 characters on one line" % key)
+    return v.strip()
+
+
+def project_gone(slug):
+    if archived_project_dir(slug) is not None:
+        return Refused("project_archived", "the project \"%s\" is archived" % project_label(slug))
+    return Refused("project_not_found", "that project is gone")
+
+
+def slug_taken(slug, projects):
+    """A short name a new project can't have: in use, the archive folder, named as a parent by a
+    live project, held by an archived project, or still named as the project of a live agent
+    (a new project with it would quietly take those over)."""
+    if slug == "archive" or os.path.exists(os.path.join(PROJECTS, slug)):
+        return True
+    if any(p["parent"] == slug for p in projects.values()):
+        return True
+    if archived_project_dir(slug) is not None:
+        return True
+    try:
+        names = os.listdir(IDENTITIES)
+    except OSError:
+        names = []
+    return any(fm_value(read_text(os.path.join(IDENTITIES, n, n + ".md")) or "", "project") == slug
+               for n in names if NAME_RE.match(n))
+
+
+def do_project_create(args, entry, save_plan):
+    base = args.get("baseSlug")
+    if not isinstance(base, str) or not SLUG_RE.match(base) or len(base) > 60:
+        raise Refused("bad_request", "baseSlug must match [a-z0-9-]{1,60}")
+    name = check_display_name(args)
+    asker = check_asker(args)
+    parent = args.get("parent")
+    if parent is not None and (not isinstance(parent, str) or not SLUG_RE.match(parent)):
+        raise Refused("bad_request", "parent must match [a-z0-9-]{1,64} or be null")
+    plan = entry.get("plan") or {}
+    if plan.get("slug") and os.path.isfile(os.path.join(PROJECTS, plan["slug"], "project.md")):
+        p = live_projects().get(plan["slug"]) or {}
+        return {"slug": plan["slug"], "displayName": p.get("displayName", name), "parent": p.get("parent")}
+    projects = projects_with_users()
+    if parent is not None and not visible_to(projects, parent, asker):
+        raise Refused("parent_not_found", "parent project not found")
+    users = [asker] if (args.get("multiUser") is True and asker) else None
+    if users and parent is not None:
+        # Made inside a project: shared with that project's people too, or with everyone
+        # when it isn't limited.
+        aud = audience(projects, parent)
+        users = None if aud is None else [asker] + [u for u in aud if u != asker]
+    # Carried on after a restart between making its folder and writing its file: that folder.
+    slug = plan.get("slug") if plan.get("slug") and os.path.isdir(os.path.join(PROJECTS, plan["slug"])) else None
+    for n in range(1, 101 if slug is None else 1):
+        cand = base if n == 1 else "%s-%d" % (base, n)
+        if slug_taken(cand, projects):
+            continue
+        try:
+            os.makedirs(PROJECTS, exist_ok=True)
+            os.mkdir(os.path.join(PROJECTS, cand))
+        except FileExistsError:
+            continue
+        slug = cand
+        break
+    if slug is None:
+        raise Failed("no_free_name", "couldn't find a free short name for that project")
+    save_plan({"slug": slug})
+    lines = ["displayName: %s" % yaml_str(name)]
+    if parent is not None:
+        lines.append("parent: %s" % parent)
+    if users:
+        lines += users_block(users)
+    write_text_atomic(os.path.join(PROJECTS, slug, "project.md"), "---\n%s\n---\n" % "\n".join(lines))
+    log("project '%s' created%s" % (slug, " inside '%s'" % parent if parent else ""))
+    return {"slug": slug, "displayName": name, "parent": parent, "users": users}
+
+
+def edit_project(slug, changes):
+    path = os.path.join(PROJECTS, slug, "project.md")
+    text = read_text(path)
+    if text is None:
+        raise project_gone(slug)
+    new = edit_frontmatter(text, changes, after=("displayName", "parent"))
+    if new is None:
+        raise Failed("unreadable", "the project's file has no frontmatter to change")
+    if new != text:
+        write_text_atomic(path, new)
+
+
+def do_project_rename(args, entry, save_plan):
+    slug = check_name(args, "slug", SLUG_RE, "slug")
+    name = check_display_name(args)
+    asker = check_asker(args)
+    if not visible_to(projects_with_users(), slug, asker):
+        raise Refused("not_found", "Project not found")
+    edit_project(slug, {"displayName": ["displayName: %s" % yaml_str(name)]})
+    log("project '%s' renamed" % slug)
+    return {"slug": slug, "displayName": name}
+
+
+def do_project_move(args, entry, save_plan):
+    slug = check_name(args, "slug", SLUG_RE, "slug")
+    asker = check_asker(args)
+    parent = args.get("parent")
+    if parent is not None and (not isinstance(parent, str) or not SLUG_RE.match(parent)):
+        raise Refused("bad_request", "parent must match [a-z0-9-]{1,64} or be null")
+    if parent == slug:
+        raise Refused("into_itself", MOVE_INTO_SELF)
+    projects = projects_with_users()
+    if not visible_to(projects, slug, asker):
+        raise Refused("not_found", "Project not found")
+    if parent is not None:
+        if not visible_to(projects, parent, asker):
+            raise Refused("parent_not_found", "parent project not found")
+        if slug in project_chain(projects, parent):
+            raise Refused("into_itself", MOVE_INTO_SELF)
+    # A move never widens who can see the project: when it would, its current audience is
+    # written into its own users: list in the same change.
+    before = audience(projects, slug)
+    after = audience(projects, slug, True, parent)
+    keep = before if before is not None and (after is None or any(u not in before for u in after)) else None
+    changes = {"parent": ["parent: %s" % parent] if parent is not None else None}
+    if keep:
+        changes["users"] = users_block(keep)
+    edit_project(slug, changes)
+    log("project '%s' moved %s%s" % (slug, "inside '%s'" % parent if parent else "to top level",
+                                    " (audience kept)" if keep else ""))
+    return {"slug": slug, "parent": parent, "audienceKept": keep}
+
+
+def agent_file(name):
+    """The live agent's file, after the checks every agent change shares."""
+    d = os.path.join(IDENTITIES, name)
+    if agent_claimed(name):
+        raise Refused("being_archived", "it's being archived")
+    path = os.path.join(d, name + ".md")
+    if not os.path.isfile(path):
+        if os.path.isdir(os.path.join(IDENTITIES_ARCHIVE, name)):
+            raise Refused("archived", "it's archived")
+        raise Refused("not_found", "there's no agent '%s' on this machine" % name)
+    return path
+
+
+def edit_agent(path, changes):
+    text = read_text(path)
+    if text is None:
+        raise Failed("unreadable", "its file couldn't be read")
+    new = edit_frontmatter(text, changes, after=("roles", "displayName", "task"))
+    if new is None:
+        raise Failed("unreadable", "its file has no frontmatter to change")
+    if new != text:
+        write_text_atomic(path, new)
+    return text
+
+
+def do_agent_project(args, entry, save_plan):
+    name = check_name(args)
+    project = args.get("project")
+    if project is not None and (not isinstance(project, str) or not SLUG_RE.match(project) or project == "archive"):
+        raise Refused("bad_request", "project must match [a-z0-9-]{1,64} or be null")
+    path = agent_file(name)
+    if args.get("birth") is True:
+        # A new agent made into a project: it was written with its project; filed only if the
+        # project is still there now, else it stays in Conversations and says why.
+        if project is None or os.path.isfile(os.path.join(PROJECTS, project, "project.md")):
+            return {"name": name, "project": project}
+        if fm_value(read_text(path), "project") == project:
+            edit_agent(path, {"project": None})
+        gone = project_gone(project)
+        log("agent '%s' made into '%s', which is gone — left in Conversations" % (name, project))
+        return {"name": name, "project": None, "notFiled": gone.reason}
+    if project is not None and not os.path.isfile(os.path.join(PROJECTS, project, "project.md")):
+        raise project_gone(project)
+    edit_agent(path, {"project": ["project: %s" % project] if project is not None else None})
+    unpinned = False
+    if project is not None and os.path.exists(os.path.join(IDENTITIES, name, ".pinned")):
+        os.unlink(os.path.join(IDENTITIES, name, ".pinned"))
+        unpinned = True
+    log("agent '%s' %s" % (name, "moved into '%s'" % project if project else "taken out of its project"))
+    return {"name": name, "project": project, "unpinned": unpinned}
+
+
+def do_agent_pin(args, entry, save_plan):
+    name = check_name(args)
+    pinned = args.get("pinned")
+    if not isinstance(pinned, bool):
+        raise Refused("bad_request", "pinned must be true or false")
+    path = agent_file(name)
+    marker = os.path.join(IDENTITIES, name, ".pinned")
+    previous = None
+    if pinned:
+        # Pinned and in a project are one or the other: pinning takes it out of its project.
+        previous = fm_value(read_text(path), "project")
+        if previous is not None:
+            edit_agent(path, {"project": None})
+        with open(marker, "a"):
+            pass
+    else:
+        try:
+            os.unlink(marker)
+        except FileNotFoundError:
+            pass
+    log("agent '%s' %s" % (name, "pinned" if pinned else "unpinned"))
+    return {"name": name, "pinned": pinned, "previousProject": previous}
+
+
+def drop_upload(name, upload):
+    if isinstance(upload, str) and UPLOAD_RE.match(upload):
+        try:
+            os.unlink(os.path.join(IDENTITIES, name, upload))
+        except OSError:
+            pass
+
+
+def do_agent_edit(args, entry, save_plan):
+    name = check_name(args)
+    sets = args.get("set") or {}
+    unset = args.get("unset") or []
+    pic = args.get("avatar")
+    upload = pic.get("upload") if isinstance(pic, dict) else None
+    try:
+        if not isinstance(sets, dict) or not isinstance(unset, list):
+            raise Refused("bad_request", "set must be an object and unset a list")
+        changes = {}
+        for key, v in sets.items():
+            if key == "displayName":
+                changes[key] = ["displayName: %s" % yaml_str(check_display_name(sets))]
+            elif key in ("title", "task"):
+                if not isinstance(v, str) or len(v) > 500 or re.search(r"[\r\n]", v):
+                    raise Refused("bad_request", "%s must be one line of at most 500 characters" % key)
+                changes[key] = ["%s: %s" % (key, yaml_str(v, quote=key == "task"))]
+            elif key == "colorHue":
+                if not isinstance(v, int) or isinstance(v, bool) or not 0 <= v <= 359:
+                    raise Refused("bad_request", "colorHue must be 0-359")
+                changes[key] = ["colorHue: '%d'" % v]
+            elif key == "voice":
+                if not isinstance(v, str) or not VOICE_RE.match(v):
+                    raise Refused("bad_request", "voice must be a voice id")
+                changes[key] = ["voice: %s" % yaml_str(v)]
+            else:
+                raise Refused("bad_request", "can't set '%s'" % key)
+        for key in unset:
+            if key not in ("title", "task", "colorHue", "voice", "avatar") or key in changes:
+                raise Refused("bad_request", "can't remove '%s'" % key)
+            changes[key] = None
+        if upload is not None:
+            ext = pic.get("ext")
+            if not isinstance(upload, str) or not UPLOAD_RE.match(upload) or ext not in AVATAR_EXTS \
+                    or not upload.endswith("." + ext) or "avatar" in changes:
+                raise Refused("bad_request", "avatar must name an upload and its extension")
+        path = agent_file(name)
+        d = os.path.join(IDENTITIES, name)
+        if upload is not None and not os.path.isfile(os.path.join(d, upload)):
+            raise Refused("upload_missing", "the new picture didn't arrive; try again")
+    except Refused:
+        if NAME_RE.match(str(args.get("name", ""))):
+            drop_upload(args["name"], upload)
+        raise
+    old_pic = fm_value(read_text(path), "avatar")
+    old_ext = old_pic[len(name) + 1:] if old_pic and old_pic.startswith(name + ".") else None
+    if upload is not None:
+        # The picture was saved under a fresh name; put it in place now that it's this change's turn.
+        os.replace(os.path.join(d, upload), os.path.join(d, "%s.%s" % (name, pic["ext"])))
+        changes["avatar"] = ["avatar: %s.%s" % (name, pic["ext"])]
+    edit_agent(path, changes)
+    if old_ext in AVATAR_EXTS and (("avatar" in changes and changes["avatar"] is None)
+                                   or (upload is not None and old_ext != pic["ext"])):
+        try:
+            os.unlink(os.path.join(d, "%s.%s" % (name, old_ext)))
+        except OSError:
+            pass
+    log("agent '%s' edited: %s" % (name, ", ".join(sorted(changes))))
+    return {"name": name, "changed": sorted(changes)}
+
+
 HANDLERS = {
     "app-move": do_app_move,
     "project-contents": do_project_contents,
@@ -1111,6 +1567,12 @@ HANDLERS = {
     "role-unarchive": do_role_unarchive,
     "app-archive": do_app_archive,
     "app-unarchive": do_app_unarchive,
+    "project-create": do_project_create,
+    "project-rename": do_project_rename,
+    "project-move": do_project_move,
+    "agent-project": do_agent_project,
+    "agent-pin": do_agent_pin,
+    "agent-edit": do_agent_edit,
 }
 
 

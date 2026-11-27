@@ -30,6 +30,7 @@ import {
 } from "@/components/kit";
 import { Modal, ModalHead, ModalBody, ModalFoot } from "@/components/modal";
 import { createProject } from "@/api/project-list-api";
+import { MachineChangeError, reasonSentence } from "@/api/machine-changes-api";
 import { submitOnEnter } from "@/lib/submit-on-enter";
 import { useProjects } from "@/state/conversation-store";
 import { projectLineage } from "@/state/project-lineage";
@@ -103,6 +104,10 @@ function interpretError(err: unknown): string {
   const status = statusOf(err);
   if (status === 400) {
     return "Project name needs at least one letter.";
+  }
+  // The machine's own reason (e.g. the parent project is gone, or it's still working on it).
+  if (err instanceof MachineChangeError || (err instanceof Error && /still working/.test(err.message))) {
+    return reasonSentence(err.message);
   }
   return "Couldn't create the project — try again.";
 }

@@ -12,7 +12,7 @@
  * subscriptionRegistry.publishProjectListChanged(<currentProjectsArray>).
  *
  * Auth middleware is mocked. resolveHostById, connectOneShot, isLocalHostId,
- * listProjects, createProject and the machine's front door are mocked so tests exercise
+ * listProjects and the machine's front door are mocked so tests exercise
  * every branch without touching real disk or SSH.
  */
 
@@ -81,10 +81,8 @@ vi.mock("../../claude-session/identity-artifact-reader.js", () => ({
   isLocalHostId: vi.fn(),
   PROJECT_SLUG_RE: /^[a-z0-9-]{1,64}$/,
   listProjects: vi.fn(),
-  createProject: vi.fn(),
   readProjectFile: vi.fn(),
   writeProjectFile: vi.fn(),
-  setProjectParentField: vi.fn(),
   // Minimal stand-in for the real parser: only the parent line matters to
   // the routes (PUT /file's parent guard).
   projectMetaFromMarkdown: (slug: string, markdown: string) => {
@@ -147,10 +145,8 @@ import { resolveHostById } from "../../ssh/host-resolver.js";
 import {
   isLocalHostId,
   listProjects,
-  createProject,
   readProjectFile,
   writeProjectFile,
-  setProjectParentField,
 } from "../../claude-session/identity-artifact-reader.js";
 // Phase 117 M8 fix (2026-09-18): import the mocked databaseLogger so
 // null-registry tests can assert the warning is logged.
@@ -272,7 +268,6 @@ beforeEach(() => {
 
   // Default: primitives resolve to sensible defaults; per-test overrides.
   (listProjects as Mock).mockResolvedValue([]);
-  (createProject as Mock).mockResolvedValue(undefined);
   (submitFrontDoor as Mock).mockImplementation(async (_c: unknown, kind: string, args: { slug: string }, o: { id?: string }) =>
     kind === "project-archive"
       ? { state: "done", id: o.id ?? "r1", seq: 1, result: { projects: [{ slug: args.slug, archivedAs: args.slug }], agents: [], apps: [] } }
@@ -283,7 +278,6 @@ beforeEach(() => {
   (releaseProjectRooms as Mock).mockResolvedValue([]);
   (readProjectFile as Mock).mockResolvedValue({ markdown: "" });
   (writeProjectFile as Mock).mockResolvedValue({ markdown: "" });
-  (setProjectParentField as Mock).mockResolvedValue({ markdown: "" });
   // Phase 130: reset auto-tag helpers each test — vi.clearAllMocks() clears
   // call history but preserves implementation, so a prior test's override
   // would leak into a later test's assertions.
@@ -494,315 +488,187 @@ describe("GET /projects", () => {
 });
 
 // ===========================================================================
-// POST /projects
+// POST /projects, POST /projects/:slug/parent, POST /projects/:slug/rename —
+// requests to the machine's front door (project-create / project-move /
+// project-rename). What the machine does with them (free slugs, visibility,
+// loops, the never-widen rule) is fleet-change.test.sh's; here: what the route
+// sends, how it answers, and that open tabs hear once it's done.
 // ===========================================================================
 
-describe("POST /projects", () => {
-  it("Test 8: happy → 200 { ok:true, slug:<derived> }; publishProjectListChanged called once", async () => {
-    (listProjects as Mock).mockResolvedValue([
-      { slug: "my-project", displayName: "My Project" },
-    ]);
+function sent(kind: string): Record<string, unknown> | undefined {
+  const call = (submitFrontDoor as Mock).mock.calls.find((c) => c[1] === kind);
+  return call?.[2] as Record<string, unknown> | undefined;
+}
 
+function machineAnswers(outcome: Record<string, unknown>): void {
+  (submitFrontDoor as Mock).mockImplementation(async (_c: unknown, _k: string, _a: unknown, o: { id?: string }) => ({
+    id: o.id ?? "r1",
+    seq: 1,
+    ...outcome,
+  }));
+}
+
+describe("POST /projects (front door)", () => {
+  it("sends the derived base slug, the name, who's asking and whether the machine is shared", async () => {
+    (isHostMultiUser as Mock).mockResolvedValue(true);
+    (getUsernameForUserId as Mock).mockResolvedValue("riley");
+    machineAnswers({ state: "done", result: { slug: "ops-two-2", displayName: "Ops 2", parent: null, users: ["riley"] } });
+    (listProjects as Mock).mockResolvedValue([{ slug: "ops-two-2", displayName: "Ops 2", users: ["riley"], parent: null }]);
     const res = await httpRequest(server, {
       method: "POST",
       path: "/projects",
-      body: { hostId: 5, displayName: "My Project" },
+      body: { hostId: 5, displayName: "  Ops 2  ", requestId: "click-1" },
     });
-
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ ok: true, slug: "my-project" });
-    expect(createProject).toHaveBeenCalledTimes(1);
-    // Phase 130: 4th arg is autoTagUsers — null on single-user hosts (the
-    // default mock state) so this is byte-identical to the pre-130 shape at
-    // the createProject write.
-    expect(createProject).toHaveBeenCalledWith(
+    expect(res.body).toMatchObject({ ok: true, requestId: "click-1", result: { slug: "ops-two-2" } });
+    expect(submitFrontDoor).toHaveBeenCalledWith(
       null,
-      "my-project",
-      "My Project",
-      null,
-      null,
+      "project-create",
+      { baseSlug: "ops-two", displayName: "Ops 2", parent: null, asker: "riley", multiUser: true },
+      { id: "click-1", hostId: 5 },
     );
-    // publishProjectListChanged should fire exactly once after successful write.
     expect(mockPublishProjectListChanged).toHaveBeenCalledTimes(1);
-    // First arg is the scoped hostId (string). Second arg is the projects
-    // array with wire-event enrichment (hostId as string + hostname from
-    // resolveHostById + archived).
-    const call = mockPublishProjectListChanged.mock.calls[0];
-    expect(call[0]).toBe("5");
-    expect(Array.isArray(call[1])).toBe(true);
-    expect(call[1]).toEqual([
-      {
-        slug: "my-project",
-        displayName: "My Project",
-        hostId: "5",
-        hostname: "myhost",
-        archived: false,
-      },
-    ]);
+    expect(mockPublishProjectListChanged.mock.calls[0]?.[0]).toBe("5");
   });
 
-  // Phase 117 M8 fix (2026-09-18): pre-fix, when getSubscriptionRegistry()
-  // returned null (startup-timing bug in production; expected during
-  // tests), the code silently no-op'd the publish. Post-fix, a warning
-  // is logged so the failure is visible.
-  it("Test 8b (M8 fix): null registry on create → publish silently skipped BUT a warning is logged", async () => {
-    mockRegistryIsNull = true;
-
-    (listProjects as Mock).mockResolvedValue([
-      { slug: "my-project", displayName: "My Project" },
-    ]);
-
+  it("passes a parent; a refusal comes back with the machine's reason and nothing is published", async () => {
+    machineAnswers({ state: "refused", code: "parent_not_found", reason: "parent project not found" });
     const res = await httpRequest(server, {
       method: "POST",
       path: "/projects",
-      body: { hostId: 5, displayName: "My Project" },
+      body: { hostId: 5, displayName: "Kid", parent: "secret" },
     });
-
-    // Create still succeeds — the null-registry is a startup-timing
-    // bug, not a request failure.
-    expect(res.status).toBe(200);
-    expect(createProject).toHaveBeenCalledTimes(1);
-    // publishProjectListChanged CANNOT be called (registry is null).
+    expect(res.status).toBe(409);
+    expect(res.body).toMatchObject({ code: "parent_not_found", error: "parent project not found" });
+    expect(sent("project-create")).toMatchObject({ parent: "secret" });
     expect(mockPublishProjectListChanged).not.toHaveBeenCalled();
-    // M8 regression: a warning MUST be logged so the failure is visible.
-    expect(databaseLogger.warn).toHaveBeenCalledWith(
-      expect.stringMatching(
-        /subscription registry not initialized.*hostId=5.*slug=my-project.*op=create/,
-      ),
-    );
   });
 
-  it("Test 9: unslugifiable displayName (all punctuation) returns 400", async () => {
-    // Pretty-names shape: derivePrettyNameSlug rejects input that reduces to
-    // zero letters after dropping digits and non-alpha. Pure separators are
-    // the canonical case.
-    const res = await httpRequest(server, {
-      method: "POST",
-      path: "/projects",
-      body: { hostId: 5, displayName: "___" },
-    });
-    expect(res.status).toBe(400);
-    expect((res.body as { error: string }).error).toMatch(/letter/);
-    expect(createProject).not.toHaveBeenCalled();
-  });
-
-  it("Test 10: rejects displayName (missing / empty / oversize)", async () => {
-    // Missing
-    let res = await httpRequest(server, {
-      method: "POST",
-      path: "/projects",
-      body: { hostId: 5 },
-    });
-    expect(res.status).toBe(400);
-    expect((res.body as { error: string }).error).toMatch(/displayName/);
-
-    // Empty string
-    res = await httpRequest(server, {
-      method: "POST",
-      path: "/projects",
-      body: { hostId: 5, displayName: "" },
-    });
-    expect(res.status).toBe(400);
-    expect((res.body as { error: string }).error).toMatch(/displayName/);
-
-    // > 80 chars
-    res = await httpRequest(server, {
-      method: "POST",
-      path: "/projects",
-      body: { hostId: 5, displayName: "a".repeat(81) },
-    });
-    expect(res.status).toBe(400);
-    expect((res.body as { error: string }).error).toMatch(/displayName/);
-
-    expect(createProject).not.toHaveBeenCalled();
-  });
-
-  it("Test 11: duplicate slug (EEXIST) → auto-suffix to -2 and succeeds", async () => {
-    // Pretty-names shape: slug collisions auto-suffix silently. First attempt
-    // on "my-project" throws EEXIST; the loop retries with "my-project-2".
-    const err = new Error("project slug already exists: my-project");
-    (err as NodeJS.ErrnoException).code = "EEXIST";
-    (createProject as Mock)
-      .mockRejectedValueOnce(err)
-      .mockResolvedValueOnce(undefined);
-
-    const res = await httpRequest(server, {
-      method: "POST",
-      path: "/projects",
-      body: { hostId: 5, displayName: "My Project" },
-    });
-
+  it("falls open when the shared-machine check or the username lookup fails", async () => {
+    (isHostMultiUser as Mock).mockRejectedValue(new Error("db"));
+    (getUsernameForUserId as Mock).mockRejectedValue(new Error("db"));
+    const res = await httpRequest(server, { method: "POST", path: "/projects", body: { hostId: 5, displayName: "X" } });
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ ok: true, slug: "my-project-2" });
-    expect(createProject).toHaveBeenCalledTimes(2);
-    expect((createProject as Mock).mock.calls[0]?.[1]).toBe("my-project");
-    expect((createProject as Mock).mock.calls[1]?.[1]).toBe("my-project-2");
+    expect(sent("project-create")).toMatchObject({ asker: null, multiUser: false });
   });
 
-  it("Test 11b: triple collision auto-suffixes to -4", async () => {
-    const err = new Error("project slug already exists");
-    (err as NodeJS.ErrnoException).code = "EEXIST";
-    (createProject as Mock)
-      .mockRejectedValueOnce(err)
-      .mockRejectedValueOnce(err)
-      .mockRejectedValueOnce(err)
-      .mockResolvedValueOnce(undefined);
+  it("a long name's base slug is cut to what the machine takes (room for -2, -3, …)", async () => {
+    await httpRequest(server, { method: "POST", path: "/projects", body: { hostId: 5, displayName: "Plan 7777777 for the big launch" } });
+    const base = sent("project-create")?.baseSlug as string;
+    expect(base.length).toBeLessThanOrEqual(60);
+    expect(base).toMatch(/^[a-z-]*[a-z]$/);
+  });
 
-    const res = await httpRequest(server, {
-      method: "POST",
-      path: "/projects",
-      body: { hostId: 5, displayName: "My Project" },
-    });
-
+  it("a remote machine is asked over its SSH connection", async () => {
+    const res = await httpRequest(server, { method: "POST", path: "/projects", body: { hostId: 7, displayName: "X" } });
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ ok: true, slug: "my-project-4" });
-    expect(createProject).toHaveBeenCalledTimes(4);
+    expect((submitFrontDoor as Mock).mock.calls[0]?.[0]).toBe(stubConn);
+    expect(stubConn.end).toHaveBeenCalled();
   });
 
-  it("Test 11c: digit-bearing displayName spells out digits in base slug", async () => {
-    // Pretty-names shape invariant: no digits in user-derived slugs.
-    (createProject as Mock).mockResolvedValueOnce(undefined);
+  it("still waiting → 202; machine updating → 503", async () => {
+    machineAnswers({ state: "pending", stage: "queued" });
+    expect((await httpRequest(server, { method: "POST", path: "/projects", body: { hostId: 5, displayName: "X" } })).status).toBe(202);
+    (submitFrontDoor as Mock).mockResolvedValue({ state: "not_installed", id: "x" });
+    const r = await httpRequest(server, { method: "POST", path: "/projects", body: { hostId: 5, displayName: "X" } });
+    expect(r.status).toBe(503);
+    expect(r.body).toMatchObject({ code: "updating" });
+  });
+
+  it("a missing registry is logged, not an error", async () => {
+    mockRegistryIsNull = true;
+    const res = await httpRequest(server, { method: "POST", path: "/projects", body: { hostId: 5, displayName: "X" } });
+    expect(res.status).toBe(200);
+    expect(databaseLogger.warn).toHaveBeenCalledWith(expect.stringMatching(/registry not initialized/));
+  });
+
+  it("validates before asking the machine", async () => {
+    const bad = [
+      { displayName: "X" },
+      { hostId: 5 },
+      { hostId: 5, displayName: "   " },
+      { hostId: 5, displayName: "!!!" },
+      { hostId: 5, displayName: "two\nlines" },
+      { hostId: 5, displayName: "x".repeat(81) },
+      { hostId: 5, displayName: "X", parent: "Bad Slug" },
+    ];
+    for (const body of bad) {
+      expect((await httpRequest(server, { method: "POST", path: "/projects", body })).status).toBe(400);
+    }
+    expect(submitFrontDoor).not.toHaveBeenCalled();
+  });
+
+  it("an unknown host → 404; SSH off → 400", async () => {
+    expect((await httpRequest(server, { method: "POST", path: "/projects", body: { hostId: 99, displayName: "X" } })).status).toBe(404);
+    (resolveHostById as Mock).mockResolvedValue({ ...stubHost, enableSsh: false });
+    expect((await httpRequest(server, { method: "POST", path: "/projects", body: { hostId: 5, displayName: "X" } })).status).toBe(400);
+    expect(submitFrontDoor).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /projects/:slug/parent (front door)", () => {
+  it("sends the move with who's asking, publishes once done", async () => {
+    (getUsernameForUserId as Mock).mockResolvedValue("riley");
+    machineAnswers({ state: "done", result: { slug: "c", parent: "q", audienceKept: null } });
+    const res = await httpRequest(server, { method: "POST", path: "/projects/c/parent", body: { hostId: 5, parent: "q" } });
+    expect(res.status).toBe(200);
+    expect(sent("project-move")).toEqual({ slug: "c", parent: "q", asker: "riley" });
+    expect(mockPublishProjectListChanged).toHaveBeenCalledTimes(1);
+  });
+
+  it("null moves it to top level", async () => {
+    await httpRequest(server, { method: "POST", path: "/projects/c/parent", body: { hostId: 5, parent: null } });
+    expect(sent("project-move")).toMatchObject({ slug: "c", parent: null });
+  });
+
+  it("the machine's refusal (into itself, gone, hidden) comes back as 409 with its reason", async () => {
+    machineAnswers({ state: "refused", code: "into_itself", reason: "cannot move a project inside itself or its own sub-project" });
+    const res = await httpRequest(server, { method: "POST", path: "/projects/a/parent", body: { hostId: 5, parent: "b" } });
+    expect(res.status).toBe(409);
+    expect(res.body).toMatchObject({ code: "into_itself" });
+    expect(mockPublishProjectListChanged).not.toHaveBeenCalled();
+  });
+
+  it("validates before asking the machine", async () => {
+    expect((await httpRequest(server, { method: "POST", path: "/projects/Bad/parent", body: { hostId: 5, parent: null } })).status).toBe(400);
+    expect((await httpRequest(server, { method: "POST", path: "/projects/c/parent", body: { hostId: 5, parent: "Bad Slug" } })).status).toBe(400);
+    expect((await httpRequest(server, { method: "POST", path: "/projects/c/parent", body: { parent: null } })).status).toBe(400);
+    expect(submitFrontDoor).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /projects/:slug/rename (front door)", () => {
+  it("sends only the new name", async () => {
+    (getUsernameForUserId as Mock).mockResolvedValue("riley");
+    machineAnswers({ state: "done", result: { slug: "team", displayName: "Dream Team" } });
     const res = await httpRequest(server, {
       method: "POST",
-      path: "/projects",
-      body: { hostId: 5, displayName: "Project 2026" },
+      path: "/projects/team/rename",
+      body: { hostId: 5, displayName: " Dream Team ", requestId: "r-9" },
     });
     expect(res.status).toBe(200);
-    expect((res.body as { slug: string }).slug).toBe(
-      "project-two-zero-two-six",
+    expect(submitFrontDoor).toHaveBeenCalledWith(
+      null,
+      "project-rename",
+      { slug: "team", displayName: "Dream Team", asker: "riley" },
+      { id: "r-9", hostId: 5 },
     );
+    expect(mockPublishProjectListChanged).toHaveBeenCalledTimes(1);
   });
 
-  it("Test 12: unknown / cross-user host → 404 (probe defense)", async () => {
-    const res = await httpRequest(server, {
-      method: "POST",
-      path: "/projects",
-      body: { hostId: 99, displayName: "My Project" },
-    });
-
-    expect(res.status).toBe(404);
-    expect((res.body as { error: string }).error).toMatch(/Host not found/);
-    expect(createProject).not.toHaveBeenCalled();
+  it("a project gone or hidden by its turn is the machine's 409", async () => {
+    machineAnswers({ state: "refused", code: "not_found", reason: "Project not found" });
+    expect((await httpRequest(server, { method: "POST", path: "/projects/team/rename", body: { hostId: 5, displayName: "X" } })).status).toBe(409);
   });
 
-  // ---------------------------------------------------------------------------
-  // Phase 130: auto-tag creator on multi-user hosts
-  //
-  // Mirror of Phase 129 roles-create auto-tag tests. Single-user hosts stay
-  // silent (byte-identical to pre-130 write); multi-user hosts get the
-  // creator's Skynet username written into the frontmatter users list. Fail-
-  // open on lookup failure — never a wrong-user tag.
-  // ---------------------------------------------------------------------------
-  it("Test 12a (Phase 130): multi-user host + username resolvable → users=[creator] passed to createProject", async () => {
-    (isHostMultiUser as Mock).mockResolvedValue(true);
-    (getUsernameForUserId as Mock).mockResolvedValue("alice");
-    (listProjects as Mock).mockResolvedValue([
-      { slug: "my-project", displayName: "My Project" },
-    ]);
-
-    const res = await httpRequest(server, {
-      method: "POST",
-      path: "/projects",
-      body: { hostId: 5, displayName: "My Project" },
-    });
-
-    expect(res.status).toBe(200);
-    expect(createProject).toHaveBeenCalledWith(
-      null,
-      "my-project",
-      "My Project",
-      ["alice"],
-      null,
-    );
-    // Auto-tag success log should have fired.
-    expect(databaseLogger.info).toHaveBeenCalledWith(
-      expect.stringMatching(
-        /auto-tagged creator on multi-user host.*hostId=5.*baseSlug=my-project.*creatorUsername=alice/,
-      ),
-    );
-  });
-
-  it("Test 12b (Phase 130): single-user host → users=null passed (byte-identical to pre-130)", async () => {
-    // Default mock is single-user + null username — assert the explicit null.
-    (listProjects as Mock).mockResolvedValue([
-      { slug: "my-project", displayName: "My Project" },
-    ]);
-
-    const res = await httpRequest(server, {
-      method: "POST",
-      path: "/projects",
-      body: { hostId: 5, displayName: "My Project" },
-    });
-
-    expect(res.status).toBe(200);
-    expect(createProject).toHaveBeenCalledWith(
-      null,
-      "my-project",
-      "My Project",
-      null,
-      null,
-    );
-    // getUsernameForUserId MUST NOT be called on a single-user host (avoid
-    // the DB round-trip when auto-tag can't apply).
-    expect(getUsernameForUserId).not.toHaveBeenCalled();
-  });
-
-  it("Test 12c (Phase 130): multi-user host + username lookup returns null → users=null + warn logged (fail-open, no wrong-user tag)", async () => {
-    (isHostMultiUser as Mock).mockResolvedValue(true);
-    (getUsernameForUserId as Mock).mockResolvedValue(null);
-    (listProjects as Mock).mockResolvedValue([
-      { slug: "my-project", displayName: "My Project" },
-    ]);
-
-    const res = await httpRequest(server, {
-      method: "POST",
-      path: "/projects",
-      body: { hostId: 5, displayName: "My Project" },
-    });
-
-    expect(res.status).toBe(200);
-    // Create still succeeds, but with no auto-tag — file falls open per D-3.
-    expect(createProject).toHaveBeenCalledWith(
-      null,
-      "my-project",
-      "My Project",
-      null,
-      null,
-    );
-    expect(databaseLogger.warn).toHaveBeenCalledWith(
-      expect.stringMatching(
-        /username lookup failed.*auto-tag skipped.*hostId=5.*baseSlug=my-project/,
-      ),
-    );
-  });
-
-  it("Test 12d (Phase 130): isHostMultiUser throws → users=null + warn logged (fail-open on probe error)", async () => {
-    (isHostMultiUser as Mock).mockRejectedValue(new Error("db probe failed"));
-    (listProjects as Mock).mockResolvedValue([
-      { slug: "my-project", displayName: "My Project" },
-    ]);
-
-    const res = await httpRequest(server, {
-      method: "POST",
-      path: "/projects",
-      body: { hostId: 5, displayName: "My Project" },
-    });
-
-    // Create MUST succeed — a multi-user probe failure MUST NOT block the
-    // create (a wrongly-blocked create is worse than a wrongly-open project).
-    expect(res.status).toBe(200);
-    expect(createProject).toHaveBeenCalledWith(
-      null,
-      "my-project",
-      "My Project",
-      null,
-      null,
-    );
-    expect(databaseLogger.warn).toHaveBeenCalledWith(
-      expect.stringMatching(
-        /isHostMultiUser probe failed.*auto-tag skipped.*hostId=5.*baseSlug=my-project.*db probe failed/,
-      ),
-    );
+  it("validates before asking the machine", async () => {
+    for (const displayName of ["", "  ", "x".repeat(81), "two\nlines", 3]) {
+      expect(
+        (await httpRequest(server, { method: "POST", path: "/projects/team/rename", body: { hostId: 5, displayName } })).status,
+      ).toBe(400);
+    }
+    expect((await httpRequest(server, { method: "POST", path: "/projects/Bad/rename", body: { hostId: 5, displayName: "X" } })).status).toBe(400);
+    expect(submitFrontDoor).not.toHaveBeenCalled();
   });
 });
 
@@ -1286,327 +1152,7 @@ describe("nested projects — GET /projects parent + inherited visibility", () =
   });
 });
 
-describe("nested projects — POST /projects with parent", () => {
-  it("existing parent → createProject receives it; publish carries parent", async () => {
-    (listProjects as Mock).mockResolvedValue([
-      { slug: "top", displayName: "Top", users: null, parent: null },
-    ]);
-    const res = await httpRequest(server, {
-      method: "POST",
-      path: "/projects",
-      body: { hostId: 5, displayName: "Kid", parent: "top" },
-    });
-    expect(res.status).toBe(200);
-    expect(createProject).toHaveBeenCalledWith(null, "kid", "Kid", null, "top");
-    expect(mockPublishProjectListChanged).toHaveBeenCalledTimes(1);
-    expect(mockPublishProjectListChanged.mock.calls[0]?.[1]?.[0]).toMatchObject({
-      slug: "top",
-      parent: null,
-    });
-  });
-
-  it("a sub-project made inside a limited project starts shared with its people", async () => {
-    (isHostMultiUser as Mock).mockResolvedValue(true);
-    (getUsernameForUserId as Mock).mockResolvedValue("alice");
-    (listProjects as Mock).mockResolvedValue([
-      { slug: "wall", displayName: "Wall", users: ["bo", "alice"], parent: null },
-    ]);
-    const res = await httpRequest(server, {
-      method: "POST",
-      path: "/projects",
-      body: { hostId: 5, displayName: "Kid", parent: "wall" },
-    });
-    expect(res.status).toBe(200);
-    expect(createProject).toHaveBeenCalledWith(null, "kid", "Kid", ["alice", "bo"], "wall");
-  });
-
-  it("inside a project nobody limited, the sub-project isn't limited either", async () => {
-    (isHostMultiUser as Mock).mockResolvedValue(true);
-    (getUsernameForUserId as Mock).mockResolvedValue("alice");
-    (listProjects as Mock).mockResolvedValue([
-      { slug: "wall", displayName: "Wall", users: null, parent: null },
-    ]);
-    await httpRequest(server, {
-      method: "POST",
-      path: "/projects",
-      body: { hostId: 5, displayName: "Kid", parent: "wall" },
-    });
-    expect(createProject).toHaveBeenCalledWith(null, "kid", "Kid", null, "wall");
-  });
-
-  it("parent not on the host → 400, nothing created", async () => {
-    (listProjects as Mock).mockResolvedValue([]);
-    const res = await httpRequest(server, {
-      method: "POST",
-      path: "/projects",
-      body: { hostId: 5, displayName: "Kid", parent: "nope" },
-    });
-    expect(res.status).toBe(400);
-    expect(res.body).toEqual({ error: "parent project not found" });
-    expect(createProject).not.toHaveBeenCalled();
-  });
-
-  it("malformed parent → 400 before any I/O", async () => {
-    const res = await httpRequest(server, {
-      method: "POST",
-      path: "/projects",
-      body: { hostId: 5, displayName: "Kid", parent: "../etc" },
-    });
-    expect(res.status).toBe(400);
-    expect(listProjects).not.toHaveBeenCalled();
-    expect(createProject).not.toHaveBeenCalled();
-  });
-});
-
-describe("nested projects — POST /projects/:slug/parent", () => {
-  // a ← b ← c (c under b under a); d top level.
-  const tree = [
-    { slug: "a", displayName: "A", users: null, parent: null },
-    { slug: "b", displayName: "B", users: null, parent: "a" },
-    { slug: "c", displayName: "C", users: null, parent: "b" },
-    { slug: "d", displayName: "D", users: null, parent: null },
-  ];
-
-  function move(slug: string, body: unknown) {
-    return httpRequest(server, {
-      method: "POST",
-      path: `/projects/${slug}/parent`,
-      body,
-    });
-  }
-
-  it("valid move → writes, publishes the host list, 200 {ok:true}", async () => {
-    (listProjects as Mock).mockResolvedValue(tree);
-    const res = await move("d", { hostId: 5, parent: "c" });
-    expect(res.status).toBe(200);
-    expect(res.body).toEqual({ ok: true });
-    expect(setProjectParentField).toHaveBeenCalledWith(null, "d", "c");
-    expect(mockPublishProjectListChanged).toHaveBeenCalledTimes(1);
-    const [hostId, entries] = mockPublishProjectListChanged.mock.calls[0]!;
-    expect(hostId).toBe("5");
-    expect(entries.map((e: { parent: unknown }) => e.parent)).toEqual([
-      null,
-      "a",
-      "b",
-      null,
-    ]);
-  });
-
-  it("parent null → clears (moves to top level)", async () => {
-    (listProjects as Mock).mockResolvedValue(tree);
-    const res = await move("c", { hostId: 5, parent: null });
-    expect(res.status).toBe(200);
-    expect(setProjectParentField).toHaveBeenCalledWith(null, "c", null);
-  });
-
-  it("remote host → uses the SSH connection", async () => {
-    (listProjects as Mock).mockResolvedValue(tree);
-    const res = await move("d", { hostId: 7, parent: "a" });
-    expect(res.status).toBe(200);
-    expect(setProjectParentField).toHaveBeenCalledWith(stubConn, "d", "a");
-    expect(stubConn.end).toHaveBeenCalled();
-  });
-
-  it("self → 409", async () => {
-    (listProjects as Mock).mockResolvedValue(tree);
-    const res = await move("a", { hostId: 5, parent: "a" });
-    expect(res.status).toBe(409);
-    expect(res.body).toEqual({
-      error: "cannot move a project inside itself or its own sub-project",
-    });
-    expect(setProjectParentField).not.toHaveBeenCalled();
-  });
-
-  it("own descendant (grandchild) → 409", async () => {
-    (listProjects as Mock).mockResolvedValue(tree);
-    const res = await move("a", { hostId: 5, parent: "c" });
-    expect(res.status).toBe(409);
-    expect(setProjectParentField).not.toHaveBeenCalled();
-  });
-
-  it("descendant check is cycle-safe on a hand-edited loop", async () => {
-    (listProjects as Mock).mockResolvedValue([
-      { slug: "x", displayName: "X", users: null, parent: "y" },
-      { slug: "y", displayName: "Y", users: null, parent: "x" },
-      { slug: "z", displayName: "Z", users: null, parent: null },
-    ]);
-    // z is not inside the x↔y loop, so moving z under x is fine…
-    const ok = await move("z", { hostId: 5, parent: "x" });
-    expect(ok.status).toBe(200);
-    // …and moving x under y (its own loop partner) is refused.
-    const bad = await move("x", { hostId: 5, parent: "y" });
-    expect(bad.status).toBe(409);
-  });
-
-  it("missing parent → 400", async () => {
-    (listProjects as Mock).mockResolvedValue(tree);
-    const res = await move("d", { hostId: 5, parent: "nope" });
-    expect(res.status).toBe(400);
-    expect(res.body).toEqual({ error: "parent project not found" });
-    expect(setProjectParentField).not.toHaveBeenCalled();
-  });
-
-  it("missing project → 404", async () => {
-    (listProjects as Mock).mockResolvedValue(tree);
-    const res = await move("nope", { hostId: 5, parent: "a" });
-    expect(res.status).toBe(404);
-    expect(setProjectParentField).not.toHaveBeenCalled();
-  });
-
-  it("malformed slug / parent / absent parent key → 400 before any I/O", async () => {
-    const r1 = await move("BAD", { hostId: 5, parent: "a" });
-    const r2 = await move("d", { hostId: 5, parent: "../x" });
-    const r3 = await move("d", { hostId: 5 });
-    expect([r1.status, r2.status, r3.status]).toEqual([400, 400, 400]);
-    expect(listProjects).not.toHaveBeenCalled();
-  });
-
-  it("unknown host → 404", async () => {
-    const res = await move("d", { hostId: 99, parent: "a" });
-    expect(res.status).toBe(404);
-  });
-
-  it("write failure → 500 generic, no publish", async () => {
-    (listProjects as Mock).mockResolvedValue(tree);
-    (setProjectParentField as Mock).mockRejectedValue(new Error("disk on fire"));
-    const res = await move("d", { hostId: 5, parent: "a" });
-    expect(res.status).toBe(500);
-    expect(res.body).toEqual({ error: "failed to move project" });
-    expect(mockPublishProjectListChanged).not.toHaveBeenCalled();
-  });
-
-  it("logs a structured outcome on success", async () => {
-    (listProjects as Mock).mockResolvedValue(tree);
-    await move("d", { hostId: 5, parent: "a" });
-    expect(databaseLogger.info).toHaveBeenCalledWith(
-      "project parent set",
-      expect.objectContaining({
-        userId: "1",
-        hostId: 5,
-        slug: "d",
-        parent: "a",
-        outcome: "ok",
-      }),
-    );
-  });
-});
-
-// ===========================================================================
-// Cross-cutting
-// ===========================================================================
-
-describe("nested projects — write routes treat projects hidden from the caller as absent", () => {
-  // secret is visible only to riley; inner hangs off it; open is for all.
-  const list = [
-    { slug: "secret", displayName: "Secret", users: ["riley"], parent: null },
-    { slug: "inner", displayName: "Inner", users: null, parent: "secret" },
-    { slug: "open", displayName: "Open", users: null, parent: null },
-  ];
-
-  it("create under a hidden parent → 400 parent not found, nothing created", async () => {
-    (listProjects as Mock).mockResolvedValue(list);
-    (getUsernameForUserId as Mock).mockResolvedValue("alice");
-    const res = await httpRequest(server, {
-      method: "POST",
-      path: "/projects",
-      body: { hostId: 5, displayName: "Kid", parent: "secret" },
-    });
-    expect(res.status).toBe(400);
-    expect(res.body).toEqual({ error: "parent project not found" });
-    expect(createProject).not.toHaveBeenCalled();
-  });
-
-  it("move under a hidden parent → 400; moving a hidden project → 404", async () => {
-    (listProjects as Mock).mockResolvedValue(list);
-    (getUsernameForUserId as Mock).mockResolvedValue("alice");
-    const under = await httpRequest(server, {
-      method: "POST",
-      path: "/projects/open/parent",
-      body: { hostId: 5, parent: "secret" },
-    });
-    expect(under.status).toBe(400);
-    const hidden = await httpRequest(server, {
-      method: "POST",
-      path: "/projects/inner/parent",
-      body: { hostId: 5, parent: null },
-    });
-    expect(hidden.status).toBe(404);
-    expect(setProjectParentField).not.toHaveBeenCalled();
-  });
-
-  it("the project's own audience can still move it", async () => {
-    (listProjects as Mock).mockResolvedValue(list);
-    (getUsernameForUserId as Mock).mockResolvedValue("riley");
-    const res = await httpRequest(server, {
-      method: "POST",
-      path: "/projects/open/parent",
-      body: { hostId: 5, parent: "secret" },
-    });
-    expect(res.status).toBe(200);
-    expect(setProjectParentField).toHaveBeenCalledWith(null, "open", "secret");
-  });
-});
-
 describe("nested projects — review fixes", () => {
-  it("moving out of a restricted parent keeps the project's audience", async () => {
-    (getUsernameForUserId as Mock).mockResolvedValue("alice");
-    (listProjects as Mock).mockResolvedValue([
-      { slug: "p", displayName: "P", users: ["alice", "bob"], parent: null },
-      { slug: "c", displayName: "C", users: null, parent: "p" },
-    ]);
-    const res = await httpRequest(server, {
-      method: "POST",
-      path: "/projects/c/parent",
-      body: { hostId: 5, parent: null },
-    });
-    expect(res.status).toBe(200);
-    expect(setProjectParentField).toHaveBeenCalledWith(null, "c", null, ["alice", "bob"]);
-  });
-
-  it("moving under a less restricted parent keeps the narrower audience", async () => {
-    (getUsernameForUserId as Mock).mockResolvedValue("alice");
-    (listProjects as Mock).mockResolvedValue([
-      { slug: "p", displayName: "P", users: ["alice"], parent: null },
-      { slug: "q", displayName: "Q", users: ["alice", "bob"], parent: null },
-      { slug: "c", displayName: "C", users: ["alice", "bob"], parent: "p" },
-    ]);
-    await httpRequest(server, {
-      method: "POST",
-      path: "/projects/c/parent",
-      body: { hostId: 5, parent: "q" },
-    });
-    expect(setProjectParentField).toHaveBeenCalledWith(null, "c", "q", ["alice"]);
-  });
-
-  it("a move that doesn't widen leaves the users list alone", async () => {
-    (listProjects as Mock).mockResolvedValue([
-      { slug: "p", displayName: "P", users: null, parent: null },
-      { slug: "q", displayName: "Q", users: ["alice"], parent: null },
-      { slug: "c", displayName: "C", users: null, parent: "p" },
-    ]);
-    await httpRequest(server, {
-      method: "POST",
-      path: "/projects/c/parent",
-      body: { hostId: 5, parent: "q" },
-    });
-    expect(setProjectParentField).toHaveBeenCalledWith(null, "c", "q");
-  });
-
-  it("create never takes a slug a live project names as its parent", async () => {
-    (listProjects as Mock).mockResolvedValue([
-      { slug: "orphan", displayName: "Orphan", users: null, parent: "foo" },
-    ]);
-    const res = await httpRequest(server, {
-      method: "POST",
-      path: "/projects",
-      body: { hostId: 5, displayName: "Foo" },
-    });
-    expect(res.status).toBe(200);
-    expect(res.body).toEqual({ ok: true, slug: "foo-2" });
-    expect(createProject).toHaveBeenCalledTimes(1);
-    expect((createProject as Mock).mock.calls[0]?.[1]).toBe("foo-2");
-  });
-
   it("archive refuses while a sub-project inside is hidden; a loop partner doesn't count", async () => {
     (getUsernameForUserId as Mock).mockResolvedValue("alice");
     (listProjects as Mock).mockResolvedValue([
@@ -1717,27 +1263,6 @@ describe("nested projects — review fixes", () => {
     expect(writeProjectFile).toHaveBeenCalledTimes(1);
   });
 
-  it("two moves at once can't write a loop", async () => {
-    // a and b both top level; move a under b and b under a concurrently.
-    let parents: Record<string, string | null> = { a: null, b: null };
-    (listProjects as Mock).mockImplementation(async () => [
-      { slug: "a", displayName: "A", users: null, parent: parents.a },
-      { slug: "b", displayName: "B", users: null, parent: parents.b },
-    ]);
-    (setProjectParentField as Mock).mockImplementation(
-      async (_c: unknown, slug: string, parent: string | null) => {
-        await new Promise((r) => setTimeout(r, 20));
-        parents = { ...parents, [slug]: parent };
-        return { markdown: "" };
-      },
-    );
-    const [r1, r2] = await Promise.all([
-      httpRequest(server, { method: "POST", path: "/projects/a/parent", body: { hostId: 5, parent: "b" } }),
-      httpRequest(server, { method: "POST", path: "/projects/b/parent", body: { hostId: 5, parent: "a" } }),
-    ]);
-    expect([r1.status, r2.status].sort()).toEqual([200, 409]);
-    expect(parents.a === "b" && parents.b === "a").toBe(false);
-  });
 });
 
 describe("cross-cutting", () => {
@@ -1766,7 +1291,6 @@ describe("cross-cutting", () => {
 
     // Absolutely no downstream calls happened.
     expect(listProjects).not.toHaveBeenCalled();
-    expect(createProject).not.toHaveBeenCalled();
     expect(submitFrontDoor).not.toHaveBeenCalled();
   });
 

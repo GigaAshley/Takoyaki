@@ -62,7 +62,12 @@ vi.mock("../../claude-session/identity-artifact-reader.js", () => ({
   },
   AVATAR_EXT_VALUES: ["webp", "png", "jpg"] as const,
   IDMEDIT_MAX_AVATAR_BYTES: 5_000_000,
+  getLocalProjectsRoot: vi.fn().mockReturnValue("/tmp/test-fleet/projects"),
+  execWithTimeout: vi.fn(),
+  readIdentityFile: vi.fn(),
+  writeIdentityFile: vi.fn(),
 }));
+vi.mock("../../fleet-change/front-door.js", () => ({ submitFrontDoor: vi.fn() }));
 
 vi.mock("node:child_process", () => ({
   exec: vi.fn(),
@@ -260,6 +265,64 @@ describe("mint-first atomic-birth flow", () => {
     expect(ended).toEqual(
       expect.objectContaining({ type: "ended", ok: true }),
     );
+  });
+
+  it("made into a project: filed through the front door after the commit; a gone project says why", async () => {
+    const { events, emit } = collectEvents();
+    const fileIntoProject = vi.fn(async (_c: unknown, _name: string, _project: string) => 'the project "Garden" is archived');
+    const deps = makeDeps({ fileIntoProject });
+    const birthPromise = birthIdentity({ ...makeOpts(), project: "garden" }, emit, deps);
+    await vi.runAllTimersAsync();
+    await birthPromise;
+    expect(fileIntoProject).toHaveBeenCalledTimes(1);
+    expect(fileIntoProject.mock.calls[0]?.[2]).toBe("garden");
+    const ended = events.find((e) => e.type === "ended");
+    expect(ended).toMatchObject({ ok: true, notFiled: 'the project "Garden" is archived' });
+  });
+
+  it("the front door can't take the filing (machine updating) and the project is gone: taken out here, with the reason", async () => {
+    const { submitFrontDoor } = await import("../../fleet-change/front-door.js");
+    const reader = await import("../../claude-session/identity-artifact-reader.js");
+    (submitFrontDoor as unknown as Mock).mockResolvedValue({ state: "not_installed", id: "x" });
+    (reader.execWithTimeout as unknown as Mock).mockResolvedValue("no\n");
+    (reader.readIdentityFile as unknown as Mock).mockResolvedValue({
+      markdown: "---\nroles: [eng]\nproject: garden\ntask: \"T\"\n---\n\n# body",
+    });
+    const { events, emit } = collectEvents();
+    const birthPromise = birthIdentity({ ...makeOpts(), project: "garden" }, emit, makeDeps());
+    await vi.runAllTimersAsync();
+    await birthPromise;
+    expect(reader.execWithTimeout).toHaveBeenCalledWith(expect.anything(), expect.stringContaining("fleet/projects/garden/project.md"));
+    expect(reader.writeIdentityFile).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.any(String),
+      "---\nroles: [eng]\ntask: \"T\"\n---\n\n# body\n",
+    );
+    expect(events.find((e) => e.type === "ended")).toMatchObject({ ok: true, notFiled: "that project is gone" });
+  });
+
+  it("the front door can't take the filing but the project is there: left as made", async () => {
+    const { submitFrontDoor } = await import("../../fleet-change/front-door.js");
+    const reader = await import("../../claude-session/identity-artifact-reader.js");
+    (submitFrontDoor as unknown as Mock).mockResolvedValue({ state: "failed", id: "x", seq: 1, code: "internal", reason: "x" });
+    (reader.execWithTimeout as unknown as Mock).mockResolvedValue("yes\n");
+    (reader.writeIdentityFile as unknown as Mock).mockClear();
+    const { events, emit } = collectEvents();
+    const birthPromise = birthIdentity({ ...makeOpts(), project: "garden" }, emit, makeDeps());
+    await vi.runAllTimersAsync();
+    await birthPromise;
+    expect(reader.writeIdentityFile).not.toHaveBeenCalled();
+    expect(events.find((e) => e.type === "ended")).not.toHaveProperty("notFiled");
+  });
+
+  it("no project: nothing is filed and the answer has no notFiled", async () => {
+    const { events, emit } = collectEvents();
+    const fileIntoProject = vi.fn(async () => undefined);
+    const birthPromise = birthIdentity(makeOpts(), emit, makeDeps({ fileIntoProject }));
+    await vi.runAllTimersAsync();
+    await birthPromise;
+    expect(fileIntoProject).not.toHaveBeenCalled();
+    expect(events.find((e) => e.type === "ended")).not.toHaveProperty("notFiled");
   });
 
   it("Matrix mint fires BEFORE SSH connect (mint-first invariant)", async () => {

@@ -1,30 +1,21 @@
 /**
- * PUT /identities/:key/pinned  body: { hostId: number, pinned: boolean }
- *   → { pinned: boolean }
+ * PUT /identities/:key/pinned  body: { hostId: number, pinned: boolean, requestId?: string }
+ *   → 200 { ok: true, pinned, requestId, result: { name, pinned, previousProject } }
  *
- * Single-identity pin toggle — writes or removes `~/fleet/identities/<key>/.pinned`
- * on the identity's host via the per-identity-file primitive. Idempotent.
+ * Pin or unpin one agent, through the machine's front door (fleet-change agent-pin), in turn
+ * with the machine's other changes. A per-agent change, never the whole set of pins: a stale
+ * tab can't unpin what another just pinned.
  *
- * Replaces the whole-set `PUT /user-preferences { pinnedConversationIds,
- * identityHosts }` path for pin/unpin clicks. That path reconciled disk to
- * whatever full set the client sent, which (a) let a stale second tab silently
- * unpin what another tab just pinned, (b) let two fast clicks race each other,
- * and (c) 400'd the entire write whenever one id in the set had no host
- * mapping (a pinned relay room, an orphaned pin) — after which no identity pin
- * persisted at all. A per-key delta has none of those failure modes, and
- * touches one host instead of probing every identity on every host.
+ * Pinned and in a project are one or the other: pinning takes the agent out of its project in
+ * the same change (open sidebars are told with session-project-changed). The inverse lives in
+ * session-project-write.ts. Other tabs learn the pin itself from the fleet-status sweep.
  *
- * Other tabs / users learn the change through the fleet-status sweep: the
- * identity-appearance fingerprint carries `pinned`, so the next tick emits an
- * update frame.
+ *   → 202 still waiting its turn; 503 { code: "updating" }
+ *   → 409 { error, code }: being_archived, not_found, archived
+ *   → 400 bad hostId / key / pinned; 404 not the caller's host; 504 unreachable
  *
- * Pinned and in-a-project are mutually exclusive: pinning also clears the
- * identity's `project:` frontmatter (and fans out session-project-changed so
- * open sidebars move the row out of its project section). The inverse lives
- * in session-project-write.ts.
- *
- * Mounted in database.ts BEFORE the generic /identities router (same
- * discipline as no-dormancy / archive).
+ * Mounted in database.ts BEFORE the generic /identities router (same discipline as
+ * no-dormancy / archive).
  */
 
 import type { AuthenticatedRequest } from "../../../types/index.js";
@@ -32,165 +23,63 @@ import express from "express";
 import type { Request, Response } from "express";
 import { AuthManager } from "../../utils/auth-manager.js";
 import { databaseLogger } from "../../utils/logger.js";
-import { resolveHostById } from "../../ssh/host-resolver.js";
-import { connectOneShot } from "../../ssh/ssh-one-shot.js";
-import {
-  isLocalHostId,
-  IDENTITY_KEY_RE,
-  readSessionProjectField,
-} from "../../claude-session/identity-artifact-reader.js";
-import { writeSessionProjectFieldPreservingNewline } from "./session-project-write.js";
-import { getHostSemaphore } from "../../ssh/host-semaphore-registry.js";
+import { IDENTITY_KEY_RE } from "../../claude-session/identity-artifact-reader.js";
 import { getSubscriptionRegistry } from "../../fleet-status/subscription-registry.js";
-import {
-  writeIdentityFile,
-  assertNotBeingArchived,
-  IdentityBeingArchivedError,
-  removeIdentityFile,
-} from "../../claude-session/per-identity-file.js";
+import { frontDoorHttp, requestIdFrom } from "../../fleet-change/front-door.js";
+import { answerFromFrontDoor, parseHostId } from "../../fleet-change/front-door-route.js";
 
 const router = express.Router();
 const authManager = AuthManager.getInstance();
 const authenticateJWT = authManager.createAuthMiddleware();
-
-const SSH_CONNECT_TIMEOUT_MS = 3000;
-
-/**
- * Run the handler's SSH motion (connectOneShot + pin write + project clear +
- * conn.end) under the shared per-host semaphore. One slot per request — the
- * handler drives its connection serially. Local hosts bypass.
- */
-function withHostSlot<T>(hostId: number, fn: () => Promise<T>): Promise<T> {
-  return isLocalHostId(hostId) ? fn() : getHostSemaphore(hostId).run(fn);
-}
-
-/**
- * Pinning takes the identity out of its project. Best-effort: the pin itself
- * already landed, so a failed project clear is logged rather than turned into
- * a 500 — the sidebar shows project membership over the pin until it's fixed.
- */
-async function clearProjectOnPin(
-  conn: Awaited<ReturnType<typeof connectOneShot>> | null,
-  key: string,
-  hostId: number,
-  userId: string | undefined,
-): Promise<void> {
-  try {
-    const current = await readSessionProjectField(conn, key);
-    if (current === null) return;
-    await writeSessionProjectFieldPreservingNewline(conn, key, null);
-    databaseLogger.info("identity pin cleared project", {
-      operation: "identity_pin_cleared_project",
-      userId,
-      hostId,
-      identityKey: key,
-      previousProject: current,
-    });
-    try {
-      getSubscriptionRegistry()?.publishSessionProjectChanged(key, hostId, null);
-    } catch (pubErr) {
-      databaseLogger.warn("session-project-changed publish failed after pin", {
-        operation: "identity_pin_project_publish_failed",
-        hostId,
-        identityKey: key,
-        errMessage: pubErr instanceof Error ? pubErr.message : String(pubErr),
-      });
-    }
-  } catch (err) {
-    databaseLogger.warn("identity pin could not clear project", {
-      operation: "identity_pin_clear_project_failed",
-      userId,
-      hostId,
-      identityKey: key,
-      errMessage: err instanceof Error ? err.message : String(err),
-    });
-  }
-}
 
 router.put(
   "/:key/pinned",
   authenticateJWT,
   async (req: Request, res: Response) => {
     const userId = (req as AuthenticatedRequest).userId;
-    const body = (req.body ?? {}) as { hostId?: unknown; pinned?: unknown };
+    const body = (req.body ?? {}) as { hostId?: unknown; pinned?: unknown; requestId?: unknown };
 
     const rawHostId = body.hostId;
     if (rawHostId === undefined || rawHostId === null || rawHostId === "") {
       return res.status(400).json({ error: "hostId is required" });
     }
-    const hostId =
-      typeof rawHostId === "number" ? rawHostId : parseInt(String(rawHostId), 10);
-    if (!Number.isFinite(hostId) || hostId <= 0 || !Number.isInteger(hostId)) {
+    const hostId = parseHostId(rawHostId);
+    if (hostId === null) {
       return res.status(400).json({ error: "hostId must be a positive integer" });
     }
-
     if (typeof body.pinned !== "boolean") {
       return res.status(400).json({ error: "pinned must be a boolean" });
     }
     const pinned = body.pinned;
-
     const key = String(req.params.key ?? "");
     if (!key || !IDENTITY_KEY_RE.test(key)) {
-      return res
-        .status(400)
-        .json({ error: "identity key must match [a-z0-9_-]{1,64}" });
+      return res.status(400).json({ error: "identity key must match [a-z0-9_-]{1,64}" });
     }
 
-    const host = await resolveHostById(hostId, userId);
-    if (!host) {
-      return res.status(404).json({ error: "Host not found" });
-    }
-
-    // SSH work (connect + execs + conn.end) runs under the per-host
-    // semaphore (verify:ssh-cap); local hosts bypass it.
-    return withHostSlot(hostId, async () => {
-      let conn: Awaited<ReturnType<typeof connectOneShot>> | null = null;
-      if (!isLocalHostId(hostId)) {
-        try {
-          conn = await connectOneShot(
-            host as unknown as Parameters<typeof connectOneShot>[0],
-            SSH_CONNECT_TIMEOUT_MS,
-          );
-        } catch {
-          return res.status(504).json({ error: "Host unreachable" });
-        }
-      }
-
-      try {
-        await assertNotBeingArchived(key, { hostId, conn });
-        if (pinned) {
-          await writeIdentityFile(key, ".pinned", "", { hostId, conn });
-          await clearProjectOnPin(conn, key, hostId, userId);
-        } else {
-          await removeIdentityFile(key, ".pinned", { hostId, conn });
-        }
-        databaseLogger.info("identity pin set", {
-          operation: "identity_pin_set",
+    return answerFromFrontDoor(res, {
+      hostId,
+      userId,
+      kind: "agent-pin",
+      args: { name: key, pinned },
+      requestId: requestIdFrom(body.requestId),
+      operation: "identity_pin_set",
+      answer: (outcome) => {
+        if (outcome.state !== "done") return null;
+        const { status, body: b } = frontDoorHttp(outcome);
+        return { status, body: { ...b, pinned } };
+      },
+      onDone: async (_conn, outcome) => {
+        const previous = (outcome.result as { previousProject?: unknown } | null)?.previousProject;
+        if (typeof previous !== "string") return;
+        databaseLogger.info("identity pin cleared project", {
+          operation: "identity_pin_cleared_project",
           userId,
           hostId,
           identityKey: key,
-          pinned,
+          previousProject: previous,
         });
-        return res.json({ pinned });
-      } catch (err) {
-        if (err instanceof IdentityBeingArchivedError) return res.status(409).json({ error: "it's being archived", code: "being_archived" });
-        databaseLogger.error("identity pin write failed", err, {
-          operation: "identity_pin_set_failed",
-          userId,
-          hostId,
-          identityKey: key,
-          pinned,
-        });
-        return res.status(500).json({ error: "failed to update pin" });
-      } finally {
-        if (conn) {
-          try {
-            conn.end();
-          } catch {
-            /* ignore */
-          }
-        }
-      }
+        getSubscriptionRegistry()?.publishSessionProjectChanged(key, hostId, null);
+      },
     });
   },
 );

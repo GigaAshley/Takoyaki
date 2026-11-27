@@ -64,7 +64,6 @@ import { decideNewConversationOpen } from "@/lib/new-conversation-open";
 import { findAppPaneTab } from "@/lib/sidebar-app-open";
 import { decideSearchResultPlacement, findOpenResultTab, type SearchResultPlacement } from "@/lib/search-result-open";
 import { NEW_CONVERSATION_DRAG_MIME, hasNewConversationDragMime } from "@/shell/new-conversation-drag";
-import { setSessionProject } from "@/api/session-project-api";
 import { usePhoneDesktop } from "@/shell/use-phone-desktop";
 import { applyAccentColor, applyFontSize } from "@/lib/theme";
 import { useTheme } from "@/components/theme-provider";
@@ -4083,24 +4082,20 @@ export function AppShell({
           return next;
         });
         removeNewConversationTab(tabId, wasShown ? newTabId : null);
-        // Born into a project: the birth already wrote `project:`; filing it
-        // again here (as the old dialog did) also refreshes the store so the
-        // row lands under its project at once.
+        // Born into a project: the birth filed it (at its turn on the machine);
+        // refresh the store so the row lands under its project at once.
         if (what.kind === "agent" && what.project !== null) {
           const hostIdNum = parseInt(what.host.id, 10);
           const key = what.name;
-          const slug = what.project;
-          setSessionProject(hostIdNum, key, slug)
-            .then(() => refreshIdentities({ [key]: hostIdNum }))
-            .catch((err: unknown) => {
-              systemLogger.warn("[new-conversation] couldn't file the newborn in its project", {
-                operation: "new_conversation_project_failed",
-                hostId: hostIdNum,
-                identityKey: key,
-                project: slug,
-                error: err instanceof Error ? err.message : String(err),
-              });
+          refreshIdentities({ [key]: hostIdNum }).catch((err: unknown) => {
+            systemLogger.warn("[new-conversation] couldn't refresh the newborn", {
+              operation: "new_conversation_refresh_failed",
+              hostId: hostIdNum,
+              identityKey: key,
+              project: what.project,
+              error: err instanceof Error ? err.message : String(err),
             });
+          });
         }
       },
       close: (tabId) => {

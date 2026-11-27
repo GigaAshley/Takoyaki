@@ -1,14 +1,12 @@
 import type { AuthenticatedRequest } from "../../../types/index.js";
 import {
   resolveIdentityAppearance,
-  capitalizeFirstIdentityKey,
   AVATAR_VERSION_RE,
 } from "../../fleet-status/identity-appearance.js";
 import express from "express";
 import multer from "multer";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import yaml from "js-yaml";
 import type { Request, Response } from "express";
 import { databaseLogger, systemLogger } from "../../utils/logger.js";
 // Phase 129 Plan 129-02: per-user visibility gate on GET /identities. The
@@ -32,23 +30,20 @@ import { AuthManager } from "../../utils/auth-manager.js";
 import {
   readIdentityFile,
   listIdentityKeysOnHost,
-  writeIdentityFile,
-  writeAvatarSiblingFile,
   readAvatarSiblingFile,
   extractCosmeticsFromFrontmatter,
-  repairFrontmatterTaskLine,
   isLocalHostId,
   getLocalIdentitiesRoot,
   extractRoleFromMarkdown,
   extractRolesFromMarkdown,
-  flowRolesInYamlDump,
   MIME_TO_AVATAR_EXT,
+  IDMEDIT_MAX_AVATAR_BYTES,
+  writeBinaryFileAtomic,
   IDENTITY_KEY_RE,
   // Phase 85 Plan 85-01 Task 2: role-cosmetic merge (per-host memo in GET /
   // fanout) + role-folder avatar fallback in GET /:identityKey/avatar.
   readRoleFileByName,
   readAvatarSiblingFileByRole,
-  stringifyColorHueForYaml,
 } from "../../claude-session/identity-artifact-reader.js";
 import { connectOneShot } from "../../ssh/ssh-one-shot.js";
 import { execCommand } from "../../ssh/tmux-helper.js";
@@ -65,8 +60,6 @@ import { isRecognizedVoiceId } from "../../voice/tts-provider.js";
 // the read-side of the D-05 wire — a fail-closed stat against
 // `~/fleet/identities/<identityKey>/.pinned` on the identity's host.
 import {
-  assertNotBeingArchived,
-  IdentityBeingArchivedError,
   identityFileExists,
 } from "../../claude-session/per-identity-file.js";
 import { getHostSemaphore } from "../../ssh/host-semaphore-registry.js";
@@ -75,6 +68,7 @@ import { getAvatarVersion, forgetAvatarVersion } from "../../fleet-status/avatar
 import { normalizeAvatar, normalizeUploadedAvatar } from "../../utils/avatar-normalize.js";
 import { composeSplitAvatar, type SplitAvatarPart } from "../../utils/avatar-split.js";
 import { getCachedAvatar, invalidateCachedAvatar } from "./identity-avatar-cache.js";
+import { frontDoorHttp, requestIdFrom, submitAndFollow } from "../../fleet-change/front-door.js";
 
 const router = express.Router();
 const authManager = AuthManager.getInstance();
@@ -127,6 +121,8 @@ type IdentityMetadata = {
    *  route the artifact-reader (isLocalHostId LOCAL branch vs
    *  connectOneShot REMOTE branch). Missing/invalid → 400. */
   hostId?: number;
+  /** The change's id at the machine's front door; the same id sent again is the same edit. */
+  requestId?: string;
 };
 
 function parseMultipartMetadata(req: Request): IdentityMetadata | null {
@@ -729,208 +725,75 @@ router.put(
       }
 
       try {
-        // An agent whose archive is claimed is archived from every point of view: no edits.
-        await assertNotBeingArchived(identityKey, { hostId, conn });
-        // ---- Read the existing on-disk identity file ----
-        const { markdown: existing } = await readIdentityFile(conn, identityKey);
-        if (!existing || existing.length === 0) {
-          // Data-integrity violation: the identity's home is supposed to hold the .md
-          // file. No implicit-create (shape file: "error and move on"). Canned message
-          // per threat T-66-02-04 / T-68-02-04.
-          return res
-            .status(500)
-            .json({ error: "identity file missing on target host" });
-        }
-
-        // ---- Parse frontmatter ----
-        const fmMatch = existing.match(/^---\r?\n([\s\S]*?)\r?\n---/);
-        let overlaid: Record<string, unknown> = {};
-        let bodyAfterFm = existing;
-        if (fmMatch) {
-          try {
-            const parsed = yaml.load(repairFrontmatterTaskLine(fmMatch[1])) as
-              | Record<string, unknown>
-              | null;
-            if (parsed && typeof parsed === "object") {
-              overlaid = { ...parsed };
-            }
-          } catch (yamlErr) {
-            // Malformed frontmatter YAML — do NOT silently reset to {} because
-            // that would drop the mandatory `roles:` pointer (and anything else
-            // the identity carried) on the next write, permanently bricking the
-            // identity for every downstream artifact reader. Fail loud instead;
-            // the operator must repair the frontmatter on disk before Skynet
-            // will touch it again. (Code review HIGH #1, 2026-09-01.)
-            databaseLogger.warn(
-              "identity update: existing frontmatter YAML malformed — refusing overlay",
-              {
-                operation: "identity_update_frontmatter_parse",
-                userId,
-                identityKey,
-                error: yamlErr instanceof Error ? yamlErr.message : "Unknown",
-              },
-            );
-            return res.status(500).json({
-              error:
-                "existing identity frontmatter is malformed — repair on disk before editing",
-            });
-          }
-          bodyAfterFm = existing.slice(fmMatch[0].length);
-          // Strip a leading newline after the closing `---` (we re-add \n in
-          // the emit below). If the original body starts with \n we keep the
-          // rest verbatim.
-          if (bodyAfterFm.startsWith("\n")) {
-            bodyAfterFm = bodyAfterFm.slice(1);
-          } else if (bodyAfterFm.startsWith("\r\n")) {
-            bodyAfterFm = bodyAfterFm.slice(2);
-          }
-        }
-
-        // Capture old avatar ext (if any) for post-write cleanup
-        const oldAvatar =
-          typeof overlaid.avatar === "string" ? overlaid.avatar : null;
-        const oldExt =
-          oldAvatar && oldAvatar.startsWith(`${identityKey}.`)
-            ? oldAvatar.slice(identityKey.length + 1)
-            : null;
-
-        // ---- Overlay changed fields ----
+        // ---- The change, through the machine's front door ----
+        // Only the lines being changed are written, read when its turn comes (fleet-change
+        // agent-edit); an agent whose archive is claimed is refused there (being_archived).
         // absent → leave alone; explicit null → REMOVE; present → set.
-        if (meta.displayName !== undefined) {
-          // Empty string already rejected above.
-          overlaid.displayName = String(meta.displayName).trim();
-        }
-        if (meta.title !== undefined) {
-          if (meta.title === null) delete overlaid.title;
-          else overlaid.title = String(meta.title);
-        }
-        // Phase modal-unification 2026-09-29: task is editable via the
-        // IdentityModal head inline-pencil (user call). Mirrors the title
-        // overlay above: absent → leave alone, null → REMOVE, present → set.
-        // This relaxes the pre-existing "write-once at birth" property of
-        // task (D-05 origin), which is fine — the identity's frontmatter is
-        // the source of truth and both agents and the user can now update it.
-        if (meta.task !== undefined) {
-          if (meta.task === null) delete overlaid.task;
-          else overlaid.task = String(meta.task);
+        const set: Record<string, unknown> = {};
+        const unset: string[] = [];
+        if (meta.displayName !== undefined) set.displayName = String(meta.displayName).trim();
+        for (const k of ["title", "task", "voice"] as const) {
+          if (meta[k] === undefined) continue;
+          if (meta[k] === null) unset.push(k);
+          else set[k] = String(meta[k]);
         }
         if (meta.colorHue !== undefined) {
-          if (meta.colorHue === null) delete overlaid.colorHue;
-          else overlaid.colorHue = meta.colorHue;
+          if (meta.colorHue === null) unset.push("colorHue");
+          else set.colorHue = meta.colorHue;
         }
-        if (meta.voice !== undefined) {
-          if (meta.voice === null) delete overlaid.voice;
-          else overlaid.voice = meta.voice;
-        }
-        if (meta.avatar !== undefined) {
-          if (meta.avatar === null) delete overlaid.avatar;
-          // Non-null values in meta.avatar are silently ignored — avatar bytes
-          // arrive via req.file (multipart upload) at the "---- Avatar handling
-          // ----" block below, NOT via the JSON meta payload. Only the null-
-          // revert case is meaningful here.
-        }
+        // Non-null values in meta.avatar are ignored — avatar bytes arrive via req.file.
+        if (meta.avatar === null && !req.file) unset.push("avatar");
 
-        // ---- Avatar handling ----
-        let newExt: string | null = null;
+        const requestId = requestIdFrom(meta.requestId);
+        // A new picture is saved in the agent's folder under a fresh name first; the change
+        // puts it in place at its turn (and the machine removes it if the change is refused).
+        let avatar: { upload: string; ext: string } | undefined;
         if (req.file) {
           await normalizeUploadedAvatar(req.file);
           const mapped = MIME_TO_AVATAR_EXT[req.file.mimetype];
           if (!mapped) {
-            return res
-              .status(415)
-              .json({ error: "Avatar must be PNG, JPEG, or WebP" });
+            return res.status(415).json({ error: "Avatar must be PNG, JPEG, or WebP" });
           }
-          newExt = mapped;
-          overlaid.avatar = `${identityKey}.${newExt}`;
-        }
-
-        // ---- Emit new file body ----
-        // `roles:` round-trips as a list; flowRolesInYamlDump restores the
-        // canonical flow form (`roles: [a, b]`) yaml.dump would block-ify.
-        const yamlBody = flowRolesInYamlDump(
-          yaml.dump(stringifyColorHueForYaml(overlaid), {
-            sortKeys: false,
-            lineWidth: -1,
-            noRefs: true,
-            forceQuotes: false,
-          }),
-        );
-        let newBody = `---\n${yamlBody}---\n${bodyAfterFm}`;
-        // REMOTE reads come back through execCommand, which trims stdout, so
-        // the original file's trailing newline is lost before we get here.
-        // Identity markdown files always end with "\n" on disk; restore it so
-        // a remote rewrite doesn't strip it. LOCAL reads are byte-exact and
-        // are written back unchanged (no normalization).
-        if (!local && !newBody.endsWith("\n")) newBody += "\n";
-
-        // ---- Write markdown ----
-        await writeIdentityFile(conn, identityKey, newBody);
-
-        // ---- Write avatar sibling (if new bytes) ----
-        if (req.file && newExt) {
-          await writeAvatarSiblingFile(
+          if (req.file.buffer.byteLength > IDMEDIT_MAX_AVATAR_BYTES) {
+            return res.status(413).json({ error: "Avatar is too large" });
+          }
+          avatar = { upload: `.avatar-upload-${requestId}.${mapped}`, ext: mapped };
+          await writeBinaryFileAtomic(
             conn,
-            identityKey,
-            newExt as import("../../claude-session/identity-artifact-reader.js").AvatarExt,
+            `$HOME/fleet/identities/${identityKey}/${avatar.upload}`,
             req.file.buffer,
           );
-
-          // Ext-swap cleanup: hard-delete the old sibling file. Best-effort
-          // (missing-file is fine — this is opportunistic hygiene, not a
-          // correctness guarantee).
-          if (oldExt && oldExt !== newExt) {
-            if (local) {
-              const oldPath = path.join(
-                getLocalIdentitiesRoot(),
-                identityKey,
-                `${identityKey}.${oldExt}`,
-              );
-              await fs.unlink(oldPath).catch(() => {
-                /* best-effort */
-              });
-            } else if (conn) {
-              await execCommand(
-                conn,
-                `rm -f "$HOME/fleet/identities/${identityKey}/${identityKey}.${oldExt}"`,
-              ).catch(() => {
-                /* best-effort */
-              });
-            }
-          }
         }
 
-        // 260909-dls: avatar-revert sibling-file cleanup. When the null-delete
-        // branch above ran AND the identity previously had an avatar override
-        // whose filename matches the canonical `<identityKey>.<ext>` shape,
-        // hard-delete the sibling file on disk. Best-effort (missing file is
-        // fine — matches the ext-swap cleanup pattern above). Ordering:
-        // this runs AFTER writeIdentityFile so the frontmatter delete is
-        // persisted before the sibling removal. A mid-motion crash between
-        // the two steps leaves an orphaned sibling file, but readers correctly
-        // fall back to the role's avatar via Phase 86 Plan 86-01, so the
-        // invariant holds. Gated on `oldExt` (only set when oldAvatar starts
-        // with `${identityKey}.`) — a hand-edited non-canonical frontmatter
-        // value is silently skipped so no non-identityKey filename ever flows
-        // into fs.unlink or (more importantly) the REMOTE shell command.
-        if (meta.avatar === null && oldExt) {
-          const canonicalName = `${identityKey}.${oldExt}`;
+        // Waits out a longer change ahead of it (an archive stopping apps) rather than
+        // answering "still working" to an edit the window is waiting on.
+        const outcome = await submitAndFollow(
+          conn,
+          "agent-edit",
+          { name: identityKey, set, unset, ...(avatar ? { avatar } : {}) },
+          { id: requestId, hostId, totalS: 60 },
+        );
+        if (outcome.state === "not_installed" && avatar) {
+          // The machine never took it: the picture saved for it isn't wanted.
+          const upload = avatar.upload;
           if (local) {
-            const oldPath = path.join(
-              getLocalIdentitiesRoot(),
-              identityKey,
-              canonicalName,
-            );
-            await fs.unlink(oldPath).catch(() => {
-              /* best-effort */
-            });
+            await fs.unlink(path.join(getLocalIdentitiesRoot(), identityKey, upload)).catch(() => undefined);
           } else if (conn) {
-            await execCommand(
-              conn,
-              `rm -f "$HOME/fleet/identities/${identityKey}/${canonicalName}"`,
-            ).catch(() => {
-              /* best-effort */
-            });
+            await execCommand(conn, `rm -f "$HOME/fleet/identities/${identityKey}/${upload}"`).catch(() => undefined);
           }
+        }
+        databaseLogger.info("identity edit requested", {
+          operation: "update_identity_request",
+          userId,
+          identityKey,
+          hostId,
+          requestId,
+          outcome: outcome.state,
+          code: "code" in outcome ? outcome.code : undefined,
+        });
+        if (outcome.state !== "done") {
+          const { status, body } = frontDoorHttp(outcome);
+          return res.status(status).json(body);
         }
 
         // Avatar changed → drop the server-side cached bytes, and forget the
@@ -990,9 +853,6 @@ router.put(
           ),
         );
       } catch (e) {
-        if (e instanceof IdentityBeingArchivedError) {
-          return res.status(409).json({ error: "it's being archived", code: "being_archived" });
-        }
         databaseLogger.error("Failed to update identity on disk", e, {
           operation: "update_identity_disk_write",
           userId,

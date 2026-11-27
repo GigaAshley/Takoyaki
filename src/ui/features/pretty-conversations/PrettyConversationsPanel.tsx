@@ -152,9 +152,8 @@ import {
   getArchivePreflight,
   type ProjectArchiveContents,
   type ProjectArchivePreflight,
-  getProjectFile,
+  renameProject,
   setProjectParent,
-  updateProjectFile,
 } from "@/api/project-list-api";
 // Phase 117 Plan 117-09 Task 2 (D-14) — reusable right-click / long-press
 // context menu chrome. The section header binds onContextMenu, which opens
@@ -439,38 +438,6 @@ function collectHostsFromFolder(folder: HostFolder): Host[] {
 //                                                    cannot be constructed).
 // The panel only threads `onArchive` on rows whose gate returns non-null,
 // which the row component then renders as the "Archive" menu entry.
-// Rewrite the `displayName:` value inside the leading YAML frontmatter fence
-// of a project.md body. If the file has a `---` fence with a `displayName:`
-// key, that value is swapped; if the fence exists without the key, the key is
-// injected; if there is no fence at all, one is prepended. The new value is
-// YAML-quoted only when it contains a character that would break bare-string
-// parsing (colon, hash, leading dash, etc.) — matches the shape written by
-// writeProjectFile in identity-artifact-reader.ts.
-//
-// Exported for the frontend test suite; not called at runtime outside the
-// panel's handleRenameProject.
-export function rewriteDisplayNameInFrontmatter(
-  markdown: string,
-  nextDisplayName: string,
-): string {
-  const yamlValue = /[:#\-\[\]\{\},&*!|>'"%@`\n]/.test(nextDisplayName)
-    ? JSON.stringify(nextDisplayName)
-    : nextDisplayName;
-
-  const fenceMatch = markdown.match(/^---\r?\n([\s\S]*?)\r?\n---(\r?\n|$)/);
-  if (fenceMatch) {
-    const fmBody = fenceMatch[1];
-    const rest = markdown.slice(fenceMatch[0].length);
-    const dnLine = /^displayName:.*$/m;
-    const newFmBody = dnLine.test(fmBody)
-      ? fmBody.replace(dnLine, `displayName: ${yamlValue}`)
-      : `${fmBody}\ndisplayName: ${yamlValue}`;
-    return `---\n${newFmBody}\n---\n${rest}`;
-  }
-
-  return `---\ndisplayName: ${yamlValue}\n---\n${markdown}`;
-}
-
 function canonicalArchiveIdForRow(row: ConversationRowShape): string | null {
   if (row.rdpHostRow === true) return null;
   if (row.kind === "relay-room") return null;
@@ -2331,6 +2298,7 @@ export function PrettyConversationsPanel({
         .catch((err: unknown) => {
           const msg = err instanceof Error ? err.message : String(err);
           console.error(`[project-drop] setSessionProject failed: ${msg}`);
+          void kitAlert({ title: "Couldn't move this conversation", body: sentenceOf(msg) });
         });
     },
     [viewingUserMxid],
@@ -2510,6 +2478,7 @@ export function PrettyConversationsPanel({
         .catch((err: unknown) => {
           const msg = err instanceof Error ? err.message : String(err);
           console.error(`[project-menu] setSessionProject failed: ${msg}`);
+          void kitAlert({ title: "Couldn't move this conversation", body: sentenceOf(msg) });
         });
     },
     [viewingUserMxid, identitiesByHostKey, identitiesByKey],
@@ -2675,7 +2644,7 @@ export function PrettyConversationsPanel({
         if (now.find((p) => p.slug === slug)?.parent === newParent) {
           mergeProjectsForHost(hostId, hostRows);
         }
-        void kitAlert({ title: "Couldn't move this project", body: msg });
+        void kitAlert({ title: "Couldn't move this project", body: sentenceOf(msg) });
       });
     },
     [isInSubtree],
@@ -2929,6 +2898,7 @@ export function PrettyConversationsPanel({
       setSessionProject(hostIdNum, identityKey, null).catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(`[project-drop] setSessionProject(null) failed: ${msg}`);
+        void kitAlert({ title: "Couldn't move this conversation", body: sentenceOf(msg) });
       });
     },
     [rowIdToProjectSlug, viewingUserMxid, pinnedIds, roomPinnedIds, releaseFlatMiddlePreview, readSidebarDrop],
@@ -3405,9 +3375,8 @@ export function PrettyConversationsPanel({
         if (next.length === 0 || next.length > 80) return; // validate blocks > 80
         if (next === currentDisplayName) return; // No-op
         try {
-          const { markdown } = await getProjectFile(projHostIdNum, slug);
-          const rewritten = rewriteDisplayNameInFrontmatter(markdown, next);
-          await updateProjectFile(projHostIdNum, slug, rewritten);
+          // Only its name changes, at its turn on the machine.
+          await renameProject(projHostIdNum, slug, next);
         } catch (err) {
           // eslint-disable-next-line no-console
           console.warn({
@@ -3418,7 +3387,7 @@ export function PrettyConversationsPanel({
           });
           void kitAlert({
             title: "Couldn't rename the project",
-            body: err instanceof Error ? err.message : "unknown error",
+            body: err instanceof Error ? sentenceOf(err.message) : "unknown error",
           });
         }
       })();

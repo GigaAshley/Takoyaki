@@ -6,6 +6,7 @@
  */
 
 import type { Response } from "express";
+import type { Client as SSHClientType } from "ssh2";
 import { databaseLogger } from "../utils/logger.js";
 import { HttpError, withHost } from "../sharing/host-conn.js";
 import {
@@ -37,15 +38,35 @@ export async function answerFromFrontDoor(
     totalS?: number;
     /** A route's own answer for an outcome; null falls back to the usual one. */
     answer?: (outcome: FrontDoorOutcome) => { status: number; body: Record<string, unknown> } | null;
+    /** The server's part once the change is done (tell open tabs), on the same connection.
+     *  Its failure is logged; the change itself already happened. */
+    onDone?: (conn: SSHClientType | null, outcome: Extract<FrontDoorOutcome, { state: "done" }>) => Promise<void>;
+    /** Clean-up when the machine never took the change (still updating, or unreachable). */
+    onNotTaken?: (conn: SSHClientType | null) => Promise<void>;
   },
 ): Promise<Response> {
   const { hostId, userId, kind, args, requestId, operation } = opts;
   try {
-    const outcome = await withHost(hostId, userId, (conn) =>
-      opts.totalS !== undefined
-        ? submitAndFollow(conn, kind, args, { id: requestId, hostId, totalS: opts.totalS })
-        : submitFrontDoor(conn, kind, args, { id: requestId, hostId }),
-    );
+    const outcome = await withHost(hostId, userId, async (conn) => {
+      const o =
+        opts.totalS !== undefined
+          ? await submitAndFollow(conn, kind, args, { id: requestId, hostId, totalS: opts.totalS })
+          : await submitFrontDoor(conn, kind, args, { id: requestId, hostId });
+      if (o.state === "done" && opts.onDone) {
+        try {
+          await opts.onDone(conn, o);
+        } catch (err) {
+          databaseLogger.warn(`${kind}: the server's part after it was done failed`, {
+            operation: `${operation}_after_failed`,
+            hostId,
+            requestId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+      if (o.state === "not_installed" && opts.onNotTaken) await opts.onNotTaken(conn).catch(() => undefined);
+      return o;
+    });
     databaseLogger.info(`${kind} requested`, {
       operation,
       userId,

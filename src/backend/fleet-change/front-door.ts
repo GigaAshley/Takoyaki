@@ -38,7 +38,13 @@ export type FrontDoorKind =
   | "role-archive"
   | "role-unarchive"
   | "app-archive"
-  | "app-unarchive";
+  | "app-unarchive"
+  | "project-create"
+  | "project-rename"
+  | "project-move"
+  | "agent-project"
+  | "agent-pin"
+  | "agent-edit";
 
 /** An archive is done once claimed; while the machine is still finishing it, what's left and
  *  (for anything failing 10 minutes or more) why. */

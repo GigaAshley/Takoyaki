@@ -1,40 +1,12 @@
 /**
- * Phase 68 Plan 68-02 Task 2 (PUT /:identityKey rekey): Tests for the rekeyed
- * PUT /identities/:identityKey handler.
+ * PUT /identities/:identityKey — the agent window's edits (name, title, task, colour, voice,
+ * picture), sent to the machine's front door (fleet-change agent-edit) so only the lines being
+ * changed are written, in turn with the machine's other changes. What the machine writes is
+ * fleet-change.test.sh's; here: what the route sends, the picture saved first under a fresh
+ * name, the answers, and the echo read back afterwards.
  *
- * Post-Phase-68-02 contract:
- *
- * Route renamed from /:id to /:identityKey. Row lookup removed (no DB select
- * by id+userId). Row bump removed (no db.update updatedAt). forceSave removed
- * (disk write is fsynced by writeMarkdownFileAtomic). The URL param IS the
- * identityKey used for disk reads/writes — no indirection through the DB.
- *
- * Frontmatter mutation semantics (unchanged from Phase 66):
- *   - absent-in-payload  → leave key alone
- *   - explicit-null      → REMOVE key
- *   - present-scalar     → overlay
- *
- * Test surface: 10 tests (Tests 1-9 preserved with URL + assertion updates;
- * Test 10 was "forceSave called" which is removed — replaced with NEW Test 10
- * "disk-file-missing → 500" via :identityKey URL that doesn't exist on disk):
- *   1  present-updates-overlay: full body → yaml overlay (URL uses identityKey)
- *   2  absent-in-payload-leaves-alone
- *   3  explicit-null-removes-key
- *   4  avatar-write-same-ext (no rm exec)
- *   5  avatar-write-swap-ext (rm old sibling)
- *   6  hostId missing → 400
- *   7  connectOneShot rejects → 502
- *   8  readIdentityFile returns "" → 500 (data-integrity violation T-68-02-04)
- *   9  LOCAL branch (isLocalHostId true) → conn=null across all helpers
- *  10  NEW: PUT /identities/nonexistent-key where .md missing → 500 "identity file missing on target host"
- *  11  PUT response echoes coordinator:true from disk after write (Phase 67 H1 preserved)
- *
- * Scaffold follows identity-birth.test.ts:
- *   - bare Express + Node http.request (no supertest dep)
- *   - vi.mock() AuthManager, db/index, drizzle-orm, db/schema, logger,
- *     artifact-reader, ssh-one-shot, tmux-helper, DatabaseSaveTrigger
- *   - DB shim retained for POST / path (410 stub; not exercised here) and any
- *     other routes mounted on the router that still touch the DB.
+ * Bare Express + Node http.request; AuthManager, db, logger, artifact-reader, SSH and the
+ * front door are mocked.
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from "vitest";
@@ -49,10 +21,6 @@ import yaml from "js-yaml";
 
 let mockUserId: string | null = "test-user";
 
-vi.mock("../../claude-session/per-identity-file.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../../claude-session/per-identity-file.js")>()),
-  assertNotBeingArchived: vi.fn(async () => undefined),
-}));
 vi.mock("../../utils/auth-manager.js", () => {
   const AuthManager = {
     getInstance: () => ({
@@ -220,6 +188,12 @@ const readIdentityFileMock = vi.fn();
 const writeIdentityFileMock = vi.fn();
 const writeAvatarSiblingFileMock = vi.fn();
 const isLocalHostIdMock = vi.fn();
+const writeBinaryFileAtomicMock = vi.fn();
+const submitAndFollowMock = vi.fn();
+vi.mock("../../fleet-change/front-door.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../fleet-change/front-door.js")>()),
+  submitAndFollow: (...a: unknown[]) => submitAndFollowMock(...a),
+}));
 
 vi.mock("../../claude-session/identity-artifact-reader.js", () => ({
   stringifyColorHueForYaml: (obj: Record<string, unknown>) => (typeof obj.colorHue === "number" ? { ...obj, colorHue: String(obj.colorHue) } : obj),
@@ -240,6 +214,8 @@ vi.mock("../../claude-session/identity-artifact-reader.js", () => ({
   ) => writeAvatarSiblingFileMock(conn, key, ext, bytes),
   isLocalHostId: (n: number | undefined) => isLocalHostIdMock(n),
   getLocalIdentitiesRoot: () => "/tmp/test-identities",
+  writeBinaryFileAtomic: (conn: unknown, target: string, bytes: Buffer) => writeBinaryFileAtomicMock(conn, target, bytes),
+  IDMEDIT_MAX_AVATAR_BYTES: 5_000_000,
   MIME_TO_AVATAR_EXT: {
     "image/webp": "webp",
     "image/png": "png",
@@ -462,6 +438,13 @@ beforeEach(() => {
   execCommandMock.mockResolvedValue("");
   forceSaveMock.mockResolvedValue(undefined);
   fsUnlinkSpy.mockResolvedValue(undefined);
+  writeBinaryFileAtomicMock.mockResolvedValue(undefined);
+  submitAndFollowMock.mockImplementation(async (_c: unknown, _k: string, _a: unknown, o: { id: string }) => ({
+    state: "done",
+    id: o.id,
+    seq: 1,
+    result: { name: "testkey", changed: [] },
+  }));
 
   const app = express();
   app.use("/identities", identitiesRouter);
@@ -474,569 +457,106 @@ afterEach(() => {
   return new Promise<void>((resolve) => server.close(() => resolve()));
 });
 
-// Helper — extract the frontmatter block from a written body and yaml.load it
-function loadWrittenFrontmatter(body: string): Record<string, unknown> {
-  const match = body.match(/^---\r?\n([\s\S]*?)\r?\n---/);
-  if (!match) throw new Error("no frontmatter block in written body");
-  const parsed = yaml.load(match[1]) as Record<string, unknown>;
-  return parsed;
-}
-
 // ===========================================================================
 // Tests
 // ===========================================================================
 
-describe("PUT /identities/:identityKey — Phase 68-02 rekey (no row bump, no forceSave)", () => {
+describe("PUT /identities/:identityKey — the change goes through the machine's front door", () => {
+  function put(data: unknown, file?: { filename: string; contentType: string; bytes: Buffer }) {
+    return httpPut(server, "/identities/testkey", buildMultipartBody({ data, ...(file ? { file } : {}) }));
+  }
+  function sentArgs(): Record<string, unknown> {
+    return (submitAndFollowMock.mock.calls[0]?.[2] ?? {}) as Record<string, unknown>;
+  }
 
-  // -------------------------------------------------------------------------
-  // Test 1: present-updates-overlay (URL now uses identityKey, not id)
-  // -------------------------------------------------------------------------
-  it("Test 1: full-body present values overlay onto existing frontmatter; disk-write-only (no row bump)", async () => {
-    const body = buildMultipartBody({
-      data: {
-        hostId: 7,
-        displayName: "Newname",
-        title: "New Title",
-        colorHue: 180,
-        voice: "Joanna",
-      },
+  it("sends only the fields being set, with the click's request id; answers with the agent as it is now", async () => {
+    readIdentityFileMock.mockResolvedValue({
+      markdown: "---\nroles: box-maintainer\ndisplayName: Newname\ntitle: New Title\ncolorHue: '180'\n---\n\n# testkey\n",
     });
-
-    // Phase 68-02: URL uses identityKey ("testkey") not the nanoid id ("test-id")
-    const res = await httpPut(server, "/identities/testkey", body);
-
+    const res = await put({ hostId: 7, displayName: "  Newname ", title: "New Title", colorHue: 180, task: "Ship: it", requestId: "edit-1" });
     expect(res.status).toBe(200);
-
-    // writeIdentityFile called with (conn, "testkey", body-with-overlaid-yaml)
-    expect(writeIdentityFileMock).toHaveBeenCalledTimes(1);
-    const [conn, key, writtenBody] = writeIdentityFileMock.mock.calls[0];
-    expect(conn).not.toBeNull(); // REMOTE branch — real conn passed through
-    expect(key).toBe("testkey");
-
-    const fm = loadWrittenFrontmatter(writtenBody as string);
-    expect(fm.roles).toBe("box-maintainer"); // preserved verbatim
-    expect(fm.displayName).toBe("Newname");
-    expect(fm.title).toBe("New Title");
-    // colorHue on-disk shape is now the quoted-string form '180' (MDXEditor
-    // parity — see stringifyColorHueForYaml). loadWrittenFrontmatter is a raw
-    // yaml.load, so the string round-trips as string.
-    expect(fm.colorHue).toBe("180");
-    expect(fm.voice).toBe("Joanna");
-
-    // Phase 68-02: no row bump — DB update NOT called at all.
-    expect(dbState.lastUpdateSetKeys).toBeNull();
-    // Phase 68-02: no forceSave after disk write.
-    expect(forceSaveMock).not.toHaveBeenCalled();
+    expect(submitAndFollowMock).toHaveBeenCalledWith(
+      expect.objectContaining({ __fake: "ssh-conn" }),
+      "agent-edit",
+      { name: "testkey", set: { displayName: "Newname", title: "New Title", task: "Ship: it", colorHue: 180 }, unset: [] },
+      { id: "edit-1", hostId: 7, totalS: 60 },
+    );
+    expect(res.body).toMatchObject({ displayName: "Newname", title: "New Title", colorHue: 180 });
+    // The server never writes the file itself.
+    expect(writeIdentityFileMock).not.toHaveBeenCalled();
   });
 
-  // -------------------------------------------------------------------------
-  // Test 2: absent-in-payload-leaves-alone
-  // -------------------------------------------------------------------------
-  it("Test 2: absent-in-payload fields leave existing frontmatter values alone", async () => {
-    readIdentityFileMock.mockResolvedValue({
-      markdown:
-        "---\nroles: box-maintainer\ndisplayName: Keep\ntitle: KeepTitle\ncolorHue: 100\nvoice: Keep.wav\n---\n\n# testkey\n",
-    });
-
-    const body = buildMultipartBody({
-      data: { hostId: 7, title: "Only Title Change" },
-    });
-
-    const res = await httpPut(server, "/identities/testkey", body);
-
-    expect(res.status).toBe(200);
-    expect(writeIdentityFileMock).toHaveBeenCalledTimes(1);
-    const [, , writtenBody] = writeIdentityFileMock.mock.calls[0];
-    const fm = loadWrittenFrontmatter(writtenBody as string);
-
-    // title was overlaid
-    expect(fm.title).toBe("Only Title Change");
-    // other keys untouched from the on-disk read
-    expect(fm.displayName).toBe("Keep");
-    // colorHue: written as bare `100` in the seed, re-emitted quoted `'100'`
-    // by stringifyColorHueForYaml (MDXEditor parity). Raw yaml.load returns
-    // the string form.
-    expect(fm.colorHue).toBe("100");
-    expect(fm.voice).toBe("Keep.wav");
-    expect(fm.roles).toBe("box-maintainer");
+  it("explicit null removes a line; absent leaves it alone", async () => {
+    await put({ hostId: 7, title: null, voice: null, colorHue: null, task: null });
+    expect(sentArgs()).toEqual({ name: "testkey", set: {}, unset: ["title", "task", "voice", "colorHue"] });
   });
 
-  // -------------------------------------------------------------------------
-  // Test 3: explicit-null-removes-key
-  // -------------------------------------------------------------------------
-  it("Test 3: explicit-null-in-payload REMOVES that key from frontmatter", async () => {
-    readIdentityFileMock.mockResolvedValue({
-      markdown:
-        "---\nroles: box-maintainer\ndisplayName: Keep\ntitle: Doomed\ncolorHue: 42\nvoice: Keep.wav\n---\n\n# testkey\n",
-    });
-
-    const body = buildMultipartBody({
-      data: { hostId: 7, title: null, colorHue: null },
-    });
-
-    const res = await httpPut(server, "/identities/testkey", body);
-
+  it("a new picture is saved under a fresh name first, then put in place by the change", async () => {
+    const res = await put(
+      { hostId: 7, requestId: "pic-1" },
+      { filename: "avatar.png", contentType: "image/png", bytes: Buffer.from("newpng") },
+    );
     expect(res.status).toBe(200);
-    expect(writeIdentityFileMock).toHaveBeenCalledTimes(1);
-    const [, , writtenBody] = writeIdentityFileMock.mock.calls[0];
-    const fm = loadWrittenFrontmatter(writtenBody as string);
-
-    // title + colorHue removed
-    expect("title" in fm).toBe(false);
-    expect("colorHue" in fm).toBe(false);
-    // others preserved
-    expect(fm.roles).toBe("box-maintainer");
-    expect(fm.displayName).toBe("Keep");
-    expect(fm.voice).toBe("Keep.wav");
-  });
-
-  // -------------------------------------------------------------------------
-  // Test 4: avatar-write-same-ext (no rm exec)
-  // -------------------------------------------------------------------------
-  it("Test 4: avatar write with same extension calls writeAvatarSiblingFile; no rm exec fires", async () => {
-    readIdentityFileMock.mockResolvedValue({
-      markdown:
-        "---\nroles: box-maintainer\ndisplayName: Keep\navatar: testkey.png\n---\n\n# testkey\n",
-    });
-
-    const body = buildMultipartBody({
-      data: { hostId: 7 },
-      file: {
-        filename: "avatar.png",
-        contentType: "image/png",
-        bytes: Buffer.from("newpng"),
-      },
-    });
-
-    const res = await httpPut(server, "/identities/testkey", body);
-
-    expect(res.status).toBe(200);
-    expect(writeAvatarSiblingFileMock).toHaveBeenCalledTimes(1);
-    const [conn, key, ext, bytes] = writeAvatarSiblingFileMock.mock.calls[0];
-    expect(conn).not.toBeNull();
-    expect(key).toBe("testkey");
-    expect(ext).toBe("png");
+    expect(writeBinaryFileAtomicMock).toHaveBeenCalledTimes(1);
+    const [, target, bytes] = writeBinaryFileAtomicMock.mock.calls[0];
+    expect(target).toBe("$HOME/fleet/identities/testkey/.avatar-upload-pic-1.png");
     expect(Buffer.isBuffer(bytes)).toBe(true);
-    expect((bytes as Buffer).toString()).toBe("newpng");
-
-    // No rm exec — extension unchanged.
-    const rmCalls = execCommandMock.mock.calls.filter(([, cmd]) =>
-      String(cmd).startsWith("rm -f"),
-    );
-    expect(rmCalls.length).toBe(0);
-
-    // Frontmatter still has avatar: testkey.png
-    const [, , writtenBody] = writeIdentityFileMock.mock.calls[0];
-    const fm = loadWrittenFrontmatter(writtenBody as string);
-    expect(fm.avatar).toBe("testkey.png");
+    expect(sentArgs()).toMatchObject({ avatar: { upload: ".avatar-upload-pic-1.png", ext: "png" } });
+    expect(writeBinaryFileAtomicMock.mock.invocationCallOrder[0]).toBeLessThan(submitAndFollowMock.mock.invocationCallOrder[0]);
   });
 
-  // -------------------------------------------------------------------------
-  // Test 5: avatar-write-swap-ext (rm old sibling)
-  // -------------------------------------------------------------------------
-  it("Test 5: avatar write with new extension deletes old sibling via rm -f and updates frontmatter", async () => {
-    readIdentityFileMock.mockResolvedValue({
-      markdown:
-        "---\nroles: box-maintainer\ndisplayName: Keep\navatar: testkey.png\n---\n\n# testkey\n",
-    });
-
-    const body = buildMultipartBody({
-      data: { hostId: 7 },
-      file: {
-        filename: "avatar.webp",
-        contentType: "image/webp",
-        bytes: Buffer.from("newwebp"),
-      },
-    });
-
-    const res = await httpPut(server, "/identities/testkey", body);
-
-    expect(res.status).toBe(200);
-    expect(writeAvatarSiblingFileMock).toHaveBeenCalledTimes(1);
-    const [, , ext] = writeAvatarSiblingFileMock.mock.calls[0];
-    expect(ext).toBe("webp");
-
-    // rm -f fired for the OLD sibling (extension swap)
-    const rmCalls = execCommandMock.mock.calls.filter(([, cmd]) =>
-      String(cmd).includes("rm -f"),
-    );
-    expect(rmCalls.length).toBe(1);
-    const rmCmd = String(rmCalls[0][1]);
-    expect(rmCmd).toContain(
-      `rm -f "$HOME/fleet/identities/testkey/testkey.png"`,
-    );
-
-    // Frontmatter now has avatar: testkey.webp
-    const [, , writtenBody] = writeIdentityFileMock.mock.calls[0];
-    const fm = loadWrittenFrontmatter(writtenBody as string);
-    expect(fm.avatar).toBe("testkey.webp");
+  it("avatar:null removes the picture (the machine drops the line and the file)", async () => {
+    await put({ hostId: 7, avatar: null });
+    expect(sentArgs()).toMatchObject({ unset: ["avatar"] });
   });
 
-  // -------------------------------------------------------------------------
-  // Test 6: hostId missing → 400
-  // -------------------------------------------------------------------------
-  it("Test 6: missing hostId in body → 400 with 'hostId' error message", async () => {
-    const body = buildMultipartBody({
-      data: { title: "foo" },
-    });
+  it("a refusal (being archived, gone) is the machine's 409 with its reason", async () => {
+    submitAndFollowMock.mockResolvedValue({ state: "refused", id: "x", seq: 1, code: "being_archived", reason: "it's being archived" });
+    const res = await put({ hostId: 7, title: "T" });
+    expect(res.status).toBe(409);
+    expect(res.body).toMatchObject({ code: "being_archived", error: "it's being archived" });
+    submitAndFollowMock.mockResolvedValue({ state: "refused", id: "x", seq: 1, code: "not_found", reason: "there's no agent 'testkey' on this machine" });
+    expect((await put({ hostId: 7, title: "T" })).status).toBe(409);
+  });
 
-    const res = await httpPut(server, "/identities/testkey", body);
+  it("still waiting after the follow-up → 202", async () => {
+    submitAndFollowMock.mockResolvedValue({ state: "pending", id: "x", seq: 1, stage: "queued" });
+    expect((await put({ hostId: 7, title: "T" })).status).toBe(202);
+  });
 
-    expect(res.status).toBe(400);
-    const errBody = res.body as { error?: string };
-    expect(errBody.error).toBeDefined();
-    expect(errBody.error?.toLowerCase()).toContain("hostid");
+  it("a machine still updating never took the picture: it's removed (REMOTE and LOCAL)", async () => {
+    submitAndFollowMock.mockResolvedValue({ state: "not_installed", id: "x" });
+    const file = { filename: "a.png", contentType: "image/png", bytes: Buffer.from("png") };
+    const r = await put({ hostId: 7, requestId: "u1" }, file);
+    expect(r.status).toBe(503);
+    expect(execCommandMock).toHaveBeenCalledWith(expect.anything(), 'rm -f "$HOME/fleet/identities/testkey/.avatar-upload-u1.png"');
+    isLocalHostIdMock.mockReturnValue(true);
+    await put({ hostId: 5, requestId: "u2" }, file);
+    expect(fsUnlinkSpy).toHaveBeenCalledWith("/tmp/test-identities/testkey/.avatar-upload-u2.png");
+  });
 
-    // No SSH work happened
+  it("missing hostId → 400; an unreachable machine → 502", async () => {
+    expect((await put({ title: "T" })).status).toBe(400);
+    connectOneShotMock.mockRejectedValueOnce(new Error("refused"));
+    const r = await put({ hostId: 7, title: "T" });
+    expect(r.status).toBe(502);
+    expect(r.body).toMatchObject({ error: "identity home box unreachable" });
+    expect(submitAndFollowMock).not.toHaveBeenCalled();
+  });
+
+  it("LOCAL: no SSH; the front door is reached through the bind mount (conn null)", async () => {
+    isLocalHostIdMock.mockReturnValue(true);
+    expect((await put({ hostId: 5, title: "T" })).status).toBe(200);
     expect(connectOneShotMock).not.toHaveBeenCalled();
-    expect(writeIdentityFileMock).not.toHaveBeenCalled();
+    expect(submitAndFollowMock.mock.calls[0]?.[0]).toBeNull();
   });
 
-  // -------------------------------------------------------------------------
-  // Test 7: SSH connect failure → 502
-  // -------------------------------------------------------------------------
-  it("Test 7: connectOneShot rejects → 502 { error: 'identity home box unreachable' }", async () => {
-    connectOneShotMock.mockRejectedValue(new Error("Host unreachable"));
-
-    const body = buildMultipartBody({
-      data: { hostId: 7, title: "will not land" },
-    });
-
-    const res = await httpPut(server, "/identities/testkey", body);
-
-    expect(res.status).toBe(502);
-    const errBody = res.body as { error?: string };
-    expect(errBody.error).toBe("identity home box unreachable");
-
-    // Read/write never happened because connect failed
-    expect(readIdentityFileMock).not.toHaveBeenCalled();
-    expect(writeIdentityFileMock).not.toHaveBeenCalled();
-  });
-
-  // -------------------------------------------------------------------------
-  // Test 8: readIdentityFile returns empty → 500 descriptive error (T-68-02-04)
-  // -------------------------------------------------------------------------
-  it("Test 8: readIdentityFile returns empty markdown → 500 'identity file missing on target host'", async () => {
-    readIdentityFileMock.mockResolvedValue({ markdown: "" });
-
-    const body = buildMultipartBody({
-      data: { hostId: 7, title: "orphan" },
-    });
-
-    const res = await httpPut(server, "/identities/testkey", body);
-
-    expect(res.status).toBe(500);
-    const errBody = res.body as { error?: string };
-    expect(errBody.error).toBe("identity file missing on target host");
-
-    // Never wrote anything
-    expect(writeIdentityFileMock).not.toHaveBeenCalled();
-    expect(writeAvatarSiblingFileMock).not.toHaveBeenCalled();
-  });
-
-  // -------------------------------------------------------------------------
-  // Test 9: LOCAL branch — isLocalHostId true → conn=null across all helpers
-  // -------------------------------------------------------------------------
-  it("Test 9: LOCAL branch (isLocalHostId=true) → connectOneShot NEVER called; all helpers get conn=null", async () => {
-    isLocalHostIdMock.mockReturnValue(true);
-
-    const body = buildMultipartBody({
-      data: { hostId: 1, title: "Local Edit" },
-      file: {
-        filename: "avatar.png",
-        contentType: "image/png",
-        bytes: Buffer.from("localpng"),
-      },
-    });
-
-    const res = await httpPut(server, "/identities/testkey", body);
-
-    expect(res.status).toBe(200);
-    expect(connectOneShotMock).not.toHaveBeenCalled();
-
-    // The handler re-reads the identity file post-write so the response echoes true
-    // disk cosmetics. In the LOCAL branch that means readIdentityFile is called TWICE
-    // (pre-write overlay parse + post-write echo re-read); both calls must pass
-    // conn=null since we never opened an SSH connection.
-    expect(readIdentityFileMock).toHaveBeenCalledTimes(2);
-    expect(readIdentityFileMock.mock.calls[0][0]).toBeNull();
-    expect(readIdentityFileMock.mock.calls[1][0]).toBeNull();
-
-    expect(writeIdentityFileMock).toHaveBeenCalledTimes(1);
-    expect(writeIdentityFileMock.mock.calls[0][0]).toBeNull();
-
-    expect(writeAvatarSiblingFileMock).toHaveBeenCalledTimes(1);
-    expect(writeAvatarSiblingFileMock.mock.calls[0][0]).toBeNull();
-  });
-
-  // -------------------------------------------------------------------------
-  // Test 10 (Phase 68-02): PUT /identities/nonexistent-key with missing on-disk
-  // .md → 500 'identity file missing on target host' (T-68-02-04 preserved)
-  // -------------------------------------------------------------------------
-  it("Test 10 (NEW, Phase 68-02): PUT /identities/nonexistent-key where .md missing on disk → 500 'identity file missing on target host'", async () => {
-    // The key "nonexistent-key" doesn't have a .md file on disk
-    readIdentityFileMock.mockResolvedValue({ markdown: "" });
-
-    const body = buildMultipartBody({
-      data: { hostId: 7, title: "will not land" },
-    });
-
-    // Use the identityKey directly in the URL — no DB row lookup to check existence
-    const res = await httpPut(server, "/identities/nonexistent-key", body);
-
-    expect(res.status).toBe(500);
-    const errBody = res.body as { error?: string };
-    expect(errBody.error).toBe("identity file missing on target host");
-
-    // Never wrote anything
-    expect(writeIdentityFileMock).not.toHaveBeenCalled();
-    expect(writeAvatarSiblingFileMock).not.toHaveBeenCalled();
-    // Phase 68-02: no row bump, no forceSave
-    expect(dbState.lastUpdateSetKeys).toBeNull();
-    expect(forceSaveMock).not.toHaveBeenCalled();
-  });
-
-  // -------------------------------------------------------------------------
-  // Test 11 (Phase 67 /close 2026-09-01 follow-up, H1): coordinator round-trip
-  // -------------------------------------------------------------------------
-  // The PUT response body must echo the identity's true on-disk `coordinator`
-  // state. The handler re-reads disk cosmetics after write and passes them
-  // through publicIdentity(..., cosmetics) so the response reflects reality —
-  // coordinator=true here must round-trip as true.
-  it("Test 11 (H1): PUT response echoes coordinator:true from disk after write", async () => {
-    // The mock's writeIdentityFile is a spy — it does NOT actually mutate the
-    // markdown fixture. So the post-write re-read returns the SAME fixture we
-    // seeded. Seed with coordinator: true; the re-read + overlay must
-    // surface it in the response.
+  it("the answer echoes the disk after the change (coordinator included)", async () => {
     readIdentityFileMock.mockResolvedValue({
-      markdown:
-        "---\nroles: box-maintainer\ndisplayName: Coord\ntitle: Coordinator\ncolorHue: 216\ncoordinator: true\n---\n\n# testkey\n",
+      markdown: "---\nroles: box-maintainer\ndisplayName: Coord\ncolorHue: 216\ncoordinator: true\n---\n\n# testkey\n",
     });
-
-    const body = buildMultipartBody({
-      data: { hostId: 7, title: "New Title" },
-    });
-
-    const res = await httpPut(server, "/identities/testkey", body);
-
-    expect(res.status).toBe(200);
-    const responseBody = res.body as {
-      coordinator?: boolean;
-      title?: string | null;
-      colorHue?: number | null;
-      displayName?: string;
-    };
-    // Pre-fix this was false (safe-default from publicIdentity with no overlay).
-    // Post-fix the disk-read overlay lifts the true value into the response.
-    expect(responseBody.coordinator).toBe(true);
-    // Side-benefit assertion: title/colorHue/displayName also echo from disk
-    // (closes the pre-existing "stale echo" TODO).
-    expect(responseBody.displayName).toBe("Coord");
-    expect(responseBody.colorHue).toBe(216);
-    // readIdentityFile called twice: once pre-write (to load frontmatter for
-    // overlay) and once post-write (echo re-read for the response).
-    expect(readIdentityFileMock).toHaveBeenCalledTimes(2);
-  });
-
-  // -------------------------------------------------------------------------
-  // Test 12a (260909-dls): LOCAL avatar-null deletes frontmatter key + sibling
-  // -------------------------------------------------------------------------
-  it("Test 12a (260909-dls): PUT avatar:null on LOCAL host — frontmatter avatar key deleted + fs.unlink fired with sibling path", async () => {
-    isLocalHostIdMock.mockReturnValue(true);
-    readIdentityFileMock.mockResolvedValue({
-      markdown:
-        "---\nroles: box-maintainer\ndisplayName: Keep\navatar: testkey.webp\n---\n\n# testkey\n",
-    });
-
-    const body = buildMultipartBody({
-      data: { hostId: 1, avatar: null },
-    });
-
-    const res = await httpPut(server, "/identities/testkey", body);
-
-    expect(res.status).toBe(200);
-
-    // writeIdentityFile must have been called once
-    expect(writeIdentityFileMock).toHaveBeenCalledTimes(1);
-    const [, , writtenBody] = writeIdentityFileMock.mock.calls[0];
-    const fm = loadWrittenFrontmatter(writtenBody as string);
-
-    // avatar key must be gone from the written frontmatter
-    expect("avatar" in fm).toBe(false);
-
-    // fs.unlink must have been called once with a path containing testkey/testkey.webp
-    expect(fsUnlinkSpy).toHaveBeenCalledTimes(1);
-    expect(fsUnlinkSpy.mock.calls[0][0]).toEqual(
-      expect.stringContaining("testkey/testkey.webp"),
-    );
-
-    // execCommand rm -f must NOT have been called (LOCAL path uses fs.unlink)
-    const rmCalls = execCommandMock.mock.calls.filter(([, cmd]) =>
-      String(cmd).startsWith("rm -f"),
-    );
-    expect(rmCalls.length).toBe(0);
-
-    // Response avatarUrl still resolves to the identity's avatar endpoint
-    const responseBody = res.body as { avatarUrl?: string };
-    expect(responseBody.avatarUrl).toContain("/identities/testkey/avatar");
-  });
-
-  // -------------------------------------------------------------------------
-  // Test 12b (260909-dls): REMOTE avatar-null deletes frontmatter key + execCommand rm -f
-  // -------------------------------------------------------------------------
-  it("Test 12b (260909-dls): PUT avatar:null on REMOTE host — frontmatter avatar key deleted + execCommand rm -f fired", async () => {
-    // isLocalHostIdMock defaults to false (REMOTE) — no override needed
-    readIdentityFileMock.mockResolvedValue({
-      markdown:
-        "---\nroles: box-maintainer\ndisplayName: Keep\navatar: testkey.png\n---\n\n# testkey\n",
-    });
-
-    const body = buildMultipartBody({
-      data: { hostId: 7, avatar: null },
-    });
-
-    const res = await httpPut(server, "/identities/testkey", body);
-
-    expect(res.status).toBe(200);
-
-    // writeIdentityFile must have been called once
-    expect(writeIdentityFileMock).toHaveBeenCalledTimes(1);
-    const [, , writtenBody] = writeIdentityFileMock.mock.calls[0];
-    const fm = loadWrittenFrontmatter(writtenBody as string);
-
-    // avatar key must be gone from the written frontmatter
-    expect("avatar" in fm).toBe(false);
-
-    // execCommand rm -f must have been called exactly once with the old sibling path
-    const rmCalls = execCommandMock.mock.calls.filter(([, cmd]) =>
-      String(cmd).startsWith("rm -f"),
-    );
-    expect(rmCalls.length).toBe(1);
-    const rmCmd = String(rmCalls[0][1]);
-    expect(rmCmd).toContain(
-      `rm -f "$HOME/fleet/identities/testkey/testkey.png"`,
-    );
-
-    // fs.unlink must NOT have been called (REMOTE path uses execCommand)
-    expect(fsUnlinkSpy).not.toHaveBeenCalled();
-  });
-
-  // -------------------------------------------------------------------------
-  // Test 12c (260909-dls): idempotent no-op — avatar:null on identity with no override
-  // -------------------------------------------------------------------------
-  it("Test 12c (260909-dls): PUT avatar:null when identity has no avatar override — safe no-op (200, no unlink, no rm -f)", async () => {
-    isLocalHostIdMock.mockReturnValue(true);
-    // Seed markdown WITHOUT any avatar: key in frontmatter
-    readIdentityFileMock.mockResolvedValue({
-      markdown:
-        "---\nroles: box-maintainer\ndisplayName: Keep\ntitle: Some Title\n---\n\n# testkey\n",
-    });
-
-    const body = buildMultipartBody({
-      data: { hostId: 1, avatar: null },
-    });
-
-    const res = await httpPut(server, "/identities/testkey", body);
-
-    // Must not crash
-    expect(res.status).toBe(200);
-
-    // writeIdentityFile was still called (frontmatter re-emitted with other fields)
-    expect(writeIdentityFileMock).toHaveBeenCalledTimes(1);
-
-    // Neither sibling-cleanup path should fire (oldAvatar was null)
-    expect(fsUnlinkSpy).not.toHaveBeenCalled();
-    const rmCalls = execCommandMock.mock.calls.filter(([, cmd]) =>
-      String(cmd).startsWith("rm -f"),
-    );
-    expect(rmCalls.length).toBe(0);
-  });
-
-  // -------------------------------------------------------------------------
-  // Test 12d (260909-dls review MEDIUM #1 fix): hand-edited non-canonical
-  // avatar filename in frontmatter → PUT avatar:null still deletes the
-  // frontmatter key, but the sibling-cleanup branch skips (no unlink, no
-  // rm -f) because the filename doesn't match the canonical
-  // `<identityKey>.<ext>` shape. Guards the REMOTE shell interpolation
-  // surface: only server-controlled `${identityKey}.${oldExt}` ever flows
-  // into execCommand, never a raw frontmatter string.
-  // -------------------------------------------------------------------------
-  it("Test 12d (260909-dls review): PUT avatar:null with non-canonical frontmatter filename — key deleted but sibling-cleanup skipped", async () => {
-    isLocalHostIdMock.mockReturnValue(false); // REMOTE path is where the shell surface matters
-    // Seed with an avatar: value that does NOT start with the identityKey prefix
-    readIdentityFileMock.mockResolvedValue({
-      markdown:
-        "---\nroles: box-maintainer\ndisplayName: Keep\navatar: some-other-role.png\n---\n\n# testkey\n",
-    });
-
-    const body = buildMultipartBody({
-      data: { hostId: 7, avatar: null },
-    });
-
-    const res = await httpPut(server, "/identities/testkey", body);
-
-    expect(res.status).toBe(200);
-
-    // Frontmatter key still deleted (the overlay branch runs regardless of
-    // canonicalness — only the on-disk sibling cleanup is gated).
-    expect(writeIdentityFileMock).toHaveBeenCalledTimes(1);
-    const [, , writtenMarkdown] = writeIdentityFileMock.mock.calls[0];
-    expect(writtenMarkdown).not.toMatch(/^avatar:/m);
-
-    // Sibling cleanup MUST NOT fire — oldExt was null because the frontmatter
-    // filename didn't start with `${identityKey}.`.
-    expect(fsUnlinkSpy).not.toHaveBeenCalled();
-    const rmCalls = execCommandMock.mock.calls.filter(([, cmd]) =>
-      String(cmd).startsWith("rm -f"),
-    );
-    expect(rmCalls.length).toBe(0);
-  });
-
-  // -------------------------------------------------------------------------
-  // Trailing newline: REMOTE reads arrive trimmed (execCommand trims stdout),
-  // so the rewrite must restore the file's trailing "\n". LOCAL reads are
-  // byte-exact and are written back without normalization.
-  // -------------------------------------------------------------------------
-  it("REMOTE rewrite of a trimmed read restores the trailing newline", async () => {
-    readIdentityFileMock.mockResolvedValue({
-      markdown: "---\nroles: box-maintainer\ndisplayName: Old\n---\n\n# testkey",
-    });
-    const res = await httpPut(
-      server,
-      "/identities/testkey",
-      buildMultipartBody({ data: { hostId: 7, title: "T" } }),
-    );
-    expect(res.status).toBe(200);
-    const written = writeIdentityFileMock.mock.calls[0][2] as string;
-    expect(written.endsWith("# testkey\n")).toBe(true);
-    expect(written.endsWith("\n\n")).toBe(false);
-  });
-
-  it("REMOTE rewrite does not double an existing trailing newline", async () => {
-    const res = await httpPut(
-      server,
-      "/identities/testkey",
-      buildMultipartBody({ data: { hostId: 7, title: "T" } }),
-    );
-    expect(res.status).toBe(200);
-    const written = writeIdentityFileMock.mock.calls[0][2] as string;
-    expect(written.endsWith("# testkey\n")).toBe(true);
-    expect(written.endsWith("\n\n")).toBe(false);
-  });
-
-  it("LOCAL rewrite is byte-exact (no newline appended)", async () => {
-    isLocalHostIdMock.mockReturnValue(true);
-    readIdentityFileMock.mockResolvedValue({
-      markdown: "---\nroles: box-maintainer\ndisplayName: Old\n---\n\n# testkey",
-    });
-    const res = await httpPut(
-      server,
-      "/identities/testkey",
-      buildMultipartBody({ data: { hostId: 1, title: "T" } }),
-    );
-    expect(res.status).toBe(200);
-    const written = writeIdentityFileMock.mock.calls[0][2] as string;
-    expect(written.endsWith("# testkey")).toBe(true);
+    const res = await put({ hostId: 7, title: "New Title" });
+    expect(res.body).toMatchObject({ coordinator: true, displayName: "Coord", colorHue: 216 });
   });
 
   it("REMOTE PUT holds a per-host semaphore slot: 6 concurrent PUTs, cap 2 → ≤2 live conns", async () => {
@@ -1051,15 +571,11 @@ describe("PUT /identities/:identityKey — Phase 68-02 rekey (no row bump, no fo
       peak = Math.max(peak, live);
       return { end: () => { live--; } };
     });
-    readIdentityFileMock.mockImplementation(async () => {
+    submitAndFollowMock.mockImplementation(async (_c: unknown, _k: string, _a: unknown, o: { id: string }) => {
       await new Promise((r) => setTimeout(r, 5));
-      return { markdown: "---\nroles: box-maintainer\n---\n\n# testkey\n" };
+      return { state: "done", id: o.id, seq: 1, result: {} };
     });
-    const results = await Promise.all(
-      Array.from({ length: 6 }, () =>
-        httpPut(server, "/identities/testkey", buildMultipartBody({ data: { hostId: 7, title: "T" } })),
-      ),
-    );
+    const results = await Promise.all(Array.from({ length: 6 }, () => put({ hostId: 7, title: "T" })));
     expect(results.every((r) => r.status === 200)).toBe(true);
     expect(peak).toBeLessThanOrEqual(2);
     expect(peak).toBeGreaterThan(1);
@@ -1067,4 +583,3 @@ describe("PUT /identities/:identityKey — Phase 68-02 rekey (no row bump, no fo
     __resetHostSemaphoreRegistryForTests();
   });
 });
-

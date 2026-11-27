@@ -579,6 +579,176 @@ STUB
 }
 
 printf 'fleet-change tests\n'
+# ---- quick changes: projects and agents ----
+
+limited() {  # limited <s> <slug> <user...>: give a project its own users: list
+  local f="$1/fleet/projects/$2/project.md"; shift 2
+  python3 - "$f" "$@" <<'PY'
+import sys
+f, users = sys.argv[1], sys.argv[2:]
+t = open(f).read().split("\n")
+t.insert(len(t) - 2, "users:\n" + "\n".join("  - " + u for u in users))
+open(f, "w").write("\n".join(t))
+PY
+}
+
+test_project_create_skips_names_with_leftovers() {
+  local s; s=$(setup)
+  mkdir -p "$s/fleet/projects/archive/garden"; printf -- '---\ndisplayName: Garden\n---\n' > "$s/fleet/projects/archive/garden/project.md"
+  agent "$s" finch orchard
+  submit "$s" project-create '{"baseSlug":"garden","displayName":"Garden"}' c1
+  submit "$s" project-create '{"baseSlug":"orchard","displayName":"Orchard: big"}' c2
+  submit "$s" project-create '{"baseSlug":"garden","displayName":"Garden"}' c3
+  serve_once "$s"
+  assert_eq garden-2 "$(field "$(fc "$s" status c1)" result.slug)" "archived name not reused"
+  assert_eq orchard-2 "$(field "$(fc "$s" status c2)" result.slug)" "a name an agent still points at isn't reused"
+  assert_eq garden-3 "$(field "$(fc "$s" status c3)" result.slug)" "next free"
+  assert_eq 'displayName: "Orchard: big"' "$(sed -n 2p "$s/fleet/projects/orchard-2/project.md")" "name quoted when it must be"
+  assert_absent "$s/fleet/projects/garden" "archived slug left alone"
+  rm -rf "$s"
+}
+
+test_project_create_inside_a_limited_project_shares_it() {
+  local s; s=$(setup)
+  project "$s" team "Team"; limited "$s" team ana bo
+  submit "$s" project-create '{"baseSlug":"sub","displayName":"Sub","parent":"team","asker":"bo","multiUser":true}' c1
+  submit "$s" project-create '{"baseSlug":"peek","displayName":"Peek","parent":"team","asker":"cy","multiUser":true}' c2
+  submit "$s" project-create '{"baseSlug":"mine","displayName":"Mine","asker":"cy","multiUser":true}' c3
+  serve_once "$s"
+  assert_eq '["bo", "ana"]' "$(field "$(fc "$s" status c1)" result.users)" "asker first, then the parent's people"
+  local c2; c2=$(fc "$s" status c2)
+  assert_eq parent_not_found "$(field "$c2" code)" "a hidden parent reads as missing"
+  assert_absent "$s/fleet/projects/peek" "nothing made"
+  assert_eq '["cy"]' "$(field "$(fc "$s" status c3)" result.users)" "starts shared with the asker"
+  rm -rf "$s"
+}
+
+test_project_rename_changes_only_its_name() {
+  local s; s=$(setup)
+  project "$s" team "Team"
+  printf -- '---\ndisplayName: Team\nusers:\n  - ana\n# keep me\nmembers: [finch]\n---\nNotes stay.\n' > "$s/fleet/projects/team/project.md"
+  submit "$s" project-move '{"slug":"team","parent":null}' m0
+  submit "$s" project-rename '{"slug":"team","displayName":"Dream Team","asker":"ana"}' r1
+  submit "$s" project-rename '{"slug":"team","displayName":"Nope","asker":"bo"}' r2
+  submit "$s" project-rename '{"slug":"gone","displayName":"X"}' r3
+  serve_once "$s"
+  assert_eq done "$(field "$(fc "$s" status r1)" state)" "renamed"
+  assert_eq "$(printf -- '---\ndisplayName: Dream Team\nusers:\n  - ana\n# keep me\nmembers: [finch]\n---\nNotes stay.')" \
+    "$(cat "$s/fleet/projects/team/project.md")" "every other byte kept"
+  assert_eq not_found "$(field "$(fc "$s" status r2)" code)" "hidden from bo"
+  assert_eq not_found "$(field "$(fc "$s" status r3)" code)" "gone"
+  rm -rf "$s"
+}
+
+test_project_move_checks_at_its_turn() {
+  local s; s=$(setup)
+  project "$s" a "A"; project "$s" b "B" a; project "$s" c "C"
+  submit "$s" project-move '{"slug":"a","parent":"b"}' m1
+  submit "$s" project-archive '{"slug":"c","expected":{"projects":["c"],"agents":[],"apps":[]}}' x1
+  submit "$s" project-move '{"slug":"a","parent":"c"}' m2
+  submit "$s" project-move '{"slug":"b","parent":null}' m3
+  serve_once "$s"
+  assert_eq into_itself "$(field "$(fc "$s" status m1)" code)" "not under its own sub-project"
+  assert_eq parent_not_found "$(field "$(fc "$s" status m2)" code)" "not under a project archived a moment ago"
+  assert_eq done "$(field "$(fc "$s" status m3)" state)" "to top level"
+  assert_eq "$(printf -- '---\ndisplayName: B\n---')" "$(cat "$s/fleet/projects/b/project.md")" "parent line gone"
+  rm -rf "$s"
+}
+
+test_project_move_never_widens_its_audience() {
+  local s; s=$(setup)
+  project "$s" team "Team"; limited "$s" team ana; project "$s" sub "Sub" team
+  submit "$s" project-move '{"slug":"sub","parent":null,"asker":"ana"}' m1
+  serve_once "$s"
+  local m; m=$(fc "$s" status m1)
+  assert_eq '["ana"]' "$(field "$m" result.audienceKept)" "audience kept"
+  assert_eq "$(printf -- '---\ndisplayName: Sub\nusers:\n  - ana\n---')" "$(cat "$s/fleet/projects/sub/project.md")" "its own list now"
+  rm -rf "$s"
+}
+
+test_agent_move_to_a_gone_project_is_refused() {
+  local s; s=$(setup)
+  project "$s" garden "Garden"; project "$s" orchard "Orchard"; agent "$s" finch ""
+  : > "$s/fleet/identities/finch/.pinned"
+  submit "$s" project-archive '{"slug":"garden","expected":{"projects":["garden"],"agents":[],"apps":[]}}' x1
+  submit "$s" agent-project '{"name":"finch","project":"garden"}' p1
+  submit "$s" agent-project '{"name":"finch","project":"orchard"}' p2
+  serve_once "$s"
+  local p1; p1=$(fc "$s" status p1)
+  assert_eq project_archived "$(field "$p1" code)" "gone project refused"
+  assert_eq 'the project "Garden" is archived' "$(field "$p1" reason)" "says which"
+  assert_eq True "$(field "$(fc "$s" status p2)" result.unpinned)" "moving in unpins"
+  assert_absent "$s/fleet/identities/finch/.pinned" "pin gone"
+  grep -qx 'project: orchard' "$s/fleet/identities/finch/finch.md" || fail "filed: $(cat "$s/fleet/identities/finch/finch.md")"
+  grep -qx 'task: "Doing finch"' "$s/fleet/identities/finch/finch.md" || fail "other lines kept"
+  rm -rf "$s"
+}
+
+test_pin_then_move_lands_as_the_last_click_says() {
+  local s; s=$(setup)
+  project "$s" garden "Garden"; agent "$s" finch garden
+  submit "$s" agent-pin '{"name":"finch","pinned":true}' p1
+  submit "$s" agent-project '{"name":"finch","project":"garden"}' p2
+  serve_once "$s"
+  assert_eq garden "$(field "$(fc "$s" status p1)" result.previousProject)" "pin took it out"
+  assert_absent "$s/fleet/identities/finch/.pinned" "the later move unpinned"
+  grep -qx 'project: garden' "$s/fleet/identities/finch/finch.md" || fail "in the project"
+  submit "$s" agent-pin '{"name":"finch","pinned":true}' p3
+  serve_once "$s"
+  assert_exists "$s/fleet/identities/finch/.pinned" "pinned"
+  grep -q '^project:' "$s/fleet/identities/finch/finch.md" && fail "pinned and in a project"
+  rm -rf "$s"
+}
+
+test_new_agent_into_a_gone_project_lands_in_conversations() {
+  local s; s=$(setup)
+  project "$s" garden "Garden"; agent "$s" finch garden; agent "$s" wren orchard
+  submit "$s" agent-project '{"name":"finch","project":"garden","birth":true}' b1
+  submit "$s" agent-project '{"name":"wren","project":"orchard","birth":true}' b2
+  serve_once "$s"
+  assert_eq garden "$(field "$(fc "$s" status b1)" result.project)" "filed"
+  local b2; b2=$(fc "$s" status b2)
+  assert_eq done "$(field "$b2" state)" "still made"
+  assert_eq "that project is gone" "$(field "$b2" result.notFiled)" "says why"
+  grep -q '^project:' "$s/fleet/identities/wren/wren.md" && fail "left pointing at a gone project"
+  rm -rf "$s"
+}
+
+test_agent_edit_changes_only_its_lines() {
+  local s; s=$(setup)
+  agent "$s" finch ""
+  printf -- '---\nroles: [eng]\ndisplayName: Finch\ntask: "Old"\ncustom: keep\navatar: finch.png\n---\nBody stays.\n' > "$s/fleet/identities/finch/finch.md"
+  : > "$s/fleet/identities/finch/finch.png"; printf 'new' > "$s/fleet/identities/finch/.avatar-upload-u1.webp"
+  submit "$s" agent-edit '{"name":"finch","set":{"displayName":"Finch Two","task":"Ship: it","colorHue":12,"voice":"alloy"},"avatar":{"upload":".avatar-upload-u1.webp","ext":"webp"}}' e1
+  serve_once "$s"
+  assert_eq done "$(field "$(fc "$s" status e1)" state)" "edited"
+  assert_eq "$(printf -- '---\nroles: [eng]\ndisplayName: Finch Two\ntask: "Ship: it"\ncolorHue: '"'"'12'"'"'\nvoice: alloy\ncustom: keep\navatar: finch.webp\n---\nBody stays.')" \
+    "$(cat "$s/fleet/identities/finch/finch.md")" "only those lines"
+  assert_eq new "$(cat "$s/fleet/identities/finch/finch.webp")" "picture in place"
+  assert_absent "$s/fleet/identities/finch/finch.png" "old picture gone"
+  assert_absent "$s/fleet/identities/finch/.avatar-upload-u1.webp" "upload used up"
+  submit "$s" agent-edit '{"name":"finch","unset":["avatar","task"]}' e2
+  serve_once "$s"
+  grep -q '^avatar:\|^task:' "$s/fleet/identities/finch/finch.md" && fail "removed lines still there"
+  assert_absent "$s/fleet/identities/finch/finch.webp" "picture removed"
+  rm -rf "$s"
+}
+
+test_agent_changes_refused_while_its_archive_is_claimed() {
+  local s; s=$(setup)
+  project "$s" garden "Garden"; agent "$s" finch ""
+  printf 'x' > "$s/fleet/identities/finch/.avatar-upload-u2.png"
+  submit "$s" agent-archive '{"name":"finch"}' a1
+  submit "$s" agent-project '{"name":"finch","project":"garden"}' p1
+  submit "$s" agent-pin '{"name":"finch","pinned":true}' p2
+  submit "$s" agent-edit '{"name":"finch","set":{"task":"x"},"avatar":{"upload":".avatar-upload-u2.png","ext":"png"}}' e1
+  serve_once "$s"
+  for id in p1 p2 e1; do assert_eq being_archived "$(field "$(fc "$s" status $id)" code)" "$id refused"; done
+  assert_absent "$s/fleet/identities/finch/.avatar-upload-u2.png" "unused picture removed"
+  assert_absent "$s/fleet/identities/finch/.pinned" "not pinned"
+  rm -rf "$s"
+}
+
 run_test test_aither_sequence_runs_in_click_order
 run_test test_archive_first_then_move_out_is_refused
 run_test test_move_into_archived_project_is_refused
@@ -608,6 +778,16 @@ run_test test_app_archive
 run_test test_group_archives_refused_when_an_agents_slot_is_taken
 run_test test_sleep_sweep_refused_when_the_agent_woke
 run_test test_app_unarchive_start_is_tried_again
+run_test test_project_create_skips_names_with_leftovers
+run_test test_project_create_inside_a_limited_project_shares_it
+run_test test_project_rename_changes_only_its_name
+run_test test_project_move_checks_at_its_turn
+run_test test_project_move_never_widens_its_audience
+run_test test_agent_move_to_a_gone_project_is_refused
+run_test test_pin_then_move_lands_as_the_last_click_says
+run_test test_new_agent_into_a_gone_project_lands_in_conversations
+run_test test_agent_edit_changes_only_its_lines
+run_test test_agent_changes_refused_while_its_archive_is_claimed
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 if [ "$FAIL" -gt 0 ]; then

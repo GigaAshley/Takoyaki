@@ -658,8 +658,22 @@ export function NewConversationPane({ tabId, picks, isVisible, onSelectPane }: N
         // or it opens as a plain terminal.
         await refreshOneIdentity(bornName, hostIdNum);
         console.info(`[new-conversation] started tabId=${tabId} name=${bornName} hostId=${hostIdNum}`);
-        const what: NewConversationStarted = { kind: "agent", host: selectedHost, name: bornName, project };
+        // Its project was gone by the time it was filed: it's in Conversations instead.
+        const notFiled = endedEvent.notFiled;
+        const what: NewConversationStarted = {
+          kind: "agent",
+          host: selectedHost,
+          name: bornName,
+          project: notFiled === undefined ? project : null,
+        };
         host?.started(tabId, what);
+        if (notFiled !== undefined) {
+          console.info(`[new-conversation] not filed tabId=${tabId} name=${bornName} project=${project} reason=${notFiled}`);
+          void kitAlert({
+            title: "It's in Conversations",
+            body: `The agent was made, but ${notFiled}, so it isn't in that project.`,
+          });
+        }
         return;
       }
       console.warn(`[new-conversation] start failed tabId=${tabId} hostId=${hostIdNum} reason=ended-not-ok`);

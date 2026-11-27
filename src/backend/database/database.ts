@@ -78,8 +78,8 @@ import identitiesArchiveListRoutes from "./routes/identities-archive-list.js";
 import conversationSearchRoutes from "./routes/conversation-search.js";
 // Phase 117 Plan 117-05 (D-05, D-31, D-36a, D-37): user-initiated project
 // membership write — POST /identities/:key/project writes (or clears)
-// the `project:` frontmatter field on the identity's markdown file via
-// writeSessionProjectField (117-01). Mounted alongside the sibling
+// the `project:` frontmatter field on the identity's markdown file through
+// the machine's front door (fleet-change agent-project). Mounted alongside the sibling
 // /:key/archive sub-route BEFORE the generic /identities router.
 import sessionProjectWriteRoutes from "./routes/session-project-write.js";
 import identityBirthRoutes from "./routes/identity-birth.js";
