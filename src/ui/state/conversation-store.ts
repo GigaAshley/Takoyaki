@@ -3270,7 +3270,8 @@ export function mergeProjectsForHost(
 // waiting its turn, every report of the old place is shown with the new one instead; a
 // report that agrees ends the hold, and so does the machine finishing or refusing the move
 // (settleProjectMoveIntent). No timer.
-const projectMoveIntents = new Map<string, { parent: string | null; seq: number }>();
+// `origin`: where the project really is — from before the first of a run of moves still open.
+const projectMoveIntents = new Map<string, { parent: string | null; seq: number; origin: string | null }>();
 let projectMoveSeq = 0;
 
 function withProjectMoveIntents(hostId: string, rows: readonly ProjectRow[]): readonly ProjectRow[] {
@@ -3290,28 +3291,29 @@ function withProjectMoveIntents(hostId: string, rows: readonly ProjectRow[]): re
 /** Show project `slug` under `parent` now, ahead of its machine. Returns the hold's handle. */
 export function startProjectMoveIntent(hostId: string, slug: string, parent: string | null): number {
   const seq = ++projectMoveSeq;
-  projectMoveIntents.set(`${hostId}::${slug}`, { parent, seq });
+  const k = `${hostId}::${slug}`;
+  const origin =
+    projectMoveIntents.get(k)?.origin ??
+    state.projects.find((p) => p.hostId === hostId && p.slug === slug)?.parent ??
+    null;
+  projectMoveIntents.set(k, { parent, seq, origin });
   mergeProjectsForHost(hostId, state.projects.filter((p) => p.hostId === hostId));
   return seq;
 }
 
 /**
- * The machine has finished the move (`done`) or it didn't happen (`previous`: put the
- * project back under it). A newer move of the same project owns the hold.
+ * The machine has finished the move (`done`) or it didn't happen (the project goes back
+ * where it really is). A newer move of the same project owns the hold.
  */
-export function settleProjectMoveIntent(
-  hostId: string,
-  slug: string,
-  seq: number,
-  outcome: { done: true } | { done: false; previous: string | null },
-): void {
+export function settleProjectMoveIntent(hostId: string, slug: string, seq: number, done: boolean): void {
   const k = `${hostId}::${slug}`;
-  if (projectMoveIntents.get(k)?.seq !== seq) return;
+  const intent = projectMoveIntents.get(k);
+  if (intent?.seq !== seq) return;
   projectMoveIntents.delete(k);
-  if ("previous" in outcome) {
+  if (!done) {
     mergeProjectsForHost(
       hostId,
-      state.projects.filter((p) => p.hostId === hostId).map((p) => (p.slug === slug ? { ...p, parent: outcome.previous } : p)),
+      state.projects.filter((p) => p.hostId === hostId).map((p) => (p.slug === slug ? { ...p, parent: intent.origin } : p)),
     );
   }
 }

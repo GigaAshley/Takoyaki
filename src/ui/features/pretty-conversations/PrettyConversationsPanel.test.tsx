@@ -3004,6 +3004,7 @@ describe("PrettyConversationsPanel: Phase 115 Plan 115-06 handleArchive", () => 
   // the row off the sidebar.
   it("A11: confirm=true → the row greys with Archiving… until the machine answers, then leaves", async () => {
     const hostA = makeHost("42", "hostA");
+    mockFleetSessionsSnapshot = [{ hostId: 42, hostName: "hostA", sessionName: "wren", created: 1, role: null }];
     mockIdentitiesByKey = new Map([
       ["wren", { identityKey: "wren", displayName: "wren", title: null }],
     ]);

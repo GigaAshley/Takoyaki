@@ -1,6 +1,6 @@
 import axios from "axios";
 import { authApi, handleApiError } from "@/main-axios";
-import { afterMachineSettles } from "@/state/machine-changes-store";
+import { afterMachineSettles, setOutcomeAsker } from "@/state/machine-changes-store";
 
 // ─── Changes sent to a machine's front door ──────────────────────────────────
 //
@@ -158,3 +158,27 @@ export function whenMachineDone(
 ): Promise<"done" | "failed"> {
   return !answer || answer.done ? Promise.resolve("done") : afterMachineSettles(hostId, answer.requestId);
 }
+
+/**
+ * How a request ended, asked of its machine by id — quietly: a refusal read this way doesn't
+ * count as having told the person (their row's mark does that).
+ */
+async function askOutcome(hostId: string, requestId: string): Promise<"done" | "failed" | "pending"> {
+  try {
+    const response = await authApi.get(
+      `/machine-changes/${encodeURIComponent(hostId)}/${encodeURIComponent(requestId)}?quiet=1`,
+    );
+    return response.status === 202 ? "pending" : "done";
+  } catch (error) {
+    if (axios.isAxiosError(error) && error.response) {
+      const status = error.response.status;
+      // Unknown to the machine (forgotten after a week): nothing left to hold.
+      if (status === 404) return "done";
+      if (status === 409 || status === 500) return "failed";
+    }
+    // No answer (offline, the machine unreachable): ask again on the next report.
+    return "pending";
+  }
+}
+
+setOutcomeAsker(askOutcome);

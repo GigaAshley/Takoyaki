@@ -932,6 +932,7 @@ export type GatedMachineChange = MachineChange & {
   toAudience?: string[] | null;
   byUser?: string;
   byAgent?: string;
+  cardAudience?: string[] | null;
 };
 
 export const FrontendMachineChangesFrameSchema = z.object({

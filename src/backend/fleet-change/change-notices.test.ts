@@ -27,6 +27,7 @@ import {
   setChangeNoticeStoreForTests,
   setNoticeRefan,
   toldDirectly,
+  untellIfUndelivered,
   type ChangeNoticeStore,
 } from "./change-notices.js";
 
@@ -68,6 +69,37 @@ describe("change notices", () => {
     store.markSeen("u1", "7", "new");
     expect(store.isSeen("u1", "7", "old")).toBe(false);
     expect(store.isSeen("u1", "7", "new")).toBe(true);
+  });
+
+  it("a stuck archive's 'had it' outlives the two days — it never pops up again while still stuck", () => {
+    store.markSeen("u1", "7", "a1:stuck");
+    store.markSeen("u1", "7", "old");
+    now += 3 * 24 * 3600 * 1000;
+    store.markSeen("u1", "7", "trigger-prune");
+    expect(store.isSeen("u1", "7", "a1:stuck")).toBe(true);
+    expect(store.isSeen("u1", "7", "old")).toBe(false);
+  });
+
+  it("an answer that never reached them is taken back, and their devices are sent the list again", () => {
+    const refan = vi.fn();
+    setNoticeRefan(refan);
+    const outcome = { state: "refused", id: "r9" };
+    toldDirectly("u1", 7, outcome);
+    const handlers: Array<() => void> = [];
+    const res = { writableFinished: false, on: (_e: "close", fn: () => void) => handlers.push(fn) };
+    untellIfUndelivered(res, "u1", 7, outcome);
+    handlers.forEach((h) => h());
+    expect(store.isSeen("u1", "7", "r9")).toBe(false);
+    expect(refan).toHaveBeenCalledWith("7");
+  });
+
+  it("an answer that was sent stays told", () => {
+    const outcome = { state: "failed", id: "r8" };
+    toldDirectly("u1", 7, outcome);
+    const handlers: Array<() => void> = [];
+    untellIfUndelivered({ writableFinished: true, on: (_e, fn) => handlers.push(fn) }, "u1", 7, outcome);
+    handlers.forEach((h) => h());
+    expect(store.isSeen("u1", "7", "r8")).toBe(true);
   });
 
   it("an outcome handed to the asker counts as told — refusals, failures, a new agent left out", () => {

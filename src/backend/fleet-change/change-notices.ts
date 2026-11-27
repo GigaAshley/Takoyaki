@@ -26,12 +26,15 @@ import { databaseLogger } from "../utils/logger.js";
 export { CHANGE_NOTICE_TABLES_SQL } from "./change-notices-schema.js";
 
 const KEEP_MS = 2 * 24 * 3600 * 1000;
+const STUCK_KEEP_MS = 90 * 24 * 3600 * 1000;
 const KEY_RE = /^[A-Za-z0-9._:-]{1,100}$/;
 
 export interface ChangeNoticeStore {
   /** Record that the user has had this notice. True when this is the first time. */
   markSeen(userId: string, hostId: string, key: string): boolean;
   isSeen(userId: string, hostId: string, key: string): boolean;
+  /** Take a "had it" back (the answer that counted as telling them never reached them). */
+  unmarkSeen(userId: string, hostId: string, key: string): void;
 }
 
 export function createChangeNoticeStore(deps: {
@@ -52,7 +55,11 @@ export function createChangeNoticeStore(deps: {
         .run(userId, hostId, key, now).changes;
       if (now - lastPrune > 3600 * 1000) {
         lastPrune = now;
-        db.prepare("DELETE FROM machine_change_notices_seen WHERE seen_at < ?").run(now - KEEP_MS);
+        // A stuck archive is reported for as long as it stays stuck — its "had it" is kept
+        // much longer, so it never pops up again.
+        db.prepare(
+          "DELETE FROM machine_change_notices_seen WHERE (notice_key NOT LIKE '%:stuck' AND seen_at < ?) OR seen_at < ?",
+        ).run(now - KEEP_MS, now - STUCK_KEEP_MS);
       }
       if (changes > 0) {
         try {
@@ -62,6 +69,12 @@ export function createChangeNoticeStore(deps: {
         }
       }
       return changes > 0;
+    },
+    unmarkSeen(userId, hostId, key) {
+      deps
+        .sqlite()
+        .prepare("DELETE FROM machine_change_notices_seen WHERE user_id = ? AND host_id = ? AND notice_key = ?")
+        .run(userId, hostId, key);
     },
     isSeen(userId, hostId, key) {
       return (
@@ -81,7 +94,7 @@ export function getChangeNoticeStore(): ChangeNoticeStore {
     singleton = createChangeNoticeStore({
       sqlite: getSqlite,
       now: () => Date.now(),
-      save: (reason) => DatabaseSaveTrigger.forceSave(reason),
+      save: (reason) => DatabaseSaveTrigger.triggerSave(reason),
     });
   }
   return singleton;
@@ -154,10 +167,7 @@ export function toldDirectly(
   outcome: { state: string; id: string; result?: unknown },
 ): void {
   if (!userId || hostId === undefined) return;
-  const notFiled = (outcome.result as { notFiled?: unknown } | null | undefined)?.notFiled;
-  const isNotice =
-    outcome.state === "refused" || outcome.state === "failed" || (outcome.state === "done" && typeof notFiled === "string");
-  if (!isNotice) return;
+  if (!isNoticeOutcome(outcome)) return;
   try {
     getChangeNoticeStore().markSeen(userId, String(hostId), outcome.id);
   } catch (err) {
@@ -168,4 +178,37 @@ export function toldDirectly(
       error: err instanceof Error ? err.message : String(err),
     });
   }
+}
+
+/**
+ * An outcome that counted as telling the asker (toldDirectly) is only told once its answer
+ * actually reaches them: if the connection closes before the response was sent, the "had it"
+ * is taken back, so the notice shows on their devices after all.
+ */
+export function untellIfUndelivered(
+  res: { on(event: "close", fn: () => void): unknown; writableFinished: boolean },
+  userId: string | undefined,
+  hostId: number | undefined,
+  outcome: { state: string; id: string; result?: unknown },
+): void {
+  if (!userId || hostId === undefined || !isNoticeOutcome(outcome)) return;
+  res.on("close", () => {
+    if (res.writableFinished) return;
+    try {
+      getChangeNoticeStore().unmarkSeen(userId, String(hostId), outcome.id);
+      databaseLogger.info("machine notice answer not delivered — the asker will see it on the row", {
+        operation: "machine_change_notice_undelivered",
+        hostId,
+        requestId: outcome.id,
+      });
+      refanHost(hostId);
+    } catch {
+      /* the notice then stays counted as told */
+    }
+  });
+}
+
+function isNoticeOutcome(outcome: { state: string; result?: unknown }): boolean {
+  const notFiled = (outcome.result as { notFiled?: unknown } | null | undefined)?.notFiled;
+  return outcome.state === "refused" || outcome.state === "failed" || (outcome.state === "done" && typeof notFiled === "string");
 }

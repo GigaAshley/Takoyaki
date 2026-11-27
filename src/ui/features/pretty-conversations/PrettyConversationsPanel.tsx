@@ -1961,7 +1961,9 @@ export function PrettyConversationsPanel({
       matchKey === null
         ? undefined
         : (identitiesByHostKey?.get(`${hostId}::${matchKey}`) ?? identitiesByKey.get(matchKey));
-    markPendingArchive(hostId, sessionName);
+    // Already gone (the machine's `gone` beat this here): nothing left to guard, and a
+    // mark set now would never be cleared.
+    if (removed) markPendingArchive(hostId, sessionName);
     removeFleetSession(hostId, sessionName);
     applyIdentityChange(null, identityKey, hostId);
     return () => {
@@ -2649,19 +2651,18 @@ export function PrettyConversationsPanel({
       });
       // Shown in its new place at once, and held there while the machine has the move
       // waiting its turn (a newer move of the same project owns the hold).
-      const previous = target.parent ?? null;
       const seq = startProjectMoveIntent(hostId, slug, newParent);
       setProjectParent(hostIdNum, slug, newParent)
         .then((answer) => whenMachineDone(hostIdNum, answer))
         .then((ended) => {
           // Refused after this stopped asking: back where it was, the reason on its header.
           if (ended === "failed") console.info({ operation: "move_project_refused_later", slug, hostId, newParent });
-          settleProjectMoveIntent(hostId, slug, seq, ended === "done" ? { done: true } : { done: false, previous });
+          settleProjectMoveIntent(hostId, slug, seq, ended === "done");
         })
         .catch((err: unknown) => {
           const msg = err instanceof Error ? err.message : String(err);
           console.error({ operation: "move_project_failed", slug, hostId, newParent, errMessage: msg });
-          settleProjectMoveIntent(hostId, slug, seq, { done: false, previous });
+          settleProjectMoveIntent(hostId, slug, seq, false);
           void kitAlert({ title: "Couldn't move this project", body: sentenceOf(msg) });
         });
     },

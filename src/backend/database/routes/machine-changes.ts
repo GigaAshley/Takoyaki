@@ -26,7 +26,7 @@ import { AuthManager } from "../../utils/auth-manager.js";
 import { databaseLogger } from "../../utils/logger.js";
 import { HttpError, withHost } from "../../sharing/host-conn.js";
 import { REQUEST_ID_RE, frontDoorHttp, frontDoorStatus } from "../../fleet-change/front-door.js";
-import { dismissNotice } from "../../fleet-change/change-notices.js";
+import { dismissNotice, untellIfUndelivered } from "../../fleet-change/change-notices.js";
 import { resolveHostById } from "../../ssh/host-resolver.js";
 
 const router = express.Router();
@@ -44,10 +44,14 @@ router.get("/:hostId/:requestId", authenticateJWT, async (req: Request, res: Res
     return res.status(400).json({ error: "invalid request id" });
   }
   try {
+    // quiet: a device checking how its change ended (not asking on someone's behalf) —
+    // no wait, and it doesn't count as telling them.
+    const quiet = req.query.quiet === "1";
     const outcome = await withHost(hostId, userId, (conn) =>
-      frontDoorStatus(conn, requestId, undefined, { hostId, by: userId }),
+      quiet ? frontDoorStatus(conn, requestId, 0) : frontDoorStatus(conn, requestId, undefined, { hostId, by: userId }),
     );
     if (outcome === null) return res.status(404).json({ error: "no such request on this machine" });
+    if (!quiet && outcome.state !== "not_installed") untellIfUndelivered(res, userId, hostId, outcome);
     const { status, body } = frontDoorHttp(outcome);
     return res.status(status).json(body);
   } catch (err) {

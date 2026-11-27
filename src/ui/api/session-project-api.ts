@@ -5,11 +5,7 @@ import {
   whenMachineDone,
   type MachineChangeAnswer,
 } from "@/api/machine-changes-api";
-import {
-  getIdentitiesSnapshot,
-  settleIdentityProjectIntent,
-  startIdentityProjectIntent,
-} from "@/state/identities-store";
+import { settleIdentityProjectIntent, startIdentityProjectIntent } from "@/state/identities-store";
 
 // ─── Phase 117 Plan 117-06 (D-05 / D-05a) — session-project-api ─────────────
 //
@@ -41,7 +37,6 @@ export async function setSessionProject(
   identityKey: string,
   projectSlug: string | null,
 ): Promise<{ ok: true }> {
-  const previous = currentProject(hostId, identityKey);
   const seq = startIdentityProjectIntent(identityKey, hostId, projectSlug);
   let answer: MachineChangeAnswer<unknown>;
   try {
@@ -58,31 +53,18 @@ export async function setSessionProject(
       ),
     );
   } catch (err) {
-    settleIdentityProjectIntent(identityKey, hostId, seq, { done: false, previous });
+    settleIdentityProjectIntent(identityKey, hostId, seq, false);
     throw err;
   }
   if (answer.done) {
-    settleIdentityProjectIntent(identityKey, hostId, seq, { done: true });
+    settleIdentityProjectIntent(identityKey, hostId, seq, true);
   } else {
     void whenMachineDone(hostId, answer).then((ended) => {
       console.info({ operation: "agent_move_settled_later", hostId, identityKey, project: projectSlug, ended });
-      settleIdentityProjectIntent(
-        identityKey,
-        hostId,
-        seq,
-        ended === "done" ? { done: true } : { done: false, previous },
-      );
+      settleIdentityProjectIntent(identityKey, hostId, seq, ended === "done");
     });
   }
   return { ok: true };
-}
-
-function currentProject(hostId: number, identityKey: string): string | null {
-  const keyLc = identityKey.toLowerCase();
-  const found = getIdentitiesSnapshot().find(
-    (i) => i.hostId === hostId && i.identityKey.toLowerCase() === keyLc,
-  );
-  return found?.project ?? null;
 }
 
 export async function setRelayRoomProject(

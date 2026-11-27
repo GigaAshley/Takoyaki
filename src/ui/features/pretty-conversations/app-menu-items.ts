@@ -13,6 +13,7 @@ import {
   setPendingAppMove,
   clearPendingAppMove,
   confirmPendingAppMove,
+  hasAppTile,
 } from "../../state/app-tiles-store";
 import type { RowKebabMenuItem, RowKebabSubmenuItem } from "./RowKebabMenu";
 import type { AppMoveProject } from "../apps/use-app-move-projects";
@@ -277,7 +278,8 @@ export function buildAppMenuItems(
           }
           // Archived: off the sidebar now. Mark pending FIRST so a racing fleet-status
           // app-update / app-snapshot frame is silent-dropped rather than re-inserting it.
-          markPendingAppArchive(app.hostId, app.slug);
+          // (Unless the machine's `app-gone` already took it: a mark set then is never cleared.)
+          if (hasAppTile(app.hostId, app.slug)) markPendingAppArchive(app.hostId, app.slug);
           publishAppGone(app.hostId, app.slug);
         } catch (err) {
           // Closed panes are NOT re-opened — the alert lets the user do it by hand.

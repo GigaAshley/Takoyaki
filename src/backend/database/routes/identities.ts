@@ -69,6 +69,7 @@ import { normalizeAvatar, normalizeUploadedAvatar } from "../../utils/avatar-nor
 import { composeSplitAvatar, type SplitAvatarPart } from "../../utils/avatar-split.js";
 import { getCachedAvatar, invalidateCachedAvatar } from "./identity-avatar-cache.js";
 import { frontDoorHttp, requestIdFrom, submitFrontDoor } from "../../fleet-change/front-door.js";
+import { untellIfUndelivered } from "../../fleet-change/change-notices.js";
 
 const router = express.Router();
 const authManager = AuthManager.getInstance();
@@ -797,6 +798,7 @@ router.put(
           code: "code" in outcome ? outcome.code : undefined,
         });
         if (outcome.state !== "done") {
+          if (outcome.state !== "not_installed") untellIfUndelivered(res, userId, hostId, outcome);
           const { status, body } = frontDoorHttp(outcome);
           return res.status(status).json(body);
         }

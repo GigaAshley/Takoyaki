@@ -326,6 +326,7 @@ export interface BirthDeps {
     project: string,
     hostId: number,
     userId?: string,
+    pageGone?: () => boolean,
   ) => Promise<string | undefined>;
   /**
    * Called once the identity's folder is committed on the host — from then on
@@ -1428,11 +1429,17 @@ async function fileIntoProjectByFrontDoor(
   project: string,
   hostId: number,
   userId?: string,
+  pageGone?: () => boolean,
 ): Promise<string | undefined> {
   let notFiled: string | undefined;
   let outcomeState = "error";
   try {
-    const outcome = await submitFrontDoor(conn, "agent-project", { name, project, birth: true }, { hostId, by: userId });
+    const outcome = await submitFrontDoor(conn, "agent-project", { name, project, birth: true }, {
+      hostId,
+      by: userId,
+      // The page that asked is gone: it won't say so, so the row's mark will.
+      tell: !(pageGone?.() ?? false),
+    });
     outcomeState = outcome.state;
     if (outcome.state === "done") {
       const r = (outcome.result as { notFiled?: unknown } | null)?.notFiled;
@@ -1889,6 +1896,7 @@ export async function birthIdentity(
         opts.project,
         opts.hostId,
         opts.userId,
+        () => opts.abortSignal?.aborted === true,
       );
     }
 

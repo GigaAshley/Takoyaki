@@ -116,6 +116,14 @@ describe("machine-changes filter", () => {
     expect(out?.map((c) => c.id)).toEqual(["s1", "s3", "s4"]);
   });
 
+  it("where an agent coming back lands is never named to someone who can't see that project", async () => {
+    const [c] = (await view([
+      change({ state: "returning", kind: "agent-unarchive", card: { displayName: "Wren", project: "secret" }, cardAudience: ["bob"] }),
+    ]))!;
+    expect(c.card).toEqual({ displayName: "Wren", project: null });
+    expect(c).not.toHaveProperty("cardAudience");
+  });
+
   it("agents coming back show to everyone who can see them", async () => {
     const out = await view([
       change({ id: "u", state: "returning", kind: "agent-unarchive", card: { displayName: "Wren", project: null } }),

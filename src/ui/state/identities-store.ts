@@ -761,7 +761,8 @@ export function setIdentityProject(
 // back — so reports that disagree are held off while the move is open. A report that
 // agrees ends the hold; so does the machine finishing or refusing the move
 // (settleIdentityProjectIntent). No timer.
-const projectIntents = new Map<string, { project: string | null; seq: number }>();
+// `origin`: where the agent really is — from before the first of a run of moves still open.
+const projectIntents = new Map<string, { project: string | null; seq: number; origin: string | null }>();
 let projectIntentSeq = 0;
 const intentKey = (hostId: number, identityKey: string) => `${hostId}::${identityKey.toLowerCase()}`;
 
@@ -785,26 +786,28 @@ export function getIdentitiesSnapshot(): readonly Identity[] {
 /** Show an agent in `project` now, ahead of its machine. Returns the hold's handle. */
 export function startIdentityProjectIntent(identityKey: string, hostId: number, project: string | null): number {
   const seq = ++projectIntentSeq;
-  projectIntents.set(intentKey(hostId, identityKey), { project, seq });
+  const k = intentKey(hostId, identityKey);
+  const keyLc = identityKey.toLowerCase();
+  const origin =
+    projectIntents.get(k)?.origin ??
+    state.identities.find((i) => i.hostId === hostId && i.identityKey.toLowerCase() === keyLc)?.project ??
+    null;
+  projectIntents.set(k, { project, seq, origin });
   writeIdentityProject(identityKey, hostId, project);
   return seq;
 }
 
 /**
  * The machine has finished the move (`done`: the place shown is now the truth) or it
- * didn't happen (`previous`: put the row back where it is). A newer move of the same
+ * didn't happen (the row goes back where the agent really is). A newer move of the same
  * agent owns the hold; this one then does nothing.
  */
-export function settleIdentityProjectIntent(
-  identityKey: string,
-  hostId: number,
-  seq: number,
-  outcome: { done: true } | { done: false; previous: string | null },
-): void {
+export function settleIdentityProjectIntent(identityKey: string, hostId: number, seq: number, done: boolean): void {
   const k = intentKey(hostId, identityKey);
-  if (projectIntents.get(k)?.seq !== seq) return;
+  const intent = projectIntents.get(k);
+  if (intent?.seq !== seq) return;
   projectIntents.delete(k);
-  if ("previous" in outcome) writeIdentityProject(identityKey, hostId, outcome.previous);
+  if (!done) writeIdentityProject(identityKey, hostId, intent.origin);
 }
 
 function writeIdentityProject(

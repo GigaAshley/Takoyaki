@@ -122,7 +122,14 @@ export async function submitFrontDoor(
   conn: SSHClientType | null,
   kind: FrontDoorKind,
   args: Record<string, unknown>,
-  opts: { id?: string; waitS?: number; hostId?: number; by?: string } = {},
+  opts: {
+    id?: string;
+    waitS?: number;
+    hostId?: number;
+    by?: string;
+    /** false: the outcome won't reach the asker now (their page has gone) — don't count it as told. */
+    tell?: boolean;
+  } = {},
 ): Promise<FrontDoorOutcome> {
   const id = opts.id ?? randomUUID();
   if (!REQUEST_ID_RE.test(id)) throw new Error("invalid request id");
@@ -135,7 +142,7 @@ export async function submitFrontDoor(
     outcome = conn === null
       ? await submitLocally(kind, args, id, waitS, by)
       : await submitOverSsh(conn, kind, args, id, waitS, by);
-    toldDirectly(by, opts.hostId, outcome);
+    if (opts.tell !== false) toldDirectly(by, opts.hostId, outcome);
   } finally {
     release();
   }

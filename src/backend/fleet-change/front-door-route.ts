@@ -17,6 +17,7 @@ import {
   type FrontDoorKind,
   type FrontDoorOutcome,
 } from "./front-door.js";
+import { untellIfUndelivered } from "./change-notices.js";
 
 /**
  * Who a change's visibility checks are for: the caller's username. When it can't be looked
@@ -103,6 +104,7 @@ export async function answerFromFrontDoor(
       code: "code" in outcome ? outcome.code : undefined,
     });
     const { status, body } = opts.answer?.(outcome) ?? frontDoorHttp(outcome);
+    if (outcome.state !== "not_installed") untellIfUndelivered(res, userId, hostId, outcome);
     return res.status(status).json(body);
   } catch (err) {
     if (err instanceof HttpError) {

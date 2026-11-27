@@ -139,6 +139,7 @@ export function adaptChangeEntry(e: SweepChangeEntry): GatedMachineChange {
   if (typeof e.by_agent === "string") out.byAgent = e.by_agent;
   if (e.card && typeof e.card.display_name === "string") {
     out.card = { displayName: e.card.display_name, project: typeof e.card.project === "string" ? e.card.project : null };
+    if (e.card_audience !== undefined) out.cardAudience = e.card_audience;
   }
   return out;
 }

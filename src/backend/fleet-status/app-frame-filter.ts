@@ -603,10 +603,14 @@ export async function filterAppFrame(
         if (!(mine || raw.byUser === undefined) || seen(`${raw.id}:stuck`)) continue;
       }
       // eslint-disable-next-line @typescript-eslint/no-unused-vars
-      const { audience: _a, toAudience, byUser: _u, byAgent: _g, ...rest } = raw;
+      const { audience: _a, toAudience, cardAudience, byUser: _u, byAgent: _g, ...rest } = raw;
       const entry: MachineChange = { ...rest, mine };
       if (entry.to && !canSee(toAudience)) {
         entry.to = { ...(entry.to.pinned !== undefined ? { pinned: entry.to.pinned } : {}), hidden: true };
+      }
+      if (entry.card?.project && !canSee(cardAudience)) {
+        // It lands in a project hidden from them: for them it's Conversations.
+        entry.card = { ...entry.card, project: null };
       }
       out.push(entry);
     }

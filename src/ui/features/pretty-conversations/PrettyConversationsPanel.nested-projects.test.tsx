@@ -210,6 +210,7 @@ let mockProjects: readonly {
   parent?: string | null;
 }[] = [];
 const mergeProjectsForHostSpy = vi.fn();
+let moveOrigin: typeof mockProjects = [];
 
 const selectConversationSpy = vi.fn();
 const addToActiveSetSpy = vi.fn();
@@ -249,19 +250,16 @@ vi.mock("@/state/conversation-store", () => ({
     mergeProjectsForHostSpy(hostId, rows),
   // The move hold, as the store does it: the new place at once, the old one back on a refusal.
   startProjectMoveIntent: (hostId: string, slug: string, parent: string | null) => {
+    moveOrigin = mockProjects.filter((p) => p.hostId === hostId);
     mergeProjectsForHostSpy(
       hostId,
       mockProjects.filter((p) => p.hostId === hostId).map((p) => (p.slug === slug ? { ...p, parent } : p)),
     );
     return 1;
   },
-  settleProjectMoveIntent: (hostId: string, slug: string, _seq: number, outcome: { done: boolean; previous?: string | null }) => {
-    if ("previous" in outcome) {
-      mergeProjectsForHostSpy(
-        hostId,
-        mockProjects.filter((p) => p.hostId === hostId).map((p) => (p.slug === slug ? { ...p, parent: outcome.previous } : p)),
-      );
-    }
+  settleProjectMoveIntent: (hostId: string, _slug: string, _seq: number, done: boolean) => {
+    // A refusal: the project goes back where it really is (as it was before the move).
+    if (!done) mergeProjectsForHostSpy(hostId, moveOrigin);
   },
   selectConversation: (id: string | null) => selectConversationSpy(id),
   pinConversation: (id: string) => pinConversationSpy(id),

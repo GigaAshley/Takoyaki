@@ -146,12 +146,35 @@ test_role_archive_marks_its_agents() {
   rm -rf "$h"
 }
 
+test_nothing_named_to_people_who_cant_see_it() {
+  local h; h=$(setup)
+  project "$h" secret "ann"
+  fc "$h" submit project-create '{"baseSlug":"plans","displayName":"Plans","asker":"bob","multiUser":true}' --id c1 --by user:u2 --wait 0 >/dev/null
+  fc "$h" submit project-create '{"baseSlug":"inner","displayName":"Inner","parent":"secret"}' --id c2 --wait 0 >/dev/null
+  mkdir -p "$h/fleet/roles-archive/ops"; printf -- '---\nusers: [ann]\n---\n' > "$h/fleet/roles-archive/ops/ops.md"
+  fc "$h" submit role-unarchive '{"name":"ops"}' --id r1 --wait 0 >/dev/null
+  mkdir -p "$h/fleet/apps-archive/beds"; printf '{"title":"Beds","users":["ann"]}' > "$h/fleet/apps-archive/beds/app.json"
+  fc "$h" submit app-unarchive '{"slug":"beds"}' --id a1 --wait 0 >/dev/null
+  mkdir -p "$h/fleet/identities-archive/wren"
+  printf -- '---\nroles: []\nproject: secret\n---\n' > "$h/fleet/identities-archive/wren/wren.md"
+  mkdir -p "$h/fleet/.changes/returning"; printf '{"name":"wren","ids":["u1"],"accepted_at":1}' > "$h/fleet/.changes/returning/wren.json"
+  local c; c=$(changes "$h")
+  local of='lambda i, k: [e for e in d["changes"] if e["id"] == i][0].get(k)'
+  assert_eq '["bob"]' "$(q "$c" "($of)('c1', 'audience')")" "a new project: only whoever asked"
+  assert_eq '["ann"]' "$(q "$c" "($of)('c2', 'audience')")" "a new sub-project: whoever sees its parent"
+  assert_eq '["ann"]' "$(q "$c" "($of)('r1', 'audience')")" "an archived role, read in the archive"
+  assert_eq '["ann"]' "$(q "$c" "($of)('a1', 'audience')")" "an archived app, read in the archive"
+  assert_eq '["ann"]' "$(q "$c" "($of)('u1', 'card_audience')")" "where it lands, gated"
+  rm -rf "$h"
+}
+
 run_test test_no_front_door_no_line
 run_test test_waiting_move_says_where_and_for_whom
 run_test test_notices_and_what_is_still_open
 run_test test_stuck_archive_names_who_to_tell
 run_test test_agent_coming_back_carries_its_row
 run_test test_role_archive_marks_its_agents
+run_test test_nothing_named_to_people_who_cant_see_it
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 if [ "$FAIL" -gt 0 ]; then

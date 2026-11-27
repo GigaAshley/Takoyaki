@@ -98,6 +98,7 @@ import {
 import { answerFromFrontDoor, askerFor } from "../../fleet-change/front-door-route.js";
 import { HttpError } from "../../sharing/host-conn.js";
 import { findProjectRooms, releaseProjectRooms } from "../../fleet-change/project-rooms.js";
+import { untellIfUndelivered } from "../../fleet-change/change-notices.js";
 
 /** What a project archive takes, as the machine reports it (fleet-change project-contents). */
 interface ProjectContents {
@@ -806,6 +807,7 @@ router.post(
             outcome: outcome.state,
             code: "code" in outcome ? outcome.code : undefined,
           });
+          if (outcome.state !== "not_installed") untellIfUndelivered(res, userId, hostId, outcome);
           const { status, body: answer } = frontDoorHttp(outcome);
           res.status(status).json(answer);
           return;

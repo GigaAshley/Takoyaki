@@ -415,6 +415,8 @@ export interface SweepChangeEntry {
   code?: string;
   /** An agent on its way back: what its row shows, and where it lands. */
   card?: { display_name: string; project: string | null };
+  /** Who can see the project an agent coming back lands in (gate-only). */
+  card_audience?: string[] | null;
 }
 
 export interface SweepChangesLine {

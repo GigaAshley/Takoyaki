@@ -198,7 +198,11 @@ export function clearPendingAppTitle(
 // frame that already agrees; once the machine has said it's done
 // (confirmPendingAppMove), on the next frame whatever it says; and when the
 // machine refuses it, via clearPendingAppMove. No timer.
-const pendingAppMoves = new Map<string, { project: string | null; confirmed: boolean }>();
+// `origin`: where the app really is — from before the first of a run of moves still open.
+const pendingAppMoves = new Map<
+  string,
+  { project: string | null; confirmed: boolean; origin: { owner: string | null; project: string | null } | null }
+>();
 
 function applyPendingMove(app: AppState): AppState {
   const key = `${app.hostId}:${app.slug}`;
@@ -219,13 +223,21 @@ function applyPending(app: AppState): AppState {
 /** Optimistically show an app in its new place: a project, or the sidebar (null). */
 export function setPendingAppMove(hostId: string, slug: string, project: string | null): void {
   const key = `${hostId}:${slug}`;
-  pendingAppMoves.set(key, { project, confirmed: false });
   const current = state.map.get(key);
+  const origin =
+    pendingAppMoves.get(key)?.origin ??
+    (current ? { owner: current.owner ?? null, project: current.project ?? null } : null);
+  pendingAppMoves.set(key, { project, confirmed: false, origin });
   if (!current) return;
   const nextMap = new Map(state.map);
   nextMap.set(key, { ...current, owner: null, project });
   state = { map: nextMap };
   notify();
+}
+
+/** Is this app in the sidebar's list right now? */
+export function hasAppTile(hostId: string, slug: string): boolean {
+  return state.map.has(`${hostId}:${slug}`);
 }
 
 /** The machine has finished the move: the next frame about the app is the truth. */
@@ -234,13 +246,17 @@ export function confirmPendingAppMove(hostId: string, slug: string): void {
   if (pending) pending.confirmed = true;
 }
 
-/** Roll back an optimistic move: the app goes back to `previous`. */
+/**
+ * Roll back an optimistic move: the app goes back where it really is — `previous`, unless
+ * an earlier move still open already knew better.
+ */
 export function clearPendingAppMove(
   hostId: string,
   slug: string,
-  previous: { owner: string | null; project: string | null },
+  given: { owner: string | null; project: string | null },
 ): void {
   const key = `${hostId}:${slug}`;
+  const previous = pendingAppMoves.get(key)?.origin ?? given;
   pendingAppMoves.delete(key);
   const current = state.map.get(key);
   if (!current) return;

@@ -48,6 +48,7 @@ import { readShareHostState } from "../../sharing/sharing-host.js";
 import type { ShareHostState } from "../../sharing/sharing-plan.js";
 import { HttpError, withHost } from "../../sharing/host-conn.js";
 import { planAppMove, type MoveDestination } from "../../apps/app-move-plan.js";
+import { untellIfUndelivered } from "../../fleet-change/change-notices.js";
 
 const router = express.Router();
 const authManager = AuthManager.getInstance();
@@ -134,6 +135,7 @@ router.post("/:hostId/:slug/move", authenticateJWT, async (req: Request, res: Re
       });
       return result;
     });
+    if (outcome.state !== "not_installed") untellIfUndelivered(res, userId, hostId, outcome);
     const { status, body } = frontDoorHttp(outcome);
     return res.status(status).json(body);
   } catch (err) {

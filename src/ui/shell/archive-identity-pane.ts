@@ -13,6 +13,7 @@ import { markArchivingHere } from "@/state/machine-changes-store";
 import {
   markPendingArchive,
   removeFleetSession,
+  getFleetSessionsSnapshot,
 } from "@/state/conversation-store";
 import { toast } from "sonner";
 import { archiveIdentity } from "@/api/identity-archive-api";
@@ -78,7 +79,10 @@ async function confirmThenArchive(args: {
       }
       // Taken: off the sidebar now — markPendingArchive FIRST so a racing fleet-status
       // upsert is silent-dropped rather than re-inserting the row.
-      markPendingArchive(hostId, identityKey);
+      // (Unless the machine's `gone` already took it: a mark set then is never cleared.)
+      if (getFleetSessionsSnapshot().some((fs) => fs.hostId === hostId && fs.sessionName === identityKey)) {
+        markPendingArchive(hostId, identityKey);
+      }
       removeFleetSession(hostId, identityKey);
       applyIdentityChange(null, identityKey, hostId);
       // Archived: every other open copy in this window closes too.

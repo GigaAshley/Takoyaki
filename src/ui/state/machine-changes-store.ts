@@ -171,8 +171,16 @@ export function markArchivingHere(hostId: number | string, type: TargetType, nam
 
 // ─── A device's own changes: after the machine settles them ──────────────────
 
-type Waiter = { id: string; seenOpen: boolean; resolve: (r: "done" | "failed") => void };
+type Waiter = { id: string; asking: boolean; resolve: (r: "done" | "failed") => void };
 const waiters = new Map<string, Waiter[]>();
+
+/** How a request ended, asked of its machine by id (set by machine-changes-api). */
+export type OutcomeAsker = (hostId: string, requestId: string) => Promise<"done" | "failed" | "pending">;
+let askOutcome: OutcomeAsker | null = null;
+
+export function setOutcomeAsker(fn: OutcomeAsker | null): void {
+  askOutcome = fn;
+}
 
 function settleWaiters(hostId: string, changes: readonly MachineChange[]): void {
   const list = waiters.get(hostId);
@@ -182,29 +190,50 @@ function settleWaiters(hostId: string, changes: readonly MachineChange[]): void 
     const mine = changes.filter((c) => c.id === w.id);
     if (mine.some((c) => c.state === "refused" || c.state === "failed")) {
       w.resolve("failed");
-    } else if (mine.some((c) => isOpen(c) || c.state === "stuck")) {
-      w.seenOpen = true;
-      keep.push(w);
-    } else if (w.seenOpen || mine.some((c) => c.state === "unfiled")) {
+    } else if (mine.some((c) => c.state === "unfiled")) {
       w.resolve("done");
     } else {
       keep.push(w);
+      // Not listed open (any more): this person's view of the list can't say how it ended
+      // — a refusal may be hidden from it (dismissed elsewhere, left out) — so ask the
+      // machine. Still under way → wait for the next report.
+      if (!mine.some((c) => isOpen(c) || c.state === "stuck")) askAbout(hostId, w);
     }
   }
   if (keep.length > 0) waiters.set(hostId, keep);
   else waiters.delete(hostId);
 }
 
+function askAbout(hostId: string, w: Waiter): void {
+  if (w.asking || askOutcome === null) return;
+  w.asking = true;
+  void askOutcome(hostId, w.id).then(
+    (ended) => {
+      w.asking = false;
+      if (ended === "pending") return;
+      const list = waiters.get(hostId);
+      if (!list || !list.includes(w)) return;
+      const rest = list.filter((x) => x !== w);
+      if (rest.length > 0) waiters.set(hostId, rest);
+      else waiters.delete(hostId);
+      w.resolve(ended);
+    },
+    () => {
+      w.asking = false;
+    },
+  );
+}
+
 /**
  * For a change this device sent that was still waiting when it stopped asking: resolves
- * "done" once the machine's report has listed it open and then no longer does, or "failed"
- * when the report shows it refused or failed. Until then whatever the device shows for it
- * stays as it is.
+ * "failed" when the machine's report shows it refused or failed, and otherwise — once the
+ * report no longer lists it as open — with how the machine says it ended, asked by its id.
+ * Until then whatever the device shows for it stays as it is.
  */
 export function afterMachineSettles(hostId: number | string, requestId: string): Promise<"done" | "failed"> {
   const key = String(hostId);
   return new Promise((resolve) => {
-    const w: Waiter = { id: requestId, seenOpen: false, resolve };
+    const w: Waiter = { id: requestId, asking: false, resolve };
     waiters.set(key, [...(waiters.get(key) ?? []), w]);
     const now = byHost.get(key);
     if (now) settleWaiters(key, now);

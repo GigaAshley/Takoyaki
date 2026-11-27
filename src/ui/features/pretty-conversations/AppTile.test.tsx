@@ -90,6 +90,7 @@ vi.mock("../../state/app-tiles-store", () => ({
   clearPendingAppArchive: vi.fn(),
   setPendingAppTitle: vi.fn(),
   clearPendingAppTitle: vi.fn(),
+  hasAppTile: () => true,
 }));
 
 // Keep the real validateAppTitle (the prompt loop's gate); stub the request.

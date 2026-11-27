@@ -2068,19 +2068,30 @@ def _enumerate_changes(home, projects, app_records):
         if t == "app":
             a = apps.get(n)
             if a is None:
-                return None
+                # Not in the sidebar now (archived): its own card still says who can see it.
+                card = _read_json_file(os.path.join(home, "fleet", "apps-archive", n, "app.json"))
+                return _finish_audience(_intersect(None, card.get("users") if isinstance(card, dict) else None))
             audience = _intersect(None, a.get("users"))
             if a.get("owner"):
                 owner = audience_of({"type": "agent", "name": a["owner"]})
                 audience = _intersect(audience, owner)
             return _finish_audience(audience)
         if t == "role":
-            return _finish_audience(_intersect(None, (_read_role_cosmetics(n, home, role_memo) or {}).get("users")))
+            if os.path.isdir(os.path.join(home, "fleet", "roles", n)):
+                cos = _read_role_cosmetics(n, home, role_memo)
+            else:
+                # An archived role (being brought back): read it where it is.
+                cos, _r = _read_frontmatter_cosmetics(
+                    os.path.join(home, "fleet", "roles-archive", n, n + ".md"), ("users",))
+            return _finish_audience(_intersect(None, (cos or {}).get("users")))
         return None
 
-    out = []
+    # Open changes first, then stuck archives, then notices newest first: when there are
+    # more than CHANGES_CAP entries, the oldest notices are the ones left out.
+    open_entries, stuck_entries, notice_entries = [], [], []
 
-    def add(rid, req, state, at, extra=None):
+    def add(rid, req, state, at, extra=None, into=None):
+        into = open_entries if into is None else into
         kind = req.get("kind")
         args = req.get("args")
         if not isinstance(rid, str) or not CHANGE_ID_RE.match(rid) or kind in CHANGE_READ_ONLY:
@@ -2089,15 +2100,24 @@ def _enumerate_changes(home, projects, app_records):
             return
         by = req.get("by") if isinstance(req.get("by"), dict) else {}
         for target, to in _change_targets(kind, args):
-            if len(out) >= CHANGES_CAP:
+            if len(into) >= CHANGES_CAP:
                 return
+            audience = audience_of(target)
+            if kind == "project-create":
+                # A project not made yet: only whoever asked (on a machine several people
+                # share), else whoever can see the project it goes into.
+                asker, parent = args.get("asker"), args.get("parent")
+                if isinstance(asker, str) and asker:
+                    audience = [asker]
+                elif isinstance(parent, str) and PROJECT_SLUG_RE.match(parent):
+                    audience = _project_audience(projects, parent)
             entry = {
                 "id": rid,
                 "seq": req.get("seq") if isinstance(req.get("seq"), int) else None,
                 "kind": kind,
                 "state": state,
                 "target": target,
-                "audience": audience_of(target),
+                "audience": audience,
                 "at": at if isinstance(at, (int, float)) else None,
             }
             if to is not None:
@@ -2111,7 +2131,11 @@ def _enumerate_changes(home, projects, app_records):
                 entry["by_agent"] = by["agent"]
             if extra:
                 entry.update(extra)
-            out.append(entry)
+            card_project = (entry.get("card") or {}).get("project")
+            if card_project:
+                # Where an agent coming back lands is only named to who can see that project.
+                entry["card_audience"] = _project_audience(projects, card_project)
+            into.append(entry)
 
     for n in _json_names(os.path.join(root, "incoming")):
         req = _read_json_file(os.path.join(root, "incoming", n))
@@ -2139,15 +2163,18 @@ def _enumerate_changes(home, projects, app_records):
             "display_name": cos.get("displayName") or name,
             "project": cos.get("project") if isinstance(cos.get("project"), str) else None,
         }})
+    notices = []
     for n in _json_names(os.path.join(root, "notices")):
         notice = _read_json_file(os.path.join(root, "notices", n))
-        if not isinstance(notice, dict) or notice.get("state") not in ("refused", "failed", "unfiled"):
-            continue
+        if isinstance(notice, dict) and notice.get("state") in ("refused", "failed", "unfiled"):
+            notices.append(notice)
+    notices.sort(key=lambda x: x.get("at") if isinstance(x.get("at"), (int, float)) else 0, reverse=True)
+    for notice in notices:
         reason = notice.get("reason") if isinstance(notice.get("reason"), str) else ""
         extra = {"reason": reason[:500]}
         if isinstance(notice.get("code"), str):
             extra["code"] = notice["code"][:64]
-        add(notice.get("id"), notice, notice["state"], notice.get("at"), extra)
+        add(notice.get("id"), notice, notice["state"], notice.get("at"), extra, into=notice_entries)
 
     # Archives whose clean-up has been failing for 10 minutes or more.
     now = time.time()
@@ -2168,7 +2195,9 @@ def _enumerate_changes(home, projects, app_records):
             if not (isinstance(since, (int, float)) and now - since >= STUCK_AFTER_S and isinstance(err, str) and err):
                 continue
             add(c.get("id"), {"kind": kind, "args": {"name": name}, "by": c.get("asked_by")}, "stuck", since,
-                {"reason": err[:500]})
+                {"reason": err[:500]}, into=stuck_entries)
+
+    out = (open_entries + stuck_entries + notice_entries)[:CHANGES_CAP]
 
     return {
         "line_kind": "changes",
