@@ -2,7 +2,7 @@ import { archiveApp } from "../../api/apps-archive-api";
 import { encodeWorkspaceSpec, specForTab } from "../../lib/tab-url";
 import { renameApp, validateAppTitle } from "../../api/apps-rename-api";
 import { requestAppMove, type AppMoveDestination } from "../../api/apps-move-api";
-import { MachineChangeError, reasonSentence } from "../../api/machine-changes-api";
+import { MachineChangeError, reasonSentence, whenMachineDone } from "../../api/machine-changes-api";
 import { toast } from "sonner";
 import {
   publishAppGone,
@@ -12,6 +12,7 @@ import {
   clearPendingAppTitle,
   setPendingAppMove,
   clearPendingAppMove,
+  confirmPendingAppMove,
 } from "../../state/app-tiles-store";
 import type { RowKebabMenuItem, RowKebabSubmenuItem } from "./RowKebabMenu";
 import type { AppMoveProject } from "../apps/use-app-move-projects";
@@ -97,6 +98,12 @@ export async function moveApp(app: AppScopeTarget, dest: AppMoveDestination): Pr
       done: answer.done,
       requestId: answer.requestId,
     });
+    // Shown in its new place until the machine has finished it. Refused after this
+    // stopped asking → back where it is, with the reason on it.
+    const ended = await whenMachineDone(app.hostId, answer);
+    if (latestMove.get(key) !== mine) return;
+    if (ended === "failed") clearPendingAppMove(app.hostId, app.slug, previous);
+    else confirmPendingAppMove(app.hostId, app.slug);
   } catch (err) {
     // A later move of the same app owns where it's shown; this one only says it failed.
     if (latestMove.get(key) === mine) clearPendingAppMove(app.hostId, app.slug, previous);
@@ -260,9 +267,15 @@ export function buildAppMenuItems(
         onArchive?.(Number(app.hostId), app.slug, app.title);
         // A refusal or failure carries the machine's reason (MachineChangeError).
         try {
-          await archiveApp(Number(app.hostId), app.slug, () => {
+          const answer = await archiveApp(Number(app.hostId), app.slug, () => {
             toast(`Still archiving "${app.title}"`, { description: "The machine is still working on it." });
           });
+          // Still waiting its turn when this stopped asking: gone until the machine says.
+          // Refused after all → it comes back, with the reason on it.
+          if ((await whenMachineDone(app.hostId, answer)) === "failed") {
+            console.info({ operation: "app_archive_refused_later", hostId: Number(app.hostId), slug: app.slug });
+            clearPendingAppArchive(app.hostId, app.slug);
+          }
         } catch (err) {
           // Rollback: the next fleet-status pulse re-inserts the tile. Closed
           // panes are NOT re-opened — the alert lets the user do it by hand.

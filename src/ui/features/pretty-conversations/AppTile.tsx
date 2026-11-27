@@ -17,6 +17,8 @@ import { useMultiUserMachine } from "../sharing/AppShareWindow";
 // touch screen (row-touch-gestures.ts), the ⋮ on keyboard focus.
 import { RowKebabMenu, useRowKebabContextMenu, type RowKebabMenuItem } from "./RowKebabMenu";
 import { isCoarsePointer, useRowTouchGestures } from "./row-touch-gestures";
+import { useMachineMark } from "@/state/machine-changes-store";
+import { MachineChangeMark } from "@/features/machine-changes/MachineChangeMark";
 
 // ─── AppTile — Phase 119 Plan 03 (D-07..D-13) ───────────────────────────────
 // One tile in the sidebar's Apps section (119-04 integrates it into
@@ -199,6 +201,8 @@ export function AppTile({ app, onOpenApp, onArchive, variant = "desktop" }: AppT
   const menu = buildAppMenuItems(app, onArchive);
   const shareable = useMultiUserMachine(Number(app.hostId));
   const moveProjects = useAppMoveProjects(app.hostId);
+  // A move or archive of this app its machine hasn't finished (machine-changes-store).
+  const machineMark = useMachineMark(app.hostId, "app", app.slug);
   const kebabItems: RowKebabMenuItem[] = [
     // Desktop-only — a phone has no multi-window story.
     ...(isMobile
@@ -236,6 +240,7 @@ export function AppTile({ app, onOpenApp, onArchive, variant = "desktop" }: AppT
       onContextMenu={kebabContextMenu.onContextMenu}
       data-testid="pv-app-tile"
       data-app-key={`${app.hostId}:${app.slug}`}
+      data-machine-mark={machineMark?.kind}
     >
       <div className="pv-app-icon-slot">
         {showFallback ? (
@@ -252,6 +257,7 @@ export function AppTile({ app, onOpenApp, onArchive, variant = "desktop" }: AppT
       </div>
       <div className="pv-app-body">
         <span className="pv-app-title">{app.title}</span>
+        <MachineChangeMark mark={machineMark} hostId={app.hostId} thing={app.title} />
         {!app.isHealthy && app.healthMessage != null && (
           <span className="pv-app-unhealthy-message">{app.healthMessage}</span>
         )}

@@ -28,7 +28,6 @@ import {
   upsertFleetSession,
   markPendingArchive,
   clearPendingArchive,
-  PENDING_ARCHIVE_TTL_MS,
   updateHostsFlat,
   updateIdentitiesByKey,
   selectConversation,
@@ -1252,7 +1251,7 @@ describe("conversation-store: pending-archive filter", () => {
     ).toBe(true);
   });
 
-  it("pending-archive mark expires after PENDING_ARCHIVE_TTL_MS (supervisor-failure backstop)", () => {
+  it("pending-archive mark has no timer: an archive still waiting its turn stays hidden until the machine says", () => {
     vi.useFakeTimers();
     try {
       markPendingArchive(4, "stuck");
@@ -1261,7 +1260,12 @@ describe("conversation-store: pending-archive filter", () => {
       act(() => upsertFleetSession(row));
       expect(__getFleetOnlyRowsForTest().some((r) => r.id === "fleet::4::stuck")).toBe(false);
 
-      vi.advanceTimersByTime(PENDING_ARCHIVE_TTL_MS);
+      vi.advanceTimersByTime(60 * 60 * 1000);
+      act(() => upsertFleetSession(row));
+      expect(__getFleetOnlyRowsForTest().some((r) => r.id === "fleet::4::stuck")).toBe(false);
+
+      // The machine refused it: the rollback lets the row back.
+      clearPendingArchive(4, "stuck");
       act(() => upsertFleetSession(row));
       expect(__getFleetOnlyRowsForTest().some((r) => r.id === "fleet::4::stuck")).toBe(true);
     } finally {
@@ -2411,7 +2415,7 @@ describe("conversation-store (Phase 15): pinnedIds ↔ server persistence", () =
   it("30n2: hydratePinnedIdsFromServer during an in-flight pin keeps the pin (no flicker)", async () => {
     const spy = vi.mocked(UserPreferencesApi.setIdentityPinned);
     let resolveWrite: () => void = () => {};
-    spy.mockImplementationOnce(() => new Promise<void>((r) => { resolveWrite = r; }));
+    spy.mockImplementationOnce(() => new Promise((r) => { resolveWrite = () => r({ done: true, requestId: "w", result: {} }); }));
 
     act(() => pinConversation("fleet::1::tina"));
     // Identities-store hasn't seen the write yet → its projection lacks it.
@@ -2436,7 +2440,7 @@ describe("conversation-store (Phase 15): pinnedIds ↔ server persistence", () =
     const spy = vi.mocked(UserPreferencesApi.setIdentityPinned);
     spy.mockClear();
     let resolveFirst: () => void = () => {};
-    spy.mockImplementationOnce(() => new Promise<void>((r) => { resolveFirst = r; }));
+    spy.mockImplementationOnce(() => new Promise((r) => { resolveFirst = () => r({ done: true, requestId: "w", result: {} }); }));
     spy.mockResolvedValueOnce(undefined);
 
     act(() => pinConversation("fleet::1::tina"));
@@ -2459,7 +2463,7 @@ describe("conversation-store (Phase 15): pinnedIds ↔ server persistence", () =
   it("30n3: a superseded write's failure does not roll back the newer click", async () => {
     const spy = vi.mocked(UserPreferencesApi.setIdentityPinned);
     let rejectFirst: (e: Error) => void = () => {};
-    spy.mockImplementationOnce(() => new Promise<void>((_, rej) => { rejectFirst = rej; }));
+    spy.mockImplementationOnce(() => new Promise((_, rej) => { rejectFirst = rej; }));
     spy.mockResolvedValueOnce(undefined);
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 

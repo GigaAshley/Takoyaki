@@ -63,13 +63,22 @@ export async function listProjects(
  * carries it out, and the sidebar shows it when it lands).
  */
 async function projectChange<T>(hostId: number, url: string, body: Record<string, unknown>, operation: string): Promise<T> {
-  const answer = await inMachineOrder(hostId, () =>
+  const answer = await sendProjectChange<T>(hostId, url, body, operation);
+  if (!answer.done) throw new Error("the machine is still working on it; it'll show once it's done");
+  return answer.result.result;
+}
+
+function sendProjectChange<T>(
+  hostId: number,
+  url: string,
+  body: Record<string, unknown>,
+  operation: string,
+): Promise<MachineChangeAnswer<{ result: T }>> {
+  return inMachineOrder(hostId, () =>
     sendMachineChange<{ result: T }>(hostId, { method: "post", url, body: { hostId, ...body } }, operation, {
       followUp: "resend",
     }),
   );
-  if (!answer.done) throw new Error("the machine is still working on it; it'll show once it's done");
-  return answer.result.result;
 }
 
 export async function createProject(
@@ -184,13 +193,17 @@ export function getArchivePreflight(
  * POST /projects/:slug/parent  body { hostId, parent }  →  { ok: true }
  * 400 = parent not found, 409 = parent is the project itself or inside it.
  */
-export async function setProjectParent(
+/**
+ * Move a project (under `parent`, or to the top level). Resolves with the machine's answer;
+ * `done: false` = still waiting its turn (whenMachineDone says how it ends). Refusals throw
+ * MachineChangeError with the machine's reason.
+ */
+export function setProjectParent(
   hostId: number,
   slug: string,
   parent: string | null,
-): Promise<{ ok: true }> {
-  await projectChange(hostId, `/projects/${encodeURIComponent(slug)}/parent`, { parent }, "move project");
-  return { ok: true };
+): Promise<MachineChangeAnswer<unknown>> {
+  return sendProjectChange(hostId, `/projects/${encodeURIComponent(slug)}/parent`, { parent }, "move project");
 }
 
 /**

@@ -1277,3 +1277,78 @@
   opacity: 0.45;
   filter: grayscale(1);
 }
+
+/* A change its machine hasn't finished, or one of this person's that didn't happen
+   (machine-changes-store): a quiet mark at the row's end. A waiting archive greys the
+   row the way a machine that's down does. */
+.pv-machine-mark {
+  flex: none;
+  max-width: 45%;
+  margin-left: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--k-t2);
+  position: relative;
+  z-index: 1;
+}
+.pv-machine-mark--failed {
+  padding: 0 7px;
+  border: none;
+  border-radius: 999px;
+  background: rgba(229, 72, 77, 0.2);
+  color: #f2a7a9;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+}
+.pv-machine-mark--failed:hover,
+.pv-machine-mark--failed:focus-visible {
+  background: rgba(229, 72, 77, 0.32);
+  outline: none;
+}
+[data-machine-mark="archiving"] .pv-body,
+[data-machine-mark="archiving"] .pv-avatar {
+  opacity: 0.45;
+  filter: grayscale(1);
+}
+.pv-project-section[data-machine-mark="archiving"] {
+  opacity: 0.45;
+  filter: grayscale(1);
+}
+.pv-project-head .pv-machine-mark {
+  margin-left: 8px;
+}
+.pv-app-tile[data-machine-mark="archiving"] .pv-app-icon-slot,
+.pv-app-tile[data-machine-mark="archiving"] .pv-app-title,
+[data-testid="pv-project-app-row"][data-machine-mark="archiving"] .pv-body {
+  opacity: 0.45;
+  filter: grayscale(1);
+}
+.pv-app-body .pv-machine-mark {
+  margin-left: 0;
+  max-width: 100%;
+  font-size: 10px;
+}
+.pv-app-tile[data-machine-mark="archiving"] .pv-app-icon-slot,
+.pv-app-tile[data-machine-mark="archiving"] .pv-app-title,
+[data-testid="pv-project-app-row"][data-machine-mark="archiving"] .pv-body {
+  opacity: 0.45;
+  filter: grayscale(1);
+}
+.pv-app-body .pv-machine-mark {
+  margin-left: 0;
+  max-width: 100%;
+  font-size: 10px;
+}
+/* An agent on its way back from the archive (ComingBackRows): greyed until it's back. */
+.pv-row--coming-back .pv-body,
+.pv-row--coming-back .pv-avatar {
+  opacity: 0.45;
+  filter: grayscale(1);
+}
+.pv-row--coming-back {
+  cursor: default;
+}

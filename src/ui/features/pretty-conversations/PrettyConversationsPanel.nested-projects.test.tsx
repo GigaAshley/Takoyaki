@@ -247,6 +247,22 @@ vi.mock("@/state/conversation-store", () => ({
   getProjectsSnapshot: () => mockProjects,
   mergeProjectsForHost: (hostId: string, rows: unknown) =>
     mergeProjectsForHostSpy(hostId, rows),
+  // The move hold, as the store does it: the new place at once, the old one back on a refusal.
+  startProjectMoveIntent: (hostId: string, slug: string, parent: string | null) => {
+    mergeProjectsForHostSpy(
+      hostId,
+      mockProjects.filter((p) => p.hostId === hostId).map((p) => (p.slug === slug ? { ...p, parent } : p)),
+    );
+    return 1;
+  },
+  settleProjectMoveIntent: (hostId: string, slug: string, _seq: number, outcome: { done: boolean; previous?: string | null }) => {
+    if ("previous" in outcome) {
+      mergeProjectsForHostSpy(
+        hostId,
+        mockProjects.filter((p) => p.hostId === hostId).map((p) => (p.slug === slug ? { ...p, parent: outcome.previous } : p)),
+      );
+    }
+  },
   selectConversation: (id: string | null) => selectConversationSpy(id),
   pinConversation: (id: string) => pinConversationSpy(id),
   unpinConversation: (id: string) => unpinConversationSpy(id),

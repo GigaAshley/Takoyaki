@@ -22,6 +22,8 @@
 
 export const FRAME_SCHEMA_VERSION = 1 as const;
 
+import type { MachineChange } from "@/state/machine-changes-store";
+
 // ---------------------------------------------------------------------------
 // BackgroundTask — mirrors Stop hook background_tasks[] entry
 // ---------------------------------------------------------------------------
@@ -525,6 +527,16 @@ export interface FrontendRelayRoomPlacementChangedFrame {
   pinned: boolean;
 }
 
+// machine-changes — one machine's open changes (its front door), already cut down to what
+// this person can see. Mirrors wire-protocol.ts FrontendMachineChangesFrameSchema; the
+// entries are machine-changes-store's MachineChange.
+export interface FrontendMachineChangesFrame {
+  schemaVersion: typeof FRAME_SCHEMA_VERSION;
+  type: "machine-changes";
+  hostId: string;
+  changes: MachineChange[];
+}
+
 export type FrontendOutboundFrame =
   | FrontendSnapshotFrame
   | FrontendUpdateFrame
@@ -541,4 +553,5 @@ export type FrontendOutboundFrame =
   | FrontendRelayRoomPlacementChangedFrame
   | FrontendAppSnapshotFrame
   | FrontendAppUpdateFrame
-  | FrontendAppGoneFrame;
+  | FrontendAppGoneFrame
+  | FrontendMachineChangesFrame;

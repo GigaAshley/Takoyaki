@@ -9,6 +9,7 @@ import {
   publishAppUpdate,
   useAppTiles,
   setPendingAppMove,
+  confirmPendingAppMove,
   clearPendingAppMove,
   readAppTilesCache,
   __resetForTest,
@@ -61,12 +62,21 @@ describe("pending app moves", () => {
     expect(result.current[0].owner).toBe("alpha");
   });
 
-  it("a move the machine never carries out lets go after five minutes", () => {
+  it("a move still waiting its turn holds however long it takes — no timer", () => {
     vi.useFakeTimers();
     publishAppSnapshot([app]);
     const { result } = renderHook(() => useAppTiles());
     act(() => setPendingAppMove("1", "beds", "garden"));
-    vi.advanceTimersByTime(301_000);
+    vi.advanceTimersByTime(60 * 60 * 1000);
+    act(() => publishAppSnapshot([{ ...app, title: "Beds" }]));
+    expect(result.current[0]).toMatchObject({ owner: null, project: "garden" });
+  });
+
+  it("once the machine has finished it, the next report is the truth", () => {
+    publishAppSnapshot([app]);
+    const { result } = renderHook(() => useAppTiles());
+    act(() => setPendingAppMove("1", "beds", "garden"));
+    act(() => confirmPendingAppMove("1", "beds"));
     act(() => publishAppSnapshot([{ ...app, title: "Beds" }]));
     expect(result.current[0]).toMatchObject({ owner: "alpha", project: null });
   });

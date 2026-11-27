@@ -32,7 +32,6 @@ import {
   readAppTilesCache,
   markPendingAppArchive,
   clearPendingAppArchive,
-  PENDING_APP_ARCHIVE_TTL_MS,
   setPendingAppTitle,
   clearPendingAppTitle,
   __resetForTest,
@@ -765,7 +764,7 @@ describe("app-tiles-store: pending-archive filter", () => {
     expect(result.current.map((a) => a.slug).sort()).toEqual(["keeper", "restored"]);
   });
 
-  it("pending-archive mark expires after PENDING_APP_ARCHIVE_TTL_MS (supervisor-failure backstop)", () => {
+  it("pending-archive mark has no timer: it holds until the machine refuses it", () => {
     vi.useFakeTimers();
     try {
       const { result, rerender } = renderHook(() => useAppTiles());
@@ -777,7 +776,14 @@ describe("app-tiles-store: pending-archive filter", () => {
       rerender();
       expect(result.current).toHaveLength(0);
 
-      vi.advanceTimersByTime(PENDING_APP_ARCHIVE_TTL_MS);
+      vi.advanceTimersByTime(60 * 60 * 1000);
+      act(() => {
+        publishAppUpdate(makeApp({ hostId: "5", slug: "stuck", title: "Stuck" }));
+      });
+      rerender();
+      expect(result.current).toHaveLength(0);
+
+      clearPendingAppArchive("5", "stuck");
       act(() => {
         publishAppUpdate(makeApp({ hostId: "5", slug: "stuck", title: "Stuck" }));
       });

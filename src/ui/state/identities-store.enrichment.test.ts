@@ -632,8 +632,8 @@ describe("Pin/hide remount-cycle regression (fern 2026-09-13)", () => {
     pinConversation(rowId);
     // Let the fire-and-forget PUT .then() microtask run so patchIdentityFlag
     // executes before we simulate the remount.
-    await Promise.resolve();
-    await Promise.resolve();
+    // (the write's answer, then how the machine says it ended)
+    await new Promise((r) => setTimeout(r, 0));
 
     // Simulate the panel's remount hydrate cycle: derive from the identities-
     // store (should NOW include tina), then hydrate the conversation-store.
@@ -652,8 +652,8 @@ describe("Pin/hide remount-cycle regression (fern 2026-09-13)", () => {
     hydratePinnedIdsFromServer(["fleet::1::tina"]);
 
     unpinConversation("fleet::1::tina");
-    await Promise.resolve();
-    await Promise.resolve();
+    // (the write's answer, then how the machine says it ended)
+    await new Promise((r) => setTimeout(r, 0));
 
     const identityHosts = buildIdentityHostsFromFleet([makeSession(1, "tina")]);
     expect(deriveDiskPinnedIds(identityHosts)).toEqual([]);

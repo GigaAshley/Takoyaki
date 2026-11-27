@@ -1,5 +1,6 @@
 import axios from "axios";
 import { authApi, handleApiError } from "@/main-axios";
+import { afterMachineSettles } from "@/state/machine-changes-store";
 
 // ─── Changes sent to a machine's front door ──────────────────────────────────
 //
@@ -124,4 +125,36 @@ export function reasonSentence(reason: string): string {
   if (!s) return s;
   const first = s[0] === '"' ? s : s[0].toUpperCase() + s.slice(1);
   return /[.!?]$/.test(first) ? first : `${first}.`;
+}
+
+/**
+ * This person has had one of a machine's notices (a refusal, failure or stuck archive):
+ * dismissed from a row, or claimed by this device before showing it as a pop-up. Resolves
+ * true for the first claim — false when one of their devices already had it.
+ * Key: the request id, or `<id>:stuck`.
+ */
+export async function markNoticeSeen(hostId: number | string, key: string): Promise<boolean> {
+  try {
+    const response = await authApi.post(
+      `/machine-changes/${encodeURIComponent(String(hostId))}/${encodeURIComponent(key)}/seen`,
+      {},
+    );
+    return (response.data as { first?: unknown }).first === true;
+  } catch (error) {
+    handleApiError(error, "dismiss the notice");
+  }
+}
+
+/**
+ * How a change sent from this device ended: at once when its answer came back done, or —
+ * when the device stopped asking while it still waited its turn — once the machine's
+ * status report says it's finished ("done") or that it didn't happen ("failed"; the
+ * person is told on the row, with why). Whatever the device shows for the change stays
+ * until then.
+ */
+export function whenMachineDone(
+  hostId: number | string,
+  answer: MachineChangeAnswer<unknown>,
+): Promise<"done" | "failed"> {
+  return !answer || answer.done ? Promise.resolve("done") : afterMachineSettles(hostId, answer.requestId);
 }

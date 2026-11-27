@@ -66,6 +66,8 @@ import {
 } from "@/shell/badge-drag";
 
 import { isCoarsePointer } from "./row-touch-gestures";
+import { useMachineMark } from "@/state/machine-changes-store";
+import { MachineChangeMark } from "@/features/machine-changes/MachineChangeMark";
 import { droppedApp, endAppDrag, getDraggedApp, hasAppMime, type DraggedApp } from "./app-drag";
 import {
   RowKebabMenu,
@@ -211,6 +213,9 @@ export function PrettyProjectSectionHeader({
   onDropApp,
 }: PrettyProjectSectionHeaderProps) {
   const [isDragOver, setIsDragOver] = useState(false);
+  // A move, rename-failure or archive of this project its machine hasn't finished
+  // (machine-changes-store).
+  const machineMark = useMachineMark(hostId, "project", slug);
 
   // Exclusive-claim + session-end sweep (drag-preview-session.ts). Covers
   // Escape-cancel (no dragleave fires) and the lost dragend when dropping a
@@ -423,6 +428,7 @@ export function PrettyProjectSectionHeader({
       data-testid={`pv-project-section-${slug}`}
       data-project-slug={slug}
       className="pv-panel-group pv-project-section relative"
+      data-machine-mark={machineMark?.kind}
       style={{ isolation: "isolate" }}
       onDragOver={onDragOver}
       onDragLeave={onDragLeave}
@@ -480,6 +486,7 @@ export function PrettyProjectSectionHeader({
         <span className="pv-section-label">
           {displayName}
         </span>
+        <MachineChangeMark mark={machineMark} hostId={hostId} thing={displayName} />
         {collapsed && hasDm ? (
           <span
             className="pv-section-dm-mark"

@@ -83,6 +83,7 @@ afterEach(() => {
 });
 
 // ---------------------------------------------------------------------------
+import { getMachineChanges } from "@/state/machine-changes-store";
 // Import AFTER injecting the mock so the module picks up MockWebSocket
 // ---------------------------------------------------------------------------
 
@@ -205,6 +206,17 @@ describe("fleet-status-client: Test 4 — gone frame → onGone", () => {
     // so onGone sees undefined (frontend treats undefined as pid_stale-safe:
     // sidebar row cleans up but open tabs stay open).
     expect(onGone).toHaveBeenCalledWith("h1", "s1", "sid1", undefined);
+  });
+
+  it("a machine-changes frame becomes that machine's list in the store; a malformed one is dropped", () => {
+    createFleetStatusClient({ url: "ws://localhost/fleet-status/ws", onSnapshot: vi.fn(), onUpdate: vi.fn(), onGone: vi.fn() });
+    const ws = latestWs();
+    ws.onopen?.();
+    const entry = { id: "r1", kind: "agent-pin", state: "waiting", target: { type: "agent", name: "finch" }, at: 1, mine: true };
+    ws.onmessage?.({ data: JSON.stringify({ schemaVersion: FRAME_SCHEMA_VERSION, type: "machine-changes", hostId: "h9", changes: [entry] }) });
+    expect(getMachineChanges().get("h9")).toEqual([entry]);
+    ws.onmessage?.({ data: JSON.stringify({ schemaVersion: FRAME_SCHEMA_VERSION, type: "machine-changes", hostId: "h9", changes: "nope" }) });
+    expect(getMachineChanges().get("h9")).toEqual([entry]);
   });
 
   it("propagates the `reason` discriminator when the frame carries it", () => {

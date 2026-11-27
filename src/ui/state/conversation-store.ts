@@ -50,7 +50,7 @@
 import { useSyncExternalStore } from "react";
 import type { Host, HostFolder, Tab, TabType } from "@/types/ui-types";
 import { setIdentityPinned } from "@/api/user-preferences-api";
-import { MachineChangeError, reasonSentence } from "@/api/machine-changes-api";
+import { MachineChangeError, reasonSentence, whenMachineDone, type MachineChangeAnswer } from "@/api/machine-changes-api";
 import type { Identity } from "@/api/identities-api";
 import type { RelayRoomFace } from "@/api/sessions-api";
 import { sessionMatchKey } from "@/features/terminal/session-hue";
@@ -613,15 +613,13 @@ const listeners = new Set<() => void>();
 //
 // Lifecycle — the mark must not outlive the archive, or a later un-archive /
 // same-name re-birth stays invisible in this tab until reload:
-//   - cleared on archive-failure rollback (clearPendingArchive)
-//   - cleared when the supervisor's retire lands (`identity_gone` frame,
-//     AppShell onGone)
+//   - cleared on archive-failure rollback (clearPendingArchive) — including a
+//     refusal the machine reports after this device stopped asking
+//     (whenMachineDone)
+//   - cleared when the claim lands (`identity_gone` frame, AppShell onGone)
 //   - cleared when an un-archive of the same identity succeeds
-//   - expires after PENDING_ARCHIVE_TTL_MS as a backstop (supervisor retire
-//     failing and retrying forever would otherwise hide a live identity)
-// Value = expiry epoch-ms. Module-scope, in-memory only.
-export const PENDING_ARCHIVE_TTL_MS = 2 * 60 * 1000;
-const pendingArchiveKeys = new Map<string, number>();
+// No timer: whether it happened is the machine's say.
+const pendingArchiveKeys = new Set<string>();
 
 function pendingArchiveKey(hostId: number, sessionName: string): string {
   // Case-folded: the mark is set from a row's tmux session name but cleared
@@ -630,28 +628,11 @@ function pendingArchiveKey(hostId: number, sessionName: string): string {
 }
 
 function isPendingArchive(hostId: number, sessionName: string): boolean {
-  if (pendingArchiveKeys.size === 0) return false;
-  const key = pendingArchiveKey(hostId, sessionName);
-  const expiresAt = pendingArchiveKeys.get(key);
-  if (expiresAt === undefined) return false;
-  if (Date.now() >= expiresAt) {
-    pendingArchiveKeys.delete(key);
-    console.warn({
-      operation: "pending_archive_expired",
-      hostId,
-      sessionName,
-      ttlMs: PENDING_ARCHIVE_TTL_MS,
-    });
-    return false;
-  }
-  return true;
+  return pendingArchiveKeys.size > 0 && pendingArchiveKeys.has(pendingArchiveKey(hostId, sessionName));
 }
 
 export function markPendingArchive(hostId: number, sessionName: string): void {
-  pendingArchiveKeys.set(
-    pendingArchiveKey(hostId, sessionName),
-    Date.now() + PENDING_ARCHIVE_TTL_MS,
-  );
+  pendingArchiveKeys.add(pendingArchiveKey(hostId, sessionName));
 }
 
 export function clearPendingArchive(hostId: number, sessionName: string): void {
@@ -2985,7 +2966,7 @@ function syncIdentityFlagAfterWrite(
 // superseded settle (pin then quick unpin) a no-op.
 const pendingPinIntents = new Map<string, { pinned: boolean; seq: number }>();
 // Per-row tail of the pin write chain (see writePin).
-const pinWriteChains = new Map<string, Promise<void>>();
+const pinWriteChains = new Map<string, Promise<MachineChangeAnswer<unknown>>>();
 let pinIntentSeq = 0;
 
 // Resolve a pin row id to the identity it targets. Fleet-synthetic ids carry
@@ -3039,7 +3020,17 @@ function writePin(id: string, pinned: boolean): void {
     if (pinWriteChains.get(id) === write) pinWriteChains.delete(id);
   }).catch(() => {});
   write
-    .then(() => {
+    // Still waiting its turn when this stopped asking: the pin shown holds until the
+    // machine has finished it.
+    .then((answer) => whenMachineDone(target.hostId, answer))
+    .then((ended) => {
+      if (ended === "failed") {
+        // Refused after all: back as it was — the machine's reason is on the row.
+        console.info({ operation: "pin_refused_later", id, pinned });
+        if (pendingPinIntents.get(id)?.seq === seq) setPinnedLocal(id, !pinned);
+        refreshIdentities().catch(() => {});
+        return;
+      }
       // Mirror into identities-store so a panel remount / re-derive agrees
       // with the write (mobile list→session→list unmount — fern 2026-09-13).
       syncIdentityFlagAfterWrite(id, "pinned", pinned);
@@ -3243,8 +3234,9 @@ export function useProjects(): readonly ProjectRow[] {
  */
 export function mergeProjectsForHost(
   hostId: string,
-  rows: readonly ProjectRow[],
+  incoming: readonly ProjectRow[],
 ): void {
+  const rows = withProjectMoveIntents(hostId, incoming);
   const cur = state.projects;
   const currentForHost = cur.filter((p) => p.hostId === hostId);
   if (currentForHost.length === rows.length) {
@@ -3270,6 +3262,58 @@ export function mergeProjectsForHost(
   state = { ...state, projects: [...preserved, ...rows] };
   persistProjectsSlice();
   notify();
+}
+
+// ─── A project move this device sent, until its machine has finished it ──────
+//
+// Move to shows a project in its new place at once. While the machine has the move
+// waiting its turn, every report of the old place is shown with the new one instead; a
+// report that agrees ends the hold, and so does the machine finishing or refusing the move
+// (settleProjectMoveIntent). No timer.
+const projectMoveIntents = new Map<string, { parent: string | null; seq: number }>();
+let projectMoveSeq = 0;
+
+function withProjectMoveIntents(hostId: string, rows: readonly ProjectRow[]): readonly ProjectRow[] {
+  if (projectMoveIntents.size === 0) return rows;
+  return rows.map((p) => {
+    const k = `${hostId}::${p.slug}`;
+    const intent = projectMoveIntents.get(k);
+    if (intent === undefined) return p;
+    if ((p.parent ?? null) === intent.parent) {
+      projectMoveIntents.delete(k);
+      return p;
+    }
+    return { ...p, parent: intent.parent };
+  });
+}
+
+/** Show project `slug` under `parent` now, ahead of its machine. Returns the hold's handle. */
+export function startProjectMoveIntent(hostId: string, slug: string, parent: string | null): number {
+  const seq = ++projectMoveSeq;
+  projectMoveIntents.set(`${hostId}::${slug}`, { parent, seq });
+  mergeProjectsForHost(hostId, state.projects.filter((p) => p.hostId === hostId));
+  return seq;
+}
+
+/**
+ * The machine has finished the move (`done`) or it didn't happen (`previous`: put the
+ * project back under it). A newer move of the same project owns the hold.
+ */
+export function settleProjectMoveIntent(
+  hostId: string,
+  slug: string,
+  seq: number,
+  outcome: { done: true } | { done: false; previous: string | null },
+): void {
+  const k = `${hostId}::${slug}`;
+  if (projectMoveIntents.get(k)?.seq !== seq) return;
+  projectMoveIntents.delete(k);
+  if ("previous" in outcome) {
+    mergeProjectsForHost(
+      hostId,
+      state.projects.filter((p) => p.hostId === hostId).map((p) => (p.slug === slug ? { ...p, parent: outcome.previous } : p)),
+    );
+  }
 }
 
 /**

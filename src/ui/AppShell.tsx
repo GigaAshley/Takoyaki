@@ -28,6 +28,7 @@ import { useKeyboardCloseTab } from "@/hooks/use-keyboard-close-tab";
 //     renders post-auth) rather than in src/main.tsx alongside branding.
 import { useKeyboardTriggerFeedbackDev } from "@/hooks/use-keyboard-trigger-feedback-dev";
 import { FeedbackModal } from "@/feedback/FeedbackModal";
+import { MachineNoticePopups } from "@/features/machine-changes/MachineNoticePopups";
 import { postFeedback } from "@/feedback/feedback-api";
 import { fetchFeedbackConfig } from "@/feedback/feedback-fetch";
 // Phase 11 Plan 03 (PURGE-02, PURGE-03): AppRail + RailView + 10 sidebar-panel
@@ -5728,6 +5729,9 @@ export function AppShell({
         </div>
       </div>
 
+      {/* Machine notices with no row to mark (a project never made, an agent that
+          didn't come back, a stuck archive), as one-time pop-ups. */}
+      <MachineNoticePopups />
       {/* Phase 121 Plan 04: FeedbackModal + dev-chord + fire-and-forget POST.
           Mounted UNCONDITIONALLY — even when useFeedbackEnabled() is false —
           so the dev chord (Ctrl+Alt+F / Ctrl+Alt+T) can still exercise the

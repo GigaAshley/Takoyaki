@@ -750,6 +750,68 @@ export function setIdentityProject(
   hostId: number,
   project: string | null,
 ): void {
+  if (projectIntentBlocks(hostId, identityKey, project)) return;
+  writeIdentityProject(identityKey, hostId, project);
+}
+
+// ─── A Move to this device sent, until its machine has finished it ───────────
+//
+// Move to shows the agent in its new project at once. The machine may still have it
+// waiting its turn, and until it's done every report of the old place would put the row
+// back — so reports that disagree are held off while the move is open. A report that
+// agrees ends the hold; so does the machine finishing or refusing the move
+// (settleIdentityProjectIntent). No timer.
+const projectIntents = new Map<string, { project: string | null; seq: number }>();
+let projectIntentSeq = 0;
+const intentKey = (hostId: number, identityKey: string) => `${hostId}::${identityKey.toLowerCase()}`;
+
+function projectIntentBlocks(hostId: number, identityKey: string, project: string | null): boolean {
+  if (projectIntents.size === 0) return false;
+  const k = intentKey(hostId, identityKey);
+  const intent = projectIntents.get(k);
+  if (intent === undefined) return false;
+  if (intent.project === project) {
+    projectIntents.delete(k);
+    return false;
+  }
+  return true;
+}
+
+/** The identities as they stand now (outside React). */
+export function getIdentitiesSnapshot(): readonly Identity[] {
+  return state.identities;
+}
+
+/** Show an agent in `project` now, ahead of its machine. Returns the hold's handle. */
+export function startIdentityProjectIntent(identityKey: string, hostId: number, project: string | null): number {
+  const seq = ++projectIntentSeq;
+  projectIntents.set(intentKey(hostId, identityKey), { project, seq });
+  writeIdentityProject(identityKey, hostId, project);
+  return seq;
+}
+
+/**
+ * The machine has finished the move (`done`: the place shown is now the truth) or it
+ * didn't happen (`previous`: put the row back where it is). A newer move of the same
+ * agent owns the hold; this one then does nothing.
+ */
+export function settleIdentityProjectIntent(
+  identityKey: string,
+  hostId: number,
+  seq: number,
+  outcome: { done: true } | { done: false; previous: string | null },
+): void {
+  const k = intentKey(hostId, identityKey);
+  if (projectIntents.get(k)?.seq !== seq) return;
+  projectIntents.delete(k);
+  if ("previous" in outcome) writeIdentityProject(identityKey, hostId, outcome.previous);
+}
+
+function writeIdentityProject(
+  identityKey: string,
+  hostId: number,
+  project: string | null,
+): void {
   const keyLc = identityKey.toLowerCase();
   let changed = false;
   const nextList = state.identities.map((i) => {
@@ -1053,7 +1115,8 @@ export function mergeIdentityAppearance(
   // DO write on string→null transitions (the "clear project" gesture on
   // the frontend must round-trip through this path). Only skip on
   // undefined (older publisher not emitting the field yet).
-  if (appearance.project !== undefined) {
+  // A Move to this device sent that the machine hasn't finished keeps its place.
+  if (appearance.project !== undefined && !projectIntentBlocks(hostId, identityKey, appearance.project)) {
     if (next.project !== appearance.project) {
       next.project = appearance.project;
       changed = true;

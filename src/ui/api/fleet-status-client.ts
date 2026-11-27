@@ -57,6 +57,7 @@ import {
 import { applyRemoteDm, applyRemoteRoom, applyRemoteSeen, loadReadState, publishLastFinishAt } from "@/state/attention-store";
 import { handleAgentNotified, handleRoomNotified } from "@/features/notifications/browser-notifications";
 import { applyRoomPlacement } from "@/state/conversation-store";
+import { setMachineChanges } from "@/state/machine-changes-store";
 
 // ---------------------------------------------------------------------------
 // Constants — mirror patch #148 backoff schedule verbatim
@@ -488,6 +489,15 @@ export function createFleetStatusClient(
         case "relay-rooms-changed":
           console.info({ operation: "fleet_status_client_relay_rooms_changed", url });
           onRelayRoomsChanged?.();
+          break;
+        case "machine-changes":
+          // One machine's open changes (its front door), cut down by the server to what
+          // this person can see. The store keeps one list per machine.
+          if (typeof parsed.hostId !== "string" || !Array.isArray(parsed.changes)) {
+            console.warn({ operation: "fleet_status_client_machine_changes_malformed", url });
+            break;
+          }
+          setMachineChanges(parsed.hostId, parsed.changes);
           break;
         case "session-project-changed":
           // Per-identity delta from backend session-project-write. The frame

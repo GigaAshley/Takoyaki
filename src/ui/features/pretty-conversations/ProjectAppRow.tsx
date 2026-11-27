@@ -22,6 +22,8 @@ import { useAppMoveProjects } from "../apps/use-app-move-projects";
 import { endAppDrag, startAppDrag } from "./app-drag";
 import { RowKebabMenu, useRowKebabContextMenu, type RowKebabMenuItem } from "./RowKebabMenu";
 import { isCoarsePointer, useRowTouchGestures } from "./row-touch-gestures";
+import { useMachineMark } from "@/state/machine-changes-store";
+import { MachineChangeMark } from "@/features/machine-changes/MachineChangeMark";
 
 export interface ProjectAppRowProps {
   app: AppState;
@@ -35,6 +37,8 @@ export function ProjectAppRow({ app, onOpenApp, variant }: ProjectAppRowProps): 
   const iconUrl = appIconUrl(app.hostId, app.slug, app.iconVersion);
   useEffect(() => setImgFailed(false), [iconUrl]);
   const moveProjects = useAppMoveProjects(app.hostId);
+  // A move or archive of this app its machine hasn't finished (machine-changes-store).
+  const machineMark = useMachineMark(app.hostId, "app", app.slug);
 
   const open = useCallback(() => {
     onOpenApp?.(Number(app.hostId), app.slug, app.title);
@@ -64,7 +68,12 @@ export function ProjectAppRow({ app, onOpenApp, variant }: ProjectAppRowProps): 
   const touch = useRowTouchGestures({ onHold: kebabContextMenu.openAt });
 
   return (
-    <div className="relative" data-testid="pv-project-app-row" data-app-key={`${app.hostId}:${app.slug}`}>
+    <div
+      className="relative"
+      data-testid="pv-project-app-row"
+      data-app-key={`${app.hostId}:${app.slug}`}
+      data-machine-mark={machineMark?.kind}
+    >
       <div
         role="button"
         tabIndex={0}
@@ -109,6 +118,7 @@ export function ProjectAppRow({ app, onOpenApp, variant }: ProjectAppRowProps): 
           </span>
           <span className="pv-ai-title">{app.description || " "}</span>
         </div>
+        <MachineChangeMark mark={machineMark} hostId={app.hostId} thing={app.title} />
         <div className="pv-row-kebab-slot">
           <RowKebabMenu ariaLabel={`${app.title} menu`} testId="pv-project-app-kebab-trigger" items={items} />
           {kebabContextMenu.menu}

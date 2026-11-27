@@ -1,5 +1,5 @@
 import { authApi, handleApiError } from "@/main-axios";
-import { inMachineOrder, sendMachineChange } from "@/api/machine-changes-api";
+import { inMachineOrder, sendMachineChange, type MachineChangeAnswer } from "@/api/machine-changes-api";
 
 // Phase 15 (Wave 2) → Phase 92 Plan 04 (D-04) —
 // thin wrapper around PUT /user-preferences for the pinned slice.
@@ -53,8 +53,8 @@ export async function setIdentityPinned(
   identityKey: string,
   hostId: number,
   pinned: boolean,
-): Promise<void> {
-  await inMachineOrder(hostId, () =>
+): Promise<MachineChangeAnswer<unknown>> {
+  return inMachineOrder(hostId, () =>
     sendMachineChange(
       hostId,
       { method: "put", url: `/identities/${encodeURIComponent(identityKey)}/pinned`, body: { hostId, pinned } },

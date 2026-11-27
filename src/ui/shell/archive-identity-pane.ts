@@ -7,7 +7,7 @@
 // them — so it can name the ones that would stop (archive-wakeup-check.ts).
 
 import { announceAgentArchived } from "@/features/archived-view/archived-identity";
-import { applyIdentityChange } from "@/state/identities-store";
+import { applyIdentityChange, refreshIdentities } from "@/state/identities-store";
 import {
   markPendingArchive,
   clearPendingArchive,
@@ -15,7 +15,7 @@ import {
 } from "@/state/conversation-store";
 import { toast } from "sonner";
 import { archiveIdentity } from "@/api/identity-archive-api";
-import { MachineChangeError, reasonSentence } from "@/api/machine-changes-api";
+import { MachineChangeError, reasonSentence, whenMachineDone } from "@/api/machine-changes-api";
 import { kitAlert, kitConfirm } from "@/components/kit";
 import {
   ARCHIVE_AGENT_BODY,
@@ -69,9 +69,17 @@ async function confirmThenArchive(args: {
   applyIdentityChange(null, identityKey, hostId);
   void (async () => {
     try {
-      await archiveIdentity(hostId, identityKey, () => {
+      const answer = await archiveIdentity(hostId, identityKey, () => {
         toast(`Still archiving "${label}"`, { description: "The machine is still working on it." });
       });
+      // Still waiting its turn when this stopped asking: gone until the machine says.
+      // Refused after all → it comes back with the reason on its row.
+      if ((await whenMachineDone(hostId, answer)) === "failed") {
+        console.info({ operation: "identity_archive_refused_later", hostId, identityKey });
+        clearPendingArchive(hostId, identityKey);
+        refreshIdentities({ [identityKey]: hostId }).catch(() => {});
+        return;
+      }
       // Archived: every other open copy in this window closes too.
       announceAgentArchived(hostId, identityKey);
     } catch (err) {

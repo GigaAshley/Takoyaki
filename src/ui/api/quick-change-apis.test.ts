@@ -13,6 +13,14 @@ vi.mock("@/main-axios", () => ({
 }));
 
 import { authApi } from "@/main-axios";
+import { applyIdentityChange, getIdentitiesSnapshot, setIdentityProject } from "@/state/identities-store";
+import { setMachineChanges } from "@/state/machine-changes-store";
+import type { Identity } from "@/api/identities-api";
+
+async function seedIdentity(over: Partial<Identity> & { identityKey: string; hostId: number }): Promise<void> {
+  applyIdentityChange({ displayName: over.identityKey, pinned: false, roles: [], ...over } as Identity);
+}
+const projectOf = (key: string) => getIdentitiesSnapshot().find((i) => i.identityKey === key)?.project ?? null;
 import { setIdentityPinned } from "@/api/user-preferences-api";
 import { setSessionProject } from "@/api/session-project-api";
 import { createProject, renameProject, setProjectParent } from "@/api/project-list-api";
@@ -60,6 +68,28 @@ describe("setSessionProject", () => {
     await expect(setSessionProject(42, "wren", "garden")).rejects.toMatchObject({ message: 'the project "Garden" is archived' });
   });
 
+  it("shows the agent in its new project at once; a move still waiting holds until the machine refuses it, then it's back", async () => {
+    await seedIdentity({ identityKey: "wren", hostId: 42, project: "orchard" });
+    vi.mocked(authApi.post).mockResolvedValue({ status: 202, data: { pending: true, requestId: "m1" } });
+    vi.mocked(authApi.get).mockResolvedValue({ status: 202, data: { pending: true, requestId: "m1" } });
+    const sent = setSessionProject(42, "wren", "garden");
+    expect(projectOf("wren")).toBe("garden");
+    await expect(sent).resolves.toEqual({ ok: true });
+    // A stale report of the old place while the machine still has it waiting: held off.
+    setIdentityProject("wren", 42, "orchard");
+    expect(projectOf("wren")).toBe("garden");
+    setMachineChanges("42", [{ id: "m1", kind: "agent-project", state: "waiting", target: { type: "agent", name: "wren" }, at: 1, mine: true }]);
+    setMachineChanges("42", [{ id: "m1", kind: "agent-project", state: "refused", target: { type: "agent", name: "wren" }, at: 1, mine: true, reason: "that project is gone" }]);
+    await vi.waitFor(() => expect(projectOf("wren")).toBe("orchard"));
+  });
+
+  it("a refused move puts the agent back at once", async () => {
+    await seedIdentity({ identityKey: "finch", hostId: 42, project: null });
+    vi.mocked(authApi.post).mockRejectedValueOnce(axiosError(409, { error: "that project is gone", code: "not_found" }));
+    await expect(setSessionProject(42, "finch", "garden")).rejects.toMatchObject({ code: "not_found" });
+    expect(projectOf("finch")).toBeNull();
+  });
+
   it("one machine's changes go out one after another, in click order", async () => {
     const order: string[] = [];
     let release!: () => void;
@@ -97,13 +127,13 @@ describe("projects", () => {
     expect(authApi.post).toHaveBeenCalledWith("/projects/team/rename", { hostId: 42, displayName: "Dream Team", requestId: expect.any(String) });
   });
 
-  it("setProjectParent: a refusal rejects with the reason; still waiting after the follow-ups says so", async () => {
+  it("setProjectParent: a refusal rejects with the reason; still waiting after the follow-ups answers not done", async () => {
     vi.mocked(authApi.post).mockRejectedValueOnce(
       axiosError(409, { error: "cannot move a project inside itself or its own sub-project", code: "into_itself" }),
     );
     await expect(setProjectParent(42, "a", "b")).rejects.toMatchObject({ code: "into_itself" });
     vi.mocked(authApi.post).mockResolvedValue({ status: 202, data: { pending: true, requestId: "m1" } });
-    await expect(setProjectParent(42, "a", null)).rejects.toThrow(/still working on it/);
+    await expect(setProjectParent(42, "a", null)).resolves.toMatchObject({ done: false, requestId: "m1" });
   });
 });
 

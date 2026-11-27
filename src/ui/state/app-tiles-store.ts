@@ -107,36 +107,21 @@ const listeners = new Set<() => void>();
 //   - cleared on a backend `app-gone` frame (AppShell onAppGone)
 //   - cleared when an app-snapshot no longer contains the app
 //   - cleared when an un-archive of the same app succeeds
-//   - expires after PENDING_APP_ARCHIVE_TTL_MS as a backstop
-// Value = expiry epoch-ms. Module-scope, in-memory only.
-export const PENDING_APP_ARCHIVE_TTL_MS = 2 * 60 * 1000;
-const pendingAppArchiveKeys = new Map<string, number>();
+//   - cleared when the machine refuses it after this device stopped asking
+//     (whenMachineDone)
+// No timer: whether it happened is the machine's say. Module-scope, in-memory only.
+const pendingAppArchiveKeys = new Set<string>();
 
 function pendingAppArchiveKey(hostId: string, slug: string): string {
   return `${hostId}:${slug}`;
 }
 
 function isPendingAppArchive(key: string): boolean {
-  if (pendingAppArchiveKeys.size === 0) return false;
-  const expiresAt = pendingAppArchiveKeys.get(key);
-  if (expiresAt === undefined) return false;
-  if (Date.now() >= expiresAt) {
-    pendingAppArchiveKeys.delete(key);
-    console.warn({
-      operation: "pending_app_archive_expired",
-      key,
-      ttlMs: PENDING_APP_ARCHIVE_TTL_MS,
-    });
-    return false;
-  }
-  return true;
+  return pendingAppArchiveKeys.size > 0 && pendingAppArchiveKeys.has(key);
 }
 
 export function markPendingAppArchive(hostId: string, slug: string): void {
-  pendingAppArchiveKeys.set(
-    pendingAppArchiveKey(hostId, slug),
-    Date.now() + PENDING_APP_ARCHIVE_TTL_MS,
-  );
+  pendingAppArchiveKeys.add(pendingAppArchiveKey(hostId, slug));
 }
 
 export function clearPendingAppArchive(hostId: string, slug: string): void {
@@ -206,23 +191,21 @@ export function clearPendingAppTitle(
 }
 
 // Pending-move overrides (project-scoped apps): `${hostId}:${slug}` → where
-// the user just moved the app (a project slug, or null for the sidebar). The
-// machine carries the move out on its next tick (~15s) and the sweep reports
-// it after that, so Move to shows the app in its new place immediately and
-// every frame still describing the old place is shown as the new one. The
-// override clears itself on the first frame that already agrees, after
-// PENDING_MOVE_TTL_MS (a move the machine refused — the app goes back to
-// where it really is), or on request failure via clearPendingAppMove. Generous:
-// on a busy machine the move can wait behind other app work for a minute or two.
-const PENDING_MOVE_TTL_MS = 300_000;
-const pendingAppMoves = new Map<string, { project: string | null; at: number }>();
+// the user just moved the app (a project slug, or null for the sidebar). Move
+// to shows the app in its new place at once, and every frame still describing
+// the old place is shown as the new one while the machine hasn't finished the
+// move (it may be waiting its turn). The override clears itself on the first
+// frame that already agrees; once the machine has said it's done
+// (confirmPendingAppMove), on the next frame whatever it says; and when the
+// machine refuses it, via clearPendingAppMove. No timer.
+const pendingAppMoves = new Map<string, { project: string | null; confirmed: boolean }>();
 
 function applyPendingMove(app: AppState): AppState {
   const key = `${app.hostId}:${app.slug}`;
   const pending = pendingAppMoves.get(key);
   if (pending === undefined) return app;
   const arrived = (app.owner ?? null) === null && (app.project ?? null) === pending.project;
-  if (arrived || Date.now() - pending.at > PENDING_MOVE_TTL_MS) {
+  if (arrived || pending.confirmed) {
     pendingAppMoves.delete(key);
     return app;
   }
@@ -236,13 +219,19 @@ function applyPending(app: AppState): AppState {
 /** Optimistically show an app in its new place: a project, or the sidebar (null). */
 export function setPendingAppMove(hostId: string, slug: string, project: string | null): void {
   const key = `${hostId}:${slug}`;
-  pendingAppMoves.set(key, { project, at: Date.now() });
+  pendingAppMoves.set(key, { project, confirmed: false });
   const current = state.map.get(key);
   if (!current) return;
   const nextMap = new Map(state.map);
   nextMap.set(key, { ...current, owner: null, project });
   state = { map: nextMap };
   notify();
+}
+
+/** The machine has finished the move: the next frame about the app is the truth. */
+export function confirmPendingAppMove(hostId: string, slug: string): void {
+  const pending = pendingAppMoves.get(`${hostId}:${slug}`);
+  if (pending) pending.confirmed = true;
 }
 
 /** Roll back an optimistic move: the app goes back to `previous`. */

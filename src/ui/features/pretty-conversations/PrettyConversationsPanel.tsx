@@ -123,6 +123,8 @@ import {
   markPendingArchive,
   clearPendingArchive,
   mergeProjectsForHost,
+  startProjectMoveIntent,
+  settleProjectMoveIntent,
   getProjectsSnapshot,
   type ConversationRow as ConversationRowShape,
   type ProjectSection,
@@ -139,7 +141,7 @@ import {
 import { useCollapsedProjectSlugs } from "@/state/use-collapsed-project-slugs";
 import { useProjectsSectionCollapsed } from "@/state/use-projects-section-collapsed";
 import { projectKey } from "@/state/project-tree";
-import { MachineChangeError, reasonSentence as sentenceOf } from "@/api/machine-changes-api";
+import { MachineChangeError, reasonSentence as sentenceOf, whenMachineDone } from "@/api/machine-changes-api";
 // Phase 117 Plan 117-08 (D-22): project drop-handler API surface. Landed by
 // 117-06 as thin authApi wrappers; called fire-and-forget from the panel's
 // handleProjectDrop / handleFlatMiddleDrop.
@@ -329,6 +331,7 @@ import {
   type WakeupCheck,
 } from "@/shell/archive-wakeup-check";
 import { KitScopeContext, type KitScopeValue } from "@/components/kit/scope";
+import { ComingBackRows } from "@/features/machine-changes/ComingBackRows";
 
 // Phase 122 Plan 04 (D-17 removal): the SEARCH_HIDDEN_SENTINEL_KEY constant
 // and its one-shot cold-load scroll-hide useEffect at ~L950 were retired
@@ -1992,9 +1995,16 @@ export function PrettyConversationsPanel({
   // On failure the row comes back and the user is told.
   const commitArchive = async (hostIdNum: number, identityKey: string, undoRemove: () => void, label?: string) => {
     try {
-      await archiveIdentity(hostIdNum, identityKey, () => {
+      const answer = await archiveIdentity(hostIdNum, identityKey, () => {
         toast(`Still archiving "${label ?? identityKey}"`, { description: "The machine is still working on it." });
       });
+      // Still waiting its turn when this stopped asking: the row stays gone until the
+      // machine says. Refused after all → the row comes back with the reason on it.
+      if ((await whenMachineDone(hostIdNum, answer)) === "failed") {
+        console.info({ operation: "identity_archive_refused_later", hostId: hostIdNum, identityKey });
+        undoRemove();
+        return;
+      }
       // Archived: every open copy of the conversation in this window closes.
       announceAgentArchived(hostIdNum, identityKey);
     } catch (err) {
@@ -2641,20 +2651,23 @@ export function PrettyConversationsPanel({
         from: target.parent ?? null,
         to: newParent,
       });
-      mergeProjectsForHost(
-        hostId,
-        hostRows.map((p) => (p.slug === slug ? { ...p, parent: newParent } : p)),
-      );
-      setProjectParent(hostIdNum, slug, newParent).catch((err: unknown) => {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error({ operation: "move_project_failed", slug, hostId, newParent, errMessage: msg });
-        // Restore only if nothing newer replaced our optimistic row.
-        const now = getProjectsSnapshot().filter((p) => p.hostId === hostId);
-        if (now.find((p) => p.slug === slug)?.parent === newParent) {
-          mergeProjectsForHost(hostId, hostRows);
-        }
-        void kitAlert({ title: "Couldn't move this project", body: sentenceOf(msg) });
-      });
+      // Shown in its new place at once, and held there while the machine has the move
+      // waiting its turn (a newer move of the same project owns the hold).
+      const previous = target.parent ?? null;
+      const seq = startProjectMoveIntent(hostId, slug, newParent);
+      setProjectParent(hostIdNum, slug, newParent)
+        .then((answer) => whenMachineDone(hostIdNum, answer))
+        .then((ended) => {
+          // Refused after this stopped asking: back where it was, the reason on its header.
+          if (ended === "failed") console.info({ operation: "move_project_refused_later", slug, hostId, newParent });
+          settleProjectMoveIntent(hostId, slug, seq, ended === "done" ? { done: true } : { done: false, previous });
+        })
+        .catch((err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error({ operation: "move_project_failed", slug, hostId, newParent, errMessage: msg });
+          settleProjectMoveIntent(hostId, slug, seq, { done: false, previous });
+          void kitAlert({ title: "Couldn't move this project", body: sentenceOf(msg) });
+        });
     },
     [isInSubtree],
   );
@@ -4068,6 +4081,9 @@ export function PrettyConversationsPanel({
                           />
                         ))
                         )}
+                        {!sidebarSearchActive && (
+                          <ComingBackRows project={section.slug} hostId={section.hostId} variant={variant} />
+                        )}
                       </>
                     }
                   />
@@ -4161,6 +4177,7 @@ export function PrettyConversationsPanel({
                     subtitleMode="identityTitle"
                   />
                 ))}
+                {!sidebarSearchActive && <ComingBackRows project={null} variant={variant} />}
               </div>
             )}
             {/* Phase 41 Plan 01: RDP zone renderer. When `searchedRdpGroup`

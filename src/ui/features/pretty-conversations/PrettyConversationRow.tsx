@@ -119,6 +119,8 @@ import { armOutboundDrag, mintDragId } from "@/shell/cross-window-drag";
 import { promptAndRenameIdentity } from "@/shell/rename-identity";
 import { confirmAndLeaveRelayRoom, promptAndRenameRelayRoom } from "./relay-room-row-actions";
 import { RelayRoomFaces } from "./RelayRoomFaces";
+import { useMachineMark } from "@/state/machine-changes-store";
+import { MachineChangeMark } from "@/features/machine-changes/MachineChangeMark";
 import type { ConversationRow as ConversationRowShape } from "@/state/conversation-store";
 import { specForTab, encodeWorkspaceSpec } from "@/lib/tab-url";
 import {
@@ -360,6 +362,13 @@ function PrettyConversationRowImpl({
   // (same shape AppShell uses at openTab hostId derivation). Consumed by
   // useTrappedWork and the rename gate below.
   const rowHostIdNum = row.host ? parseInt(row.host.id, 10) : NaN;
+  // A change its machine hasn't finished (a move, pin or archive), or one of this
+  // person's that didn't happen — machine-changes-store. Agent rows only.
+  const machineMark = useMachineMark(
+    Number.isFinite(rowHostIdNum) && row.kind !== "relay-room" ? rowHostIdNum : null,
+    "agent",
+    identity?.identityKey ?? sessionMatchKey(row.targetTmuxSession),
+  );
 
   // An identity with no roles and no colorHue paints in the neutral grey.
   const neutralLook = hasNeutralLook(identity);
@@ -707,6 +716,7 @@ function PrettyConversationRowImpl({
       data-variant={variant}
       data-rdp-host-row={isRdp ? "true" : undefined}
       data-swiping={touch.offset !== 0 ? "true" : undefined}
+      data-machine-mark={machineMark?.kind}
     >
       {onSwipeArchive && touch.offset !== 0 && (
         <div className="pv-row-swipe-action" aria-hidden="true">
@@ -891,6 +901,12 @@ function PrettyConversationRowImpl({
             </>
           )}
         </div>
+
+        <MachineChangeMark
+          mark={machineMark}
+          hostId={Number.isFinite(rowHostIdNum) ? rowHostIdNum : null}
+          thing={identity?.displayName || row.label}
+        />
 
         {/* Unread: a small off-white dot at the row's end
             (pretty-conversations.css). Notified (the agent DM'd this user):
