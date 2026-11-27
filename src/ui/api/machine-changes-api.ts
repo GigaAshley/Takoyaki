@@ -95,7 +95,11 @@ export async function sendMachineChange<T>(
     data = response.data as Body;
     if (response.status !== 202) return { done: true, requestId: data.requestId ?? requestId, result: data as T };
   } catch (error) {
-    asError(error, operation);
+    // No answer at all (the connection dropped): the change may well be under way on the
+    // machine, so ask about it by id rather than treat it as failed. A read has nothing to
+    // ask about — it just failed.
+    if (!(axios.isAxiosError(error) && !error.response && request.method === "post")) asError(error, operation);
+    data = { requestId };
   }
   const id = data.requestId ?? requestId;
   opts.onStillWorking?.();

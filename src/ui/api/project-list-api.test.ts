@@ -142,6 +142,21 @@ describe("Phase 117 Plan 117-06 Task 1 — project-list-api", () => {
     expect(answer).toMatchObject({ done: true, requestId: "r2" });
   });
 
+  // Test 6b — the connection drops before any answer: asked again by id, not treated as failed
+  it("Test 6b (archiveProject no answer): a dropped connection is asked about again with the same id", async () => {
+    vi.mocked(authApi.post)
+      .mockRejectedValueOnce(Object.assign(new Error("Network Error"), { isAxiosError: true, response: undefined }))
+      .mockResolvedValueOnce({ status: 200, data: { ok: true, requestId: "r3", result: {} } });
+
+    const answer = await archiveProject(1, "alpha", { projects: ["alpha"], agents: [], apps: [] });
+
+    expect(authApi.post).toHaveBeenCalledTimes(2);
+    const first = (vi.mocked(authApi.post).mock.calls[0] as [string, { requestId: string }])[1].requestId;
+    const second = (vi.mocked(authApi.post).mock.calls[1] as [string, { requestId: string }])[1].requestId;
+    expect(second).toBe(first);
+    expect(answer.done).toBe(true);
+  });
+
   // ─── Phase 117 followup — getProjectFile / updateProjectFile ────────────────
 
   it("Test 7 (getProjectFile happy): GET /projects/alpha/file?hostId=1 returns { markdown }", async () => {

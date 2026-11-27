@@ -3164,7 +3164,12 @@ export function PrettyConversationsPanel({
         return;
       }
 
-      let contents = pre.contents;
+      if (pre.contents === null) {
+        console.error({ operation: "archive_project_preflight_no_contents", slug, hostId: projHostIdNum });
+        void kitAlert({ title: `Couldn't check "${name}"`, body: "Nothing was archived." });
+        return;
+      }
+      let contents: ProjectArchiveContents = pre.contents;
       let changedNote = "";
       for (let attempt = 0; attempt < 3; attempt++) {
         // 2. Confirm what the machine holds.
@@ -3302,9 +3307,11 @@ export function PrettyConversationsPanel({
             changedNote = `What's in "${name}" changed since you looked. This is what it holds now.`;
             continue;
           }
+          // Some failures happen after part of it was archived; the machine's reason says what.
+          const partial = err instanceof MachineChangeError && (err.code === "archive_move_failed" || err.code === "changed_during_restart");
           void kitAlert({
             title: `Couldn't archive "${name}"`,
-            body: `${sentenceOf(err instanceof Error ? err.message : String(err))} Nothing was archived.`,
+            body: `${sentenceOf(err instanceof Error ? err.message : String(err))}${partial ? "" : " Nothing was archived."}`,
           });
           return;
         }

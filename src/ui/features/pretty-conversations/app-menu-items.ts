@@ -73,9 +73,16 @@ export interface AppScopeTarget extends AppMenuTarget {
  * puts the app back and says why. One the machine is still on after a
  * while gets a "still moving" note and stays shown in its new place.
  */
+/** The latest move clicked for each app (`hostId:slug`) — only it may put the app back. */
+const latestMove = new Map<string, number>();
+let moveCounter = 0;
+
 export async function moveApp(app: AppScopeTarget, dest: AppMoveDestination): Promise<void> {
   const previous = { owner: app.owner ?? null, project: app.project ?? null };
   const to = dest.to === "project" ? `project:${dest.project}` : "sidebar";
+  const key = `${app.hostId}:${app.slug}`;
+  const mine = ++moveCounter;
+  latestMove.set(key, mine);
   setPendingAppMove(app.hostId, app.slug, dest.to === "project" ? dest.project : null);
   try {
     const answer = await requestAppMove(Number(app.hostId), app.slug, dest, () => {
@@ -91,7 +98,8 @@ export async function moveApp(app: AppScopeTarget, dest: AppMoveDestination): Pr
       requestId: answer.requestId,
     });
   } catch (err) {
-    clearPendingAppMove(app.hostId, app.slug, previous);
+    // A later move of the same app owns where it's shown; this one only says it failed.
+    if (latestMove.get(key) === mine) clearPendingAppMove(app.hostId, app.slug, previous);
     const errMessage = err instanceof Error ? err.message : String(err);
     console.warn({
       operation: "app_move_request_failed",

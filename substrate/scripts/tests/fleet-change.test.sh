@@ -64,7 +64,11 @@ case "\$1" in
     done
     exit 1 ;;
   port) [ -f "$s/units/app-\$2.socket" ] && echo 9100; exit 0 ;;
-  stash|uninstall) printf 'units %s\n' "\$*" >> "$s/calls"; [ "\$1" = uninstall ] && rm -f "$s/units/app-\$2.socket"; exit 0 ;;
+  stash|restore|install) printf 'units %s\n' "\$*" >> "$s/calls"; exit 0 ;;
+  uninstall)
+    printf 'units %s\n' "\$*" >> "$s/calls"
+    [ "\$2" = "\${STUB_UNINSTALL_FAILS:-}" ] && { echo "unit busy"; exit 1; }
+    rm -f "$s/units/app-\$2.socket"; exit 0 ;;
 esac
 STUB
   chmod +x "$s/move-app.sh" "$s/app-units.sh"
@@ -288,6 +292,51 @@ test_change_lock_is_held_while_a_request_runs() {
   rm -rf "$s"
 }
 
+test_app_that_wont_stop_leaves_the_project_as_it_was() {
+  local s; s=$(setup)
+  project "$s" garden "Garden"; project "$s" beds "Beds" garden
+  app "$s/fleet/projects/beds/apps/aaa"; : > "$s/units/app-aaa.socket"
+  app "$s/fleet/projects/garden/apps/zzz"; : > "$s/units/app-zzz.socket"
+  fc "$s" submit project-archive '{"slug":"garden","expected":{"projects":["garden","beds"],"agents":[],"apps":["aaa","zzz"]}}' --id a1 --wait 0 >/dev/null
+  STUB_UNINSTALL_FAILS=aaa serve_once "$s"
+  local a; a=$(fc "$s" status a1)
+  assert_eq failed "$(field "$a" state)" "failed"
+  assert_eq app_stop_failed "$(field "$a" code)" "code"
+  assert_exists "$s/fleet/projects/beds/project.md" "sub-project not archived"
+  assert_exists "$s/fleet/projects/garden/project.md" "project not archived"
+  grep -q 'units restore zzz' "$s/calls" || fail "the app already stopped is started again: $(cat "$s/calls")"
+  rm -rf "$s"
+}
+
+test_carry_on_refuses_what_appeared_since() {
+  local s; s=$(setup)
+  project "$s" garden "Garden"; project "$s" beds "Beds" garden
+  mkdir -p "$s/fleet/.changes/journal" "$s/fleet/projects/archive"
+  mv "$s/fleet/projects/beds" "$s/fleet/projects/archive/beds"
+  agent "$s" newcomer garden
+  printf '{"seq":2,"id":"a1","kind":"project-archive","args":{"slug":"garden","expected":{"projects":["garden","beds"],"agents":[],"apps":[]}},"state":"running","plan":{"projects":["garden","beds"],"agents":[],"apps":[],"archivedAs":{"beds":"beds"}}}' \
+    > "$s/fleet/.changes/journal/0000000002-a1.json"
+  serve_once "$s"
+  local a; a=$(fc "$s" status a1)
+  assert_eq changed_during_restart "$(field "$a" code)" "refused to take the newcomer"
+  assert_exists "$s/fleet/projects/garden/project.md" "garden left live"
+  assert_absent "$s/fleet/identities/newcomer/.archive-requested" "newcomer untouched"
+  rm -rf "$s"
+}
+
+test_move_cut_off_after_the_folder_moved_is_finished() {
+  local s; s=$(setup)
+  project "$s" garden "Garden"
+  app "$s/fleet/projects/garden/apps/tally"   # folder already moved, units not back yet
+  mkdir -p "$s/fleet/.changes/journal"
+  printf '{"seq":3,"id":"m1","kind":"app-move","args":{"slug":"tally","to":"project","project":"garden"},"state":"running","plan":{"port":9123}}' \
+    > "$s/fleet/.changes/journal/0000000003-m1.json"
+  serve_once "$s"
+  assert_eq done "$(field "$(fc "$s" status m1)" state)" "done"
+  grep -q "units install tally $s/fleet/projects/garden/apps/tally 9123" "$s/calls" || fail "started again on its port: $(cat "$s/calls")"
+  rm -rf "$s"
+}
+
 printf 'fleet-change tests\n'
 run_test test_aither_sequence_runs_in_click_order
 run_test test_archive_first_then_move_out_is_refused
@@ -303,6 +352,9 @@ run_test test_conversation_app_owner_is_told
 run_test test_unknown_kind_written_by_hand_is_refused
 run_test test_running_request_is_carried_on_after_restart
 run_test test_change_lock_is_held_while_a_request_runs
+run_test test_app_that_wont_stop_leaves_the_project_as_it_was
+run_test test_carry_on_refuses_what_appeared_since
+run_test test_move_cut_off_after_the_folder_moved_is_finished
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 if [ "$FAIL" -gt 0 ]; then

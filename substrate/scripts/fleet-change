@@ -311,15 +311,27 @@ def project_label(slug):
     return (fm or {}).get("displayName") or slug
 
 
-def run(argv, timeout=120):
+def run(argv, timeout=60):
+    """Run a helper; one that runs out of time gets SIGTERM (so its own rollback runs), then SIGKILL."""
     try:
-        p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                           stdin=subprocess.DEVNULL, timeout=timeout)
-        return p.returncode, p.stdout.decode("utf-8", "replace")
-    except subprocess.TimeoutExpired:
-        return 124, "timed out after %ds" % timeout
+        p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             stdin=subprocess.DEVNULL, start_new_session=True)
     except OSError as e:
         return 127, str(e)
+    try:
+        out, _ = p.communicate(timeout=timeout)
+        return p.returncode, out.decode("utf-8", "replace")
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, signal.SIGTERM)
+            out, _ = p.communicate(timeout=10)
+        except (subprocess.TimeoutExpired, ProcessLookupError):
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            out, _ = p.communicate()
+        return 124, out.decode("utf-8", "replace") + "\ntimed out after %ds" % timeout
 
 
 class Refused(Exception):
@@ -351,73 +363,136 @@ def do_project_contents(args, entry, save_plan):
 
 
 def stop_project_app(slug, app_dir):
-    """Stop an app that's being archived with its project; its units are kept in its folder."""
+    """Stop an app that's being archived with its project; its units are kept in its folder.
+    False when it wasn't running (nothing to stop)."""
     rc, out = run(["bash", APP_UNITS, "port", slug])
     if rc != 0 or not out.strip():
-        return
+        return False
     rc, out = run(["bash", APP_UNITS, "stash", slug, app_dir])
     if rc != 0:
-        log("WARN: project app '%s': couldn't stash its units (%s); stopping it anyway" % (slug, out.strip()[-200:]))
+        raise Failed("app_stop_failed", "couldn't keep the units of the app '%s': %s" % (slug, out.strip()[-300:]))
     rc, out = run(["bash", APP_UNITS, "uninstall", slug])
     if rc != 0:
         raise Failed("app_stop_failed", "couldn't stop the app '%s': %s" % (slug, out.strip()[-300:]))
     log("project app '%s' stopped, units kept in %s" % (slug, app_dir))
+    return True
+
+
+def restart_project_app(slug, app_dir):
+    rc, out = run(["bash", APP_UNITS, "restore", slug, app_dir])
+    if rc != 0:
+        log("WARN: project app '%s': couldn't start it again (%s) — run app-units.sh restore %s %s"
+            % (slug, out.strip()[-200:], slug, app_dir))
+
+
+def plan_extras(plan):
+    """What appeared in the not-yet-archived part of a plan since it was made (agents, apps,
+    sub-projects) — a request carried on after a restart must not take those unconfirmed."""
+    projects = live_projects()
+    remaining = {p for p in plan["projects"] if p in projects}
+    extras = []
+    for p, meta in projects.items():
+        if meta["parent"] in remaining and p not in plan["projects"]:
+            extras.append("the sub-project \"%s\"" % meta["displayName"])
+    planned_apps = {a["slug"] for a in plan["apps"]}
+    for p in remaining:
+        try:
+            names = os.listdir(os.path.join(PROJECTS, p, "apps"))
+        except OSError:
+            names = []
+        extras += ["the app '%s'" % a for a in sorted(names) if APP_SLUG_RE.match(a) and a not in planned_apps]
+    try:
+        idents = sorted(os.listdir(IDENTITIES))
+    except OSError:
+        idents = []
+    for name in idents:
+        fm = frontmatter(os.path.join(IDENTITIES, name, name + ".md"))
+        if fm and fm.get("project") in remaining and name not in plan["agents"]:
+            extras.append("the agent '%s'" % name)
+    return extras
 
 
 def do_project_archive(args, entry, save_plan):
     slug = args.get("slug")
     if not isinstance(slug, str) or not SLUG_RE.match(slug) or slug == "archive":
         raise Refused("bad_request", "slug must match [a-z0-9-]{1,64}")
-    plan = entry.get("plan")
-    if plan is None:
-        expected = args.get("expected")
-        if not isinstance(expected, dict):
-            raise Refused("bad_request", "expected (the contents the user confirmed) is required")
-        current = project_contents(slug)
-        if current is None:
-            raise Refused("not_found", "that project doesn't exist or is already archived")
-        if contents_key(current) != contents_key(expected):
-            raise Refused("contents_changed",
-                          "what's in \"%s\" changed since you looked; check the list again" % project_label(slug),
-                          current)
-        plan = {
-            "projects": [p["slug"] for p in current["projects"]],
-            "agents": [a["name"] for a in current["agents"]],
-            "apps": [{"slug": a["slug"], "project": a["project"]} for a in current["apps"]],
-            "archivedAs": {},
-        }
-        save_plan(plan)
-    else:
-        log("project archive '%s': carrying on from where it stopped" % slug)
+    # The create lock too, from the check to the last folder: an app created or moved by an
+    # agent in the meantime would otherwise go into the archive unconfirmed.
+    with Lock(CREATE_LOCK, "the app create lock"):
+        plan = entry.get("plan")
+        if plan is None:
+            expected = args.get("expected")
+            if not isinstance(expected, dict):
+                raise Refused("bad_request", "expected (the contents the user confirmed) is required")
+            current = project_contents(slug)
+            if current is None:
+                raise Refused("not_found", "that project doesn't exist or is already archived")
+            if contents_key(current) != contents_key(expected):
+                raise Refused("contents_changed",
+                              "what's in \"%s\" changed since you looked; check the list again" % project_label(slug),
+                              current)
+            plan = {
+                "projects": [p["slug"] for p in current["projects"]],
+                "agents": [a["name"] for a in current["agents"]],
+                "apps": [{"slug": a["slug"], "project": a["project"]} for a in current["apps"]],
+                "stopped": [],
+                "archivedAs": {},
+            }
+            save_plan(plan)
+        else:
+            log("project archive '%s': carrying on from where it stopped" % slug)
+            plan.setdefault("stopped", [])
+            extras = plan_extras(plan)
+            if extras:
+                raise Failed("changed_during_restart",
+                             "the archive was cut off, and since then %s appeared in it; "
+                             "nothing more was archived" % ", ".join(extras[:5]))
+        return archive_by_plan(plan, save_plan)
 
-    # Deepest first, so a project is never archived with something still live beneath it.
+
+def archive_by_plan(plan, save_plan):
+    # 1. Stop every app in the tree before any folder moves, so a failure here leaves the
+    #    whole project as it was (the apps already stopped are started again).
+    for app in plan["apps"]:
+        d = os.path.join(PROJECTS, app["project"], "apps", app["slug"])
+        if app["slug"] in plan["stopped"] or not os.path.isdir(d):
+            continue
+        try:
+            if stop_project_app(app["slug"], d):
+                plan["stopped"].append(app["slug"])
+                save_plan(plan)
+        except Failed:
+            if not plan["archivedAs"]:
+                for a in plan["apps"]:
+                    if a["slug"] in plan["stopped"]:
+                        restart_project_app(a["slug"], os.path.join(PROJECTS, a["project"], "apps", a["slug"]))
+                plan["stopped"] = []
+                save_plan(plan)
+            raise
+
+    # 2. Folders, deepest first, so a project is never archived with something live beneath it.
+    os.makedirs(PROJECTS_ARCHIVE, exist_ok=True)
     for p in reversed(plan["projects"]):
         src = os.path.join(PROJECTS, p)
         if not os.path.isdir(src):
             continue
-        apps_dir = os.path.join(src, "apps")
-        try:
-            app_slugs = sorted(os.listdir(apps_dir))
-        except OSError:
-            app_slugs = []
-        if app_slugs:
-            with Lock(CREATE_LOCK, "the app create lock"):
-                for a in app_slugs:
-                    d = os.path.join(apps_dir, a)
-                    if APP_SLUG_RE.match(a) and os.path.isdir(d):
-                        stop_project_app(a, d)
-        os.makedirs(PROJECTS_ARCHIVE, exist_ok=True)
         name = p
         if os.path.exists(os.path.join(PROJECTS_ARCHIVE, name)):
             name = "%s-%s" % (p, time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()))
+        try:
             if os.path.exists(os.path.join(PROJECTS_ARCHIVE, name)):
-                raise Failed("archive_exists", "an archived copy of '%s' is in the way" % p)
-        os.rename(src, os.path.join(PROJECTS_ARCHIVE, name))
+                raise OSError("an archived copy of '%s' is in the way" % p)
+            os.rename(src, os.path.join(PROJECTS_ARCHIVE, name))
+        except OSError as e:
+            done = [q for q in reversed(plan["projects"]) if q in plan["archivedAs"]]
+            raise Failed("archive_move_failed", "couldn't archive \"%s\" (%s)%s" % (
+                project_label(p), e,
+                "; already archived: %s" % ", ".join(done) if done else "; nothing was archived"))
         plan["archivedAs"][p] = name
         save_plan(plan)
         log("project '%s' archived as archive/%s" % (p, name))
 
-    # Agents go through the agent archive route the app uses (the supervisor retires them).
+    # 3. Agents go through the agent archive route the app uses (the supervisor retires them).
     for name in plan["agents"]:
         d = os.path.join(IDENTITIES, name)
         if os.path.isfile(os.path.join(d, name + ".md")):
@@ -498,8 +573,19 @@ def do_app_move(args, entry, save_plan):
         if os.path.isdir(os.path.join(APPS_ARCHIVE, slug)):
             raise Refused("archived", "it's archived")
         raise Refused("not_found", "there's no app '%s' on this machine" % slug)
+    plan = entry.get("plan") or {}
     if os.path.realpath(src) == os.path.realpath(dest):
-        # Already there — nothing to do, or an earlier run of this request finished.
+        # Already there — nothing to do, or an earlier run of this request got the folder
+        # there. One cut off before it reinstalled the app's units is finished now.
+        port = plan.get("port")
+        if port:
+            rc, out = run(["bash", APP_UNITS, "port", slug])
+            if rc != 0 or not out.strip():
+                rc, out = run(["bash", APP_UNITS, "install", slug, dest, str(port)], timeout=60)
+                if rc != 0:
+                    raise Failed("move_failed", "it's in its new place but couldn't be started there: %s"
+                                 % out.strip()[-200:])
+                log("app '%s' move: carried on — started it in its new place on port %s" % (slug, port))
         return {"slug": slug, "to": to, "path": dest, "alreadyThere": True}
 
     owner = None
@@ -507,7 +593,12 @@ def do_app_move(args, entry, save_plan):
     if not rel.startswith(".."):
         owner = rel.split(os.sep, 1)[0]
     title = app_title(src, slug)
-    rc, out = run(["bash", MOVE_APP, slug] + argv, timeout=180)
+    # Its port, kept with the request: if this is cut off midway, carrying on can finish it.
+    rc, out = run(["bash", APP_UNITS, "port", slug])
+    if rc == 0 and out.strip().isdigit():
+        save_plan({"port": int(out.strip())})
+    # Under the listener's stop timeout, so a stop never cuts move-app.sh off without its rollback.
+    rc, out = run(["bash", MOVE_APP, slug] + argv, timeout=90)
     for line in out.splitlines():
         if line.strip():
             log("  move-app.sh[%s]: %s" % (slug, line))
@@ -627,9 +718,6 @@ def carry_out(name):
         os.unlink(path)  # finished before a restart; only the clean-up was left
         return
     resumed = entry.get("state") == "running"
-    entry["state"] = "running"
-    entry["started_at"] = entry.get("started_at") or time.time()
-    write_json_atomic(path, entry)
 
     def save_plan(plan):
         entry["plan"] = plan
@@ -639,6 +727,10 @@ def carry_out(name):
     t0 = time.time()
     try:
         with Lock(CHANGE_LOCK, "the change lock"):
+            # "running" only once it has its turn; until then it's still waiting.
+            entry["state"] = "running"
+            entry["started_at"] = entry.get("started_at") or time.time()
+            write_json_atomic(path, entry)
             result = HANDLERS[entry["kind"]](entry["args"], entry, save_plan)
         outcome.update(state="done", result=result)
     except Refused as e:

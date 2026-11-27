@@ -912,6 +912,41 @@ describe("POST /projects/:slug/archive", () => {
     expect(releaseProjectRooms).toHaveBeenCalledWith("1", ["my-project"]);
   });
 
+  it("Test 13g: still working → the server keeps asking and does its part (rooms, other tabs) once it's done", async () => {
+    (listProjects as Mock).mockResolvedValue([{ slug: "my-project", displayName: "My", users: null, parent: null }]);
+    (submitFrontDoor as Mock).mockResolvedValueOnce({ state: "pending", id: "slow-1", seq: 6, stage: "running" });
+    (frontDoorStatus as Mock)
+      .mockResolvedValueOnce(null) // the route's "already sent?" check
+      .mockResolvedValueOnce({ state: "pending", id: "slow-1", seq: 6, stage: "running" })
+      .mockResolvedValueOnce({ state: "done", id: "slow-1", seq: 6, result: { projects: [{ slug: "my-project", archivedAs: "my-project" }], agents: [], apps: [] } });
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/projects/my-project/archive",
+      body: { hostId: 5, expected: EXPECTED, requestId: "slow-1" },
+    });
+    expect(res.status).toBe(202);
+    await vi.waitFor(() => expect(releaseProjectRooms).toHaveBeenCalledWith("1", ["my-project"]));
+    expect(mockPublishProjectListChanged).toHaveBeenCalled();
+  });
+
+  it("Test 13h: contents changed to include a sub-project hidden from the caller → refused without showing it", async () => {
+    (getUsernameForUserId as Mock).mockResolvedValue("alice");
+    (listProjects as Mock).mockResolvedValue([
+      { slug: "my-project", displayName: "My", users: null, parent: null },
+      { slug: "secret", displayName: "Secret", users: ["bob"], parent: "my-project" },
+    ]);
+    // Visible at the route's check (secret appears only on the machine's turn): simulate by
+    // letting the first listing omit it.
+    (listProjects as Mock).mockResolvedValueOnce([{ slug: "my-project", displayName: "My", users: null, parent: null }]);
+    (submitFrontDoor as Mock).mockResolvedValueOnce({
+      state: "refused", id: "r5", seq: 7, code: "contents_changed", reason: "changed",
+      result: { project: "my-project", projects: [{ slug: "my-project", displayName: "My", parent: null }, { slug: "secret", displayName: "Secret", parent: "my-project" }], agents: [], apps: [] },
+    });
+    const res = await httpRequest(server, { method: "POST", path: "/projects/my-project/archive", body: { hostId: 5, expected: EXPECTED } });
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: "some sub-projects inside it are hidden from you", code: "sub_projects_hidden" });
+  });
+
   it("Test 13e: missing or malformed expected list → 400 before any I/O", async () => {
     for (const expected of [undefined, { projects: ["a"] }, { projects: "a", agents: [], apps: [] }]) {
       const res = await httpRequest(server, { method: "POST", path: "/projects/my-project/archive", body: { hostId: 5, expected } });
@@ -1600,13 +1635,11 @@ describe("nested projects — review fixes", () => {
     expect((submitFrontDoor as Mock).mock.calls[0]?.[2]).toMatchObject({ slug: "a" });
   });
 
-  it("archive preflight: the machine's contents, sub-projects hidden from the caller, and the caller's rooms", async () => {
+  it("archive preflight: the machine's contents and the caller's rooms; a project hidden from the caller is not found", async () => {
     (getUsernameForUserId as Mock).mockResolvedValue("alice");
     (listProjects as Mock).mockResolvedValue([
       { slug: "p", displayName: "P", users: ["alice", "bob"], parent: null },
       { slug: "seen", displayName: "S", users: null, parent: "p" },
-      { slug: "hidden", displayName: "H", users: ["bob"], parent: "p" },
-      { slug: "deep", displayName: "D", users: null, parent: "hidden" },
       { slug: "other", displayName: "O", users: ["bob"], parent: null },
     ]);
     const contents = {
@@ -1622,7 +1655,7 @@ describe("nested projects — review fixes", () => {
       path: "/projects/p/archive-preflight?hostId=5",
     });
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ hiddenSubProjects: 2, contents, rooms: [{ roomId: "!r:x", project: "seen" }], roomsUnknown: false });
+    expect(res.body).toEqual({ hiddenSubProjects: 0, contents, rooms: [{ roomId: "!r:x", project: "seen" }], roomsUnknown: false });
     expect((submitFrontDoor as Mock).mock.calls[0]?.slice(1, 3)).toEqual(["project-contents", { slug: "p" }]);
     expect(findProjectRooms).toHaveBeenCalledWith("1", ["p", "seen"]);
     const hidden = await httpRequest(server, {
@@ -1630,6 +1663,18 @@ describe("nested projects — review fixes", () => {
       path: "/projects/other/archive-preflight?hostId=5",
     });
     expect(hidden.status).toBe(404);
+  });
+
+  it("archive preflight with hidden sub-projects says how many and nothing about what's in them", async () => {
+    (getUsernameForUserId as Mock).mockResolvedValue("alice");
+    (listProjects as Mock).mockResolvedValue([
+      { slug: "p", displayName: "P", users: null, parent: null },
+      { slug: "hidden", displayName: "H", users: ["bob"], parent: "p" },
+    ]);
+    const res = await httpRequest(server, { method: "GET", path: "/projects/p/archive-preflight?hostId=5" });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ hiddenSubProjects: 1, contents: null, rooms: [], roomsUnknown: false });
+    expect(submitFrontDoor).not.toHaveBeenCalled();
   });
 
   it("archive preflight says when the chat server couldn't be asked, and passes 'still working' through", async () => {

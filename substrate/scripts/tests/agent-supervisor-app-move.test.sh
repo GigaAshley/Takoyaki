@@ -90,7 +90,7 @@ test_move_note_is_handed_to_the_front_door() {
   local s; s=$(setup); fc_stub "$s"
   app "$s/apps/tally"
   printf '{"to":"project","project":"garden"}' > "$s/apps/tally/.move-requested"
-  local id="note-tally-$(stat -c %Y "$s/apps/tally/.move-requested")"
+  local id="note-$(printf '%s:%s' "$s/apps/tally/.move-requested" "$(stat -c %Y "$s/apps/tally/.move-requested")" | sha1sum | cut -c1-20)"
   ( source_supervisor "$s"; scan_app_move_requested_sentinels >/dev/null 2>&1 )
   assert_eq "fleet-change submit app-move {\"slug\":\"tally\",\"to\":\"project\",\"project\":\"garden\"} --id $id --wait 0" "$(cat "$s/calls")" "calls"
   assert_absent "$s/apps/tally/.move-requested" "note consumed"

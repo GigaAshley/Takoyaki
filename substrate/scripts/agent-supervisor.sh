@@ -100,7 +100,7 @@ change_lock_take() {
   fi
   local ready i=0
   ready="$(mktemp)" || return 1
-  FLEET_CHANGE_LOCK="$CHANGE_LOCK" python3 "$FLEET_CHANGE_BIN" hold-lock --parent "$$" >"$ready" 2>/dev/null </dev/null &
+  FLEET_CHANGE_LOCK="$CHANGE_LOCK" python3 "$FLEET_CHANGE_BIN" hold-lock --parent "$BASHPID" >"$ready" 2>/dev/null </dev/null &
   CHANGE_LOCK_HOLDER=$!
   until grep -q '^held' "$ready" 2>/dev/null; do
     if ! kill -0 "$CHANGE_LOCK_HOLDER" 2>/dev/null || [ "$i" -ge 2400 ]; then
@@ -1559,16 +1559,12 @@ stop_ambient_monitor() {
 }
 
 retire_identity() {
-  # A birth that landed mid-pass launches now, not after every queued retire (see helper) — and
-  # outside the change lock, so the newborn's processes never hold it.
-  launch_newborns_midtick
-  with_change_lock _retire_identity_locked "$@"
-}
-
-_retire_identity_locked() {
   local name="$1"
   local iddir="$IDENTITIES_DIR/$name"
   local archdir="$IDENTITIES_ARCHIVE_DIR/$name"
+
+  # A birth that landed mid-pass launches now, not after every queued retire (see helper).
+  launch_newborns_midtick
 
   # =============================================================================================
   # STEP 0: stop the ambient monitor (and with it every watcher child) BEFORE the account goes off.
@@ -1681,6 +1677,17 @@ _retire_identity_locked() {
   else
     log "'$name' retire step 3 (tmux kill-session) success: no tmux session found (no-op)"
   fi
+
+  # Steps 4a–4b change what the front door reads (the identity's folder and its conversation
+  # apps), so they run as one change under the change lock. Steps 0–3 — the account, the
+  # graceful exit, the tmux kill, with their waits — come before it and don't hold it, so
+  # requests aren't kept waiting for them. No lock: the sentinel stays and the next pass retries.
+  with_change_lock _retire_identity_move "$name" "$iddir" "$archdir"
+}
+
+# _retire_identity_move <name> <iddir> <archdir> — retire_identity steps 4a–4b (see above).
+_retire_identity_move() {
+  local name="$1" iddir="$2" archdir="$3"
 
   # =============================================================================================
   # STEP 4a (Phase 115 D-12 option b): Delete the .archive-requested sentinel BEFORE folder move.
@@ -2094,8 +2101,8 @@ scan_app_archive_requested_sentinels() {
 # A `.move-requested` note in an app folder — left from before the front door, or dropped by
 # an agent still using the old way — is handed to the front door as a request and removed, so
 # none is stranded. It holds one JSON object: {"to":"sidebar","users":[...]|null} or
-# {"to":"project","project":"<slug>"}. The note's own path and age make the request id, so a
-# note handed over twice (a crash before the rm) is still one request. Until fleet-change is
+# {"to":"project","project":"<slug>"}. The note's path and age, hashed, make the request id, so
+# a note handed over twice (a crash before the rm) is still one request. Until fleet-change is
 # installed the note is left where it is for a later pass.
 scan_app_move_requested_sentinels() {
   local f d slug req id out
@@ -2136,7 +2143,7 @@ PY
       continue
     fi
     [ -f "$FLEET_CHANGE_BIN" ] || continue
-    id="note-$slug-$(stat -c %Y "$f" 2>/dev/null || date +%s)"
+    id="note-$(printf '%s:%s' "$f" "$(stat -c %Y "$f" 2>/dev/null)" | sha1sum | cut -c1-20)"
     if out="$(python3 "$FLEET_CHANGE_BIN" submit app-move "$req" --id "$id" --wait 0 2>&1)"; then
       rm -f "$f"
       log "app '$slug' move: .move-requested handed to the front door as $id ($req)"

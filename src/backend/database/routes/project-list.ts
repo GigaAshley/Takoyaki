@@ -92,6 +92,7 @@ import {
 } from "../../fleet-status/project-visibility-gate.js";
 import { getHostSemaphore } from "../../ssh/host-semaphore-registry.js";
 import { bornInProjectUsers } from "../../sharing/born-in-project.js";
+import { withHost } from "../../sharing/host-conn.js";
 import { frontDoorHttp, frontDoorStatus, requestIdFrom, submitFrontDoor } from "../../fleet-change/front-door.js";
 import { findProjectRooms, releaseProjectRooms } from "../../fleet-change/project-rooms.js";
 
@@ -681,6 +682,125 @@ router.post(
   },
 );
 
+type ArchiveResult = { projects?: Array<{ slug: string }>; agents?: string[]; apps?: unknown[] };
+
+/**
+ * The server's part of a finished project archive: release the user's relay
+ * rooms filed in the archived projects (from the chat server's own list) and
+ * tell every open tab the host's project list changed. Safe to run twice.
+ */
+async function afterProjectArchive(
+  conn: Awaited<ReturnType<typeof connectOneShot>> | null,
+  hostId: number,
+  hostName: string,
+  userId: string,
+  slug: string,
+  result: ArchiveResult,
+): Promise<Array<{ roomId: string; project: string }>> {
+  const archivedSlugs = (result.projects ?? []).map((p) => p.slug);
+  let rooms: Array<{ roomId: string; project: string }> = [];
+  try {
+    rooms = await releaseProjectRooms(userId, archivedSlugs);
+  } catch (err) {
+    databaseLogger.warn("project archive: couldn't release its relay rooms", {
+      operation: "project_archive_rooms",
+      userId,
+      hostId,
+      slug,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+  // Post-write wire event (D-37) — rebuild the projects list (which now
+  // excludes the just-archived slugs) and publish, scoped to this hostId. If
+  // they were the LAST projects on this host, current is [] — a legitimate
+  // per-host delta.
+  try {
+    const registry = getSubscriptionRegistry();
+    if (registry) {
+      const current = await listProjects(conn);
+      registry.publishProjectListChanged(String(hostId), enrichForWire(current, hostId, hostName));
+    } else {
+      // Phase 117 M8 fix (2026-09-18): null-registry-at-request-time is a
+      // startup-timing bug in production. Log a warning so the failure is
+      // visible instead of dropping the WS fanout silently.
+      databaseLogger.warn(
+        `project-list-changed publish skipped: subscription registry not initialized (hostId=${hostId} slug=${slug} op=archive)`,
+      );
+    }
+  } catch (publishErr) {
+    databaseLogger.warn(
+      `project-list-changed publish failed after archive hostId=${hostId} slug=${slug}: ${publishErr instanceof Error ? publishErr.message : String(publishErr)}`,
+    );
+  }
+  return rooms;
+}
+
+/** Archives the server is waiting on to finish, by `${hostId}:${requestId}`. */
+const archivesBeingFinished = new Set<string>();
+/** How long the server keeps asking about an archive still under way (15s waits). */
+const FINISH_LATER_ROUNDS = 40;
+
+/**
+ * An archive still under way when its route answered: keep asking the machine
+ * about it and do the server's part once it's done.
+ */
+function finishProjectArchiveLater(hostId: number, hostName: string, userId: string, slug: string, requestId: string): void {
+  const key = `${hostId}:${requestId}`;
+  if (archivesBeingFinished.has(key)) return;
+  archivesBeingFinished.add(key);
+  void (async () => {
+    try {
+      for (let round = 0; round < FINISH_LATER_ROUNDS; round++) {
+        const finished = await withHost(hostId, userId, async (conn) => {
+          const outcome = await frontDoorStatus(conn, requestId);
+          if (outcome === null || outcome.state === "pending") return outcome === null ? "gone" : null;
+          if (outcome.state === "done") {
+            const rooms = await afterProjectArchive(conn, hostId, hostName, userId, slug, outcome.result as ArchiveResult);
+            databaseLogger.info("project archived (finished after its request answered)", {
+              operation: "project_archive",
+              userId,
+              hostId,
+              slug,
+              requestId,
+              seq: outcome.seq,
+              rooms: rooms.length,
+              outcome: "archived_later",
+            });
+          } else {
+            databaseLogger.info("project archive ended without archiving", {
+              operation: "project_archive",
+              userId,
+              hostId,
+              slug,
+              requestId,
+              outcome: outcome.state,
+              code: "code" in outcome ? outcome.code : undefined,
+            });
+          }
+          return outcome.state;
+        });
+        if (finished !== null) return;
+      }
+      databaseLogger.warn("project archive still under way after the server stopped waiting", {
+        operation: "project_archive_finish_gave_up",
+        hostId,
+        slug,
+        requestId,
+      });
+    } catch (err) {
+      databaseLogger.warn("project archive: couldn't finish the server's part", {
+        operation: "project_archive_finish_failed",
+        hostId,
+        slug,
+        requestId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      archivesBeingFinished.delete(key);
+    }
+  })();
+}
+
 // ---------------------------------------------------------------------------
 // POST /projects/:slug/archive  body { hostId, expected, requestId? }
 // ---------------------------------------------------------------------------
@@ -809,6 +929,21 @@ router.post(
           res.status(500).json({ error: "failed to archive project" });
           return;
         }
+        if (outcome.state === "refused" && outcome.code === "contents_changed") {
+          // The new contents may include a sub-project this user can't see: refuse
+          // instead of showing them what's in it.
+          const now = (outcome.result as ProjectContents | undefined)?.projects ?? [];
+          const visibleNow = await visibleSlugsForCaller(await listProjects(conn), userId);
+          if (now.some((p) => !visibleNow.has(p.slug))) {
+            res.status(409).json({ error: "some sub-projects inside it are hidden from you", code: "sub_projects_hidden" });
+            return;
+          }
+        }
+        if (outcome.state === "pending") {
+          // The machine carries on with it; the server finishes its own part (rooms, other
+          // devices) when it's done, whether or not this client asks again.
+          finishProjectArchiveLater(hostId, host.name ?? String(hostId), userId, slug, requestId);
+        }
         if (outcome.state !== "done") {
           databaseLogger.info("project archive not done", {
             operation: "project_archive",
@@ -823,49 +958,9 @@ router.post(
           res.status(status).json(answer);
           return;
         }
-        const result = outcome.result as { projects?: Array<{ slug: string }>; agents?: string[]; apps?: unknown[] };
+        const result = outcome.result as ArchiveResult;
         const archivedSlugs = (result.projects ?? []).map((p) => p.slug);
-
-        // Relay rooms in any of them go back to Conversations — found from
-        // the chat server's own list, not the browser's sidebar.
-        let rooms: Array<{ roomId: string; project: string }> = [];
-        try {
-          rooms = await releaseProjectRooms(userId, archivedSlugs);
-        } catch (err) {
-          databaseLogger.warn("project archive: couldn't release its relay rooms", {
-            operation: "project_archive_rooms",
-            userId,
-            hostId,
-            slug,
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }
-
-        // Post-write wire event (D-37) — rebuild the projects list
-        // (which now excludes the just-archived slugs) and publish, scoped
-        // to this hostId. If they were the LAST projects on this host,
-        // current is [] — a legitimate per-host delta.
-        try {
-          const registry = getSubscriptionRegistry();
-          if (registry) {
-            const current = await listProjects(conn);
-            registry.publishProjectListChanged(
-              String(hostId),
-              enrichForWire(current, hostId, host.name ?? String(hostId)),
-            );
-          } else {
-            // Phase 117 M8 fix (2026-09-18): null-registry-at-request-time is
-            // a startup-timing bug in production. Log a warning so the
-            // failure is visible instead of dropping the WS fanout silently.
-            databaseLogger.warn(
-              `project-list-changed publish skipped: subscription registry not initialized (hostId=${hostId} slug=${slug} op=archive)`,
-            );
-          }
-        } catch (publishErr) {
-          databaseLogger.warn(
-            `project-list-changed publish failed after archive hostId=${hostId} slug=${slug}: ${publishErr instanceof Error ? publishErr.message : String(publishErr)}`,
-          );
-        }
+        const rooms = await afterProjectArchive(conn, hostId, host.name ?? String(hostId), userId, slug, result);
 
         databaseLogger.info("project archived", {
           operation: "project_archive",
@@ -1192,6 +1287,11 @@ router.get(
         const hiddenSubProjects = descendantSlugs(current, slug).filter(
           (s) => !visible.has(s),
         ).length;
+        if (hiddenSubProjects > 0) {
+          // Refused up front; what's inside isn't this user's to see.
+          res.json({ hiddenSubProjects, contents: null, rooms: [], roomsUnknown: false });
+          return;
+        }
         const outcome = await submitFrontDoor(conn, "project-contents", { slug }, { hostId });
         if (outcome.state === "refused" && outcome.code === "not_found") {
           res.status(404).json({ error: "Project not found" });

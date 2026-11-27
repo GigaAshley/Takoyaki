@@ -88,7 +88,8 @@ export interface ProjectArchiveContents {
 export interface ProjectArchivePreflight {
   /** Sub-projects beneath it hidden from the caller (archiving is refused when not 0). */
   hiddenSubProjects: number;
-  contents: ProjectArchiveContents;
+  /** What it holds — null when some of it is hidden from the caller (archiving is refused). */
+  contents: ProjectArchiveContents | null;
   /** The caller's relay rooms filed in any of them, from the chat server. */
   rooms: Array<{ roomId: string; project: string }>;
   /** The chat server couldn't be asked, so `rooms` is unknown. */

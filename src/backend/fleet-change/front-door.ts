@@ -123,7 +123,17 @@ async function submitOverSsh(
   const cmd =
     `if [ -f ${fc} ]; then python3 ${fc} submit ${kind} ${shellWord(JSON.stringify(args))} ` +
     `--id ${shellWord(id)} --wait ${waitS}; else echo '{"state":"not_installed"}'; fi`;
-  const out = await execCommand(conn, cmd, { timeoutMs: waitS * 1000 + EXEC_GRACE_MS });
+  let out: string;
+  try {
+    out = await execCommand(conn, cmd, { timeoutMs: waitS * 1000 + EXEC_GRACE_MS });
+  } catch (err) {
+    // The command ran out of time on a slow connection: the request was most likely written
+    // down and will still run, so it's pending — asking by its id finds out.
+    if (err instanceof Error && err.name === "ExecTimeoutError") {
+      return { state: "pending", id, seq: null, stage: "received" };
+    }
+    throw err;
+  }
   const line = out.trim().split("\n").pop() ?? "";
   return parseFrontDoorLine(id, line);
 }
@@ -132,6 +142,14 @@ async function submitOverSsh(
 // This backend's own machine: the same protocol as `fleet-change submit`,
 // through the bind mount.
 // ---------------------------------------------------------------------------
+
+// Wall-clock nanoseconds that never go backwards within this process: one wall-clock base,
+// advanced by the monotonic clock, so two submits in the same millisecond keep their order.
+const WALL_BASE_NS = BigInt(Date.now()) * 1_000_000n;
+const MONO_BASE_NS = process.hrtime.bigint();
+function arrivalNs(): bigint {
+  return WALL_BASE_NS + (process.hrtime.bigint() - MONO_BASE_NS);
+}
 
 function localHome(): string {
   return process.env.HOME_HOST_DIR || process.env.HOME || "/";
@@ -199,7 +217,7 @@ async function submitLocally(
   if ((await whereIs(id)) === null) {
     await fs.mkdir(incoming, { recursive: true });
     // Same name shape as fleet-change submit: arrival time in ns, then the id.
-    const name = `${(BigInt(Date.now()) * 1_000_000n + process.hrtime.bigint() % 1_000_000n).toString().padStart(20, "0")}-${id}.json`;
+    const name = `${arrivalNs().toString().padStart(20, "0")}-${id}.json`;
     const tmp = path.join(incoming, `${name}.tmp.${process.pid}`);
     await fs.writeFile(tmp, JSON.stringify({ id, kind, args, received_at: Date.now() / 1000 }) + "\n");
     await fs.rename(tmp, path.join(incoming, name));
