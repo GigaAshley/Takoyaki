@@ -122,12 +122,22 @@ export function AdminUserView({
         <PhoneGroup user={user} onUserChanged={onUserChanged} onDirtyChange={setPhoneDirty} />
         <SessionsGroup user={user} isSelf={isSelf} />
         <HostsGroup user={user} />
-        <KitSettingsGroup title="Details" footer="The Matrix ID is set when the account is made and can't be changed here.">
+        <KitSettingsGroup title="Details" footer="The Matrix ID is set when the account is made. The time zone follows the browser they use the app from, unless they pinned one; only they can change it.">
           <KitSettingsRow
             label="Matrix ID"
             value={
               <span className="font-mono text-[12.5px] break-all" data-testid="admin-user-mxid">
                 {user.mxid ?? "—"}
+              </span>
+            }
+          />
+          <KitSettingsRow
+            label="Time zone"
+            value={
+              <span data-testid="admin-user-time-zone">
+                {user.timeZone
+                  ? `${user.timeZone.replace(/_/g, " ")}${user.timeZonePinned ? " · pinned" : ""}`
+                  : "Not set"}
               </span>
             }
           />

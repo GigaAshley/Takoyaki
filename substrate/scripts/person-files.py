@@ -211,23 +211,58 @@ def _read_head(path):
     return text, True
 
 
-def machine_people():
-    """Usernames on the machine's people list, in file order. Each person is
-    one `- <username> · relay ID …` / `- <username> · no relay ID` line (see
-    the app's machine-people.ts). No list on the machine → nobody."""
+_TIME_ZONE_FIELD = "time zone "
+_TIME_ZONE_NOT_SET = "not set"
+
+
+def _parse_people_line(line):
+    """(username, time zone or None) from one people-list line, or None when
+    the line isn't a person. A person is `- <username> · relay ID …` (or
+    `· no relay ID`), then `· time zone <IANA name>` / `· time zone not set`
+    on lists written since the app learned time zones. Fields are taken off
+    from the right, so a username containing ` · ` survives."""
+    if not line.startswith("- "):
+        return None
+    rest = line[2:]
+    zone = None
+    head, sep, last = rest.rpartition(" · ")
+    if sep and last.startswith(_TIME_ZONE_FIELD):
+        value = last[len(_TIME_ZONE_FIELD):].strip()
+        zone = None if value == _TIME_ZONE_NOT_SET or not value else value
+        rest = head
+    name = rest.rsplit(" · ", 1)[0].strip()
+    return (name, zone) if name else None
+
+
+def _machine_people_entries():
+    """[(username, time zone or None)] in file order, first line per person
+    wins. No list on the machine → nobody."""
     try:
         with open(machine_people_path(), encoding="utf-8") as fh:
             text = fh.read()
     except (OSError, UnicodeDecodeError):
         return []
     out = []
+    seen = set()
     for line in text.split("\n"):
-        if not line.startswith("- "):
+        parsed = _parse_people_line(line)
+        if parsed is None or parsed[0] in seen:
             continue
-        name = line[2:].rsplit(" · ", 1)[0].strip()
-        if name and name not in out:
-            out.append(name)
+        seen.add(parsed[0])
+        out.append(parsed)
     return out
+
+
+def machine_people():
+    """Usernames on the machine's people list, in file order (see the app's
+    machine-people.ts). No list on the machine → nobody."""
+    return [name for name, _ in _machine_people_entries()]
+
+
+def machine_people_time_zones():
+    """{username: IANA time zone or None} for everyone on the machine's
+    people list — None when the person's zone isn't known."""
+    return dict(_machine_people_entries())
 
 
 def agent_people(identity):

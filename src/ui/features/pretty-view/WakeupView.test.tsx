@@ -11,7 +11,7 @@
  * Save only enables once something changed, so the round-trip tests make a
  * trivial rename first and then assert the schedule written back.
  *
- * detectBrowserTimezone is pinned to Europe/London so the "blank zone uses
+ * the person's saved time zone is Europe/London so the "blank zone uses
  * the browser's" assertions are stable.
  */
 
@@ -19,10 +19,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor, cleanup, within } from "@testing-library/react";
 import type { Wakeup } from "@/api/claude-session-api";
 
-vi.mock("./WakeupFormShared", async (importOriginal) => {
-  const actual = (await importOriginal()) as Record<string, unknown>;
-  return { ...actual, detectBrowserTimezone: () => "Europe/London" };
-});
+// The person's saved time zone — "your time zone" in the forms.
+import { __resetMyTimeZoneForTests } from "@/lib/my-time-zone";
 
 import { WakeupView, type WakeupViewProps } from "./WakeupView";
 import type { LeaveGuard } from "./roles-window/RolesWindow";
@@ -121,6 +119,7 @@ async function savedUpdates(onSave: ReturnType<typeof vi.fn>): Promise<{
 }
 
 beforeEach(() => {
+  __resetMyTimeZoneForTests({ timeZone: "Europe/London", pinned: false, loaded: true });
   vi.clearAllMocks();
 });
 

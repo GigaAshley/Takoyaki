@@ -23,12 +23,12 @@ let database: ReturnType<typeof drizzle<typeof schema>>;
 beforeEach(() => {
   sqlite = new Database(":memory:");
   sqlite.exec(`
-    CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT NOT NULL, mxid TEXT);
+    CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT NOT NULL, mxid TEXT, time_zone TEXT);
     CREATE TABLE ssh_data (id INTEGER PRIMARY KEY, user_id TEXT NOT NULL, ip TEXT NOT NULL, port INTEGER NOT NULL, username TEXT NOT NULL, machine_id INTEGER);
     CREATE TABLE host_access (id INTEGER PRIMARY KEY, host_id INTEGER NOT NULL, user_id TEXT, role_id INTEGER, expires_at TEXT);
     CREATE TABLE user_roles (id INTEGER PRIMARY KEY, user_id TEXT NOT NULL, role_id INTEGER NOT NULL);
   `);
-  const users = sqlite.prepare("INSERT INTO users VALUES (?, ?, ?)");
+  const users = sqlite.prepare("INSERT INTO users (id, username, mxid) VALUES (?, ?, ?)");
   for (const [id, name, mxid] of [
     ["u-amy", "amy", "@amy:x"],
     ["u-ben", "ben", "@ben_human:x"],
@@ -61,6 +61,7 @@ describe("listMachinePeople (real SQLite)", () => {
     const people = await listMachinePeople(1, NOW, database);
     expect(people?.map((p) => p.username).sort()).toEqual(["amy", "ben", "cat", "dan"]);
     expect(people?.find((p) => p.username === "cat")?.mxid).toBeNull();
+    expect(people?.every((p) => p.timeZone === null)).toBe(true);
   });
 
   it("gives the same list from either row of the same login", async () => {

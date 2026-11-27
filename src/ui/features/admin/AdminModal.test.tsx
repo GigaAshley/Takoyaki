@@ -396,6 +396,27 @@ describe("AdminModal — a user", () => {
     expect(sw("admin-user-notifications-switch").checked).toBe(true);
   });
 
+  it("shows each person's time zone, read-only, and whether they pinned it", async () => {
+    m.getUserList.mockResolvedValue({
+      users: [
+        ...USERS.filter((u) => u.id !== "u2" && u.id !== "u3"),
+        user({ id: "u2", username: "riley", timeZone: "America/Los_Angeles", timeZonePinned: false }),
+        user({ id: "u3", username: "bob", timeZone: "Asia/Tokyo", timeZonePinned: true }),
+      ],
+    });
+    renderModal();
+    await openUser("riley");
+    expect(screen.getByTestId("admin-user-time-zone").textContent).toBe("America/Los Angeles");
+    await userEvent.click(screen.getByTestId("admin-user-back"));
+    await openUser("bob");
+    expect(screen.getByTestId("admin-user-time-zone").textContent).toBe("Asia/Tokyo · pinned");
+    await userEvent.click(screen.getByTestId("admin-user-back"));
+    await openUser("alice");
+    expect(screen.getByTestId("admin-user-time-zone").textContent).toBe("Not set");
+    // Nothing to change it with.
+    expect(screen.getByTestId("admin-user-time-zone").closest(".k-row")?.querySelector("button, input, select")).toBeNull();
+  });
+
   it("phone: Save appears only once the number changes, and saves it", async () => {
     m.setUserPhone.mockResolvedValue({});
     renderModal();

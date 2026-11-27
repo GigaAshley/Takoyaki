@@ -95,6 +95,11 @@ mentioned, so a machine with no person files hears nothing:
 The very first run records the set silently: the hook just handed those files
 over.
 
+Time zones of those same people come from the people list too (one state
+file, `last-time-zones`): when a person the agent is still shared with gets a
+new known zone, one line — `📝 [time-zone: <user>] <user>'s time zone is now
+<zone>`. This goes out whether or not the person has an About you file.
+
 The watch is diff-first and dumb on purpose: it fires the unified diff of what
 changed (inline when small, spilled to a file pointer when large), and lets the AGENT
 decide whether the change is its own echo, a peer's, or user's. See the design
@@ -1855,6 +1860,52 @@ def _people_sync(identity, baseline_dir, spill_dir, hold=True):
         _atomic_write_baseline(
             baseline_dir, os.path.join(baseline_dir, _PEOPLE_STATE_NAME),
             json.dumps(audience).encode("utf-8"),
+        )
+
+    _time_zones_sync(mod, audience, baseline_dir)
+
+
+# Time zones of the people the agent is shared with, from the machine's people
+# list. `last-time-zones` (JSON {username: zone or null}) holds what the agent
+# last knew; a person still shared with whose zone changed to a known one gets
+# one line. The first run, people newly shared with, and a zone going unknown
+# are recorded silently — the SessionStart people list already has them.
+_TIME_ZONES_STATE_NAME = "last-time-zones"
+
+
+def _read_time_zones_state(baseline_dir):
+    try:
+        with open(os.path.join(baseline_dir, _TIME_ZONES_STATE_NAME), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if isinstance(data, dict) and all(
+        isinstance(k, str) and (v is None or isinstance(v, str)) for k, v in data.items()
+    ):
+        return data
+    return None
+
+
+def _time_zones_sync(mod, audience, baseline_dir):
+    zones_of = getattr(mod, "machine_people_time_zones", None)
+    if zones_of is None:
+        return
+    try:
+        all_zones = zones_of()
+    except Exception as e:
+        print("⚠️ [file-watch] couldn't read people's time zones: %s" % e, file=sys.stderr, flush=True)
+        return
+    current = {u: all_zones.get(u) for u in audience}
+    prior = _read_time_zones_state(baseline_dir)
+    if prior is not None:
+        for u in audience:
+            zone = current[u]
+            if u in prior and zone is not None and prior[u] != zone:
+                _out("📝 [time-zone: %s] %s's time zone is now %s" % (u, u, zone))
+    if prior != current:
+        _atomic_write_baseline(
+            baseline_dir, os.path.join(baseline_dir, _TIME_ZONES_STATE_NAME),
+            json.dumps(current, sort_keys=True).encode("utf-8"),
         )
 
 

@@ -14,7 +14,7 @@
  * before dropping unsaved edits.
  *
  * Each test is a user flow: open → act → check what the user sees and what
- * was written. detectBrowserTimezone is pinned to Europe/London.
+ * was written. the person's saved time zone is Europe/London.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
@@ -69,10 +69,8 @@ vi.mock("@/api/identities-api", () => ({
   roleAvatarUrl: (hostId: number, role: string) => `/avatars/${hostId}/${role}.png`,
 }));
 
-vi.mock("@/features/pretty-view/WakeupFormShared", async (importOriginal) => {
-  const actual = (await importOriginal()) as Record<string, unknown>;
-  return { ...actual, detectBrowserTimezone: () => "Europe/London" };
-});
+// The person's saved time zone — "your time zone" in the forms.
+import { __resetMyTimeZoneForTests } from "@/lib/my-time-zone";
 
 // Radix menus (the right-click menu) measure with ResizeObserver.
 if (typeof window !== "undefined" && !window.ResizeObserver) {
@@ -200,6 +198,7 @@ function title(): string {
 }
 
 beforeEach(() => {
+  __resetMyTimeZoneForTests({ timeZone: "Europe/London", pinned: false, loaded: true });
   listScheduledAgentsMock.mockReset();
   createScheduledAgentMock.mockReset();
   updateScheduledAgentMock.mockReset();

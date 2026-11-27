@@ -19,6 +19,7 @@
 // Round-trip: keys of the schedule the form doesn't show ride along in the
 // hydrated schedule, so an edit never drops them.
 
+import { useMyTimeZone } from "@/lib/my-time-zone";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Check, Server } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -51,7 +52,6 @@ import { SensorDetails } from "@/features/pretty-view/SensorStatusView";
 import {
   type FormSchedule,
   buildSchedule,
-  detectBrowserTimezone,
   hydrateFormSchedule,
   isOnceSensorSchedule,
   isSensorSchedule,
@@ -154,7 +154,7 @@ export function ScheduledTaskView({
 }: ScheduledTaskViewProps): JSX.Element {
   const { t } = useTranslation();
   const isNew = !task;
-  const detectedTz = useMemo(detectBrowserTimezone, []);
+  const detectedTz = useMyTimeZone();
   const isSensor = !!task && isSensorSchedule(task.schedule);
 
   // Drafts start from the task as it was when the view opened; the list's

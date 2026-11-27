@@ -1361,6 +1361,12 @@ const migrateSchema = async () => {
   // users.notificationsEnabled.
   addColumnIfNotExists("users", "notifications_enabled", "INTEGER NOT NULL DEFAULT 0");
 
+  // Person time zone — IANA name (null = not known yet) and whether the
+  // person pinned it. Persisted by the forceSave below. The Drizzle mirror
+  // lives at schema.ts users.timeZone / users.timeZonePinned.
+  addColumnIfNotExists("users", "time_zone", "TEXT");
+  addColumnIfNotExists("users", "time_zone_pinned", "INTEGER NOT NULL DEFAULT 0");
+
   // agent-phone — persist the new users.phone_e164 column. Same pattern as
   // phase-75 and phase-85 above: addColumnIfNotExists executes against RAM
   // SQLite; without an explicit forceSave the schema lives only in memory

@@ -20,6 +20,10 @@
 #   T-F8  — changes made while the watcher was down are told at restart.
 #   T-F9  — agent's own edit to a person file (claimed via the self-edit
 #           hook) stays silent.
+#   T-Z1  — a shared person's new time zone is told (no About you files
+#           needed); first run, unchanged lists, people not shared with and
+#           a zone going unknown stay silent.
+#   T-Z2  — a time zone change made while the watcher was down is told.
 #   T-I1  — instance-wide file edit fires; removal is told once and the
 #           watcher survives; it coming back is told.
 #   T-I2  — instance-wide file absent at start, then appears: told.
@@ -128,6 +132,19 @@ write_people() {
   local f="$HOME_DIR/fleet/host/people.md"
   { printf 'People on this machine — x\n\n'
     for p in "$@"; do printf -- '- %s · no relay ID\n' "$p"; done
+  } > "$f.new"
+  mv "$f.new" "$f"
+}
+
+# Same, with each person's time zone: write_people_tz amy=America/Denver zed=
+# (blank = not set).
+write_people_tz() {
+  local f="$HOME_DIR/fleet/host/people.md"
+  { printf 'People on this machine — x\n\n'
+    for p in "$@"; do
+      local who="${p%%=*}" zone="${p#*=}"
+      printf -- '- %s · relay ID @%s:x · time zone %s\n' "$who" "$who" "${zone:-not set}"
+    done
   } > "$f.new"
   mv "$f.new" "$f"
 }
@@ -309,6 +326,44 @@ test_T_F9_self_edit_silent() {
   wait_for 50 out_has "amy's About you changed — .*rooibos" || fail "edit after self-edit not told; $(logs)"
 }
 
+test_T_Z1_time_zone_change_told() {
+  seed_fixture "users: [amy]" amy zed
+  write_people_tz amy=America/New_York zed=Europe/Paris
+  launch_watcher
+  wait_for 50 test -f "$STATE/last-time-zones" || { fail "zones never recorded; $(logs)"; return; }
+  wait_armed
+  out_has "time-zone" && { fail "first run told a zone; $(logs)"; return; }
+  # Same zones rewritten, and a zone change for someone not shared with: silent.
+  write_people_tz amy=America/New_York zed=Asia/Tokyo
+  sleep 1.5
+  out_has "time-zone" && { fail "told a zone that didn't change for a shared person; $(logs)"; return; }
+  write_people_tz amy=America/Denver zed=Asia/Tokyo
+  wait_for 50 out_has "📝 \[time-zone: amy\] amy's time zone is now America/Denver" \
+    || { fail "zone change not told; $(logs)"; return; }
+  [ "$(grep -c "time-zone" "$OUT_LOG")" = 1 ] || { fail "told more than once; $(logs)"; return; }
+  # Going unknown is recorded, not told; coming back is told.
+  write_people_tz amy= zed=Asia/Tokyo
+  sleep 1.5
+  [ "$(grep -c "time-zone" "$OUT_LOG")" = 1 ] || { fail "told a zone going unknown; $(logs)"; return; }
+  write_people_tz amy=America/Denver zed=Asia/Tokyo
+  zone_notes_are() { [ "$(grep -c "time-zone" "$OUT_LOG")" = "$1" ]; }
+  wait_for 50 zone_notes_are 2 || { fail "zone coming back not told; $(logs)"; return; }
+  out_has "person-file" && fail "person-file notice with no person files; $(logs)"
+  alive || fail "watcher died; $(logs)"
+}
+
+test_T_Z2_time_zone_change_while_down() {
+  seed_fixture "" amy
+  write_people_tz amy=America/New_York
+  launch_watcher
+  wait_for 50 test -f "$STATE/last-time-zones" || { fail "zones never recorded; $(logs)"; return; }
+  wait_armed
+  stop_watcher
+  write_people_tz amy=America/Chicago
+  launch_watcher
+  wait_for 50 out_has "amy's time zone is now America/Chicago" || fail "change while down not told; $(logs)"
+}
+
 test_T_I1_instance_edit_remove_return() {
   seed_fixture "" amy
   printf 'Instance rules.\n' > "$INSTANCE"
@@ -400,6 +455,8 @@ run_test test_T_I2_instance_appears
 run_test test_T_F10_half_written_identity
 run_test test_T_I3_instance_added_while_down
 run_test test_T_I4_instance_first_run_silent
+run_test test_T_Z1_time_zone_change_told
+run_test test_T_Z2_time_zone_change_while_down
 
 printf '\n===============================\n'
 printf 'PASS: %d  FAIL: %d\n' "$PASS" "$FAIL"

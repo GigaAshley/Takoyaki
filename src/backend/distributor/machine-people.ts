@@ -14,6 +14,9 @@
  * since it groups different logins whose homes, and so files, differ), so
  * every such row's sweep writes the same bytes. Expired shares don't count.
  *
+ * Each person's line also carries their time zone (utils/person-time-zone.ts),
+ * so a zone change reaches their machines with the next people-list refresh.
+ *
  * The file states facts only: no instructions, and no product name. Every
  * field is reduced to one plain line before it's written — usernames are
  * user-chosen, and this file is read into every session on the machine.
@@ -29,14 +32,18 @@ export { MACHINE_PEOPLE_REL_PATH } from "./run-bootstrap.js";
 export const MACHINE_PEOPLE_HEADING =
   "People on this machine — this list of everyone with access to this machine is updated automatically.";
 
-export type MachinePerson = { username: string; mxid: string | null };
+export type MachinePerson = { username: string; mxid: string | null; timeZone: string | null };
 
 export function renderMachinePeopleFile(people: readonly MachinePerson[]): string {
   const lines = [...people]
     .sort((a, b) => a.username.localeCompare(b.username))
     .map((p) => {
       const mxid = p.mxid ? plainField(p.mxid) : "";
-      return `- ${plainField(p.username)} · ${mxid ? `relay ID ${mxid}` : "no relay ID"}`;
+      const zone = p.timeZone ? plainField(p.timeZone) : "";
+      return (
+        `- ${plainField(p.username)} · ${mxid ? `relay ID ${mxid}` : "no relay ID"}` +
+        ` · ${zone ? `time zone ${zone}` : "time zone not set"}`
+      );
     });
   return [MACHINE_PEOPLE_HEADING, "", ...lines].join("\n") + "\n";
 }
@@ -101,10 +108,10 @@ export async function listMachinePeople(
 
   if (userIds.size === 0) return [];
   const people = await database
-    .select({ username: users.username, mxid: users.mxid })
+    .select({ username: users.username, mxid: users.mxid, timeZone: users.timeZone })
     .from(users)
     .where(inArray(users.id, [...userIds]));
-  return people.map((p) => ({ username: p.username, mxid: p.mxid ?? null }));
+  return people.map((p) => ({ username: p.username, mxid: p.mxid ?? null, timeZone: p.timeZone ?? null }));
 }
 
 /**

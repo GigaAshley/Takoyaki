@@ -19,6 +19,14 @@
 import { Plus, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
+  myTimeZone,
+  parseLocalInput,
+  wallClockAt,
+  wallClockToInstant,
+  zoneOffsetMinutes,
+  type WallClock,
+} from "@/lib/my-time-zone";
+import {
   KitBanner,
   KitButton,
   KitCheckbox,
@@ -128,15 +136,6 @@ export function cap(s: string): string {
   return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
-export function detectBrowserTimezone(): string {
-  try {
-    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
-    return tz && tz !== "UTC" ? tz : "America/New_York";
-  } catch {
-    return "America/New_York";
-  }
-}
-
 export function pad2(n: number): string {
   return String(n).padStart(2, "0");
 }
@@ -166,55 +165,66 @@ export function formatYearlyDate(month: number, day: number): string {
   return `${pad2(month)}-${pad2(clamped)}`;
 }
 
-function defaultYearlyDate(): string {
-  const d = new Date();
-  return formatYearlyDate(d.getMonth() + 1, d.getDate());
+// Dates and times typed into these forms are wall-clock times in the
+// person's own time zone (myTimeZone(): the saved zone, else the browser's),
+// not the computer's clock.
+
+function defaultYearlyDate(zone: string = myTimeZone()): string {
+  const w = wallClockAt(Date.now(), zone);
+  return formatYearlyDate(w.month, w.day);
 }
 
-function formatLocalInput(d: Date): string {
-  return (
-    d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()) +
-    "T" + pad2(d.getHours()) + ":" + pad2(d.getMinutes())
-  );
+function formatWallClock(w: WallClock): string {
+  return `${w.year}-${pad2(w.month)}-${pad2(w.day)}T${pad2(w.hour)}:${pad2(w.minute)}`;
 }
 
-/** One hour from now, on the hour, as a datetime-local value. */
-export function defaultOneShotAt(): string {
-  const d = new Date(Date.now() + 3600e3);
-  d.setMinutes(0, 0, 0);
-  return formatLocalInput(d);
+function formatLocalInput(d: Date, zone: string = myTimeZone()): string {
+  return formatWallClock(wallClockAt(d.getTime(), zone));
+}
+
+/** One hour from now, on the hour, as a datetime-local value in `zone`. */
+export function defaultOneShotAt(zone: string = myTimeZone()): string {
+  const w = wallClockAt(Date.now() + 3600e3, zone);
+  return formatWallClock({ ...w, minute: 0 });
+}
+
+/** The instant a datetime-local value names in `zone`, or NaN. */
+export function localInputToMs(localVal: string, zone: string = myTimeZone()): number {
+  const w = parseLocalInput(localVal);
+  return w ? wallClockToInstant(w, zone) : NaN;
 }
 
 // Convert a `datetime-local` input string (YYYY-MM-DDTHH:MM) to a timezone-
-// suffixed ISO string using the BROWSER's UTC offset at that instant. This is
-// what the scheduler stores as the fire time for one_shot.
-export function toIsoWithOffset(localVal: string): string {
+// suffixed ISO string in `zone`. This is what the scheduler stores as the
+// fire time for one_shot. A time skipped by a spring-forward is written as
+// the time just after the jump, so the value reads back as it will fire.
+export function toIsoWithOffset(localVal: string, zone: string = myTimeZone()): string {
   if (!localVal) return "";
-  const d = new Date(localVal);
-  const off = -d.getTimezoneOffset(); // minutes east of UTC
+  const ms = localInputToMs(localVal, zone);
+  if (Number.isNaN(ms)) return "";
+  const off = zoneOffsetMinutes(ms, zone); // minutes east of UTC
   const sign = off >= 0 ? "+" : "-";
   const oh = pad2(Math.floor(Math.abs(off) / 60));
   const om = pad2(Math.abs(off) % 60);
-  return localVal + ":00" + sign + oh + ":" + om;
+  return formatWallClock(wallClockAt(ms, zone)) + ":00" + sign + oh + ":" + om;
 }
 
-/** Midnight today (browser-local) as ISO+offset — the default `start` for
+/** Midnight today in `zone` as ISO+offset — the default `start` for
  *  every-N weeks/months. */
-export function startOfTodayIso(): string {
-  const d = new Date();
-  d.setHours(0, 0, 0, 0);
-  return toIsoWithOffset(formatLocalInput(d));
+export function startOfTodayIso(zone: string = myTimeZone()): string {
+  const w = wallClockAt(Date.now(), zone);
+  return toIsoWithOffset(formatWallClock({ ...w, hour: 0, minute: 0 }), zone);
 }
 
 /** Show a spec ISO datetime in a datetime-local input. A naive value is
  *  wall-clock already and is shown as written; a Z/offset value is converted
- *  to browser-local. */
-export function isoToLocalInput(iso: string | undefined): string {
+ *  to `zone`'s wall clock. */
+export function isoToLocalInput(iso: string | undefined, zone: string = myTimeZone()): string {
   if (!iso) return "";
   const naive = /^(\d{4}-\d{2}-\d{2})(?:T(\d{2}:\d{2})(?::\d{2}(?:\.\d+)?)?)?$/.exec(iso.trim());
   if (naive) return `${naive[1]}T${naive[2] ?? "00:00"}`;
   const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? "" : formatLocalInput(d);
+  return Number.isNaN(d.getTime()) ? "" : formatLocalInput(d, zone);
 }
 
 /** Normalize "H:MM" / "HH:MM" to "HH:MM"; null if not a valid time of day. */
@@ -1075,12 +1085,9 @@ export function MonthlyDayFields({
   );
 }
 
-function defaultUntil(): string {
-  const d = new Date(Date.now() + 30 * 86400e3);
-  d.setHours(0, 0, 0, 0);
-  return toIsoWithOffset(
-    d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()) + "T00:00",
-  );
+function defaultUntil(zone: string = myTimeZone()): string {
+  const w = wallClockAt(Date.now() + 30 * 86400e3, zone);
+  return toIsoWithOffset(formatWallClock({ ...w, hour: 0, minute: 0 }), zone);
 }
 
 /** "Ends": never / on a date-time (`until`) / after N runs (`count`). A spec
@@ -1245,8 +1252,8 @@ export function ScheduleWhenFields({
   idPrefix: string;
   testIds: { when: string; kind: string; tz: string };
 }): JSX.Element {
-  const oneShotPast =
-    fs.type === "one_shot" && fs.at !== "" && !Number.isNaN(new Date(fs.at).getTime()) && new Date(fs.at).getTime() < Date.now();
+  const oneShotMs = fs.type === "one_shot" && fs.at !== "" ? localInputToMs(fs.at, detectedTz) : NaN;
+  const oneShotPast = !Number.isNaN(oneShotMs) && oneShotMs < Date.now();
   const validation = validateForm(fs);
   const gateDays = fs.type === "one_shot" ? undefined : (fs as { days?: Weekday[] }).days;
   return (

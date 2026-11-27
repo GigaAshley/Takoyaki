@@ -13,6 +13,9 @@ export interface AdminUser {
   totpEnabled: boolean;
   mxid: string | null;
   phoneE164: string | null;
+  /** IANA time zone, or null when not known yet; read-only for admins. */
+  timeZone?: string | null;
+  timeZonePinned?: boolean;
   avatarPath: string | null;
   /** Push-notification grant. Admins always have notifications regardless. */
   notificationsEnabled: boolean;

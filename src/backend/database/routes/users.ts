@@ -38,6 +38,7 @@ import { registerUserAdminHostRoutes } from "./user-admin-host-routes.js";
 import { registerUserAdminRoutes } from "./user-admin-routes.js";
 import { registerAdminHostsRoutes } from "../../admin-hosts/routes.js";
 import { registerUserPhoneRoutes } from "./user-phone-routes.js";
+import { registerUserTimeZoneRoutes } from "./user-time-zone-routes.js";
 import { getSessionTimeoutHours } from "../../utils/session-timeout.js";
 import { registerServicesAdminRoutes } from "../../agent-services/admin/routes.js";
 import { registerUserDataAccessRoutes } from "./user-data-access-routes.js";
@@ -2788,6 +2789,8 @@ registerUserOidcAccountRoutes(router, {
 registerUserSettingsRoutes(router, authenticateJWT);
 
 registerUserPhoneRoutes(router, authenticateJWT);
+
+registerUserTimeZoneRoutes(router, authenticateJWT);
 
 registerUserApiKeyRoutes(router, requireAdmin);
 

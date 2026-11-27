@@ -138,6 +138,22 @@ out="$(hook agent)"
 [ "${#out}" -le 10000 ] && [[ "$out" == *"more people's files are too long to include here — Read them in $T/fleet/people)"* ]] \
   && pass "many long files: within cap (${#out}), rest pointed at" || fail "many long files: ${#out} chars, tail: ${out: -200}"
 
+# --- people list lines with time zones (and old lines without) ---
+mkdir -p "$T/fleet/host"
+printf 'People on this machine — x\n\n- amy · relay ID @amy:x · time zone America/Denver\n- zed · no relay ID · time zone not set\n- a · b · relay ID @ab:x · time zone Europe/Paris\n- old · relay ID @old:x\n' \
+  > "$T/fleet/host/people.md"
+got="$(HOME="$T" python3 - "$HOOK" <<'PY'
+import importlib.machinery, importlib.util, sys
+l = importlib.machinery.SourceFileLoader("pf", sys.argv[1])
+m = importlib.util.module_from_spec(importlib.util.spec_from_loader("pf", l)); l.exec_module(m)
+print("|".join(m.machine_people()))
+print(sorted(m.machine_people_time_zones().items()))
+PY
+)"
+want="amy|zed|a · b|old
+[('a · b', 'Europe/Paris'), ('amy', 'America/Denver'), ('old', None), ('zed', None)]"
+[ "$got" = "$want" ] && pass "people list with time zones" || fail "people list with time zones: $got"
+
 # --- file names: every unsafe character percent-encoded ---
 got="$(python3 - "$HOOK" <<'PY'
 import importlib.machinery, importlib.util, sys

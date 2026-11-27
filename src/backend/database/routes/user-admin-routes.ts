@@ -92,6 +92,8 @@ export function registerUserAdminRoutes(
           phoneE164: users.phoneE164,
           avatarPath: users.avatarPath,
           notificationsEnabled: users.notificationsEnabled,
+          timeZone: users.timeZone,
+          timeZonePinned: users.timeZonePinned,
         })
         .from(users);
 

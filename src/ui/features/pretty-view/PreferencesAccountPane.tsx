@@ -1,6 +1,6 @@
 /**
- * Preferences → the account: the user's picture, name and Log out, plus the
- * account card that leads the side list.
+ * Preferences → the account: the user's picture, name, time zone and Log
+ * out, plus the account card that leads the side list.
  *
  * Load-bearing invariants (picture):
  *   - Local preview via URL.createObjectURL + revokeObjectURL cleanup (no leaks)
@@ -14,6 +14,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ChevronRight, Pencil } from "lucide-react";
 import { uploadUserAvatar, removeUserAvatar } from "@/api/user-preferences-api";
 import { logoutUser } from "@/main-axios";
+import { PreferencesTimeZoneGroup } from "./PreferencesTimeZoneGroup";
 import {
   KitAvatar,
   KitBanner,
@@ -85,7 +86,7 @@ export function PreferencesAccountCard({
       />
       <span className="flex flex-col min-w-0 text-left">
         <span className="k-account-name truncate">{username?.trim() || "Your account"}</span>
-        <span className="k-account-sub truncate">Picture, log out</span>
+        <span className="k-account-sub truncate">Picture, time zone, log out</span>
       </span>
       {drill ? (
         <ChevronRight size={16} aria-hidden="true" className="ml-auto shrink-0 opacity-45" />
@@ -234,6 +235,8 @@ export function PreferencesAccountPane({
           {error}
         </KitBanner>
       )}
+
+      <PreferencesTimeZoneGroup />
 
       <KitSettingsGroup footer="You'll need to sign in again to get back to your agents.">
         <KitSettingsRow

@@ -18,6 +18,15 @@ import userEvent from "@testing-library/user-event";
 import { PreferencesAccountPane, PreferencesAccountCard } from "./PreferencesAccountPane";
 import { __resetKitDialogsForTests, autoAnswerKitDialogs } from "@/components/kit";
 
+
+// The time zone line loads the saved zone; keep it off the network.
+vi.mock("@/api/user-time-zone-api", () => ({
+  getMyTimeZone: vi.fn().mockResolvedValue({ timeZone: "America/New_York", pinned: false }),
+  reportBrowserTimeZone: vi.fn().mockResolvedValue({ timeZone: "America/New_York", pinned: false }),
+  pinMyTimeZone: vi.fn(),
+  unpinMyTimeZone: vi.fn(),
+}));
+
 vi.mock("@/main-axios", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/main-axios")>();
   return { ...actual, logoutUser: vi.fn().mockResolvedValue(undefined) };
@@ -311,7 +320,7 @@ describe("PreferencesAccountPane", () => {
 });
 
 describe("PreferencesAccountCard", () => {
-  it("shows the name, the picture and 'Picture, log out'; click selects", async () => {
+  it("shows the name, the picture and 'Picture, time zone, log out'; click selects", async () => {
     const onSelect = vi.fn();
     const user = userEvent.setup();
     render(
@@ -326,7 +335,7 @@ describe("PreferencesAccountCard", () => {
     );
     const card = screen.getByTestId("preferences-nav-account");
     expect(card.textContent).toContain("robin");
-    expect(card.textContent).toContain("Picture, log out");
+    expect(card.textContent).toContain("Picture, time zone, log out");
     expect(card.getAttribute("aria-current")).toBe("true");
     expect(card.querySelector("img")?.getAttribute("src")).toContain("abc.png");
     await user.click(card);

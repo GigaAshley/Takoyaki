@@ -12,6 +12,7 @@
 //   - Delete wake-up… at the bottom (existing ones), Cancel / Save or
 //     Create at the foot. Leaving with unsaved changes asks first.
 
+import { useMyTimeZone } from "@/lib/my-time-zone";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ModalFoot } from "@/components/modal";
 import {
@@ -30,7 +31,6 @@ import { SensorDetails, lastFiredLabel } from "./SensorStatusView";
 import {
   type FormSchedule,
   buildSchedule,
-  detectBrowserTimezone,
   hydrateFormSchedule,
   isOnceSensorSchedule,
   isSensorSchedule,
@@ -90,7 +90,7 @@ export function WakeupView({
   gone,
 }: WakeupViewProps): JSX.Element {
   const isNew = !wakeup;
-  const detectedTz = useMemo(detectBrowserTimezone, []);
+  const detectedTz = useMyTimeZone();
   const isSensor = !!wakeup && isSensorSchedule(wakeup.schedule);
 
   // Drafts start from the wake-up as it was when the view opened; the list's

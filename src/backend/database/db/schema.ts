@@ -74,6 +74,14 @@ export const users = sqliteTable("users", {
   notificationsEnabled: integer("notifications_enabled", { mode: "boolean" })
     .notNull()
     .default(false),
+
+  // The person's time zone (IANA name), or null when it isn't known yet. It
+  // follows the browser they use the app from (never plain UTC) unless they
+  // pinned one in Preferences; see utils/person-time-zone.ts.
+  timeZone: text("time_zone"),
+  timeZonePinned: integer("time_zone_pinned", { mode: "boolean" })
+    .notNull()
+    .default(false),
 });
 
 export const settings = sqliteTable("settings", {

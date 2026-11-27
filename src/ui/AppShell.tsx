@@ -1,5 +1,6 @@
 /* eslint-disable react-refresh/only-export-components */
 /* eslint-disable react-hooks/exhaustive-deps */
+import { useFollowBrowserTimeZone } from "@/lib/my-time-zone";
 import { toast } from "sonner";
 import { useTranslation } from "react-i18next";
 import { Sheet, SheetContent } from "@/components/sheet";
@@ -495,6 +496,8 @@ export function AppShell({
   // Phase 137 D-30: avatar filename from /users/me, threaded to PrettyConversationsPanel
   // for the sidebar footer conditional <img> and into PreferencesModal for live-sync.
   const [meAvatarPath, setMeAvatarPath] = useState<string | null>(() => cachedMe?.avatarPath ?? null);
+  // The person's saved time zone follows this browser while the app is open.
+  useFollowBrowserTimeZone(meUserId);
   const [backgroundTabRecords, setBackgroundTabRecords] = useState<
     OpenTabRecord[]
   >([]);

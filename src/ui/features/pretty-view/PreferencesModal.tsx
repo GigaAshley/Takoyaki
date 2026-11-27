@@ -3,7 +3,7 @@
  * a time (apple-ux shape-preferences-modal).
  *
  *   - The list opens with the account card (picture, name) — the account
- *     section holds the picture and Log out. Then About you, Voice,
+ *     section holds the picture, time zone and Log out. Then About you, Voice,
  *     Notifications, Phone; About pinned at the bottom.
  *   - Every section saves as it changes, so there is no Close button at the
  *     bottom; About you carries its own Edit / Cancel / Save foot.

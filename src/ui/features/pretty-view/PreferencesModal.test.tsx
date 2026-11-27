@@ -22,6 +22,15 @@ import { __resetKitDialogsForTests, autoAnswerKitDialogs } from "@/components/ki
 import { publishBrandingConfig, __resetForTest as resetBranding } from "@/branding/branding-store";
 
 // About you's editor, as a plain textarea.
+
+// The time zone line loads the saved zone; keep it off the network.
+vi.mock("@/api/user-time-zone-api", () => ({
+  getMyTimeZone: vi.fn().mockResolvedValue({ timeZone: "America/New_York", pinned: false }),
+  reportBrowserTimeZone: vi.fn().mockResolvedValue({ timeZone: "America/New_York", pinned: false }),
+  pinMyTimeZone: vi.fn(),
+  unpinMyTimeZone: vi.fn(),
+}));
+
 vi.mock("@/features/pretty-view/MarkdownEditor", () => ({
   MarkdownEditor: (props: { content: string; onChange: (v: string) => void }) => (
     <textarea
@@ -431,7 +440,7 @@ describe("PreferencesModal", () => {
     const card = screen.getByTestId("preferences-nav-account");
     expect(buttons[0]).toBe(card);
     expect(card.textContent).toContain("robin");
-    expect(card.textContent).toContain("Picture, log out");
+    expect(card.textContent).toContain("Picture, time zone, log out");
     expect(screen.queryByTestId("preferences-nav-general")).toBeNull();
     expect(screen.queryByTestId("preferences-nav-logout")).toBeNull();
     expect(nav.textContent).not.toMatch(/General|Log out/);
