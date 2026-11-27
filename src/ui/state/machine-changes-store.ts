@@ -126,8 +126,47 @@ export function markFor(changes: readonly MachineChange[]): MachineMark {
 
 export function useMachineMark(hostId: number | string | null | undefined, type: TargetType, name: string | null | undefined): MachineMark {
   const all = useMachineChanges();
+  const local = useSyncExternalStore(subscribe, getLocalArchiving, getLocalArchiving);
   if (hostId === null || hostId === undefined || !name) return null;
-  return markFor(changesFor(all, hostId, type, name));
+  const mark = markFor(changesFor(all, hostId, type, name));
+  if (mark === null && local.has(localKey(hostId, type, name))) {
+    return {
+      kind: "archiving",
+      change: { id: "here", kind: `${type}-archive`, state: "waiting", target: { type, name }, at: null, mine: true },
+    };
+  }
+  return mark;
+}
+
+// ─── An archive this device just sent ────────────────────────────────────────
+//
+// The device that clicked Archive shows the row greyed with "Archiving…" — like every
+// other device — from the click until the machine has taken it (the row then goes) or
+// refused it (the row stays, ungreyed). The machine's own report may not list it yet,
+// so the device marks it here meanwhile.
+let localArchiving: ReadonlySet<string> = new Set();
+const localKey = (hostId: number | string, type: TargetType, name: string) => `${hostId}::${type}::${name.toLowerCase()}`;
+
+function getLocalArchiving(): ReadonlySet<string> {
+  return localArchiving;
+}
+
+/** Grey this row with "Archiving…" until the returned function is called. */
+export function markArchivingHere(hostId: number | string, type: TargetType, name: string): () => void {
+  const k = localKey(hostId, type, name);
+  const next = new Set(localArchiving);
+  next.add(k);
+  localArchiving = next;
+  notify();
+  let cleared = false;
+  return () => {
+    if (cleared) return;
+    cleared = true;
+    const after = new Set(localArchiving);
+    after.delete(k);
+    localArchiving = after;
+    notify();
+  };
 }
 
 // ─── A device's own changes: after the machine settles them ──────────────────
@@ -174,6 +213,7 @@ export function afterMachineSettles(hostId: number | string, requestId: string):
 
 export function __resetMachineChangesForTest(): void {
   byHost = new Map();
+  localArchiving = new Set();
   serialized.clear();
   waiters.clear();
   notify();

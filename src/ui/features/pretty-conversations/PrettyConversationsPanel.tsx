@@ -332,6 +332,7 @@ import {
 } from "@/shell/archive-wakeup-check";
 import { KitScopeContext, type KitScopeValue } from "@/components/kit/scope";
 import { ComingBackRows } from "@/features/machine-changes/ComingBackRows";
+import { markArchivingHere } from "@/state/machine-changes-store";
 
 // Phase 122 Plan 04 (D-17 removal): the SEARCH_HIDDEN_SENTINEL_KEY constant
 // and its one-shot cold-load scroll-hide useEffect at ~L950 were retired
@@ -1935,17 +1936,12 @@ export function PrettyConversationsPanel({
   //      (identity has a visible pane), call handleRowDeactivate(row) to
   //      close the pane BEFORE firing the API call. This mirrors the deleted
   //      handleToggleHide's `handleRowDeactivate` composition.
-  //   5. Optimistic sidebar removal: mark pending-archive, then drop the
-  //      fleet-session row + identity-store entry. The identity keeps pulsing
-  //      fleet-status for ~15s until the supervisor's scan tick retires it;
-  //      the pending-archive filter in conversation-store's upsert/update
-  //      paths keeps the row from flickering back in during that window.
-  //   6. await archiveIdentity. On success the pending flag stays set until
-  //      the supervisor's onGone frame arrives (harmless — the identity is
-  //      gone), and gets naturally GC'd on page reload. On failure we roll
-  //      back: clearPendingArchive so the next fleet-status pulse re-inserts
-  //      the row, then a kit notice so the user knows the archive did not
-  //      land.
+  //   5. The row stays, greyed with "Archiving…" (markArchivingHere), while
+  //      the machine has the archive waiting its turn.
+  //   6. Once the machine has taken it, the row is removed (pending-archive
+  //      keeps a racing fleet-status frame from putting it back until the
+  //      `gone` frame lands). Refused: the mark comes off and the user is
+  //      told — a dialog while this still asks, the row's mark after.
   //
   // D-05 lock: no un-archive branch. One-way gesture.
   // Optimistic archive removal + its undo. The undo can't wait for the next
@@ -1991,25 +1987,27 @@ export function PrettyConversationsPanel({
     return { hostIdNum, identityKey, label };
   };
 
-  // The archive call itself, after the row is already gone from the sidebar.
-  // On failure the row comes back and the user is told.
-  const commitArchive = async (hostIdNum: number, identityKey: string, undoRemove: () => void, label?: string) => {
+  // The archive call itself. The row stays, greyed with "Archiving…", until the machine
+  // has taken it (then it goes) or refused it (then it stays, and the user is told —
+  // straight away while this still asks, or by the mark on the row after).
+  const commitArchive = async (hostIdNum: number, identityKey: string, label?: string) => {
+    const clearMark = markArchivingHere(hostIdNum, "agent", identityKey);
     try {
       const answer = await archiveIdentity(hostIdNum, identityKey, () => {
         toast(`Still archiving "${label ?? identityKey}"`, { description: "The machine is still working on it." });
       });
-      // Still waiting its turn when this stopped asking: the row stays gone until the
-      // machine says. Refused after all → the row comes back with the reason on it.
-      if ((await whenMachineDone(hostIdNum, answer)) === "failed") {
+      const ended = await whenMachineDone(hostIdNum, answer);
+      clearMark();
+      if (ended === "failed") {
         console.info({ operation: "identity_archive_refused_later", hostId: hostIdNum, identityKey });
-        undoRemove();
         return;
       }
-      // Archived: every open copy of the conversation in this window closes.
+      // Taken: gone from the sidebar now, and every open copy of the conversation in
+      // this window closes.
+      optimisticArchiveRemove(hostIdNum, identityKey, identityKey);
       announceAgentArchived(hostIdNum, identityKey);
     } catch (err) {
-      // Rollback: put the row back now (see optimisticArchiveRemove).
-      undoRemove();
+      clearMark();
       console.warn({
         operation: "identity_archive_failed",
         hostId: hostIdNum,
@@ -2056,11 +2054,7 @@ export function PrettyConversationsPanel({
     if (activeSetRef.current.has(row.id)) { // latest — the confirm doesn't freeze the page
       handleRowDeactivate(row);
     }
-    // Optimistic removal — mark pending FIRST so any in-flight fleet-status
-    // frame that races with the removes below is silent-dropped rather than
-    // re-inserting the row.
-    const undoRemove = optimisticArchiveRemove(hostIdNum, identityKey, identityKey);
-    await commitArchive(hostIdNum, identityKey, undoRemove, label);
+    await commitArchive(hostIdNum, identityKey, label);
   };
 
   // Swipe-to-archive on touch (shape-sidebar): no confirm. The row leaves at
@@ -2117,7 +2111,9 @@ export function PrettyConversationsPanel({
         if (check.status === "unknown" && !checkFailureShown) {
           toast(`Archived "${label}"`, { description: "Couldn't check its scheduled wake-ups first — any it had have stopped." });
         }
-        void commitArchive(hostIdNum, identityKey, undoRemove, label);
+        // The Undo window is over: the row comes back greyed while the machine has it.
+        undoRemove();
+        void commitArchive(hostIdNum, identityKey, label);
       });
     };
     const undo = () => {
@@ -3088,12 +3084,13 @@ export function PrettyConversationsPanel({
   //   2. Confirm, naming the project and counting its sub-projects, agents,
   //      apps (by name) and relay rooms; Archive waits for the agents'
   //      wake-up checks.
-  //   3. Show it archived at once (projects, agents and rooms leave the
-  //      sidebar), then send the archive with the list that was confirmed.
-  //   4. The machine refuses when what's inside changed since: everything is
-  //      put back and the confirm shows the new list. Any other refusal or
-  //      failure puts everything back and says why. Still working after the
-  //      wait: a note, and it stays shown as archived.
+  //   3. Grey it with "Archiving…" (its agents' panes close), then send the
+  //      archive with the list that was confirmed. Once the machine has taken
+  //      it, the projects, agents and rooms leave the sidebar.
+  //   4. The machine refuses when what's inside changed since: the mark comes
+  //      off and the confirm shows the new list. Any other refusal or failure
+  //      takes the mark off and says why. Still waiting after this stops
+  //      asking: a note, and it stays greyed until the machine says.
   // RDP rows never sit in a project section; agents are matched to their
   // sidebar rows by name only to hide them and close their panes.
   const handleArchiveProject = useCallback(
@@ -3233,17 +3230,10 @@ export function PrettyConversationsPanel({
         });
         if (!proceed) return;
 
-        // 3. Shown archived at once.
-        const undo: Array<() => void> = [];
+        // 3. Greyed with "Archiving…" (the project and everything in it) until the
+        //    machine has taken it; its agents' open panes close now.
+        const clearMark = markArchivingHere(projHostIdNum, "project", slug);
         const archivedSlugs = new Set(contents.projects.map((p) => p.slug));
-        const hostRows = getProjectsSnapshot().filter((p) => p.hostId === projHost);
-        mergeProjectsForHost(projHost, hostRows.filter((p) => !archivedSlugs.has(p.slug)));
-        undo.push(() => {
-          const now = getProjectsSnapshot().filter((p) => p.hostId === projHost);
-          // Put back only what's still missing (a newer list may already have it).
-          const missing = hostRows.filter((p) => archivedSlugs.has(p.slug) && !now.some((n) => n.slug === p.slug));
-          if (missing.length > 0) mergeProjectsForHost(projHost, [...now, ...missing]);
-        });
         const agentNames = new Set(contents.agents.map((a) => a.name));
         const agentRows = projectSectionsRef.current
           .filter((s) => s.hostId === undefined || s.hostId === projHost)
@@ -3255,14 +3245,19 @@ export function PrettyConversationsPanel({
           });
         for (const r of agentRows) {
           if (activeSetRef.current.has(r.id)) handleRowDeactivateRef.current(r);
-          const key = sessionMatchKey(r.targetTmuxSession as string) ?? (r.targetTmuxSession as string);
-          undo.push(optimisticArchiveRemove(projHostIdNum, r.targetTmuxSession as string, key));
         }
-        for (const room of pre.rooms) {
-          if (archivedSlugs.has(room.project)) undo.push(patchRoomProjectAssignment(room.roomId, null));
-        }
-        const putBack = () => {
-          for (const u of undo.reverse()) u();
+        // 4. Taken: off the sidebar — the projects, their agents, and rooms back to
+        //    Conversations.
+        const removeArchived = () => {
+          const hostRows = getProjectsSnapshot().filter((p) => p.hostId === projHost);
+          mergeProjectsForHost(projHost, hostRows.filter((p) => !archivedSlugs.has(p.slug)));
+          for (const r of agentRows) {
+            const key = sessionMatchKey(r.targetTmuxSession as string) ?? (r.targetTmuxSession as string);
+            optimisticArchiveRemove(projHostIdNum, r.targetTmuxSession as string, key);
+          }
+          for (const room of pre.rooms) {
+            if (archivedSlugs.has(room.project)) patchRoomProjectAssignment(room.roomId, null);
+          }
         };
 
         try {
@@ -3279,12 +3274,18 @@ export function PrettyConversationsPanel({
             agents: contents.agents.length,
             apps: contents.apps.length,
           });
-          if (answer.done) {
-            for (const a of contents.agents) announceAgentArchived(projHostIdNum, a.name);
+          const ended = await whenMachineDone(projHostIdNum, answer);
+          clearMark();
+          // Refused after this stopped asking: it stays, with the reason on its header.
+          if (ended === "failed") {
+            console.info({ operation: "archive_project_refused_later", slug, hostId: projHostIdNum });
+            return;
           }
+          removeArchived();
+          for (const a of contents.agents) announceAgentArchived(projHostIdNum, a.name);
           return;
         } catch (err) {
-          putBack();
+          clearMark();
           const changed =
             err instanceof MachineChangeError && err.code === "contents_changed" && err.result !== null
               ? (err.result as ProjectArchiveContents)

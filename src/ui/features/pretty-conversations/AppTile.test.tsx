@@ -99,6 +99,7 @@ vi.mock("../../api/apps-rename-api", async (importOriginal) => {
 });
 
 import { AppTile } from "./AppTile";
+import { __resetMachineChangesForTest } from "../../state/machine-changes-store";
 import { archiveApp } from "../../api/apps-archive-api";
 import { renameApp } from "../../api/apps-rename-api";
 import {
@@ -574,7 +575,8 @@ describe("AppTile — app-archive shape: Archive menu item", () => {
     warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     // Reset the archiveApp mock per test.
     (archiveApp as unknown as Mock).mockReset();
-    (archiveApp as unknown as Mock).mockResolvedValue({ ok: true });
+    (archiveApp as unknown as Mock).mockResolvedValue({ done: true, requestId: "a1", result: {} });
+    __resetMachineChangesForTest();
     // Reset the store mock spies per test.
     (publishAppGone as unknown as Mock).mockClear();
     (markPendingAppArchive as unknown as Mock).mockClear();
@@ -673,34 +675,32 @@ describe("AppTile — app-archive shape: Archive menu item", () => {
     expect(warnPayload.errMessage).toBe(errorMessage);
   });
 
-  it("Q: optimistic sidebar removal — markPendingAppArchive + publishAppGone fire on confirm=true, in that order, BEFORE archiveApp resolves", async () => {
+  it("Q: the tile greys with Archiving… while the machine has it, and leaves (mark, then gone) once archived", async () => {
     autoAnswerKitDialogs({ confirm: true });
-    // archiveApp never resolves — the optimistic mutators must not wait on it.
-    (archiveApp as unknown as Mock).mockReturnValue(new Promise(() => {}));
+    let finish!: (v: unknown) => void;
+    (archiveApp as unknown as Mock).mockReturnValue(new Promise((r) => (finish = r)));
     render(<AppTile app={makeApp({ hostId: "7", slug: "scratch", title: "Scratch" })} />);
     const tile = screen.getByRole("button", { name: /App tile: Scratch/ });
     await openTileKebab(tile);
     fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
 
-    // Both mutators fired with the wire-shaped hostId (string) and slug.
-    await vi.waitFor(() => expect(publishAppGone).toHaveBeenCalledTimes(1));
-    expect(markPendingAppArchive).toHaveBeenCalledTimes(1);
-    expect(markPendingAppArchive).toHaveBeenCalledWith("7", "scratch");
-    expect(publishAppGone).toHaveBeenCalledWith("7", "scratch");
-    // Rollback path did NOT fire on the happy path.
-    expect(clearPendingAppArchive).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(tile.getAttribute("data-machine-mark")).toBe("archiving"));
+    expect(tile.textContent).toContain("Archiving…");
+    expect(publishAppGone).not.toHaveBeenCalled();
 
-    // Order matters: mark THEN gone. If gone fired first, the sidebar
-    // would drop the tile and any in-flight app-update frame arriving in
-    // the same tick could re-add it before mark is set. Assert via mock
-    // invocation order.
+    await act(async () => finish({ done: true, requestId: "a1", result: {} }));
+    await vi.waitFor(() => expect(publishAppGone).toHaveBeenCalledWith("7", "scratch"));
+    expect(markPendingAppArchive).toHaveBeenCalledWith("7", "scratch");
+    // Mark THEN gone: a racing app-update must not re-add it.
     const markOrder = (markPendingAppArchive as unknown as Mock).mock.invocationCallOrder[0];
     const goneOrder = (publishAppGone as unknown as Mock).mock.invocationCallOrder[0];
     expect(markOrder).toBeLessThan(goneOrder);
+    expect(tile.getAttribute("data-machine-mark")).toBeNull();
   });
 
-  it("R: onArchive callback fires with (Number(hostId), slug, title) after optimistic remove", async () => {
+  it("R: onArchive (close its panes) fires at the confirm, before the machine answers", async () => {
     autoAnswerKitDialogs({ confirm: true });
+    (archiveApp as unknown as Mock).mockReturnValue(new Promise(() => {}));
     const onArchive = vi.fn();
     render(
       <AppTile
@@ -714,15 +714,10 @@ describe("AppTile — app-archive shape: Archive menu item", () => {
 
     await vi.waitFor(() => expect(onArchive).toHaveBeenCalledTimes(1));
     expect(onArchive).toHaveBeenCalledWith(7, "scratch", "Scratch");
-    // Ordering: publishAppGone (sidebar drop) BEFORE onArchive (tab close).
-    // The user sees the tile go, then any open pane close — no scenario
-    // where the pane persists after the tile vanishes.
-    const goneOrder = (publishAppGone as unknown as Mock).mock.invocationCallOrder[0];
-    const archiveOrder = (onArchive as unknown as Mock).mock.invocationCallOrder[0];
-    expect(goneOrder).toBeLessThan(archiveOrder);
+    expect(publishAppGone).not.toHaveBeenCalled();
   });
 
-  it("S: archiveApp rejects → clearPendingAppArchive fires (rollback) alongside the alert", async () => {
+  it("S: archiveApp rejects → the mark comes off, the tile stays, and the alert says why", async () => {
     const errorMessage = "boom";
     (archiveApp as unknown as Mock).mockRejectedValueOnce(new Error(errorMessage));
     const dialogs = autoAnswerKitDialogs({ confirm: true });
@@ -731,26 +726,21 @@ describe("AppTile — app-archive shape: Archive menu item", () => {
     await openTileKebab(tile);
     fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
 
-    // Optimistic-remove fired.
-    await vi.waitFor(() => expect(markPendingAppArchive).toHaveBeenCalledWith("7", "scratch"));
-    expect(publishAppGone).toHaveBeenCalledWith("7", "scratch");
-
-    // Wait for the awaited archiveApp to reject and the catch to run.
-    await vi.waitFor(() => expect(clearPendingAppArchive).toHaveBeenCalledTimes(1));
-    expect(clearPendingAppArchive).toHaveBeenCalledWith("7", "scratch");
-    expect(alerts(dialogs)).toHaveLength(1);
+    await vi.waitFor(() => expect(alerts(dialogs)).toHaveLength(1));
+    expect(tile.getAttribute("data-machine-mark")).toBeNull();
+    expect(publishAppGone).not.toHaveBeenCalled();
+    expect(markPendingAppArchive).not.toHaveBeenCalled();
   });
 
   it("T: onArchive is optional — missing prop does not throw the click handler", async () => {
     autoAnswerKitDialogs({ confirm: true });
+    (archiveApp as unknown as Mock).mockResolvedValue({ done: true, requestId: "a1", result: {} });
     render(<AppTile app={makeApp()} />);
     const tile = screen.getByRole("button", { name: /App tile: Scratch/ });
     await openTileKebab(tile);
     expect(() => {
       fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
     }).not.toThrow();
-    // Store optimistic-remove still fires; only the tab-close callback is
-    // silently skipped.
     await vi.waitFor(() => expect(publishAppGone).toHaveBeenCalledTimes(1));
     expect(markPendingAppArchive).toHaveBeenCalledTimes(1);
   });

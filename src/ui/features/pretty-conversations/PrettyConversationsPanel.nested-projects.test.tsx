@@ -854,23 +854,19 @@ describe("nested projects: archive takes the subtree", () => {
     expect(archiveProjectSpy).not.toHaveBeenCalled();
   });
 
-  it("a failed archive puts the whole subtree back and says why", async () => {
+  it("a failed archive leaves the whole subtree in place and says why", async () => {
     seedTree();
     const dialogs = autoAnswerKitDialogs({ confirm: () => true });
     archiveProjectSpy.mockRejectedValueOnce(new MachineChangeError("couldn't stop the app 'beds': unit busy", 500, "app_stop_failed", null));
-    const keepList = (h: string, rows: typeof mockProjects) => {
-      mockProjects = [...mockProjects.filter((p) => p.hostId !== h), ...rows];
-    };
-    mergeProjectsForHostSpy.mockImplementationOnce(keepList).mockImplementationOnce(keepList);
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const { container } = renderPanel();
     await openProjectKebabAndClickItem(container, "skynet", "Archive project");
     await waitFor(() => expect(dialogs.calls.filter((c) => c.kind === "alert")).toHaveLength(1));
     const alert = dialogs.calls.find((c) => c.kind === "alert")!;
     expect(String(alert.opts.body)).toBe("Couldn't stop the app 'beds': unit busy. Nothing was archived.");
-    // Hidden first, then put back: the last list has every project of the subtree again.
-    const lastRows = mergeProjectsForHostSpy.mock.calls.at(-1)![1] as Array<{ slug: string }>;
-    expect(lastRows.map((r) => r.slug).sort()).toEqual(["design", "ops", "other", "skynet", "ui"]);
+    // Greyed while the machine had it, never taken off the sidebar; the mark is off again.
+    expect(mergeProjectsForHostSpy).not.toHaveBeenCalled();
+    expect(sectionEl(container, "skynet")!.getAttribute("data-machine-mark")).toBeNull();
     warnSpy.mockRestore();
   });
 });

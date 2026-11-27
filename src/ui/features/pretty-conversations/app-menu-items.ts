@@ -3,11 +3,11 @@ import { encodeWorkspaceSpec, specForTab } from "../../lib/tab-url";
 import { renameApp, validateAppTitle } from "../../api/apps-rename-api";
 import { requestAppMove, type AppMoveDestination } from "../../api/apps-move-api";
 import { MachineChangeError, reasonSentence, whenMachineDone } from "../../api/machine-changes-api";
+import { markArchivingHere } from "../../state/machine-changes-store";
 import { toast } from "sonner";
 import {
   publishAppGone,
   markPendingAppArchive,
-  clearPendingAppArchive,
   setPendingAppTitle,
   clearPendingAppTitle,
   setPendingAppMove,
@@ -157,9 +157,9 @@ export function buildAppMoveToItem(
 
 export function buildAppMenuItems(
   app: AppMenuTarget,
-  // Fired after the user confirms Archive, once the tile is optimistically
-  // dropped and BEFORE the awaited archiveApp resolves, so the parent can
-  // close every open pane for this app in the same beat as the tile vanishes.
+  // Fired after the user confirms Archive, as the tile greys with "Archiving…"
+  // and BEFORE the awaited archiveApp resolves, so the parent can close every
+  // open pane for this app straight away.
   onArchive?: (hostId: number, slug: string, title: string) => void,
 ): AppMenuItems {
   // Defensive encodeURIComponent on both segments — APP_SLUG_RE gates the
@@ -260,26 +260,28 @@ export function buildAppMenuItems(
           }))
         )
           return;
-        // Mark pending FIRST so any in-flight fleet-status app-update /
-        // app-snapshot frame is silent-dropped rather than re-inserting it.
-        markPendingAppArchive(app.hostId, app.slug);
-        publishAppGone(app.hostId, app.slug);
+        // The tile stays, greyed with "Archiving…", until the machine has archived it.
+        const clearMark = markArchivingHere(app.hostId, "app", app.slug);
         onArchive?.(Number(app.hostId), app.slug, app.title);
         // A refusal or failure carries the machine's reason (MachineChangeError).
         try {
           const answer = await archiveApp(Number(app.hostId), app.slug, () => {
             toast(`Still archiving "${app.title}"`, { description: "The machine is still working on it." });
           });
-          // Still waiting its turn when this stopped asking: gone until the machine says.
-          // Refused after all → it comes back, with the reason on it.
-          if ((await whenMachineDone(app.hostId, answer)) === "failed") {
+          const ended = await whenMachineDone(app.hostId, answer);
+          clearMark();
+          // Refused after this stopped asking: it stays, with the reason on it.
+          if (ended === "failed") {
             console.info({ operation: "app_archive_refused_later", hostId: Number(app.hostId), slug: app.slug });
-            clearPendingAppArchive(app.hostId, app.slug);
+            return;
           }
+          // Archived: off the sidebar now. Mark pending FIRST so a racing fleet-status
+          // app-update / app-snapshot frame is silent-dropped rather than re-inserting it.
+          markPendingAppArchive(app.hostId, app.slug);
+          publishAppGone(app.hostId, app.slug);
         } catch (err) {
-          // Rollback: the next fleet-status pulse re-inserts the tile. Closed
-          // panes are NOT re-opened — the alert lets the user do it by hand.
-          clearPendingAppArchive(app.hostId, app.slug);
+          // Closed panes are NOT re-opened — the alert lets the user do it by hand.
+          clearMark();
           const errMessage = err instanceof Error ? err.message : String(err);
           console.warn({
             operation: "app_archive_failed",

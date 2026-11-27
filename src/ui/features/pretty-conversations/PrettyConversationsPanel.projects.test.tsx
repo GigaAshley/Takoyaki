@@ -1654,7 +1654,7 @@ describe("PrettyConversationsPanel: archive-project cascade (117-09 Task 2)", ()
     mockActiveSet = new Set();
   });
 
-  it("A9 Test 2b (refused): everything is put back and the machine's reason is shown", async () => {
+  it("A9 Test 2b (refused): nothing leaves the sidebar and the machine's reason is shown", async () => {
     setSnapshot({ projectSections: [{ slug: "alpha", displayName: "Alpha", rows: [] }] });
     mockProjects = [alpha];
     confirmAnswer = true;
@@ -1669,7 +1669,7 @@ describe("PrettyConversationsPanel: archive-project cascade (117-09 Task 2)", ()
     expect(String((kitCalls("alert")[0] as KitAlertOptions).body)).toBe(
       "That project doesn't exist or is already archived. Nothing was archived.",
     );
-    expect(mergeProjectsForHostSpy).toHaveBeenLastCalledWith("1", [alpha]);
+    expect(mergeProjectsForHostSpy).not.toHaveBeenCalled();
     warnSpy.mockRestore();
   });
 

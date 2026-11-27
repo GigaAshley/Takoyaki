@@ -98,15 +98,12 @@ export interface AppTileProps {
   // → openTab boundary.
   onOpenApp?: (hostId: number, slug: string, title: string) => void;
   // Fired after the user confirms Archive (both dialogs accepted) so the
-  // parent can close any open tabs/panes that point at this app. Runs
-  // AFTER the optimistic publishAppGone drop (tile is already off the
-  // grid) but BEFORE the awaited archiveApp resolves, so the pane close
-  // and the tile removal appear together to the user rather than staggered
-  // by the API round-trip. Mirrors identity-archive's handleRowDeactivate
-  // composition — this component owns the store optimistic-remove; the
-  // parent owns anything that touches AppShell-level state (tabs, split
-  // tree). Optional so preview surfaces / older tests can render without
-  // wiring the callback.
+  // parent can close any open tabs/panes that point at this app. Runs as the
+  // tile greys with "Archiving…" and BEFORE the awaited archiveApp resolves;
+  // the tile leaves the grid once the machine has archived it. The parent
+  // owns anything that touches AppShell-level state (tabs, split tree).
+  // Optional so preview surfaces / older tests can render without wiring the
+  // callback.
   onArchive?: (hostId: number, slug: string, title: string) => void;
   // Density variant — mirrors PrettyConversationRow's `variant` prop. Drives
   // the `pv-app-tile--mobile` vs `pv-app-tile--desktop` class toggle so tiles

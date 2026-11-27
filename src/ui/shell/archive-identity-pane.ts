@@ -1,16 +1,17 @@
 // ─── archive-identity-pane.ts ──────────────────────────────────────────────
-// Archive the identity behind an open pane: confirm, close the pane, drop
-// the sidebar row optimistically, then fire the archive. Shared by the
+// Archive the identity behind an open pane: confirm, close the pane, grey
+// the sidebar row with "Archiving…", then fire the archive; the row goes once
+// the machine has taken it. Shared by the
 // identity badge's menu Archive item and the badge drop lane's archive zone
 // so both read the same confirmation and roll back the same way. The agent's
 // active wake-ups are looked up while the confirm is open — Archive waits for
 // them — so it can name the ones that would stop (archive-wakeup-check.ts).
 
 import { announceAgentArchived } from "@/features/archived-view/archived-identity";
-import { applyIdentityChange, refreshIdentities } from "@/state/identities-store";
+import { applyIdentityChange } from "@/state/identities-store";
+import { markArchivingHere } from "@/state/machine-changes-store";
 import {
   markPendingArchive,
-  clearPendingArchive,
   removeFleetSession,
 } from "@/state/conversation-store";
 import { toast } from "sonner";
@@ -61,29 +62,29 @@ async function confirmThenArchive(args: {
   // Close the visible pane BEFORE the API call (mirrors the panel's
   // handleArchive).
   closePane();
-  // Optimistic sidebar removal — markPendingArchive FIRST so an in-flight
-  // fleet-status upsert racing the removes is silent-dropped rather than
-  // re-inserting the row.
-  markPendingArchive(hostId, identityKey);
-  removeFleetSession(hostId, identityKey);
-  applyIdentityChange(null, identityKey, hostId);
+  // The sidebar row stays, greyed with "Archiving…", until the machine has taken it.
+  const clearMark = markArchivingHere(hostId, "agent", identityKey);
   void (async () => {
     try {
       const answer = await archiveIdentity(hostId, identityKey, () => {
         toast(`Still archiving "${label}"`, { description: "The machine is still working on it." });
       });
-      // Still waiting its turn when this stopped asking: gone until the machine says.
-      // Refused after all → it comes back with the reason on its row.
-      if ((await whenMachineDone(hostId, answer)) === "failed") {
+      const ended = await whenMachineDone(hostId, answer);
+      clearMark();
+      // Refused after this stopped asking: the row stays, with the reason on it.
+      if (ended === "failed") {
         console.info({ operation: "identity_archive_refused_later", hostId, identityKey });
-        clearPendingArchive(hostId, identityKey);
-        refreshIdentities({ [identityKey]: hostId }).catch(() => {});
         return;
       }
+      // Taken: off the sidebar now — markPendingArchive FIRST so a racing fleet-status
+      // upsert is silent-dropped rather than re-inserting the row.
+      markPendingArchive(hostId, identityKey);
+      removeFleetSession(hostId, identityKey);
+      applyIdentityChange(null, identityKey, hostId);
       // Archived: every other open copy in this window closes too.
       announceAgentArchived(hostId, identityKey);
     } catch (err) {
-      clearPendingArchive(hostId, identityKey);
+      clearMark();
       console.warn({
         operation: "identity_archive_failed",
         hostId,

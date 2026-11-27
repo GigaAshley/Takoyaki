@@ -21,7 +21,13 @@ vi.mock("@/state/identities-store", () => ({
 }));
 
 import { __resetKitDialogsForTests, autoAnswerKitDialogs } from "@/components/kit/dialogs";
-import { __resetMachineChangesForTest, setMachineChanges, useMachineMark, type MachineChange } from "@/state/machine-changes-store";
+import {
+  __resetMachineChangesForTest,
+  markArchivingHere,
+  setMachineChanges,
+  useMachineMark,
+  type MachineChange,
+} from "@/state/machine-changes-store";
 import { __resetProjectsForTest, setProjects } from "@/state/conversation-store";
 import { MachineChangeMark } from "./MachineChangeMark";
 import { MachineNoticePopups } from "./MachineNoticePopups";
@@ -90,6 +96,18 @@ describe("waiting marks", () => {
     );
     expect(screen.getByTestId("row-finch").textContent).toBe("Moving…");
     expect(screen.getByTestId("row-wren").textContent).toBe("Moving to Pinned…");
+  });
+
+  it("the device that clicked Archive greys the row at once, before the machine's report lists it", () => {
+    render(<AgentMark name="finch" />);
+    let clear!: () => void;
+    act(() => {
+      clear = markArchivingHere(1, "agent", "finch");
+    });
+    expect(screen.getByTestId("row-finch").getAttribute("data-machine-mark")).toBe("archiving");
+    expect(screen.getByTestId("row-finch").textContent).toBe("Archiving…");
+    act(() => clear());
+    expect(screen.getByTestId("row-finch").getAttribute("data-machine-mark")).toBeNull();
   });
 
   it("a rename waiting its turn shows nothing", () => {

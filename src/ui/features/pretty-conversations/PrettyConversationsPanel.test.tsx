@@ -2999,12 +2999,10 @@ describe("PrettyConversationsPanel: Phase 115 Plan 115-06 handleArchive", () => 
     ).toBeNull();
   });
 
-  // A11: optimistic sidebar removal — confirm=true fires markPendingArchive +
-  // removeFleetSession + applyIdentityChange with the correct (hostId, key)
-  // BEFORE the awaited archiveIdentity resolves. This is what makes the row
-  // disappear immediately instead of ~15s later after the supervisor's retire
-  // tick.
-  it("A11: confirm=true → markPendingArchive + removeFleetSession fire synchronously with (hostId, key) before archiveIdentity resolves", async () => {
+  // A11: while the machine has the archive, the row stays greyed with
+  // "Archiving…"; once it's taken, markPendingArchive + removeFleetSession take
+  // the row off the sidebar.
+  it("A11: confirm=true → the row greys with Archiving… until the machine answers, then leaves", async () => {
     const hostA = makeHost("42", "hostA");
     mockIdentitiesByKey = new Map([
       ["wren", { identityKey: "wren", displayName: "wren", title: null }],
@@ -3038,11 +3036,17 @@ describe("PrettyConversationsPanel: Phase 115 Plan 115-06 handleArchive", () => 
     const body = rowEl!.querySelector('[role="button"]') as HTMLElement;
     await openRowKebabInBody(body);
     const menu = screen.getByRole("menu");
+    let finish!: (v: unknown) => void;
+    archiveIdentitySpy.mockImplementationOnce(() => new Promise((r) => (finish = r)) as never);
     const archiveItem = within(menu).getByRole("menuitem", { name: "Archive" });
     fireEvent.click(archiveItem);
 
-    // All three before-await calls happened, each exactly once.
     await waitFor(() => expect(archiveIdentitySpy).toHaveBeenCalled());
+    await waitFor(() => expect(rowEl!.getAttribute("data-machine-mark")).toBe("archiving"));
+    expect(rowEl!.textContent).toContain("Archiving…");
+    expect(removeFleetSessionSpy).not.toHaveBeenCalled();
+    await act(async () => finish({ done: true, requestId: "a1", result: {} }));
+    await waitFor(() => expect(removeFleetSessionSpy).toHaveBeenCalledTimes(1));
     expect(markPendingArchiveSpy).toHaveBeenCalledTimes(1);
     expect(markPendingArchiveSpy).toHaveBeenCalledWith(42, "wren");
     expect(removeFleetSessionSpy).toHaveBeenCalledTimes(1);
@@ -3054,10 +3058,9 @@ describe("PrettyConversationsPanel: Phase 115 Plan 115-06 handleArchive", () => 
     expect(clearPendingArchiveSpy).not.toHaveBeenCalled();
   });
 
-  // A12: archive failure → clearPendingArchive fired + kit alert shown.
-  //      The pending-archive flag must clear so the next fleet-status pulse
-  //      naturally re-inserts the row (identity is still alive).
-  it("A12: archiveIdentity rejects → clearPendingArchive + kit alert fire (rollback)", async () => {
+  // A12: archive refused → the row stays, its "Archiving…" mark comes off,
+  //      and a kit alert says why. Nothing was taken off the sidebar.
+  it("A12: archiveIdentity rejects → the mark comes off, the row stays, and the alert says why", async () => {
     const hostA = makeHost("42", "hostA");
     const wrenSession = { hostId: 42, hostName: "hostA", sessionName: "wren", created: 1, role: null };
     mockFleetSessionsSnapshot = [wrenSession];
@@ -3103,15 +3106,10 @@ describe("PrettyConversationsPanel: Phase 115 Plan 115-06 handleArchive", () => 
     const archiveItem = within(menu).getByRole("menuitem", { name: "Archive" });
     fireEvent.click(archiveItem);
 
-    // Wait for the async catch to run.
-    await waitFor(() => {
-      expect(clearPendingArchiveSpy).toHaveBeenCalledTimes(1);
-    });
-    expect(clearPendingArchiveSpy).toHaveBeenCalledWith(42, "wren");
-    // The captured session row is put straight back (a fingerprint-
-    // suppressed pulse may never re-insert it).
-    expect(upsertFleetSessionSpy).toHaveBeenCalledWith(wrenSession);
     await waitFor(() => expect(kitAlerts(dialogs)).toHaveLength(1));
+    expect(rowEl!.getAttribute("data-machine-mark")).toBeNull();
+    expect(removeFleetSessionSpy).not.toHaveBeenCalled();
+    expect(markPendingArchiveSpy).not.toHaveBeenCalled();
     expect(String(kitAlerts(dialogs)[0].title)).toMatch(/couldn't archive/i);
     expect(kitText(kitAlerts(dialogs)[0])).toContain("boom");
   });
@@ -4550,7 +4548,9 @@ describe("PrettyConversationsPanel (shape-sidebar): swipe to archive with Undo",
     });
     await flushKit();
     expect(archiveIdentitySpy).toHaveBeenCalledTimes(1);
-    expect(clearPendingArchiveSpy).not.toHaveBeenCalled();
+    // Once, when the Undo window closed: the row came back, greyed, while the machine had
+    // it — never again for the later dismiss / Undo.
+    expect(clearPendingArchiveSpy).toHaveBeenCalledTimes(1);
   });
 
   it("dismissing the toast archives exactly once", async () => {
