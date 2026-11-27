@@ -1,4 +1,5 @@
 import { authApi, handleApiError } from "@/main-axios";
+import { inMachineOrder, sendMachineChange, type MachineChangeAnswer } from "@/api/machine-changes-api";
 
 // ─── Phase 117 Plan 117-06 (D-25 / D-28 / D-30) — project-list-api ──────────
 //
@@ -15,8 +16,9 @@ import { authApi, handleApiError } from "@/main-axios";
 //                                         the "create project" operation
 //                                         label so the modal can detect it
 //                                         and surface a specific message)
-//   POST /projects/:slug/archive       body { hostId }
-//                                        → { ok: true }
+//   POST /projects/:slug/archive       body { hostId, expected, requestId }
+//                                        → { ok, requestId, result } (the
+//                                          machine's front door; see below)
 //   POST /projects/:slug/parent        body { hostId, parent|null }
 //                                        → { ok: true }
 //   GET  /projects/:slug/archive-preflight?hostId=<n>
@@ -75,37 +77,88 @@ export async function createProject(
   }
 }
 
-export async function archiveProject(
-  hostId: number,
-  slug: string,
-): Promise<{ ok: true }> {
-  try {
-    const url = `/projects/${encodeURIComponent(slug)}/archive`;
-    const response = await authApi.post(url, { hostId });
-    return response.data as { ok: true };
-  } catch (error) {
-    handleApiError(error, "archive project");
-  }
+/** What a project archive takes, as the machine sees it. */
+export interface ProjectArchiveContents {
+  project: string;
+  projects: Array<{ slug: string; displayName: string; parent: string | null }>;
+  agents: Array<{ name: string; displayName: string; task: string; project: string }>;
+  apps: Array<{ slug: string; title: string; project: string }>;
+}
+
+export interface ProjectArchivePreflight {
+  /** Sub-projects beneath it hidden from the caller (archiving is refused when not 0). */
+  hiddenSubProjects: number;
+  contents: ProjectArchiveContents;
+  /** The caller's relay rooms filed in any of them, from the chat server. */
+  rooms: Array<{ roomId: string; project: string }>;
+  /** The chat server couldn't be asked, so `rooms` is unknown. */
+  roomsUnknown: boolean;
+}
+
+export interface ProjectArchiveResult {
+  projects: Array<{ slug: string; archivedAs: string | null }>;
+  agents: string[];
+  apps: Array<{ slug: string; project: string }>;
+  rooms: Array<{ roomId: string; project: string }>;
+}
+
+/** The names of what the user confirmed, as the archive request carries them. */
+export function expectedFromContents(c: ProjectArchiveContents): { projects: string[]; agents: string[]; apps: string[] } {
+  return {
+    projects: c.projects.map((p) => p.slug),
+    agents: c.agents.map((a) => a.name),
+    apps: c.apps.map((a) => a.slug),
+  };
 }
 
 /**
- * Count the sub-projects beneath `slug` that are hidden from the caller.
- * Archiving takes the whole subtree, so a non-zero count means the archive
- * can't be done by this user.
+ * Archive a project and everything in it, through the machine's front door,
+ * in turn after this machine's earlier changes. `expected` is what the
+ * confirm showed; when the machine's contents changed since, this throws a
+ * MachineChangeError with code "contents_changed" and the current contents
+ * as its result. Other refusals and failures throw with the machine's reason.
  *
- * GET /projects/:slug/archive-preflight?hostId=<n>  →  { hiddenSubProjects }
+ * POST /projects/:slug/archive  body { hostId, expected, requestId }
  */
-export async function getArchivePreflight(
+export function archiveProject(
   hostId: number,
   slug: string,
-): Promise<{ hiddenSubProjects: number }> {
-  try {
-    const url = `/projects/${encodeURIComponent(slug)}/archive-preflight?hostId=${encodeURIComponent(String(hostId))}`;
-    const response = await authApi.get(url);
-    return response.data as { hiddenSubProjects: number };
-  } catch (error) {
-    handleApiError(error, "check project before archive");
-  }
+  expected: { projects: string[]; agents: string[]; apps: string[] },
+  onStillWorking?: () => void,
+): Promise<MachineChangeAnswer<{ ok: true; requestId: string; result: ProjectArchiveResult }>> {
+  return inMachineOrder(hostId, () =>
+    sendMachineChange(
+      hostId,
+      { method: "post", url: `/projects/${encodeURIComponent(slug)}/archive`, body: { hostId, expected } },
+      "archive the project",
+      { followUp: "resend", onStillWorking },
+    ),
+  );
+}
+
+/**
+ * What archiving `slug` would take, asked of the machine in turn after this
+ * machine's earlier changes (so moves just clicked are already done), plus
+ * the sub-projects hidden from the caller and the caller's rooms in it.
+ * `done: false` = the machine is still busy; try again in a moment.
+ *
+ * GET /projects/:slug/archive-preflight?hostId=<n>
+ */
+export function getArchivePreflight(
+  hostId: number,
+  slug: string,
+): Promise<MachineChangeAnswer<ProjectArchivePreflight>> {
+  return inMachineOrder(hostId, () =>
+    sendMachineChange<ProjectArchivePreflight>(
+      hostId,
+      {
+        method: "get",
+        url: `/projects/${encodeURIComponent(slug)}/archive-preflight?hostId=${encodeURIComponent(String(hostId))}`,
+      },
+      "check project before archive",
+      { followUp: "none" },
+    ),
+  );
 }
 
 /**

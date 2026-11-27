@@ -92,7 +92,7 @@ import {
 } from "../../fleet-status/project-visibility-gate.js";
 import { getHostSemaphore } from "../../ssh/host-semaphore-registry.js";
 import { bornInProjectUsers } from "../../sharing/born-in-project.js";
-import { frontDoorHttp, requestIdFrom, submitFrontDoor } from "../../fleet-change/front-door.js";
+import { frontDoorHttp, frontDoorStatus, requestIdFrom, submitFrontDoor } from "../../fleet-change/front-door.js";
 import { findProjectRooms, releaseProjectRooms } from "../../fleet-change/project-rooms.js";
 
 /** What a project archive takes, as the machine reports it (fleet-change project-contents). */
@@ -757,9 +757,16 @@ router.post(
       }
 
       try {
+        // The same request again (the client asking after "still working
+        // on it"): the machine already has it, and the project may already
+        // be gone — skip straight to its outcome.
+        const known =
+          typeof body.requestId === "string"
+            ? await frontDoorStatus(conn, requestId, 0).catch(() => null)
+            : null;
         // Archiving takes the whole subtree. Refuse when some of it is
         // hidden from the caller, rather than archive what they can't see.
-        try {
+        if (known === null) try {
           const current = await listProjects(conn);
           const visible = await visibleSlugsForCaller(current, userId);
           if (!current.some((p) => p.slug === slug) || !visible.has(slug)) {

@@ -109,35 +109,37 @@ describe("Phase 117 Plan 117-06 Task 1 — project-list-api", () => {
     );
   });
 
-  // Test 5 — archiveProject happy path
-  it("Test 5 (archiveProject happy): POST /projects/alpha/archive with body {hostId} returns { ok: true }", async () => {
+  // Test 5 — archiveProject sends the confirmed list and a request id
+  it("Test 5 (archiveProject happy): POST /projects/alpha/archive with {hostId, expected, requestId} → done", async () => {
+    const expected = { projects: ["alpha"], agents: ["finch"], apps: [] };
     vi.mocked(authApi.post).mockResolvedValueOnce({
-      data: { ok: true },
+      status: 200,
+      data: { ok: true, requestId: "r1", result: { projects: [{ slug: "alpha", archivedAs: "alpha" }], agents: ["finch"], apps: [], rooms: [] } },
     });
 
-    const result = await archiveProject(1, "alpha");
+    const answer = await archiveProject(1, "alpha", expected);
 
     expect(authApi.post).toHaveBeenCalledTimes(1);
-    expect(authApi.post).toHaveBeenCalledWith("/projects/alpha/archive", {
-      hostId: 1,
-    });
-    expect(result).toEqual({ ok: true });
+    const [url, body] = vi.mocked(authApi.post).mock.calls[0] as [string, Record<string, unknown>];
+    expect(url).toBe("/projects/alpha/archive");
+    expect(body).toMatchObject({ hostId: 1, expected });
+    expect(typeof body.requestId).toBe("string");
+    expect(answer.done).toBe(true);
   });
 
-  // Test 6 — archiveProject slug URL-encoded but URL-safe slugs do not
-  //          double-encode. PROJECT_SLUG_RE ⊂ URL-safe so encodeURIComponent
-  //          is an identity for the valid slug set — the URL segment must
-  //          match verbatim.
-  it("Test 6 (archiveProject URL-safe slug): valid slug 'abc-123' does not double-encode in the URL path", async () => {
-    vi.mocked(authApi.post).mockResolvedValueOnce({
-      data: { ok: true },
-    });
+  // Test 6 — still working: the same request is sent again with the same id
+  it("Test 6 (archiveProject still working): resends with the same request id until it's done", async () => {
+    const onStillWorking = vi.fn();
+    vi.mocked(authApi.post)
+      .mockResolvedValueOnce({ status: 202, data: { pending: true, requestId: "r2" } })
+      .mockResolvedValueOnce({ status: 200, data: { ok: true, requestId: "r2", result: {} } });
 
-    await archiveProject(1, "abc-123");
+    const answer = await archiveProject(1, "abc-123", { projects: ["abc-123"], agents: [], apps: [] }, onStillWorking);
 
-    expect(authApi.post).toHaveBeenCalledWith("/projects/abc-123/archive", {
-      hostId: 1,
-    });
+    expect(onStillWorking).toHaveBeenCalledTimes(1);
+    expect(authApi.post).toHaveBeenCalledTimes(2);
+    expect((vi.mocked(authApi.post).mock.calls[1] as [string, { requestId: string }])[1].requestId).toBe("r2");
+    expect(answer).toMatchObject({ done: true, requestId: "r2" });
   });
 
   // ─── Phase 117 followup — getProjectFile / updateProjectFile ────────────────

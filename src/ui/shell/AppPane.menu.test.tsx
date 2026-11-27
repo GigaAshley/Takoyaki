@@ -285,7 +285,7 @@ describe("AppPane bar menu — Move to", () => {
     const menu = await openKebab(container);
     await user.click(menu.querySelector('[data-testid="app-menu-item-move-to"]') as HTMLElement);
     fireEvent.click(screen.getByTestId("app-menu-move-to-sidebar"));
-    expect(requestAppMove).toHaveBeenCalledWith(1, "tally", { to: "sidebar" });
+    expect(requestAppMove).toHaveBeenCalledWith(1, "tally", { to: "sidebar" }, expect.any(Function));
     await vi.waitFor(() => expect(tiles.find((t) => t.slug === "tally")?.owner).toBeNull());
   });
 

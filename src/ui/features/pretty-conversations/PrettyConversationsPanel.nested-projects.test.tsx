@@ -296,10 +296,26 @@ const createProjectSpy = vi.fn<
   ok: true as const,
   slug: name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, ""),
 }));
-const getArchivePreflightSpy = vi.fn(async (_hostId: number, _slug: string) => ({ hiddenSubProjects: 0 }));
+// What the machine says SKYNET's subtree holds (archive preflight).
+const skynetContents = {
+  project: "skynet",
+  projects: [
+    { slug: "skynet", displayName: "SKYNET", parent: null },
+    { slug: "design", displayName: "Design", parent: "skynet" },
+    { slug: "ops", displayName: "Ops", parent: "skynet" },
+    { slug: "ui", displayName: "UI", parent: "design" },
+  ],
+  agents: ["s-agent", "d-agent", "o-agent"].map((name) => ({ name, displayName: name, task: "", project: "skynet" })),
+  apps: [{ slug: "beds", title: "Beds", project: "ops" }],
+};
+const getArchivePreflightSpy = vi.fn(async (_hostId: number, _slug: string) => ({
+  done: true as const,
+  requestId: "pre-1",
+  result: { hiddenSubProjects: 0, contents: skynetContents, rooms: [{ roomId: "!room:matrix.example", project: "ops" }], roomsUnknown: false },
+}));
 const archiveProjectSpy = vi.fn<
-  (hostId: number, slug: string) => Promise<{ ok: true }>
->(async () => ({ ok: true as const }));
+  (hostId: number, slug: string, expected: unknown) => Promise<unknown>
+>(async () => ({ done: true as const, requestId: "arch-1", result: { ok: true } }));
 const getProjectFileSpy = vi.fn<
   (hostId: number, slug: string) => Promise<{ markdown: string }>
 >(async () => ({ markdown: "---\ndisplayName: Alpha\n---\n" }));
@@ -314,8 +330,13 @@ vi.mock("@/api/project-list-api", () => ({
     createProjectSpy(hostId, displayName, parent),
   setProjectParent: (hostId: number, slug: string, parent: string | null) =>
     setProjectParentSpy(hostId, slug, parent),
-  archiveProject: (hostId: number, slug: string) =>
-    archiveProjectSpy(hostId, slug),
+  archiveProject: (hostId: number, slug: string, expected: unknown) =>
+    archiveProjectSpy(hostId, slug, expected),
+  expectedFromContents: (c: typeof skynetContents) => ({
+    projects: c.projects.map((p) => p.slug),
+    agents: c.agents.map((a) => a.name),
+    apps: c.apps.map((a) => a.slug),
+  }),
   getArchivePreflight: (hostId: number, slug: string) =>
     getArchivePreflightSpy(hostId, slug),
   getProjectFile: (hostId: number, slug: string) =>
@@ -389,6 +410,7 @@ vi.mock("@/api/global-files-api", () => ({
 // ─── Component under test ───────────────────────────────────────────────────
 
 import { PrettyConversationsPanel } from "./PrettyConversationsPanel";
+import { MachineChangeError } from "@/api/machine-changes-api";
 import { publishAppSnapshot, __resetForTest as resetAppTiles } from "@/state/app-tiles-store";
 import { startAppDrag, endAppDrag } from "./app-drag";
 import type { AppState } from "@/api/fleet-status-types";
@@ -761,7 +783,7 @@ describe("nested projects: the project window", () => {
 });
 
 describe("nested projects: archive takes the subtree", () => {
-  it("confirm names the project and counts sub-projects, agents and rooms; folders move deepest first; every member handled", async () => {
+  it("confirm names the project and counts what the machine says is in its subtree; one archive request takes it all", async () => {
     seedTree();
     const dialogs = autoAnswerKitDialogs({ confirm: () => true });
     const { archiveIdentity } = await import("@/api/identity-archive-api");
@@ -771,20 +793,30 @@ describe("nested projects: archive takes the subtree", () => {
     expect(dialogs.calls[0].kind).toBe("confirm");
     expect(dialogs.calls[0].opts.title).toBe('Archive "SKYNET"?');
     expect(dialogs.calls[0].opts.body).toBe(
-      'This also archives its 3 sub-projects and the 3 agents across them.\n\n1 relay room will move back to Conversations.\n\nThis can\'t be undone. Move conversations out first to keep them.',
+      'This also archives its 3 sub-projects and the 3 agents across them.\n\nIts app "Beds" is archived with it.\n\n1 relay room will move back to Conversations.\n\nThis can\'t be undone. Move conversations and apps out first to keep them.',
     );
-    await waitFor(() => expect(archiveProjectSpy).toHaveBeenCalledTimes(4));
-    expect(archiveProjectSpy.mock.calls.map((c) => c[1])).toEqual(["ops", "ui", "design", "skynet"]);
-    await waitFor(() => expect(archiveIdentity).toHaveBeenCalledTimes(3));
-    expect(setRelayRoomProjectSpy).toHaveBeenCalledWith("!room:matrix.example", "@user:matrix.example", null);
-    // Other is untouched.
-    expect(archiveProjectSpy.mock.calls.some((c) => c[1] === "other")).toBe(false);
+    await waitFor(() => expect(archiveProjectSpy).toHaveBeenCalledTimes(1));
+    expect(archiveProjectSpy).toHaveBeenCalledWith(1, "skynet", {
+      projects: ["skynet", "design", "ops", "ui"],
+      agents: ["s-agent", "d-agent", "o-agent"],
+      apps: ["beds"],
+    });
+    // The machine and the server do the agents and rooms; the sidebar only shows it.
+    expect(archiveIdentity).not.toHaveBeenCalled();
+    expect(setRelayRoomProjectSpy).not.toHaveBeenCalled();
+    // Shown archived at once: the subtree leaves the host's list, Other stays.
+    const [, rows] = mergeProjectsForHostSpy.mock.calls[0] as [string, Array<{ slug: string }>];
+    expect(rows.map((r) => r.slug)).toEqual(["other"]);
   });
 
   it("refuses up front when a sub-project inside is hidden from the user", async () => {
     seedTree();
     const dialogs = autoAnswerKitDialogs({ confirm: () => true });
-    getArchivePreflightSpy.mockResolvedValueOnce({ hiddenSubProjects: 2 });
+    getArchivePreflightSpy.mockResolvedValueOnce({
+      done: true,
+      requestId: "pre-2",
+      result: { hiddenSubProjects: 2, contents: skynetContents, rooms: [], roomsUnknown: false },
+    });
     const { container } = renderPanel();
     await openProjectKebabAndClickItem(container, "skynet", "Archive project");
     await waitFor(() => expect(dialogs.calls).toHaveLength(1));
@@ -806,23 +838,24 @@ describe("nested projects: archive takes the subtree", () => {
     expect(archiveProjectSpy).not.toHaveBeenCalled();
   });
 
-  it("a folder move failing part-way stops, archives only members of moved projects, and says so", async () => {
+  it("a failed archive puts the whole subtree back and says why", async () => {
     seedTree();
     const dialogs = autoAnswerKitDialogs({ confirm: () => true });
-    const { archiveIdentity } = await import("@/api/identity-archive-api");
-    // ops moves, ui fails.
-    archiveProjectSpy
-      .mockResolvedValueOnce({ ok: true })
-      .mockRejectedValueOnce(new Error("disk full"));
+    archiveProjectSpy.mockRejectedValueOnce(new MachineChangeError("couldn't stop the app 'beds': unit busy", 500, "app_stop_failed", null));
+    const keepList = (h: string, rows: typeof mockProjects) => {
+      mockProjects = [...mockProjects.filter((p) => p.hostId !== h), ...rows];
+    };
+    mergeProjectsForHostSpy.mockImplementationOnce(keepList).mockImplementationOnce(keepList);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const { container } = renderPanel();
     await openProjectKebabAndClickItem(container, "skynet", "Archive project");
     await waitFor(() => expect(dialogs.calls.filter((c) => c.kind === "alert")).toHaveLength(1));
-    expect(archiveProjectSpy.mock.calls.map((c) => c[1])).toEqual(["ops", "ui"]);
     const alert = dialogs.calls.find((c) => c.kind === "alert")!;
-    expect(String(alert.opts.body)).toContain("1 project beneath it was archived");
-    // Only o-row (in ops) is archived; the room in ops is released.
-    await waitFor(() => expect(archiveIdentity).toHaveBeenCalledTimes(1));
-    expect(setRelayRoomProjectSpy).toHaveBeenCalledWith("!room:matrix.example", "@user:matrix.example", null);
+    expect(String(alert.opts.body)).toBe("Couldn't stop the app 'beds': unit busy. Nothing was archived.");
+    // Hidden first, then put back: the last list has every project of the subtree again.
+    const lastRows = mergeProjectsForHostSpy.mock.calls.at(-1)![1] as Array<{ slug: string }>;
+    expect(lastRows.map((r) => r.slug).sort()).toEqual(["design", "ops", "other", "skynet", "ui"]);
+    warnSpy.mockRestore();
   });
 });
 
@@ -1072,7 +1105,7 @@ describe("project apps in the sidebar", () => {
     expect(over.defaultPrevented).toBe(true);
     expect(screen.queryByTestId("pv-apps-zone-drop-overlay")).not.toBeNull();
     fireEvent(appsSection, createEvent.drop(appsSection, { dataTransfer: dt }));
-    expect(requestAppMove).toHaveBeenCalledWith(1, "beds", { to: "sidebar" });
+    expect(requestAppMove).toHaveBeenCalledWith(1, "beds", { to: "sidebar" }, expect.any(Function));
     // Shown in the sidebar at once.
     expect(within(contentEl(container, "skynet")!).queryAllByTestId("pv-project-app-row")).toHaveLength(0);
   });

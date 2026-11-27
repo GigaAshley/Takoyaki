@@ -2,6 +2,8 @@ import { archiveApp } from "../../api/apps-archive-api";
 import { encodeWorkspaceSpec, specForTab } from "../../lib/tab-url";
 import { renameApp, validateAppTitle } from "../../api/apps-rename-api";
 import { requestAppMove, type AppMoveDestination } from "../../api/apps-move-api";
+import { MachineChangeError, reasonSentence } from "../../api/machine-changes-api";
+import { toast } from "sonner";
 import {
   publishAppGone,
   markPendingAppArchive,
@@ -66,14 +68,28 @@ export interface AppScopeTarget extends AppMenuTarget {
 
 /**
  * project-scoped apps: move an app to the sidebar or a project. Shown in its
- * new place at once (setPendingAppMove); the machine carries the move out on
- * its next tick. A refused request puts it back and says why.
+ * new place at once (setPendingAppMove). The machine carries moves out in the
+ * order they were clicked, one machine's at a time; a refused or failed move
+ * puts the app back and says why. One the machine is still on after a
+ * while gets a "still moving" note and stays shown in its new place.
  */
 export async function moveApp(app: AppScopeTarget, dest: AppMoveDestination): Promise<void> {
   const previous = { owner: app.owner ?? null, project: app.project ?? null };
+  const to = dest.to === "project" ? `project:${dest.project}` : "sidebar";
   setPendingAppMove(app.hostId, app.slug, dest.to === "project" ? dest.project : null);
   try {
-    await requestAppMove(Number(app.hostId), app.slug, dest);
+    const answer = await requestAppMove(Number(app.hostId), app.slug, dest, () => {
+      console.info({ operation: "app_move_still_working", hostId: Number(app.hostId), slug: app.slug, to });
+      toast(`Still moving "${app.title}"`, { description: "The machine is still working on it." });
+    });
+    console.info({
+      operation: "app_move_answered",
+      hostId: Number(app.hostId),
+      slug: app.slug,
+      to,
+      done: answer.done,
+      requestId: answer.requestId,
+    });
   } catch (err) {
     clearPendingAppMove(app.hostId, app.slug, previous);
     const errMessage = err instanceof Error ? err.message : String(err);
@@ -81,10 +97,11 @@ export async function moveApp(app: AppScopeTarget, dest: AppMoveDestination): Pr
       operation: "app_move_request_failed",
       hostId: Number(app.hostId),
       slug: app.slug,
-      to: dest.to === "project" ? `project:${dest.project}` : "sidebar",
+      to,
+      code: err instanceof MachineChangeError ? err.code : null,
       errMessage,
     });
-    void kitAlert({ title: `Couldn't move "${app.title}"`, body: errMessage });
+    void kitAlert({ title: `Couldn't move "${app.title}"`, body: reasonSentence(errMessage) });
   }
 }
 

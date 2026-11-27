@@ -100,7 +100,7 @@ describe("AppsTab", () => {
     expect(screen.getByTestId("app-menu-move-to-project-beds")).toBeTruthy();
     expect(screen.queryByTestId("app-menu-move-to-project-far")).toBeNull();
     fireEvent.click(screen.getByTestId("app-menu-move-to-project-beds"));
-    expect(requestAppMove).toHaveBeenCalledWith(6, "tally", { to: "project", project: "beds" });
+    expect(requestAppMove).toHaveBeenCalledWith(6, "tally", { to: "project", project: "beds" }, expect.any(Function));
   });
 
   it("picking where a project app already is does nothing; the sidebar moves it", async () => {
@@ -114,6 +114,6 @@ describe("AppsTab", () => {
     await user.click(screen.getByTestId("identity-apps-row-kebab"));
     await user.click(within(screen.getByRole("menu")).getByTestId("app-menu-item-move-to"));
     fireEvent.click(screen.getByTestId("app-menu-move-to-sidebar"));
-    expect(requestAppMove).toHaveBeenCalledWith(6, "tally", { to: "sidebar" });
+    expect(requestAppMove).toHaveBeenCalledWith(6, "tally", { to: "sidebar" }, expect.any(Function));
   });
 });

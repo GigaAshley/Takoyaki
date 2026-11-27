@@ -217,6 +217,39 @@ async function submitLocally(
   }
 }
 
+/**
+ * Where an earlier request is now: its outcome, or still pending, waiting up
+ * to `waitS` for it to finish. Null when the machine has never heard of it
+ * (or has forgotten it — outcomes are kept a week).
+ */
+export async function frontDoorStatus(
+  conn: SSHClientType | null,
+  id: string,
+  waitS: number = FRONT_DOOR_WAIT_S,
+): Promise<FrontDoorOutcome | null> {
+  if (!REQUEST_ID_RE.test(id)) throw new Error("invalid request id");
+  let line: string | null;
+  if (conn === null) {
+    const deadline = Date.now() + waitS * 1000;
+    for (;;) {
+      line = await whereIs(id);
+      const finished = line !== null && parseFrontDoorLine(id, line).state !== "pending";
+      if (finished || Date.now() >= deadline) break;
+      await new Promise((r) => setTimeout(r, LOCAL_POLL_MS));
+    }
+  } else {
+    const fc = '"$HOME/.local/bin/fleet-change"';
+    const out = await execCommand(
+      conn,
+      `if [ -f ${fc} ]; then python3 ${fc} status ${shellWord(id)} --wait ${waitS}; else echo '{"state":"not_installed"}'; fi`,
+      { timeoutMs: waitS * 1000 + EXEC_GRACE_MS },
+    );
+    line = out.trim().split("\n").pop() ?? "";
+    if (line.includes('"state":"unknown"')) line = null;
+  }
+  return line === null ? null : parseFrontDoorLine(id, line);
+}
+
 /** The HTTP answer for an outcome a route doesn't treat specially. */
 export function frontDoorHttp(outcome: FrontDoorOutcome): { status: number; body: Record<string, unknown> } {
   switch (outcome.state) {

@@ -138,17 +138,20 @@ import {
 import { useCollapsedProjectSlugs } from "@/state/use-collapsed-project-slugs";
 import { useProjectsSectionCollapsed } from "@/state/use-projects-section-collapsed";
 import { projectKey } from "@/state/project-tree";
+import { MachineChangeError, reasonSentence as sentenceOf } from "@/api/machine-changes-api";
 // Phase 117 Plan 117-08 (D-22): project drop-handler API surface. Landed by
 // 117-06 as thin authApi wrappers; called fire-and-forget from the panel's
 // handleProjectDrop / handleFlatMiddleDrop.
 import { setSessionProject, setRelayRoomProject, setRelayRoomPinned } from "@/api/session-project-api";
-// Phase 117 Plan 117-09 Task 2 (D-28, D-29, D-30) — archive-project cascade.
-// handleArchiveProject collects the section's members, presents the D-29
-// verbatim confirmation, fires Promise.allSettled across archiveIdentity +
-// setRelayRoomProject(null) member ops, then archiveProject as the folder-move.
+// Archive project: the machine's front door decides and does the whole
+// cascade; handleArchiveProject asks it what's inside, confirms that, and
+// sends the confirmed list.
 import {
   archiveProject,
+  expectedFromContents,
   getArchivePreflight,
+  type ProjectArchiveContents,
+  type ProjectArchivePreflight,
   getProjectFile,
   setProjectParent,
   updateProjectFile,
@@ -591,6 +594,12 @@ const PrettyConversationRowLive = memo(function PrettyConversationRowLive(props:
 });
 
 // A relay room's sidebar row (it carries the Matrix room id).
+/** "a", "a and b", "a, b and c". */
+function joinNames(names: string[]): string {
+  if (names.length <= 1) return names.join("");
+  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+}
+
 function isRelayRoomRow(row: { roomId?: string | null }): boolean {
   return typeof row.roomId === "string" && row.roomId.length > 0;
 }
@@ -3076,80 +3085,32 @@ export function PrettyConversationsPanel({
     [findProject, onNewConversation],
   );
 
-  // Phase 117 Plan 117-09 Task 2 (D-28, D-29, D-30 + Fix 3) — archive
-  // project cascade, extended to the whole subtree for nested projects.
-  // Sequence:
-  //   1. Collect the project and every sub-project beneath it (resolved tree
-  //      from the store) and all their member rows.
-  //   2. Confirm, naming the project and counting sub-projects, agents and
-  //      relay rooms.
-  //   3. Move each folder to ~/fleet/projects/archive/, deepest first, so a
-  //      failure part-way never leaves a sub-project whose parent survives
-  //      but is half-archived — anything left behind still shows (at top
-  //      level if its parent went). If the host can't be resolved or a move
-  //      fails, alert; members of projects that didn't move are left alone.
-  //   4. Run ONE Promise.allSettled batch that includes BOTH identity-
-  //      archive calls (archiveIdentity per identity member, after closing
-  //      its pane and optimistically removing its row) AND relay-room
-  //      tag-clear calls (setRelayRoomProject(null) per relay-room member).
-  //      One shared wait boundary per Fix 3.
-  //   5. Log partial failures via console.error and alert the user. The
-  //      archive itself is one-way (Phase 115 semantics); only a failed
-  //      member's optimistic sidebar removal is rolled back.
-  //
-  // RDP rows are defense-in-depth guarded (D-08) — the derived selector
-  // should never emit them into a project section, but the filter here is
-  // a safety net.
+  // Archive a project and everything in it — every sub-project beneath it,
+  // their apps and agents — through the machine's front door. The machine,
+  // not this sidebar, decides what that is:
+  //   1. Ask the machine what it holds (in turn after any moves just clicked
+  //      on that machine, so they're already done), plus the sub-projects
+  //      hidden from the user — archiving is refused up front when some are.
+  //   2. Confirm, naming the project and counting its sub-projects, agents,
+  //      apps (by name) and relay rooms; Archive waits for the agents'
+  //      wake-up checks.
+  //   3. Show it archived at once (projects, agents and rooms leave the
+  //      sidebar), then send the archive with the list that was confirmed.
+  //   4. The machine refuses when what's inside changed since: everything is
+  //      put back and the confirm shows the new list. Any other refusal or
+  //      failure puts everything back and says why. Still working after the
+  //      wait: a note, and it stays shown as archived.
+  // RDP rows never sit in a project section; agents are matched to their
+  // sidebar rows by name only to hide them and close their panes.
   const handleArchiveProject = useCallback(
     async (slug: string, hostId?: string) => {
-      // 1. The project's section plus every section beneath it, in tree
-      //    order (parent first).
-      //    Read from the latest snapshot: the kit confirm doesn't freeze the
-      //    page, so this runs again after it to pick up membership changes.
-      const collectSubtree = () => {
-        const sections = projectSectionsRef.current;
-        const root = sections.find(
-          (s) => s.slug === slug && (hostId === undefined || s.hostId === undefined || s.hostId === hostId),
-        );
-        const sectionKey = (s: { slug: string; hostId?: string }) => `${s.hostId ?? ""}::${s.slug}`;
-        const tree: typeof sections = [];
-        if (root) {
-          const inSubtree = new Set<string>([sectionKey(root)]);
-          for (const s of sections) {
-            if (s === root) {
-              tree.push(s);
-              continue;
-            }
-            const pk = s.parentKey ?? null;
-            if (pk !== null && inSubtree.has(pk)) {
-              inSubtree.add(sectionKey(s));
-              tree.push(s);
-            }
-          }
-        }
-        return { section: root, subtree: tree };
-      };
-      const { section, subtree } = collectSubtree();
-      const subProjects = subtree.slice(1);
-      const members = subtree.flatMap((s) => s.rows);
-      const isRoomRow = (r: (typeof members)[number]) =>
-        !!(r as { matrixRoomId?: string | null }).matrixRoomId ||
-        !!(r as { roomId?: string | null }).roomId;
-      const nonRdpMembers = members.filter((r) => r.rdpHostRow !== true);
-      const agentCount = nonRdpMembers.filter((r) => !isRoomRow(r)).length;
-      const roomCount = nonRdpMembers.filter(isRoomRow).length;
-      // 2. Resolve the host — hostId comes from the project's own row
-      //    (D-01; M7: never infer it); every sub-project lives on the same
-      //    host by construction.
       const proj = findProject(slug, hostId);
       const projHostIdNum = proj ? parseInt(proj.hostId, 10) : NaN;
       if (!proj || !(Number.isFinite(projHostIdNum) && projHostIdNum > 0)) {
         console.warn({
-          operation: "archive_project_folder_move_skipped_no_host",
+          operation: "archive_project_skipped_no_host",
           slug,
-          reason: proj
-            ? "project host invalid"
-            : "project not found in projectsList",
+          reason: proj ? "project host invalid" : "project not found in projectsList",
         });
         void kitAlert({
           title: "Couldn't archive this project",
@@ -3157,236 +3118,203 @@ export function PrettyConversationsPanel({
         });
         return;
       }
-      // The sidebar only knows the sub-projects this user can see; archiving
-      // must take the whole subtree, so ask the host first and refuse when
-      // some of it is hidden from them.
+      const projHost = proj.hostId;
       const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
-      const name = section?.displayName ?? slug;
-      if (subtree.length > 0) {
-        let hiddenSubProjects = 0;
-        try {
-          ({ hiddenSubProjects } = await getArchivePreflight(projHostIdNum, slug));
-        } catch (err) {
-          console.error({
-            operation: "archive_project_preflight_failed",
-            slug,
-            hostId: projHostIdNum,
-            errMessage: err instanceof Error ? err.message : "unknown",
-          });
+      const name =
+        projectSectionsRef.current.find((s) => s.slug === slug && (s.hostId === undefined || s.hostId === projHost))
+          ?.displayName ?? proj.displayName ?? slug;
+
+      // 1. What the machine holds.
+      let pre: ProjectArchivePreflight;
+      try {
+        const answer = await getArchivePreflight(projHostIdNum, slug);
+        if (!answer.done) {
+          console.info({ operation: "archive_project_preflight_still_working", slug, hostId: projHostIdNum });
           void kitAlert({
-            title: `Couldn't check "${name}"`,
-            body: "Couldn't check it before archiving. Nothing was archived.",
+            title: `Couldn't check "${name}" yet`,
+            body: "Its machine is still busy with earlier changes. Try again in a moment. Nothing was archived.",
           });
           return;
         }
-        if (hiddenSubProjects > 0) {
-          console.info({
-            operation: "archive_project_refused_hidden_sub_projects",
-            slug,
-            hostId: projHostIdNum,
-            hiddenSubProjects,
-          });
-          void kitAlert({
-            title: `Can't archive "${name}"`,
-            body: `${plural(hiddenSubProjects, "sub-project")} inside it ${hiddenSubProjects === 1 ? "is" : "are"} hidden from you. Nothing was archived.`,
-          });
-          return;
-        }
-      }
-      // 3. Confirm with counts. It opens at once; Archive waits for the
-      //    agents' wake-up checks, which add the agents whose wake-ups would
-      //    stop with them.
-      const agentTargets = nonRdpMembers
-        .filter((r) => !isRoomRow(r))
-        .map((r) => archiveTarget(r))
-        .filter((t): t is NonNullable<typeof t> => t !== null);
-      const confirmBody = (wakeupWarning: string) => {
-        const lines: string[] = [];
-        if (subProjects.length > 0) {
-          lines.push(
-            agentCount > 0
-              ? `This also archives its ${plural(subProjects.length, "sub-project")} and the ${plural(agentCount, "agent")} across them.`
-              : `This also archives its ${plural(subProjects.length, "sub-project")}.`,
-          );
-        } else if (agentCount > 0) {
-          lines.push(`This also archives the ${plural(agentCount, "agent")} in it.`);
-        }
-        if (roomCount > 0) {
-          lines.push(
-            `${plural(roomCount, "relay room")} will move back to Conversations.`,
-          );
-        }
-        if (wakeupWarning) lines.push(wakeupWarning);
-        lines.push("This can't be undone. Move conversations out first to keep them.");
-        return lines.join("\n\n");
-      };
-      console.info({
-        operation: "archive_project_confirm_shown",
-        slug,
-        hostId,
-        subProjectCount: subProjects.length,
-        agentCount,
-        roomCount,
-      });
-      const ready = checkActiveWakeupsForAgents(
-        agentTargets.map((t) => ({ hostId: t.hostIdNum, identityKey: t.identityKey, label: t.label })),
-      ).then((wakeupChecks) => {
-        console.info({
-          operation: "archive_project_wakeups_checked",
-          slug,
-          agentsWithWakeups: wakeupChecks.filter((r) => r.check.status === "checked" && r.check.active.length > 0).length,
-          agentsUnchecked: wakeupChecks.filter((r) => r.check.status === "unknown").length,
-        });
-        return {
-          body: confirmBody(
-            multiAgentWakeupWarning(wakeupChecks.map(({ agent, check }) => ({ label: agent.label, check }))),
-          ),
-        };
-      });
-      const proceed = await kitConfirm({
-        title: `Archive "${name}"?`,
-        body: confirmBody(""),
-        ready,
-        confirmLabel: "Archive",
-        destructive: true,
-      });
-      if (!proceed) return;
-      // 4. Folder moves FIRST, deepest first (host resolved above), over the
-      //    subtree as it is now.
-      const latestSubtree = collectSubtree().subtree;
-      const toMove: Array<{ slug: string; rows: typeof members }> =
-        latestSubtree.length > 0 ? latestSubtree : [{ slug, rows: [] }];
-      const moved: typeof toMove = [];
-      let moveError: unknown = null;
-      for (const s of [...toMove].reverse()) {
-        try {
-          await archiveProject(projHostIdNum, s.slug);
-          moved.push(s);
-        } catch (err) {
-          moveError = err;
-          console.error({
-            operation: "archive_project_folder_move_failed",
-            slug: s.slug,
-            rootSlug: slug,
-            hostId: projHostIdNum,
-            movedSoFar: moved.length,
-            errMessage: err instanceof Error ? err.message : "unknown",
-          });
-          break;
-        }
-      }
-      if (moveError !== null) {
-        const msg = moveError instanceof Error ? moveError.message : String(moveError);
-        void kitAlert(
-          moved.length === 0
-            ? { title: "Couldn't archive this project", body: `${msg}. Nothing was archived.` }
-            : {
-                title: "Couldn't finish archiving this project",
-                body: `${msg}. ${plural(moved.length, "project")} beneath it ${moved.length === 1 ? "was" : "were"} archived; the rest are still in the sidebar.`,
-              },
-        );
-        if (moved.length === 0) return;
-      }
-      console.info({
-        operation: "archive_project_folders_moved",
-        slug,
-        hostId: projHostIdNum,
-        movedSlugs: moved.map((s) => s.slug),
-      });
-      // Only members of projects that actually moved are archived/released.
-      const movedMembers = moved
-        .flatMap((s) => s.rows)
-        .filter((r) => r.rdpHostRow !== true);
-      // Agents are archived only if the confirm counted them — one moved in
-      // while it was up just falls back to the unassigned list. (Rooms only
-      // lose their tag, so every room inside is released.)
-      const countedIds = new Set(members.map((r) => r.id));
-      const identityMembers = movedMembers.filter((r) => !isRoomRow(r) && countedIds.has(r.id));
-      const relayRoomMembers = movedMembers.filter(isRoomRow);
-      // 5. Member ops in one Promise.allSettled batch. Identity members get
-      //    the same optimistic removal as a single-row archive (pending mark
-      //    + row drop), so they don't fall into the unassigned list for the
-      //    ~15s until the supervisor retires them. Relay-room members get a
-      //    tag clear (Fix 3 — the room itself survives).
-      const ops: Promise<unknown>[] = [];
-      const hostForRow = (
-        row: { host?: { id: string } | null; targetTmuxSession?: string | null },
-      ) => {
-        if (!row.host || typeof row.host.id !== "string") return null;
-        const n = parseInt(row.host.id, 10);
-        if (!Number.isFinite(n) || n <= 0) return null;
-        const key = row.targetTmuxSession
-          ? sessionMatchKey(row.targetTmuxSession) ?? row.targetTmuxSession
-          : null;
-        if (!key) return null;
-        return { hostId: n, identityKey: key, sessionName: row.targetTmuxSession as string };
-      };
-      for (const r of identityMembers) {
-        const parsed = hostForRow(r);
-        if (!parsed) continue;
-        // Close the member's pane if open, as handleArchive does.
-        if (activeSetRef.current.has(r.id)) {
-          handleRowDeactivateRef.current(r);
-        }
-        const undoRemove = optimisticArchiveRemove(parsed.hostId, parsed.sessionName, parsed.identityKey);
-        ops.push(
-          archiveIdentity(parsed.hostId, parsed.identityKey).catch((err: unknown) => {
-            undoRemove();
-            throw err;
-          }),
-        );
-      }
-      // relay-room tag-clear ops require the viewing user's mxid (D-05a).
-      if (relayRoomMembers.length > 0) {
-        if (!viewingUserMxid) {
-          console.warn({
-            operation: "archive_project_relay_members_skipped_no_mxid",
-            slug,
-            relayRoomMemberCount: relayRoomMembers.length,
-          });
-        } else {
-          for (const r of relayRoomMembers) {
-            const roomId =
-              (r as { matrixRoomId?: string | null }).matrixRoomId ??
-              (r as { roomId?: string | null }).roomId ??
-              null;
-            if (typeof roomId !== "string" || roomId.length === 0) continue;
-            // Fix 3 gate: setRelayRoomProject(roomId, mxid, null) is the
-            // canonical tag-clear call. The literal `null` third arg is
-            // asserted by the acceptance grep on this file.
-            const undoTag = patchRoomProjectAssignment(roomId, null);
-            ops.push(
-              setRelayRoomProject(roomId, viewingUserMxid, null).catch((err: unknown) => {
-                undoTag();
-                throw err;
-              }),
-            );
-          }
-        }
-      }
-      const results = await Promise.allSettled(ops);
-      const failures = results.filter((r) => r.status === "rejected");
-      if (failures.length > 0) {
+        pre = answer.result;
+      } catch (err) {
         console.error({
-          operation: "archive_project_partial_member_failures",
+          operation: "archive_project_preflight_failed",
           slug,
-          failureCount: failures.length,
-          totalOps: ops.length,
-          failures: failures.map((f) =>
-            f.status === "rejected"
-              ? f.reason instanceof Error
-                ? f.reason.message
-                : String(f.reason)
-              : "",
-          ),
+          hostId: projHostIdNum,
+          errMessage: err instanceof Error ? err.message : "unknown",
         });
         void kitAlert({
-          title: "Some conversations weren't archived",
-          body: `The project was archived, but ${failures.length} of its ${ops.length} conversation${ops.length === 1 ? "" : "s"} couldn't be archived. They're back in the sidebar, outside any project.`,
+          title: `Couldn't check "${name}"`,
+          body: `${err instanceof MachineChangeError ? sentenceOf(err.message) + " " : ""}Nothing was archived.`,
         });
+        return;
       }
+      if (pre.hiddenSubProjects > 0) {
+        console.info({
+          operation: "archive_project_refused_hidden_sub_projects",
+          slug,
+          hostId: projHostIdNum,
+          hiddenSubProjects: pre.hiddenSubProjects,
+        });
+        void kitAlert({
+          title: `Can't archive "${name}"`,
+          body: `${plural(pre.hiddenSubProjects, "sub-project")} inside it ${pre.hiddenSubProjects === 1 ? "is" : "are"} hidden from you. Nothing was archived.`,
+        });
+        return;
+      }
+
+      let contents = pre.contents;
+      let changedNote = "";
+      for (let attempt = 0; attempt < 3; attempt++) {
+        // 2. Confirm what the machine holds.
+        const subProjects = contents.projects.filter((p) => p.slug !== slug);
+        const roomCount = pre.rooms.filter((r) => contents.projects.some((p) => p.slug === r.project)).length;
+        const confirmBody = (wakeupWarning: string) => {
+          const lines: string[] = [];
+          if (changedNote) lines.push(changedNote);
+          const agentCount = contents.agents.length;
+          if (subProjects.length > 0) {
+            lines.push(
+              agentCount > 0
+                ? `This also archives its ${plural(subProjects.length, "sub-project")} and the ${plural(agentCount, "agent")} across them.`
+                : `This also archives its ${plural(subProjects.length, "sub-project")}.`,
+            );
+          } else if (agentCount > 0) {
+            lines.push(`This also archives the ${plural(agentCount, "agent")} in it.`);
+          }
+          if (contents.apps.length > 0) {
+            const titles = contents.apps.map((a) => `"${a.title}"`);
+            const list = titles.length <= 4 ? joinNames(titles) : `${titles.slice(0, 3).join(", ")} and ${titles.length - 3} more`;
+            lines.push(`${contents.apps.length === 1 ? "Its app" : `Its ${contents.apps.length} apps`} ${list} ${contents.apps.length === 1 ? "is" : "are"} archived with it.`);
+          }
+          if (pre.roomsUnknown) {
+            lines.push("Any relay rooms in it will move back to Conversations.");
+          } else if (roomCount > 0) {
+            lines.push(`${plural(roomCount, "relay room")} will move back to Conversations.`);
+          }
+          if (wakeupWarning) lines.push(wakeupWarning);
+          lines.push("This can't be undone. Move conversations and apps out first to keep them.");
+          return lines.join("\n\n");
+        };
+        console.info({
+          operation: "archive_project_confirm_shown",
+          slug,
+          hostId: projHostIdNum,
+          attempt,
+          subProjectCount: subProjects.length,
+          agentCount: contents.agents.length,
+          appCount: contents.apps.length,
+          roomCount,
+        });
+        const agentTargets = contents.agents.map((a) => ({
+          hostId: projHostIdNum,
+          identityKey: a.name,
+          label: a.task || a.displayName || a.name,
+        }));
+        const ready = checkActiveWakeupsForAgents(agentTargets).then((wakeupChecks) => {
+          console.info({
+            operation: "archive_project_wakeups_checked",
+            slug,
+            agentsWithWakeups: wakeupChecks.filter((r) => r.check.status === "checked" && r.check.active.length > 0).length,
+            agentsUnchecked: wakeupChecks.filter((r) => r.check.status === "unknown").length,
+          });
+          return {
+            body: confirmBody(
+              multiAgentWakeupWarning(wakeupChecks.map(({ agent, check }) => ({ label: agent.label, check }))),
+            ),
+          };
+        });
+        const proceed = await kitConfirm({
+          title: `Archive "${name}"?`,
+          body: confirmBody(""),
+          ready,
+          confirmLabel: "Archive",
+          destructive: true,
+        });
+        if (!proceed) return;
+
+        // 3. Shown archived at once.
+        const undo: Array<() => void> = [];
+        const archivedSlugs = new Set(contents.projects.map((p) => p.slug));
+        const hostRows = getProjectsSnapshot().filter((p) => p.hostId === projHost);
+        mergeProjectsForHost(projHost, hostRows.filter((p) => !archivedSlugs.has(p.slug)));
+        undo.push(() => {
+          const now = getProjectsSnapshot().filter((p) => p.hostId === projHost);
+          // Put back only what's still missing (a newer list may already have it).
+          const missing = hostRows.filter((p) => archivedSlugs.has(p.slug) && !now.some((n) => n.slug === p.slug));
+          if (missing.length > 0) mergeProjectsForHost(projHost, [...now, ...missing]);
+        });
+        const agentNames = new Set(contents.agents.map((a) => a.name));
+        const agentRows = projectSectionsRef.current
+          .filter((s) => s.hostId === undefined || s.hostId === projHost)
+          .flatMap((s) => s.rows)
+          .filter((r) => {
+            if (r.rdpHostRow === true || !r.host || r.host.id !== projHost || !r.targetTmuxSession) return false;
+            const key = sessionMatchKey(r.targetTmuxSession) ?? r.targetTmuxSession;
+            return agentNames.has(key);
+          });
+        for (const r of agentRows) {
+          if (activeSetRef.current.has(r.id)) handleRowDeactivateRef.current(r);
+          const key = sessionMatchKey(r.targetTmuxSession as string) ?? (r.targetTmuxSession as string);
+          undo.push(optimisticArchiveRemove(projHostIdNum, r.targetTmuxSession as string, key));
+        }
+        for (const room of pre.rooms) {
+          if (archivedSlugs.has(room.project)) undo.push(patchRoomProjectAssignment(room.roomId, null));
+        }
+        const putBack = () => {
+          for (const u of undo.reverse()) u();
+        };
+
+        try {
+          const answer = await archiveProject(projHostIdNum, slug, expectedFromContents(contents), () => {
+            console.info({ operation: "archive_project_still_working", slug, hostId: projHostIdNum });
+            toast(`Still archiving "${name}"`, { description: "The machine is still working on it." });
+          });
+          console.info({
+            operation: answer.done ? "archive_project_done" : "archive_project_still_working_gave_up",
+            slug,
+            hostId: projHostIdNum,
+            requestId: answer.requestId,
+            projects: archivedSlugs.size,
+            agents: contents.agents.length,
+            apps: contents.apps.length,
+          });
+          if (answer.done) {
+            for (const a of contents.agents) announceAgentArchived(projHostIdNum, a.name);
+          }
+          return;
+        } catch (err) {
+          putBack();
+          const changed =
+            err instanceof MachineChangeError && err.code === "contents_changed" && err.result !== null
+              ? (err.result as ProjectArchiveContents)
+              : null;
+          console.warn({
+            operation: changed ? "archive_project_contents_changed" : "archive_project_failed",
+            slug,
+            hostId: projHostIdNum,
+            code: err instanceof MachineChangeError ? err.code : null,
+            errMessage: err instanceof Error ? err.message : String(err),
+          });
+          if (changed) {
+            contents = changed;
+            changedNote = `What's in "${name}" changed since you looked. This is what it holds now.`;
+            continue;
+          }
+          void kitAlert({
+            title: `Couldn't archive "${name}"`,
+            body: `${sentenceOf(err instanceof Error ? err.message : String(err))} Nothing was archived.`,
+          });
+          return;
+        }
+      }
+      void kitAlert({
+        title: `Couldn't archive "${name}"`,
+        body: "What's in it kept changing. Nothing was archived; try again once it settles.",
+      });
     },
-    [projectSections, findProject, viewingUserMxid],
+    [findProject, projectSections],
   );
 
   // Phase 117 Plan 117-09 Task 2 (D-14) — handleSectionContextMenu RETIRED

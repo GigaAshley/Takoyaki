@@ -102,6 +102,7 @@ vi.mock("../../claude-session/identity-artifact-reader.js", () => ({
 vi.mock("../../fleet-change/front-door.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../fleet-change/front-door.js")>()),
   submitFrontDoor: vi.fn(),
+  frontDoorStatus: vi.fn(),
 }));
 vi.mock("../../fleet-change/project-rooms.js", () => ({
   findProjectRooms: vi.fn(),
@@ -139,7 +140,7 @@ vi.mock("../../fleet-status/subscription-registry.js", () => ({
 // Import mocked modules AFTER vi.mock() declarations
 // ---------------------------------------------------------------------------
 
-import { submitFrontDoor } from "../../fleet-change/front-door.js";
+import { frontDoorStatus, submitFrontDoor } from "../../fleet-change/front-door.js";
 import { findProjectRooms, releaseProjectRooms } from "../../fleet-change/project-rooms.js";
 import { connectOneShot } from "../../ssh/ssh-one-shot.js";
 import { resolveHostById } from "../../ssh/host-resolver.js";
@@ -277,6 +278,7 @@ beforeEach(() => {
       ? { state: "done", id: o.id ?? "r1", seq: 1, result: { projects: [{ slug: args.slug, archivedAs: args.slug }], agents: [], apps: [] } }
       : { state: "done", id: o.id ?? "r1", seq: 1, result: { project: args.slug, projects: [{ slug: args.slug, displayName: args.slug, parent: null }], agents: [], apps: [] } },
   );
+  (frontDoorStatus as Mock).mockResolvedValue(null);
   (findProjectRooms as Mock).mockResolvedValue([]);
   (releaseProjectRooms as Mock).mockResolvedValue([]);
   (readProjectFile as Mock).mockResolvedValue({ markdown: "" });
@@ -894,6 +896,20 @@ describe("POST /projects/:slug/archive", () => {
     res = await httpRequest(server, { method: "POST", path: "/projects/my-project/archive", body: { hostId: 5, expected: EXPECTED } });
     expect(res.status).toBe(503);
     expect(res.body).toMatchObject({ code: "updating" });
+  });
+
+  it("Test 13f: the same request again after the project is gone → its outcome, rooms released", async () => {
+    (listProjects as Mock).mockResolvedValue([]);
+    (frontDoorStatus as Mock).mockResolvedValueOnce({ state: "done", id: "click-9", seq: 5, result: {} });
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/projects/my-project/archive",
+      body: { hostId: 5, expected: EXPECTED, requestId: "click-9" },
+    });
+    expect(res.status).toBe(200);
+    expect(frontDoorStatus).toHaveBeenCalledWith(null, "click-9", 0);
+    expect(submitFrontDoor).toHaveBeenCalledWith(null, "project-archive", { slug: "my-project", expected: EXPECTED }, { id: "click-9", hostId: 5 });
+    expect(releaseProjectRooms).toHaveBeenCalledWith("1", ["my-project"]);
   });
 
   it("Test 13e: missing or malformed expected list → 400 before any I/O", async () => {

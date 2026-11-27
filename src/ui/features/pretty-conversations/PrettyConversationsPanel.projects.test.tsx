@@ -230,6 +230,7 @@ const unpinConversationSpy = vi.fn();
 const hydratePinnedIdsFromServerSpy = vi.fn();
 
 let mockActiveSet: ReadonlySet<string> = new Set();
+const mergeProjectsForHostSpy = vi.fn<(hostId: string, rows: unknown[]) => void>();
 let mockFleetSessionsLoaded = true;
 const patchRoomPinnedSpy = vi.fn<(roomId: string, pinned: boolean) => void>();
 let mockRoomPinnedIds: ReadonlySet<string> = new Set();
@@ -260,6 +261,11 @@ vi.mock("@/state/conversation-store", () => ({
   useFleetSessionsLoaded: () => mockFleetSessionsLoaded,
   getFleetSessionsSnapshot: () => [],
   useProjects: () => mockProjects,
+  getProjectsSnapshot: () => mockProjects,
+  mergeProjectsForHost: (hostId: string, rows: typeof mockProjects) => {
+    mergeProjectsForHostSpy(hostId, rows);
+    mockProjects = [...mockProjects.filter((p) => p.hostId !== hostId), ...rows];
+  },
   selectConversation: (id: string | null) => selectConversationSpy(id),
   pinConversation: (id: string) => pinConversationSpy(id),
   unpinConversation: (id: string) => unpinConversationSpy(id),
@@ -314,10 +320,29 @@ const createProjectSpy = vi.fn<
   ok: true as const,
   slug: name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, ""),
 }));
-const getArchivePreflightSpy = vi.fn(async (_hostId: number, _slug: string) => ({ hiddenSubProjects: 0 }));
+// What the machine says a project holds (archive preflight) — per test.
+type Contents = {
+  project: string;
+  projects: Array<{ slug: string; displayName: string; parent: string | null }>;
+  agents: Array<{ name: string; displayName: string; task: string; project: string }>;
+  apps: Array<{ slug: string; title: string; project: string }>;
+};
+const contentsOf = (slug: string, agents: string[] = [], apps: Array<[string, string]> = []): Contents => ({
+  project: slug,
+  projects: [{ slug, displayName: slug, parent: null }],
+  agents: agents.map((name) => ({ name, displayName: name, task: "", project: slug })),
+  apps: apps.map(([a, title]) => ({ slug: a, title, project: slug })),
+});
+let mockPreflightRooms: Array<{ roomId: string; project: string }> = [];
+let mockContents: (slug: string) => Contents = (slug) => contentsOf(slug);
+const getArchivePreflightSpy = vi.fn(async (_hostId: number, slug: string) => ({
+  done: true as const,
+  requestId: "pre-1",
+  result: { hiddenSubProjects: 0, contents: mockContents(slug), rooms: mockPreflightRooms, roomsUnknown: false },
+}));
 const archiveProjectSpy = vi.fn<
-  (hostId: number, slug: string) => Promise<{ ok: true }>
->(async () => ({ ok: true as const }));
+  (hostId: number, slug: string, expected: { projects: string[]; agents: string[]; apps: string[] }) => Promise<unknown>
+>(async () => ({ done: true as const, requestId: "arch-1", result: { ok: true } }));
 const getProjectFileSpy = vi.fn<
   (hostId: number, slug: string) => Promise<{ markdown: string }>
 >(async () => ({ markdown: "---\ndisplayName: Alpha\n---\n" }));
@@ -327,8 +352,13 @@ const updateProjectFileSpy = vi.fn<
 vi.mock("@/api/project-list-api", () => ({
   createProject: (hostId: number, displayName: string) =>
     createProjectSpy(hostId, displayName),
-  archiveProject: (hostId: number, slug: string) =>
-    archiveProjectSpy(hostId, slug),
+  archiveProject: (hostId: number, slug: string, expected: { projects: string[]; agents: string[]; apps: string[] }) =>
+    archiveProjectSpy(hostId, slug, expected),
+  expectedFromContents: (c: Contents) => ({
+    projects: c.projects.map((p) => p.slug),
+    agents: c.agents.map((a) => a.name),
+    apps: c.apps.map((a) => a.slug),
+  }),
   getArchivePreflight: (hostId: number, slug: string) =>
     getArchivePreflightSpy(hostId, slug),
   getProjectFile: (hostId: number, slug: string) =>
@@ -402,6 +432,7 @@ vi.mock("@/api/global-files-api", () => ({
 // ─── Component under test ───────────────────────────────────────────────────
 
 import { PrettyConversationsPanel } from "./PrettyConversationsPanel";
+import { MachineChangeError } from "@/api/machine-changes-api";
 import { resetWakeupCheckMock, wakeupCheckMock } from "@/shell/archive-wakeup-check.test-mocks";
 
 // ─── Fixture helpers ────────────────────────────────────────────────────────
@@ -1472,6 +1503,8 @@ describe("PrettyConversationsPanel: archive-project cascade (117-09 Task 2)", ()
   beforeEach(() => {
     confirmAnswer = false;
     promptAnswer = null;
+    mockContents = (slug) => contentsOf(slug);
+    mockPreflightRooms = [];
     dialogs = autoAnswerKitDialogs({
       confirm: () => confirmAnswer,
       prompt: () => promptAnswer,
@@ -1481,47 +1514,64 @@ describe("PrettyConversationsPanel: archive-project cascade (117-09 Task 2)", ()
     __resetKitDialogsForTests();
   });
 
-  it("A9 Test 1 (confirm copy): kebab 'Archive project' names the project, counts its agents, says it can't be undone", async () => {
-    const hostA = makeHost("1", "hostA");
-    const rowA = makeRow({ id: "in-alpha", host: hostA, targetTmuxSession: "wren" });
-    setSnapshot({
-      projectSections: [{ slug: "alpha", displayName: "Alpha", rows: [rowA] }],
-    });
-    mockProjects = [
-      { slug: "alpha", displayName: "Alpha", hostId: "1", hostname: "hostA", archived: false },
-    ];
-    confirmAnswer = false;
-
-    const { container, getByText } = render(
+  const renderPanel = (onDeactivateRow: (r: unknown) => void = () => {}) =>
+    render(
       <PrettyConversationsPanel isAdmin
         variant="desktop"
         hostTree={HOST_TREE}
         onNewConversation={() => {}}
-        onDeactivateRow={() => {}}
+        onDeactivateRow={onDeactivateRow}
       />,
     );
+  const settle = async () => {
+    for (let i = 0; i < 4; i++) await new Promise((r) => setTimeout(r, 0));
+  };
+  const alpha = { slug: "alpha", displayName: "Alpha", hostId: "1", hostname: "hostA", archived: false };
+
+  it("A9 Test 1 (confirm copy): names the project, counts the agents the machine says are in it, says it can't be undone", async () => {
+    const hostA = makeHost("1", "hostA");
+    setSnapshot({ projectSections: [{ slug: "alpha", displayName: "Alpha", rows: [makeRow({ id: "in-alpha", host: hostA, targetTmuxSession: "wren" })] }] });
+    mockProjects = [alpha];
+    mockContents = (slug) => contentsOf(slug, ["wren"]);
+    confirmAnswer = false;
+
+    const { container } = renderPanel();
     await openProjectKebabAndClickItem(container, "alpha", "Archive project");
 
     await waitFor(() => expect(kitCalls("confirm")).toHaveLength(1));
+    expect(getArchivePreflightSpy).toHaveBeenCalledWith(1, "alpha");
     const opts = kitCalls("confirm")[0] as KitConfirmOptions;
     expect(opts.title).toBe('Archive "Alpha"?');
     expect(opts.body).toBe(
-      "This also archives the 1 agent in it.\n\nThis can't be undone. Move conversations out first to keep them.",
+      "This also archives the 1 agent in it.\n\nThis can't be undone. Move conversations and apps out first to keep them.",
     );
     expect(opts.destructive).toBe(true);
   });
 
+  it("A9 Test 1a (machine decides): an agent the sidebar doesn't show is counted; the apps are named", async () => {
+    setSnapshot({ projectSections: [{ slug: "alpha", displayName: "Alpha", rows: [] }] });
+    mockProjects = [alpha];
+    mockContents = (slug) => contentsOf(slug, ["unseen"], [["ai-spend", "AI Spend"], ["ai-cost", "AI Cost"]]);
+    mockPreflightRooms = [{ roomId: "!abc:host", project: "alpha" }];
+    confirmAnswer = false;
+
+    const { container } = renderPanel();
+    await openProjectKebabAndClickItem(container, "alpha", "Archive project");
+
+    await waitFor(() => expect(kitCalls("confirm")).toHaveLength(1));
+    expect((kitCalls("confirm")[0] as KitConfirmOptions).body).toBe(
+      "This also archives the 1 agent in it.\n\n" +
+        'Its 2 apps "AI Spend" and "AI Cost" are archived with it.\n\n' +
+        "1 relay room will move back to Conversations.\n\n" +
+        "This can't be undone. Move conversations and apps out first to keep them.",
+    );
+    mockPreflightRooms = [];
+  });
+
   it("A9 Test 1b (wake-ups): the confirm names the agents whose wake-ups would stop, and any it couldn't check", async () => {
-    const hostA = makeHost("1", "hostA");
-    const row1 = makeRow({ id: "r1", host: hostA, targetTmuxSession: "wren" });
-    const row2 = makeRow({ id: "r2", host: hostA, targetTmuxSession: "sparrow" });
-    const row3 = makeRow({ id: "r3", host: hostA, targetTmuxSession: "finch" });
-    setSnapshot({
-      projectSections: [{ slug: "alpha", displayName: "Alpha", rows: [row1, row2, row3] }],
-    });
-    mockProjects = [
-      { slug: "alpha", displayName: "Alpha", hostId: "1", hostname: "hostA", archived: false },
-    ];
+    setSnapshot({ projectSections: [{ slug: "alpha", displayName: "Alpha", rows: [] }] });
+    mockProjects = [alpha];
+    mockContents = (slug) => contentsOf(slug, ["wren", "sparrow", "finch"]);
     wakeupCheckMock.impl = async (_hostId, identityKey) =>
       identityKey === "wren"
         ? {
@@ -1536,14 +1586,7 @@ describe("PrettyConversationsPanel: archive-project cascade (117-09 Task 2)", ()
           : { status: "checked", active: [] };
     confirmAnswer = false;
 
-    const { container } = render(
-      <PrettyConversationsPanel isAdmin
-        variant="desktop"
-        hostTree={HOST_TREE}
-        onNewConversation={() => {}}
-        onDeactivateRow={() => {}}
-      />,
-    );
+    const { container } = renderPanel();
     await openProjectKebabAndClickItem(container, "alpha", "Archive project");
 
     await waitFor(() => expect(kitCalls("confirm")).toHaveLength(1));
@@ -1554,75 +1597,50 @@ describe("PrettyConversationsPanel: archive-project cascade (117-09 Task 2)", ()
         "1 of these agents has scheduled wake-ups that will stop: wren (2).\n\n" +
         "Couldn't check the scheduled wake-ups of finch — any they have will stop.\n\n" +
         "If this work should keep running, set it up as a scheduled conversation (clock icon) first.\n\n" +
-        "This can't be undone. Move conversations out first to keep them.",
+        "This can't be undone. Move conversations and apps out first to keep them.",
     );
     expect(archiveProjectSpy).not.toHaveBeenCalled();
   });
 
-  it("A9 Test 2 (cascade: archiveProject first, then N archiveIdentity): 3 identity members → 3 archiveIdentity + 1 archiveProject", async () => {
+  it("A9 Test 2 (one request): Archive sends the confirmed list to the machine; it, not the sidebar, archives the agents and rooms", async () => {
     const hostA = makeHost("1", "hostA");
-    const row1 = makeRow({ id: "r1", host: hostA, targetTmuxSession: "wren" });
-    const row2 = makeRow({ id: "r2", host: hostA, targetTmuxSession: "sparrow" });
-    const row3 = makeRow({ id: "r3", host: hostA, targetTmuxSession: "finch" });
+    const relayRow = makeRow({ id: "relay-1", host: undefined, targetTmuxSession: null, kind: "relay-room", roomId: "!abc:host" });
     setSnapshot({
-      projectSections: [
-        { slug: "alpha", displayName: "Alpha", rows: [row1, row2, row3] },
-      ],
+      projectSections: [{ slug: "alpha", displayName: "Alpha", rows: [makeRow({ id: "r1", host: hostA, targetTmuxSession: "wren" }), relayRow] }],
     });
-    mockProjects = [
-      { slug: "alpha", displayName: "Alpha", hostId: "1", hostname: "hostA", archived: false },
-    ];
+    mockProjects = [alpha];
+    mockContents = (slug) => contentsOf(slug, ["wren", "sparrow"]);
+    mockPreflightRooms = [{ roomId: "!abc:host", project: "alpha" }];
     confirmAnswer = true;
 
-    const { container, getByText } = render(
-      <PrettyConversationsPanel isAdmin
-        variant="desktop"
-        hostTree={HOST_TREE}
-        onNewConversation={() => {}}
-        onDeactivateRow={() => {}}
-      />,
-    );
+    const { container } = renderPanel();
     await openProjectKebabAndClickItem(container, "alpha", "Archive project");
+    await settle();
 
-    // Wait for the async cascade to settle.
-    await new Promise((r) => setTimeout(r, 0));
-    await new Promise((r) => setTimeout(r, 0));
-
-    // Read the archiveIdentity spy from the vi.mock; expose via import.
-    const { archiveIdentity } = await import("@/api/identity-archive-api");
-    expect(archiveIdentity).toHaveBeenCalledTimes(3);
     expect(archiveProjectSpy).toHaveBeenCalledTimes(1);
-    expect(archiveProjectSpy).toHaveBeenCalledWith(1, "alpha");
-    // Folder move goes first so a failed move archives nothing.
-    const idOrder = (archiveIdentity as unknown as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
-    expect(archiveProjectSpy.mock.invocationCallOrder[0]).toBeLessThan(idOrder);
+    expect(archiveProjectSpy).toHaveBeenCalledWith(1, "alpha", { projects: ["alpha"], agents: ["wren", "sparrow"], apps: [] });
+    const { archiveIdentity } = await import("@/api/identity-archive-api");
+    expect(archiveIdentity).not.toHaveBeenCalled();
+    expect(setRelayRoomProjectSpy).not.toHaveBeenCalled();
+    // Shown archived at once: the project leaves this host's list.
+    expect(mergeProjectsForHostSpy).toHaveBeenCalledWith("1", []);
+    mockPreflightRooms = [];
   });
 
   it("A9 Test 2a (open member pane): archiving the project closes a member's open pane", async () => {
     const hostA = makeHost("1", "hostA");
-    const row1 = makeRow({ id: "r1", host: hostA, targetTmuxSession: "wren" });
-    const row2 = makeRow({ id: "r2", host: hostA, targetTmuxSession: "sparrow" });
     setSnapshot({
-      projectSections: [{ slug: "alpha", displayName: "Alpha", rows: [row1, row2] }],
+      projectSections: [{ slug: "alpha", displayName: "Alpha", rows: [makeRow({ id: "r1", host: hostA, targetTmuxSession: "wren" }), makeRow({ id: "r2", host: hostA, targetTmuxSession: "sparrow" })] }],
     });
-    mockProjects = [
-      { slug: "alpha", displayName: "Alpha", hostId: "1", hostname: "hostA", archived: false },
-    ];
+    mockProjects = [alpha];
+    mockContents = (slug) => contentsOf(slug, ["wren", "sparrow"]);
     mockActiveSet = new Set(["r1"]);
     confirmAnswer = true;
     const onDeactivateRow = vi.fn();
 
-    const { container } = render(
-      <PrettyConversationsPanel isAdmin
-        variant="desktop"
-        hostTree={HOST_TREE}
-        onNewConversation={() => {}}
-        onDeactivateRow={onDeactivateRow}
-      />,
-    );
+    const { container } = renderPanel(onDeactivateRow);
     await openProjectKebabAndClickItem(container, "alpha", "Archive project");
-    await new Promise((r) => setTimeout(r, 0));
-    await new Promise((r) => setTimeout(r, 0));
+    await settle();
 
     expect(onDeactivateRow).toHaveBeenCalledTimes(1);
     expect(onDeactivateRow).toHaveBeenCalledWith(expect.objectContaining({ id: "r1" }));
@@ -1630,276 +1648,137 @@ describe("PrettyConversationsPanel: archive-project cascade (117-09 Task 2)", ()
     mockActiveSet = new Set();
   });
 
-  it("A9 Test 2b (folder move fails): NO member is archived and the user is alerted", async () => {
-    const hostA = makeHost("1", "hostA");
-    const row1 = makeRow({ id: "r1", host: hostA, targetTmuxSession: "wren" });
-    setSnapshot({
-      projectSections: [{ slug: "alpha", displayName: "Alpha", rows: [row1] }],
-    });
-    mockProjects = [
-      { slug: "alpha", displayName: "Alpha", hostId: "1", hostname: "hostA", archived: false },
-    ];
+  it("A9 Test 2b (refused): everything is put back and the machine's reason is shown", async () => {
+    setSnapshot({ projectSections: [{ slug: "alpha", displayName: "Alpha", rows: [] }] });
+    mockProjects = [alpha];
     confirmAnswer = true;
-    archiveProjectSpy.mockRejectedValueOnce(new Error("archive destination already exists"));
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    archiveProjectSpy.mockRejectedValueOnce(new MachineChangeError("that project doesn't exist or is already archived", 409, "not_found", null));
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
-    const { container } = render(
-      <PrettyConversationsPanel isAdmin
-        variant="desktop"
-        hostTree={HOST_TREE}
-        onNewConversation={() => {}}
-        onDeactivateRow={() => {}}
-      />,
-    );
+    const { container } = renderPanel();
     await openProjectKebabAndClickItem(container, "alpha", "Archive project");
-    await new Promise((r) => setTimeout(r, 0));
-    await new Promise((r) => setTimeout(r, 0));
+    await settle();
 
-    const { archiveIdentity } = await import("@/api/identity-archive-api");
-    expect(archiveIdentity).not.toHaveBeenCalled();
     await waitFor(() => expect(kitCalls("alert")).toHaveLength(1));
-    expect(String((kitCalls("alert")[0] as KitAlertOptions).body)).toMatch(/Nothing was archived/);
-    errorSpy.mockRestore();
+    expect(String((kitCalls("alert")[0] as KitAlertOptions).body)).toBe(
+      "That project doesn't exist or is already archived. Nothing was archived.",
+    );
+    expect(mergeProjectsForHostSpy).toHaveBeenLastCalledWith("1", [alpha]);
+    warnSpy.mockRestore();
   });
 
-  it("A9 Test 3 (partial failure): 1 archiveIdentity throws → console.error logs + user alerted", async () => {
-    const hostA = makeHost("1", "hostA");
-    const row1 = makeRow({ id: "r1", host: hostA, targetTmuxSession: "wren" });
-    const row2 = makeRow({ id: "r2", host: hostA, targetTmuxSession: "sparrow" });
-    setSnapshot({
-      projectSections: [
-        { slug: "alpha", displayName: "Alpha", rows: [row1, row2] },
-      ],
-    });
-    mockProjects = [
-      { slug: "alpha", displayName: "Alpha", hostId: "1", hostname: "hostA", archived: false },
-    ];
+  it("A9 Test 3 (contents changed): the confirm shows what it holds now, and Archive sends that list", async () => {
+    setSnapshot({ projectSections: [{ slug: "alpha", displayName: "Alpha", rows: [] }] });
+    mockProjects = [alpha];
     confirmAnswer = true;
-
-    const { archiveIdentity } = await import("@/api/identity-archive-api");
-    // First call throws; second succeeds.
-    (archiveIdentity as unknown as ReturnType<typeof vi.fn>)
-      .mockImplementationOnce(async () => {
-        throw new Error("cannot reach host");
-      })
-      .mockImplementationOnce(async () => ({ ok: true }));
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
-    const { container, getByText } = render(
-      <PrettyConversationsPanel isAdmin
-        variant="desktop"
-        hostTree={HOST_TREE}
-        onNewConversation={() => {}}
-        onDeactivateRow={() => {}}
-      />,
+    archiveProjectSpy.mockRejectedValueOnce(
+      new MachineChangeError("what's in \"Alpha\" changed since you looked; check the list again", 409, "contents_changed", contentsOf("alpha", ["finch"])),
     );
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const { container } = renderPanel();
     await openProjectKebabAndClickItem(container, "alpha", "Archive project");
+    await settle();
 
-    await new Promise((r) => setTimeout(r, 0));
-    await new Promise((r) => setTimeout(r, 0));
-
-    // archiveProject STILL fires despite partial failure (Promise.allSettled semantics).
-    expect(archiveProjectSpy).toHaveBeenCalledWith(1, "alpha");
-    // Partial-failure logged.
-    expect(errorSpy).toHaveBeenCalled();
-    errorSpy.mockRestore();
+    await waitFor(() => expect(kitCalls("confirm")).toHaveLength(2));
+    expect((kitCalls("confirm")[1] as KitConfirmOptions).body).toBe(
+      'What\'s in "Alpha" changed since you looked. This is what it holds now.\n\n' +
+        "This also archives the 1 agent in it.\n\n" +
+        "This can't be undone. Move conversations and apps out first to keep them.",
+    );
+    await waitFor(() => expect(archiveProjectSpy).toHaveBeenCalledTimes(2));
+    expect(archiveProjectSpy).toHaveBeenLastCalledWith(1, "alpha", { projects: ["alpha"], agents: ["finch"], apps: [] });
+    expect(kitCalls("alert")).toHaveLength(0);
+    warnSpy.mockRestore();
   });
 
-  it("A9 Test 3a (Fix 3 — mixed identity + relay-room cascade): archiveProject first, then BOTH archiveIdentity + setRelayRoomProject(null)", async () => {
-    const hostA = makeHost("1", "hostA");
-    const identityRow = makeRow({
-      id: "identity-1",
-      host: hostA,
-      targetTmuxSession: "wren",
-    });
-    const relayRow = makeRow({
-      id: "relay-1",
-      host: undefined,
-      targetTmuxSession: null,
-      kind: "relay-room",
-      roomId: "!abc:host",
-    });
-    setSnapshot({
-      projectSections: [
-        { slug: "alpha", displayName: "Alpha", rows: [identityRow, relayRow] },
-      ],
-    });
-    mockProjects = [
-      { slug: "alpha", displayName: "Alpha", hostId: "1", hostname: "hostA", archived: false },
-    ];
-    confirmAnswer = true;
+  it("A9 Test 3a (machine busy): the check before the confirm says to try again; nothing is archived", async () => {
+    setSnapshot({ projectSections: [{ slug: "alpha", displayName: "Alpha", rows: [] }] });
+    mockProjects = [alpha];
+    getArchivePreflightSpy.mockResolvedValueOnce({ done: false, requestId: "pre-2" } as never);
 
-    const { archiveIdentity } = await import("@/api/identity-archive-api");
-
-    const { container, getByText } = render(
-      <PrettyConversationsPanel isAdmin
-        variant="desktop"
-        hostTree={HOST_TREE}
-        onNewConversation={() => {}}
-        onDeactivateRow={() => {}}
-      />,
-    );
+    const { container } = renderPanel();
     await openProjectKebabAndClickItem(container, "alpha", "Archive project");
+    await settle();
 
-    await new Promise((r) => setTimeout(r, 0));
-    await new Promise((r) => setTimeout(r, 0));
-
-    // Both member spies fired exactly once.
-    expect(archiveIdentity).toHaveBeenCalledTimes(1);
-    expect(archiveIdentity).toHaveBeenCalledWith(1, "wren");
-    expect(setRelayRoomProjectSpy).toHaveBeenCalledTimes(1);
-    expect(setRelayRoomProjectSpy).toHaveBeenCalledWith(
-      "!abc:host",
-      "@user:matrix.example",
-      null,
-    );
-    // Then archiveProject fired.
-    expect(archiveProjectSpy).toHaveBeenCalledTimes(1);
-    expect(archiveProjectSpy).toHaveBeenCalledWith(1, "alpha");
+    await waitFor(() => expect(kitCalls("alert")).toHaveLength(1));
+    expect((kitCalls("alert")[0] as KitAlertOptions).title).toBe('Couldn\'t check "Alpha" yet');
+    expect(kitCalls("confirm")).toHaveLength(0);
+    expect(archiveProjectSpy).not.toHaveBeenCalled();
   });
 
-  it("A9 Test 3b (same slug on two hosts): archiving host 2's section only touches host 2", async () => {
+  it("A9 Test 3b (same slug on two hosts): archiving host 2's section only asks host 2", async () => {
     const hostA = makeHost("1", "hostA");
     const hostB = makeHost("2", "hostB");
-    const rowA = makeRow({ id: "rA", host: hostA, targetTmuxSession: "wren" });
-    const rowB = makeRow({ id: "rB", host: hostB, targetTmuxSession: "finch" });
     setSnapshot({
       projectSections: [
-        { slug: "ops", hostId: "1", displayName: "Ops", rows: [rowA] },
-        { slug: "ops", hostId: "2", displayName: "Ops", rows: [rowB] },
+        { slug: "ops", hostId: "1", displayName: "Ops", rows: [makeRow({ id: "rA", host: hostA, targetTmuxSession: "wren" })] },
+        { slug: "ops", hostId: "2", displayName: "Ops", rows: [makeRow({ id: "rB", host: hostB, targetTmuxSession: "finch" })] },
       ],
     });
     mockProjects = [
       { slug: "ops", displayName: "Ops", hostId: "1", hostname: "hostA", archived: false },
       { slug: "ops", displayName: "Ops", hostId: "2", hostname: "hostB", archived: false },
     ];
+    mockContents = (slug) => contentsOf(slug, ["finch"]);
     confirmAnswer = true;
-    const { container } = render(
-      <PrettyConversationsPanel isAdmin
-        variant="desktop"
-        hostTree={HOST_TREE}
-        onNewConversation={() => {}}
-        onDeactivateRow={() => {}}
-      />,
-    );
+    const { container } = renderPanel();
     const user = userEvent.setup();
     const triggers = container.querySelectorAll('[data-testid="pv-project-section-kebab-trigger-ops"]');
     expect(triggers).toHaveLength(2);
     await user.click(triggers[1] as HTMLElement);
     await user.click(screen.getByRole("menuitem", { name: "Archive project" }));
-    await new Promise((r) => setTimeout(r, 0));
-    await new Promise((r) => setTimeout(r, 0));
+    await settle();
 
-    const { archiveIdentity } = await import("@/api/identity-archive-api");
+    expect(getArchivePreflightSpy).toHaveBeenCalledWith(2, "ops");
     expect(archiveProjectSpy).toHaveBeenCalledTimes(1);
-    expect(archiveProjectSpy).toHaveBeenCalledWith(2, "ops");
-    expect(archiveIdentity).toHaveBeenCalledTimes(1);
-    expect(archiveIdentity).toHaveBeenCalledWith(2, "finch");
+    expect(archiveProjectSpy).toHaveBeenCalledWith(2, "ops", { projects: ["ops"], agents: ["finch"], apps: [] });
+    expect(mergeProjectsForHostSpy).toHaveBeenCalledWith("2", []);
   });
 
-  it("A9 Test 4 (cancel): user clicks Cancel in confirm → no cascade, no archiveProject", async () => {
-    const hostA = makeHost("1", "hostA");
-    const rowA = makeRow({ id: "r1", host: hostA, targetTmuxSession: "wren" });
-    setSnapshot({
-      projectSections: [{ slug: "alpha", displayName: "Alpha", rows: [rowA] }],
-    });
-    mockProjects = [
-      { slug: "alpha", displayName: "Alpha", hostId: "1", hostname: "hostA", archived: false },
-    ];
+  it("A9 Test 4 (cancel): user clicks Cancel in confirm → nothing sent", async () => {
+    setSnapshot({ projectSections: [{ slug: "alpha", displayName: "Alpha", rows: [] }] });
+    mockProjects = [alpha];
     confirmAnswer = false;
 
-    const { container, getByText } = render(
-      <PrettyConversationsPanel isAdmin
-        variant="desktop"
-        hostTree={HOST_TREE}
-        onNewConversation={() => {}}
-        onDeactivateRow={() => {}}
-      />,
-    );
+    const { container } = renderPanel();
     await openProjectKebabAndClickItem(container, "alpha", "Archive project");
     await waitFor(() => expect(kitCalls("confirm")).toHaveLength(1));
-    await new Promise((r) => setTimeout(r, 0));
+    await settle();
 
-    const { archiveIdentity } = await import("@/api/identity-archive-api");
-    expect(archiveIdentity).not.toHaveBeenCalled();
     expect(archiveProjectSpy).not.toHaveBeenCalled();
-    expect(setRelayRoomProjectSpy).not.toHaveBeenCalled();
+    expect(mergeProjectsForHostSpy).not.toHaveBeenCalled();
   });
 
-  it("A9 Test 5 (empty project): 0 members → skip cascade, just archiveProject", async () => {
-    setSnapshot({
-      projectSections: [{ slug: "empty", displayName: "Empty", rows: [] }],
-    });
-    mockProjects = [
-      { slug: "empty", displayName: "Empty", hostId: "1", hostname: "hostA", archived: false },
-    ];
+  it("A9 Test 5 (empty project): the archive carries empty lists", async () => {
+    setSnapshot({ projectSections: [{ slug: "empty", displayName: "Empty", rows: [] }] });
+    mockProjects = [{ slug: "empty", displayName: "Empty", hostId: "1", hostname: "hostA", archived: false }];
     confirmAnswer = true;
 
-    const { container, getByText } = render(
-      <PrettyConversationsPanel isAdmin
-        variant="desktop"
-        hostTree={HOST_TREE}
-        onNewConversation={() => {}}
-        onDeactivateRow={() => {}}
-      />,
-    );
+    const { container } = renderPanel();
     await openProjectKebabAndClickItem(container, "empty", "Archive project");
+    await settle();
 
-    await new Promise((r) => setTimeout(r, 0));
-
-    const { archiveIdentity } = await import("@/api/identity-archive-api");
-    expect(archiveIdentity).not.toHaveBeenCalled();
-    expect(setRelayRoomProjectSpy).not.toHaveBeenCalled();
-    expect(archiveProjectSpy).toHaveBeenCalledTimes(1);
-    expect(archiveProjectSpy).toHaveBeenCalledWith(1, "empty");
+    expect(archiveProjectSpy).toHaveBeenCalledWith(1, "empty", { projects: ["empty"], agents: [], apps: [] });
   });
 
-  // Phase 117 M7 fix (2026-09-18): pre-fix, if projectsList did not
-  // contain the slug the code fell back to defaultCreateProjectHostId —
-  // a DIFFERENT host than the project actually lives on. That fallback
-  // would silently archive a same-slug project on the wrong host or
-  // fail silently. Correct behavior: log a warning and RETURN early
-  // without firing archiveProject. This test proves the fix.
-  it("A9 Test 5a (M7 fix): project missing from projectsList → NO archiveProject fires (defensive early-return, not host-fallback)", async () => {
-    setSnapshot({
-      projectSections: [
-        { slug: "alpha", displayName: "Alpha", rows: [] },
-      ],
-    });
-    // projectsList does NOT contain "alpha" — simulate a stale sidebar
-    // where a project was archived on another client but the WS event
-    // has not landed yet.
+  // Phase 117 M7 fix (2026-09-18): if projectsList doesn't contain the slug,
+  // never fall back to another host — log and return without asking anything.
+  it("A9 Test 5a (M7 fix): project missing from projectsList → nothing asked or archived (defensive early-return, not host-fallback)", async () => {
+    setSnapshot({ projectSections: [{ slug: "alpha", displayName: "Alpha", rows: [] }] });
     mockProjects = [];
     confirmAnswer = true;
+    const consoleWarnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
-    const consoleWarnSpy = vi
-      .spyOn(console, "warn")
-      .mockImplementation(() => {});
-
-    const { container, getByText } = render(
-      <PrettyConversationsPanel isAdmin
-        variant="desktop"
-        hostTree={HOST_TREE}
-        onNewConversation={() => {}}
-        onDeactivateRow={() => {}}
-      />,
-    );
+    const { container } = renderPanel();
     await openProjectKebabAndClickItem(container, "alpha", "Archive project");
+    await settle();
 
-    await new Promise((r) => setTimeout(r, 0));
-
-    // M7 regression: archiveProject MUST NOT have fired — refusing to
-    // fall back to defaultCreateProjectHostId when the project isn't
-    // in the list.
+    expect(getArchivePreflightSpy).not.toHaveBeenCalled();
     expect(archiveProjectSpy).not.toHaveBeenCalled();
-    // Warning was logged with the reason.
     expect(consoleWarnSpy).toHaveBeenCalledWith(
-      expect.objectContaining({
-        operation: "archive_project_folder_move_skipped_no_host",
-        slug: "alpha",
-      }),
+      expect.objectContaining({ operation: "archive_project_skipped_no_host", slug: "alpha" }),
     );
-
     consoleWarnSpy.mockRestore();
   });
 

@@ -37,6 +37,7 @@ import appsRenameRoutes from "./routes/apps-rename.js";
 // project-scoped apps: POST /apps/:hostId/:slug/move — "Move to" on any app
 // (sidebar or a project); the agent-supervisor carries it out.
 import appsMoveRoutes from "./routes/apps-move.js";
+import machineChangesRoutes from "./routes/machine-changes.js";
 // Phase 120 Plan 05 (D-08): the /apps/:hostId/:slug/pane/* reverse-proxy
 // route. Named export (not default) to disambiguate from Phase 119's
 // default-exported apps router at the mount site below.
@@ -2224,6 +2225,7 @@ app.use("/apps", appsArchiveRoutes);
 app.use("/apps", appsUnarchiveRoutes); // Phase 143 D-01
 app.use("/apps", appsRenameRoutes); // app-rename shape
 app.use("/apps", appsMoveRoutes); // project-scoped apps: Move to (sidebar / project)
+app.use("/machine-changes", machineChangesRoutes); // a front-door request's outcome, by id
 // Phase 143 Plan 143-03 (D-05/D-07): GET /apps-archive — fleet-wide archived-app
 // list. Standalone base path; must mount BEFORE any generic catch-all (mirrors
 // archive-route mount discipline at database.ts:2067).
