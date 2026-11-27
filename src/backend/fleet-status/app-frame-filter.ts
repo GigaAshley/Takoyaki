@@ -35,10 +35,16 @@
  */
 import { checkHostAccess as defaultCheckHostAccess } from "../ssh/host-resolver.js";
 import { systemLogger } from "../utils/logger.js";
-import type { AppState, FrontendOutboundFrameType } from "./wire-protocol.js";
+import type {
+  AppState,
+  FrontendOutboundFrameType,
+  GatedMachineChange,
+  MachineChange,
+} from "./wire-protocol.js";
 import {
   makeAppSnapshotFrame,
   makeAppUpdateFrame,
+  makeMachineChangesFrame,
   makeProjectListChangedFrame,
   makeSnapshotFrame,
 } from "./wire-protocol.js";
@@ -120,6 +126,14 @@ export interface AppFrameFilterCtx {
    * (host-access gate still applies).
    */
   resolveCallerUsername?: (userId: string) => Promise<string | null>;
+  /**
+   * machine-changes: has this person already had this notice (told directly when their
+   * device got the outcome, dismissed, or a pop-up claimed)? Key: request id, or
+   * `<id>:stuck`. Absent = never.
+   */
+  noticeSeen?: (userId: string, hostIdStr: string, key: string) => boolean;
+  /** machine-changes: is the server waiting on this request for someone right now? */
+  beingAsked?: (hostIdStr: string, requestId: string) => boolean;
 }
 
 /**
@@ -559,6 +573,46 @@ export async function filterAppFrame(
     return frame;
   }
 
+  if (frame.type === "machine-changes") {
+    // Host gate, then per entry: only things this person can see (the target's audience),
+    // and notices only for the person they're for, once (see change-notices.ts):
+    //   - refused / failed / unfiled: the person who asked, unless they've had it or the
+    //     server is waiting on it for them right now (their answer is on its way);
+    //   - stuck: whoever archived it — or, for an archive no person asked for, everyone
+    //     who can see it — until one of their devices has claimed it;
+    //   - waiting / running / returning: everyone who can see it.
+    // A move's destination hidden from them is named as hidden. Gate fields are stripped.
+    if (!(await canUserSee(frame.hostId))) return null;
+    const callerUsername = await getCallerUsername();
+    const seen = (key: string) => {
+      try {
+        return ctx.noticeSeen?.(userId, frame.hostId, key) ?? false;
+      } catch {
+        return false;
+      }
+    };
+    const canSee = (audience: string[] | null | undefined) =>
+      audience === null || audience === undefined || callerUsername === null || audience.includes(callerUsername);
+    const out: MachineChange[] = [];
+    for (const raw of frame.changes as GatedMachineChange[]) {
+      if (!canSee(raw.audience)) continue;
+      const mine = raw.byUser !== undefined && raw.byUser === userId;
+      if (raw.state === "refused" || raw.state === "failed" || raw.state === "unfiled") {
+        if (!mine || ctx.beingAsked?.(frame.hostId, raw.id) || seen(raw.id)) continue;
+      } else if (raw.state === "stuck") {
+        if (!(mine || raw.byUser === undefined) || seen(`${raw.id}:stuck`)) continue;
+      }
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const { audience: _a, toAudience, byUser: _u, byAgent: _g, ...rest } = raw;
+      const entry: MachineChange = { ...rest, mine };
+      if (entry.to && !canSee(toAudience)) {
+        entry.to = { ...(entry.to.pinned !== undefined ? { pinned: entry.to.pinned } : {}), hidden: true };
+      }
+      out.push(entry);
+    }
+    return makeMachineChangesFrame(frame.hostId, out);
+  }
+
   if (frame.type === "app-snapshot") {
     // Collect unique hostIds, check in parallel, filter the apps array.
     // Return a NEW frame (do not mutate the input). Empty result is still a
@@ -644,6 +698,8 @@ export interface CreateAppFrameFilterDeps {
    * Optional so existing tests without the wiring degrade gracefully.
    */
   resolveCallerUsername?: AppFrameFilterCtx["resolveCallerUsername"];
+  noticeSeen?: AppFrameFilterCtx["noticeSeen"];
+  beingAsked?: AppFrameFilterCtx["beingAsked"];
   ttlMs?: number;
   /**
    * Test seam — inject a mock checkHostAccess without vi.mock. Production
@@ -676,6 +732,8 @@ export function createAppFrameFilter(
         resolveHostOwnerById,
         resolveIdentityGate,
         resolveCallerUsername,
+        noticeSeen: deps.noticeSeen,
+        beingAsked: deps.beingAsked,
       },
       cache,
       check,

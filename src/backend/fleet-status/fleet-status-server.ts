@@ -16,6 +16,7 @@
  * Every inbound frame is validated via zod before dispatch.
  * Structured logs at every WS lifecycle boundary — never JSON.stringify(event) objects.
  */
+import { getChangeNoticeStore, isBeingAsked, setNoticeRefan } from "../fleet-change/change-notices.js";
 import { WebSocketServer, WebSocket } from "ws";
 import type { IncomingMessage } from "node:http";
 import { systemLogger } from "../utils/logger.js";
@@ -248,6 +249,8 @@ export function startFleetStatusServer(
       resolveHostOwnerById: opts.resolveHostOwnerById,
       resolveIdentityGate,
       resolveCallerUsername: opts.resolveCallerUsername,
+      noticeSeen: (userId, hostIdStr, key) => getChangeNoticeStore().isSeen(userId, hostIdStr, key),
+      beingAsked: (hostIdStr, requestId) => isBeingAsked(hostIdStr, requestId),
       ttlMs: opts.appFrameFilterTtlMs,
       _checkHostAccess: opts._testCheckHostAccessOverride,
     });
@@ -273,6 +276,11 @@ export function startFleetStatusServer(
       },
     );
   }
+
+  // Machine notices: a dismissal, or a request no longer being waited on, changes what a
+  // person may see of a host's open changes — send them again.
+  const registryForNotices = registry;
+  setNoticeRefan((hostId) => registryForNotices.refanMachineChanges(hostId));
 
   // Use path: undefined so we can dispatch manually per req.url
   const wss = new WebSocketServer({

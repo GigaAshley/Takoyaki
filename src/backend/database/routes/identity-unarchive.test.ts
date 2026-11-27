@@ -92,7 +92,7 @@ describe("POST /identities/:key/unarchive", () => {
     const r = await call(server, "POST", "/identities/alpha/unarchive", { hostId: 5, requestId: "u1" });
     expect(r.status).toBe(200);
     expect(r.body).toEqual({ ok: true, outcome: "restored", requestId: "u1" });
-    expect(submitFrontDoor).toHaveBeenCalledWith(conn, "agent-unarchive", { name: "alpha" }, { id: "u1", hostId: 5 });
+    expect(submitFrontDoor).toHaveBeenCalledWith(conn, "agent-unarchive", { name: "alpha" }, { id: "u1", hostId: 5, by: "1" });
     expect(submitAndFollow).not.toHaveBeenCalled();
   });
 

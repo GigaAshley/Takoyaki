@@ -10,6 +10,7 @@ import { DatabaseMigration } from "../../utils/database-migration.js";
 import { DatabaseSaveTrigger } from "../../utils/database-save-trigger.js";
 import { applyMachineIdSchema } from "./machine-id-migration.js";
 import { ATTENTION_TABLES_SQL } from "../../attention/attention-schema.js";
+import { CHANGE_NOTICE_TABLES_SQL } from "../../fleet-change/change-notices-schema.js";
 import { countUncountedAccounts } from "../../whats-new/count-existing-accounts.js";
 import { WHATS_NEW_NOTES } from "../../whats-new/notes.js";
 
@@ -740,6 +741,8 @@ async function initializeCompleteDatabase(): Promise<void> {
 
   // Sidebar unread marks: turn-finish log + per-user read state.
   sqlite.exec(ATTENTION_TABLES_SQL);
+  // Machine notices each person has already had (fleet-change/change-notices.ts).
+  sqlite.exec(CHANGE_NOTICE_TABLES_SQL);
 
   try {
     sqlite.prepare("DELETE FROM user_open_tabs").run();

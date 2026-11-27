@@ -16,7 +16,7 @@ agent-supervisor takes the same lock for each change its own pass makes, so a
 request and the supervisor never touch things at the same moment.
 
 Usage:
-  fleet-change submit <kind> <args-json> [--id <id>] [--wait <sec>]
+  fleet-change submit <kind> <args-json> [--id <id>] [--wait <sec>] [--by user:<id>|agent:<name>]
   fleet-change status <id> [--wait <sec>]
   fleet-change serve [--until-idle]
   fleet-change kinds
@@ -26,7 +26,9 @@ Usage:
   submit   send a request and wait up to --wait seconds (default 15) for its
            outcome. --id is chosen by the caller; sending the same id again
            never does the request twice, it just waits for (or returns) the
-           first one's outcome. Without --id a random one is used.
+           first one's outcome. Without --id a random one is used. --by is who
+           asked (the app's user id, or an agent): kept with the request, its
+           outcome and any archive claim it makes, so they can be told later.
   status   the outcome of an earlier request, waiting up to --wait (default 0).
   serve    run the listener (fleet-changes.service). One per machine.
            --until-idle stops once nothing is waiting (tests, manual runs).
@@ -106,6 +108,9 @@ On disk, all under ~/fleet/.changes/:
   background/<id>.json      a request handed to the supervisor to finish
   returning/<name>.json     an agent un-archive under way: {"name","ids":[...]}
   uploads/<file>            a new agent picture waiting for its agent-edit
+  notices/<id>.json         a person's request that was refused or failed (or a new agent
+                            left in Conversations), kept a day so their devices can tell
+                            them; the machine's status report lists these
   next-seq                  the next request number
   .serve.lock               held by the one running listener
 
@@ -145,6 +150,8 @@ RETURNING = os.path.join(ROOT, "returning")
 # change's turn (never into the folder before then: an archive may take it meanwhile).
 UPLOADS = os.path.join(ROOT, "uploads")
 UPLOAD_KEEP_S = 3600
+NOTICES = os.path.join(ROOT, "notices")
+NOTICE_KEEP_S = 24 * 3600
 SKILL_DIR = os.path.join(os.path.expanduser("~"), ".claude", "skills", "app-development")
 APP_UNITS = os.environ.get("FLEET_CHANGE_APP_UNITS") or os.path.join(SKILL_DIR, "app-units.sh")
 MOVE_APP = os.environ.get("FLEET_CHANGE_MOVE_APP") or os.path.join(SKILL_DIR, "move-app.sh")
@@ -171,6 +178,9 @@ NAME_RE = re.compile(r"^[a-z0-9_-]{1,64}$")
 ROLE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 APP_SLUG_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 USER_RE = re.compile(r"^[^,\s]+$")
+BY_USER_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# Kinds that only look: never a notice, never a mark.
+READ_ONLY_KINDS = ("project-contents", "role-contents")
 KINDS = ("app-move", "project-contents", "project-archive", "agent-archive", "agent-unarchive",
          "role-contents", "role-archive", "role-unarchive", "app-archive", "app-unarchive",
          "project-create", "project-rename", "project-move", "agent-project", "agent-pin", "agent-edit")
@@ -181,7 +191,7 @@ def log(msg):
 
 
 def ensure_dirs():
-    for d in (ROOT, INCOMING, JOURNAL, OUTCOMES, BACKGROUND, RETURNING, UPLOADS):
+    for d in (ROOT, INCOMING, JOURNAL, OUTCOMES, BACKGROUND, RETURNING, UPLOADS, NOTICES):
         os.makedirs(d, exist_ok=True)
 
 
@@ -459,11 +469,18 @@ def agent_card(name, fm):
     return {"name": name, "displayName": fm.get("displayName") or name, "task": fm.get("task") or ""}
 
 
+# Who asked for the request being carried out right now ({"user": id} | {"agent": name}), so a
+# claim can say who to tell if its clean-up gets stuck.
+_asked_by = None
+
+
 def claim(path, rid, by, extra=None):
     """Mark a folder as being archived. A folder already claimed keeps its first claim."""
     if claim_of(path) is not None:
         return False
     mark = {"id": rid, "by": by, "claimed_at": time.time()}
+    if _asked_by:
+        mark["asked_by"] = _asked_by
     mark.update(extra or {})
     write_json_atomic(os.path.join(path, CLAIM), mark)
     try:
@@ -1672,6 +1689,8 @@ def take_in():
             continue
         entry = {"seq": seq, "id": rid, "kind": kind, "args": args,
                  "received_at": req.get("received_at"), "taken_at": time.time(), "state": "queued"}
+        if valid_by(req.get("by")):
+            entry["by"] = req["by"]
         write_json_atomic(os.path.join(JOURNAL, "%010d-%s.json" % (seq, rid)), entry)
         os.unlink(path)
         in_journal.add(rid)
@@ -1700,7 +1719,10 @@ def carry_out(name):
         entry["plan"] = plan
         write_json_atomic(path, entry)
 
+    global _asked_by
     outcome = {"id": rid, "seq": entry["seq"], "kind": entry["kind"]}
+    if entry.get("by"):
+        outcome["by"] = entry["by"]
     t0 = time.time()
     try:
         with Lock(CHANGE_LOCK, "the change lock"):
@@ -1708,7 +1730,11 @@ def carry_out(name):
             entry["state"] = "running"
             entry["started_at"] = entry.get("started_at") or time.time()
             write_json_atomic(path, entry)
-            result = HANDLERS[entry["kind"]](entry["args"], entry, save_plan)
+            _asked_by = entry.get("by")
+            try:
+                result = HANDLERS[entry["kind"]](entry["args"], entry, save_plan)
+            finally:
+                _asked_by = None
         outcome.update(state="done", result=result)
     except HandedOff:
         entry["state"] = "finishing"
@@ -1727,10 +1753,44 @@ def carry_out(name):
         outcome.update(state="failed", code="internal", reason="%s: %s" % (type(e).__name__, e))
     outcome["finished_at"] = time.time()
     write_json_atomic(out_path, outcome)
+    write_notice(outcome, entry.get("args"))
     os.unlink(path)
     log("request #%d %s %s%s in %.1fs%s" % (
         entry["seq"], entry["kind"], outcome["state"], " (carried on after a restart)" if resumed else "",
         time.time() - t0, (" — %s: %s" % (outcome.get("code"), outcome.get("reason"))) if outcome["state"] != "done" else ""))
+
+
+def valid_by(by):
+    """{"user": <id>} or {"agent": <name>}: who asked."""
+    if not isinstance(by, dict) or len(by) != 1:
+        return False
+    if isinstance(by.get("user"), str):
+        return bool(BY_USER_RE.match(by["user"]))
+    return isinstance(by.get("agent"), str) and bool(NAME_RE.match(by["agent"]))
+
+
+def write_notice(outcome, args):
+    """A refusal or failure (or a new agent left out of its project) for a person who asked:
+    kept for a day so whichever of their devices is open can tell them, however long ago their
+    own device stopped asking. Agents' own changes have no one to tell."""
+    by = outcome.get("by")
+    if not (isinstance(by, dict) and isinstance(by.get("user"), str)) or outcome.get("kind") in READ_ONLY_KINDS:
+        return
+    state = outcome.get("state")
+    res = outcome.get("result")
+    if state == "done" and isinstance(res, dict) and isinstance(res.get("notFiled"), str):
+        notice = {"state": "unfiled", "reason": res["notFiled"]}
+    elif state in ("refused", "failed"):
+        notice = {"state": state, "code": outcome.get("code"), "reason": outcome.get("reason") or ""}
+    else:
+        return
+    notice.update(id=outcome["id"], seq=outcome.get("seq"), kind=outcome.get("kind"),
+                  args=args if isinstance(args, dict) else {}, by=by, at=time.time())
+    try:
+        ensure_dirs()
+        write_json_atomic(os.path.join(NOTICES, outcome["id"] + ".json"), notice)
+    except OSError as e:
+        log("WARN: couldn't keep the notice for %s: %s" % (outcome["id"], e))
 
 
 def prune():
@@ -1739,6 +1799,13 @@ def prune():
         p = os.path.join(OUTCOMES, name)
         try:
             if os.stat(p).st_mtime < cutoff:
+                os.unlink(p)
+        except OSError:
+            pass
+    for name in list_json(NOTICES):
+        p = os.path.join(NOTICES, name)
+        try:
+            if os.stat(p).st_mtime < time.time() - NOTICE_KEEP_S:
                 os.unlink(p)
         except OSError:
             pass
@@ -1859,6 +1926,15 @@ def submit(argv):
         del argv[i:i + 2]
         if not ID_RE.match(rid):
             usage("--id must match [A-Za-z0-9._-]{1,80}")
+    by = None
+    if "--by" in argv:
+        i = argv.index("--by")
+        raw_by = argv[i + 1] if i + 1 < len(argv) else ""
+        del argv[i:i + 2]
+        who, _, val = raw_by.partition(":")
+        by = {who: val} if who in ("user", "agent") else None
+        if not valid_by(by):
+            usage("--by must be user:<id> or agent:<name>")
     if len(argv) != 2:
         usage("submit takes a kind and its args as JSON")
     kind, raw = argv
@@ -1873,8 +1949,10 @@ def submit(argv):
     rid = rid or str(uuid.uuid4())
     ensure_dirs()
     if where_is(rid) is None:
-        write_json_atomic(os.path.join(INCOMING, "%020d-%s.json" % (time.time_ns(), rid)),
-                          {"id": rid, "kind": kind, "args": args, "received_at": time.time()})
+        req = {"id": rid, "kind": kind, "args": args, "received_at": time.time()}
+        if by:
+            req["by"] = by
+        write_json_atomic(os.path.join(INCOMING, "%020d-%s.json" % (time.time_ns(), rid)), req)
     print(json.dumps(wait_for(rid, wait_s), separators=(",", ":")))
 
 
@@ -1908,6 +1986,8 @@ def finish(argv):
     if not isinstance(bg, dict):
         usage("there's no request %s being finished in the background" % rid)
     outcome = {"id": rid, "seq": bg.get("seq"), "kind": bg.get("kind"), "state": state}
+    if bg.get("by"):
+        outcome["by"] = bg["by"]
     if state != "done":
         outcome["code"] = opts.get("code") or state
         outcome["reason"] = opts.get("reason") or ""
@@ -1919,6 +1999,7 @@ def finish(argv):
     outcome["finished_at"] = time.time()
     ensure_dirs()
     write_json_atomic(out_path, outcome)
+    write_notice(outcome, bg.get("args"))
     os.unlink(bg_path)
     print(json.dumps(where_is(rid), separators=(",", ":")))
 

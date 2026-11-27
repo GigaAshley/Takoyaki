@@ -77,8 +77,8 @@ export async function answerFromFrontDoor(
     const outcome = await withHost(hostId, userId, async (conn) => {
       const o =
         opts.totalS !== undefined
-          ? await submitAndFollow(conn, kind, args, { id: requestId, hostId, totalS: opts.totalS })
-          : await submitFrontDoor(conn, kind, args, { id: requestId, hostId });
+          ? await submitAndFollow(conn, kind, args, { id: requestId, hostId, totalS: opts.totalS, by: userId })
+          : await submitFrontDoor(conn, kind, args, { id: requestId, hostId, by: userId });
       if (o.state === "done" && opts.onDone) {
         try {
           await opts.onDone(conn, o);

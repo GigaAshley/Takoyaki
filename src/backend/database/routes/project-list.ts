@@ -773,7 +773,7 @@ router.post(
         // no longer matches the list the user confirmed.
         let outcome: Awaited<ReturnType<typeof submitFrontDoor>>;
         try {
-          outcome = await submitFrontDoor(conn, "project-archive", { slug, expected }, { id: requestId, hostId });
+          outcome = await submitFrontDoor(conn, "project-archive", { slug, expected }, { id: requestId, hostId, by: userId });
         } catch (err) {
           databaseLogger.error(
             `failed to archive project hostId=${hostId} slug=${slug}: ${err instanceof Error ? err.message : String(err)}`,

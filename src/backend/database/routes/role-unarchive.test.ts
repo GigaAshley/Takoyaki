@@ -92,7 +92,7 @@ describe("POST /roles/:name/unarchive", () => {
     const r = await call(server, "POST", "/roles/eng/unarchive", { hostId: 5, requestId: "r1" });
     expect(r.status).toBe(200);
     expect(r.body).toEqual({ ok: true, outcome: "restored", requestId: "r1" });
-    expect(submitAndFollow).toHaveBeenCalledWith(conn, "role-unarchive", { name: "eng" }, { id: "r1", hostId: 5, totalS: 30 });
+    expect(submitAndFollow).toHaveBeenCalledWith(conn, "role-unarchive", { name: "eng" }, { id: "r1", hostId: 5, totalS: 30, by: "1" });
   });
 
   it("passes on a name collision", async () => {

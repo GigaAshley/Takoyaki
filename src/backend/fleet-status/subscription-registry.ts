@@ -11,6 +11,7 @@ import type {
   AppState,
   FrontendOutboundFrameType,
   SessionState,
+  GatedMachineChange,
 } from "./wire-protocol.js";
 import {
   FRAME_SCHEMA_VERSION,
@@ -18,6 +19,7 @@ import {
   makeAppSnapshotFrame,
   makeAppUpdateFrame,
   makeGoneFrame,
+  makeMachineChangesFrame,
   makeProjectListChangedFrame,
   makeSessionProjectChangedFrame,
   makeSnapshotFrame,
@@ -197,6 +199,19 @@ export interface SubscriptionRegistry {
     hostId: string,
     projects: ProjectListEntry[],
   ): void;
+
+  /**
+   * Publish one machine's open changes (the sweep's `changes` line), the full list for that
+   * host. Same per-host cache, byte-compare skip and replay-on-subscribe as the project list;
+   * each subscriber gets its own filtered copy (app-frame-filter.ts).
+   */
+  publishMachineChanges(hostId: string, changes: GatedMachineChange[]): void;
+
+  /**
+   * Send a host's cached open changes to every subscriber again, unchanged: what a person may
+   * see of them changed (a notice dismissed or told, a request no longer being waited on).
+   */
+  refanMachineChanges(hostId: string): void;
 
   /**
    * Publish a `session-project-changed` frame carrying the delta from a
@@ -541,6 +556,8 @@ export function createSubscriptionRegistry(
   // JSON.stringify of the cache entry for that hostId to drop no-op
   // republishes at cache-hit.
   const projectListCache = new Map<string, ProjectListEntry[]>();
+  // Per-host open changes (publishMachineChanges), replayed on subscribe like the project list.
+  const machineChangesCache = new Map<string, GatedMachineChange[]>();
   // Phase 118 Plan 118-03 (D-09): sibling map for source-C apps, indexed by
   // `${hostId}:${slug}` via makeAppKey. Populated by publishAppUpdate, drained
   // by publishAppGoneByHostSlug, and re-emitted to every new subscriber via
@@ -657,6 +674,17 @@ export function createSubscriptionRegistry(
             );
           }
         }
+        for (const [cachedHostId, cachedChanges] of machineChangesCache) {
+          try {
+            sendFrame(makeMachineChangesFrame(cachedHostId, cachedChanges));
+          } catch (err) {
+            systemLogger.warn("Fleet-status machine-changes snapshot delivery failed", {
+              operation: "fleet_status_machine_changes_snapshot_failed",
+              scopeHostId: cachedHostId,
+              error: err instanceof Error ? err.message : "unknown",
+            });
+          }
+        }
       }
 
       // Phase 118 Plan 118-03 (D-14, D-16): re-emit the current apps map as
@@ -747,6 +775,23 @@ export function createSubscriptionRegistry(
                     error: err instanceof Error ? err.message : "unknown",
                   },
                 );
+              }
+            }
+
+            // Replay each host's open changes, projected per subscriber.
+            for (const [cachedHostId, cachedChanges] of machineChangesCache) {
+              try {
+                const projectedChanges = await appFrameFilter(
+                  makeMachineChangesFrame(cachedHostId, cachedChanges),
+                  userIdForFilter,
+                );
+                if (projectedChanges !== null) sendFrame(projectedChanges);
+              } catch (err) {
+                systemLogger.warn("Fleet-status machine-changes snapshot delivery failed", {
+                  operation: "fleet_status_machine_changes_snapshot_failed",
+                  scopeHostId: cachedHostId,
+                  error: err instanceof Error ? err.message : "unknown",
+                });
               }
             }
 
@@ -987,6 +1032,29 @@ export function createSubscriptionRegistry(
       // comparisons and snapshot-on-subscribe replays).
       projectListCache.set(hostId, projects.slice());
       const frame = makeProjectListChangedFrame(hostId, projects);
+      if (appFrameFilter !== undefined) {
+        void fanOutApp(subscribers, frame, appFrameFilter);
+      } else {
+        fanOut(subscribers, frame);
+      }
+    },
+
+    publishMachineChanges(hostId: string, changes: GatedMachineChange[]): void {
+      const prev = machineChangesCache.get(hostId);
+      if (prev !== undefined && JSON.stringify(prev) === JSON.stringify(changes)) return;
+      machineChangesCache.set(hostId, changes.slice());
+      const frame = makeMachineChangesFrame(hostId, changes);
+      if (appFrameFilter !== undefined) {
+        void fanOutApp(subscribers, frame, appFrameFilter);
+      } else {
+        fanOut(subscribers, frame);
+      }
+    },
+
+    refanMachineChanges(hostId: string): void {
+      const cached = machineChangesCache.get(hostId);
+      if (cached === undefined) return;
+      const frame = makeMachineChangesFrame(hostId, cached);
       if (appFrameFilter !== undefined) {
         void fanOutApp(subscribers, frame, appFrameFilter);
       } else {

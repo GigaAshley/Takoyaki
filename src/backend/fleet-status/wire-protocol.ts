@@ -888,6 +888,59 @@ export const FrontendRelayRoomPlacementChangedFrameSchema = z.object({
   pinned: z.boolean(),
 });
 
+// ---------------------------------------------------------------------------
+// machine-changes — one machine's open changes (its front door), per host.
+//
+// The full list for that host on every emit (like project-list-changed): changes waiting
+// their turn or running, agents on their way back from the archive, and — for the person
+// they're for — refusals, failures, new agents left out of their project, and archives
+// whose clean-up is stuck. Each subscriber gets only entries about things they can see,
+// and notices only for themselves (app-frame-filter.ts); `mine` = this person asked.
+// `to.hidden` = the move's destination is hidden from them. Additive frame kind —
+// FRAME_SCHEMA_VERSION stays at 1.
+// ---------------------------------------------------------------------------
+
+export const MachineChangeSchema = z.object({
+  id: z.string(),
+  kind: z.string(),
+  state: z.enum(["waiting", "running", "returning", "refused", "failed", "unfiled", "stuck"]),
+  target: z.object({
+    type: z.enum(["agent", "app", "project", "role"]),
+    name: z.string().nullable(),
+    displayName: z.string().optional(),
+  }),
+  to: z
+    .object({
+      project: z.string().nullable().optional(),
+      parent: z.string().nullable().optional(),
+      pinned: z.boolean().optional(),
+      hidden: z.boolean().optional(),
+    })
+    .optional(),
+  at: z.number().nullable(),
+  reason: z.string().optional(),
+  code: z.string().optional(),
+  mine: z.boolean(),
+  card: z.object({ displayName: z.string(), project: z.string().nullable() }).optional(),
+});
+
+export type MachineChange = z.infer<typeof MachineChangeSchema>;
+
+/** A change as the registry holds it: with the gate-only fields the filter reads and strips. */
+export type GatedMachineChange = MachineChange & {
+  audience: string[] | null;
+  toAudience?: string[] | null;
+  byUser?: string;
+  byAgent?: string;
+};
+
+export const FrontendMachineChangesFrameSchema = z.object({
+  schemaVersion: z.literal(FRAME_SCHEMA_VERSION),
+  type: z.literal("machine-changes"),
+  hostId: z.string(),
+  changes: z.array(MachineChangeSchema),
+});
+
 export const FrontendOutboundFrame = z.discriminatedUnion("type", [
   FrontendSnapshotFrameSchema,
   FrontendUpdateFrameSchema,
@@ -902,6 +955,7 @@ export const FrontendOutboundFrame = z.discriminatedUnion("type", [
   FrontendRelayRoomAttentionChangedFrameSchema,
   FrontendRelayRoomNotifiedFrameSchema,
   FrontendRelayRoomPlacementChangedFrameSchema,
+  FrontendMachineChangesFrameSchema,
   AppSnapshotFrameSchema,
   AppUpdateFrameSchema,
   AppGoneFrameSchema,
@@ -978,6 +1032,14 @@ export function makeProjectListChangedFrame(
     hostId,
     projects: projects.map((p) => ({ ...p, parent: p.parent ?? null })),
   };
+}
+
+/** A `machine-changes` frame for one host (gate-only fields stripped by the filter). */
+export function makeMachineChangesFrame(
+  hostId: string,
+  changes: Array<MachineChange | GatedMachineChange>,
+): FrontendOutboundFrameType {
+  return { schemaVersion: FRAME_SCHEMA_VERSION, type: "machine-changes", hostId, changes };
 }
 
 /**

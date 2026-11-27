@@ -788,6 +788,38 @@ test_move_to_a_hidden_project_answers_like_a_gone_one() {
   rm -rf "$s"
 }
 
+# Who asked is kept with the request; a person's refusal, failure or un-filed new agent is
+# kept as a notice for a day; agents' own changes and look-only requests never are.
+test_who_asked_and_their_notices() {
+  local s; s=$(setup)
+  project "$s" garden "Garden"; agent "$s" finch garden; agent "$s" wren garden
+  fc "$s" submit agent-project '{"name":"finch","project":"orchard"}' --id m1 --by user:u_Ann-1 --wait 0 >/dev/null
+  fc "$s" submit agent-project '{"name":"wren","project":"orchard"}' --id m2 --by agent:wren --wait 0 >/dev/null
+  fc "$s" submit agent-project '{"name":"finch","project":"orchard","birth":true}' --id b1 --by user:u_Ann-1 --wait 0 >/dev/null
+  fc "$s" submit project-contents '{"slug":"nope"}' --id c1 --by user:u_Ann-1 --wait 0 >/dev/null
+  fc "$s" submit agent-archive '{"name":"wren"}' --id a1 --by user:u_Bob --wait 0 >/dev/null
+  serve_once "$s"
+  local n="$s/fleet/.changes/notices"
+  assert_eq refused "$(field "$(cat "$n/m1.json")" state)" "refusal kept"
+  assert_eq '{"user": "u_Ann-1"}' "$(field "$(cat "$n/m1.json")" by)" "who asked"
+  assert_eq orchard "$(field "$(cat "$n/m1.json")" args.project)" "what was asked"
+  assert_absent "$n/m2.json" "an agent's own change has no one to tell"
+  assert_eq unfiled "$(field "$(cat "$n/b1.json")" state)" "new agent left out"
+  assert_absent "$n/c1.json" "a look-only request is never a notice"
+  assert_absent "$n/a1.json" "a done change is no notice"
+  assert_eq '{"user": "u_Bob"}' "$(field "$(cat "$s/fleet/identities/wren/.archiving")" asked_by)" "claim says who"
+  assert_eq '{"user": "u_Ann-1"}' "$(field "$(fc "$s" status m1)" by)" "outcome says who"
+  local rc=0; fc "$s" submit agent-pin '{"name":"finch","pinned":true}' --by "user:a b" --wait 0 >/dev/null 2>&1 || rc=$?
+  assert_eq 2 "$rc" "a malformed asker is a usage error"
+  touch -d '25 hours ago' "$n/m1.json"
+  FLEET_CHANGE_FLEET_DIR="$s/fleet" python3 -c '
+import importlib.machinery, sys
+m = importlib.machinery.SourceFileLoader("fc", sys.argv[1]).load_module(); m.prune()' "$FC"
+  assert_absent "$n/m1.json" "gone after a day"
+  assert_exists "$n/b1.json" "a fresh one stays"
+  rm -rf "$s"
+}
+
 run_test test_aither_sequence_runs_in_click_order
 run_test test_archive_first_then_move_out_is_refused
 run_test test_move_into_archived_project_is_refused
@@ -830,6 +862,7 @@ run_test test_agent_changes_refused_while_its_archive_is_claimed
 run_test test_odd_usernames_and_names_stay_strings
 run_test test_a_file_without_frontmatter_gets_one
 run_test test_move_to_a_hidden_project_answers_like_a_gone_one
+run_test test_who_asked_and_their_notices
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 if [ "$FAIL" -gt 0 ]; then

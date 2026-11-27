@@ -92,7 +92,7 @@ describe("PUT /identities/:key/pinned", () => {
     const r = await call(server, "/identities/alpha/pinned", { hostId: 5, pinned: true, requestId: "click-1" });
     expect(r.status).toBe(200);
     expect(r.body).toMatchObject({ ok: true, pinned: true, requestId: "click-1" });
-    expect(submitFrontDoor).toHaveBeenCalledWith(conn, "agent-pin", { name: "alpha", pinned: true }, { id: "click-1", hostId: 5 });
+    expect(submitFrontDoor).toHaveBeenCalledWith(conn, "agent-pin", { name: "alpha", pinned: true }, { id: "click-1", hostId: 5, by: "1" });
     expect(publishSessionProjectChanged).not.toHaveBeenCalled();
   });
 

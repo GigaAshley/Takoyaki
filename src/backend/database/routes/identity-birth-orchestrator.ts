@@ -320,7 +320,13 @@ export interface BirthDeps {
    * with the machine's other changes: a project gone by then leaves it in Conversations, and
    * the answer says why. Absent = the real front door.
    */
-  fileIntoProject?: (conn: SSHClient | null, name: string, project: string, hostId: number) => Promise<string | undefined>;
+  fileIntoProject?: (
+    conn: SSHClient | null,
+    name: string,
+    project: string,
+    hostId: number,
+    userId?: string,
+  ) => Promise<string | undefined>;
   /**
    * Called once the identity's folder is committed on the host — from then on
    * it exists whatever happens to the request (a closed tab, a supervisor
@@ -1421,11 +1427,12 @@ async function fileIntoProjectByFrontDoor(
   name: string,
   project: string,
   hostId: number,
+  userId?: string,
 ): Promise<string | undefined> {
   let notFiled: string | undefined;
   let outcomeState = "error";
   try {
-    const outcome = await submitFrontDoor(conn, "agent-project", { name, project, birth: true }, { hostId });
+    const outcome = await submitFrontDoor(conn, "agent-project", { name, project, birth: true }, { hostId, by: userId });
     outcomeState = outcome.state;
     if (outcome.state === "done") {
       const r = (outcome.result as { notFiled?: unknown } | null)?.notFiled;
@@ -1881,6 +1888,7 @@ export async function birthIdentity(
         identityFolderName,
         opts.project,
         opts.hostId,
+        opts.userId,
       );
     }
 

@@ -268,6 +268,7 @@ describe("parseSweepJsonl — empty input", () => {
       pidLines: [],
       appLines: [],
       projectList: null,
+      changes: null,
       unknownLines: 0,
       schemaMismatch: false,
     });
@@ -281,6 +282,7 @@ describe("parseSweepJsonl — empty input", () => {
       pidLines: [],
       appLines: [],
       projectList: null,
+      changes: null,
       unknownLines: 0,
       schemaMismatch: false,
     });
@@ -1017,5 +1019,45 @@ describe("Condense sentinels: SweepIdentityLine.compact_requested / compacting",
     expect(SWEEP_FIELD_PARITY.B2.field).toBe("compact_requested");
     expect(SWEEP_FIELD_PARITY.B3.field).toBe("compacting");
     expect(SWEEP_FIELD_PARITY.B5.field).toBeNull();
+  });
+});
+
+describe("parseSweepJsonl — changes line (source F)", () => {
+  const changesLine = (changes: unknown) =>
+    JSON.stringify({ line_kind: "changes", schema_version: SWEEP_SCHEMA_VERSION, changes });
+  const ok = {
+    id: "r1",
+    seq: 3,
+    kind: "agent-project",
+    state: "waiting",
+    target: { type: "agent", name: "finch" },
+    audience: null,
+    at: 1,
+    to: { project: "garden" },
+    to_audience: ["ann"],
+    by_user: "u1",
+  };
+
+  it("is null when the sweep emits no changes line", () => {
+    expect(parseSweepJsonl("").changes).toBeNull();
+  });
+
+  it("keeps well-formed entries and drops malformed ones on their own", () => {
+    const r = parseSweepJsonl(
+      changesLine([
+        ok,
+        { ...ok, id: 5 },
+        { ...ok, state: "done" },
+        { ...ok, target: { type: "user", name: "x" } },
+        { ...ok, audience: "ann" },
+        { ...ok, id: "r2", target: { type: "project", name: null, display_name: "New" } },
+      ]),
+    );
+    expect(r.changes?.map((c) => c.id)).toEqual(["r1", "r2"]);
+    expect(r.unknownLines).toBe(0);
+  });
+
+  it("an empty list is a machine with nothing open", () => {
+    expect(parseSweepJsonl(changesLine([])).changes).toEqual([]);
   });
 });

@@ -381,11 +381,54 @@ export interface SweepProjectListLine {
   }>;
 }
 
+/**
+ * Source F: the machine's open changes, ONE line per tick from `_enumerate_changes` in
+ * `fleet-status-sweep.py` — changes waiting their turn or running, people's refusals and
+ * failures from the last day, archives stuck 10 minutes or more, agents on their way back
+ * from the archive. `audience` / `to_audience` / `by_user` / `by_agent` are gate-only: the
+ * per-user filter reads them and strips them (app-frame-filter.ts).
+ */
+export type SweepChangeState =
+  | "waiting"
+  | "running"
+  | "returning"
+  | "refused"
+  | "failed"
+  | "unfiled"
+  | "stuck";
+
+export interface SweepChangeEntry {
+  id: string;
+  seq: number | null;
+  kind: string;
+  state: SweepChangeState;
+  target: { type: "agent" | "app" | "project" | "role"; name: string | null; display_name?: string };
+  /** Who can see the target: null = everyone on the machine. */
+  audience: string[] | null;
+  at: number | null;
+  /** Where a move goes: a project (null = out of any), a parent (null = top level), or pinned. */
+  to?: { project?: string | null; parent?: string | null; pinned?: boolean };
+  to_audience?: string[] | null;
+  by_user?: string;
+  by_agent?: string;
+  reason?: string;
+  code?: string;
+  /** An agent on its way back: what its row shows, and where it lands. */
+  card?: { display_name: string; project: string | null };
+}
+
+export interface SweepChangesLine {
+  line_kind: "changes";
+  schema_version: SweepSchemaVersion;
+  changes: SweepChangeEntry[];
+}
+
 export type SweepLine =
   | SweepIdentityLine
   | SweepPidLine
   | SweepAppLine
-  | SweepProjectListLine;
+  | SweepProjectListLine
+  | SweepChangesLine;
 
 /**
  * Narrow type-guard used by parseSweepJsonl (and available to tests). Returns
@@ -408,7 +451,8 @@ export function isSweepLineOfCurrentSchema(obj: unknown): obj is SweepLine {
     rec.line_kind === "identity" ||
     rec.line_kind === "pid" ||
     rec.line_kind === "app" ||
-    rec.line_kind === "project-list"
+    rec.line_kind === "project-list" ||
+    rec.line_kind === "changes"
   );
 }
 
@@ -433,6 +477,11 @@ export interface SweepParseResult {
    * null means "unknown — keep the last picture", NOT "zero projects".
    */
   projectList: SweepProjectListLine | null;
+  /**
+   * Source F: the machine's open changes (well-formed entries only), or null when the sweep
+   * emitted no `changes` line (older script, or the machine has no front door yet).
+   */
+  changes: SweepChangeEntry[] | null;
   /**
    * Count of JSON-parseable lines whose `line_kind` was none of "identity",
    * "pid", "app", or "project-list". Observability only; not a failure
@@ -477,6 +526,7 @@ export function parseSweepJsonl(raw: string): SweepParseResult {
   // returns this array so consumers can safely destructure appLines.
   const appLines: SweepAppLine[] = [];
   let projectList: SweepProjectListLine | null = null;
+  let changes: SweepChangeEntry[] | null = null;
   let unknownLines = 0;
   let schemaMismatch = false;
 
@@ -486,6 +536,7 @@ export function parseSweepJsonl(raw: string): SweepParseResult {
       pidLines,
       appLines,
       projectList,
+      changes,
       unknownLines,
       schemaMismatch,
     };
@@ -537,6 +588,11 @@ export function parseSweepJsonl(raw: string): SweepParseResult {
       if (isWellFormedProjectList(rec.projects)) {
         projectList = parsed as SweepProjectListLine;
       }
+    } else if (rec.line_kind === "changes") {
+      // Source F: each entry checked; a malformed one is dropped on its own.
+      if (Array.isArray(rec.changes)) {
+        changes = rec.changes.filter(isWellFormedChange);
+      }
     } else {
       // Unknown line_kind at the current schema version — forward-compat
       // marker (or a retired kind such as `interactive-message` from an older
@@ -550,9 +606,32 @@ export function parseSweepJsonl(raw: string): SweepParseResult {
     pidLines,
     appLines,
     projectList,
+    changes,
     unknownLines,
     schemaMismatch,
   };
+}
+
+const CHANGE_STATES = new Set(["waiting", "running", "returning", "refused", "failed", "unfiled", "stuck"]);
+const CHANGE_TARGETS = new Set(["agent", "app", "project", "role"]);
+
+function isStringList(v: unknown): v is string[] {
+  return Array.isArray(v) && v.every((u) => typeof u === "string");
+}
+
+function isWellFormedChange(raw: unknown): raw is SweepChangeEntry {
+  if (raw === null || typeof raw !== "object") return false;
+  const e = raw as Record<string, unknown>;
+  const t = e.target as Record<string, unknown> | null | undefined;
+  if (typeof e.id !== "string" || typeof e.kind !== "string" || !CHANGE_STATES.has(e.state as string)) return false;
+  if (!t || typeof t !== "object" || !CHANGE_TARGETS.has(t.type as string)) return false;
+  if (!(t.name === null || typeof t.name === "string")) return false;
+  if (!(e.audience === null || isStringList(e.audience))) return false;
+  if (e.to_audience !== undefined && !(e.to_audience === null || isStringList(e.to_audience))) return false;
+  if (e.to !== undefined && (e.to === null || typeof e.to !== "object")) return false;
+  if (e.by_user !== undefined && typeof e.by_user !== "string") return false;
+  if (e.by_agent !== undefined && typeof e.by_agent !== "string") return false;
+  return true;
 }
 
 function isWellFormedProjectList(

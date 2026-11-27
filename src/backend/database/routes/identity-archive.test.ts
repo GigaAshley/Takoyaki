@@ -94,7 +94,7 @@ describe("POST /identities/:key/archive", () => {
     expect(r.status).toBe(200);
     expect(r.body).toMatchObject({ ok: true, requestId: "click-1", finishing: { pending: ["alpha"] } });
     expect(withHost).toHaveBeenCalledWith(5, "1", expect.any(Function));
-    expect(submitFrontDoor).toHaveBeenCalledWith(conn, "agent-archive", { name: "alpha" }, { id: "click-1", hostId: 5 });
+    expect(submitFrontDoor).toHaveBeenCalledWith(conn, "agent-archive", { name: "alpha" }, { id: "click-1", hostId: 5, by: "1" });
   });
 
   it("passes a refusal on with the machine's reason", async () => {

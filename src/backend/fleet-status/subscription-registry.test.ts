@@ -1869,3 +1869,44 @@ describe("publishToUser — per-user frames (read-state-changed)", () => {
     expect(good).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("publishMachineChanges — one machine's open changes", () => {
+  const waiting = {
+    id: "r1",
+    kind: "agent-project",
+    state: "waiting" as const,
+    target: { type: "agent" as const, name: "finch" },
+    at: 1,
+    mine: false,
+    audience: null,
+  };
+  const frames = (registry: ReturnType<typeof createSubscriptionRegistry>) => {
+    const got: FrontendOutboundFrameType[] = [];
+    registry.subscribe((f) => got.push(f));
+    return got;
+  };
+
+  it("fans out on change, skips a byte-identical repeat, and sends again on request", () => {
+    const registry = createSubscriptionRegistry();
+    const got = frames(registry);
+    got.length = 0;
+    registry.publishMachineChanges("1", [waiting]);
+    registry.publishMachineChanges("1", [waiting]);
+    expect(got.filter((f) => f.type === "machine-changes")).toHaveLength(1);
+    registry.refanMachineChanges("1");
+    expect(got.filter((f) => f.type === "machine-changes")).toHaveLength(2);
+    registry.refanMachineChanges("2");
+    expect(got.filter((f) => f.type === "machine-changes")).toHaveLength(2);
+    registry.publishMachineChanges("1", []);
+    const last = got.filter((f) => f.type === "machine-changes").pop();
+    expect(last).toMatchObject({ type: "machine-changes", hostId: "1", changes: [] });
+  });
+
+  it("a device that connects later gets each machine's current list", () => {
+    const registry = createSubscriptionRegistry();
+    registry.publishMachineChanges("1", [waiting]);
+    registry.publishMachineChanges("2", []);
+    const got = frames(registry);
+    expect(got.filter((f) => f.type === "machine-changes").map((f) => (f as { hostId: string }).hostId)).toEqual(["1", "2"]);
+  });
+});

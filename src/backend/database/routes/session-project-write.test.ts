@@ -100,7 +100,7 @@ describe("POST /identities/:key/project", () => {
     const r = await call(server, "/identities/alpha/project", { hostId: 5, project: "garden", requestId: "click-1" });
     expect(r.status).toBe(200);
     expect(r.body).toMatchObject({ ok: true, requestId: "click-1", result: { project: "garden" } });
-    expect(submitFrontDoor).toHaveBeenCalledWith(conn, "agent-project", { name: "alpha", project: "garden", asker: "riley" }, { id: "click-1", hostId: 5 });
+    expect(submitFrontDoor).toHaveBeenCalledWith(conn, "agent-project", { name: "alpha", project: "garden", asker: "riley" }, { id: "click-1", hostId: 5, by: "1" });
     expect(publishSessionProjectChanged).toHaveBeenCalledWith("alpha", 5, "garden");
   });
 

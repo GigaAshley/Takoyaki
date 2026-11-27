@@ -486,7 +486,7 @@ describe("PUT /identities/:identityKey — the change goes through the machine's
       expect.objectContaining({ __fake: "ssh-conn" }),
       "agent-edit",
       { name: "testkey", set: { displayName: "Newname", title: "New Title", task: "Ship: it", colorHue: 180 }, unset: [] },
-      { id: "edit-1", hostId: 7 },
+      { id: "edit-1", hostId: 7, by: "test-user" },
     );
     expect(res.body).toMatchObject({ displayName: "Newname", title: "New Title", colorHue: 180 });
     // The server never writes the file itself.

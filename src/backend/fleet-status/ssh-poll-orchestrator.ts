@@ -56,6 +56,7 @@ import {
   makeGoneFrame,
   makeUpdateFrame,
   type AppState,
+  type GatedMachineChange,
   type SessionState,
 } from "./wire-protocol.js";
 import { isIdentityVisibleToUser } from "./identity-visibility-gate.js";
@@ -70,6 +71,7 @@ import {
   parseSweepJsonl,
   SWEEP_SCHEMA_VERSION,
   type SweepAppLine,
+  type SweepChangeEntry,
   type SweepPidLine,
   type SweepIdentityLine,
 } from "./sweep-schema.js";
@@ -108,6 +110,39 @@ import {
 } from "../spawn-requests/parse-request-body.js";
 
 // ---------------------------------------------------------------------------
+/** A sweep `changes` entry as the registry holds it (camelCase; gate-only fields kept for the filter). */
+export function adaptChangeEntry(e: SweepChangeEntry): GatedMachineChange {
+  const out: GatedMachineChange = {
+    id: e.id,
+    kind: e.kind,
+    state: e.state,
+    target: {
+      type: e.target.type,
+      name: e.target.name,
+      ...(typeof e.target.display_name === "string" ? { displayName: e.target.display_name } : {}),
+    },
+    at: typeof e.at === "number" ? e.at : null,
+    mine: false,
+    audience: e.audience,
+  };
+  if (e.to && typeof e.to === "object") {
+    const to: NonNullable<GatedMachineChange["to"]> = {};
+    if ("project" in e.to) to.project = typeof e.to.project === "string" ? e.to.project : null;
+    if ("parent" in e.to) to.parent = typeof e.to.parent === "string" ? e.to.parent : null;
+    if (typeof e.to.pinned === "boolean") to.pinned = e.to.pinned;
+    out.to = to;
+    if (e.to_audience !== undefined) out.toAudience = e.to_audience;
+  }
+  if (typeof e.reason === "string") out.reason = e.reason;
+  if (typeof e.code === "string") out.code = e.code;
+  if (typeof e.by_user === "string") out.byUser = e.by_user;
+  if (typeof e.by_agent === "string") out.byAgent = e.by_agent;
+  if (e.card && typeof e.card.display_name === "string") {
+    out.card = { displayName: e.card.display_name, project: typeof e.card.project === "string" ? e.card.project : null };
+  }
+  return out;
+}
+
 // Peer-keyed sweep-result cache
 //
 // Two orchestrators on the same Skynet process (one per subscribed user) that
@@ -2324,6 +2359,12 @@ export function createSshPollOrchestrator(
           parent: p.parent ?? null,
         })),
       );
+    }
+
+    // Source F — this machine's open changes (its front door). null = older sweep or no
+    // front door yet: publish nothing.
+    if (parsed.changes !== null) {
+      deps.registry.publishMachineChanges(host.id, parsed.changes.map(adaptChangeEntry));
     }
 
     // Empty output disambiguation: freshly-provisioned or empty box vs

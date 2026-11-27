@@ -18,6 +18,8 @@
  *   - agent-supervisor-retire-monitor-first.test.sh, agent-supervisor-stray-procs.test.sh,
  *     agent-supervisor-desktop-teardown.test.sh: the retire's order — the agent stops first
  *     and stays stopped; strays and the desktop go before the folder moves.
+ *   - fleet-status-sweep-changes.test.sh: the machine's open changes as its status report
+ *     lists them — waiting, notices for whoever asked, stuck archives, agents coming back.
  */
 
 import { execFileSync } from "node:child_process";
@@ -48,6 +50,7 @@ describe("archive substrate suites", () => {
     ["agent-supervisor-retire-monitor-first.test.sh", 120_000],
     ["agent-supervisor-stray-procs.test.sh", 120_000],
     ["agent-supervisor-desktop-teardown.test.sh", 120_000],
+    ["fleet-status-sweep-changes.test.sh", 60_000],
   ] as const) {
     it(`${script} passes`, () => {
       const r = run(script, timeout);

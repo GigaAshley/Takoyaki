@@ -92,7 +92,7 @@ describe("POST /apps/:hostId/:slug/archive", () => {
   it("sends it to the front door", async () => {
     const r = await call(server, "POST", "/apps/5/tally/archive", { requestId: "a1" });
     expect(r.status).toBe(200);
-    expect(submitFrontDoor).toHaveBeenCalledWith(conn, "app-archive", { slug: "tally" }, { id: "a1", hostId: 5 });
+    expect(submitFrontDoor).toHaveBeenCalledWith(conn, "app-archive", { slug: "tally" }, { id: "a1", hostId: 5, by: "1" });
   });
 
   it("passes a refusal on", async () => {
@@ -115,7 +115,7 @@ describe("POST /apps/:hostId/:slug/unarchive", () => {
   it("sends it to the front door and answers restored", async () => {
     const r = await call(server, "POST", "/apps/5/tally/unarchive", { requestId: "u1" });
     expect(r.body).toEqual({ ok: true, outcome: "restored", requestId: "u1" });
-    expect(submitAndFollow).toHaveBeenCalledWith(conn, "app-unarchive", { slug: "tally" }, { id: "u1", hostId: 5, totalS: 30 });
+    expect(submitAndFollow).toHaveBeenCalledWith(conn, "app-unarchive", { slug: "tally" }, { id: "u1", hostId: 5, totalS: 30, by: "1" });
   });
 
   it("a port now taken comes back refused, with the machine's reason", async () => {

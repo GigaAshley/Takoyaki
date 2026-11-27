@@ -119,7 +119,7 @@ router.post("/:hostId/:slug/move", authenticateJWT, async (req: Request, res: Re
       const plan = planAppMove(app, dest, state, you ?? null);
       if (!plan.ok || plan.request === undefined) throw new HttpError(plan.status ?? 500, plan.error ?? "can't move");
       const request = plan.request;
-      const result = await submitFrontDoor(conn, "app-move", { slug, ...request }, { id: requestId, hostId });
+      const result = await submitFrontDoor(conn, "app-move", { slug, ...request }, { id: requestId, hostId, by: userId });
       databaseLogger.info("app move requested", {
         operation: "apps_move_request",
         userId,

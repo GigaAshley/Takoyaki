@@ -105,7 +105,7 @@ describe("role archive", () => {
     answer({ state: "done", result: { role: "eng", claimed: ["ann"] }, finishing: { pending: ["ann", "eng"] } });
     const r = await call(server, "POST", "/roles/eng/archive", { hostId: 5, expected: { agents: ["ann"] }, requestId: "r1" });
     expect(r.status).toBe(200);
-    expect(submitFrontDoor).toHaveBeenCalledWith(conn, "role-archive", { name: "eng", expected: { agents: ["ann"] } }, { id: "r1", hostId: 5 });
+    expect(submitFrontDoor).toHaveBeenCalledWith(conn, "role-archive", { name: "eng", expected: { agents: ["ann"] } }, { id: "r1", hostId: 5, by: "1" });
   });
 
   it("passes on a changed list with the machine's current one", async () => {

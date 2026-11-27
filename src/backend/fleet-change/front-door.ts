@@ -21,6 +21,7 @@ import path from "node:path";
 import type { Client as SSHClientType } from "ssh2";
 import { execCommand } from "../ssh/tmux-helper.js";
 import { databaseLogger } from "../utils/logger.js";
+import { beginAsking, toldDirectly } from "./change-notices.js";
 
 /** How long a click waits for the machine's answer before "still working on it". */
 export const FRONT_DOOR_WAIT_S = 15;
@@ -107,23 +108,37 @@ export function parseFrontDoorLine(id: string, line: string): FrontDoorOutcome {
   }
 }
 
+/** The app's user ids (nanoids) as fleet-change's --by takes them. */
+const BY_USER_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
 /**
  * Send one request to the machine's front door and wait (up to `waitS`) for
  * its outcome. `conn` null = this backend's own machine (bind mount).
+ * `by` is the app user asking: the machine keeps it with the request, so a
+ * refusal or failure after this wait can still be told to them (and one this
+ * wait hands back counts as told — change-notices.ts).
  */
 export async function submitFrontDoor(
   conn: SSHClientType | null,
   kind: FrontDoorKind,
   args: Record<string, unknown>,
-  opts: { id?: string; waitS?: number; hostId?: number } = {},
+  opts: { id?: string; waitS?: number; hostId?: number; by?: string } = {},
 ): Promise<FrontDoorOutcome> {
   const id = opts.id ?? randomUUID();
   if (!REQUEST_ID_RE.test(id)) throw new Error("invalid request id");
   const waitS = opts.waitS ?? FRONT_DOOR_WAIT_S;
+  const by = opts.by && BY_USER_RE.test(opts.by) ? opts.by : undefined;
   const t0 = Date.now();
-  const outcome = conn === null
-    ? await submitLocally(kind, args, id, waitS)
-    : await submitOverSsh(conn, kind, args, id, waitS);
+  const release = opts.hostId !== undefined && by ? beginAsking(opts.hostId, id) : () => undefined;
+  let outcome: FrontDoorOutcome;
+  try {
+    outcome = conn === null
+      ? await submitLocally(kind, args, id, waitS, by)
+      : await submitOverSsh(conn, kind, args, id, waitS, by);
+    toldDirectly(by, opts.hostId, outcome);
+  } finally {
+    release();
+  }
   databaseLogger.info("front door request", {
     operation: "front_door_request",
     hostId: opts.hostId,
@@ -143,13 +158,15 @@ async function submitOverSsh(
   args: Record<string, unknown>,
   id: string,
   waitS: number,
+  by?: string,
 ): Promise<FrontDoorOutcome> {
   const fc = '"$HOME/.local/bin/fleet-change"';
   const cmd =
     `if [ -f ${fc} ]; then python3 ${fc} submit ${kind} ${shellWord(JSON.stringify(args))} ` +
-    // An older fleet-change that doesn't know this kind exits with a usage error: the
-    // machine's update after a deploy hasn't finished.
-    `--id ${shellWord(id)} --wait ${waitS} || echo '{"state":"not_installed"}'; else echo '{"state":"not_installed"}'; fi`;
+    // An older fleet-change that doesn't know this kind (or --by) exits with a usage error:
+    // the machine's update after a deploy hasn't finished.
+    `--id ${shellWord(id)} --wait ${waitS}${by ? ` --by ${shellWord(`user:${by}`)}` : ""} ` +
+    `|| echo '{"state":"not_installed"}'; else echo '{"state":"not_installed"}'; fi`;
   let out: string;
   try {
     out = await execCommand(conn, cmd, { timeoutMs: waitS * 1000 + EXEC_GRACE_MS });
@@ -285,6 +302,7 @@ async function submitLocally(
   args: Record<string, unknown>,
   id: string,
   waitS: number,
+  by?: string,
 ): Promise<FrontDoorOutcome> {
   if (!(await exists(path.join(localHome(), ".local", "bin", "fleet-change")))) {
     return { state: "not_installed", id };
@@ -295,7 +313,10 @@ async function submitLocally(
     // Same name shape as fleet-change submit: arrival time in ns, then the id.
     const name = `${arrivalNs().toString().padStart(20, "0")}-${id}.json`;
     const tmp = path.join(incoming, `${name}.tmp.${process.pid}`);
-    await fs.writeFile(tmp, JSON.stringify({ id, kind, args, received_at: Date.now() / 1000 }) + "\n");
+    await fs.writeFile(
+      tmp,
+      JSON.stringify({ id, kind, args, received_at: Date.now() / 1000, ...(by ? { by: { user: by } } : {}) }) + "\n",
+    );
     await fs.rename(tmp, path.join(incoming, name));
   }
   const deadline = Date.now() + waitS * 1000;
@@ -320,8 +341,20 @@ export async function frontDoorStatus(
   conn: SSHClientType | null,
   id: string,
   waitS: number = FRONT_DOOR_WAIT_S,
+  who: { hostId?: number; by?: string } = {},
 ): Promise<FrontDoorOutcome | null> {
   if (!REQUEST_ID_RE.test(id)) throw new Error("invalid request id");
+  const release = who.hostId !== undefined && who.by ? beginAsking(who.hostId, id) : () => undefined;
+  try {
+    const outcome = await statusOf(conn, id, waitS);
+    if (outcome !== null) toldDirectly(who.by, who.hostId, outcome);
+    return outcome;
+  } finally {
+    release();
+  }
+}
+
+async function statusOf(conn: SSHClientType | null, id: string, waitS: number): Promise<FrontDoorOutcome | null> {
   let line: string | null;
   if (conn === null) {
     const deadline = Date.now() + waitS * 1000;
@@ -352,17 +385,18 @@ export async function submitAndFollow(
   conn: SSHClientType | null,
   kind: FrontDoorKind,
   args: Record<string, unknown>,
-  opts: { id: string; hostId?: number; totalS: number },
+  opts: { id: string; hostId?: number; totalS: number; by?: string },
 ): Promise<FrontDoorOutcome> {
   const deadline = Date.now() + opts.totalS * 1000;
   let outcome = await submitFrontDoor(conn, kind, args, {
     id: opts.id,
     hostId: opts.hostId,
+    by: opts.by,
     waitS: Math.min(FRONT_DOOR_WAIT_S, opts.totalS),
   });
   while (outcome.state === "pending" && Date.now() < deadline) {
     const waitS = Math.max(1, Math.min(FRONT_DOOR_WAIT_S, Math.ceil((deadline - Date.now()) / 1000)));
-    const next = await frontDoorStatus(conn, opts.id, waitS);
+    const next = await frontDoorStatus(conn, opts.id, waitS, { hostId: opts.hostId, by: opts.by });
     if (next === null) break;
     outcome = next;
   }

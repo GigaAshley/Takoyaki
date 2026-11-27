@@ -1925,6 +1925,258 @@ def _enumerate_projects(home):
     }
 
 
+# ---------------------------------------------------------------------------
+# Source F — the machine's open changes (its front door, fleet-change)
+# ---------------------------------------------------------------------------
+#
+# One `changes` line per tick: every change waiting its turn or running, people's
+# refusals and failures from the last day (fleet-change keeps them as notices), archives
+# whose clean-up has been stuck 10 minutes or more, and agents on their way back from the
+# archive. Each entry names what it's about (`target`) and who can see that (`audience`,
+# a gate-only list the server checks and strips: None = everyone on the machine). On-disk
+# layout: substrate/scripts/fleet-change's docstring.
+
+CHANGES_CAP = 300
+CHANGE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
+STUCK_AFTER_S = 600
+# Kinds that only look — never shown.
+CHANGE_READ_ONLY = ("project-contents", "role-contents")
+
+
+def _read_json_file(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def _json_names(d):
+    try:
+        return sorted(n for n in os.listdir(d) if n.endswith(".json") and ".tmp." not in n)
+    except OSError:
+        return []
+
+
+def _intersect(audience, users):
+    """Narrow an audience (None = everyone) by one more `users` list (None/[] = no limit)."""
+    if not (isinstance(users, list) and users):
+        return audience
+    users = set(u for u in users if isinstance(u, str))
+    return users if audience is None else audience & users
+
+
+def _finish_audience(audience):
+    if audience is None:
+        return None
+    return sorted(audience) or [PROJECT_APP_NOBODY]
+
+
+def _agent_file(home, name):
+    """The agent's file wherever it is now (live, or in the archive)."""
+    for root in ("identities", "identities-archive"):
+        path = os.path.join(home, "fleet", root, name, name + ".md")
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _agent_audience(home, name, role_memo, path=None):
+    """Who can see agent `name`: its own `users` list and every role's (the identity gate)."""
+    path = path or _agent_file(home, name)
+    if path is None:
+        return None
+    cos, _role = _read_frontmatter_cosmetics(path, ("users",))
+    audience = _intersect(None, (cos or {}).get("users"))
+    for r in _read_identity_roles(path):
+        audience = _intersect(audience, (_read_role_cosmetics(r, home, role_memo) or {}).get("users"))
+    return _finish_audience(audience)
+
+
+def _change_targets(kind, args):
+    """What one change is about, as (target, to) pairs. `to` is where a move goes."""
+    def name(key, pattern):
+        v = args.get(key)
+        return v if isinstance(v, str) and pattern.match(v) else None
+
+    def project_or_none(v):
+        return v if isinstance(v, str) and PROJECT_SLUG_RE.match(v) else None
+
+    if kind in ("agent-project", "agent-pin", "agent-edit", "agent-archive", "agent-unarchive"):
+        n = name("name", SAFE_NAME_RE)
+        if n is None:
+            return []
+        to = None
+        if kind == "agent-project":
+            to = {"project": project_or_none(args.get("project"))}
+        elif kind == "agent-pin":
+            to = {"pinned": args.get("pinned") is True}
+        return [({"type": "agent", "name": n}, to)]
+    if kind in ("app-move", "app-archive", "app-unarchive"):
+        n = name("slug", APP_SLUG_RE)
+        if n is None:
+            return []
+        to = None
+        if kind == "app-move":
+            to = {"project": project_or_none(args.get("project")) if args.get("to") == "project" else None}
+        return [({"type": "app", "name": n}, to)]
+    if kind in ("project-archive", "project-rename", "project-move"):
+        n = name("slug", PROJECT_SLUG_RE)
+        if n is None:
+            return []
+        to = {"parent": project_or_none(args.get("parent"))} if kind == "project-move" else None
+        return [({"type": "project", "name": n}, to)]
+    if kind == "project-create":
+        dn = args.get("displayName")
+        return [({"type": "project", "name": None,
+                  "display_name": dn if isinstance(dn, str) else ""}, None)]
+    if kind in ("role-archive", "role-unarchive"):
+        n = name("name", _ROLES_SLUG_RE)
+        if n is None:
+            return []
+        out = [({"type": "role", "name": n}, None)]
+        expected = args.get("expected")
+        agents = expected.get("agents") if isinstance(expected, dict) else None
+        for a in agents if isinstance(agents, list) else []:
+            a = a.get("name") if isinstance(a, dict) else a
+            if isinstance(a, str) and SAFE_NAME_RE.match(a):
+                out.append(({"type": "agent", "name": a}, None))
+        return out
+    return []
+
+
+def _enumerate_changes(home, projects, app_records):
+    """Return the `changes` line dict, or None when the machine has no front door yet."""
+    root = os.path.join(home, "fleet", ".changes")
+    if not os.path.isdir(root):
+        return None
+    role_memo = {}
+    agent_memo = {}
+    apps = {a.get("slug"): a for a in app_records or []}
+    projects = projects or []
+
+    def audience_of(target):
+        t, n = target["type"], target.get("name")
+        if n is None:
+            return None
+        if t == "agent":
+            if n not in agent_memo:
+                agent_memo[n] = _agent_audience(home, n, role_memo)
+            return agent_memo[n]
+        if t == "project":
+            return _project_audience(projects, n)
+        if t == "app":
+            a = apps.get(n)
+            if a is None:
+                return None
+            audience = _intersect(None, a.get("users"))
+            if a.get("owner"):
+                owner = audience_of({"type": "agent", "name": a["owner"]})
+                audience = _intersect(audience, owner)
+            return _finish_audience(audience)
+        if t == "role":
+            return _finish_audience(_intersect(None, (_read_role_cosmetics(n, home, role_memo) or {}).get("users")))
+        return None
+
+    out = []
+
+    def add(rid, req, state, at, extra=None):
+        kind = req.get("kind")
+        args = req.get("args")
+        if not isinstance(rid, str) or not CHANGE_ID_RE.match(rid) or kind in CHANGE_READ_ONLY:
+            return
+        if not isinstance(kind, str) or not isinstance(args, dict):
+            return
+        by = req.get("by") if isinstance(req.get("by"), dict) else {}
+        for target, to in _change_targets(kind, args):
+            if len(out) >= CHANGES_CAP:
+                return
+            entry = {
+                "id": rid,
+                "seq": req.get("seq") if isinstance(req.get("seq"), int) else None,
+                "kind": kind,
+                "state": state,
+                "target": target,
+                "audience": audience_of(target),
+                "at": at if isinstance(at, (int, float)) else None,
+            }
+            if to is not None:
+                entry["to"] = to
+                dest = to.get("project") or to.get("parent")
+                if dest:
+                    entry["to_audience"] = _project_audience(projects, dest)
+            if isinstance(by.get("user"), str):
+                entry["by_user"] = by["user"]
+            elif isinstance(by.get("agent"), str):
+                entry["by_agent"] = by["agent"]
+            if extra:
+                entry.update(extra)
+            out.append(entry)
+
+    for n in _json_names(os.path.join(root, "incoming")):
+        req = _read_json_file(os.path.join(root, "incoming", n))
+        if isinstance(req, dict):
+            add(req.get("id"), req, "waiting", req.get("received_at"))
+    for n in _json_names(os.path.join(root, "journal")):
+        req = _read_json_file(os.path.join(root, "journal", n))
+        if isinstance(req, dict):
+            add(req.get("id"), req, "running" if req.get("state") == "running" else "waiting",
+                req.get("received_at"))
+    returning_names = set()
+    for n in _json_names(os.path.join(root, "returning")):
+        name = n[:-5]
+        r = _read_json_file(os.path.join(root, "returning", n))
+        if not SAFE_NAME_RE.match(name) or not isinstance(r, dict):
+            continue
+        returning_names.add(name)
+        path = _agent_file(home, name)
+        cos, _role = _read_frontmatter_cosmetics(path, ("displayName", "project", "users")) if path else (None, None)
+        cos = cos or {}
+        ids = [i for i in r.get("ids") or [] if isinstance(i, str)]
+        first = (_read_json_file(os.path.join(root, "background", ids[0] + ".json")) or {}) if ids else {}
+        req = {"kind": "agent-unarchive", "args": {"name": name}, "seq": first.get("seq"), "by": first.get("by")}
+        add(ids[0] if ids else "returning-" + name, req, "returning", r.get("accepted_at"), {"card": {
+            "display_name": cos.get("displayName") or name,
+            "project": cos.get("project") if isinstance(cos.get("project"), str) else None,
+        }})
+    for n in _json_names(os.path.join(root, "notices")):
+        notice = _read_json_file(os.path.join(root, "notices", n))
+        if not isinstance(notice, dict) or notice.get("state") not in ("refused", "failed", "unfiled"):
+            continue
+        reason = notice.get("reason") if isinstance(notice.get("reason"), str) else ""
+        extra = {"reason": reason[:500]}
+        if isinstance(notice.get("code"), str):
+            extra["code"] = notice["code"][:64]
+        add(notice.get("id"), notice, notice["state"], notice.get("at"), extra)
+
+    # Archives whose clean-up has been failing for 10 minutes or more.
+    now = time.time()
+    for kind, sub in (("agent-archive", "identities"), ("role-archive", "roles")):
+        base = os.path.join(home, "fleet", sub)
+        try:
+            names = sorted(os.listdir(base))
+        except OSError:
+            names = []
+        for name in names:
+            mark = os.path.join(base, name, ".archiving")
+            if not SAFE_NAME_RE.match(name) or not os.path.exists(mark):
+                continue
+            c = _read_json_file(mark)
+            if not isinstance(c, dict):
+                continue
+            since, err = c.get("failing_since"), c.get("last_error")
+            if not (isinstance(since, (int, float)) and now - since >= STUCK_AFTER_S and isinstance(err, str) and err):
+                continue
+            add(c.get("id"), {"kind": kind, "args": {"name": name}, "by": c.get("asked_by")}, "stuck", since,
+                {"reason": err[:500]})
+
+    return {
+        "line_kind": "changes",
+        "schema_version": SCHEMA_VERSION,
+        "changes": out,
+    }
+
+
 def _emit(record):
     """Write one JSON line to stdout — compact, terminated with \\n."""
     sys.stdout.write(json.dumps(record, separators=(",", ":")))
@@ -2028,6 +2280,20 @@ def main():
     # ---- Source E: one project-list line (absent only on scandir failure).
     if project_list_line is not None:
         _emit(project_list_line)
+
+    # ---- Source F: the machine's open changes — last, so a device that sees a change
+    #      gone from it already has everything else from this same tick.
+    try:
+        changes_line = _enumerate_changes(
+            home,
+            project_list_line["projects"] if project_list_line is not None else None,
+            app_records,
+        )
+    except Exception:  # noqa: BLE001 — never costs the rest of the sweep
+        _log("changes_enumeration_failed")
+        changes_line = None
+    if changes_line is not None:
+        _emit(changes_line)
 
     sys.stdout.flush()
     return 0

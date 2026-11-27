@@ -525,7 +525,7 @@ describe("POST /projects (front door)", () => {
       null,
       "project-create",
       { baseSlug: "ops-two", displayName: "Ops 2", parent: null, asker: "riley", multiUser: true },
-      { id: "click-1", hostId: 5 },
+      { id: "click-1", hostId: 5, by: "1" },
     );
     expect(mockPublishProjectListChanged).toHaveBeenCalledTimes(1);
     expect(mockPublishProjectListChanged.mock.calls[0]?.[0]).toBe("5");
@@ -661,7 +661,7 @@ describe("POST /projects/:slug/rename (front door)", () => {
       null,
       "project-rename",
       { slug: "team", displayName: "Dream Team", asker: "riley" },
-      { id: "r-9", hostId: 5 },
+      { id: "r-9", hostId: 5, by: "1" },
     );
     expect(mockPublishProjectListChanged).toHaveBeenCalledTimes(1);
   });
@@ -715,7 +715,7 @@ describe("POST /projects/:slug/archive", () => {
       null,
       "project-archive",
       { slug: "my-project", expected: EXPECTED },
-      { id: "click-9", hostId: 5 },
+      { id: "click-9", hostId: 5, by: "1" },
     );
     expect(releaseProjectRooms).toHaveBeenCalledWith("1", ["my-project"]);
     expect(mockPublishProjectListChanged).toHaveBeenCalledTimes(1);
@@ -784,7 +784,7 @@ describe("POST /projects/:slug/archive", () => {
     });
     expect(res.status).toBe(200);
     expect(frontDoorStatus).toHaveBeenCalledWith(null, "click-9", 0);
-    expect(submitFrontDoor).toHaveBeenCalledWith(null, "project-archive", { slug: "my-project", expected: EXPECTED }, { id: "click-9", hostId: 5 });
+    expect(submitFrontDoor).toHaveBeenCalledWith(null, "project-archive", { slug: "my-project", expected: EXPECTED }, { id: "click-9", hostId: 5, by: "1" });
     expect(releaseProjectRooms).toHaveBeenCalledWith("1", ["my-project"]);
   });
 

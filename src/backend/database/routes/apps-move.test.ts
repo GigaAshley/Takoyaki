@@ -115,7 +115,7 @@ describe("POST /apps/:hostId/:slug/move", () => {
   it("sends a sidebar move with the conversation's audience to the front door", async () => {
     const r = await post(server, "/apps/5/tally/move", { to: "sidebar", requestId: "click-1" });
     expect(r.status).toBe(200);
-    expect(submitFrontDoor).toHaveBeenCalledWith(null, "app-move", { slug: "tally", to: "sidebar", users: ["ann"] }, { id: "click-1", hostId: 5 });
+    expect(submitFrontDoor).toHaveBeenCalledWith(null, "app-move", { slug: "tally", to: "sidebar", users: ["ann"] }, { id: "click-1", hostId: 5, by: "1" });
   });
 
   it("sends a project move, with a fresh request id when the client gave none", async () => {

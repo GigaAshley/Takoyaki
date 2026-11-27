@@ -774,7 +774,7 @@ router.put(
           conn,
           "agent-edit",
           { name: identityKey, set, unset, ...(avatar ? { avatar } : {}) },
-          { id: requestId, hostId },
+          { id: requestId, hostId, by: userId },
         );
         if (outcome.state === "not_installed" && avatar) {
           // The machine never took it: the picture saved for it isn't wanted.
