@@ -5,6 +5,7 @@
 import { and, eq } from "drizzle-orm";
 import { getDb } from "../../../database/db/index.js";
 import { hosts, users } from "../../../database/db/schema.js";
+import { sameMachineAs } from "../../user-secrets/acting-user.js";
 
 /** `{ id, phoneE164 }` for a Skynet username, or null if there is no such user. */
 export async function getUserByUsername(
@@ -23,9 +24,9 @@ export async function getUserByUsername(
 /**
  * True when `userId` has registered the machine behind host row
  * `hostIdNum` — either they own that row, or they own another row that
- * points at the same machine (same ip + port + login). `ssh_data` rows are
- * per-user, so a box two users both registered appears as two rows, and
- * the scan that claims a request file may be either one.
+ * points at the same machine (same machine id, or same ip + port + login).
+ * `ssh_data` rows are per-user, so a box two users both registered appears
+ * as two rows, and a machine's requests run as one of them.
  *
  * This gates outbound calls: an agent may only phone the people who
  * registered the host it runs on.
@@ -41,6 +42,7 @@ export async function userHasRegisteredHost(
       ip: hosts.ip,
       port: hosts.port,
       username: hosts.username,
+      machineId: hosts.machineId,
     })
     .from(hosts)
     .where(eq(hosts.id, hostIdNum))
@@ -51,14 +53,7 @@ export async function userHasRegisteredHost(
   const sameMachine = await db
     .select({ id: hosts.id })
     .from(hosts)
-    .where(
-      and(
-        eq(hosts.userId, userId),
-        eq(hosts.ip, origin.ip),
-        eq(hosts.port, origin.port),
-        eq(hosts.username, origin.username),
-      ),
-    )
+    .where(and(eq(hosts.userId, userId), sameMachineAs(origin)))
     .limit(1);
   return sameMachine.length > 0;
 }

@@ -64,14 +64,13 @@ Write `<message>` as pure content — no `"Hi, this is …"`, no `"— <name>"` 
 
 ## What happens
 
-1. The helper (via the shared `fleet-service` client) drops a request into `~/fleet/service-requests/<uuid>.json`.
-2. The backend picks it up within ~10 seconds and renames it to `<uuid>.claimed.json`.
-3. The backend places the call. The recipient's phone rings.
-4. On pickup, the voice speaks the opening line and your message, then records the reply, up to about five minutes. The reply ends when the callee stops talking for a few seconds or presses any key. Then the voice says the receipt phrase and hangs up.
-5. The backend transcribes the reply, deletes the recording, and drops `~/fleet/service-requests/<uuid>.response.json` back onto your host.
-6. The helper prints the transcript to stdout, cleans up its files, and exits.
+1. The helper (via the shared `fleet-service` client) sends the request straight to the backend.
+2. The backend places the call. The recipient's phone rings.
+3. On pickup, the voice speaks the opening line and your message, then records the reply, up to about five minutes. The reply ends when the callee stops talking for a few seconds or presses any key. Then the voice says the receipt phrase and hangs up.
+4. The backend transcribes the reply, deletes the recording, and answers the helper.
+5. The helper prints the transcript to stdout and exits.
 
-Most calls come back within a minute or two of being picked up. The worst case is about **13 minutes**. The backend's limits fit inside the helper's wait — a request that waits more than 2 minutes to start is dropped as `expired` without dialing, and a call still going after 9 minutes is hung up — so a call does not ring after you've been told it failed.
+Most calls come back within a minute or two. The worst case is about **13 minutes**. The backend's limits fit inside the helper's wait — a request that waits more than 2 minutes to start is dropped as `expired` without dialing, and a call still going after 9 minutes is hung up — so a call does not ring after you've been told it failed.
 
 ## Response shape
 
@@ -82,7 +81,7 @@ Run in the background, the transcript is in the command's output when you're not
 
 ## Outcomes
 
-Every response file carries exactly one `outcome`. Successful transcripts land under `completed`; every other value is a failure of some flavor. Full enumeration:
+Every answer carries exactly one `outcome`. Successful transcripts land under `completed`; every other value is a failure of some flavor. Full enumeration:
 
 | outcome            | caller action |
 | ------------------ | --- |
@@ -93,9 +92,12 @@ Every response file carries exactly one `outcome`. Successful transcripts land u
 | canceled           | Rare — the call was canceled before it connected. Retry. |
 | placement_error    | The provider refused to place the call. Check `message` for the reason (bad phone number, out of credit, rejected credentials). Not agent-retriable — escalate to the operator. |
 | queue_error        | The call was accepted but couldn't be connected (carrier trouble, or a number that can't be reached). The phone did not ring. Retry once in a few minutes; if it happens again, escalate. |
-| timeout            | The call didn't finish within 9 minutes and the backend hung it up (or, from the helper, the backend never answered). Very rare. **The phone may have rung**, so do NOT retry right away — tell the user by another channel or escalate. |
+| timeout            | The call didn't finish within 9 minutes and the backend hung it up (or, from the helper, the backend hadn't answered in time). Very rare. **The phone may have rung**, so do NOT retry right away — tell the user by another channel or escalate. |
+| lost               | The backend restarted during the call, so its outcome is gone; it was not placed again. **The phone may have rung**, so do NOT retry right away — tell the user by another channel. |
 | expired            | The request sat in the queue past 2 minutes and was dropped without dialing (usually because another call to the same person was in progress). The phone did not ring; retry. |
-| not_picked_up      | The backend never picked up the request. The backend may be down or not managing this host. Not agent-retriable — escalate to the operator. |
+| unreachable        | The backend couldn't be reached from this machine. The phone did not ring. Retry later; if it keeps happening, escalate to the operator. |
+| not_set_up         | This machine hasn't been given its service credential yet (it arrives within a minute of the machine being set up), or an admin revoked it. The phone did not ring. Retry in a minute; if it persists, escalate to the operator. |
+| revoked            | An admin revoked this machine's access to services. The phone did not ring. Not agent-retriable — tell the user an admin can issue it a new credential in Admin → Services. |
 | not_configured     | Phone calls aren't set up yet (the Twilio keys are missing). Not agent-retriable — escalate to the operator; an admin sets them up in Admin → Services. |
 | not_enabled        | Phone calls aren't switched on for this machine. Not agent-retriable — tell the user an admin can switch them on in Admin → Services. |
 | queue_full         | Too many calls are queued. Try again later. |
@@ -110,4 +112,4 @@ Every response file carries exactly one `outcome`. Successful transcripts land u
 
 There are no code-side rate limits. The call is scripted, so it is always short: deliver, record one reply, receipt, hang up. If you find yourself wanting to place three calls in five minutes, that is the signal to reconsider — the recipient's phone is not a stream.
 
-Concurrency: two agents dropping request files targeting the same user at the same time will run serially — the second call rings after the first finishes. Calls to different users run concurrently.
+Concurrency: two agents calling the same user at the same time will run serially — the second call rings after the first finishes. Calls to different users run concurrently.

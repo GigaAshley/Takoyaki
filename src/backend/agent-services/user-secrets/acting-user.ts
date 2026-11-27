@@ -2,10 +2,10 @@
  * agent-services/user-secrets/acting-user.ts — which Skynet user a request
  * acts for.
  *
- * A request arrives from a host, not a person. The people who can be behind
- * it are the host's registrants: every user with a host row for the same
- * machine (same ip + port + login; host rows are per-user, so a shared box
- * has one row per person who added it). Rules:
+ * A request arrives from a machine, not a person. The people who can be
+ * behind it are the machine's registrants: every user with a host row for
+ * the same machine (same machine id, or same ip + port + login; host rows
+ * are per-user, so a shared box has one row per person who added it). Rules:
  *
  *   - `as_user` given (fleet-service --as <username>): that user, if they
  *     registered this host. Agents on a shared host may act for any of its
@@ -15,11 +15,30 @@
  *     retry with --as.
  */
 
-import { eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, or, type SQL } from "drizzle-orm";
 import { getDb } from "../../database/db/index.js";
 import { hosts, users } from "../../database/db/schema.js";
 import type { ActingUserResolution } from "../engine/engine.js";
 import type { ActingUser } from "../engine/types.js";
+
+/**
+ * Host rows for the same machine as `origin`: the same machine id, or the
+ * same ip + port + login. A machine's requests run as one of its rows
+ * (http/production.ts), so every row of the machine counts.
+ */
+export function sameMachineAs(origin: {
+  ip: string;
+  port: number;
+  username: string;
+  machineId: number | null;
+}): SQL {
+  const sameLogin = and(
+    eq(hosts.ip, origin.ip),
+    eq(hosts.port, origin.port),
+    eq(hosts.username, origin.username),
+  )!;
+  return origin.machineId === null ? sameLogin : or(sameLogin, eq(hosts.machineId, origin.machineId))!;
+}
 
 /** Every user who registered the machine behind host row `hostIdNum`. */
 export async function listHostRegistrants(
@@ -28,7 +47,7 @@ export async function listHostRegistrants(
   const db = getDb();
   const origin = (
     await db
-      .select({ ip: hosts.ip, port: hosts.port, username: hosts.username })
+      .select({ ip: hosts.ip, port: hosts.port, username: hosts.username, machineId: hosts.machineId })
       .from(hosts)
       .where(eq(hosts.id, hostIdNum))
       .limit(1)
@@ -36,21 +55,10 @@ export async function listHostRegistrants(
   if (!origin) return [];
 
   const sameMachine = await db
-    .select({
-      userId: hosts.userId,
-      ip: hosts.ip,
-      port: hosts.port,
-      username: hosts.username,
-    })
+    .select({ userId: hosts.userId })
     .from(hosts)
-    .where(eq(hosts.ip, origin.ip));
-  const userIds = [
-    ...new Set(
-      sameMachine
-        .filter((h) => h.port === origin.port && h.username === origin.username)
-        .map((h) => h.userId),
-    ),
-  ];
+    .where(sameMachineAs(origin));
+  const userIds = [...new Set(sameMachine.map((h) => h.userId))];
   if (userIds.length === 0) return [];
 
   const rows = await db

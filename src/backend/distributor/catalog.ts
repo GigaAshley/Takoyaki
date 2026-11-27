@@ -377,9 +377,9 @@ export const FLEET_SUBSTRATE_CATALOG: readonly CatalogEntry[] = [
     installPath: "~/.local/bin/inbox-watcher",
     restartHook: null,
   },
-  // Agent services: fleet-service is the shared file-drop client every
-  // service wrapper calls (request envelope into ~/fleet/service-requests/,
-  // wait for the response, collect output files). Each service's own skill
+  // Agent services: fleet-service is the shared client every service
+  // wrapper calls (sends the request straight to the backend with the
+  // machine's credential, waits for the answer, saves output files). Each service's own skill
   // and wrapper are not listed here: they ship from the service's folder
   // (full-catalog.ts). See src/backend/agent-services/README.md.
   {

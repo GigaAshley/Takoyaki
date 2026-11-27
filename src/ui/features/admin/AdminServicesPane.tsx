@@ -1,6 +1,7 @@
 /**
  * Admin → Services: every backend service agents can use, and whether it's
- * working. A service opens one level deeper, where an admin:
+ * working, then each machine's credential for calling them (Revoke cuts a
+ * machine off until Issue new). A service opens one level deeper, where an admin:
  *   - picks its settings (e.g. speech to text's provider);
  *   - sets, replaces or removes its keys (never shown back);
  *   - switches it on or off per machine (a machine switched off loses the
@@ -13,7 +14,9 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   getAgentService,
+  issueMachineCredential,
   listAgentServices,
+  revokeMachineCredential,
   removePersonKey,
   removeServiceKey,
   setPersonKey,
@@ -21,12 +24,14 @@ import {
   setServiceMachine,
   setServiceSetting,
   type KeyStoreInfo,
+  type MachineCredential,
   type ServiceDetail,
   type ServiceState,
   type ServiceSummary,
 } from "@/api/agent-services-admin-api";
 import {
   KitBanner,
+  KitButton,
   KitChip,
   KitEmpty,
   KitLoading,
@@ -34,6 +39,7 @@ import {
   KitSettingsGroup,
   KitSettingsRow,
   KitSwitch,
+  kitConfirm,
 } from "@/components/kit";
 import { AdminBack, adminErrorMessage, formatAdminDate, relativeAdminTime, useEscBack } from "./admin-ui";
 import { ServiceKeyRow } from "./ServiceKeyRow";
@@ -109,17 +115,24 @@ function KeyStoreLine({ store }: { store: KeyStoreInfo }) {
 }
 
 function AdminServicesList({ onOpen }: { onOpen: (name: string) => void }) {
-  const [data, setData] = useState<{ keyStore: KeyStoreInfo; services: ServiceSummary[] } | null>(null);
+  const [data, setData] = useState<{
+    keyStore: KeyStoreInfo;
+    services: ServiceSummary[];
+    machines: MachineCredential[];
+  } | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    listAgentServices()
-      .then((d) => {
-        setData(d);
-        setError(null);
-      })
-      .catch((err) => setError(adminErrorMessage(err, "Failed to load services.")));
+  const load = useCallback(async () => {
+    try {
+      setData(await listAgentServices());
+      setError(null);
+    } catch (err) {
+      setError(adminErrorMessage(err, "Failed to load services."));
+    }
   }, []);
+  useEffect(() => {
+    void load();
+  }, [load]);
 
   if (error) return <KitBanner tone="danger" data-testid="admin-services-error">{error}</KitBanner>;
   if (!data) return <KitLoading label="Loading services…" />;
@@ -152,7 +165,90 @@ function AdminServicesList({ onOpen }: { onOpen: (name: string) => void }) {
           />
         ))}
       </KitSettingsGroup>
+      <MachineCredentials machines={data.machines} onChanged={load} />
     </div>
+  );
+}
+
+/** Each machine's credential for calling services: replaced daily, revocable. */
+function MachineCredentials({ machines, onChanged }: { machines: MachineCredential[]; onChanged: () => Promise<void> }) {
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const now = Date.now();
+
+  const change = async (m: MachineCredential, what: "revoke" | "issue") => {
+    if (what === "revoke") {
+      const ok = await kitConfirm({
+        title: `Revoke ${m.name}'s access to services?`,
+        body: "Its agents can't use any service until you issue it a new credential.",
+        confirmLabel: "Revoke",
+        destructive: true,
+      });
+      if (!ok) return;
+    }
+    setBusy(m.machineId);
+    setError(null);
+    try {
+      await (what === "revoke" ? revokeMachineCredential(m.machineId) : issueMachineCredential(m.machineId));
+    } catch (err) {
+      setError(adminErrorMessage(err, what === "revoke" ? "Failed to revoke the machine." : "Failed to issue a new credential."));
+    }
+    setBusy(null);
+    await onChanged();
+  };
+
+  const describe = (m: MachineCredential) => {
+    if (m.state === "revoked") {
+      const when = m.revokedAt ? relativeAdminTime(m.revokedAt, now) : "";
+      return `Revoked${when ? ` ${when}` : ""}${m.revokedBy ? ` by ${m.revokedBy}` : ""}`;
+    }
+    if (m.state === "pending") return "Getting its credential";
+    return `Active${m.issuedAt ? ` · replaced ${relativeAdminTime(m.issuedAt, now)}` : ""}`;
+  };
+
+  return (
+    <KitSettingsGroup
+      title="Machines"
+      footer="Each machine holds its own credential for calling services, replaced every day. Revoking one cuts its agents off from every service until you issue it a new one."
+      data-testid="admin-service-credentials"
+    >
+      {error && <KitBanner tone="danger">{error}</KitBanner>}
+      {machines.length === 0 ? (
+        <KitSettingsRow label="No machines run agents yet" />
+      ) : (
+        machines.map((m) => (
+          <KitSettingsRow
+            key={m.machineId}
+            label={m.name}
+            description={describe(m)}
+            data-testid={`admin-service-credential-${m.machineId}`}
+            control={
+              m.state === "revoked" ? (
+                <KitButton
+                  size="sm"
+                  variant="primary"
+                  disabled={busy !== null}
+                  onClick={() => void change(m, "issue")}
+                  data-testid={`admin-service-credential-issue-${m.machineId}`}
+                >
+                  Issue new
+                </KitButton>
+              ) : m.state === "active" ? (
+                <KitButton
+                  size="sm"
+                  variant="danger-quiet"
+                  disabled={busy !== null}
+                  onClick={() => void change(m, "revoke")}
+                  data-testid={`admin-service-credential-revoke-${m.machineId}`}
+                >
+                  Revoke
+                </KitButton>
+              ) : undefined
+            }
+          />
+        ))
+      )}
+    </KitSettingsGroup>
   );
 }
 
@@ -305,7 +401,6 @@ function AdminServiceView({ name, onBack }: { name: string; onBack: () => void }
             <KitSettingsRow
               key={m.machineId}
               label={m.name}
-              description={m.unreachableSince ? `Not reachable since ${relativeAdminTime(m.unreachableSince, now)}` : undefined}
               control={
                 <KitSwitch
                   checked={m.enabled}

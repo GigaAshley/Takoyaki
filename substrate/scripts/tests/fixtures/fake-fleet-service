@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Stand-in for fleet-service in agent-supervisor-unarchive.test.sh. The
+# "backend" is the folder $FAKE_SERVICE_DIR, which the tests drive by hand:
+#
+#   call <service> --id <id> --input <json> [--timeout <s>]
+#       records <id>.json ({service, input}); answers from <id>.response.json
+#       when present, else {"ok":false,"error":{"code":"timeout"}}.
+#   collect <id> [--timeout <s>]
+#       <id>.lost present → lost; <id>.unreachable present → unreachable;
+#       <id>.response.json present → that answer, and the backend forgets the
+#       request (every <id>.* file goes); else timeout.
+set -u
+dir="${FAKE_SERVICE_DIR:?}"
+mkdir -p "$dir"
+mode="$1"; shift
+answer() {
+  local id="$1"
+  if [ -f "$dir/$id.lost" ]; then
+    rm -f "$dir/$id".*
+    echo '{"ok":false,"service":null,"error":{"code":"lost","message":"lost in a restart"}}'
+  elif [ -f "$dir/$id.unreachable" ]; then
+    echo '{"ok":false,"service":null,"error":{"code":"unreachable","message":"no route"}}'
+  elif [ -f "$dir/$id.response.json" ]; then
+    cat "$dir/$id.response.json"
+    rm -f "$dir/$id".*
+  else
+    echo '{"ok":false,"service":"identity-reactivate","error":{"code":"timeout","message":"still running"}}'
+  fi
+}
+case "$mode" in
+  call)
+    service="$1"; shift
+    id="" input="{}"
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --id) id="$2"; shift 2;;
+        --input) input="$2"; shift 2;;
+        *) shift 2;;
+      esac
+    done
+    jq -cn --arg s "$service" --argjson i "$input" '{service: $s, input: $i}' > "$dir/$id.json"
+    answer "$id"
+    ;;
+  collect)
+    answer "$1"
+    ;;
+esac

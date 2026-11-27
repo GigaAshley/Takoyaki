@@ -4,10 +4,9 @@
  * An agent service is something an agent on a managed host can ask the
  * backend to do on its behalf, using credentials only the backend holds
  * (place a phone call, generate an image, ...). The engine owns everything
- * about getting the request off the host and the answer back on: claiming
- * request files, validating input, queueing, rate limiting, TTLs, and the
- * atomic response write. A service only declares what it accepts and
- * implements `handle()`.
+ * about taking the request and giving the answer: validating input,
+ * queueing, rate limiting, TTLs, keys and the acting user. A service only
+ * declares what it accepts and implements `handle()`.
  *
  * See ../README.md for the wire protocol and a walkthrough of adding one.
  */
@@ -16,7 +15,7 @@ import type { z } from "zod";
 
 /** A file the agent sent alongside the request (e.g. a reference image). */
 export interface ServiceAttachment {
-  /** Wire filename on the host: `<uuid>.in.<name>.<ext>`. */
+  /** `<slot>.<ext>`, e.g. `ref.png`. */
   filename: string;
   /** Lower-case extension, without the dot. */
   ext: string;

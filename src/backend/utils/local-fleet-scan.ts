@@ -3,9 +3,8 @@
  *
  * ## Why this exists
  *
- * The always-on scan orchestrators (`agent-services/engine/scan-orchestrator.ts` +
- * `spawn-requests/scan-orchestrator.ts`) enumerate every substrate-eligible
- * host and SSH into each to atomically claim request-file drops. When the
+ * The always-on scan orchestrator (`spawn-requests/scan-orchestrator.ts`)
+ * enumerates every substrate-eligible host and SSHes into each to atomically claim request-file drops. When the
  * substrate host is the container's OWN host (i.e. the host whose numeric id
  * appears in `IDENTITIES_LOCAL_HOST_IDS`, e.g. Skynet), SSH-to-self from
  * inside the container HANGS INDEFINITELY: acquireChannel's exec never
@@ -16,14 +15,13 @@
  * container has the host's `~/` bind-mounted at `/host-home` (via
  * HOME_HOST_DIR), and IDENTITIES_HOST_DIR points inside it at
  * `/host-home/fleet/identities`. The parent (`/host-home/fleet`) is where
- * `~/fleet/spawn-requests/` and `~/fleet/service-requests/` live on the
- * local host. Reading from the bind-mount is byte-identical to what an SSH
+ * `~/fleet/spawn-requests/` lives on the local host. Reading from the bind-mount is byte-identical to what an SSH
  * scan would have seen.
  *
  * ## Semantics (must match the SSH scan commands byte-for-byte)
  *
- * The SSH scan commands (agent-services `SCAN_CMD` + `SPAWN_REQUESTS_SCAN_CMD`)
- * implement an atomic-claim primitive (both use the preserveClaimed variant
+ * The SSH scan command (`SPAWN_REQUESTS_SCAN_CMD`)
+ * implements an atomic-claim primitive (it uses the preserveClaimed variant
  * described on scanLocalFleetFolder below):
  *   1. `cd <folder> 2>/dev/null || exit 0` — missing folder is not an error.
  *   2. `for f in *.json` — list JSON files.
@@ -62,7 +60,6 @@ import { getLocalIdentitiesRoot } from "../claude-session/identity-artifact-read
  * so this returns `/host-home/fleet` (= `~/fleet` on host). Request folders
  * sit alongside identities:
  *   - `/host-home/fleet/spawn-requests/`
- *   - `/host-home/fleet/service-requests/`
  *
  * In dev (no env var), `getLocalIdentitiesRoot()` returns `~/fleet/identities`,
  * so this returns `~/fleet` — matches the SSH scan command's `~/fleet/...` root.
@@ -84,8 +81,7 @@ export interface LocalFleetScanItem {
 }
 
 /**
- * Scan the given fleet subfolder (e.g. `"spawn-requests"` or
- * `"service-requests"`) and atomically claim every 36-char-basename
+ * Scan the given fleet subfolder (e.g. `"spawn-requests"`) and atomically claim every 36-char-basename
  * `<uuid>.json` file present. For each claimed file, returns `{filename,
  * contents}` — the filename is the ORIGINAL (`<uuid>.json`), the contents
  * are the raw JSON body read from the claimed file.
@@ -95,7 +91,7 @@ export interface LocalFleetScanItem {
  * pattern).
  *
  * @param subfolder — subfolder name under the local fleet root
- *                    (e.g. `"spawn-requests"`, `"service-requests"`)
+ *                    (e.g. `"spawn-requests"`)
  * @param opts.preserveClaimed — when true, the atomic claim renames to
  *                    `<uuid>.claimed.json` and LEAVES it on disk (durable
  *                    in-flight marker; mirrors the SSH SPAWN_REQUESTS_SCAN_CMD

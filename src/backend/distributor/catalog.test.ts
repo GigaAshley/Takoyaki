@@ -106,7 +106,7 @@ describe("FLEET_SUBSTRATE_CATALOG", () => {
     // shape-composebox-cutover) — 126 → 127.
     // +4 for the agent desktop (desktop SKILL.md + agent-desktop helper +
     // desktop-mcp helper + agent-desktop@.service template unit) — 127 → 131.
-    // +1 for fleet-service (shared agent-services file-drop client that the
+    // +1 for fleet-service (shared agent-services client that the
     // image-gen and agent-phone wrappers call) — 131 → 132.
     // +2 for stt (SKILL.md + stt helper, speech-to-text agent service) —
     // 132 → 134.
@@ -301,9 +301,9 @@ describe("FLEET_SUBSTRATE_CATALOG", () => {
     // retired 2026-10-09 with the usage meter — 21 → 18) +
     // pv-context-pct-sweep (Phase 95 PrettyView context-pct batch sweep) +
     // ambient-monitor (mega-monitor phase, single on-wake launcher) +
-    // image-gen (Phase 116 file-drop broker helper) +
+    // image-gen (Phase 116 agent-service helper) +
     // task-field-check (UserPromptSubmit hook for id skill task: field nag) +
-    // agent-phone (file-drop broker helper for phone-call capability) +
+    // agent-phone (agent-service helper for phone-call capability) +
     // allow-all-tools (PreToolUse hook — fleet-wide auto-allow, eliminates
     // residual permission prompts that --dangerously-skip-permissions doesn't) +
     // self-edit-baseline-sync (PostToolUse hook for file-watch self-edit
@@ -315,7 +315,7 @@ describe("FLEET_SUBSTRATE_CATALOG", () => {
     // composebox cutover) +
     // agent-desktop + desktop-mcp (per-identity virtual desktop: lifecycle
     // CLI + MCP server for screenshot/click/type tools) +
-    // fleet-service (shared agent-services file-drop client) +
+    // fleet-service (shared agent-services client) +
     // stt (speech-to-text agent-services wrapper) +
     // resume-gap-notice (UserPromptSubmit hook — time-since-last-activity note)
     // +1 pending-context-drain +

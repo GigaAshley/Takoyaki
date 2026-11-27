@@ -37,6 +37,7 @@ const PROTECTED: Array<[file: string, method: string, path: string]> = [
   ["database/routes/user-admin-password-routes.ts", "post", "/:id/set-password"],
   ["database/routes/user-admin-host-routes.ts", "delete", "/:id/hosts/:hostId"],
   ["database/routes/instance-wide.ts", "put", "/machines"],
+  ["agent-services/admin/routes.ts", "post", "/admin/service-machines/:machineId/issue"],
 ];
 
 function middlewareOf(src: string, method: string, path: string): string {

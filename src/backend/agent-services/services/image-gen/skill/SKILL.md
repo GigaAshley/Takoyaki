@@ -44,7 +44,7 @@ Grab the first image path in the usual way:
 img=$(image-gen "a cat" | head -1)
 ```
 
-Files land under `~/fleet/image-gen-outputs/` by default (fleet-tree convention — never `/tmp`, which is wiped on reboot). The helper talks to the backend through the shared `fleet-service` client and cleans up its scratch files in `~/fleet/service-requests/` on every exit path — you get back only the moved output paths.
+Files land under `~/fleet/image-gen-outputs/` by default (fleet-tree convention — never `/tmp`, which is wiped on reboot). The helper talks to the backend through the shared `fleet-service` client and cleans up its scratch files on every exit path — you get back only the saved output paths.
 
 ## Failure handling
 
@@ -61,7 +61,10 @@ Full failure enum and what to do for each:
 | not_enabled | Image generation isn't switched on for this machine. Not agent-retriable: tell the user an admin can switch it on in Admin → Services. |
 | malformed | Read the `message` field and fix the request (e.g. `n: ...` means `--n` was out of range); retry. |
 | expired | The request waited in the queue past 5 minutes. Retry — the fleet may be overloaded. |
-| timeout | The backend accepted the request but did not answer within 5 minutes. Retry. |
-| not_picked_up | The backend never picked up the request — it may be down or not managing this host. Escalate to the operator. |
+| timeout | The backend accepted the request but did not answer in time. It keeps going: `fleet-service collect <id>` (the ID is in `message`) gets the images later. Don't retry, or you'll generate them twice. |
+| lost | The backend restarted while the request was in flight, so its answer is gone; it was not run again. Retry. |
+| unreachable | The backend couldn't be reached from this machine (the helper kept trying until its time ran out). Retry later; if it keeps happening, escalate to the operator. |
+| not_set_up | This machine hasn't been given its service credential yet (it arrives within a minute of the machine being set up), or an admin revoked it. Retry in a minute; if it persists, escalate to the operator. |
+| revoked | An admin revoked this machine's access to services. Not agent-retriable: tell the user an admin can issue it a new credential in Admin → Services. |
 | queue_full | Too many requests queued. Retry later. |
 | unknown / internal | Escalate to the operator. |

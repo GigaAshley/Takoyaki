@@ -22,17 +22,19 @@ beforeEach(() => {
       user_id TEXT NOT NULL,
       ip TEXT NOT NULL,
       port INTEGER NOT NULL,
-      username TEXT NOT NULL
+      username TEXT NOT NULL,
+      machine_id INTEGER
     );
   `);
   const insert = sqlite.prepare(
-    "INSERT INTO ssh_data (id, user_id, ip, port, username) VALUES (?, ?, ?, ?, ?)",
+    "INSERT INTO ssh_data (id, user_id, ip, port, username, machine_id) VALUES (?, ?, ?, ?, ?, ?)",
   );
-  insert.run(1, "alice", "10.0.0.5", 22, "agent"); // alice's box
-  insert.run(2, "bob", "10.0.0.5", 22, "agent"); // bob registered the same box
-  insert.run(3, "bob", "10.0.0.9", 22, "agent"); // bob-only box
-  insert.run(4, "carol", "10.0.0.9", 2222, "agent"); // same ip, different port
-  insert.run(5, "dave", "10.0.0.9", 22, "other"); // same ip+port, different login
+  insert.run(1, "alice", "10.0.0.5", 22, "agent", null); // alice's box
+  insert.run(2, "bob", "10.0.0.5", 22, "agent", null); // bob registered the same box
+  insert.run(3, "bob", "10.0.0.9", 22, "agent", 7); // bob-only box
+  insert.run(4, "carol", "10.0.0.9", 2222, "agent", null); // same ip, different port
+  insert.run(5, "dave", "10.0.0.9", 22, "other", null); // same ip+port, different login
+  insert.run(6, "erin", "10.0.0.9", 22, "root", 7); // another login, same machine id
   drizzleInstance = drizzle(sqlite);
 });
 
@@ -53,6 +55,11 @@ describe("userHasRegisteredHost", () => {
   it("treats a different port or login as a different machine", async () => {
     expect(await userHasRegisteredHost("carol", 3)).toBe(false);
     expect(await userHasRegisteredHost("dave", 3)).toBe(false);
+  });
+
+  it("counts another login on the same machine id as the same machine", async () => {
+    expect(await userHasRegisteredHost("erin", 3)).toBe(true);
+    expect(await userHasRegisteredHost("bob", 6)).toBe(true);
   });
 
   it("rejects when the origin host row does not exist", async () => {

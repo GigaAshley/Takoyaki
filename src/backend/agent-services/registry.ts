@@ -7,7 +7,7 @@
  *   skill/          optional; installed to ~/.claude/skills/<name>/ on hosts
  *   bin/            optional; each file installed to ~/.local/bin/<file>
  * Nothing else in the app names a service. See README.md. (Identity
- * reactivate rides the same request files but is the app's own machinery,
+ * reactivate rides the same requests but is the app's own machinery,
  * not a service; it lives in matrix/ and is wired in boot.ts.)
  *
  * A broken folder is skipped with a loud log line; the other services still

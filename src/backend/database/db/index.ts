@@ -717,6 +717,25 @@ async function initializeCompleteDatabase(): Promise<void> {
     CREATE INDEX IF NOT EXISTS agent_service_usage_service_at
         ON agent_service_usage (service, at);
 
+    -- Each machine's credential for calling agent services directly
+    -- (agent-services/machine-credentials/store.ts). token is FieldCrypto
+    -- ciphertext under the system ENCRYPTION_KEY, kept so the backend can
+    -- write it onto every login of the machine; token_hash is what a request
+    -- is checked against. previous_hash stays valid until
+    -- previous_valid_until after a daily replacement. revoked_at set = cut
+    -- off until an admin issues a new one. Drizzle mirror
+    -- agentServiceMachineCredentials.
+    CREATE TABLE IF NOT EXISTS agent_service_machine_credentials (
+        machine_id TEXT PRIMARY KEY,
+        token TEXT,
+        token_hash TEXT,
+        issued_at TEXT,
+        previous_hash TEXT,
+        previous_valid_until TEXT,
+        revoked_at TEXT,
+        revoked_by TEXT
+    );
+
 `);
 
   // Sidebar unread marks: turn-finish log + per-user read state.

@@ -1,95 +1,51 @@
 /**
- * agent-services/engine/protocol.ts — the host-side file-drop wire protocol.
+ * agent-services/engine/protocol.ts — the wire format between a machine's
+ * `fleet-service` command and the backend (http/routes.ts).
  *
- * Everything lives in one folder per host, `~/fleet/service-requests/`:
+ * A request is `POST /agent-services/v1/jobs/<id>` from the machine, with its
+ * credential, as multipart form data:
  *
- *   <uuid>.json              request envelope, written atomically by the agent:
- *                            {service, requested_at, input, attachments?, as_user?}
- *   <uuid>.in.<slot>.<ext>   optional attachments, written BEFORE the envelope
- *   <uuid>.claimed.json      the envelope after the backend claims it; its
- *                            appearance tells the agent "accepted"
- *   <uuid>.out.<i>.<ext>     output files, written before the response
- *   <uuid>.response.json     the answer, written atomically and last
+ *   request              JSON: {service, input, as_user?}
+ *   attachment.<slot>    one file per attachment slot; its filename's
+ *                        extension is the attachment's type
  *
- * The agent-side helper (substrate/scripts/fleet-service) removes every
- * `<uuid>.*` file when it finishes. Anything a vanished helper leaves behind
- * is swept by the scan after a day.
+ * <id> is a UUID the caller picks. The answer is the response JSON below,
+ * whose `files` describe output files fetched separately by index.
  *
- * Pure module: no I/O, no logger. Shared by the SSH and local scanners.
+ *   {ok:true,  service, result, files:[{ext, size}]}
+ *   {ok:false, service, error:{code, message?, ...}}
+ *
+ * Pure module: no I/O, no logger.
  */
 
-import type { EngineErrorCode, ServiceResult } from "./types.js";
-
-/** Folder name under `~/fleet/` on every managed host. */
-export const REQUESTS_FOLDER = "service-requests";
-
-/** `$HOME`-relative folder path, for the response writer. */
-export const REQUESTS_DIR = `$HOME/fleet/${REQUESTS_FOLDER}`;
-
-/** Leftover wire files older than this are deleted by the scan. */
-export const STALE_FILE_MINUTES = 24 * 60;
+import type {
+  AttachmentSpec,
+  EngineErrorCode,
+  ServiceOutputFile,
+  ServiceResult,
+} from "./types.js";
 
 /** Canonical lower/upper-case dashed UUID. */
 export const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-const SERVICE_NAME_RE = /^[a-z][a-z0-9-]{0,63}$/;
-const SLOT_NAME_RE = /^[a-z][a-z0-9_]{0,31}$/;
+export const SERVICE_NAME_RE = /^[a-z][a-z0-9-]{0,63}$/;
+export const SLOT_NAME_RE = /^[a-z][a-z0-9_]{0,31}$/;
 const EXT_RE = /^[a-z0-9]{1,8}$/;
 
-/**
- * Scan-and-claim command, run over SSH on each host every tick.
- *
- *   1. Missing folder is not an error (`cd || exit 0`).
- *   2. Sweep wire files older than a day, left by helpers that died.
- *   3. For each `<uuid>.json` (36-char basename, so `.claimed.json`,
- *      `.response.json`, attachments and `.tmp` files are skipped), claim it
- *      with an atomic rename to `<uuid>.claimed.json`. A losing racer's mv
- *      fails and it moves on.
- *   4. Emit `<uuid>\t<base64 body>\n`. Base64 keeps the line protocol intact
- *      whatever the body contains, including pretty-printed JSON.
- *
- * The claimed file is left in place so the agent can see the request was
- * accepted.
- */
-export const SCAN_CMD = [
-  `cd ~/fleet/${REQUESTS_FOLDER} 2>/dev/null || exit 0;`,
-  `find . -maxdepth 1 -type f -name '????????-????-????-????-????????????.*' -mmin +${STALE_FILE_MINUTES} -delete 2>/dev/null;`,
-  "for f in *.json; do",
-  '[ -f "$f" ] || continue;',
-  'base="${f%.json}";',
-  "[ ${#base} -eq 36 ] || continue;",
-  'mv "$f" "$base.claimed.json" 2>/dev/null || continue;',
-  "printf '%s\\t' \"$base\"; base64 -w0 \"$base.claimed.json\"; printf '\\n';",
-  "done",
-].join(" ");
+/** Form field name prefix for attachments: `attachment.<slot>`. */
+export const ATTACHMENT_FIELD_PREFIX = "attachment.";
 
-export interface ClaimedFile {
-  uuid: string;
-  body: string;
-}
-
-/** Parse SCAN_CMD stdout. Lines that don't fit the shape are dropped. */
-export function parseScanOutput(stdout: string): ClaimedFile[] {
-  const out: ClaimedFile[] = [];
-  for (const line of stdout.split("\n")) {
-    const tab = line.indexOf("\t");
-    if (tab === -1) continue;
-    const uuid = line.slice(0, tab).trim();
-    if (!UUID_RE.test(uuid)) continue;
-    const body = Buffer.from(line.slice(tab + 1).trim(), "base64").toString(
-      "utf-8",
-    );
-    out.push({ uuid, body });
-  }
-  return out;
-}
-
-/** Shell command printing an attachment as base64, capped at `maxBytes + 1`. */
-export function attachmentReadCmd(filename: string, maxBytes: number): string {
-  // `filename` has already passed attachmentFilenameError(), so it is
-  // `<uuid>.in.<slot>.<ext>` with no shell metacharacters.
-  return `head -c ${maxBytes + 1} "$HOME/fleet/${REQUESTS_FOLDER}/${filename}" | base64 -w0`;
+/** One request as the engine takes it. */
+export interface IncomingRequest {
+  /** Caller-chosen UUID. */
+  id: string;
+  service: string;
+  input: unknown;
+  /** App username the request acts for (services with userSecrets). */
+  asUser?: string;
+  /** slot → the file sent in it. */
+  attachments: Record<string, { ext: string; bytes: Buffer }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -98,21 +54,11 @@ export function attachmentReadCmd(filename: string, maxBytes: number): string {
 
 interface RequestEnvelope {
   service: string;
-  requested_at: string;
   input: unknown;
-  /** slot name → wire filename */
-  attachments: Record<string, string>;
-  /** Skynet username the request acts for (services with userSecrets). */
   as_user?: string;
 }
 
-const ENVELOPE_KEYS = new Set([
-  "service",
-  "requested_at",
-  "input",
-  "attachments",
-  "as_user",
-]);
+const ENVELOPE_KEYS = new Set(["service", "input", "as_user"]);
 
 export type EnvelopeParse =
   | { ok: true; envelope: RequestEnvelope }
@@ -140,33 +86,12 @@ export function parseEnvelope(body: string): EnvelopeParse {
   });
 
   for (const k of Object.keys(obj)) {
-    if (!ENVELOPE_KEYS.has(k)) return fail(`unrecognized envelope field: ${k}`);
+    if (!ENVELOPE_KEYS.has(k)) return fail(`unrecognized request field: ${k}`);
   }
   if (service === undefined || !SERVICE_NAME_RE.test(service)) {
     return fail("service must be a kebab-case service name");
   }
-  if (
-    typeof obj.requested_at !== "string" ||
-    !Number.isFinite(Date.parse(obj.requested_at))
-  ) {
-    return fail("requested_at must be an ISO-8601 timestamp");
-  }
   if (!("input" in obj)) return fail("input is required");
-
-  const attachments: Record<string, string> = {};
-  if (obj.attachments !== undefined) {
-    const a = obj.attachments;
-    if (a === null || typeof a !== "object" || Array.isArray(a)) {
-      return fail("attachments must be an object of slot name to filename");
-    }
-    for (const [slot, filename] of Object.entries(a)) {
-      if (!SLOT_NAME_RE.test(slot))
-        return fail(`bad attachment slot name: ${slot}`);
-      if (typeof filename !== "string")
-        return fail(`attachment ${slot} must be a filename`);
-      attachments[slot] = filename;
-    }
-  }
 
   if (
     obj.as_user !== undefined &&
@@ -181,34 +106,33 @@ export function parseEnvelope(body: string): EnvelopeParse {
     ok: true,
     envelope: {
       service,
-      requested_at: obj.requested_at,
       input: obj.input,
-      attachments,
       ...(obj.as_user !== undefined ? { as_user: obj.as_user as string } : {}),
     },
   };
 }
 
-/**
- * Check an attachment filename is exactly `<uuid>.in.<slot>.<ext>` for this
- * request, with an allowed extension. Returns an error message, or null when
- * it is fine. Tying the name to the request uuid stops one request from
- * reading another request's attachment.
- */
-export function attachmentFilenameError(
-  uuid: string,
+/** The attachment extension from a sent filename, lower-cased, or null. */
+export function attachmentExt(filename: string): string | null {
+  const dot = filename.lastIndexOf(".");
+  if (dot === -1) return null;
+  const ext = filename.slice(dot + 1).toLowerCase();
+  return EXT_RE.test(ext) ? ext : null;
+}
+
+/** Why a sent attachment doesn't fit its slot, or null when it does. */
+export function attachmentError(
   slot: string,
-  filename: string,
-  allowedExtensions: readonly string[],
+  file: { ext: string; bytes: Buffer },
+  spec: AttachmentSpec,
 ): string | null {
-  const prefix = `${uuid}.in.${slot}.`;
-  if (!filename.startsWith(prefix)) {
-    return `attachment ${slot} must be named ${prefix}<ext>`;
+  if (!EXT_RE.test(file.ext)) return `attachment ${slot} has a bad extension`;
+  if (!spec.extensions.includes(file.ext)) {
+    return `attachment ${slot} must be one of: ${spec.extensions.join(", ")}`;
   }
-  const ext = filename.slice(prefix.length);
-  if (!EXT_RE.test(ext)) return `attachment ${slot} has a bad extension`;
-  if (!allowedExtensions.includes(ext)) {
-    return `attachment ${slot} must be one of: ${allowedExtensions.join(", ")}`;
+  if (file.bytes.byteLength === 0) return `attachment ${slot} is missing or empty`;
+  if (file.bytes.byteLength > spec.maxBytes) {
+    return `attachment ${slot} exceeds ${spec.maxBytes} bytes`;
   }
   return null;
 }
@@ -217,38 +141,31 @@ export function attachmentFilenameError(
 // Response
 // ---------------------------------------------------------------------------
 
-export function responseFilename(uuid: string): string {
-  return `${uuid}.response.json`;
-}
-
-export function outputFilename(
-  uuid: string,
-  index: number,
-  ext: string,
-): string {
-  return `${uuid}.out.${index}.${ext}`;
-}
-
 export type WireResponse =
-  | { ok: true; service: string; result: unknown; files: string[] }
+  | {
+      ok: true;
+      service: string;
+      result: unknown;
+      files: Array<{ ext: string; size: number }>;
+    }
   | {
       ok: false;
       service: string | null;
       error: { code: string; message?: string; [k: string]: unknown };
     };
 
-/** Build the response JSON from a service result and the output filenames. */
+/** Build the response JSON from a service result and its output files. */
 export function buildResponse(
   service: string | null,
   result: ServiceResult | EngineFailure,
-  outputFilenames: string[] = [],
+  files: readonly ServiceOutputFile[] = [],
 ): WireResponse {
   if (result.ok === true) {
     return {
       ok: true,
       service: service ?? "",
       result: result.result,
-      files: outputFilenames,
+      files: files.map((f) => ({ ext: f.ext, size: f.bytes.byteLength })),
     };
   }
   const error: { code: string; message?: string; [k: string]: unknown } = {

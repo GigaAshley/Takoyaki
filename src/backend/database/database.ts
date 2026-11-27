@@ -2,6 +2,7 @@ import express from "express";
 import http from "http";
 import bodyParser from "body-parser";
 import multer from "multer";
+import { agentServicesRouter } from "../agent-services/http/production.js";
 import cookieParser from "cookie-parser";
 import { createSubdomainDispatchMiddleware } from "../serve-url/subdomain-dispatch.js";
 import { serveUrlHandler } from "../serve-url/serve-route.js";
@@ -2038,6 +2039,9 @@ app.post("/database/restore", requireAdmin, async (req, res) => {
   }
 });
 
+// Machines' agent service requests: machine credential, not a user session.
+// agent-services/http/routes.ts.
+app.use("/agent-services", agentServicesRouter);
 app.use("/users", userRoutes);
 // Phase 75 amendment: matrix-admin creds ingestion + rotation surface. Admin-gated
 // (authenticateJWT + requireAdmin middleware). Same endpoint serves the one-shot

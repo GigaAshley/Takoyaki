@@ -1005,3 +1005,20 @@ export const agentServiceUsage = sqliteTable("agent_service_usage", {
   code: text("code"),
   fault: integer("fault", { mode: "boolean" }).notNull().default(false),
 });
+
+/**
+ * Each machine's credential for calling agent services directly. `token` is
+ * ciphertext; requests are checked against `tokenHash` (or `previousHash`
+ * until `previousValidUntil`). Store: agent-services/machine-credentials/store.ts.
+ */
+export const agentServiceMachineCredentials = sqliteTable("agent_service_machine_credentials", {
+  machineId: text("machine_id").primaryKey(),
+  token: text("token"),
+  tokenHash: text("token_hash"),
+  issuedAt: text("issued_at"),
+  previousHash: text("previous_hash"),
+  previousValidUntil: text("previous_valid_until"),
+  revokedAt: text("revoked_at"),
+  /** User id of the admin who revoked it. */
+  revokedBy: text("revoked_by"),
+});

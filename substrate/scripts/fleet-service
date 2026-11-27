@@ -6,22 +6,17 @@
 # (src/backend/distributor/catalog.ts). Installed per-box at
 # ~/.local/bin/fleet-service. Do NOT hand-edit the installed copy.
 #
-# The backend holds the credentials; this script only drops a request file
-# and waits for the answer. Wire protocol (all in ~/fleet/service-requests/):
-#
-#   <uuid>.in.<slot>.<ext>   attachments, written first
-#   <uuid>.json              request envelope, written atomically:
-#                              {service, requested_at, input, attachments?, as_user?}
-#   <uuid>.claimed.json      appears when the backend accepts the request
-#   <uuid>.out.<i>.<ext>     output files
-#   <uuid>.response.json     the answer, written last:
-#                              {ok:true,  service, result, files:[...]}
-#                              {ok:false, service, error:{code, message?, ...}}
+# The backend holds the service keys; this script sends the request straight
+# to it and waits for the answer. It sends to the app's address
+# (~/fleet/host/parent) with this machine's credential
+# (~/fleet/host/service-credential), both written by the backend. Wire format:
+# src/backend/agent-services/engine/protocol.ts.
 #
 # Usage:
 #   fleet-service call <service> [--input <json> | --input - | --input-file <path>]
 #                       [--attach <slot>=<path>]... [--as <username>]
-#                       [--timeout <sec>] [--out-dir <dir>]
+#                       [--timeout <sec>] [--out-dir <dir>] [--id <uuid>]
+#   fleet-service collect <uuid> [--timeout <sec>] [--out-dir <dir>]
 #
 #   --input -        read the input JSON from stdin (best for long text)
 #   --attach         send a file in the named slot, e.g. --attach ref=cat.png
@@ -30,34 +25,42 @@
 #   --timeout        seconds to wait (default $FLEET_SERVICE_TIMEOUT_SEC or 540,
 #                    under Claude Code's 10-minute Bash-tool limit)
 #   --out-dir        where output files land (default ~/fleet/service-outputs)
+#   --id             the request's ID (a UUID; default a new one)
+#
+# `collect` waits for the answer to a request already sent (one that timed
+# out here, or whose caller died), by its ID. It never sends the request
+# again: an ID the backend doesn't know comes back `lost`.
 #
 # Output: the response JSON on stdout, one line, with `files` rewritten to the
-# absolute paths the output files were moved to.
+# absolute paths the output files were saved to.
 #
 # Exit status:
 #   0  ok:true
-#   1  ok:false, including the two client-side codes this script adds:
-#        not_picked_up  the backend never claimed the request
-#        timeout        the backend claimed it but did not answer in time
+#   1  ok:false, including the codes this script adds:
+#        unreachable  couldn't reach the backend
+#        not_set_up   this machine has no service credential (yet)
+#        timeout      the backend accepted the request but didn't answer in
+#                     time; it keeps going, and `collect <id>` gets the answer
 #   2  usage or local error (message on stderr, nothing on stdout)
 #
-# Every <uuid>.* wire file is removed on exit, including on Ctrl-C, so a
-# request whose caller has gone away is never picked up later.
+# The backend answers `lost` for an ID it doesn't know: the request was lost in
+# a backend restart (or its answer expired). It is never run again on its own.
 #
-# `-e` is intentionally not set: polling and cleanup expect non-zero exits.
+# `-e` is intentionally not set: retries and cleanup expect non-zero exits.
 
 set -uo pipefail
 
-REQ_DIR="${HOME}/fleet/service-requests"
-POLL_INTERVAL_FAST="0.5"   # first 30s
-POLL_INTERVAL_SLOW="2"     # after that
-FAST_POLL_WINDOW_SEC=30
+HOLD_SEC=50          # the backend holds each wait this long at most
+SEND_HOLD_SEC=1      # how long the sending call itself waits for a quick answer
+RETRY_PAUSE_MAX=8    # longest pause between attempts while it can't be reached
+UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 
 usage() {
   cat >&2 <<'USAGE'
 usage: fleet-service call <service> [--input <json> | --input - | --input-file <path>]
                           [--attach <slot>=<path>]... [--as <username>]
-                          [--timeout <sec>] [--out-dir <dir>]
+                          [--timeout <sec>] [--out-dir <dir>] [--id <uuid>]
+       fleet-service collect <uuid> [--timeout <sec>] [--out-dir <dir>]
 USAGE
 }
 
@@ -67,12 +70,22 @@ die() {
 }
 
 [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ] && { usage; exit 0; }
-[ "${1:-}" = "call" ] || { usage; exit 2; }
+mode="${1:-}"
+case "$mode" in call|collect) ;; *) usage; exit 2;; esac
 shift
-service="${1:-}"
-[ -n "$service" ] || { usage; exit 2; }
-shift
-[[ "$service" =~ ^[a-z][a-z0-9-]{0,63}$ ]] || die "bad service name: $service"
+
+service=""
+id=""
+if [ "$mode" = call ]; then
+  service="${1:-}"
+  [ -n "$service" ] || { usage; exit 2; }
+  shift
+  [[ "$service" =~ ^[a-z][a-z0-9-]{0,63}$ ]] || die "bad service name: $service"
+else
+  id="${1:-}"
+  [ -n "$id" ] || { usage; exit 2; }
+  shift
+fi
 
 input_arg=""
 input_file=""
@@ -83,13 +96,14 @@ attach_slots=()
 attach_paths=()
 
 while [ $# -gt 0 ]; do
-  case "$1" in
-    --input)      input_arg="${2-}"; shift 2 || die "--input needs a value";;
-    --input-file) input_file="${2-}"; shift 2 || die "--input-file needs a value";;
-    --as)         as_user="${2-}"; shift 2 || die "--as needs a username";;
-    --timeout)    timeout_sec="${2-}"; shift 2 || die "--timeout needs a value";;
-    --out-dir)    out_dir="${2-}"; shift 2 || die "--out-dir needs a value";;
-    --attach)
+  case "$mode:$1" in
+    call:--input)      input_arg="${2-}"; shift 2 || die "--input needs a value";;
+    call:--input-file) input_file="${2-}"; shift 2 || die "--input-file needs a value";;
+    call:--as)         as_user="${2-}"; shift 2 || die "--as needs a username";;
+    call:--id)         id="${2-}"; shift 2 || die "--id needs a UUID";;
+    *:--timeout)       timeout_sec="${2-}"; shift 2 || die "--timeout needs a value";;
+    *:--out-dir)       out_dir="${2-}"; shift 2 || die "--out-dir needs a value";;
+    call:--attach)
       spec="${2-}"
       shift 2 || die "--attach needs <slot>=<path>"
       slot="${spec%%=*}"
@@ -100,135 +114,184 @@ while [ $# -gt 0 ]; do
       attach_slots+=("$slot")
       attach_paths+=("$path")
       ;;
-    -h|--help) usage; exit 0;;
+    *:-h|*:--help) usage; exit 0;;
     *) usage; die "unexpected argument: $1";;
   esac
 done
 
 [[ "$timeout_sec" =~ ^[0-9]+$ ]] || die "--timeout must be whole seconds"
 command -v jq >/dev/null 2>&1 || die "jq is required but not installed (apt install jq)"
+command -v curl >/dev/null 2>&1 || die "curl is required but not installed (apt install curl)"
 
-mkdir -p "$REQ_DIR" "$out_dir" || die "cannot create $REQ_DIR or $out_dir"
-
-if command -v uuidgen >/dev/null 2>&1; then
-  uuid=$(uuidgen | tr '[:upper:]' '[:lower:]')
-else
-  uuid=$(tr '[:upper:]' '[:lower:]' < /proc/sys/kernel/random/uuid 2>/dev/null)
+if [ -z "$id" ]; then
+  if command -v uuidgen >/dev/null 2>&1; then
+    id=$(uuidgen)
+  else
+    id=$(cat /proc/sys/kernel/random/uuid 2>/dev/null)
+  fi
 fi
-[ -n "$uuid" ] || die "could not generate a uuid"
-
-# ---- cleanup: every exit path removes this request's wire files -------------
-
-cleanup() {
-  rm -f -- "$REQ_DIR/$uuid".* 2>/dev/null || true
-}
-on_signal() {
-  cleanup
-  trap - "$1"
-  kill -"$1" $$
-}
-trap cleanup EXIT
-trap 'on_signal INT' INT
-trap 'on_signal TERM' TERM
-trap 'on_signal HUP' HUP
-
-# ---- input -------------------------------------------------------------------
-
-input_tmp="$REQ_DIR/$uuid.input.tmp.$$"
-if [ -n "$input_file" ]; then
-  [ -f "$input_file" ] || die "--input-file not found: $input_file"
-  cp -- "$input_file" "$input_tmp" || die "cannot read $input_file"
-elif [ "$input_arg" = "-" ]; then
-  cat > "$input_tmp" || die "cannot read input from stdin"
-elif [ -n "$input_arg" ]; then
-  printf '%s' "$input_arg" > "$input_tmp"
-else
-  printf '{}' > "$input_tmp"
-fi
-jq -e . "$input_tmp" >/dev/null 2>&1 || die "input is not valid JSON"
-
-# ---- attachments, before the envelope (the backend reads them on claim) -----
-
-attachments='{}'
-for i in "${!attach_slots[@]}"; do
-  slot="${attach_slots[$i]}"
-  src="${attach_paths[$i]}"
-  ext="${src##*.}"
-  ext=$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]')
-  [[ "$ext" =~ ^[a-z0-9]{1,8}$ ]] || die "attachment $slot needs a file extension: $src"
-  wire="$uuid.in.$slot.$ext"
-  cp -- "$src" "$REQ_DIR/$wire.tmp.$$" || die "cannot stage attachment $src"
-  mv -- "$REQ_DIR/$wire.tmp.$$" "$REQ_DIR/$wire" || die "cannot stage attachment $src"
-  attachments=$(jq -c --arg s "$slot" --arg f "$wire" '. + {($s): $f}' <<<"$attachments")
-done
-
-# ---- envelope, committed atomically ------------------------------------------
-
-req_path="$REQ_DIR/$uuid.json"
-jq -cn \
-  --arg service "$service" \
-  --arg requested_at "$(date -u +%FT%TZ)" \
-  --slurpfile input "$input_tmp" \
-  --argjson attachments "$attachments" \
-  --arg as_user "$as_user" \
-  '{service: $service, requested_at: $requested_at, input: $input[0]}
-   + (if ($attachments | length) > 0 then {attachments: $attachments} else {} end)
-   + (if $as_user != "" then {as_user: $as_user} else {} end)' \
-  > "$req_path.tmp.$$" || die "cannot write request"
-rm -f -- "$input_tmp"
-mv -- "$req_path.tmp.$$" "$req_path" || die "cannot commit request"
-
-# ---- wait for the response ---------------------------------------------------
-
-response_file="$REQ_DIR/$uuid.response.json"
-claimed_file="$REQ_DIR/$uuid.claimed.json"
-poll_start=$(date +%s)
-deadline=$(( poll_start + timeout_sec ))
+id=$(printf '%s' "$id" | tr '[:upper:]' '[:lower:]')
+[[ "$id" =~ $UUID_RE ]] || die "the request ID must be a UUID"
 
 client_error() {
   jq -cn --arg s "$service" --arg c "$1" --arg m "$2" \
-    '{ok: false, service: $s, error: {code: $c, message: $m}}'
+    '{ok: false, service: (if $s == "" then null else $s end), error: {code: $c, message: $m}}'
   exit 1
 }
 
-while [ ! -f "$response_file" ]; do
-  now=$(date +%s)
-  if [ "$now" -ge "$deadline" ]; then
-    if [ -f "$claimed_file" ]; then
-      client_error timeout "the backend accepted the request but did not answer within ${timeout_sec}s"
-    fi
-    client_error not_picked_up "the backend did not pick up the request within ${timeout_sec}s; is it running and managing this host?"
-  fi
-  if [ $(( now - poll_start )) -lt "$FAST_POLL_WINDOW_SEC" ]; then
-    sleep "$POLL_INTERVAL_FAST"
-  else
-    sleep "$POLL_INTERVAL_SLOW"
-  fi
-done
+# ---- scratch files: request, auth header, response bodies --------------------
 
-response=$(cat "$response_file" 2>/dev/null)
-if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"$response"; then
-  client_error internal "response file was empty or not JSON"
+work=$(mktemp -d "${TMPDIR:-/tmp}/fleet-service.XXXXXX") || die "cannot create a scratch folder"
+cleanup() { rm -rf -- "$work" 2>/dev/null || true; }
+trap cleanup EXIT
+trap 'cleanup; trap - INT; kill -INT $$' INT
+trap 'cleanup; trap - TERM; kill -TERM $$' TERM
+trap 'cleanup; trap - HUP; kill -HUP $$' HUP
+
+form=()
+if [ "$mode" = call ]; then
+  input_tmp="$work/input.json"
+  if [ -n "$input_file" ]; then
+    [ -f "$input_file" ] || die "--input-file not found: $input_file"
+    cp -- "$input_file" "$input_tmp" || die "cannot read $input_file"
+  elif [ "$input_arg" = "-" ]; then
+    cat > "$input_tmp" || die "cannot read input from stdin"
+  elif [ -n "$input_arg" ]; then
+    printf '%s' "$input_arg" > "$input_tmp"
+  else
+    printf '{}' > "$input_tmp"
+  fi
+  jq -e . "$input_tmp" >/dev/null 2>&1 || die "input is not valid JSON"
+
+  jq -cn --arg service "$service" --slurpfile input "$input_tmp" --arg as_user "$as_user" \
+    '{service: $service, input: $input[0]} + (if $as_user != "" then {as_user: $as_user} else {} end)' \
+    > "$work/request.json" || die "cannot write request"
+
+  form=(-F "request=<$work/request.json;type=application/json")
+  for i in "${!attach_slots[@]}"; do
+    slot="${attach_slots[$i]}"
+    src="${attach_paths[$i]}"
+    ext="${src##*.}"
+    ext=$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]')
+    [[ "$ext" =~ ^[a-z0-9]{1,8}$ ]] || die "attachment $slot needs a file extension: $src"
+    form+=(-F "attachment.$slot=@$src;filename=$slot.$ext;type=application/octet-stream")
+  done
 fi
 
-# ---- move output files out of the wire folder --------------------------------
+# ---- where to send, and this machine's credential ---------------------------
+
+base=$(cat "$HOME/fleet/host/parent" 2>/dev/null)
+base="${base%/}"
+cred_file="$HOME/fleet/host/service-credential"
+[ -n "$base" ] || client_error not_set_up "this machine doesn't know the app's address yet (~/fleet/host/parent is missing); the app writes it when it sets the machine up"
+credential=$({ tr -d '[:space:]' < "$cred_file"; } 2>/dev/null)
+[ -n "$credential" ] || client_error not_set_up "this machine has no service credential ($cred_file is missing); the app writes one within a minute of setting the machine up"
+
+# The credential goes in a header file, not the command line, so other
+# processes on the machine can't read it from the process list.
+( umask 077; printf 'Authorization: Bearer %s\n' "$credential" > "$work/auth" ) || die "cannot write scratch files"
+
+job_url="$base/agent-services/v1/jobs/$id"
+
+# ---- send, then wait --------------------------------------------------------
+
+start=$(date +%s)
+deadline=$(( start + timeout_sec ))
+remaining() { echo $(( deadline - $(date +%s) )); }
+
+# call <method> <wait-seconds> [curl args...] — sets $http, $curl_rc and
+# $curl_err; the body is in $work/body. A send may carry large attachments
+# over a slow link, so it's bounded by its remaining time and a stall check,
+# not a fixed limit.
+call() {
+  local method="$1" wait="$2"; shift 2
+  local limits=(--max-time $(( wait + 20 )))
+  [ "$method" = POST ] && limits=(--max-time "$(( $(remaining) > 30 ? $(remaining) : 30 ))" --speed-limit 1024 --speed-time 60)
+  curl_err=""
+  http=$(curl -sS -X "$method" -H @"$work/auth" \
+    --connect-timeout 10 "${limits[@]}" \
+    -o "$work/body" -w '%{http_code}' "$@" "$job_url?wait=$wait" 2>"$work/curl.err")
+  curl_rc=$?
+  [ "$curl_rc" -eq 0 ] || { curl_err=$(head -c 300 "$work/curl.err"); http="000"; }
+}
+
+# The request is sent again only while the backend clearly hasn't taken it
+# (no connection, or the app said it's still starting). Once it may have it,
+# this only asks for the answer, so a backend restart can't run it twice.
+method=$([ "$mode" = call ] && echo POST || echo GET)
+ever_reached=0
+pause=1
+while :; do
+  left=$(remaining)
+  if [ "$left" -le 0 ]; then
+    if [ "$ever_reached" -eq 1 ]; then
+      client_error timeout "the backend accepted the request but did not answer within ${timeout_sec}s; it keeps going, and 'fleet-service collect $id' gets the answer"
+    fi
+    client_error unreachable "couldn't reach the backend at $base${curl_err:+: $curl_err}"
+  fi
+  if [ "$method" = POST ]; then
+    call POST "$SEND_HOLD_SEC" "${form[@]}"
+  else
+    call GET "$(( left < HOLD_SEC ? left : HOLD_SEC ))"
+  fi
+  case "$http" in
+    200) break ;;
+    202) ever_reached=1; method=GET; pause=1; continue ;;
+  esac
+  starting=0
+  [ "$http" = 503 ] && jq -e '.error.code == "starting"' "$work/body" >/dev/null 2>&1 && starting=1
+  if [ "$starting" -eq 1 ] || { [ "$http" = 000 ] && { [ "$curl_rc" -eq 6 ] || [ "$curl_rc" -eq 7 ]; }; }; then
+    # Never taken: safe to send (or ask) again.
+    [ "$http" = 000 ] || ever_reached=1
+  elif [ "$http" = 000 ] || { [ "${http:0:1}" = 5 ] && ! jq -e '.ok == false' "$work/body" >/dev/null 2>&1; }; then
+    # Broken mid-call, or a server error with no answer of ours (a proxy
+    # that lost the backend): it may have the request.
+    ever_reached=1
+    method=GET
+  else
+    # A refusal (revoked, unknown credential, lost, malformed): the body says why.
+    if jq -e '.ok == false' "$work/body" >/dev/null 2>&1; then
+      jq -c --arg s "$service" '.service = (.service // (if $s == "" then null else $s end))' "$work/body"
+      exit 1
+    fi
+    client_error internal "the backend answered http $http without a reason"
+  fi
+  sleep "$pause"
+  pause=$(( pause * 2 > RETRY_PAUSE_MAX ? RETRY_PAUSE_MAX : pause * 2 ))
+done
+
+response=$(cat "$work/body")
+jq -e 'type == "object" and has("ok")' >/dev/null 2>&1 <<<"$response" \
+  || client_error internal "the backend's answer was empty or not JSON"
+
+# ---- output files ------------------------------------------------------------
 
 moved=()
-i=0
-while IFS= read -r f; do
-  [ -n "$f" ] || continue
-  # Only accept this request's own output files.
-  case "$f" in "$uuid".out.*) ;; *) continue;; esac
-  case "$f" in */*) continue;; esac
-  dest="$out_dir/$uuid-$i.${f##*.}"
-  if mv -- "$REQ_DIR/$f" "$dest" 2>/dev/null; then
+if [ "$(jq -r '.ok' <<<"$response")" = "true" ]; then
+  mkdir -p "$out_dir" || die "cannot create $out_dir"
+  count=$(jq -r '(.files // []) | length' <<<"$response")
+  for (( i = 0; i < count; i++ )); do
+    ext=$(jq -r --argjson i "$i" '.files[$i].ext // "bin"' <<<"$response")
+    [[ "$ext" =~ ^[a-z0-9]{1,8}$ ]] || ext=bin
+    dest="$out_dir/$id-$i.$ext"
+    got=0
+    for attempt in 1 2 3; do
+      code=$(curl -sS -H @"$work/auth" --connect-timeout 10 --max-time 300 \
+        -o "$dest.part" -w '%{http_code}' "$job_url/files/$i" 2>/dev/null)
+      if [ "$code" = 200 ] && mv -f -- "$dest.part" "$dest"; then got=1; break; fi
+      rm -f -- "$dest.part"
+      sleep "$attempt"
+    done
+    [ "$got" -eq 1 ] || client_error internal "the request finished but output file $i couldn't be downloaded; 'fleet-service collect $id' tries again"
     moved+=("$dest")
-    i=$(( i + 1 ))
-  fi
-done < <(jq -r '.files[]? // empty' <<<"$response")
+  done
+  response=$(jq -c '.files = $ARGS.positional' --args "${moved[@]}" <<<"$response")
+fi
 
-response=$(jq -c 'if .ok == true then .files = $ARGS.positional else . end' --args "${moved[@]}" <<<"$response")
-printf '%s\n' "$response"
+# The answer is ours now: the backend can drop its copy.
+curl -sS -X DELETE -H @"$work/auth" --connect-timeout 5 --max-time 10 -o /dev/null "$job_url" 2>/dev/null || true
+
+printf '%s\n' "$(jq -c . <<<"$response")"
 
 [ "$(jq -r '.ok' <<<"$response")" = "true" ] && exit 0
 exit 1

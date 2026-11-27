@@ -6,8 +6,8 @@
  * an `.unarchive-requested` flag (front end and agents drop the same flag).
  *
  * Not an agent service: it is the app's own machinery. It rides the agent
- * services' request files (the supervisor drops a `fleet-service` request
- * named "identity-reactivate") and the engine answers it as a core handler,
+ * services' requests (the supervisor sends a `fleet-service` request named
+ * "identity-reactivate") and the engine answers it as a core handler,
  * for every machine, never switched, listed or recorded. Wired in
  * agent-services/boot.ts.
  * The chat admin credentials never leave the backend; this is the one narrow

@@ -2,15 +2,21 @@
 
 An agent service is something an agent on a managed host asks the Skynet
 backend to do for it, using credentials only the backend holds: place a phone
-call, generate an image, and so on. Agents never see the keys. They drop a
-request file on their own host, and the backend picks it up over SSH, does the
-work, and writes the answer back next to it.
+call, generate an image, and so on. Agents never see the keys. The agent's
+command sends the request straight to the backend, which does the work and
+answers on the same connection.
 
 ```
-host: ~/fleet/service-requests/            backend
-  agent ──fleet-service──▶ <uuid>.json ──scan (10s)──▶ engine ──▶ service.handle()
-  agent ◀── result ── <uuid>.response.json ◀──SSH write── engine ◀──┘
+host                                          backend (/agent-services)
+  agent ──fleet-service── POST jobs/<id> ──▶ credential → machine ──▶ engine ──▶ service.handle()
+  agent ◀── result ────── 200 answer ◀────── job store ◀──────────────────────┘
+                          (202 "running" → GET jobs/<id> until the answer)
 ```
+
+The request goes to the app's own address (`~/fleet/host/parent`, which the
+distributor already writes), with the machine's credential
+(`~/fleet/host/service-credential`, which the backend writes). A quick call
+costs one round trip, tens of milliseconds.
 
 Services today: `agent-phone` (Twilio calls), `image-gen` (OpenAI
 gpt-image-1.5), `stt` (speech to text, with its own provider). Admins run
@@ -18,7 +24,7 @@ them from **Admin → Services**: keys, settings, which machines may use each
 one, usage and errors (`admin/`).
 
 Identity reactivate (`src/backend/matrix/identity-reactivate.ts`) rides the
-same request files but is not a service: it's the app's own machinery (the
+same requests but is not a service: it's the app's own machinery (the
 agent-supervisor asks it to bring an archived agent's chat account back). The
 engine answers it as a core handler, for every machine, never switched,
 listed or recorded. Identity births (`spawn-requests/`) predate this and
@@ -29,11 +35,13 @@ still have their own scanner.
 | Path                          | What it is                                                                   |
 | ----------------------------- | ---------------------------------------------------------------------------- |
 | `engine/types.ts`             | The service contract: `defineService`, `ok`, `fail`                          |
-| `engine/protocol.ts`          | Wire format: scan command, envelope, filenames                               |
-| `engine/engine.ts`            | Validation, queueing, TTL, secrets, rate limits, responses                   |
+| `engine/protocol.ts`          | Wire format: request, attachments, answer                                    |
+| `engine/engine.ts`            | Validation, queueing, TTL, secrets, rate limits, answers                     |
 | `engine/queue.ts`             | Per-service queue (concurrency plus optional serialization key)              |
-| `engine/host-io.ts`           | Claim and attachment reads over SSH or the local bind mount; response writer |
-| `engine/scan-orchestrator.ts` | The one scan loop over every substrate host                                  |
+| `engine/jobs.ts`              | Requests by their caller's ID: join, wait, keep the answer, forget           |
+| `http/routes.ts`              | `/agent-services/v1`: where machines send requests (mounted in database.ts)  |
+| `http/production.ts`          | That router wired to the real stores; which host row a machine runs as       |
+| `machine-credentials/`        | Each machine's credential: issue, daily replacement, revoke, delivery        |
 | `boot.ts`                     | Wiring, called from `starter.ts`                                             |
 | `registry.ts`                 | Finds the services by reading `services/`                                    |
 | `distribution.ts`             | Turns each service's `skill/` and `bin/` into distributor rows               |
@@ -45,6 +53,7 @@ still have their own scanner.
 | `admin/settings-store.ts`     | Services' settings (e.g. which provider)                                     |
 | `admin/grants.ts`             | Which machines each service is switched on for (none, until an admin says)   |
 | `admin/usage.ts`              | One record per answer (no content), for state, usage and recent errors       |
+| `admin/overview.ts`           | What Admin → Services shows, including each machine's credential state       |
 | `admin/orphaned-grants.ts`    | Start-up warning for switches left on for machines that no longer exist      |
 | `admin/routes.ts`             | Admin → Services' routes (`/users/admin/services…`)                          |
 
@@ -265,21 +274,64 @@ Wrapper scripts for such services should pass `--as` through (e.g. an
 `--as` flag or an `AS_USER` env var) and the skill should tell agents when
 to use it.
 
+## Machine credentials
+
+Each machine (`hosts.machine_id`, or the row id for a row without one) has
+one credential, shared by every login and agent on it. It says which machine
+is asking and nothing else; each entry point decides what a machine may do,
+and today the only one is service calls. Requests run as the machine's
+lowest-numbered host row set to run agents, and every person registered on
+any of the machine's rows counts as one of its registrants.
+
+- **Issued and delivered by the backend.** Every 30 seconds
+  (`machine-credentials/delivery.ts`) each agent host gets its machine's
+  credential written to `~/fleet/host/service-credential`, mode 600, when it
+  differs from what was last written there. It travels on the write
+  command's input, never its command line. A host that can't be reached is
+  retried with back-off, a few hosts at a time. No person ever sees or types
+  one.
+- **Replaced daily.** The replaced one keeps working for ten minutes so calls
+  in flight finish.
+- **Stored** encrypted under the system key (so it can be written to a login
+  that missed a delivery), and checked by its SHA-256. No route returns it.
+- **Revoke** (Admin → Services → Machines) cuts the machine off from every
+  service; its calls get `revoked`. Only **Issue new** brings it back, and
+  it asks the admin to confirm it's them. Nothing automatic ever overwrites
+  a revoke: issuing and daily replacement only land on an unrevoked row.
+- **A machine that stops running agents** loses its credential, unless it
+  was revoked: that stays in force if the machine is set up again.
+
 ## Wire protocol
 
-All files live in `~/fleet/service-requests/` on the host.
+`fleet-service` talks to `<app address>/agent-services/v1` with
+`Authorization: Bearer <machine credential>`:
 
-| File                     | Written by                | Meaning                                                                                   |
-| ------------------------ | ------------------------- | ----------------------------------------------------------------------------------------- |
-| `<uuid>.in.<slot>.<ext>` | agent, first              | Attachment                                                                                |
-| `<uuid>.json`            | agent, atomically         | Request: `{service, requested_at, input, attachments?, as_user?}`                         |
-| `<uuid>.claimed.json`    | backend (rename)          | Accepted; the agent can tell "queued" from "nobody home"                                  |
-| `<uuid>.out.<i>.<ext>`   | backend                   | Output files                                                                              |
-| `<uuid>.response.json`   | backend, atomically, last | `{ok:true, service, result, files}` or `{ok:false, service, error:{code, message?, ...}}` |
+| Call                          | Meaning                                                                                                |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `POST /jobs/<id>`             | Start the request, multipart: `request` = `{service, input, as_user?}`, `attachment.<slot>` = a file  |
+| `GET /jobs/<id>`              | Wait for its answer                                                                                    |
+| `GET /jobs/<id>/files/<i>`    | One output file                                                                                        |
+| `DELETE /jobs/<id>`           | The caller has the answer; drop it                                                                     |
 
-The client removes every `<uuid>.*` file when it exits, including on a
-signal, so an abandoned request is never picked up later. The scan deletes
-leftovers older than a day.
+`<id>` is a UUID the caller picks (`fleet-service call --id`). The same ID
+again on the same machine joins the existing request instead of running it
+twice. A wait holds up to 50 seconds (less with `?wait=<seconds>`): `200` with
+the answer, or `202 {state:"running"}`, after which the client asks again.
+The answer is `{ok:true, service, result, files:[{ext, size}]}` or
+`{ok:false, service, error:{code, message?, ...}}`. Finished answers are kept
+until collected, or an hour (the oldest go early past 128 MB or 10,000 of
+them); jobs live in memory only, so after a restart an
+ID is `lost` (404), and is never run again on the caller's behalf.
+`fleet-service collect <id>` waits for an answer without ever sending the
+request again.
+
+The client sends a request again only while the backend clearly hasn't taken
+it (no connection, or `503 starting`); once it may have it, it only asks by
+ID.
+
+Attachments are refused while they upload unless the service has their
+slot, and queued requests hold at most 256 MB of attachments between them
+(past that, `queue_full`), so a burst can't exhaust a small host's memory.
 
 Error codes any service can return, from the engine: `malformed`,
 `unknown_service`, `not_enabled` (not switched on for this machine),
@@ -287,19 +339,25 @@ Error codes any service can return, from the engine: `malformed`,
 missing), `internal`;
 for services with `userSecrets`, also `ambiguous_user`, `unknown_user`,
 `not_permitted` and `no_user_secret`.
-From the client: `not_picked_up` (never claimed) and `timeout` (claimed, no
-answer in time).
+From the door: `unauthorized` (a credential the backend didn't issue, or a
+replaced one past its grace), `revoked`, `lost`, `starting`.
+From the client: `unreachable` (couldn't reach the backend), `not_set_up`
+(no credential or address on the machine yet) and `timeout` (accepted, no
+answer in time; `collect <id>` gets it later).
 
-## Why file drops rather than HTTP or MCP
+## Why direct requests
 
-- **No host credential.** The backend reaches into hosts it already trusts
-  over SSH. An HTTP endpoint would need a per-host token, readable by the
-  same processes that can write `~/fleet/` today.
-- **Long requests.** A phone call takes minutes. File drops are already
-  asynchronous and survive a backend restart without a job-id API.
-- **Agents can debug it.** A skill plus a script is readable; an agent can
-  look in the folder, rerun with `bash -x`, and work around problems. An MCP
-  tool is a black box to it.
+- **Speed.** A request reaches the backend at once, and a quick one costs a
+  round trip. The file drop waited for a ten-second scan, which made bursts of
+  small calls (a database service's opening queries) take over a minute.
+- **The answer survives the caller.** It's kept by ID, so a command that died
+  or timed out can collect it.
+- **Same trust.** The file drop's identity came from the backend reading the
+  machine's own folder. The credential gives the same: anything on the machine
+  that could write that folder can read the credential, and nothing off the
+  machine gets it. It's revocable, replaced daily, and good only for service
+  calls.
 
-If an MCP server or HTTP transport is ever wanted, it can sit in front of the
-same engine and schemas without changing any service.
+Machines already reach the instance (every agent logs into its chat server),
+and the app's address reaches the backend over the instance's private
+network.

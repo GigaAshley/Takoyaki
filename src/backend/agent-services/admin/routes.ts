@@ -10,10 +10,14 @@
  *   PUT    /users/admin/services/:service/machines/:machineId      { enabled }
  *   PUT    /users/admin/services/:service/people/:userId/keys/:name   { value }
  *   DELETE /users/admin/services/:service/people/:userId/keys/:name
+ *   POST   /users/admin/service-machines/:machineId/revoke         cut the machine off
+ *   POST   /users/admin/service-machines/:machineId/issue          give it a new credential
  *
  * Write-only: no response ever carries a key value, to admins either. A
  * machine switch re-sweeps hosts, so the service's skill and helper arrive
- * on (or leave) the machine within a minute.
+ * on (or leave) the machine within a minute. The service list also carries
+ * each machine's credential state (machine-credentials/); a revoke or a new
+ * credential reaches the machine at once.
  */
 
 import type { Request, RequestHandler, Response, Router } from "express";
@@ -22,9 +26,15 @@ import type { AuthenticatedRequest } from "../../../types/index.js";
 import { getDb } from "../../database/db/index.js";
 import { users } from "../../database/db/schema.js";
 import { systemLogger } from "../../utils/logger.js";
+import { requireRecentAuth } from "../../utils/recent-auth.js";
 import type { ServiceDefinition } from "../engine/types.js";
 import { AGENT_SERVICES } from "../registry.js";
-import { hostReach } from "./reachability.js";
+import {
+  issueNewMachineCredential,
+  listMachineCredentialStatus,
+  revokeMachineCredential,
+} from "../machine-credentials/store.js";
+import { deliverCredentialsNow } from "../machine-credentials/delivery.js";
 import { listAgentMachines } from "./machines.js";
 import {
   clearUserSecret,
@@ -39,6 +49,7 @@ import { enabledMachines, setEnabled } from "./grants.js";
 import { serviceHealth, usageSummary } from "./usage.js";
 import {
   listServices,
+  machineCredentials,
   serviceDetail,
   type AgentMachine,
   type OverviewDeps,
@@ -57,6 +68,10 @@ export interface ServicesRouteDeps extends OverviewDeps {
   userExists(userId: string): Promise<boolean>;
   setPersonKey(userId: string, service: string, name: string, value: string, by: string): Promise<void>;
   clearPersonKey(userId: string, service: string, name: string): Promise<boolean>;
+  revokeMachine(machineId: string, by: string): Promise<void>;
+  issueMachine(machineId: string): Promise<void>;
+  /** Write credential changes to the machines now. */
+  deliverCredentials(): Promise<void>;
 }
 
 /** One re-push for a burst of switch changes (an admin flipping several). */
@@ -87,7 +102,7 @@ export const defaultServicesRouteDeps: ServicesRouteDeps = {
   listAgentMachines,
   serviceHealth: (s) => serviceHealth(s),
   usageSummary: (s) => usageSummary(s),
-  hostReach,
+  listMachineCredentialStatus,
   async listUsers() {
     return getDb().select({ id: users.id, username: users.username }).from(users);
   },
@@ -102,6 +117,9 @@ export const defaultServicesRouteDeps: ServicesRouteDeps = {
   },
   setPersonKey: setUserSecret,
   clearPersonKey: clearUserSecret,
+  revokeMachine: (machineId, by) => revokeMachineCredential(machineId, by),
+  issueMachine: (machineId) => issueNewMachineCredential(machineId),
+  deliverCredentials: deliverCredentialsNow,
 };
 
 export function registerServicesAdminRoutes(
@@ -159,8 +177,9 @@ export function registerServicesAdminRoutes(
   router.get("/admin/services", requireAdmin, async (_req, res) => {
     try {
       const services = await listServices(deps.services(), deps);
+      const machines = await machineCredentials(deps);
       // After the reads, so it reflects whether AWS just answered.
-      res.json({ keyStore: deps.keyStore.info(), services });
+      res.json({ keyStore: deps.keyStore.info(), services, machines });
     } catch (err) {
       failed(res, err, "list services");
     }
@@ -287,6 +306,39 @@ export function registerServicesAdminRoutes(
       res.json({ ok: true, removed });
     } catch (err) {
       failed(res, err, "remove the person's key");
+    }
+  });
+
+  const machineExists = async (machineId: string) =>
+    (await deps.listAgentMachines()).some((m) => m.machineId === machineId);
+  // Best-effort and bounded: the next pass retries a machine it can't reach.
+  const deliverSoon = () =>
+    Promise.race([deps.deliverCredentials(), new Promise((r) => setTimeout(r, 5_000))]).catch(() => undefined);
+
+  router.post("/admin/service-machines/:machineId/revoke", requireAdmin, async (req, res) => {
+    try {
+      const machineId = param(req, "machineId");
+      if (!(await machineExists(machineId))) return res.status(404).json({ error: "No such machine" });
+      await deps.revokeMachine(machineId, actor(req));
+      log("admin_service_machine_revoked", { machineId, actorId: actor(req) });
+      await deliverSoon();
+      res.json({ ok: true });
+    } catch (err) {
+      failed(res, err, "revoke the machine's credential");
+    }
+  });
+
+  // A new credential put onto a machine: confirm it's you (AGENTS.md § Security).
+  router.post("/admin/service-machines/:machineId/issue", requireAdmin, requireRecentAuth, async (req, res) => {
+    try {
+      const machineId = param(req, "machineId");
+      if (!(await machineExists(machineId))) return res.status(404).json({ error: "No such machine" });
+      await deps.issueMachine(machineId);
+      log("admin_service_machine_issued", { machineId, actorId: actor(req) });
+      await deliverSoon();
+      res.json({ ok: true });
+    } catch (err) {
+      failed(res, err, "issue the machine a new credential");
     }
   });
 }

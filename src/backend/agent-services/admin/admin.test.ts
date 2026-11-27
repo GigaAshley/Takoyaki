@@ -28,6 +28,12 @@ vi.mock("../../utils/logger.js", () => {
   const stub = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
   return { databaseLogger: stub, systemLogger: stub, authLogger: stub, sshLogger: stub };
 });
+// Whether the admin has confirmed it's them recently (the real check reads the session).
+let recentlyConfirmed = true;
+vi.mock("../../utils/recent-auth.js", () => ({
+  requireRecentAuth: (_req: unknown, res: { status(n: number): { json(b: unknown): void } }, next: () => void) =>
+    recentlyConfirmed ? next() : res.status(403).json({ code: "REAUTH_REQUIRED" }),
+}));
 vi.mock("../../distributor/substrate-orchestrator-singleton.js", () => ({
   getSubstrateOrchestrator: () => null,
 }));
@@ -47,7 +53,7 @@ import { createParameterStoreKeyStore, type ParameterStoreClient } from "./param
 import { misconfiguredKeyStore } from "./choose-store.js";
 import { defaultServicesRouteDeps, registerServicesAdminRoutes, type ServicesRouteDeps } from "./routes.js";
 type ServicesRouteDepsKeyStore = ServicesRouteDeps["keyStore"];
-import { setReachabilitySource } from "./reachability.js";
+import { currentCredential, identifyMachine } from "../machine-credentials/store.js";
 import { STT_SECRETS, STT_SETTINGS, loadSttEnv } from "../services/stt/setup.js";
 
 const DDL = `
@@ -75,6 +81,10 @@ const DDL = `
   CREATE TABLE agent_service_grants (
     service TEXT NOT NULL, machine_id TEXT NOT NULL,
     updated_at TEXT NOT NULL, updated_by TEXT, PRIMARY KEY (service, machine_id)
+  );
+  CREATE TABLE agent_service_machine_credentials (
+    machine_id TEXT PRIMARY KEY, token TEXT, token_hash TEXT, issued_at TEXT,
+    previous_hash TEXT, previous_valid_until TEXT, revoked_at TEXT, revoked_by TEXT
   );
   CREATE TABLE agent_service_usage (
     id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, service TEXT NOT NULL,
@@ -252,9 +262,12 @@ describe("Admin → Services routes", () => {
   let server: http.Server;
   let base: string;
   const resweep = vi.fn();
+  const deliverCredentials = vi.fn(async () => {});
 
   beforeEach(async () => {
     resweep.mockClear();
+    deliverCredentials.mockClear();
+    recentlyConfirmed = true;
     sqlite.prepare("INSERT INTO users (id, username) VALUES ('u-admin', 'pat'), ('u-zoey', 'zoey')").run();
     machine(1, "t1000");
     machine(2, "thenasty", 2);
@@ -273,6 +286,7 @@ describe("Admin → Services routes", () => {
       ...defaultServicesRouteDeps,
       services: () => SERVICES,
       resweep,
+      deliverCredentials,
     });
     app.use("/users", router);
     server = app.listen(0);
@@ -322,9 +336,9 @@ describe("Admin → Services routes", () => {
       state: "ready",
       keys: [{ name: "OPENAI_API_KEY", label: "OpenAI API key", needed: true, isSet: true }],
       machines: [
-        { machineId: "4", name: "joe-agents", enabled: false, unreachableSince: null },
-        { machineId: "1", name: "t1000", enabled: false, unreachableSince: null },
-        { machineId: "2", name: "thenasty", enabled: true, unreachableSince: null },
+        { machineId: "4", name: "joe-agents", enabled: false },
+        { machineId: "1", name: "t1000", enabled: false },
+        { machineId: "2", name: "thenasty", enabled: true },
       ],
       personKeys: null,
     });
@@ -344,25 +358,38 @@ describe("Admin → Services routes", () => {
     expect(detail.usage.recentErrors[0]).toMatchObject({ name: "thenasty", code: "provider_unavailable" });
   });
 
-  it("says when a machine can't be reached, only once none of its scanned rows answer", async () => {
-    const down = new Map([["2", Date.parse("2026-11-25T10:00:00Z")]]);
-    const scanned = new Set(["1", "2", "3"]);
-    setReachabilitySource((id) => ({ scanned: scanned.has(id), since: down.get(id) ?? null }));
-    const thenasty = async () =>
-      (await call("GET", "/admin/services/image-gen")).body.service.machines.find(
-        (m: { machineId: string }) => m.machineId === "2",
-      ).unreachableSince;
-    try {
-      expect(await thenasty()).toBeNull();
-      down.set("3", Date.parse("2026-11-25T11:00:00Z"));
-      expect(await thenasty()).toBe("2026-11-25T11:00:00.000Z");
-      // A row the scan never visits (no SSH) doesn't keep the machine looking fine.
-      down.delete("3");
-      scanned.delete("3");
-      expect(await thenasty()).toBe("2026-11-25T10:00:00.000Z");
-    } finally {
-      setReachabilitySource(() => ({ scanned: false, since: null }));
-    }
+  it("lists each machine's credential, and an admin can revoke it and issue a new one", async () => {
+    const creds = async () => (await call("GET", "/admin/services")).body.machines;
+    expect(await creds()).toEqual([
+      { machineId: "4", name: "joe-agents", state: "pending", issuedAt: null, revokedAt: null, revokedBy: null },
+      { machineId: "1", name: "t1000", state: "pending", issuedAt: null, revokedAt: null, revokedBy: null },
+      { machineId: "2", name: "thenasty", state: "pending", issuedAt: null, revokedAt: null, revokedBy: null },
+    ]);
+    const issued = await currentCredential("2");
+    if (issued.kind !== "active") throw new Error("expected a credential");
+    const listed = await call("GET", "/admin/services");
+    expect(listed.text).not.toContain(issued.token);
+    expect(listed.body.machines[2]).toMatchObject({ state: "active", issuedAt: expect.any(String) });
+
+    expect((await call("POST", "/admin/service-machines/2/revoke")).body).toEqual({ ok: true });
+    expect(deliverCredentials).toHaveBeenCalledOnce();
+    expect(await identifyMachine(issued.token)).toEqual({ ok: false, reason: "revoked" });
+    expect((await creds())[2]).toMatchObject({ state: "revoked", revokedAt: expect.any(String), revokedBy: "pat" });
+
+    // Issuing a new credential puts a key on a machine: it needs a recent confirmation.
+    recentlyConfirmed = false;
+    expect((await call("POST", "/admin/service-machines/2/issue")).status).toBe(403);
+    expect((await creds())[2].state).toBe("revoked");
+    recentlyConfirmed = true;
+    expect((await call("POST", "/admin/service-machines/2/issue")).body).toEqual({ ok: true });
+    expect((await creds())[2]).toMatchObject({ state: "active", revokedAt: null });
+    expect(await identifyMachine(issued.token)).toEqual({ ok: false, reason: "unknown" });
+  });
+
+  it("refuses credential changes for machines that don't run agents, and from non-admins", async () => {
+    expect((await call("POST", "/admin/service-machines/99/revoke")).status).toBe(404);
+    expect((await call("POST", "/admin/service-machines/99/issue")).status).toBe(404);
+    expect((await call("POST", "/admin/service-machines/2/revoke", undefined, "u-zoey")).status).toBe(403);
   });
 
   it("ignores names that aren't the service's own (no inherited object names)", async () => {

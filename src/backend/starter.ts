@@ -1909,9 +1909,10 @@ if (process.env.VITEST !== "true") {
     }
 
     // =========================================================================
-    // Agent services (agent-phone, image-gen, ...) — one scan loop over
-    // ~/fleet/service-requests/ on every substrate host, one engine that
-    // validates, queues and answers. See src/backend/agent-services/README.md.
+    // Agent services (agent-phone, image-gen, ...) — machines send requests
+    // straight to /agent-services; one engine validates, queues and answers,
+    // and each machine is kept holding its credential. See
+    // src/backend/agent-services/README.md.
     // =========================================================================
     {
       const { startAgentServices } = await import("./agent-services/boot.js");

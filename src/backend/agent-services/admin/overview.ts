@@ -15,13 +15,14 @@
 import type { ServiceDefinition } from "../engine/types.js";
 import type { InstanceKeyStore } from "./key-store.js";
 import type { ServiceHealth, UsageSummary } from "./usage.js";
+import type { MachineCredentialStatus } from "../machine-credentials/store.js";
 
 export type ServiceState = "not_set_up" | "ready" | "failing";
 
 export interface AgentMachine {
   machineId: string;
   name: string;
-  /** Every host row for the machine, for reachability. */
+  /** Every host row for the machine set to run agents. */
   hostIds: string[];
 }
 
@@ -35,8 +36,8 @@ export interface OverviewDeps {
   listAgentMachines(): Promise<AgentMachine[]>;
   serviceHealth(service: string): Promise<ServiceHealth>;
   usageSummary(service: string): Promise<UsageSummary>;
-  /** Whether the scan visits a host row, and since when it can't reach it. */
-  hostReach(hostId: string): { scanned: boolean; since: number | null };
+  /** Each machine's service credential, without values. */
+  listMachineCredentialStatus(): Promise<MachineCredentialStatus[]>;
   listUsers(): Promise<Array<{ id: string; username: string }>>;
   listPersonKeyStatus(service: string): Promise<Array<{ userId: string; name: string; updatedAt: string }>>;
 }
@@ -80,8 +81,19 @@ export interface MachineView {
   machineId: string;
   name: string;
   enabled: boolean;
-  /** ISO time the services system stopped reaching it, or null. */
-  unreachableSince: string | null;
+}
+
+/** One machine's credential for calling services, as Admin → Services lists it. */
+export interface MachineCredentialView {
+  machineId: string;
+  name: string;
+  /** "pending" until the backend first issues one (within a minute of the machine appearing). */
+  state: "active" | "revoked" | "pending";
+  /** When the current credential was issued (replaced daily). */
+  issuedAt: string | null;
+  revokedAt: string | null;
+  /** Username of the admin who revoked it, when known. */
+  revokedBy: string | null;
 }
 
 export interface ServiceDetail extends ServiceSummary {
@@ -205,18 +217,11 @@ export async function serviceDetail(def: ServiceDefinition, deps: OverviewDeps):
   // A machine removed since its requests were recorded.
   const machineName = (id: string) => nameOf.get(id) ?? "a removed machine";
 
-  const machineViews: MachineView[] = machines.map((m) => {
-    // Judged over the rows the scan visits; unreachable only when none of
-    // them is being reached. A machine with no scanned row says nothing.
-    const since = m.hostIds.map((id) => deps.hostReach(id)).filter((r) => r.scanned).map((r) => r.since);
-    const down = since.length > 0 && since.every((t) => t !== null);
-    return {
-      machineId: m.machineId,
-      name: m.name,
-      enabled: on.has(m.machineId),
-      unreachableSince: down ? new Date(Math.max(...(since as number[]))).toISOString() : null,
-    };
-  });
+  const machineViews: MachineView[] = machines.map((m) => ({
+    machineId: m.machineId,
+    name: m.name,
+    enabled: on.has(m.machineId),
+  }));
 
   const usage = await deps.usageSummary(def.name);
   const personSpecs = Object.entries(def.userSecrets ?? {});
@@ -257,4 +262,22 @@ export async function serviceDetail(def: ServiceDefinition, deps: OverviewDeps):
     },
     personKeys,
   };
+}
+
+/** Every agent machine's service credential, by machine name. */
+export async function machineCredentials(deps: OverviewDeps): Promise<MachineCredentialView[]> {
+  const machines = await deps.listAgentMachines();
+  const status = new Map((await deps.listMachineCredentialStatus()).map((c) => [c.machineId, c]));
+  const usernames = new Map((await deps.listUsers()).map((u) => [u.id, u.username]));
+  return machines.map((m) => {
+    const c = status.get(m.machineId);
+    return {
+      machineId: m.machineId,
+      name: m.name,
+      state: c ? c.state : "pending",
+      issuedAt: c?.issuedAt ?? null,
+      revokedAt: c?.revokedAt ?? null,
+      revokedBy: c?.revokedBy ? (usernames.get(c.revokedBy) ?? null) : null,
+    };
+  });
 }

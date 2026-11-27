@@ -37,7 +37,7 @@ Takoyaki is open source. Fork it, deploy it, use it however you want.
 **Fleet management**
 - A distributor installs the substrate (skills, scripts, and services) onto every managed host and keeps it reconciled
 - An instance-wide managed `CLAUDE.md` policy pushed to all hosts
-- File-drop brokers let any host request spawns, image generation, and phone calls, while paid API keys stay on the backend
+- Agent services let any host request image generation, phone calls and more with a direct call (spawns via a file drop), while paid API keys stay on the backend
 
 **Messaging, voice, and notifications**
 - Matrix relay rooms for agent-to-agent and multi-party conversations, shown on the same chat surface

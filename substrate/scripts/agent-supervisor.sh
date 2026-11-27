@@ -2344,13 +2344,15 @@ PYEOF
 #
 # Archiving switches the chat (Matrix) account off, which erases its password on
 # the chat server. Only the backend holds the chat admin credentials, so the
-# supervisor asks it — via the identity-reactivate agent service (request files
-# in $SERVICE_REQUESTS_DIR, see substrate/scripts/fleet-service for the wire
-# protocol) — to reactivate the account. The backend generates a fresh password
-# and returns it in the response; the supervisor saves it into the archived
-# relay.json and logs in normally to get a fresh access_token. The work spans
-# several ticks; progress is kept in $d/.unarchive-reactivate (the pending
-# request uuid, or the literal "saved" once the new password is in relay.json).
+# supervisor asks it — via the identity-reactivate agent service, through
+# fleet-service ($FLEET_SERVICE_CMD) — to reactivate the account. The backend
+# generates a fresh password and returns it in the answer; the supervisor saves
+# it into the archived relay.json and logs in normally to get a fresh
+# access_token. The work spans several ticks; progress is kept in
+# $d/.unarchive-reactivate (the pending request's ID, or the literal "saved"
+# once the new password is in relay.json). Each tick waits a few seconds at
+# most ($UNARCHIVE_SERVICE_WAIT_SECS); an unfinished request is collected by
+# its ID on a later tick, never sent twice.
 #
 # Per-identity flow (all steps LOG; secrets never logged):
 #
@@ -2361,43 +2363,39 @@ PYEOF
 #        holds a working login (crash recovery) → go to the folder steps.
 #     b. state "saved" → password login with relay.json's password → token
 #        saved, go to the folder steps. Rejected → refuse. Other → retry.
-#     c. state <uuid> → read <uuid>.response.json if present:
+#     c. state <uuid> → collect the answer by ID (`fleet-service collect`):
 #          ok        → save password into relay.json, state "saved", log in next tick
-#          transient → drop the request, file a new one next tick
+#          timeout   → still running: wait for the next tick (the backend
+#                      finishes it or, an hour on, answers lost — never re-sent)
+#          lost      → the backend restarted or the answer expired: file a new one next tick
+#          unreachable / unauthorized / not_set_up → keep waiting (the answer is held for an hour)
+#          transient → forget it, file a new one next tick
 #          account_active → state "saved" (try this box's password)
 #          other     → refuse with the backend's reason
-#        No response after UNARCHIVE_REQUEST_STALE_SECS → drop it, re-file.
 #     d. no state → try a login with relay.json's password (an earlier attempt
-#        may already have saved the new one); rejected → file a request naming
-#        relay.json's user_id (never a password).
+#        may already have saved the new one); rejected → send a request naming
+#        relay.json's user_id (never a password), saving its ID first, and take
+#        its answer as in c (a request that never reached the backend is
+#        forgotten and sent again next tick).
 #
 #   Folder steps: .dormant unless .no-dormancy, clear the flag + state + any old
 #   refusal note, mv archive → live, restore the conversation's apps, prepend
 #   the "you were unarchived" banner.
 #
 #   Refuse = write the reason to $d/.unarchive-refused (the front end's wait and
-#   asking agents read it), drop any pending request, delete the flag. The front
+#   asking agents read it), forget any pending request, delete the flag. The front
 #   end's wait treats "archive folder present, flag gone" as refused.
 #
 # ACCEPTED CAVEAT: room memberships do NOT survive reactivation (archive's
 # deactivate uses erase=true). The backend re-joins the agents directory room;
 # other rooms are not restored. New DMs work naturally.
-SERVICE_REQUESTS_DIR="${AGENT_SERVICE_REQUESTS_DIR:-$HOME/fleet/service-requests}"
-UNARCHIVE_REQUEST_STALE_SECS="${AGENT_UNARCHIVE_REQUEST_STALE_SECS:-600}"
-
-# _unarchive_drop_request <uuid> — remove every file of one service request.
-_unarchive_drop_request() {
-  local uuid="$1"
-  [[ "$uuid" =~ ^[A-Za-z0-9-]+$ ]] || return 0
-  rm -f -- "${SERVICE_REQUESTS_DIR:?}/${uuid:?}".* 2>/dev/null || true
-}
+FLEET_SERVICE_CMD="${AGENT_FLEET_SERVICE:-$HOME/.local/bin/fleet-service}"
+UNARCHIVE_SERVICE_WAIT_SECS="${AGENT_UNARCHIVE_SERVICE_WAIT_SECS:-10}"
 
 # _unarchive_refuse <archive-dir> <name> <reason>
 _unarchive_refuse() {
-  local d="$1" name="$2" reason="$3" st
+  local d="$1" name="$2" reason="$3"
   log "ERROR: '$name' un-archive REFUSED: $reason"
-  st=$(cat "$d/.unarchive-reactivate" 2>/dev/null || true)
-  [ "$st" = "saved" ] || _unarchive_drop_request "$st"
   rm -f "${d:?}/.unarchive-reactivate"
   printf '%s\n' "$reason" > "$d/.unarchive-refused.tmp.$$" \
     && mv -f "$d/.unarchive-refused.tmp.$$" "$d/.unarchive-refused"
@@ -2520,59 +2518,12 @@ _unarchive_account_step() {
     esac
   fi
 
-  # c. A reactivation request is pending.
+  # c. A reactivation request is pending: collect its answer.
   if [[ "$state" =~ ^[A-Za-z0-9-]+$ ]]; then
-    local resp_file="$SERVICE_REQUESTS_DIR/$state.response.json"
-    if [ -f "$resp_file" ]; then
-      local okv code msg pw
-      okv=$(jq -r '.ok' "$resp_file" 2>/dev/null)
-      if [ "$okv" = "true" ]; then
-        pw=$(jq -r '.result.password // empty' "$resp_file" 2>/dev/null)
-        if [ -z "$pw" ]; then
-          log "ERROR: '$name' un-archive: reactivation response carried no password — asking again next tick"
-          _unarchive_drop_request "$state"
-          rm -f "${d:?}/.unarchive-reactivate"
-          return 1
-        fi
-        # shellcheck disable=SC2016  # jq variables, not shell
-        if ! _unarchive_relay_set "$relay" --arg p "$pw" '.password = $p'; then
-          log "ERROR: '$name' un-archive: could not save the new chat password into relay.json — retrying next tick"
-          return 1
-        fi
-        printf 'saved\n' > "$d/.unarchive-reactivate"
-        _unarchive_drop_request "$state"
-        log "'$name' un-archive: chat account reactivated by the backend; new password saved — logging in next tick"
-        return 1
-      fi
-      code=$(jq -r '.error.code // "unknown"' "$resp_file" 2>/dev/null)
-      msg=$(jq -r '.error.message // empty' "$resp_file" 2>/dev/null)
-      _unarchive_drop_request "$state"
-      rm -f "${d:?}/.unarchive-reactivate"
-      case "$code" in
-        matrix_unavailable|expired|queue_full|internal|unknown_service|not_configured)
-          log "'$name' un-archive: reactivation request failed ($code) — will ask again next tick"
-          return 1
-          ;;
-        account_active)
-          # Already live (e.g. reactivated earlier but this box never got the
-          # reply). Try the password this box has; step b refuses if it's wrong.
-          printf 'saved\n' > "$d/.unarchive-reactivate"
-          log "'$name' un-archive: chat account already active — trying this box's saved password next tick"
-          return 1
-          ;;
-        *)
-          _unarchive_refuse "$d" "$name" "the backend refused to reactivate the chat account ($code)${msg:+: $msg}"
-          return 2
-          ;;
-      esac
-    fi
-    local age=$(( $(date +%s) - $(stat -c %Y "$d/.unarchive-reactivate" 2>/dev/null || date +%s) ))
-    if [ "$age" -ge "$UNARCHIVE_REQUEST_STALE_SECS" ]; then
-      log "'$name' un-archive: reactivation request $state unanswered after ${age}s — dropping it and asking again"
-      _unarchive_drop_request "$state"
-      rm -f "${d:?}/.unarchive-reactivate"
-    fi
-    return 1
+    local resp
+    resp=$("$FLEET_SERVICE_CMD" collect "$state" --timeout "$UNARCHIVE_SERVICE_WAIT_SECS" 2>/dev/null)
+    _unarchive_take_answer "$d" "$name" "$relay" "$state" "$resp" collect
+    return $?
   fi
 
   # d. Account may already be live with the password this box has (an earlier
@@ -2583,28 +2534,89 @@ _unarchive_account_step() {
     1) return 1 ;;
   esac
 
-  # File a reactivation request (names the account and its display name — never a password).
+  # Send a reactivation request (names the account and its display name — never a password).
   local display_name
   display_name=$(_extract_frontmatter_display_name "$d/$name.md")
-  mkdir -p "$SERVICE_REQUESTS_DIR" 2>/dev/null || true
   local uuid
   uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null)
   if [ -z "$uuid" ]; then
     log "ERROR: '$name' un-archive: could not generate a request id — retrying next tick"
     return 1
   fi
-  if jq -cn --arg a "$mxid" --arg n "$display_name" --arg t "$(date -u +%FT%TZ)" \
-      '{service:"identity-reactivate", requested_at:$t,
-        input:({account:$a} + (if $n == "" then {} else {display_name:$n} end))}' \
-      > "$SERVICE_REQUESTS_DIR/$uuid.json.tmp.$$" \
-    && mv -f "$SERVICE_REQUESTS_DIR/$uuid.json.tmp.$$" "$SERVICE_REQUESTS_DIR/$uuid.json"; then
-    printf '%s\n' "$uuid" > "$d/.unarchive-reactivate"
-    log "'$name' un-archive: asked the backend to reactivate $mxid (request $uuid)"
-  else
-    _unarchive_drop_request "$uuid"
-    log "ERROR: '$name' un-archive: could not write the reactivation request — retrying next tick"
+  # The ID is saved first, so a supervisor that dies mid-call collects the answer next tick.
+  printf '%s\n' "$uuid" > "$d/.unarchive-reactivate"
+  local input resp
+  input=$(jq -cn --arg a "$mxid" --arg n "$display_name" \
+    '{account:$a} + (if $n == "" then {} else {display_name:$n} end)')
+  log "'$name' un-archive: asked the backend to reactivate $mxid (request $uuid)"
+  resp=$("$FLEET_SERVICE_CMD" call identity-reactivate --id "$uuid" \
+    --timeout "$UNARCHIVE_SERVICE_WAIT_SECS" --input "$input" 2>/dev/null)
+  _unarchive_take_answer "$d" "$name" "$relay" "$uuid" "$resp" call
+  return $?
+}
+
+# _unarchive_take_answer <archive-dir> <name> <relay.json> <uuid> <answer-json> <call|collect>
+# Acts on one answer from fleet-service for the pending reactivation request.
+#   returns 1 = waiting (try again next tick), 2 = refused
+_unarchive_take_answer() {
+  local d="$1" name="$2" relay="$3" uuid="$4" resp="$5" mode="$6"
+  local okv code msg pw
+  okv=$(jq -r '.ok // empty' <<<"$resp" 2>/dev/null)
+  if [ "$okv" = "true" ]; then
+    pw=$(jq -r '.result.password // empty' <<<"$resp" 2>/dev/null)
+    if [ -z "$pw" ]; then
+      log "ERROR: '$name' un-archive: reactivation answer carried no password — asking again next tick"
+      rm -f "${d:?}/.unarchive-reactivate"
+      return 1
+    fi
+    # shellcheck disable=SC2016  # jq variables, not shell
+    if ! _unarchive_relay_set "$relay" --arg p "$pw" '.password = $p'; then
+      log "ERROR: '$name' un-archive: could not save the new chat password into relay.json — retrying next tick"
+      return 1
+    fi
+    printf 'saved\n' > "$d/.unarchive-reactivate"
+    log "'$name' un-archive: chat account reactivated by the backend; new password saved — logging in next tick"
+    return 1
   fi
-  return 1
+  code=$(jq -r '.error.code // empty' <<<"$resp" 2>/dev/null)
+  msg=$(jq -r '.error.message // empty' <<<"$resp" 2>/dev/null)
+  [ -n "$code" ] || code="no_answer"
+  case "$code" in
+    timeout)
+      # Still running on the backend: collect it next tick. Never sent again
+      # while the backend may still run it (it would reset the password twice).
+      return 1
+      ;;
+    lost)
+      log "'$name' un-archive: the backend lost reactivation request $uuid (it restarted) — asking again next tick"
+      rm -f "${d:?}/.unarchive-reactivate"
+      return 1
+      ;;
+    unreachable|unauthorized|not_set_up|starting|no_answer)
+      if [ "$mode" = call ] && [ "$code" != starting ]; then
+        # Never reached the backend: forget it and send a fresh one next tick.
+        rm -f "${d:?}/.unarchive-reactivate"
+      fi
+      log "'$name' un-archive: couldn't reach the backend about request $uuid ($code) — retrying next tick"
+      return 1
+      ;;
+    matrix_unavailable|expired|queue_full|internal|unknown_service|not_configured)
+      log "'$name' un-archive: reactivation request failed ($code) — will ask again next tick"
+      rm -f "${d:?}/.unarchive-reactivate"
+      return 1
+      ;;
+    account_active)
+      # Already live (e.g. reactivated earlier but this box never got the
+      # reply). Try the password this box has; step b refuses if it's wrong.
+      printf 'saved\n' > "$d/.unarchive-reactivate"
+      log "'$name' un-archive: chat account already active — trying this box's saved password next tick"
+      return 1
+      ;;
+    *)
+      _unarchive_refuse "$d" "$name" "the backend refused to reactivate the chat account ($code)${msg:+: $msg}"
+      return 2
+      ;;
+  esac
 }
 
 scan_identity_unarchive_requested_sentinels() {

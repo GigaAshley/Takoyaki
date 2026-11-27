@@ -9,7 +9,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useState } from "react";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import type { KeyStoreInfo, ServiceDetail } from "@/api/agent-services-admin-api";
+import type { KeyStoreInfo, MachineCredential, ServiceDetail } from "@/api/agent-services-admin-api";
 import { autoAnswerKitDialogs, __resetKitDialogsForTests } from "@/components/kit";
 
 const server = vi.hoisted(() => ({
@@ -17,6 +17,7 @@ const server = vi.hoisted(() => ({
   keys: new Map<string, string>(),
   keyStore: {} as KeyStoreInfo,
   refuseSaves: null as string | null,
+  creds: [] as MachineCredential[],
 }));
 
 vi.mock("@/api/agent-services-admin-api", () => {
@@ -40,7 +41,26 @@ vi.mock("@/api/agent-services-admin-api", () => {
     return s;
   };
   return {
-    listAgentServices: vi.fn(async () => ({ keyStore: server.keyStore, services: server.services.map((s) => ({ ...derive(s) })) })),
+    listAgentServices: vi.fn(async () => ({
+      keyStore: server.keyStore,
+      services: server.services.map((s) => ({ ...derive(s) })),
+      machines: structuredClone(server.creds),
+    })),
+    revokeMachineCredential: vi.fn(async (machineId: string) => {
+      Object.assign(server.creds.find((c) => c.machineId === machineId)!, {
+        state: "revoked",
+        revokedAt: new Date().toISOString(),
+        revokedBy: "pat",
+      });
+    }),
+    issueMachineCredential: vi.fn(async (machineId: string) => {
+      Object.assign(server.creds.find((c) => c.machineId === machineId)!, {
+        state: "active",
+        issuedAt: new Date().toISOString(),
+        revokedAt: null,
+        revokedBy: null,
+      });
+    }),
     getAgentService: vi.fn(async (name: string) => ({ keyStore: server.keyStore, service: structuredClone(derive(find(name))) })),
     setServiceKey: vi.fn(async (service: string, key: string, value: string) => {
       if (server.refuseSaves) throw new Error(server.refuseSaves);
@@ -67,13 +87,17 @@ import { AdminServicesPane } from "./AdminServicesPane";
 
 const usage = { sinceAt: "2026-10-27T00:00:00Z", requests: 0, failed: 0, byMachine: [], recentErrors: [] };
 const machines = () => [
-  { machineId: "1", name: "t1000", enabled: false, unreachableSince: null },
-  { machineId: "2", name: "thenasty", enabled: false, unreachableSince: "2026-11-25T10:00:00Z" },
+  { machineId: "1", name: "t1000", enabled: false },
+  { machineId: "2", name: "thenasty", enabled: false },
 ];
 
 function seed() {
   server.keyStore = { kind: "database", label: "the database", problem: null, unreachableSince: null };
   server.refuseSaves = null;
+  server.creds = [
+    { machineId: "1", name: "t1000", state: "active", issuedAt: new Date(Date.now() - 3 * 3600_000).toISOString(), revokedAt: null, revokedBy: null },
+    { machineId: "2", name: "thenasty", state: "pending", issuedAt: null, revokedAt: null, revokedBy: null },
+  ];
   server.keys = new Map([["agent-phone/TWILIO_AUTH_TOKEN", "tok"]]);
   server.services = [
     {
@@ -202,12 +226,48 @@ describe("Admin → Services", () => {
     expect(document.body.textContent).not.toContain("gq-secret");
   });
 
-  it("switches a machine on, and says when one can't be reached", async () => {
+  it("lists each machine's credential; Revoke asks first, and Issue new brings it back", async () => {
+    const dialogs = autoAnswerKitDialogs({ confirm: true });
+    try {
+      const user = userEvent.setup();
+      render(<Harness />);
+      const t1000 = await screen.findByTestId("admin-service-credential-1");
+      expect(t1000.textContent).toContain("Active · replaced 3h ago");
+      expect(screen.getByTestId("admin-service-credential-2").textContent).toContain("Getting its credential");
+      expect(screen.queryByTestId("admin-service-credential-revoke-2")).toBeNull();
+      await user.click(screen.getByTestId("admin-service-credential-revoke-1"));
+      expect(dialogs.calls.map((c) => c.opts.title)).toEqual(["Revoke t1000's access to services?"]);
+      expect(api.revokeMachineCredential).toHaveBeenCalledWith("1");
+      await waitFor(() =>
+        expect(screen.getByTestId("admin-service-credential-1").textContent).toContain("Revoked just now by pat"),
+      );
+      await user.click(screen.getByTestId("admin-service-credential-issue-1"));
+      expect(api.issueMachineCredential).toHaveBeenCalledWith("1");
+      await waitFor(() =>
+        expect(screen.getByTestId("admin-service-credential-1").textContent).toContain("Active · replaced just now"),
+      );
+    } finally {
+      __resetKitDialogsForTests();
+    }
+  });
+
+  it("doesn't revoke when the admin cancels", async () => {
+    const dialogs = autoAnswerKitDialogs({ confirm: false });
+    try {
+      const user = userEvent.setup();
+      render(<Harness />);
+      await user.click(await screen.findByTestId("admin-service-credential-revoke-1"));
+      expect(api.revokeMachineCredential).not.toHaveBeenCalled();
+    } finally {
+      __resetKitDialogsForTests();
+    }
+  });
+
+  it("switches a machine on", async () => {
     const user = userEvent.setup();
     render(<Harness />);
     await user.click(await screen.findByTestId("admin-service-row-agent-phone"));
-    const machinesGroup = await screen.findByTestId("admin-service-machines");
-    expect(machinesGroup.textContent).toContain("Not reachable since");
+    await screen.findByTestId("admin-service-machines");
     const t1000 = screen.getByTestId("admin-service-machine-1") as HTMLInputElement;
     expect(t1000.checked).toBe(false);
     await user.click(t1000);

@@ -117,31 +117,18 @@ describe("adding a service is one folder", () => {
     const all = [...shipped.services, ...added.services];
 
     // The engine answers it.
-    let answered: Record<string, unknown> | undefined;
     const engine = createAgentServiceEngine({
       services: all.map((s) => s.def),
       getKey: async (service, name) => (service === "sample" && name === "SAMPLE_API_KEY" ? "abcd" : null),
       getSettings: async () => ({}),
       isEnabled: async () => true,
-      writeResponse: async (_host, _uuid, _files, _name, json) => {
-        answered = JSON.parse(json);
-      },
     });
-    await engine.intake(
-      { id: "7", idNum: 7, machineId: "7" },
-      { claim: async () => [], readAttachment: async () => "missing" },
-      [
-        {
-          uuid: "0b5c2f9e-1a2b-4c3d-8e9f-001122334455",
-          body: JSON.stringify({
-            service: "sample",
-            requested_at: new Date().toISOString(),
-            input: { word: "hello" },
-          }),
-        },
-      ],
-    );
-    await vi.waitFor(() => expect(answered).toBeDefined());
+    const answered = (
+      await engine.submit(
+        { id: "7", idNum: 7, machineId: "7" },
+        { id: "0b5c2f9e-1a2b-4c3d-8e9f-001122334455", service: "sample", input: { word: "hello" }, attachments: {} },
+      )
+    ).body;
     expect(answered).toMatchObject({ ok: true, service: "sample", result: { word: "hello", keyLength: 4 } });
     engine.stop();
 

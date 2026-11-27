@@ -1,7 +1,7 @@
 /**
  * agent-services/services/image-gen/adapter.ts
  *
- * OpenAI gpt-image HTTP adapter (model: IMAGE_GEN_MODEL) for the image-gen file-drop broker
+ * OpenAI gpt-image HTTP adapter (model: IMAGE_GEN_MODEL) for the image-gen agent service
  * (D-25, D-26). Wraps a raw `fetch` call — no `openai` npm SDK dep, matching
  * the existing avatar-batch route convention
  * (src/backend/database/routes/identity-avatar-batch.ts:378-410).

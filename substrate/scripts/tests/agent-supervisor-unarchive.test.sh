@@ -29,22 +29,22 @@
 #   AGENT_IDENTITIES_ARCHIVE_DIR=<scratch>-archive
 #   AGENT_ROLES_DIR=<scratch>-roles
 #   AGENT_ROLES_ARCHIVE_DIR=<scratch>-roles-archive
-#   AGENT_SERVICE_REQUESTS_DIR=<scratch>-requests
+#   AGENT_FLEET_SERVICE=fixtures/fake-fleet-service, FAKE_SERVICE_DIR=<scratch>-requests
 #   AGENT_SUPERVISOR_LIB_ONLY=1
 #
 # Identity un-archive (one-path supervisor reactivation shape): the scanner
 # asks the backend to reactivate the chat account through the
-# identity-reactivate agent service (request files in
-# $AGENT_SERVICE_REQUESTS_DIR), saves the returned password into the archived
-# relay.json, logs in for a fresh token, then moves the folder live. The flow
-# spans several reconcile ticks; tests drive it tick by tick, play the backend
-# by writing <uuid>.response.json by hand, and play the homeserver with a
-# python stub (whoami + /login). Refusals are asserted via the
+# identity-reactivate agent service (fleet-service call, then collect by ID),
+# saves the returned password into the archived relay.json, logs in for a
+# fresh token, then moves the folder live. The flow spans several reconcile
+# ticks; tests drive it tick by tick, play the backend through a stand-in
+# fleet-service (fixtures/fake-fleet-service: requests recorded as <id>.json,
+# answered by writing <id>.response.json by hand), and play the homeserver
+# with a python stub (whoami + /login). Refusals are asserted via the
 # .unarchive-refused note the front end reads.
 #
-# AGENT_SERVICE_REQUESTS_DIR is ALWAYS pointed at a per-test scratch dir — the
-# supervisor's default is the real ~/fleet/service-requests, which a live
-# backend answers.
+# AGENT_FLEET_SERVICE is ALWAYS the stand-in — the supervisor's default is
+# the real fleet-service, which a live backend answers.
 
 export AGENT_SUPERVISOR_LIB_ONLY=1
 set -u
@@ -142,8 +142,9 @@ _source_supervisor_unarchive() {
     export AGENT_SYSTEMCTL_BIN="$systemctl_stub"
   fi
   export DORMANCY_STATE_DIR="$scratch/.state"
-  # Never the real ~/fleet/service-requests (a live backend answers there).
-  export AGENT_SERVICE_REQUESTS_DIR="${scratch}-requests"
+  # Never the real fleet-service (a live backend answers it).
+  export AGENT_FLEET_SERVICE="${TEST_FLEET_SERVICE:-$SCRIPT_DIR/fixtures/fake-fleet-service}"
+  export FAKE_SERVICE_DIR="${scratch}-requests"
   export AGENT_SUPERVISOR_LIB_ONLY=1
   # shellcheck disable=SC1090
   source "$SUPERVISOR" 2>/dev/null || true
@@ -444,13 +445,13 @@ _point_relay() {
   sed -i "s|STUB_PORT|$STUB_PORT|" "${1}-archive/$2/relay.json"
 }
 
-# _request_files <scratch> — request files (not responses/claims) in the
-# scratch service-requests dir, one per line.
+# _request_files <scratch> — requests the stand-in backend holds (not
+# responses), one per line.
 _request_files() {
   local f
   for f in "${1}-requests"/*.json; do
     [ -e "$f" ] || continue
-    case "$f" in *.response.json|*.claimed.json) continue ;; esac
+    case "$f" in *.response.json) continue ;; esac
     printf '%s\n' "$f"
   done
 }
@@ -782,7 +783,6 @@ test_identity_full_reactivation_happy_path() {
   assert_eq "$uuid" "$(_state "$scratch" nu)" "tick 1: state holds the request uuid"
   assert_eq "identity-reactivate" "$(jq -r '.service' "$req" 2>/dev/null)" "tick 1: request names the service"
   assert_eq '{"account":"@nu:test","display_name":"test"}' "$(jq -c '.input' "$req" 2>/dev/null)" "tick 1: input carries the account and its display name"
-  assert_grep '^20[0-9]{2}-[0-9]{2}-[0-9]{2}T' "$(jq -r '.requested_at' "$req" 2>/dev/null)" "tick 1: requested_at stamped"
   assert_nogrep 'password|pw-nu|stale-tok' "$(cat "$req" 2>/dev/null)" "tick 1: request carries no secret"
   assert_file   "$d/.unarchive-requested" "tick 1: flag retained"
   assert_nofile "$scratch/nu"             "tick 1: not moved yet"
@@ -898,7 +898,7 @@ test_identity_ok_response_without_password_rerequests() {
   teardown_unarchive_scratch "$scratch"
 }
 
-test_identity_stale_request_dropped_and_refiled() {
+test_identity_pending_request_never_resent() {
   local scratch; scratch=$(setup_unarchive_scratch)
   fixture_live_role "$scratch" box-maintainer
   fixture_archived_identity "$scratch" sigma "scalar:box-maintainer"
@@ -908,35 +908,87 @@ test_identity_stale_request_dropped_and_refiled() {
 
   _tick "$scratch" >/dev/null
   local uuid1; uuid1=$(_state "$scratch" sigma)
-  # Leave a claim behind too, as a backend that took it and died would.
-  printf '{}' > "${scratch}-requests/$uuid1.claimed.json"
 
-  # Within the stale window (default 600s): kept.
+  # Still running on the backend, however long it takes: waited on, never sent again
+  # (a second request would reset the password a second time).
+  touch -d "@$(( $(date +%s) - 7200 ))" "$d/.unarchive-reactivate"
   _tick "$scratch" >/dev/null
-  assert_eq "$uuid1" "$(_state "$scratch" sigma)" "stale: fresh request kept"
-  assert_file "${scratch}-requests/$uuid1.json" "stale: fresh request file kept"
-
-  # Age the request past the window.
-  touch -d "@$(( $(date +%s) - 700 ))" "$d/.unarchive-reactivate"
-  local out; out=$(_tick "$scratch")
-  assert_eq "0" "$(_all_request_files_count "$scratch")" "stale: request + claim dropped"
-  assert_nofile "$d/.unarchive-reactivate" "stale: state cleared"
-  assert_file   "$d/.unarchive-requested"  "stale: flag retained"
-  assert_nofile "$d/.unarchive-refused"    "stale: NOT refused"
-  assert_grep "unanswered after" "$out" "stale: log line"
-
   _tick "$scratch" >/dev/null
-  local uuid2; uuid2=$(_state "$scratch" sigma)
-  assert_eq "1" "$(_request_count "$scratch")" "stale: re-filed on the next tick"
-  if [ -z "$uuid2" ] || [ "$uuid2" = "$uuid1" ]; then
-    fail "stale: re-filed request has a new uuid (old=$uuid1 new=$uuid2)"
-  fi
-
-  # AGENT_UNARCHIVE_REQUEST_STALE_SECS=0 makes any pending request stale at once.
-  out=$( export AGENT_UNARCHIVE_REQUEST_STALE_SECS=0; _tick "$scratch" )
   stop_stub_admin
-  assert_eq "0" "$(_all_request_files_count "$scratch")" "stale (env 0): request dropped"
-  assert_nofile "$d/.unarchive-reactivate" "stale (env 0): state cleared"
+  assert_eq "$uuid1" "$(_state "$scratch" sigma)" "pending: still waiting on the same request"
+  assert_eq "1" "$(_request_count "$scratch")" "pending: never sent again"
+  assert_nofile "$d/.unarchive-refused" "pending: NOT refused"
+  teardown_unarchive_scratch "$scratch"
+}
+
+test_identity_lost_request_refiled() {
+  local scratch; scratch=$(setup_unarchive_scratch)
+  fixture_live_role "$scratch" box-maintainer
+  fixture_archived_identity "$scratch" tau "scalar:box-maintainer"
+  start_stub_admin "401" || { teardown_unarchive_scratch "$scratch"; return; }
+  _point_relay "$scratch" tau
+  local d="${scratch}-archive/tau"
+
+  _tick "$scratch" >/dev/null
+  local uuid1; uuid1=$(_state "$scratch" tau)
+  # The backend restarted: it no longer knows the request.
+  touch "${scratch}-requests/$uuid1.lost"
+  local out; out=$(_tick "$scratch")
+  assert_grep "lost reactivation request $uuid1" "$out" "lost: log line"
+  assert_nofile "$d/.unarchive-reactivate" "lost: state cleared"
+  assert_nofile "$d/.unarchive-refused"    "lost: NOT refused"
+
+  _tick "$scratch" >/dev/null
+  stop_stub_admin
+  local uuid2; uuid2=$(_state "$scratch" tau)
+  if [ -z "$uuid2" ] || [ "$uuid2" = "$uuid1" ]; then
+    fail "lost: a new request with a new uuid (old=$uuid1 new=$uuid2)"
+  fi
+  teardown_unarchive_scratch "$scratch"
+}
+
+test_identity_unreachable_while_collecting_keeps_waiting() {
+  local scratch; scratch=$(setup_unarchive_scratch)
+  fixture_live_role "$scratch" box-maintainer
+  fixture_archived_identity "$scratch" upsilon "scalar:box-maintainer"
+  start_stub_admin "401" "403,200" || { teardown_unarchive_scratch "$scratch"; return; }
+  _point_relay "$scratch" upsilon
+  local d="${scratch}-archive/upsilon"
+
+  _tick "$scratch" >/dev/null
+  local uuid; uuid=$(_state "$scratch" upsilon)
+  # The backend holds the answer but can't be reached for a while.
+  _respond "$scratch" "$uuid" '{"ok":true,"service":"identity-reactivate","result":{"password":"new-secret-pw"}}'
+  touch "${scratch}-requests/$uuid.unreachable"
+  local out; out=$(_tick "$scratch")
+  assert_grep "couldn't reach the backend about request $uuid" "$out" "unreachable: log line"
+  assert_eq "$uuid" "$(_state "$scratch" upsilon)" "unreachable: still waiting on the same request"
+  assert_eq "1" "$(_request_count "$scratch")" "unreachable: not sent again"
+
+  rm -f "${scratch}-requests/$uuid.unreachable"
+  _tick "$scratch" >/dev/null
+  assert_eq "new-secret-pw" "$(jq -r '.password' "$d/relay.json")" "unreachable: the held answer's password saved"
+  _tick "$scratch" >/dev/null
+  stop_stub_admin
+  _assert_completed "$scratch" upsilon "unreachable then back"
+  teardown_unarchive_scratch "$scratch"
+}
+
+test_identity_request_that_never_arrived_is_resent() {
+  local scratch; scratch=$(setup_unarchive_scratch)
+  fixture_live_role "$scratch" box-maintainer
+  fixture_archived_identity "$scratch" kappa "scalar:box-maintainer"
+  start_stub_admin "401" || { teardown_unarchive_scratch "$scratch"; return; }
+  _point_relay "$scratch" kappa
+  local d="${scratch}-archive/kappa"
+  # fleet-service itself missing or failing: no answer at all.
+  local out; out=$( export TEST_FLEET_SERVICE=/nonexistent/fleet-service; _tick "$scratch" )
+  assert_grep "couldn't reach the backend" "$out" "no answer: log line"
+  assert_nofile "$d/.unarchive-reactivate" "no answer on send: forgotten, sent fresh next tick"
+  assert_nofile "$d/.unarchive-refused"    "no answer: NOT refused"
+  _tick "$scratch" >/dev/null
+  stop_stub_admin
+  assert_eq "1" "$(_request_count "$scratch")" "no answer: sent on the next tick"
   teardown_unarchive_scratch "$scratch"
 }
 
@@ -1115,7 +1167,7 @@ test_identity_login_5xx_retries() {
   teardown_unarchive_scratch "$scratch"
 }
 
-test_identity_refusal_drops_pending_request() {
+test_identity_refusal_forgets_pending_request() {
   local scratch; scratch=$(setup_unarchive_scratch)
   fixture_live_role "$scratch" box-maintainer
   fixture_archived_identity "$scratch" phi "scalar:box-maintainer"
@@ -1132,7 +1184,9 @@ test_identity_refusal_drops_pending_request() {
   assert_nofile "${scratch}-archive/phi/.unarchive-requested"  "pending refuse: flag cleared"
   assert_nofile "${scratch}-archive/phi/.unarchive-reactivate" "pending refuse: state cleared"
   assert_grep "already exists" "$(cat "${scratch}-archive/phi/.unarchive-refused" 2>/dev/null)" "pending refuse: note written"
-  assert_eq "0" "$(_all_request_files_count "$scratch")" "pending refuse: pending request dropped"
+  rm -rf "$scratch/phi"
+  _tick "$scratch" >/dev/null
+  assert_eq "1" "$(_request_count "$scratch")" "pending refuse: nothing more asked once refused"
   teardown_unarchive_scratch "$scratch"
 }
 
@@ -1572,7 +1626,10 @@ run_test test_identity_full_reactivation_happy_path
 run_test test_identity_transient_error_rerequests
 run_test test_identity_permanent_error_refuses
 run_test test_identity_ok_response_without_password_rerequests
-run_test test_identity_stale_request_dropped_and_refiled
+run_test test_identity_pending_request_never_resent
+run_test test_identity_lost_request_refiled
+run_test test_identity_unreachable_while_collecting_keeps_waiting
+run_test test_identity_request_that_never_arrived_is_resent
 run_test test_identity_prelogin_succeeds_without_request
 run_test test_identity_prelogin_transient_waits
 run_test test_identity_prelogin_without_password_files_request
@@ -1581,7 +1638,7 @@ run_test test_identity_account_active_then_login_403_refuses
 run_test test_identity_refusal_note_removed_at_pickup
 run_test test_identity_login_401_refuses
 run_test test_identity_login_5xx_retries
-run_test test_identity_refusal_drops_pending_request
+run_test test_identity_refusal_forgets_pending_request
 run_test test_identity_no_sentinel_noop
 run_test test_identity_banner_prepended_on_happy_path
 

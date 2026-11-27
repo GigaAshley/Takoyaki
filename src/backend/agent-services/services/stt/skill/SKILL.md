@@ -33,7 +33,7 @@ Before invoking: confirm the recording contains nothing compliance-restricted. S
 text=$(stt memo.m4a)
 ```
 
-The helper waits up to 9 minutes, under the Bash tool's 10-minute limit, and cleans up its scratch files in `~/fleet/service-requests/` on every exit path.
+The helper waits up to 9 minutes, under the Bash tool's 10-minute limit, and cleans up its scratch files on every exit path.
 
 ## Failure handling
 
@@ -46,7 +46,10 @@ The helper waits up to 9 minutes, under the Bash tool's 10-minute limit, and cle
 | not_configured | Speech to text isn't set up yet (no provider or key). Escalate to the operator: an admin sets it up in Admin → Services. |
 | not_enabled | Speech to text isn't switched on for this machine. Not agent-retriable: tell the user an admin can switch it on in Admin → Services. |
 | expired | The request waited in the queue past 2 minutes. Retry; the fleet may be busy. |
-| timeout | The backend accepted the request but did not answer within 9 minutes. Retry with a shorter file. |
-| not_picked_up | The backend never picked up the request; it may be down or not managing this host. Escalate to the operator. |
+| timeout | The backend accepted the request but did not answer within 9 minutes. It keeps going: `fleet-service collect <id>` (the ID is in `message`) gets the transcript later. |
+| lost | The backend restarted while the request was in flight, so its answer is gone; it was not run again. Retry. |
+| unreachable | The backend couldn't be reached from this machine (the helper kept trying until its time ran out). Retry later; if it keeps happening, escalate to the operator. |
+| not_set_up | This machine hasn't been given its service credential yet (it arrives within a minute of the machine being set up), or an admin revoked it. Retry in a minute; if it persists, escalate to the operator. |
+| revoked | An admin revoked this machine's access to services. Not agent-retriable: tell the user an admin can issue it a new credential in Admin → Services. |
 | queue_full | Too many requests queued. Retry later. |
 | internal | Escalate to the operator. |

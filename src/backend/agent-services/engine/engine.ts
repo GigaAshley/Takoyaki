@@ -1,10 +1,10 @@
 /**
- * agent-services/engine/engine.ts — turns claimed request files into
- * response files.
+ * agent-services/engine/engine.ts — turns a machine's service request into
+ * its answer.
  *
- * intake(), per claimed request, at scan time:
- *   envelope parse → service lookup → switched on for this machine? →
- *   input schema → attachments → enqueue
+ * submit(), per request, as it arrives (http/routes.ts):
+ *   service lookup → switched on for this machine? → input schema →
+ *   attachments → enqueue
  * Any failure there is answered straight away (malformed, unknown_service,
  * not_enabled, queue_full) without queueing.
  *
@@ -13,25 +13,22 @@
  *   one is missing) → acting user + their keys (services with userSecrets)
  *   → rate limit → handle() → write response
  *
- * Core handlers (identity-reactivate) ride the same request files but are
- * the app's own machinery, not services: never switched, never recorded.
- * Every service response is recorded (agent-services/admin/usage.ts).
+ * Core handlers (identity-reactivate) ride the same requests but are the
+ * app's own machinery, not services: never switched, never recorded. Every
+ * service answer is recorded (agent-services/admin/usage.ts).
  *
- * Every request gets exactly one response file unless the write itself
- * fails, in which case the agent's helper times out.
+ * Every submitted request resolves to exactly one answer; submit() never
+ * rejects.
  */
 
 import { systemLogger } from "../../utils/logger.js";
-import type { HostRequestIo, OutgoingFile, ResponseWriter } from "./host-io.js";
 import {
-  attachmentFilenameError,
+  attachmentError,
   buildResponse,
   engineFailure,
-  outputFilename,
-  parseEnvelope,
-  responseFilename,
-  type ClaimedFile,
   type EngineFailure,
+  type IncomingRequest,
+  type WireResponse,
 } from "./protocol.js";
 import { JobQueue } from "./queue.js";
 import { createTokenBucket, type TokenBucket } from "./token-bucket.js";
@@ -40,10 +37,11 @@ import type {
   ServiceAttachment,
   ServiceContext,
   ServiceDefinition,
+  ServiceOutputFile,
   ServiceResult,
 } from "./types.js";
 
-interface RequestHost {
+export interface RequestHost {
   id: string;
   idNum: number;
   /** The machine behind the host row (hosts.machine_id); grants are per machine. */
@@ -63,7 +61,6 @@ export interface EngineDeps {
   services: readonly ServiceDefinition[];
   /** The app's own request handlers: answered for every machine, never listed. */
   coreHandlers?: readonly ServiceDefinition[];
-  writeResponse: ResponseWriter;
   /** Whether `service` is switched on for `machineId`. */
   isEnabled(service: string, machineId: string): Promise<boolean>;
   /** A service's instance key from the key store, or null. */
@@ -96,21 +93,31 @@ export interface EngineDeps {
   ) => Promise<string | null>;
   now?: () => number;
   createTokenBucket?: (rpm: number) => TokenBucket;
+  /**
+   * Most attachment bytes held by queued and running requests, across every
+   * service (default MAX_HELD_ATTACHMENT_BYTES). Past it, new requests with
+   * attachments are refused as queue_full.
+   */
+  maxHeldAttachmentBytes?: number;
+}
+
+/** A request's answer: the response body and any output files it names. */
+export interface ServiceAnswer {
+  body: WireResponse;
+  files: ServiceOutputFile[];
 }
 
 export interface AgentServiceEngine {
-  /** Validate and queue every request claimed from one host. Never throws. */
-  intake(
-    host: RequestHost,
-    io: HostRequestIo,
-    claimed: ClaimedFile[],
-  ): Promise<void>;
+  /** Validate, queue and run one request. Resolves with its answer; never rejects. */
+  submit(host: RequestHost, request: IncomingRequest): Promise<ServiceAnswer>;
   /** Stop starting new jobs. Running handlers finish. */
   stop(): void;
   queueSnapshot(): Record<string, { pending: number; running: number }>;
 }
 
 const DEFAULT_MAX_QUEUE_DEPTH = 1000;
+/** Attachments wait in memory; this bounds them on a small host. */
+export const MAX_HELD_ATTACHMENT_BYTES = 256 * 1024 * 1024;
 const USER_SECRET_NAME_RE = /^[A-Z][A-Z0-9_]{0,63}$/;
 
 interface ServiceRuntime {
@@ -127,6 +134,8 @@ const ADMIN_FIX = "an admin can set it up in Admin → Services";
 export function createAgentServiceEngine(deps: EngineDeps): AgentServiceEngine {
   const now = deps.now ?? (() => Date.now());
   const makeBucket = deps.createTokenBucket ?? createTokenBucket;
+  const maxHeldBytes = deps.maxHeldAttachmentBytes ?? MAX_HELD_ATTACHMENT_BYTES;
+  let heldBytes = 0;
 
   const runtimes = new Map<string, ServiceRuntime>();
   const all = [
@@ -168,10 +177,10 @@ export function createAgentServiceEngine(deps: EngineDeps): AgentServiceEngine {
 
   async function respond(
     host: RequestHost,
-    uuid: string,
+    id: string,
     service: string | null,
     result: ServiceResult | EngineFailure,
-  ): Promise<void> {
+  ): Promise<ServiceAnswer> {
     const rt = service ? runtimes.get(service) : undefined;
     if (rt && !rt.core && deps.recordUsage) {
       const code = result.ok === true ? null : result.code;
@@ -186,108 +195,86 @@ export function createAgentServiceEngine(deps: EngineDeps): AgentServiceEngine {
           (code === "internal" || (rt.def.faultCodes ?? []).includes(code)),
       });
     }
-    const files: OutgoingFile[] = [];
-    if (result.ok === true) {
-      (result.files ?? []).forEach((f, i) =>
-        files.push({
-          filename: outputFilename(uuid, i, f.ext),
-          bytes: f.bytes,
-        }),
-      );
-    }
-    const body = buildResponse(
-      service,
-      result,
-      files.map((f) => f.filename),
-    );
-    systemLogger.info("agent-services: responding", {
+    const files = result.ok === true ? (result.files ?? []) : [];
+    systemLogger.info("agent-services: answered", {
       operation: "agent_services_respond",
       service,
-      uuid,
+      requestId: id,
       fleetHostId: host.id,
+      machineId: host.machineId,
       ok: result.ok,
       code: result.ok === true ? undefined : result.code,
       files: files.length,
     });
-    await deps.writeResponse(
-      host.idNum,
-      uuid,
-      files,
-      responseFilename(uuid),
-      JSON.stringify(body, null, 2),
-    );
+    return { body: buildResponse(service, result, files), files };
   }
 
-  /** True if the service is on for the host's machine; else answers and returns false. */
-  async function switchedOn(host: RequestHost, uuid: string, service: string): Promise<boolean> {
+  /** Null if the service is on for the host's machine; else the refusal. */
+  async function refusedAsOff(
+    host: RequestHost,
+    id: string,
+    service: string,
+  ): Promise<ServiceAnswer | null> {
     let enabled: boolean;
     try {
       enabled = await deps.isEnabled(service, host.machineId);
     } catch (err) {
-      await respond(
+      return respond(
         host,
-        uuid,
+        id,
         service,
         engineFailure(
           "internal",
           `switch lookup failed: ${err instanceof Error ? err.message : String(err)}`,
         ),
       );
-      return false;
     }
-    if (!enabled) {
-      await respond(
-        host,
-        uuid,
-        service,
-        engineFailure(
-          "not_enabled",
-          `${service} isn't switched on for this machine; an admin can switch it on in Admin → Services`,
-        ),
-      );
-    }
-    return enabled;
+    if (enabled) return null;
+    return respond(
+      host,
+      id,
+      service,
+      engineFailure(
+        "not_enabled",
+        `${service} isn't switched on for this machine; an admin can switch it on in Admin → Services`,
+      ),
+    );
   }
 
   async function runJob(
     rt: ServiceRuntime,
     host: RequestHost,
-    uuid: string,
-    requestedAt: string,
+    id: string,
+    receivedAt: number,
     input: unknown,
     attachments: Record<string, ServiceAttachment>,
     asUser: string | undefined,
-  ): Promise<void> {
+  ): Promise<ServiceAnswer> {
     const { def } = rt;
+    const answer = (result: ServiceResult | EngineFailure) =>
+      respond(host, id, def.name, result);
 
-    if (now() > Date.parse(requestedAt) + def.ttlMs) {
-      await respond(
-        host,
-        uuid,
-        def.name,
+    if (now() > receivedAt + def.ttlMs) {
+      return answer(
         engineFailure("expired", "request expired before it could run"),
       );
-      return;
     }
 
     // Switched off while it waited in the queue: don't run it.
-    if (!rt.core && !(await switchedOn(host, uuid, def.name))) return;
+    if (!rt.core) {
+      const off = await refusedAsOff(host, id, def.name);
+      if (off) return off;
+    }
 
     const notConfigured = (what: string) =>
-      respond(
-        host,
-        uuid,
-        def.name,
+      answer(
         engineFailure(
           "not_configured",
           `${def.name} isn't set up yet: it needs ${what}; ${ADMIN_FIX}`,
         ),
       );
     const lookupFailed = (what: string, err: unknown) =>
-      respond(
-        host,
-        uuid,
-        def.name,
+      answer(
         engineFailure(
           "internal",
           `${what} lookup failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -298,13 +285,11 @@ export function createAgentServiceEngine(deps: EngineDeps): AgentServiceEngine {
     try {
       settings = await deps.getSettings(def);
     } catch (err) {
-      await lookupFailed("settings", err);
-      return;
+      return lookupFailed("settings", err);
     }
     for (const [name, spec] of Object.entries(def.settings ?? {})) {
       if (spec.required && !settings[name]) {
-        await notConfigured(`a choice of ${spec.label.toLowerCase()}`);
-        return;
+        return notConfigured(`a choice of ${spec.label.toLowerCase()}`);
       }
     }
 
@@ -324,16 +309,12 @@ export function createAgentServiceEngine(deps: EngineDeps): AgentServiceEngine {
             name,
             error: err instanceof Error ? err.message : String(err),
           });
-          await respond(
-            host,
-            uuid,
-            def.name,
+          return answer(
             engineFailure(
               "internal",
               `${def.name} can't read its keys right now; an admin can see why in Admin → Services`,
             ),
           );
-          return;
         }
         // A key these settings don't use can't fail the request.
         systemLogger.warn("agent-services: unused key couldn't be read", {
@@ -347,8 +328,7 @@ export function createAgentServiceEngine(deps: EngineDeps): AgentServiceEngine {
       if (value) {
         secrets[name] = value;
       } else if (needed) {
-        await notConfigured(`its ${spec.label}`);
-        return;
+        return notConfigured(`its ${spec.label}`);
       }
     }
 
@@ -361,22 +341,12 @@ export function createAgentServiceEngine(deps: EngineDeps): AgentServiceEngine {
         resolution = await deps.resolveActingUser!(host.idNum, asUser);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        await respond(
-          host,
-          uuid,
-          def.name,
+        return answer(
           engineFailure("internal", `user lookup failed: ${message}`),
         );
-        return;
       }
       if (resolution.ok === false) {
-        await respond(
-          host,
-          uuid,
-          def.name,
-          engineFailure(resolution.code, resolution.message),
-        );
-        return;
+        return answer(engineFailure(resolution.code, resolution.message));
       }
       user = resolution.user;
       for (const [name, spec] of userSecretSpecs) {
@@ -385,26 +355,19 @@ export function createAgentServiceEngine(deps: EngineDeps): AgentServiceEngine {
           value = await deps.loadUserSecret!(user.id, def.name, name);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
-          await respond(
-            host,
-            uuid,
-            def.name,
+          return answer(
             engineFailure("internal", `secret lookup failed: ${message}`),
           );
-          return;
         }
-        if (!value && spec.fallbackKey) value = secrets[spec.fallbackKey] || null;
+        if (!value && spec.fallbackKey)
+          value = secrets[spec.fallbackKey] || null;
         if (!value) {
-          await respond(
-            host,
-            uuid,
-            def.name,
+          return answer(
             engineFailure(
               "no_user_secret",
               `${user.username} has no ${spec.label} for ${def.name}; an admin can set it for them in Admin → Services`,
             ),
           );
-          return;
         }
         userSecrets[name] = value;
       }
@@ -414,12 +377,12 @@ export function createAgentServiceEngine(deps: EngineDeps): AgentServiceEngine {
 
     const logContext = {
       service: def.name,
-      uuid,
+      requestId: id,
       fleetHostId: host.id,
       ...(user ? { actingUser: user.username } : {}),
     };
     const ctx: ServiceContext = {
-      requestId: uuid,
+      requestId: id,
       host,
       attachments,
       secrets,
@@ -447,130 +410,161 @@ export function createAgentServiceEngine(deps: EngineDeps): AgentServiceEngine {
       });
       result = engineFailure("internal", message);
     }
-    await respond(host, uuid, def.name, result);
+    return answer(result);
   }
 
-  async function intakeOne(
+  async function submitOne(
     host: RequestHost,
-    io: HostRequestIo,
-    item: ClaimedFile,
-  ): Promise<void> {
-    const { uuid } = item;
-    const parsed = parseEnvelope(item.body);
-    if (parsed.ok === false) {
-      await respond(
-        host,
-        uuid,
-        parsed.service ?? null,
-        engineFailure("malformed", parsed.message),
-      );
-      return;
-    }
-    const { envelope } = parsed;
-    const rt = runtimes.get(envelope.service);
+    request: IncomingRequest,
+  ): Promise<ServiceAnswer> {
+    const { id } = request;
+    const receivedAt = now();
+    const rt = runtimes.get(request.service);
     if (!rt) {
-      await respond(
+      return respond(
         host,
-        uuid,
-        envelope.service,
+        id,
+        request.service,
         engineFailure(
           "unknown_service",
-          `no agent service named "${envelope.service}"`,
+          `no agent service named "${request.service}"`,
         ),
       );
-      return;
     }
     const { def } = rt;
-    if (!rt.core && !(await switchedOn(host, uuid, def.name))) return;
+    if (!rt.core) {
+      const off = await refusedAsOff(host, id, def.name);
+      if (off) return off;
+    }
     const malformed = (message: string) =>
-      respond(host, uuid, def.name, engineFailure("malformed", message));
+      respond(host, id, def.name, engineFailure("malformed", message));
 
-    const input = def.input.safeParse(envelope.input);
+    const input = def.input.safeParse(request.input);
     if (!input.success) {
       const issue = input.error.issues[0];
       const where =
         issue && issue.path.length > 0 ? issue.path.join(".") : "input";
-      await malformed(`${where}: ${issue?.message ?? "invalid"}`);
-      return;
+      return malformed(`${where}: ${issue?.message ?? "invalid"}`);
     }
 
     const specs = def.attachments ?? {};
     const attachments: Record<string, ServiceAttachment> = {};
-    for (const [slot, filename] of Object.entries(envelope.attachments)) {
+    for (const [slot, file] of Object.entries(request.attachments)) {
       const spec = specs[slot];
-      if (!spec)
-        return void (await malformed(`unexpected attachment: ${slot}`));
-      const nameError = attachmentFilenameError(
-        uuid,
-        slot,
-        filename,
-        spec.extensions,
-      );
-      if (nameError) return void (await malformed(nameError));
-      const bytes = await io.readAttachment(filename, spec.maxBytes);
-      if (bytes === "missing")
-        return void (await malformed(`attachment ${slot} is missing or empty`));
-      if (bytes === "too_large") {
-        return void (await malformed(
-          `attachment ${slot} exceeds ${spec.maxBytes} bytes`,
-        ));
-      }
+      if (!spec) return malformed(`unexpected attachment: ${slot}`);
+      const problem = attachmentError(slot, file, spec);
+      if (problem) return malformed(problem);
       attachments[slot] = {
-        filename,
-        ext: filename.slice(filename.lastIndexOf(".") + 1),
-        bytes,
+        filename: `${slot}.${file.ext}`,
+        ext: file.ext,
+        bytes: file.bytes,
       };
     }
     for (const [slot, spec] of Object.entries(specs)) {
       if (spec.required && !attachments[slot])
-        return void (await malformed(`attachment ${slot} is required`));
+        return malformed(`attachment ${slot} is required`);
     }
 
+    const bytes = Object.values(attachments).reduce(
+      (n, a) => n + a.bytes.byteLength,
+      0,
+    );
+    if (bytes > 0 && heldBytes + bytes > maxHeldBytes) {
+      systemLogger.warn(
+        "agent-services: too many attachment bytes waiting; refusing",
+        {
+          operation: "agent_services_attachment_budget_full",
+          service: def.name,
+          requestId: id,
+          heldBytes,
+          bytes,
+        },
+      );
+      return respond(
+        host,
+        id,
+        def.name,
+        engineFailure(
+          "queue_full",
+          "too many large requests waiting, try again later",
+        ),
+      );
+    }
+
+    let resolveAnswer!: (a: ServiceAnswer) => void;
+    const done = new Promise<ServiceAnswer>((r) => (resolveAnswer = r));
+    heldBytes += bytes;
     const queued = rt.queue.enqueue({
       key: def.serializeBy?.(input.data),
-      run: () =>
-        runJob(
-          rt,
-          host,
-          uuid,
-          envelope.requested_at,
-          input.data,
-          attachments,
-          envelope.as_user,
-        ),
+      run: async () => {
+        try {
+          resolveAnswer(
+            await runJob(
+              rt,
+              host,
+              id,
+              receivedAt,
+              input.data,
+              attachments,
+              request.asUser,
+            ).catch((err) =>
+              respond(
+                host,
+                id,
+                def.name,
+                engineFailure(
+                  "internal",
+                  err instanceof Error ? err.message : String(err),
+                ),
+              ),
+            ),
+          );
+        } finally {
+          heldBytes -= bytes;
+        }
+      },
     });
     if (!queued) {
-      await respond(
+      heldBytes -= bytes;
+      return respond(
         host,
-        uuid,
+        id,
         def.name,
         engineFailure("queue_full", "queue full, try again later"),
       );
-      return;
     }
     systemLogger.info("agent-services: queued", {
       operation: "agent_services_queued",
       service: def.name,
-      uuid,
+      requestId: id,
       fleetHostId: host.id,
       attachments: Object.keys(attachments).length,
       ...rt.queue.snapshot(),
     });
+    return done;
   }
 
   return {
-    async intake(host, io, claimed) {
-      for (const item of claimed) {
-        try {
-          await intakeOne(host, io, item);
-        } catch (err) {
-          systemLogger.error("agent-services: intake threw", {
-            operation: "agent_services_intake_threw",
-            uuid: item.uuid,
-            fleetHostId: host.id,
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }
+    async submit(host, request) {
+      try {
+        return await submitOne(host, request);
+      } catch (err) {
+        systemLogger.error("agent-services: submit threw", {
+          operation: "agent_services_submit_threw",
+          requestId: request.id,
+          fleetHostId: host.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return {
+          body: buildResponse(
+            request.service,
+            engineFailure(
+              "internal",
+              err instanceof Error ? err.message : String(err),
+            ),
+          ),
+          files: [],
+        };
       }
     },
     stop() {

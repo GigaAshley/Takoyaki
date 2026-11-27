@@ -13,20 +13,12 @@ vi.mock("../../utils/logger.js", () => {
 });
 
 import { createAgentServiceEngine, type EngineDeps } from "./engine.js";
-import type { HostRequestIo, OutgoingFile } from "./host-io.js";
+import type { IncomingRequest } from "./protocol.js";
 import { defineService, fail, ok, type ServiceDefinition } from "./types.js";
 
 const UUID = "0b5c2f9e-1a2b-4c3d-8e9f-001122334455";
 const HOST = { id: "7", idNum: 7, machineId: "m7" };
 const NOW = Date.parse("2026-10-08T12:00:00Z");
-
-interface Written {
-  hostIdNum: number;
-  uuid: string;
-  files: OutgoingFile[];
-  responseFilename: string;
-  response: Record<string, any>;
-}
 
 /** Store-backed deps: keys "service/NAME", settings per service, grants "service@machine". */
 function storeDeps(opts: {
@@ -49,6 +41,23 @@ function storeDeps(opts: {
   };
 }
 
+type Attachments = IncomingRequest["attachments"];
+
+/** A request as the router hands it over, from envelope-shaped fields. */
+function request(
+  body: { service: string; input: unknown; as_user?: string },
+  attachments: Attachments = {},
+  id = UUID,
+): IncomingRequest {
+  return {
+    id,
+    service: body.service,
+    input: body.input,
+    ...(body.as_user !== undefined ? { asUser: body.as_user } : {}),
+    attachments,
+  };
+}
+
 function setup(
   services: ServiceDefinition[],
   opts: {
@@ -57,54 +66,29 @@ function setup(
     grants?: string[];
     coreHandlers?: ServiceDefinition[];
     recordUsage?: EngineDeps["recordUsage"];
-    now?: number;
+    now?: () => number;
     resolveActingUser?: EngineDeps["resolveActingUser"];
     loadUserSecret?: EngineDeps["loadUserSecret"];
   } = {},
 ) {
-  const written: Written[] = [];
-  let done: () => void = () => {};
   const engine = createAgentServiceEngine({
     services,
     coreHandlers: opts.coreHandlers,
     ...storeDeps(opts),
     recordUsage: opts.recordUsage,
-    now: () => opts.now ?? NOW,
+    now: opts.now ?? (() => NOW),
     resolveActingUser: opts.resolveActingUser,
     loadUserSecret: opts.loadUserSecret,
-    writeResponse: async (hostIdNum, uuid, files, responseFilename, json) => {
-      written.push({
-        hostIdNum,
-        uuid,
-        files,
-        responseFilename,
-        response: JSON.parse(json),
-      });
-      done();
-    },
   });
-  const io = (
-    attachments: Record<string, Buffer | "missing" | "too_large"> = {},
-  ): HostRequestIo => ({
-    claim: async () => [],
-    readAttachment: async (filename) => attachments[filename] ?? "missing",
-  });
-  /** Submit one request and wait for its response. */
+  /** Submit one request and wait for its answer. */
   const submit = async (
-    body: unknown,
-    attachments?: Record<string, Buffer | "missing" | "too_large">,
+    body: { service: string; input: unknown; as_user?: string },
+    attachments?: Attachments,
   ) => {
-    const answered = new Promise<void>((r) => (done = r));
-    await engine.intake(HOST, io(attachments), [
-      {
-        uuid: UUID,
-        body: typeof body === "string" ? body : JSON.stringify(body),
-      },
-    ]);
-    await answered;
-    return written[written.length - 1];
+    const a = await engine.submit(HOST, request(body, attachments));
+    return { response: a.body as Record<string, any>, files: a.files };
   };
-  return { engine, written, submit };
+  return { engine, submit };
 }
 
 const echo = defineService({
@@ -120,18 +104,14 @@ const echo = defineService({
 
 const envelope = (input: unknown, extra: Record<string, unknown> = {}) => ({
   service: "echo",
-  requested_at: new Date(NOW - 1000).toISOString(),
   input,
   ...extra,
 });
 
 describe("agent-services engine", () => {
-  it("runs the handler and writes the response to the origin host", async () => {
+  it("runs the handler as the requesting host and answers", async () => {
     const { submit } = setup([echo]);
     const w = await submit(envelope({ text: "hi" }));
-    expect(w.hostIdNum).toBe(7);
-    expect(w.uuid).toBe(UUID);
-    expect(w.responseFilename).toBe(`${UUID}.response.json`);
     expect(w.response).toEqual({
       ok: true,
       service: "echo",
@@ -140,7 +120,7 @@ describe("agent-services engine", () => {
     });
   });
 
-  it("writes output files under <uuid>.out.<i>.<ext> and lists them", async () => {
+  it("hands back output files and lists their types and sizes", async () => {
     const svc = defineService({
       ...echo,
       handle: async () =>
@@ -150,13 +130,10 @@ describe("agent-services engine", () => {
         ]),
     });
     const w = await setup([svc]).submit(envelope({ text: "x" }));
-    expect(w.files.map((f) => f.filename)).toEqual([
-      `${UUID}.out.0.png`,
-      `${UUID}.out.1.txt`,
-    ]);
+    expect(w.files.map((f) => f.bytes.toString())).toEqual(["a", "b"]);
     expect(w.response.files).toEqual([
-      `${UUID}.out.0.png`,
-      `${UUID}.out.1.txt`,
+      { ext: "png", size: 1 },
+      { ext: "txt", size: 1 },
     ]);
   });
 
@@ -173,25 +150,13 @@ describe("agent-services engine", () => {
     });
   });
 
-  it.each([
-    ["a broken envelope", "{nope", null, /invalid JSON/],
-    [
-      "an unknown service",
-      { ...envelope({}), service: "nope" },
-      "nope",
-      /no agent service named "nope"/,
-    ],
-  ])(
-    "answers %s without running anything",
-    async (_n, body, service, message) => {
-      const code = service === "nope" ? "unknown_service" : "malformed";
-      const w = await setup([echo]).submit(body);
-      expect(w.response.ok).toBe(false);
-      expect(w.response.service).toBe(service);
-      expect(w.response.error.code).toBe(code);
-      expect(w.response.error.message).toMatch(message);
-    },
-  );
+  it("answers an unknown service without running anything", async () => {
+    const w = await setup([echo]).submit({ ...envelope({}), service: "nope" });
+    expect(w.response.ok).toBe(false);
+    expect(w.response.service).toBe("nope");
+    expect(w.response.error.code).toBe("unknown_service");
+    expect(w.response.error.message).toMatch(/no agent service named "nope"/);
+  });
 
   it("rejects input that fails the schema, naming the field", async () => {
     const handle = vi.fn();
@@ -207,13 +172,25 @@ describe("agent-services engine", () => {
     expect(w.response.error.message).toMatch(/txet/);
   });
 
-  it("answers expired when dequeued past the TTL", async () => {
-    const handle = vi.fn();
-    const w = await setup([{ ...echo, handle }], { now: NOW + 120_000 }).submit(
-      envelope({ text: "x" }),
-    );
-    expect(w.response.error.code).toBe("expired");
-    expect(handle).not.toHaveBeenCalled();
+  it("answers expired when dequeued past the TTL, counted from arrival", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let clock = NOW;
+    const handle = vi.fn(async (input: { text: string }) => {
+      if (input.text === "first") await gate;
+      return ok({});
+    });
+    const { engine } = setup([{ ...echo, handle }], { now: () => clock });
+    const first = engine.submit(HOST, request(envelope({ text: "first" })));
+    await vi.waitFor(() => expect(handle).toHaveBeenCalledTimes(1));
+    const second = engine.submit(HOST, request(envelope({ text: "second" }), {}, "bbbbbbbb-1111-4111-8111-111111111111"));
+    // Wait until the second is queued behind the first, then let time pass.
+    await new Promise((r) => setTimeout(r, 0));
+    clock = NOW + 120_000;
+    release();
+    await first;
+    expect((await second).body).toMatchObject({ ok: false, error: { code: "expired" } });
+    expect(handle).toHaveBeenCalledTimes(1);
   });
 
   it("answers not_configured when a declared secret is unset, and passes it when set", async () => {
@@ -323,14 +300,9 @@ describe("agent-services engine", () => {
         throw new Error("bad blob");
       },
       now: () => NOW,
-      writeResponse: async (_h, _u, _f, _n, json) => void answers.push(JSON.parse(json)),
     });
-    const answers: Record<string, any>[] = [];
-    await engine.intake(HOST, { claim: async () => [], readAttachment: async () => "missing" }, [
-      { uuid: UUID, body: JSON.stringify(envelope({ text: "x" })) },
-    ]);
-    await vi.waitFor(() => expect(answers).toHaveLength(1));
-    expect(answers[0].ok).toBe(true);
+    const answer = await engine.submit(HOST, request(envelope({ text: "x" })));
+    expect(answer.body.ok).toBe(true);
   });
 
   it("a needed key the store can't read fails without passing the store's reason to the agent", async () => {
@@ -342,14 +314,9 @@ describe("agent-services engine", () => {
         throw new Error("AWS refused to read keys under /takoyaki/t1000: arn:aws:sts::1:assumed-role/r");
       },
       now: () => NOW,
-      writeResponse: async (_h, _u, _f, _n, json) => void answers.push(JSON.parse(json)),
     });
-    const answers: Record<string, any>[] = [];
-    await engine.intake(HOST, { claim: async () => [], readAttachment: async () => "missing" }, [
-      { uuid: UUID, body: JSON.stringify(envelope({ text: "x" })) },
-    ]);
-    await vi.waitFor(() => expect(answers).toHaveLength(1));
-    expect(answers[0].error).toEqual({
+    const answer = await engine.submit(HOST, request(envelope({ text: "x" })));
+    expect((answer.body as Record<string, any>).error).toEqual({
       code: "internal",
       message: "echo can't read its keys right now; an admin can see why in Admin → Services",
     });
@@ -378,24 +345,23 @@ describe("agent-services engine", () => {
         return ok({});
       });
       const svc = defineService({ ...echo, handle });
-      const answers: Record<string, any>[] = [];
       const engine = createAgentServiceEngine({
         services: [svc],
         ...storeDeps({}),
         isEnabled: async () => on,
         now: () => NOW,
-        writeResponse: async (_h, uuid, _f, _n, json) => void answers.push({ uuid, ...JSON.parse(json) }),
       });
-      const io: HostRequestIo = { claim: async () => [], readAttachment: async () => "missing" };
-      const second = "bbbbbbbb-1111-4111-8111-111111111111";
-      await engine.intake(HOST, io, [
-        { uuid: UUID, body: JSON.stringify(envelope({ text: "first" })) },
-        { uuid: second, body: JSON.stringify(envelope({ text: "second" })) },
-      ]);
+      const first = engine.submit(HOST, request(envelope({ text: "first" })));
+      const second = engine.submit(
+        HOST,
+        request(envelope({ text: "second" }), {}, "bbbbbbbb-1111-4111-8111-111111111111"),
+      );
+      // Let both pass the switch check on arrival before switching off.
+      await new Promise((r) => setTimeout(r, 0));
       on = false;
       release();
-      await vi.waitFor(() => expect(answers).toHaveLength(2));
-      expect(answers.find((a) => a.uuid === second).error.code).toBe("not_enabled");
+      await first;
+      expect(((await second).body as Record<string, any>).error.code).toBe("not_enabled");
       expect(handle).toHaveBeenCalledTimes(1);
     });
 
@@ -467,45 +433,22 @@ describe("agent-services engine", () => {
       ...echo,
       attachments: { ref: { extensions: ["png"], maxBytes: 10 } },
       handle: async (_i, ctx) =>
-        ok({ got: ctx.attachments.ref?.bytes.toString() ?? null }),
+        ok({ got: ctx.attachments.ref?.bytes.toString() ?? null, name: ctx.attachments.ref?.filename ?? null }),
     });
-    const ref = `${UUID}.in.ref.png`;
+    const png = (text: string) => ({ ext: "png", bytes: Buffer.from(text) });
 
-    it("reads declared attachments and hands them to the handler", async () => {
-      const w = await setup([withRef]).submit(
-        envelope({ text: "x" }, { attachments: { ref } }),
-        {
-          [ref]: Buffer.from("img"),
-        },
-      );
-      expect(w.response.result).toEqual({ got: "img" });
+    it("hands declared attachments to the handler", async () => {
+      const w = await setup([withRef]).submit(envelope({ text: "x" }), { ref: png("img") });
+      expect(w.response.result).toEqual({ got: "img", name: "ref.png" });
     });
 
     it.each([
-      [
-        "an undeclared slot",
-        { other: `${UUID}.in.other.png` },
-        {},
-        /unexpected attachment: other/,
-      ],
-      [
-        "a foreign request's file",
-        { ref: "7d1e2f3a-4b5c-4d6e-9f00-aabbccddeeff.in.ref.png" },
-        {},
-        /must be named/,
-      ],
-      ["a missing file", { ref }, {}, /missing or empty/],
-      [
-        "an oversized file",
-        { ref },
-        { [ref]: "too_large" as const },
-        /exceeds 10 bytes/,
-      ],
-    ])("rejects %s", async (_n, attachments, files, message) => {
-      const w = await setup([withRef]).submit(
-        envelope({ text: "x" }, { attachments }),
-        files,
-      );
+      ["an undeclared slot", { other: png("img") }, /unexpected attachment: other/],
+      ["a type the slot doesn't take", { ref: { ext: "gif", bytes: Buffer.from("x") } }, /must be one of: png/],
+      ["an empty file", { ref: png("") }, /missing or empty/],
+      ["an oversized file", { ref: png("x".repeat(11)) }, /exceeds 10 bytes/],
+    ])("rejects %s", async (_n, attachments, message) => {
+      const w = await setup([withRef]).submit(envelope({ text: "x" }), attachments);
       expect(w.response.error.code).toBe("malformed");
       expect(w.response.error.message).toMatch(message);
     });
@@ -533,25 +476,47 @@ describe("agent-services engine", () => {
         return ok({});
       },
     });
-    const { engine, written } = setup([svc]);
-    const io: HostRequestIo = {
-      claim: async () => [],
-      readAttachment: async () => "missing",
-    };
-    const body = JSON.stringify(envelope({ text: "x" }));
-    const uuids = ["a", "b", "c"].map(
+    const { engine } = setup([svc]);
+    const ids = ["a", "b", "c"].map(
       (c) => `${c.repeat(8)}-1111-4111-8111-111111111111`,
     );
-    await engine.intake(
-      HOST,
-      io,
-      uuids.map((uuid) => ({ uuid, body })),
-    );
+    const answers = ids.map((id) => engine.submit(HOST, request(envelope({ text: "x" }), {}, id)));
     // one running, one pending, one rejected
-    expect(written.map((w) => [w.uuid, w.response.error?.code])).toEqual([
-      [uuids[2], "queue_full"],
-    ]);
+    expect(((await answers[2]).body as Record<string, any>).error.code).toBe("queue_full");
     release();
+    expect((await answers[0]).body.ok).toBe(true);
+    expect((await answers[1]).body.ok).toBe(true);
+  });
+
+  it("refuses new attachments past the memory budget, and frees it as jobs finish", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const svc = defineService({
+      ...echo,
+      concurrency: 5,
+      attachments: { ref: { extensions: ["png"], maxBytes: 100 } },
+      handle: async () => {
+        await gate;
+        return ok({});
+      },
+    });
+    const engine = createAgentServiceEngine({
+      services: [svc],
+      ...storeDeps({}),
+      now: () => NOW,
+      maxHeldAttachmentBytes: 10,
+    });
+    const png = (n: number) => ({ ref: { ext: "png", bytes: Buffer.alloc(n, 1) } });
+    const first = engine.submit(HOST, request(envelope({ text: "x" }), png(8), "aaaaaaaa-1111-4111-8111-111111111111"));
+    const second = await engine.submit(HOST, request(envelope({ text: "x" }), png(8), "bbbbbbbb-1111-4111-8111-111111111111"));
+    expect((second.body as Record<string, any>).error.code).toBe("queue_full");
+    // Requests without attachments are never held back by it.
+    const plain = engine.submit(HOST, request(envelope({ text: "x" }), {}, "cccccccc-1111-4111-8111-111111111111"));
+    release();
+    expect((await first).body.ok).toBe(true);
+    expect((await plain).body.ok).toBe(true);
+    const third = await engine.submit(HOST, request(envelope({ text: "x" }), png(8), "dddddddd-1111-4111-8111-111111111111"));
+    expect(third.body.ok).toBe(true);
   });
 
   it("waits on the rate limiter before calling the handler", async () => {
@@ -561,25 +526,13 @@ describe("agent-services engine", () => {
       getState: () => ({}) as any,
     }));
     const svc = defineService({ ...echo, rateLimitPerMinute: () => 12 });
-    const written: unknown[] = [];
-    let done!: () => void;
-    const answered = new Promise<void>((r) => (done = r));
     const engine = createAgentServiceEngine({
       services: [svc],
       ...storeDeps({}),
       now: () => NOW,
       createTokenBucket,
-      writeResponse: async (...args) => {
-        written.push(args);
-        done();
-      },
     });
-    await engine.intake(
-      HOST,
-      { claim: async () => [], readAttachment: async () => "missing" },
-      [{ uuid: UUID, body: JSON.stringify(envelope({ text: "x" })) }],
-    );
-    await answered;
+    await engine.submit(HOST, request(envelope({ text: "x" })));
     expect(createTokenBucket).toHaveBeenCalledWith(12);
     expect(acquire).toHaveBeenCalledOnce();
   });

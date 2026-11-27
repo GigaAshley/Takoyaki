@@ -37,7 +37,8 @@ beforeEach(() => {
     CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT NOT NULL);
     CREATE TABLE ssh_data (
       id INTEGER PRIMARY KEY, user_id TEXT NOT NULL,
-      ip TEXT NOT NULL, port INTEGER NOT NULL, username TEXT NOT NULL
+      ip TEXT NOT NULL, port INTEGER NOT NULL, username TEXT NOT NULL,
+      machine_id INTEGER
     );
     CREATE TABLE agent_service_user_secrets (
       id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -58,7 +58,19 @@ export interface ServiceMachine {
   machineId: string;
   name: string;
   enabled: boolean;
-  unreachableSince: string | null;
+}
+
+/** A machine's credential for calling services (never its value). */
+export interface MachineCredential {
+  machineId: string;
+  name: string;
+  /** "pending" until the backend first issues one, within a minute of the machine appearing. */
+  state: "active" | "revoked" | "pending";
+  /** When the current credential was issued; it's replaced daily. */
+  issuedAt: string | null;
+  revokedAt: string | null;
+  /** Username of the admin who revoked it, when known. */
+  revokedBy: string | null;
 }
 
 export interface ServiceDetail extends ServiceSummary {
@@ -82,7 +94,11 @@ export interface ServiceDetail extends ServiceSummary {
 const BASE = "/users/admin/services";
 const enc = encodeURIComponent;
 
-export async function listAgentServices(): Promise<{ keyStore: KeyStoreInfo; services: ServiceSummary[] }> {
+export async function listAgentServices(): Promise<{
+  keyStore: KeyStoreInfo;
+  services: ServiceSummary[];
+  machines: MachineCredential[];
+}> {
   try {
     return (await authApi.get(BASE)).data;
   } catch (error) {
@@ -158,5 +174,23 @@ export async function removePersonKey(service: string, userId: string, key: stri
     await authApi.delete(`${BASE}/${enc(service)}/people/${enc(userId)}/keys/${enc(key)}`);
   } catch (error) {
     handleApiError(error, "remove person's key");
+  }
+}
+
+/** Cut a machine off from every service until an admin issues it a new credential. */
+export async function revokeMachineCredential(machineId: string): Promise<void> {
+  try {
+    await authApi.post(`/users/admin/service-machines/${enc(machineId)}/revoke`);
+  } catch (error) {
+    handleApiError(error, "revoke machine");
+  }
+}
+
+/** Give a machine a fresh credential, lifting a revoke. Asks the admin to confirm it's them. */
+export async function issueMachineCredential(machineId: string): Promise<void> {
+  try {
+    await authApi.post(`/users/admin/service-machines/${enc(machineId)}/issue`);
+  } catch (error) {
+    handleApiError(error, "issue machine credential");
   }
 }
