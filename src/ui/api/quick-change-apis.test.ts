@@ -116,10 +116,28 @@ describe("updateIdentity", () => {
     expect(JSON.parse(String(fd.get("data")))).toMatchObject({ task: "x", hostId: 42, requestId: expect.any(String) });
   });
 
-  it("a refusal rejects with the machine's reason; still working says so", async () => {
+  it("a refusal rejects with the machine's reason", async () => {
     vi.mocked(authApi.put).mockRejectedValueOnce(axiosError(409, { error: "it's being archived", code: "being_archived" }));
     await expect(updateIdentity("wren", { task: "x" }, null, 42)).rejects.toMatchObject({ name: "MachineChangeError", message: "it's being archived" });
+  });
+
+  it("still waiting: asks by its id (never sends it again), then reads the agent back", async () => {
     vi.mocked(authApi.put).mockResolvedValueOnce({ status: 202, data: { pending: true } });
+    vi.mocked(authApi.get)
+      .mockResolvedValueOnce({ status: 202, data: { pending: true } })
+      .mockResolvedValueOnce({ status: 200, data: { ok: true } })
+      .mockResolvedValueOnce({ status: 200, data: [{ identityKey: "wren", task: "x", pinned: true }] });
+    const r = await updateIdentity("wren", { task: "x" }, null, 42);
+    expect(authApi.put).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(authApi.get).mock.calls[0]?.[0]).toMatch(/^\/machine-changes\/42\/.+/);
+    expect(r).toEqual({ identityKey: "wren", task: "x" });
+  });
+
+  it("no answer at all (timed out): asks by its id too; still working after that says so", async () => {
+    const lost = new axios.AxiosError("timeout", "ECONNABORTED");
+    vi.mocked(authApi.put).mockRejectedValueOnce(lost);
+    vi.mocked(authApi.get).mockResolvedValue({ status: 202, data: { pending: true } });
     await expect(updateIdentity("wren", { task: "x" }, null, 42)).rejects.toThrow(/still working on it/);
+    expect(authApi.get).toHaveBeenCalledTimes(3);
   });
 });

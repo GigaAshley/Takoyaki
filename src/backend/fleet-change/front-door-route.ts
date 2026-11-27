@@ -9,6 +9,7 @@ import type { Response } from "express";
 import type { Client as SSHClientType } from "ssh2";
 import { databaseLogger } from "../utils/logger.js";
 import { HttpError, withHost } from "../sharing/host-conn.js";
+import { getUsernameForUserId, isHostMultiUser } from "../utils/host-user-counter.js";
 import {
   frontDoorHttp,
   submitAndFollow,
@@ -16,6 +17,34 @@ import {
   type FrontDoorKind,
   type FrontDoorOutcome,
 } from "./front-door.js";
+
+/**
+ * Who a change's visibility checks are for: the caller's username. When it can't be looked
+ * up, null (no gate) on a machine only one person uses; on a machine several people share
+ * that would let a write past projects hidden from them, so it's refused instead.
+ */
+export async function askerFor(userId: string, hostId: number): Promise<string | null> {
+  let username: string | null = null;
+  try {
+    username = await getUsernameForUserId(userId);
+  } catch (err) {
+    databaseLogger.warn("front door: couldn't look up who is asking", {
+      operation: "front_door_asker_lookup_failed",
+      userId,
+      hostId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+  if (username !== null) return username;
+  let shared = true;
+  try {
+    shared = await isHostMultiUser(hostId);
+  } catch {
+    // Can't tell: treat it as shared.
+  }
+  if (shared) throw new HttpError(503, "couldn't tell who is asking; try again in a moment");
+  return null;
+}
 
 /** A positive integer host id from a body field or path parameter, else null. */
 export function parseHostId(raw: unknown): number | null {
@@ -41,8 +70,6 @@ export async function answerFromFrontDoor(
     /** The server's part once the change is done (tell open tabs), on the same connection.
      *  Its failure is logged; the change itself already happened. */
     onDone?: (conn: SSHClientType | null, outcome: Extract<FrontDoorOutcome, { state: "done" }>) => Promise<void>;
-    /** Clean-up when the machine never took the change (still updating, or unreachable). */
-    onNotTaken?: (conn: SSHClientType | null) => Promise<void>;
   },
 ): Promise<Response> {
   const { hostId, userId, kind, args, requestId, operation } = opts;
@@ -64,7 +91,6 @@ export async function answerFromFrontDoor(
           });
         }
       }
-      if (o.state === "not_installed" && opts.onNotTaken) await opts.onNotTaken(conn).catch(() => undefined);
       return o;
     });
     databaseLogger.info(`${kind} requested`, {

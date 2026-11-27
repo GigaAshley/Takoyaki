@@ -195,24 +195,47 @@ export async function updateIdentity(
 ): Promise<Identity> {
   // A change at the machine's front door: in order with this machine's other changes, only
   // the lines being changed written. A refusal (e.g. it's being archived) throws
-  // MachineChangeError with the machine's reason.
+  // MachineChangeError with the machine's reason. Still waiting its turn (or the answer lost
+  // on the way): asked about again by its request id — never sent again, so a picture isn't
+  // uploaded twice — and read back once it's done.
   return inMachineOrder(hostId, async () => {
-    let response;
-    try {
-      response = await authApi.put(
-        `/identities/${encodeURIComponent(identityKey)}`,
-        buildUpdateFormData({ ...meta, requestId: newRequestId() }, avatar, hostId),
-        { headers: { "Content-Type": "multipart/form-data" } },
-      );
-    } catch (error) {
-      if (axios.isAxiosError(error) && (error.response?.status === 409 || error.response?.status === 503)) {
+    const requestId = newRequestId();
+    const refusal = (error: unknown): never => {
+      if (axios.isAxiosError(error) && error.response && [409, 500, 503].includes(error.response.status)) {
         const data = (error.response.data ?? {}) as { error?: string; code?: string };
         throw new MachineChangeError(data.error ?? "couldn't change it", error.response.status, data.code ?? null, null);
       }
       handleApiError(error, "update identity");
+    };
+    let response: { status: number; data: unknown } | undefined;
+    try {
+      response = await authApi.put(
+        `/identities/${encodeURIComponent(identityKey)}`,
+        buildUpdateFormData({ ...meta, requestId }, avatar, hostId),
+        { headers: { "Content-Type": "multipart/form-data" } },
+      );
+    } catch (error) {
+      if (!(axios.isAxiosError(error) && !error.response)) refusal(error);
     }
-    if (response.status === 202) {
-      throw new MachineChangeError("the machine is still working on it; it'll show once it's done", 202, "pending", null);
+    if (response === undefined || response.status === 202) {
+      let done = false;
+      for (let i = 0; i < 3 && !done; i++) {
+        try {
+          const r = await authApi.get(`/machine-changes/${hostId}/${encodeURIComponent(requestId)}`);
+          done = r.status !== 202;
+        } catch (error) {
+          refusal(error);
+        }
+      }
+      if (!done) {
+        throw new MachineChangeError("the machine is still working on it; it'll show once it's done", 202, "pending", null);
+      }
+      const fresh = (await listIdentities({ [identityKey]: hostId }, { onlyNamed: true })).find(
+        (i) => i.identityKey === identityKey,
+      );
+      if (!fresh) throw new MachineChangeError("it was changed, but couldn't be read back", 200, null, null);
+      const { pinned: _p, ...updated } = fresh;
+      return updated;
     }
     // The PUT echo always reports `pinned: false` (it never reads the
     // `.pinned` sentinel), so drop it — applyIdentityChange then keeps the

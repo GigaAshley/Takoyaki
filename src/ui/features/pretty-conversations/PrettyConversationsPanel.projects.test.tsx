@@ -227,6 +227,7 @@ const addToActiveSetSpy = vi.fn();
 const removeFromActiveSetSpy = vi.fn();
 const pinConversationSpy = vi.fn();
 const unpinConversationSpy = vi.fn();
+const forgetPinLocallySpy = vi.fn();
 const hydratePinnedIdsFromServerSpy = vi.fn();
 
 let mockActiveSet: ReadonlySet<string> = new Set();
@@ -236,6 +237,7 @@ const patchRoomPinnedSpy = vi.fn<(roomId: string, pinned: boolean) => void>();
 let mockRoomPinnedIds: ReadonlySet<string> = new Set();
 
 vi.mock("@/state/conversation-store", () => ({
+  forgetPinLocally: (id: string) => forgetPinLocallySpy(id),
   upsertFleetSession: () => {},
   patchRoomProjectAssignment: () => () => {},
   patchRoomPinned: (roomId: string, pinned: boolean) => {
@@ -2482,6 +2484,7 @@ describe("PrettyConversationsPanel: pinned and in-a-project are exclusive (Move-
 
   it("moving a pinned row into a project unpins only after the write lands; a failed write keeps the pin", async () => {
     unpinConversationSpy.mockClear();
+    forgetPinLocallySpy.mockClear();
     setSessionProjectSpy.mockClear();
     const row = makeRow({ id: "id-row-a", host: makeHost("1", "hostA"), targetTmuxSession: "wren-session" });
     setSnapshot({
@@ -2509,12 +2512,14 @@ describe("PrettyConversationsPanel: pinned and in-a-project are exclusive (Move-
       }),
     );
 
-    // Second attempt succeeds → unpin follows.
+    // Second attempt succeeds → the pin goes on screen only (the machine took it off in the
+    // same change; no unpin is sent).
     await openMoveTo(container, "id-row-a");
     await userEvent.setup().click(screen.getByRole("menuitem", { name: /^Alpha$/ }));
     await vi.waitFor(() =>
-      expect(unpinConversationSpy).toHaveBeenCalledWith("fleet::1::wren-session"),
+      expect(forgetPinLocallySpy).toHaveBeenCalledWith("fleet::1::wren-session"),
     );
+    expect(unpinConversationSpy).not.toHaveBeenCalled();
     __resetKitDialogsForTests();
   });
 });

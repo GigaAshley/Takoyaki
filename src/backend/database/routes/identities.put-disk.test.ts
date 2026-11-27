@@ -189,10 +189,10 @@ const writeIdentityFileMock = vi.fn();
 const writeAvatarSiblingFileMock = vi.fn();
 const isLocalHostIdMock = vi.fn();
 const writeBinaryFileAtomicMock = vi.fn();
-const submitAndFollowMock = vi.fn();
+const submitFrontDoorMock = vi.fn();
 vi.mock("../../fleet-change/front-door.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../fleet-change/front-door.js")>()),
-  submitAndFollow: (...a: unknown[]) => submitAndFollowMock(...a),
+  submitFrontDoor: (...a: unknown[]) => submitFrontDoorMock(...a),
 }));
 
 vi.mock("../../claude-session/identity-artifact-reader.js", () => ({
@@ -305,13 +305,14 @@ vi.mock("../../ssh/tmux-helper.js", () => ({
 // making the spy safe to reference in both the factory and the test body.
 // ---------------------------------------------------------------------------
 
-const { fsUnlinkSpy } = vi.hoisted(() => ({ fsUnlinkSpy: vi.fn() }));
+const { fsUnlinkSpy, fsMkdirSpy } = vi.hoisted(() => ({ fsUnlinkSpy: vi.fn(), fsMkdirSpy: vi.fn() }));
 
 vi.mock("node:fs/promises", async () => {
   const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
   return {
     ...actual,
     unlink: (...args: Parameters<typeof actual.unlink>) => fsUnlinkSpy(...args),
+    mkdir: (...args: Parameters<typeof actual.mkdir>) => fsMkdirSpy(...args),
   };
 });
 
@@ -438,8 +439,9 @@ beforeEach(() => {
   execCommandMock.mockResolvedValue("");
   forceSaveMock.mockResolvedValue(undefined);
   fsUnlinkSpy.mockResolvedValue(undefined);
+  fsMkdirSpy.mockResolvedValue(undefined);
   writeBinaryFileAtomicMock.mockResolvedValue(undefined);
-  submitAndFollowMock.mockImplementation(async (_c: unknown, _k: string, _a: unknown, o: { id: string }) => ({
+  submitFrontDoorMock.mockImplementation(async (_c: unknown, _k: string, _a: unknown, o: { id: string }) => ({
     state: "done",
     id: o.id,
     seq: 1,
@@ -466,8 +468,13 @@ describe("PUT /identities/:identityKey — the change goes through the machine's
     return httpPut(server, "/identities/testkey", buildMultipartBody({ data, ...(file ? { file } : {}) }));
   }
   function sentArgs(): Record<string, unknown> {
-    return (submitAndFollowMock.mock.calls[0]?.[2] ?? {}) as Record<string, unknown>;
+    return (submitFrontDoorMock.mock.calls[0]?.[2] ?? {}) as Record<string, unknown>;
   }
+
+  it("a fractional colour is refused before the machine is asked", async () => {
+    expect((await put({ hostId: 7, colorHue: 120.5 })).status).toBe(400);
+    expect(submitFrontDoorMock).not.toHaveBeenCalled();
+  });
 
   it("sends only the fields being set, with the click's request id; answers with the agent as it is now", async () => {
     readIdentityFileMock.mockResolvedValue({
@@ -475,11 +482,11 @@ describe("PUT /identities/:identityKey — the change goes through the machine's
     });
     const res = await put({ hostId: 7, displayName: "  Newname ", title: "New Title", colorHue: 180, task: "Ship: it", requestId: "edit-1" });
     expect(res.status).toBe(200);
-    expect(submitAndFollowMock).toHaveBeenCalledWith(
+    expect(submitFrontDoorMock).toHaveBeenCalledWith(
       expect.objectContaining({ __fake: "ssh-conn" }),
       "agent-edit",
       { name: "testkey", set: { displayName: "Newname", title: "New Title", task: "Ship: it", colorHue: 180 }, unset: [] },
-      { id: "edit-1", hostId: 7, totalS: 60 },
+      { id: "edit-1", hostId: 7 },
     );
     expect(res.body).toMatchObject({ displayName: "Newname", title: "New Title", colorHue: 180 });
     // The server never writes the file itself.
@@ -491,7 +498,7 @@ describe("PUT /identities/:identityKey — the change goes through the machine's
     expect(sentArgs()).toEqual({ name: "testkey", set: {}, unset: ["title", "task", "voice", "colorHue"] });
   });
 
-  it("a new picture is saved under a fresh name first, then put in place by the change", async () => {
+  it("a new picture waits in the front door's uploads folder, then the change puts it in place", async () => {
     const res = await put(
       { hostId: 7, requestId: "pic-1" },
       { filename: "avatar.png", contentType: "image/png", bytes: Buffer.from("newpng") },
@@ -499,10 +506,11 @@ describe("PUT /identities/:identityKey — the change goes through the machine's
     expect(res.status).toBe(200);
     expect(writeBinaryFileAtomicMock).toHaveBeenCalledTimes(1);
     const [, target, bytes] = writeBinaryFileAtomicMock.mock.calls[0];
-    expect(target).toBe("$HOME/fleet/identities/testkey/.avatar-upload-pic-1.png");
+    expect(execCommandMock).toHaveBeenCalledWith(expect.anything(), 'mkdir -p "$HOME/fleet/.changes/uploads"');
+    expect(target).toBe("$HOME/fleet/.changes/uploads/pic-1.png");
     expect(Buffer.isBuffer(bytes)).toBe(true);
-    expect(sentArgs()).toMatchObject({ avatar: { upload: ".avatar-upload-pic-1.png", ext: "png" } });
-    expect(writeBinaryFileAtomicMock.mock.invocationCallOrder[0]).toBeLessThan(submitAndFollowMock.mock.invocationCallOrder[0]);
+    expect(sentArgs()).toMatchObject({ avatar: { upload: "pic-1.png", ext: "png" } });
+    expect(writeBinaryFileAtomicMock.mock.invocationCallOrder[0]).toBeLessThan(submitFrontDoorMock.mock.invocationCallOrder[0]);
   });
 
   it("avatar:null removes the picture (the machine drops the line and the file)", async () => {
@@ -511,28 +519,28 @@ describe("PUT /identities/:identityKey — the change goes through the machine's
   });
 
   it("a refusal (being archived, gone) is the machine's 409 with its reason", async () => {
-    submitAndFollowMock.mockResolvedValue({ state: "refused", id: "x", seq: 1, code: "being_archived", reason: "it's being archived" });
+    submitFrontDoorMock.mockResolvedValue({ state: "refused", id: "x", seq: 1, code: "being_archived", reason: "it's being archived" });
     const res = await put({ hostId: 7, title: "T" });
     expect(res.status).toBe(409);
     expect(res.body).toMatchObject({ code: "being_archived", error: "it's being archived" });
-    submitAndFollowMock.mockResolvedValue({ state: "refused", id: "x", seq: 1, code: "not_found", reason: "there's no agent 'testkey' on this machine" });
+    submitFrontDoorMock.mockResolvedValue({ state: "refused", id: "x", seq: 1, code: "not_found", reason: "there's no agent 'testkey' on this machine" });
     expect((await put({ hostId: 7, title: "T" })).status).toBe(409);
   });
 
-  it("still waiting after the follow-up → 202", async () => {
-    submitAndFollowMock.mockResolvedValue({ state: "pending", id: "x", seq: 1, stage: "queued" });
+  it("still waiting after one wait → 202 (the app asks again by id)", async () => {
+    submitFrontDoorMock.mockResolvedValue({ state: "pending", id: "x", seq: 1, stage: "queued" });
     expect((await put({ hostId: 7, title: "T" })).status).toBe(202);
   });
 
   it("a machine still updating never took the picture: it's removed (REMOTE and LOCAL)", async () => {
-    submitAndFollowMock.mockResolvedValue({ state: "not_installed", id: "x" });
+    submitFrontDoorMock.mockResolvedValue({ state: "not_installed", id: "x" });
     const file = { filename: "a.png", contentType: "image/png", bytes: Buffer.from("png") };
     const r = await put({ hostId: 7, requestId: "u1" }, file);
     expect(r.status).toBe(503);
-    expect(execCommandMock).toHaveBeenCalledWith(expect.anything(), 'rm -f "$HOME/fleet/identities/testkey/.avatar-upload-u1.png"');
+    expect(execCommandMock).toHaveBeenCalledWith(expect.anything(), 'rm -f "$HOME/fleet/.changes/uploads/u1.png"');
     isLocalHostIdMock.mockReturnValue(true);
     await put({ hostId: 5, requestId: "u2" }, file);
-    expect(fsUnlinkSpy).toHaveBeenCalledWith("/tmp/test-identities/testkey/.avatar-upload-u2.png");
+    expect(fsUnlinkSpy).toHaveBeenCalledWith("/tmp/.changes/uploads/u2.png");
   });
 
   it("missing hostId → 400; an unreachable machine → 502", async () => {
@@ -541,14 +549,14 @@ describe("PUT /identities/:identityKey — the change goes through the machine's
     const r = await put({ hostId: 7, title: "T" });
     expect(r.status).toBe(502);
     expect(r.body).toMatchObject({ error: "identity home box unreachable" });
-    expect(submitAndFollowMock).not.toHaveBeenCalled();
+    expect(submitFrontDoorMock).not.toHaveBeenCalled();
   });
 
   it("LOCAL: no SSH; the front door is reached through the bind mount (conn null)", async () => {
     isLocalHostIdMock.mockReturnValue(true);
     expect((await put({ hostId: 5, title: "T" })).status).toBe(200);
     expect(connectOneShotMock).not.toHaveBeenCalled();
-    expect(submitAndFollowMock.mock.calls[0]?.[0]).toBeNull();
+    expect(submitFrontDoorMock.mock.calls[0]?.[0]).toBeNull();
   });
 
   it("the answer echoes the disk after the change (coordinator included)", async () => {
@@ -571,7 +579,7 @@ describe("PUT /identities/:identityKey — the change goes through the machine's
       peak = Math.max(peak, live);
       return { end: () => { live--; } };
     });
-    submitAndFollowMock.mockImplementation(async (_c: unknown, _k: string, _a: unknown, o: { id: string }) => {
+    submitFrontDoorMock.mockImplementation(async (_c: unknown, _k: string, _a: unknown, o: { id: string }) => {
       await new Promise((r) => setTimeout(r, 5));
       return { state: "done", id: o.id, seq: 1, result: {} };
     });

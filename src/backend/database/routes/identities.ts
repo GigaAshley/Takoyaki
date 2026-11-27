@@ -68,7 +68,7 @@ import { getAvatarVersion, forgetAvatarVersion } from "../../fleet-status/avatar
 import { normalizeAvatar, normalizeUploadedAvatar } from "../../utils/avatar-normalize.js";
 import { composeSplitAvatar, type SplitAvatarPart } from "../../utils/avatar-split.js";
 import { getCachedAvatar, invalidateCachedAvatar } from "./identity-avatar-cache.js";
-import { frontDoorHttp, requestIdFrom, submitAndFollow } from "../../fleet-change/front-door.js";
+import { frontDoorHttp, requestIdFrom, submitFrontDoor } from "../../fleet-change/front-door.js";
 
 const router = express.Router();
 const authManager = AuthManager.getInstance();
@@ -671,6 +671,7 @@ router.put(
       meta.colorHue !== undefined &&
       meta.colorHue !== null &&
       (typeof meta.colorHue !== "number" ||
+        !Number.isInteger(meta.colorHue) ||
         meta.colorHue < 0 ||
         meta.colorHue > 359)
     ) {
@@ -745,8 +746,9 @@ router.put(
         if (meta.avatar === null && !req.file) unset.push("avatar");
 
         const requestId = requestIdFrom(meta.requestId);
-        // A new picture is saved in the agent's folder under a fresh name first; the change
-        // puts it in place at its turn (and the machine removes it if the change is refused).
+        // A new picture waits in the front door's uploads folder (never the agent's own: an
+        // archive ahead in line may take the folder meanwhile); the change moves it into the
+        // agent's folder at its turn, and the machine removes it if the change is refused.
         let avatar: { upload: string; ext: string } | undefined;
         if (req.file) {
           await normalizeUploadedAvatar(req.file);
@@ -757,29 +759,32 @@ router.put(
           if (req.file.buffer.byteLength > IDMEDIT_MAX_AVATAR_BYTES) {
             return res.status(413).json({ error: "Avatar is too large" });
           }
-          avatar = { upload: `.avatar-upload-${requestId}.${mapped}`, ext: mapped };
-          await writeBinaryFileAtomic(
-            conn,
-            `$HOME/fleet/identities/${identityKey}/${avatar.upload}`,
-            req.file.buffer,
-          );
+          avatar = { upload: `${requestId}.${mapped}`, ext: mapped };
+          if (local) {
+            await fs.mkdir(path.join(path.dirname(getLocalIdentitiesRoot()), ".changes", "uploads"), { recursive: true });
+          } else if (conn) {
+            await execCommand(conn, `mkdir -p "$HOME/fleet/.changes/uploads"`);
+          }
+          await writeBinaryFileAtomic(conn, `$HOME/fleet/.changes/uploads/${avatar.upload}`, req.file.buffer);
         }
 
-        // Waits out a longer change ahead of it (an archive stopping apps) rather than
-        // answering "still working" to an edit the window is waiting on.
-        const outcome = await submitAndFollow(
+        // One wait (under the app's own timeout); still waiting after it → 202, and the app
+        // asks again by the request id.
+        const outcome = await submitFrontDoor(
           conn,
           "agent-edit",
           { name: identityKey, set, unset, ...(avatar ? { avatar } : {}) },
-          { id: requestId, hostId, totalS: 60 },
+          { id: requestId, hostId },
         );
         if (outcome.state === "not_installed" && avatar) {
           // The machine never took it: the picture saved for it isn't wanted.
           const upload = avatar.upload;
           if (local) {
-            await fs.unlink(path.join(getLocalIdentitiesRoot(), identityKey, upload)).catch(() => undefined);
+            await fs
+              .unlink(path.join(path.dirname(getLocalIdentitiesRoot()), ".changes", "uploads", upload))
+              .catch(() => undefined);
           } else if (conn) {
-            await execCommand(conn, `rm -f "$HOME/fleet/identities/${identityKey}/${upload}"`).catch(() => undefined);
+            await execCommand(conn, `rm -f "$HOME/fleet/.changes/uploads/${upload}"`).catch(() => undefined);
           }
         }
         databaseLogger.info("identity edit requested", {

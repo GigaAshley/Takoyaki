@@ -103,7 +103,9 @@ function statusOf(err: unknown): number | undefined {
 function interpretError(err: unknown): string {
   const status = statusOf(err);
   if (status === 400) {
-    return "Project name needs at least one letter.";
+    return err instanceof Error && /one line/.test(err.message)
+      ? "Project name must be on one line."
+      : "Project name needs at least one letter.";
   }
   // The machine's own reason (e.g. the parent project is gone, or it's still working on it).
   if (err instanceof MachineChangeError || (err instanceof Error && /still working/.test(err.message))) {

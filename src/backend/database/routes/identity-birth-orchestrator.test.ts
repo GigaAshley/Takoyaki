@@ -301,11 +301,15 @@ describe("mint-first atomic-birth flow", () => {
     expect(events.find((e) => e.type === "ended")).toMatchObject({ ok: true, notFiled: "that project is gone" });
   });
 
-  it("the front door can't take the filing but the project is there: left as made", async () => {
+  it.each([
+    ["the project is there", { state: "not_installed", id: "x" }, "yes"],
+    ["its archive was claimed meanwhile", { state: "not_installed", id: "x" }, "claimed"],
+    ["the machine refused or failed it (its say, not checked over)", { state: "failed", id: "x", seq: 1, code: "internal", reason: "x" }, "no"],
+  ])("filing not taken but %s: left as made", async (_what, outcome, checked) => {
     const { submitFrontDoor } = await import("../../fleet-change/front-door.js");
     const reader = await import("../../claude-session/identity-artifact-reader.js");
-    (submitFrontDoor as unknown as Mock).mockResolvedValue({ state: "failed", id: "x", seq: 1, code: "internal", reason: "x" });
-    (reader.execWithTimeout as unknown as Mock).mockResolvedValue("yes\n");
+    (submitFrontDoor as unknown as Mock).mockResolvedValue(outcome);
+    (reader.execWithTimeout as unknown as Mock).mockResolvedValue(`${checked}\n`);
     (reader.writeIdentityFile as unknown as Mock).mockClear();
     const { events, emit } = collectEvents();
     const birthPromise = birthIdentity({ ...makeOpts(), project: "garden" }, emit, makeDeps());

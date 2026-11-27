@@ -1430,8 +1430,9 @@ async function fileIntoProjectByFrontDoor(
     if (outcome.state === "done") {
       const r = (outcome.result as { notFiled?: unknown } | null)?.notFiled;
       notFiled = typeof r === "string" ? r : undefined;
-    } else if (outcome.state !== "pending") {
-      // A pending one is carried out by the machine when its turn comes.
+    } else if (outcome.state === "not_installed") {
+      // The machine never took it (still updating): check here. A pending one is carried out
+      // by the machine at its turn; a refused or failed one is the machine's say.
       notFiled = await unfileIfProjectGone(conn, name, project);
     }
   } catch (err) {
@@ -1460,19 +1461,30 @@ async function fileIntoProjectByFrontDoor(
 }
 
 /** Without the front door: if the project is gone, take the newborn's project line out
- *  (that line only) and say why. */
+ *  (that line only) and say why. Never touches an agent whose archive is claimed. */
 async function unfileIfProjectGone(conn: SSHClient | null, name: string, project: string): Promise<string | undefined> {
-  let exists: boolean;
+  let state: string;
   if (conn === null) {
-    exists = await fs
-      .access(path.join(getLocalProjectsRoot(), project, "project.md"))
-      .then(() => true)
-      .catch(() => false);
+    const there = (p: string) =>
+      fs
+        .access(p)
+        .then(() => true)
+        .catch(() => false);
+    state = (await there(path.join(getLocalIdentitiesRoot(), name, ".archiving")))
+      ? "claimed"
+      : (await there(path.join(getLocalProjectsRoot(), project, "project.md")))
+        ? "yes"
+        : "no";
   } else {
-    const out = await execWithTimeout(conn, `test -f "$HOME/fleet/projects/${project}/project.md" && echo yes || echo no`);
-    exists = out.trim() === "yes";
+    state = (
+      await execWithTimeout(
+        conn,
+        `if [ -e "$HOME/fleet/identities/${name}/.archiving" ]; then echo claimed; ` +
+          `elif [ -f "$HOME/fleet/projects/${project}/project.md" ]; then echo yes; else echo no; fi`,
+      )
+    ).trim();
   }
-  if (exists) return undefined;
+  if (state !== "no") return undefined;
   const { markdown } = await readIdentityFileMd(conn, name);
   const fm = markdown.match(/^(\uFEFF?---\r?\n)((?:[^\n]*\n)*?)(---(?:\r?\n|$))/);
   if (fm) {

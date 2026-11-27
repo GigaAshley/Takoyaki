@@ -3079,6 +3079,16 @@ export function unpinConversation(id: string): void {
   writePin(id, false);
 }
 
+/**
+ * The machine already took the pin off (moving into a project unpins in the same change):
+ * drop it on screen only, sending nothing — unless a newer pin click on this row is still
+ * under way, which then stands.
+ */
+export function forgetPinLocally(id: string): void {
+  if (pendingPinIntents.has(id)) return;
+  setPinnedLocal(id, false);
+}
+
 export function togglePinConversation(id: string): void {
   if (state.pinnedIds.has(id)) unpinConversation(id);
   else pinConversation(id);

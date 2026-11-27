@@ -23,6 +23,7 @@ import {
   usePinnedIds,
   pinConversation,
   unpinConversation,
+  forgetPinLocally,
   useProjects,
 } from "@/state/conversation-store";
 import { orderProjectsAsTree } from "@/state/project-tree";
@@ -286,12 +287,16 @@ export const IdentitySessionPane = forwardRef<IdentityPaneHandle, IdentitySessio
           if (pinnedIds.has(tabId)) unpinConversation(tabId);
         };
         const setProject = (slug: string | null) => {
-          // Moving into a project unpins (the backend route removes
-          // `.pinned` too; this keeps the local pin set from lagging). Only
-          // after the write lands, so a failed move keeps the pin.
+          // Moving into a project unpins: the machine takes the pin off in the
+          // same change, so only the screen catches up (sending an unpin could
+          // land after a newer pin click). Only once it's done, so a failed
+          // move keeps the pin.
           void setSessionProject(hostIdNum, identityKey, slug)
             .then(() => {
-              if (slug !== null) unpinLocal();
+              if (slug !== null) {
+                forgetPinLocally(shadowFleetId);
+                forgetPinLocally(tabId);
+              }
             })
             .catch((err: unknown) => {
               const msg = err instanceof Error ? err.message : String(err);

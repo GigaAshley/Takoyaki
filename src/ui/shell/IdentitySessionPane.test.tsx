@@ -112,6 +112,7 @@ vi.mock("@/state/conversation-store", () => ({
   fleetRowId: (hostId: number, session: string) => `fleet::${hostId}::${session}`,
   pinConversation: vi.fn(),
   unpinConversation: vi.fn(),
+  forgetPinLocally: vi.fn(),
 }));
 
 // ── Mock: TabContext ──────────────────────────────────────────────────────────
@@ -605,7 +606,7 @@ describe("IdentitySessionPane — Phase 41 Plan 02", () => {
       expect(mockSetSessionProject).not.toHaveBeenCalled();
     });
 
-    it("picking a project while pinned unpins locally AND fires setSessionProject", async () => {
+    it("picking a project while pinned fires setSessionProject, then drops the pin on screen only", async () => {
       const store = await setPinnedIds(["fleet::42::tina"]);
       mockProjectsList = [
         { slug: "local-a", displayName: "Local A", hostId: "42", hostname: "box-1", archived: false },
@@ -614,10 +615,12 @@ describe("IdentitySessionPane — Phase 41 Plan 02", () => {
       getMoveToSubmenu().find((s) => s.label === "Local A")!.onClick();
       expect(mockSetSessionProject).toHaveBeenCalledTimes(1);
       expect(mockSetSessionProject).toHaveBeenCalledWith(42, "tina", "local-a");
-      // Unpin waits for the project write to land.
+      // Once the move is done: the machine took the pin off in the same change, so no
+      // unpin is sent — the screen just catches up.
       await vi.waitFor(() =>
-        expect(store.unpinConversation).toHaveBeenCalledWith("fleet::42::tina"),
+        expect(store.forgetPinLocally).toHaveBeenCalledWith("fleet::42::tina"),
       );
+      expect(store.unpinConversation).not.toHaveBeenCalled();
       expect(store.pinConversation).not.toHaveBeenCalled();
     });
 
@@ -632,6 +635,7 @@ describe("IdentitySessionPane — Phase 41 Plan 02", () => {
       // Flush the rejected write's .then/.catch (suite runs fake timers).
       for (let i = 0; i < 5; i++) await Promise.resolve();
       expect(store.unpinConversation).not.toHaveBeenCalled();
+      expect(store.forgetPinLocally).not.toHaveBeenCalled();
     });
 
     it("Remove from project on a stale-pinned member drops the pin too (lands in Conversations)", async () => {

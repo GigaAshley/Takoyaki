@@ -37,6 +37,12 @@ vi.mock("../../sharing/host-conn.js", () => {
   }
   return { HttpError, withHost: vi.fn() };
 });
+let mockUsername: string | null = "riley";
+let mockMultiUser = true;
+vi.mock("../../utils/host-user-counter.js", () => ({
+  getUsernameForUserId: vi.fn(async () => mockUsername),
+  isHostMultiUser: vi.fn(async () => mockMultiUser),
+}));
 const publishSessionProjectChanged = vi.fn();
 let registry: { publishSessionProjectChanged: Mock } | null = { publishSessionProjectChanged };
 vi.mock("../../fleet-status/subscription-registry.js", () => ({ getSubscriptionRegistry: () => registry }));
@@ -75,6 +81,8 @@ function answer(outcome: Record<string, unknown>): void {
 beforeEach(async () => {
   vi.clearAllMocks();
   mockUserId = "1";
+  mockUsername = "riley";
+  mockMultiUser = true;
   registry = { publishSessionProjectChanged };
   (withHost as Mock).mockImplementation(async (_h: number, _u: string, fn: (c: unknown) => Promise<unknown>) => fn(conn));
   answer({ state: "done", result: { name: "alpha", project: "garden", unpinned: false } });
@@ -92,14 +100,14 @@ describe("POST /identities/:key/project", () => {
     const r = await call(server, "/identities/alpha/project", { hostId: 5, project: "garden", requestId: "click-1" });
     expect(r.status).toBe(200);
     expect(r.body).toMatchObject({ ok: true, requestId: "click-1", result: { project: "garden" } });
-    expect(submitFrontDoor).toHaveBeenCalledWith(conn, "agent-project", { name: "alpha", project: "garden" }, { id: "click-1", hostId: 5 });
+    expect(submitFrontDoor).toHaveBeenCalledWith(conn, "agent-project", { name: "alpha", project: "garden", asker: "riley" }, { id: "click-1", hostId: 5 });
     expect(publishSessionProjectChanged).toHaveBeenCalledWith("alpha", 5, "garden");
   });
 
   it("clears with null", async () => {
     const r = await call(server, "/identities/alpha/project", { hostId: 5, project: null });
     expect(r.status).toBe(200);
-    expect(submitFrontDoor).toHaveBeenCalledWith(conn, "agent-project", { name: "alpha", project: null }, expect.anything());
+    expect(submitFrontDoor).toHaveBeenCalledWith(conn, "agent-project", { name: "alpha", project: null, asker: null }, expect.anything());
     expect(publishSessionProjectChanged).toHaveBeenCalledWith("alpha", 5, null);
   });
 
@@ -133,6 +141,16 @@ describe("POST /identities/:key/project", () => {
       throw new Error("ws down");
     });
     expect((await call(server, "/identities/alpha/project", { hostId: 5, project: "garden" })).status).toBe(200);
+  });
+
+  it("who's asking can't be told on a shared machine → 503, nothing sent; on a machine one person uses it goes ahead", async () => {
+    mockUsername = null;
+    const r = await call(server, "/identities/alpha/project", { hostId: 5, project: "garden" });
+    expect(r.status).toBe(503);
+    expect(submitFrontDoor).not.toHaveBeenCalled();
+    mockMultiUser = false;
+    expect((await call(server, "/identities/alpha/project", { hostId: 5, project: "garden" })).status).toBe(200);
+    expect(submitFrontDoor).toHaveBeenCalledWith(conn, "agent-project", { name: "alpha", project: "garden", asker: null }, expect.anything());
   });
 
   it("validates before touching the machine", async () => {

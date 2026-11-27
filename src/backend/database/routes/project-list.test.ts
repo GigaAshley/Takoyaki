@@ -544,12 +544,22 @@ describe("POST /projects (front door)", () => {
     expect(mockPublishProjectListChanged).not.toHaveBeenCalled();
   });
 
-  it("falls open when the shared-machine check or the username lookup fails", async () => {
-    (isHostMultiUser as Mock).mockRejectedValue(new Error("db"));
+  it("an unknown asker: fine on a machine one person uses, refused (503) on a shared one", async () => {
     (getUsernameForUserId as Mock).mockRejectedValue(new Error("db"));
+    (isHostMultiUser as Mock).mockResolvedValue(false);
     const res = await httpRequest(server, { method: "POST", path: "/projects", body: { hostId: 5, displayName: "X" } });
     expect(res.status).toBe(200);
     expect(sent("project-create")).toMatchObject({ asker: null, multiUser: false });
+    (submitFrontDoor as Mock).mockClear();
+    (isHostMultiUser as Mock).mockResolvedValue(true);
+    for (const [path, body] of [
+      ["/projects", { hostId: 5, displayName: "X" }],
+      ["/projects/c/parent", { hostId: 5, parent: null }],
+      ["/projects/c/rename", { hostId: 5, displayName: "Y" }],
+    ] as const) {
+      expect((await httpRequest(server, { method: "POST", path, body })).status).toBe(503);
+    }
+    expect(submitFrontDoor).not.toHaveBeenCalled();
   });
 
   it("a long name's base slug is cut to what the machine takes (room for -2, -3, …)", async () => {

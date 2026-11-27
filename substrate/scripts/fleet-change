@@ -85,16 +85,16 @@ Request kinds:
                     current audience in its own users: list
                     "asker" (a username, or null) is who the visibility checks are for: a
                     project hidden from them answers like one that doesn't exist.
-  agent-project     {"name", "project": "<slug>"|null, "birth"?: true}  Move to / Remove from
+  agent-project     {"name", "project": "<slug>"|null, "asker"?, "birth"?: true}  Move to / Remove from
                     project; moving in unpins. "birth": a new agent's filing — a project gone
                     by now leaves it in Conversations (result notFiled says why).
   agent-pin         {"name", "pinned": bool}  pinning takes it out of its project
   agent-edit        {"name", "set": {displayName|title|task|colorHue|voice: value},
                      "unset": [title|task|colorHue|voice|avatar],
-                     "avatar"?: {"upload": ".avatar-upload-<x>.<ext>", "ext"}}
-                    only those lines change. A new picture is saved in the agent's folder
-                    under the upload name first and put in place at its turn (removed when
-                    the change is refused).
+                     "avatar"?: {"upload": "<file in uploads/>", "ext"}}
+                    only those lines change. A new picture waits in uploads/ (saved there
+                    by the server) and is moved into the agent's folder at its turn; it's
+                    removed when the change is refused, or after an hour if it never comes.
                     Every agent change is refused with being_archived while its archive is
                     claimed.
 
@@ -105,6 +105,7 @@ On disk, all under ~/fleet/.changes/:
   outcomes/<id>.json        the outcome, kept for OUTCOME_KEEP_S
   background/<id>.json      a request handed to the supervisor to finish
   returning/<name>.json     an agent un-archive under way: {"name","ids":[...]}
+  uploads/<file>            a new agent picture waiting for its agent-edit
   next-seq                  the next request number
   .serve.lock               held by the one running listener
 
@@ -140,6 +141,10 @@ APPS = os.path.join(FLEET, "apps")
 APPS_ARCHIVE = os.path.join(FLEET, "apps-archive")
 BACKGROUND = os.path.join(ROOT, "background")
 RETURNING = os.path.join(ROOT, "returning")
+# New agent pictures, saved here by the server and moved into the agent's folder at the
+# change's turn (never into the folder before then: an archive may take it meanwhile).
+UPLOADS = os.path.join(ROOT, "uploads")
+UPLOAD_KEEP_S = 3600
 SKILL_DIR = os.path.join(os.path.expanduser("~"), ".claude", "skills", "app-development")
 APP_UNITS = os.environ.get("FLEET_CHANGE_APP_UNITS") or os.path.join(SKILL_DIR, "app-units.sh")
 MOVE_APP = os.environ.get("FLEET_CHANGE_MOVE_APP") or os.path.join(SKILL_DIR, "move-app.sh")
@@ -176,7 +181,7 @@ def log(msg):
 
 
 def ensure_dirs():
-    for d in (ROOT, INCOMING, JOURNAL, OUTCOMES, BACKGROUND, RETURNING):
+    for d in (ROOT, INCOMING, JOURNAL, OUTCOMES, BACKGROUND, RETURNING, UPLOADS):
         os.makedirs(d, exist_ok=True)
 
 
@@ -393,12 +398,14 @@ def fm_list(path, key, pattern):
 
     def clean(v):
         v = v.strip()
-        if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+        if v.startswith('"'):
             try:
-                return json.loads(v)
+                return json.JSONDecoder().raw_decode(v)[0]
             except ValueError:
-                return v[1:-1]
-        return re.sub(r"\s+#.*$", "", v).strip().strip("'").strip()
+                pass
+        if v.startswith("'") and "'" in v[1:]:
+            return v[1:v.index("'", 1)]
+        return re.sub(r"\s+#.*$", "", v).strip().strip("\"'").strip()
 
     for i in range(1, end):
         m = re.match(r"^%s:(.*)$" % re.escape(key), lines[i])
@@ -1139,7 +1146,7 @@ def do_app_unarchive(args, entry, save_plan):
 FM_RE = re.compile(r"^(﻿?---\r?\n)((?:[^\n]*\n)*?)(---(?:\r?\n|$))")
 USERNAME_RE = re.compile(r"^[^\s,\[\]#]{1,128}$")
 AVATAR_EXTS = ("webp", "png", "jpg", "gif", "svg")
-UPLOAD_RE = re.compile(r"^\.avatar-upload-[A-Za-z0-9._-]{1,100}\.(webp|png|jpg|gif|svg)$")
+UPLOAD_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]{0,90}\.(webp|png|jpg|gif|svg)$")
 VOICE_RE = re.compile(r"^[A-Za-z0-9._:-]{1,80}$")
 MOVE_INTO_SELF = "cannot move a project inside itself or its own sub-project"
 
@@ -1163,11 +1170,14 @@ def write_text_atomic(path, text):
     os.replace(tmp, path)
 
 
-def yaml_str(v, quote=False):
-    """A one-line YAML scalar for a string: plain when that reads back as the same string."""
-    if not quote and re.match(r"^[A-Za-z0-9][A-Za-z0-9 _./()+-]*$", v) and not v.endswith(" ") \
-            and v.lower() not in ("true", "false", "yes", "no", "on", "off", "null", "y", "n") \
-            and not re.match(r"^[0-9][0-9._+-]*$", v):
+YAML_WORDS = ("true", "false", "yes", "no", "on", "off", "null", "y", "n")
+
+
+def yaml_str(v, quote=False, chars=r" _./()+-"):
+    """A one-line YAML scalar for a string: plain only when it starts with a letter (so it
+    can't read back as a number) and isn't a word YAML reads as true / false / null."""
+    if not quote and re.match(r"^[A-Za-z][A-Za-z0-9%s]*$" % re.escape(chars), v) and not v.endswith(" ") \
+            and v.lower() not in YAML_WORDS:
         return v
     return json.dumps(v, ensure_ascii=False)
 
@@ -1198,7 +1208,11 @@ def edit_frontmatter(text, changes, after=("displayName",)):
     None when the file has no closed frontmatter."""
     m = FM_RE.match(text)
     if not m:
-        return None
+        # A file with no frontmatter gets one; an opening fence never closed is broken.
+        if re.match(r"^\ufeff?---\r?\n", text):
+            return None
+        text = "---\n---\n" + text
+        m = FM_RE.match(text)
     eol = "\r\n" if m.group(1).endswith("\r\n") else "\n"
     lines = re.findall(r"[^\n]*\n", m.group(2))
     after = list(after)
@@ -1219,7 +1233,7 @@ def edit_frontmatter(text, changes, after=("displayName",)):
 
 
 def users_block(users):
-    return ["users:"] + ["  - %s" % (u if re.match(r"^[A-Za-z0-9._@-]+$", u) else json.dumps(u)) for u in users]
+    return ["users:"] + ["  - %s" % yaml_str(u, chars="._@-") for u in users]
 
 
 def fm_value(text, key):
@@ -1247,7 +1261,11 @@ def projects_with_users():
 def project_chain(projects, slug, parent_override=False, parent=None):
     """slug and the projects above it (cycle-safe), nearest first."""
     chain, node = [], slug
-    while isinstance(node, str) and node in projects and node not in chain:
+    while isinstance(node, str) and node in projects:
+        if node in chain:
+            # A hand-made loop: cut where it closes, as the app's reader does.
+            del chain[chain.index(node) + 1:]
+            break
         chain.append(node)
         node = parent if (node == slug and parent_override) else projects[node]["parent"]
     return chain
@@ -1286,9 +1304,13 @@ def check_display_name(args, key="displayName"):
     return v.strip()
 
 
-def project_gone(slug):
-    if archived_project_dir(slug) is not None:
-        return Refused("project_archived", "the project \"%s\" is archived" % project_label(slug))
+def project_gone(slug, asker=None):
+    """The refusal for a project that isn't live. Its name only to someone who could see it."""
+    d = archived_project_dir(slug)
+    if d is not None:
+        users = fm_list(os.path.join(PROJECTS_ARCHIVE, d, "project.md"), "users", USERNAME_RE)
+        if asker is None or not users or asker in users:
+            return Refused("project_archived", "the project \"%s\" is archived" % project_label(slug))
     return Refused("project_not_found", "that project is gone")
 
 
@@ -1441,6 +1463,7 @@ def do_agent_project(args, entry, save_plan):
     project = args.get("project")
     if project is not None and (not isinstance(project, str) or not SLUG_RE.match(project) or project == "archive"):
         raise Refused("bad_request", "project must match [a-z0-9-]{1,64} or be null")
+    asker = check_asker(args)
     path = agent_file(name)
     if args.get("birth") is True:
         # A new agent made into a project: it was written with its project; filed only if the
@@ -1452,8 +1475,11 @@ def do_agent_project(args, entry, save_plan):
         gone = project_gone(project)
         log("agent '%s' made into '%s', which is gone — left in Conversations" % (name, project))
         return {"name": name, "project": None, "notFiled": gone.reason}
-    if project is not None and not os.path.isfile(os.path.join(PROJECTS, project, "project.md")):
-        raise project_gone(project)
+    if project is not None and not visible_to(projects_with_users(), project, asker):
+        # A project hidden from the asker answers exactly like one that's gone.
+        if os.path.isfile(os.path.join(PROJECTS, project, "project.md")):
+            raise Refused("project_not_found", "that project is gone")
+        raise project_gone(project, asker)
     edit_agent(path, {"project": ["project: %s" % project] if project is not None else None})
     unpinned = False
     if project is not None and os.path.exists(os.path.join(IDENTITIES, name, ".pinned")):
@@ -1487,10 +1513,10 @@ def do_agent_pin(args, entry, save_plan):
     return {"name": name, "pinned": pinned, "previousProject": previous}
 
 
-def drop_upload(name, upload):
+def drop_upload(upload):
     if isinstance(upload, str) and UPLOAD_RE.match(upload):
         try:
-            os.unlink(os.path.join(IDENTITIES, name, upload))
+            os.unlink(os.path.join(UPLOADS, upload))
         except OSError:
             pass
 
@@ -1519,7 +1545,7 @@ def do_agent_edit(args, entry, save_plan):
             elif key == "voice":
                 if not isinstance(v, str) or not VOICE_RE.match(v):
                     raise Refused("bad_request", "voice must be a voice id")
-                changes[key] = ["voice: %s" % yaml_str(v)]
+                changes[key] = ["voice: %s" % yaml_str(v, chars="._:-")]
             else:
                 raise Refused("bad_request", "can't set '%s'" % key)
         for key in unset:
@@ -1533,19 +1559,19 @@ def do_agent_edit(args, entry, save_plan):
                 raise Refused("bad_request", "avatar must name an upload and its extension")
         path = agent_file(name)
         d = os.path.join(IDENTITIES, name)
-        if upload is not None and not os.path.isfile(os.path.join(d, upload)):
+        if upload is not None and not os.path.isfile(os.path.join(UPLOADS, upload)):
             raise Refused("upload_missing", "the new picture didn't arrive; try again")
     except Refused:
-        if NAME_RE.match(str(args.get("name", ""))):
-            drop_upload(args["name"], upload)
+        drop_upload(upload)
         raise
     old_pic = fm_value(read_text(path), "avatar")
     old_ext = old_pic[len(name) + 1:] if old_pic and old_pic.startswith(name + ".") else None
     if upload is not None:
-        # The picture was saved under a fresh name; put it in place now that it's this change's turn.
-        os.replace(os.path.join(d, upload), os.path.join(d, "%s.%s" % (name, pic["ext"])))
         changes["avatar"] = ["avatar: %s.%s" % (name, pic["ext"])]
     edit_agent(path, changes)
+    if upload is not None:
+        # The picture waited outside the agent's folder; it goes in now that it's this change's turn.
+        os.replace(os.path.join(UPLOADS, upload), os.path.join(d, "%s.%s" % (name, pic["ext"])))
     if old_ext in AVATAR_EXTS and (("avatar" in changes and changes["avatar"] is None)
                                    or (upload is not None and old_ext != pic["ext"])):
         try:
@@ -1713,6 +1739,18 @@ def prune():
         p = os.path.join(OUTCOMES, name)
         try:
             if os.stat(p).st_mtime < cutoff:
+                os.unlink(p)
+        except OSError:
+            pass
+    # Pictures whose change never came (the server lost its connection mid-way).
+    try:
+        names = os.listdir(UPLOADS)
+    except OSError:
+        names = []
+    for name in names:
+        p = os.path.join(UPLOADS, name)
+        try:
+            if os.stat(p).st_mtime < time.time() - UPLOAD_KEEP_S:
                 os.unlink(p)
         except OSError:
             pass

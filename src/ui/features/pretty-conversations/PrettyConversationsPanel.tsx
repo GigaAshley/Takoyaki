@@ -89,6 +89,7 @@ import {
 } from "@/shell/badge-drag";
 
 import {
+  forgetPinLocally,
   useConversations,
   useSelectedConversationId,
   usePinnedIds,
@@ -1901,6 +1902,14 @@ export function PrettyConversationsPanel({
   };
   const unpinForProjectMoveRef = useRef(unpinForProjectMove);
   unpinForProjectMoveRef.current = unpinForProjectMove;
+  // An agent moved into a project: its machine took the pin off in the same change, so only
+  // the screen catches up. Sending an unpin here could land after a newer pin click.
+  const dropPinAfterAgentMove = (p: { id: string; host?: { id: string } | null; targetTmuxSession?: string | null }) => {
+    forgetPinLocally(p.id);
+    if (p.host && p.targetTmuxSession) forgetPinLocally(fleetRowId(parseInt(p.host.id, 10), p.targetTmuxSession));
+  };
+  const dropPinAfterAgentMoveRef = useRef(dropPinAfterAgentMove);
+  dropPinAfterAgentMoveRef.current = dropPinAfterAgentMove;
 
   // (Phase 115 Plan 115-02: prior `handleToggleHide` handler retired per
   //  D-21 alongside the Hide/Show context-menu item on both the sidebar row
@@ -2293,7 +2302,7 @@ export function PrettyConversationsPanel({
       setSessionProject(hostIdNum, identityKey, slug)
         .then(() => {
           // After the write lands (see handleRowMoveToProject).
-          unpinForProjectMoveRef.current({ id: payload.id, host: payload.host, targetTmuxSession: payload.targetTmuxSession });
+          dropPinAfterAgentMoveRef.current({ id: payload.id, host: payload.host, targetTmuxSession: payload.targetTmuxSession });
         })
         .catch((err: unknown) => {
           const msg = err instanceof Error ? err.message : String(err);
@@ -2473,7 +2482,7 @@ export function PrettyConversationsPanel({
       // just catches the local pin set up).
       setSessionProject(hostIdNum, identityKey, slug)
         .then(() => {
-          if (slug !== null) unpinForProjectMoveRef.current(row);
+          if (slug !== null) dropPinAfterAgentMoveRef.current(row);
         })
         .catch((err: unknown) => {
           const msg = err instanceof Error ? err.message : String(err);

@@ -95,7 +95,8 @@ import {
   submitFrontDoor,
   type FrontDoorKind,
 } from "../../fleet-change/front-door.js";
-import { answerFromFrontDoor } from "../../fleet-change/front-door-route.js";
+import { answerFromFrontDoor, askerFor } from "../../fleet-change/front-door-route.js";
+import { HttpError } from "../../sharing/host-conn.js";
 import { findProjectRooms, releaseProjectRooms } from "../../fleet-change/project-rooms.js";
 
 /** What a project archive takes, as the machine reports it (fleet-change project-contents). */
@@ -402,19 +403,6 @@ async function visibleSlugsForCaller(
 }
 
 
-/** Who the visibility checks are for: the caller's username, or null (no gate) when it can't
- *  be looked up — the same fall-open as GET /. */
-async function askerFor(userId: string): Promise<string | null> {
-  try {
-    return await getUsernameForUserId(userId);
-  } catch (err) {
-    databaseLogger.warn(
-      `projects: caller username lookup threw — visibility gate open for write userId=${userId}: ${err instanceof Error ? err.message : String(err)}`,
-    );
-    return null;
-  }
-}
-
 /**
  * A project change through the machine's front door (create, rename, move): carried out in
  * turn with the machine's other changes, its checks made there and then. Once done, every
@@ -436,11 +424,21 @@ async function projectChange(
     res.status(400).json({ error: "SSH is not enabled on this host" });
     return;
   }
+  let asker: string | null;
+  try {
+    asker = await askerFor(userId, opts.hostId);
+  } catch (err) {
+    if (err instanceof HttpError) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
+    throw err;
+  }
   await answerFromFrontDoor(res, {
     hostId: opts.hostId,
     userId,
     kind: opts.kind,
-    args: opts.args,
+    args: { ...opts.args, asker },
     requestId: requestIdFrom((req.body as { requestId?: unknown } | undefined)?.requestId),
     operation: opts.operation,
     onDone: async (conn) => {
@@ -529,7 +527,6 @@ router.post(
         baseSlug,
         displayName: rawDN.trim(),
         parent,
-        asker: await askerFor(userId),
         multiUser,
       },
       operation: "project_create",
@@ -889,7 +886,7 @@ router.post(
     await projectChange(req, res, {
       hostId: parsedHost.hostId,
       kind: "project-move",
-      args: { slug, parent, asker: await askerFor((req as AuthenticatedRequest).userId) },
+      args: { slug, parent },
       operation: "project_set_parent",
     });
   },
@@ -918,7 +915,7 @@ router.post(
     await projectChange(req, res, {
       hostId: parsedHost.hostId,
       kind: "project-rename",
-      args: { slug, displayName: name, asker: await askerFor((req as AuthenticatedRequest).userId) },
+      args: { slug, displayName: name },
       operation: "project_rename",
     });
   },

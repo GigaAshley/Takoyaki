@@ -718,15 +718,16 @@ test_agent_edit_changes_only_its_lines() {
   local s; s=$(setup)
   agent "$s" finch ""
   printf -- '---\nroles: [eng]\ndisplayName: Finch\ntask: "Old"\ncustom: keep\navatar: finch.png\n---\nBody stays.\n' > "$s/fleet/identities/finch/finch.md"
-  : > "$s/fleet/identities/finch/finch.png"; printf 'new' > "$s/fleet/identities/finch/.avatar-upload-u1.webp"
-  submit "$s" agent-edit '{"name":"finch","set":{"displayName":"Finch Two","task":"Ship: it","colorHue":12,"voice":"alloy"},"avatar":{"upload":".avatar-upload-u1.webp","ext":"webp"}}' e1
+  : > "$s/fleet/identities/finch/finch.png"
+  mkdir -p "$s/fleet/.changes/uploads"; printf 'new' > "$s/fleet/.changes/uploads/u1.webp"
+  submit "$s" agent-edit '{"name":"finch","set":{"displayName":"Finch Two","task":"Ship: it","colorHue":12,"voice":"alloy"},"avatar":{"upload":"u1.webp","ext":"webp"}}' e1
   serve_once "$s"
   assert_eq done "$(field "$(fc "$s" status e1)" state)" "edited"
   assert_eq "$(printf -- '---\nroles: [eng]\ndisplayName: Finch Two\ntask: "Ship: it"\ncolorHue: '"'"'12'"'"'\nvoice: alloy\ncustom: keep\navatar: finch.webp\n---\nBody stays.')" \
     "$(cat "$s/fleet/identities/finch/finch.md")" "only those lines"
   assert_eq new "$(cat "$s/fleet/identities/finch/finch.webp")" "picture in place"
   assert_absent "$s/fleet/identities/finch/finch.png" "old picture gone"
-  assert_absent "$s/fleet/identities/finch/.avatar-upload-u1.webp" "upload used up"
+  assert_absent "$s/fleet/.changes/uploads/u1.webp" "upload used up"
   submit "$s" agent-edit '{"name":"finch","unset":["avatar","task"]}' e2
   serve_once "$s"
   grep -q '^avatar:\|^task:' "$s/fleet/identities/finch/finch.md" && fail "removed lines still there"
@@ -737,15 +738,53 @@ test_agent_edit_changes_only_its_lines() {
 test_agent_changes_refused_while_its_archive_is_claimed() {
   local s; s=$(setup)
   project "$s" garden "Garden"; agent "$s" finch ""
-  printf 'x' > "$s/fleet/identities/finch/.avatar-upload-u2.png"
+  mkdir -p "$s/fleet/.changes/uploads"; printf 'x' > "$s/fleet/.changes/uploads/u2.png"
   submit "$s" agent-archive '{"name":"finch"}' a1
   submit "$s" agent-project '{"name":"finch","project":"garden"}' p1
   submit "$s" agent-pin '{"name":"finch","pinned":true}' p2
-  submit "$s" agent-edit '{"name":"finch","set":{"task":"x"},"avatar":{"upload":".avatar-upload-u2.png","ext":"png"}}' e1
+  submit "$s" agent-edit '{"name":"finch","set":{"task":"x"},"avatar":{"upload":"u2.png","ext":"png"}}' e1
   serve_once "$s"
   for id in p1 p2 e1; do assert_eq being_archived "$(field "$(fc "$s" status $id)" code)" "$id refused"; done
-  assert_absent "$s/fleet/identities/finch/.avatar-upload-u2.png" "unused picture removed"
+  assert_absent "$s/fleet/.changes/uploads/u2.png" "unused picture removed"
+  assert_absent "$s/fleet/identities/finch/u2.png" "never put in its folder"
   assert_absent "$s/fleet/identities/finch/.pinned" "not pinned"
+  rm -rf "$s"
+}
+
+test_odd_usernames_and_names_stay_strings() {
+  local s; s=$(setup)
+  project "$s" team "Team"; limited "$s" team 123 true; project "$s" sub "Sub" team
+  submit "$s" project-move '{"slug":"sub","parent":null}' m1
+  submit "$s" project-create '{"baseSlug":"e","displayName":"1e5"}' c1
+  serve_once "$s"
+  assert_eq "$(printf -- '---\ndisplayName: Sub\nusers:\n  - "123"\n  - "true"\n---')" "$(cat "$s/fleet/projects/sub/project.md")" "usernames quoted"
+  assert_eq 'displayName: "1e5"' "$(sed -n 2p "$s/fleet/projects/e/project.md")" "a number-looking name quoted"
+  rm -rf "$s"
+}
+
+test_a_file_without_frontmatter_gets_one() {
+  local s; s=$(setup)
+  mkdir -p "$s/fleet/projects/bare"; printf '# Notes\n' > "$s/fleet/projects/bare/project.md"
+  submit "$s" project-rename '{"slug":"bare","displayName":"Bare"}' r1
+  serve_once "$s"
+  assert_eq done "$(field "$(fc "$s" status r1)" state)" "renamed"
+  assert_eq "$(printf -- '---\ndisplayName: Bare\n---\n# Notes')" "$(cat "$s/fleet/projects/bare/project.md")" "frontmatter added"
+  rm -rf "$s"
+}
+
+test_move_to_a_hidden_project_answers_like_a_gone_one() {
+  local s; s=$(setup)
+  project "$s" secret "Secret"; limited "$s" secret ana; agent "$s" finch ""
+  mkdir -p "$s/fleet/projects/archive/vault"; printf -- '---\ndisplayName: Vault\nusers:\n  - ana\n---\n' > "$s/fleet/projects/archive/vault/project.md"
+  submit "$s" agent-project '{"name":"finch","project":"secret","asker":"bo"}' p1
+  submit "$s" agent-project '{"name":"finch","project":"vault","asker":"bo"}' p2
+  submit "$s" agent-project '{"name":"finch","project":"vault","asker":"ana"}' p3
+  serve_once "$s"
+  local p1 p2; p1=$(fc "$s" status p1); p2=$(fc "$s" status p2)
+  assert_eq project_not_found "$(field "$p1" code)" "hidden reads as gone"
+  assert_eq "that project is gone" "$(field "$p2" reason)" "an archived name stays hidden too"
+  assert_eq 'the project "Vault" is archived' "$(field "$(fc "$s" status p3)" reason)" "named to someone who could see it"
+  grep -q '^project: [a-z]' "$s/fleet/identities/finch/finch.md" && fail "filed anyway"
   rm -rf "$s"
 }
 
@@ -788,6 +827,9 @@ run_test test_pin_then_move_lands_as_the_last_click_says
 run_test test_new_agent_into_a_gone_project_lands_in_conversations
 run_test test_agent_edit_changes_only_its_lines
 run_test test_agent_changes_refused_while_its_archive_is_claimed
+run_test test_odd_usernames_and_names_stay_strings
+run_test test_a_file_without_frontmatter_gets_one
+run_test test_move_to_a_hidden_project_answers_like_a_gone_one
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 if [ "$FAIL" -gt 0 ]; then
