@@ -433,6 +433,8 @@ def do_project_archive(args, entry, save_plan):
 
 
 def find_app(slug):
+    if not os.path.isfile(APP_UNITS):
+        raise Failed("app_units_missing", "app-units.sh is missing on this machine")
     rc, out = run(["bash", APP_UNITS, "find", slug])
     path = out.strip().splitlines()[-1] if rc == 0 and out.strip() else ""
     return path or None
@@ -484,6 +486,10 @@ def do_app_move(args, entry, save_plan):
     else:
         raise Refused("bad_request", 'to must be "sidebar" or "project"')
 
+    if to == "project" and not os.path.isfile(os.path.join(PROJECTS, args["project"], "project.md")):
+        if archived_project_dir(args["project"]) is not None:
+            raise Refused("project_archived", "\"%s\" is archived" % project_label(args["project"]))
+        raise Refused("project_not_found", "there's no project '%s' on this machine" % args["project"])
     src = find_app(slug)
     if src is None:
         gone_with = archived_app_project(slug)
@@ -495,10 +501,6 @@ def do_app_move(args, entry, save_plan):
     if os.path.realpath(src) == os.path.realpath(dest):
         # Already there — nothing to do, or an earlier run of this request finished.
         return {"slug": slug, "to": to, "path": dest, "alreadyThere": True}
-    if to == "project" and not os.path.isfile(os.path.join(PROJECTS, args["project"], "project.md")):
-        if archived_project_dir(args["project"]) is not None:
-            raise Refused("project_archived", "\"%s\" is archived" % project_label(args["project"]))
-        raise Refused("project_not_found", "there's no project '%s' on this machine" % args["project"])
 
     owner = None
     rel = os.path.relpath(src, IDENTITIES)

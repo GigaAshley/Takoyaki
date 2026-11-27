@@ -2,17 +2,23 @@
  * project-scoped apps: POST /apps/:hostId/:slug/move
  *
  * "Move to" on any app — to the sidebar or into a project. The machine does
- * the move, no agent is asked: this route drops `.move-requested` in the
- * app's folder and the agent-supervisor's reconcile tick runs move-app.sh
- * (~15s). The app keeps its address, data and icon. When a conversation app
- * leaves its agent, the supervisor tells that agent.
+ * the move, no agent is asked: this route sends it to the machine's front
+ * door (fleet-change app-move), which carries it out in arrival order with
+ * the machine's other changes, and waits for the outcome. The app keeps its
+ * address, data and icon. When a conversation app leaves its agent, the
+ * front door tells that agent.
  *
- * Body: { to: "sidebar" } | { to: "project", project: "<slug>" }
+ * Body: { to: "sidebar" } | { to: "project", project: "<slug>" }, plus an
+ * optional requestId (the client's, so a retried click is one move).
  *
  * Who can see it afterwards is decided here (app-move-plan.ts): a move to the
  * sidebar carries the audience the app had as its "Shared with" list.
  *
- *   → 202 { ok: true }
+ *   → 200 { ok: true, result }   moved
+ *   → 202 { pending: true, requestId }  still waiting or running after the wait
+ *   → 409 { error, code }  refused by the machine (e.g. the project is archived)
+ *   → 500 { error, code }  the move failed on the machine (it stays where it was)
+ *   → 503 { code: "updating" }  the machine's update after a deploy hasn't finished
  *   → 400 bad hostId / slug / body
  *   → 404 host unknown to the caller, app unknown or hidden from the caller,
  *         destination project unknown or hidden (one shape — no probe leak)
@@ -34,7 +40,7 @@ import {
   PROJECT_SLUG_RE,
   listProjects,
 } from "../../claude-session/identity-artifact-reader.js";
-import { writeAppFile } from "../../claude-session/per-app-file.js";
+import { frontDoorHttp, requestIdFrom, submitFrontDoor, type FrontDoorOutcome } from "../../fleet-change/front-door.js";
 import { getRegistry } from "../../fleet-status/registry-holder.js";
 import { listMachinePeople } from "../../distributor/machine-people.js";
 import { getUsernameForUserId } from "../../utils/host-user-counter.js";
@@ -87,10 +93,11 @@ router.post("/:hostId/:slug/move", authenticateJWT, async (req: Request, res: Re
     users: known.users ?? null,
   };
 
+  const requestId = requestIdFrom((req.body as { requestId?: unknown } | undefined)?.requestId);
   try {
     const people = ((await listMachinePeople(hostId)) ?? []).map((p) => p.username);
     const you = await getUsernameForUserId(userId);
-    await withHost(hostId, userId, async (conn) => {
+    const outcome: FrontDoorOutcome = await withHost(hostId, userId, async (conn) => {
       // One person on the machine: nothing to work out about who sees what,
       // only that the destination project exists.
       const state: ShareHostState =
@@ -112,11 +119,7 @@ router.post("/:hostId/:slug/move", authenticateJWT, async (req: Request, res: Re
       const plan = planAppMove(app, dest, state, you ?? null);
       if (!plan.ok || plan.request === undefined) throw new HttpError(plan.status ?? 500, plan.error ?? "can't move");
       const request = plan.request;
-      await writeAppFile(slug, ".move-requested", JSON.stringify(request), {
-        hostId,
-        conn,
-        scope: { owner: app.owner, project: app.project },
-      });
+      const result = await submitFrontDoor(conn, "app-move", { slug, ...request }, { id: requestId, hostId });
       databaseLogger.info("app move requested", {
         operation: "apps_move_request",
         userId,
@@ -125,18 +128,17 @@ router.post("/:hostId/:slug/move", authenticateJWT, async (req: Request, res: Re
         from: app.owner !== null ? `conversation:${app.owner}` : app.project !== null ? `project:${app.project}` : "sidebar",
         to: request.to === "project" ? `project:${request.project}` : "sidebar",
         limited: request.to === "sidebar" && request.users !== null,
+        requestId,
+        outcome: result.state,
+        code: "code" in result ? result.code : undefined,
       });
+      return result;
     });
-    return res.status(202).json({ ok: true });
+    const { status, body } = frontDoorHttp(outcome);
+    return res.status(status).json(body);
   } catch (err) {
     if (err instanceof HttpError) {
       return res.status(err.status).json({ error: err.status === 404 ? "Not found" : err.message });
-    }
-    // The app's folder isn't where the last sweep saw it: a move of it is
-    // already under way.
-    const code = (err as { code?: unknown })?.code;
-    if (code === "ENOENT" || code === 2 || /no such file/i.test(err instanceof Error ? err.message : "")) {
-      return res.status(409).json({ error: "it's already being moved — try again in a moment" });
     }
     databaseLogger.error("app move request failed", {
       operation: "apps_move_request_failed",

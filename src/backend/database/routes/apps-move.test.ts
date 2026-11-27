@@ -4,7 +4,7 @@
  * Bare Express app over node:http; auth, registry, machine people, host
  * access and the host reads/writes are mocked. Who-sees-what decisions are
  * covered by app-move-plan.test.ts — here, the route's wiring: validation,
- * the request written into the right folder, and error mapping.
+ * the request sent to the machine's front door, and how its outcomes map.
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from "vitest";
@@ -31,7 +31,10 @@ vi.mock("../../claude-session/identity-artifact-reader.js", () => ({
   PROJECT_SLUG_RE: /^[a-z0-9-]{1,64}$/,
   listProjects: vi.fn(),
 }));
-vi.mock("../../claude-session/per-app-file.js", () => ({ writeAppFile: vi.fn() }));
+vi.mock("../../fleet-change/front-door.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../fleet-change/front-door.js")>()),
+  submitFrontDoor: vi.fn(),
+}));
 vi.mock("../../fleet-status/registry-holder.js", () => ({ getRegistry: vi.fn() }));
 vi.mock("../../distributor/machine-people.js", () => ({ listMachinePeople: vi.fn() }));
 vi.mock("../../utils/host-user-counter.js", () => ({ getUsernameForUserId: vi.fn() }));
@@ -46,7 +49,7 @@ vi.mock("../../sharing/host-conn.js", () => {
 });
 
 import { listProjects } from "../../claude-session/identity-artifact-reader.js";
-import { writeAppFile } from "../../claude-session/per-app-file.js";
+import { submitFrontDoor } from "../../fleet-change/front-door.js";
 import { getRegistry } from "../../fleet-status/registry-holder.js";
 import { listMachinePeople } from "../../distributor/machine-people.js";
 import { getUsernameForUserId } from "../../utils/host-user-counter.js";
@@ -84,6 +87,9 @@ beforeEach(async () => {
   (getRegistry as Mock).mockReturnValue({ getAppSnapshot: () => apps });
   (listMachinePeople as Mock).mockResolvedValue([{ username: "ann" }, { username: "bob" }]);
   (getUsernameForUserId as Mock).mockResolvedValue("ann");
+  (submitFrontDoor as Mock).mockImplementation(async (_c: unknown, _k: string, _a: unknown, o: { id: string }) => ({
+    state: "done", id: o.id, seq: 1, result: {},
+  }));
   (withHost as Mock).mockImplementation(async (_h: number, _u: string, fn: (c: null) => Promise<unknown>) => fn(null));
   (readShareHostState as Mock).mockResolvedValue({
     people: ["ann", "bob"],
@@ -106,31 +112,43 @@ beforeEach(async () => {
 afterEach(() => server.close());
 
 describe("POST /apps/:hostId/:slug/move", () => {
-  it("writes a sidebar move with the conversation's audience into the agent's app folder", async () => {
-    const r = await post(server, "/apps/5/tally/move", { to: "sidebar" });
-    expect(r.status).toBe(202);
-    expect(writeAppFile).toHaveBeenCalledWith("tally", ".move-requested", JSON.stringify({ to: "sidebar", users: ["ann"] }), {
-      hostId: 5,
-      conn: null,
-      scope: { owner: "alpha", project: null },
-    });
+  it("sends a sidebar move with the conversation's audience to the front door", async () => {
+    const r = await post(server, "/apps/5/tally/move", { to: "sidebar", requestId: "click-1" });
+    expect(r.status).toBe(200);
+    expect(submitFrontDoor).toHaveBeenCalledWith(null, "app-move", { slug: "tally", to: "sidebar", users: ["ann"] }, { id: "click-1", hostId: 5 });
   });
 
-  it("writes a project move into the project app's folder", async () => {
+  it("sends a project move, with a fresh request id when the client gave none", async () => {
     const r = await post(server, "/apps/5/beds/move", { to: "project", project: "shed" });
+    expect(r.status).toBe(200);
+    const [, kind, args, opts] = (submitFrontDoor as Mock).mock.calls[0];
+    expect(kind).toBe("app-move");
+    expect(args).toEqual({ slug: "beds", to: "project", project: "shed" });
+    expect(opts.id).toMatch(/^[0-9a-f-]{36}$/);
+  });
+
+  it("maps the machine's outcomes: refused, failed, still working, still updating", async () => {
+    (submitFrontDoor as Mock).mockResolvedValueOnce({ state: "refused", id: "x", seq: 2, code: "project_archived", reason: '"Shed" is archived' });
+    let r = await post(server, "/apps/5/beds/move", { to: "project", project: "shed" });
+    expect(r).toEqual({ status: 409, body: { error: '"Shed" is archived', code: "project_archived", requestId: "x" } });
+    (submitFrontDoor as Mock).mockResolvedValueOnce({ state: "failed", id: "x", seq: 2, code: "move_failed", reason: "no answer on its port" });
+    r = await post(server, "/apps/5/beds/move", { to: "project", project: "shed" });
+    expect(r.status).toBe(500);
+    expect((r.body as { error: string }).error).toBe("no answer on its port");
+    (submitFrontDoor as Mock).mockResolvedValueOnce({ state: "pending", id: "x", seq: 2, stage: "queued" });
+    r = await post(server, "/apps/5/beds/move", { to: "project", project: "shed" });
     expect(r.status).toBe(202);
-    expect(writeAppFile).toHaveBeenCalledWith("beds", ".move-requested", JSON.stringify({ to: "project", project: "shed" }), {
-      hostId: 5,
-      conn: null,
-      scope: { owner: null, project: "garden" },
-    });
+    expect(r.body).toMatchObject({ pending: true, requestId: "x" });
+    (submitFrontDoor as Mock).mockResolvedValueOnce({ state: "not_installed", id: "x" });
+    r = await post(server, "/apps/5/beds/move", { to: "project", project: "shed" });
+    expect(r).toEqual({ status: 503, body: { error: "this machine is still updating, try again in a moment", code: "updating" } });
   });
 
   it("on a single-person machine reads only the projects", async () => {
     (listMachinePeople as Mock).mockResolvedValue([{ username: "ann" }]);
     (listProjects as Mock).mockResolvedValue([{ slug: "shed", displayName: "Shed", parent: null }]);
     const r = await post(server, "/apps/5/side/move", { to: "project", project: "shed" });
-    expect(r.status).toBe(202);
+    expect(r.status).toBe(200);
     expect(readShareHostState).not.toHaveBeenCalled();
   });
 
@@ -139,7 +157,7 @@ describe("POST /apps/:hostId/:slug/move", () => {
     expect((await post(server, "/apps/5/side/move", { to: "project", project: "archive" })).status).toBe(400);
     expect((await post(server, "/apps/5/Bad_Slug/move", { to: "sidebar" })).status).toBe(400);
     expect((await post(server, "/apps/0/side/move", { to: "sidebar" })).status).toBe(400);
-    expect(writeAppFile).not.toHaveBeenCalled();
+    expect(submitFrontDoor).not.toHaveBeenCalled();
   });
 
   it("answers 404 for an unknown app and 503 before the registry exists", async () => {
@@ -148,17 +166,17 @@ describe("POST /apps/:hostId/:slug/move", () => {
     expect((await post(server, "/apps/5/side/move", { to: "sidebar" })).status).toBe(503);
   });
 
-  it("passes refusals through (already there, hidden project) without writing", async () => {
+  it("passes refusals through (already there, hidden project) without asking the machine", async () => {
     expect((await post(server, "/apps/5/side/move", { to: "sidebar" })).status).toBe(409);
     (getUsernameForUserId as Mock).mockResolvedValue("bob");
     expect((await post(server, "/apps/5/side/move", { to: "project", project: "garden" })).status).toBe(404);
-    expect(writeAppFile).not.toHaveBeenCalled();
+    expect(submitFrontDoor).not.toHaveBeenCalled();
   });
 
-  it("maps an unreachable host and a failed write", async () => {
+  it("maps an unreachable host and a failed request", async () => {
     (withHost as Mock).mockRejectedValueOnce(new HttpError(504, "Host unreachable"));
     expect((await post(server, "/apps/5/side/move", { to: "project", project: "shed" })).status).toBe(504);
-    (writeAppFile as Mock).mockRejectedValueOnce(new Error("disk"));
+    (submitFrontDoor as Mock).mockRejectedValueOnce(new Error("channel closed"));
     expect((await post(server, "/apps/5/side/move", { to: "project", project: "shed" })).status).toBe(500);
   });
 });

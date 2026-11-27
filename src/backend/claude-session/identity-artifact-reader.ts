@@ -297,8 +297,8 @@ export const IDENTITY_KEY_RE = /^[a-z0-9_-]{1,64}$/;
  * at 64 chars to match IDENTITY_KEY_RE's bound.
  *
  * The `.` and `/` characters are structurally impossible under this charset,
- * which is the load-bearing path-traversal defense for createProject +
- * archiveProject (Phase 117 threat T-117-01-01). Any user-supplied slug that
+ * which is the load-bearing path-traversal defense for createProject and
+ * the other project writers (Phase 117 threat T-117-01-01). Any user-supplied slug that
  * survives PROJECT_SLUG_RE.test() cannot escape the projects/ root by
  * construction.
  *
@@ -903,9 +903,9 @@ function shellEscape(s: string): string {
 // (T-117-01-02).
 //
 // Archive discipline (D-30): listProjects excludes the `archive/` subdirectory
-// from the enumeration; archived projects are invisible in v1. archiveProject
-// moves the whole slug dir to $HOME/fleet/projects/archive/<slug>/ — mirrors
-// the Phase 115 identity-archive tree destination shape.
+// from the enumeration; archived projects are invisible in v1. Archiving is the
+// machine's front door (fleet-change project-archive), which moves the whole
+// slug dir to $HOME/fleet/projects/archive/<slug>/.
 
 /**
  * Enumerate all non-archived projects under $HOME/fleet/projects/.
@@ -1511,85 +1511,6 @@ export async function createProject(
     `$HOME/fleet/projects/${slug}/project.md`,
     body,
   );
-}
-
-/**
- * Move the project directory at $HOME/fleet/projects/<slug>/ to
- * $HOME/fleet/projects/archive/<slug>/ (D-30). Mirrors the identity-archive
- * tree destination pattern from Phase 115.
- *
- * Slug validated via PROJECT_SLUG_RE — since `.` and `/` are not in the
- * charset, path-traversal payloads like `../etc` are rejected before any
- * I/O (T-117-01-01 path-traversal defense).
- *
- * Does NOT overwrite an existing archived slug: fs.rename onto an existing
- * directory is a filesystem error and is allowed to propagate. Callers wanting
- * "archive-anyway" semantics must clear the destination first (not v1 scope).
- */
-export async function archiveProject(
-  conn: SSHClientType | null,
-  slug: string,
-): Promise<void> {
-  if (!PROJECT_SLUG_RE.test(slug)) {
-    throw new Error("invalid project slug");
-  }
-
-  if (conn === null) {
-    const root = getLocalProjectsRoot();
-    const archiveRoot = path.join(root, "archive");
-    const src = path.join(root, slug);
-    await fs.mkdir(archiveRoot, { recursive: true });
-
-    // Never rename onto an existing directory (POSIX nests src inside it —
-    // the M1 nested-corruption bug). But a re-created slug that was archived
-    // before is normal (listProjects ignores archive/, so the slug is free
-    // again) — refusing used to fail the folder move AFTER the panel's
-    // cascade had already archived every member. Archived projects are not
-    // addressed by slug anywhere, so suffix the destination instead.
-    let dest = path.join(archiveRoot, slug);
-    if (await pathExists(dest)) {
-      dest = path.join(archiveRoot, `${slug}-${archiveStamp()}`);
-      if (await pathExists(dest)) {
-        const err = new Error(`archive destination already exists: ${dest}`);
-        (err as NodeJS.ErrnoException).code = "EEXIST";
-        throw err;
-      }
-    }
-
-    await fs.rename(src, dest);
-    return;
-  }
-
-  // Phase 117 H3 fix (2026-09-18): same $HOME shell-quoting bug as
-  // createProject — shellEscape wraps in single quotes which disables
-  // $HOME expansion. Use double-quoted interpolation directly.
-  // PROJECT_SLUG_RE ([a-z0-9-]) blocks all shell metacharacters in the
-  // slug, so double-quoted interpolation is safe.
-  //
-  // Same destination rule as the local branch: suffix on collision, and
-  // refuse (exit 17) rather than mv onto an existing dir (mv would nest).
-  const stamp = archiveStamp();
-  const cmd =
-    `mkdir -p "$HOME/fleet/projects/archive" && ` +
-    `d="$HOME/fleet/projects/archive/${slug}"; ` +
-    `if [ -e "$d" ]; then d="$d-${stamp}"; fi; ` +
-    `if [ -e "$d" ]; then echo EEXIST; exit 17; fi; ` +
-    `mv "$HOME/fleet/projects/${slug}" "$d" && echo ok`;
-  const out = (await execWithTimeout(conn, cmd)).trim();
-  if (out.endsWith("EEXIST")) {
-    const err = new Error(`archive destination already exists for slug: ${slug}`);
-    (err as NodeJS.ErrnoException).code = "EEXIST";
-    throw err;
-  }
-  if (!out.endsWith("ok")) {
-    // mv failed (missing source, permissions) — don't report success.
-    throw new Error(`archive move failed for slug: ${slug}`);
-  }
-}
-
-/** UTC compact timestamp for archive-collision suffixes, e.g. 20261009T041500Z. */
-function archiveStamp(): string {
-  return new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
 }
 
 async function pathExists(p: string): Promise<boolean> {

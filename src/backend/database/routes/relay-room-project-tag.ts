@@ -97,7 +97,7 @@ const MXID_RE = /^@[a-z0-9._=/+-]{1,255}:[a-z0-9.-]{1,255}$/;
  *
  * Mirrors relay-room-participants.ts:78-99 (lookupViewingUserMxid).
  */
-async function lookupCallerMxid(userId: string): Promise<string | null> {
+export async function lookupCallerMxid(userId: string): Promise<string | null> {
   try {
     const rows = (await db
       .select({ mxid: users.mxid })
@@ -280,7 +280,7 @@ router.post(
  * Tell every open tab of `userId` where one of their rooms now sits — in a
  * project, pinned, or neither (never both). Sent only to that user.
  */
-function publishRoomPlacement(
+export function publishRoomPlacement(
   userId: string,
   roomId: string,
   project: string | null,

@@ -4,7 +4,7 @@
  * Endpoints:
  *   GET  /projects?hostId=<n>              → enumerate non-archived projects
  *   POST /projects                          → create project (backend-slugify)
- *   POST /projects/:slug/archive            → move dir into archive/
+ *   POST /projects/:slug/archive            → archive it and everything in it (the machine's front door)
  *   POST /projects/:slug/parent             → nest under / un-nest a project
  *   GET|PUT /projects/:slug/file            → raw project.md read / write
  *
@@ -59,7 +59,6 @@ import {
   PROJECT_SLUG_RE,
   listProjects,
   createProject,
-  archiveProject,
   readProjectFile,
   writeProjectFile,
   setProjectParentField,
@@ -93,6 +92,30 @@ import {
 } from "../../fleet-status/project-visibility-gate.js";
 import { getHostSemaphore } from "../../ssh/host-semaphore-registry.js";
 import { bornInProjectUsers } from "../../sharing/born-in-project.js";
+import { frontDoorHttp, requestIdFrom, submitFrontDoor } from "../../fleet-change/front-door.js";
+import { findProjectRooms, releaseProjectRooms } from "../../fleet-change/project-rooms.js";
+
+/** What a project archive takes, as the machine reports it (fleet-change project-contents). */
+interface ProjectContents {
+  project: string;
+  projects: Array<{ slug: string; displayName: string; parent: string | null }>;
+  agents: Array<{ name: string; displayName: string; task: string; project: string }>;
+  apps: Array<{ slug: string; title: string; project: string }>;
+}
+
+/** The lists the user confirmed: `{ projects, agents, apps }`, each of names. */
+function parseExpectedContents(raw: unknown): { projects: string[]; agents: string[]; apps: string[] } | null {
+  if (raw === null || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  const names = (v: unknown): string[] | null =>
+    Array.isArray(v) && v.length <= 2000 && v.every((x) => typeof x === "string" && x.length > 0 && x.length <= 128)
+      ? (v as string[])
+      : null;
+  const projects = names(r.projects);
+  const agents = names(r.agents);
+  const apps = names(r.apps);
+  return projects && agents && apps ? { projects, agents, apps } : null;
+}
 
 const router = express.Router();
 const authManager = AuthManager.getInstance();
@@ -659,8 +682,19 @@ router.post(
 );
 
 // ---------------------------------------------------------------------------
-// POST /projects/:slug/archive
+// POST /projects/:slug/archive  body { hostId, expected, requestId? }
 // ---------------------------------------------------------------------------
+//
+// Archives the project, every sub-project beneath it, their apps and agents,
+// through the machine's front door (fleet-change project-archive): in
+// arrival order with the machine's other changes, taking what the machine
+// holds at that moment. `expected` is the { projects, agents, apps } lists
+// the confirm showed (from archive-preflight); when the machine's contents no
+// longer match it, nothing is archived and the answer is 409
+// { code: "contents_changed", result: <current contents> } so the confirm can
+// show the new list. The user's relay rooms filed in any of them go back to
+// Conversations. → 200 { ok, requestId, result: { projects, agents, apps, rooms } };
+// 202 still working; 503 machine still updating.
 
 router.post(
   "/:slug/archive",
@@ -677,14 +711,20 @@ router.post(
       return;
     }
 
-    // 2. hostId gate.
-    const body = (req.body ?? {}) as { hostId?: unknown };
+    // 2. hostId gate, plus what the user confirmed and the request's id.
+    const body = (req.body ?? {}) as { hostId?: unknown; expected?: unknown; requestId?: unknown };
     const parsedHost = parseHostId(body.hostId);
     if (!parsedHost.ok) {
       res.status(400).json({ error: parsedHost.error });
       return;
     }
     const { hostId } = parsedHost;
+    const expected = parseExpectedContents(body.expected);
+    if (expected === null) {
+      res.status(400).json({ error: "expected must be { projects, agents, apps } — the lists the user confirmed" });
+      return;
+    }
+    const requestId = requestIdFrom(body.requestId);
 
     // 3. Host ownership gate.
     const host = await resolveHostById(hostId, userId);
@@ -717,24 +757,28 @@ router.post(
       }
 
       try {
-        // Archive takes the whole subtree, deepest first, so by the time a
-        // project itself is archived nothing should sit beneath it. If
-        // something still does (most likely a sub-project the caller can't
-        // see), refuse rather than strand it at top level for whoever can.
+        // Archiving takes the whole subtree. Refuse when some of it is
+        // hidden from the caller, rather than archive what they can't see.
         try {
           const current = await listProjects(conn);
-          const remaining = descendantSlugs(current, slug);
-          if (remaining.length > 0) {
-            databaseLogger.warn("project archive refused: sub-projects remain", {
+          const visible = await visibleSlugsForCaller(current, userId);
+          if (!current.some((p) => p.slug === slug) || !visible.has(slug)) {
+            res.status(404).json({ error: "Project not found" });
+            return;
+          }
+          const hidden = descendantSlugs(current, slug).filter((s) => !visible.has(s));
+          if (hidden.length > 0) {
+            databaseLogger.warn("project archive refused: sub-projects hidden from the caller", {
               operation: "project_archive",
               userId,
               hostId,
               slug,
-              remainingCount: remaining.length,
-              outcome: "sub_projects_remain",
+              hiddenCount: hidden.length,
+              outcome: "sub_projects_hidden",
             });
             res.status(409).json({
-              error: "this project still has sub-projects inside it",
+              error: "some sub-projects inside it are hidden from you",
+              code: "sub_projects_hidden",
             });
             return;
           }
@@ -746,21 +790,54 @@ router.post(
           return;
         }
 
+        // The machine archives exactly what it holds now — refused when that
+        // no longer matches the list the user confirmed.
+        let outcome: Awaited<ReturnType<typeof submitFrontDoor>>;
         try {
-          await archiveProject(conn, slug);
+          outcome = await submitFrontDoor(conn, "project-archive", { slug, expected }, { id: requestId, hostId });
         } catch (err) {
           databaseLogger.error(
             `failed to archive project hostId=${hostId} slug=${slug}: ${err instanceof Error ? err.message : String(err)}`,
           );
-          // Generic-500 shape — no err.message leak (T-117-04-05).
           res.status(500).json({ error: "failed to archive project" });
           return;
         }
+        if (outcome.state !== "done") {
+          databaseLogger.info("project archive not done", {
+            operation: "project_archive",
+            userId,
+            hostId,
+            slug,
+            requestId,
+            outcome: outcome.state,
+            code: "code" in outcome ? outcome.code : undefined,
+          });
+          const { status, body: answer } = frontDoorHttp(outcome);
+          res.status(status).json(answer);
+          return;
+        }
+        const result = outcome.result as { projects?: Array<{ slug: string }>; agents?: string[]; apps?: unknown[] };
+        const archivedSlugs = (result.projects ?? []).map((p) => p.slug);
 
-        // 5. Post-write wire event (D-37) — rebuild the projects list
-        // (which now excludes the just-archived slug) and publish, scoped
-        // to this hostId. If the archived slug was the LAST project on
-        // this host, current is [] — a legitimate per-host delta.
+        // Relay rooms in any of them go back to Conversations — found from
+        // the chat server's own list, not the browser's sidebar.
+        let rooms: Array<{ roomId: string; project: string }> = [];
+        try {
+          rooms = await releaseProjectRooms(userId, archivedSlugs);
+        } catch (err) {
+          databaseLogger.warn("project archive: couldn't release its relay rooms", {
+            operation: "project_archive_rooms",
+            userId,
+            hostId,
+            slug,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+
+        // Post-write wire event (D-37) — rebuild the projects list
+        // (which now excludes the just-archived slugs) and publish, scoped
+        // to this hostId. If they were the LAST projects on this host,
+        // current is [] — a legitimate per-host delta.
         try {
           const registry = getSubscriptionRegistry();
           if (registry) {
@@ -783,10 +860,20 @@ router.post(
           );
         }
 
-        databaseLogger.info(
-          `project archived: userId=${userId} hostId=${hostId} slug=${slug}`,
-        );
-        res.json({ ok: true });
+        databaseLogger.info("project archived", {
+          operation: "project_archive",
+          userId,
+          hostId,
+          slug,
+          requestId,
+          seq: outcome.seq,
+          projects: archivedSlugs.length,
+          agents: result.agents?.length ?? 0,
+          apps: result.apps?.length ?? 0,
+          rooms: rooms.length,
+          outcome: "archived",
+        });
+        res.json({ ok: true, requestId, result: { ...result, rooms } });
         return;
       } finally {
         if (conn) {
@@ -1030,14 +1117,17 @@ router.post(
 //   - authenticateJWT on both routes (T-117-04-04 unauth flood).
 
 // ---------------------------------------------------------------------------
-// GET /projects/:slug/archive-preflight?hostId=<n>  →  { hiddenSubProjects }
+// GET /projects/:slug/archive-preflight?hostId=<n>
+//   →  { hiddenSubProjects, contents, rooms, roomsUnknown }
 // ---------------------------------------------------------------------------
 //
-// Nested projects: archiving a project archives its whole subtree, but the
-// sidebar only knows the sub-projects the caller can see. This counts the
-// ones beneath the project that are hidden from the caller, so the archive
-// confirm can refuse up front instead of archiving part of the subtree. A
-// project hidden from the caller answers "not found", like the move route.
+// What archiving the project would take, as the machine sees it: asked
+// through the front door (fleet-change project-contents), so it waits its
+// turn behind moves just clicked and sees their result. `hiddenSubProjects`
+// counts sub-projects hidden from the caller (the confirm refuses up front
+// when it's not 0); `rooms` are the caller's relay rooms filed in any of
+// them, from the chat server (`roomsUnknown` when it couldn't be asked).
+// A project hidden from the caller answers "not found", like the move route.
 router.get(
   "/:slug/archive-preflight",
   authenticateJWT,
@@ -1095,14 +1185,30 @@ router.get(
         const hiddenSubProjects = descendantSlugs(current, slug).filter(
           (s) => !visible.has(s),
         ).length;
+        const outcome = await submitFrontDoor(conn, "project-contents", { slug }, { hostId });
+        if (outcome.state === "refused" && outcome.code === "not_found") {
+          res.status(404).json({ error: "Project not found" });
+          return;
+        }
+        if (outcome.state !== "done") {
+          const { status, body } = frontDoorHttp(outcome);
+          res.status(status).json(body);
+          return;
+        }
+        const contents = outcome.result as ProjectContents;
+        const rooms = await findProjectRooms(userId, contents.projects.map((p) => p.slug));
         databaseLogger.info("project archive preflight", {
           operation: "project_archive_preflight",
           userId,
           hostId,
           slug,
           hiddenSubProjects,
+          projects: contents.projects.length,
+          agents: contents.agents.length,
+          apps: contents.apps.length,
+          rooms: rooms?.length ?? null,
         });
-        res.json({ hiddenSubProjects });
+        res.json({ hiddenSubProjects, contents, rooms: rooms ?? [], roomsUnknown: rooms === null });
         return;
       } catch (err) {
         databaseLogger.error(

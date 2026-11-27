@@ -12,7 +12,7 @@
  * subscriptionRegistry.publishProjectListChanged(<currentProjectsArray>).
  *
  * Auth middleware is mocked. resolveHostById, connectOneShot, isLocalHostId,
- * listProjects, createProject, archiveProject are mocked so tests exercise
+ * listProjects, createProject and the machine's front door are mocked so tests exercise
  * every branch without touching real disk or SSH.
  */
 
@@ -82,7 +82,6 @@ vi.mock("../../claude-session/identity-artifact-reader.js", () => ({
   PROJECT_SLUG_RE: /^[a-z0-9-]{1,64}$/,
   listProjects: vi.fn(),
   createProject: vi.fn(),
-  archiveProject: vi.fn(),
   readProjectFile: vi.fn(),
   writeProjectFile: vi.fn(),
   setProjectParentField: vi.fn(),
@@ -97,6 +96,16 @@ vi.mock("../../claude-session/identity-artifact-reader.js", () => ({
       parent: m && m[1] !== slug ? m[1] : null,
     };
   },
+}));
+
+// The machine's front door (fleet-change) and the relay-room lookups.
+vi.mock("../../fleet-change/front-door.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../fleet-change/front-door.js")>()),
+  submitFrontDoor: vi.fn(),
+}));
+vi.mock("../../fleet-change/project-rooms.js", () => ({
+  findProjectRooms: vi.fn(),
+  releaseProjectRooms: vi.fn(),
 }));
 
 // Phase 130: host-user-counter mock — auto-tag path in POST /projects consults
@@ -130,13 +139,14 @@ vi.mock("../../fleet-status/subscription-registry.js", () => ({
 // Import mocked modules AFTER vi.mock() declarations
 // ---------------------------------------------------------------------------
 
+import { submitFrontDoor } from "../../fleet-change/front-door.js";
+import { findProjectRooms, releaseProjectRooms } from "../../fleet-change/project-rooms.js";
 import { connectOneShot } from "../../ssh/ssh-one-shot.js";
 import { resolveHostById } from "../../ssh/host-resolver.js";
 import {
   isLocalHostId,
   listProjects,
   createProject,
-  archiveProject,
   readProjectFile,
   writeProjectFile,
   setProjectParentField,
@@ -262,7 +272,13 @@ beforeEach(() => {
   // Default: primitives resolve to sensible defaults; per-test overrides.
   (listProjects as Mock).mockResolvedValue([]);
   (createProject as Mock).mockResolvedValue(undefined);
-  (archiveProject as Mock).mockResolvedValue(undefined);
+  (submitFrontDoor as Mock).mockImplementation(async (_c: unknown, kind: string, args: { slug: string }, o: { id?: string }) =>
+    kind === "project-archive"
+      ? { state: "done", id: o.id ?? "r1", seq: 1, result: { projects: [{ slug: args.slug, archivedAs: args.slug }], agents: [], apps: [] } }
+      : { state: "done", id: o.id ?? "r1", seq: 1, result: { project: args.slug, projects: [{ slug: args.slug, displayName: args.slug, parent: null }], agents: [], apps: [] } },
+  );
+  (findProjectRooms as Mock).mockResolvedValue([]);
+  (releaseProjectRooms as Mock).mockResolvedValue([]);
   (readProjectFile as Mock).mockResolvedValue({ markdown: "" });
   (writeProjectFile as Mock).mockResolvedValue({ markdown: "" });
   (setProjectParentField as Mock).mockResolvedValue({ markdown: "" });
@@ -792,24 +808,39 @@ describe("POST /projects", () => {
 // POST /projects/:slug/archive
 // ===========================================================================
 
+const EXPECTED = { projects: ["my-project"], agents: [], apps: [] };
+
 describe("POST /projects/:slug/archive", () => {
-  it("Test 13: happy → 200 { ok:true }; archiveProject called; publishProjectListChanged called", async () => {
+  it("Test 13: happy → 200; the front door archives with the confirmed list; rooms released; list published", async () => {
+    (listProjects as Mock).mockResolvedValueOnce([{ slug: "my-project", displayName: "My", users: null, parent: null }]);
     (listProjects as Mock).mockResolvedValue([]);
+    (releaseProjectRooms as Mock).mockResolvedValue([{ roomId: "!r:x", project: "my-project" }]);
 
     const res = await httpRequest(server, {
       method: "POST",
       path: "/projects/my-project/archive",
-      body: { hostId: 5 },
+      body: { hostId: 5, expected: EXPECTED, requestId: "click-9" },
     });
 
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ ok: true });
-    expect(archiveProject).toHaveBeenCalledTimes(1);
-    expect(archiveProject).toHaveBeenCalledWith(null, "my-project");
+    expect(res.body).toEqual({
+      ok: true,
+      requestId: "click-9",
+      result: {
+        projects: [{ slug: "my-project", archivedAs: "my-project" }],
+        agents: [],
+        apps: [],
+        rooms: [{ roomId: "!r:x", project: "my-project" }],
+      },
+    });
+    expect(submitFrontDoor).toHaveBeenCalledWith(
+      null,
+      "project-archive",
+      { slug: "my-project", expected: EXPECTED },
+      { id: "click-9", hostId: 5 },
+    );
+    expect(releaseProjectRooms).toHaveBeenCalledWith("1", ["my-project"]);
     expect(mockPublishProjectListChanged).toHaveBeenCalledTimes(1);
-    // Post-archive, the enriched wire event is scoped to this hostId and
-    // carries the current (post-archive) list — empty in this test since
-    // the only project was just archived.
     const call = mockPublishProjectListChanged.mock.calls[0];
     expect(call[0]).toBe("5");
     expect(call[1]).toEqual([]);
@@ -818,20 +849,17 @@ describe("POST /projects/:slug/archive", () => {
   // Phase 117 M8 fix (2026-09-18): null-registry on archive path also logs.
   it("Test 13b (M8 fix): null registry on archive → publish silently skipped BUT a warning is logged", async () => {
     mockRegistryIsNull = true;
-    (listProjects as Mock).mockResolvedValue([]);
+    (listProjects as Mock).mockResolvedValue([{ slug: "my-project", displayName: "My", users: null, parent: null }]);
 
     const res = await httpRequest(server, {
       method: "POST",
       path: "/projects/my-project/archive",
-      body: { hostId: 5 },
+      body: { hostId: 5, expected: EXPECTED },
     });
 
-    // Archive still succeeds.
     expect(res.status).toBe(200);
-    expect(archiveProject).toHaveBeenCalledTimes(1);
-    // No publish (registry null).
+    expect(submitFrontDoor).toHaveBeenCalledTimes(1);
     expect(mockPublishProjectListChanged).not.toHaveBeenCalled();
-    // M8 regression: warning logged.
     expect(databaseLogger.warn).toHaveBeenCalledWith(
       expect.stringMatching(
         /subscription registry not initialized.*hostId=5.*slug=my-project.*op=archive/,
@@ -839,32 +867,70 @@ describe("POST /projects/:slug/archive", () => {
     );
   });
 
+  it("Test 13c: the machine's contents changed → 409 contents_changed with the current list; nothing released", async () => {
+    (listProjects as Mock).mockResolvedValue([{ slug: "my-project", displayName: "My", users: null, parent: null }]);
+    const current = { project: "my-project", projects: [{ slug: "my-project", displayName: "My", parent: null }], agents: [{ name: "finch", displayName: "finch", task: "", project: "my-project" }], apps: [] };
+    (submitFrontDoor as Mock).mockResolvedValueOnce({
+      state: "refused", id: "r2", seq: 3, code: "contents_changed", reason: "what's in \"My\" changed since you looked; check the list again", result: current,
+    });
+    const res = await httpRequest(server, {
+      method: "POST",
+      path: "/projects/my-project/archive",
+      body: { hostId: 5, expected: EXPECTED },
+    });
+    expect(res.status).toBe(409);
+    expect(res.body).toMatchObject({ code: "contents_changed", result: current });
+    expect(releaseProjectRooms).not.toHaveBeenCalled();
+    expect(mockPublishProjectListChanged).not.toHaveBeenCalled();
+  });
+
+  it("Test 13d: still working → 202; machine still updating → 503", async () => {
+    (listProjects as Mock).mockResolvedValue([{ slug: "my-project", displayName: "My", users: null, parent: null }]);
+    (submitFrontDoor as Mock).mockResolvedValueOnce({ state: "pending", id: "r3", seq: 4, stage: "running" });
+    let res = await httpRequest(server, { method: "POST", path: "/projects/my-project/archive", body: { hostId: 5, expected: EXPECTED } });
+    expect(res.status).toBe(202);
+    expect(res.body).toMatchObject({ pending: true, requestId: "r3" });
+    (submitFrontDoor as Mock).mockResolvedValueOnce({ state: "not_installed", id: "r4" });
+    res = await httpRequest(server, { method: "POST", path: "/projects/my-project/archive", body: { hostId: 5, expected: EXPECTED } });
+    expect(res.status).toBe(503);
+    expect(res.body).toMatchObject({ code: "updating" });
+  });
+
+  it("Test 13e: missing or malformed expected list → 400 before any I/O", async () => {
+    for (const expected of [undefined, { projects: ["a"] }, { projects: "a", agents: [], apps: [] }]) {
+      const res = await httpRequest(server, { method: "POST", path: "/projects/my-project/archive", body: { hostId: 5, expected } });
+      expect(res.status).toBe(400);
+    }
+    expect(submitFrontDoor).not.toHaveBeenCalled();
+  });
+
   it("Test 14: bad slug (uppercase / metacharacters) → 400 (PROJECT_SLUG_RE gate)", async () => {
     const res = await httpRequest(server, {
       method: "POST",
       path: "/projects/BAD!/archive",
-      body: { hostId: 5 },
+      body: { hostId: 5, expected: EXPECTED },
     });
 
     expect(res.status).toBe(400);
     expect((res.body as { error: string }).error).toMatch(/slug/);
-    expect(archiveProject).not.toHaveBeenCalled();
+    expect(submitFrontDoor).not.toHaveBeenCalled();
   });
 
   it("Test 15: unknown host → 404", async () => {
     const res = await httpRequest(server, {
       method: "POST",
       path: "/projects/my-project/archive",
-      body: { hostId: 99 },
+      body: { hostId: 99, expected: EXPECTED },
     });
 
     expect(res.status).toBe(404);
     expect((res.body as { error: string }).error).toMatch(/Host not found/);
-    expect(archiveProject).not.toHaveBeenCalled();
+    expect(submitFrontDoor).not.toHaveBeenCalled();
   });
 
-  it("Test 16: archiveProject throws → 500 generic (no err.message leak)", async () => {
-    (archiveProject as Mock).mockRejectedValue(
+  it("Test 16: the front door can't be reached → 500 generic (no err.message leak)", async () => {
+    (listProjects as Mock).mockResolvedValue([{ slug: "my-project", displayName: "My", users: null, parent: null }]);
+    (submitFrontDoor as Mock).mockRejectedValue(
       new Error(
         "EACCES: /private/fs/path leaked — sensitive info to caller",
       ),
@@ -873,7 +939,7 @@ describe("POST /projects/:slug/archive", () => {
     const res = await httpRequest(server, {
       method: "POST",
       path: "/projects/my-project/archive",
-      body: { hostId: 5 },
+      body: { hostId: 5, expected: EXPECTED },
     });
 
     expect(res.status).toBe(500);
@@ -1490,7 +1556,8 @@ describe("nested projects — review fixes", () => {
     expect((createProject as Mock).mock.calls[0]?.[1]).toBe("foo-2");
   });
 
-  it("archive refuses while a sub-project remains; a loop partner doesn't count", async () => {
+  it("archive refuses while a sub-project inside is hidden; a loop partner doesn't count", async () => {
+    (getUsernameForUserId as Mock).mockResolvedValue("alice");
     (listProjects as Mock).mockResolvedValue([
       { slug: "p", displayName: "P", users: null, parent: null },
       { slug: "hidden", displayName: "H", users: ["bob"], parent: "p" },
@@ -1498,10 +1565,11 @@ describe("nested projects — review fixes", () => {
     const refused = await httpRequest(server, {
       method: "POST",
       path: "/projects/p/archive",
-      body: { hostId: 5 },
+      body: { hostId: 5, expected: { projects: ["p"], agents: [], apps: [] } },
     });
     expect(refused.status).toBe(409);
-    expect(archiveProject).not.toHaveBeenCalled();
+    expect(refused.body).toMatchObject({ code: "sub_projects_hidden" });
+    expect(submitFrontDoor).not.toHaveBeenCalled();
 
     (listProjects as Mock).mockResolvedValue([
       { slug: "a", displayName: "A", users: null, parent: "b" },
@@ -1510,13 +1578,13 @@ describe("nested projects — review fixes", () => {
     const loop = await httpRequest(server, {
       method: "POST",
       path: "/projects/a/archive",
-      body: { hostId: 5 },
+      body: { hostId: 5, expected: { projects: ["a"], agents: [], apps: [] } },
     });
     expect(loop.status).toBe(200);
-    expect(archiveProject).toHaveBeenCalledWith(null, "a");
+    expect((submitFrontDoor as Mock).mock.calls[0]?.[2]).toMatchObject({ slug: "a" });
   });
 
-  it("archive preflight counts only sub-projects hidden from the caller", async () => {
+  it("archive preflight: the machine's contents, sub-projects hidden from the caller, and the caller's rooms", async () => {
     (getUsernameForUserId as Mock).mockResolvedValue("alice");
     (listProjects as Mock).mockResolvedValue([
       { slug: "p", displayName: "P", users: ["alice", "bob"], parent: null },
@@ -1525,17 +1593,38 @@ describe("nested projects — review fixes", () => {
       { slug: "deep", displayName: "D", users: null, parent: "hidden" },
       { slug: "other", displayName: "O", users: ["bob"], parent: null },
     ]);
+    const contents = {
+      project: "p",
+      projects: [{ slug: "p", displayName: "P", parent: null }, { slug: "seen", displayName: "S", parent: "p" }],
+      agents: [],
+      apps: [{ slug: "tally", title: "Tally", project: "seen" }],
+    };
+    (submitFrontDoor as Mock).mockResolvedValueOnce({ state: "done", id: "c1", seq: 7, result: contents });
+    (findProjectRooms as Mock).mockResolvedValueOnce([{ roomId: "!r:x", project: "seen" }]);
     const res = await httpRequest(server, {
       method: "GET",
       path: "/projects/p/archive-preflight?hostId=5",
     });
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ hiddenSubProjects: 2 });
+    expect(res.body).toEqual({ hiddenSubProjects: 2, contents, rooms: [{ roomId: "!r:x", project: "seen" }], roomsUnknown: false });
+    expect((submitFrontDoor as Mock).mock.calls[0]?.slice(1, 3)).toEqual(["project-contents", { slug: "p" }]);
+    expect(findProjectRooms).toHaveBeenCalledWith("1", ["p", "seen"]);
     const hidden = await httpRequest(server, {
       method: "GET",
       path: "/projects/other/archive-preflight?hostId=5",
     });
     expect(hidden.status).toBe(404);
+  });
+
+  it("archive preflight says when the chat server couldn't be asked, and passes 'still working' through", async () => {
+    (listProjects as Mock).mockResolvedValue([{ slug: "p", displayName: "P", users: null, parent: null }]);
+    (findProjectRooms as Mock).mockResolvedValueOnce(null);
+    let res = await httpRequest(server, { method: "GET", path: "/projects/p/archive-preflight?hostId=5" });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ rooms: [], roomsUnknown: true });
+    (submitFrontDoor as Mock).mockResolvedValueOnce({ state: "pending", id: "c2", seq: 8, stage: "queued" });
+    res = await httpRequest(server, { method: "GET", path: "/projects/p/archive-preflight?hostId=5" });
+    expect(res.status).toBe(202);
   });
 
   it("raw file save that changes the parent gets the move guard rails", async () => {
@@ -1610,14 +1699,14 @@ describe("cross-cutting", () => {
     const archiveRes = await httpRequest(server, {
       method: "POST",
       path: "/projects/my-project/archive",
-      body: { hostId: 5 },
+      body: { hostId: 5, expected: EXPECTED },
     });
     expect(archiveRes.status).toBe(401);
 
     // Absolutely no downstream calls happened.
     expect(listProjects).not.toHaveBeenCalled();
     expect(createProject).not.toHaveBeenCalled();
-    expect(archiveProject).not.toHaveBeenCalled();
+    expect(submitFrontDoor).not.toHaveBeenCalled();
   });
 
   // Test 18 retired: slug derivation now lives in src/backend/utils/

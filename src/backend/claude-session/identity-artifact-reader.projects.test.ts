@@ -14,7 +14,6 @@
  *     - listProjects(conn): Promise<Array<{slug, displayName}>>
  *     - readProjectFile(conn, slug): Promise<{markdown: string}>
  *     - createProject(conn, slug, displayName): Promise<void>
- *     - archiveProject(conn, slug): Promise<void>
  *
  * The load-bearing constraint (RESEARCH § Common Pitfalls #5): the frontmatter
  * writer must go through a FULL yaml.load round-trip, NOT
@@ -86,7 +85,6 @@ import {
   readProjectFile,
   writeProjectFile,
   createProject,
-  archiveProject,
   applyProjectParentLine,
   applyProjectUsersBlock,
   projectMetaFromMarkdown,
@@ -461,7 +459,7 @@ describe("writeSessionProjectField — REMOTE branch", () => {
 });
 
 // ===========================================================================
-// Task 2: listProjects + readProjectFile + createProject + archiveProject
+// Task 2: listProjects + readProjectFile + createProject
 // ===========================================================================
 
 /**
@@ -964,7 +962,7 @@ describe("createProject — LOCAL branch", () => {
       /invalid project slug/,
     );
     // Post-M2 fix: fsStatMock is no longer consulted by createProject
-    // (only archiveProject uses it now). fsMkdirMock and fsWriteFileMock
+    // (nothing here uses it now). fsMkdirMock and fsWriteFileMock
     // must NOT fire because slug validation happens before any I/O.
     expect(fsMkdirMock).not.toHaveBeenCalled();
     expect(fsWriteFileMock).not.toHaveBeenCalled();
@@ -1096,84 +1094,6 @@ describe("createProject — REMOTE branch", () => {
     expect(sftp.writeFile).not.toHaveBeenCalled();
   });
 });
-
-describe("archiveProject — LOCAL branch", () => {
-  it("Test A1: happy — mkdir archive/ recursive, then rename projects/<slug> → projects/archive/<slug>", async () => {
-    await archiveProject(null, "alpha");
-
-    // archive/ dir created with recursive:true.
-    expect(fsMkdirMock).toHaveBeenCalled();
-    const mkdirCall = fsMkdirMock.mock.calls.find(
-      (c) => typeof c[0] === "string" && (c[0] as string).endsWith("/archive"),
-    );
-    expect(mkdirCall).toBeDefined();
-    expect(mkdirCall![1]).toMatchObject({ recursive: true });
-
-    // rename from projects/alpha → projects/archive/alpha.
-    expect(fsRenameMock).toHaveBeenCalledTimes(1);
-    const [renameFrom, renameTo] = fsRenameMock.mock.calls[0];
-    expect((renameFrom as string).endsWith("/projects/alpha")).toBe(true);
-    expect((renameTo as string).endsWith("/projects/archive/alpha")).toBe(true);
-  });
-
-  it("Test A2: invalid slug — '../etc' throws before any I/O (path-traversal defense)", async () => {
-    await expect(archiveProject(null, "../etc")).rejects.toThrow(
-      /invalid project slug/,
-    );
-    expect(fsMkdirMock).not.toHaveBeenCalled();
-    expect(fsRenameMock).not.toHaveBeenCalled();
-  });
-
-  it("Test A2b (M1 fix): archive-twice → renames to a SUFFIXED archive dest, never onto the existing one", async () => {
-    // archive/alpha exists (earlier archive of this slug); the suffixed
-    // dest does not.
-    fsStatMock.mockImplementationOnce(() => Promise.resolve({ isDirectory: () => true }));
-    await archiveProject(null, "alpha");
-    expect(fsRenameMock).toHaveBeenCalledTimes(1);
-    const renameTo = fsRenameMock.mock.calls[0][1] as string;
-    expect(renameTo).toMatch(/\/projects\/archive\/alpha-\d{8}T\d{6}Z$/);
-  });
-
-  it("Test A2c: suffixed dest ALSO exists → EEXIST and no rename (nested-corruption defense)", async () => {
-    fsStatMock.mockImplementation(() => Promise.resolve({ isDirectory: () => true }));
-    await expect(archiveProject(null, "alpha")).rejects.toMatchObject({ code: "EEXIST" });
-    expect(fsRenameMock).not.toHaveBeenCalled();
-  });
-});
-
-describe("archiveProject — REMOTE branch", () => {
-  it("Test A3 (H3 fix): single exec — mkdir -p archive, collision-suffix guard, mv, all with double-quoted $HOME", async () => {
-    const { conn } = buildMockConn();
-    const execedCmds: string[] = [];
-    execCommandMock.mockImplementation((_conn: unknown, cmd: string) => {
-      execedCmds.push(cmd);
-      return Promise.resolve("ok\n");
-    });
-
-    await archiveProject(conn, "alpha");
-
-    expect(execedCmds).toHaveLength(1);
-    const cmd = execedCmds[0];
-    expect(cmd).toContain('mkdir -p "$HOME/fleet/projects/archive"');
-    expect(cmd).toContain('d="$HOME/fleet/projects/archive/alpha"');
-    // Collision → suffix; still-colliding → refuse rather than nest.
-    expect(cmd).toMatch(/if \[ -e "\$d" \]; then d="\$d-\d{8}T\d{6}Z"; fi/);
-    expect(cmd).toContain('if [ -e "$d" ]; then echo EEXIST; exit 17; fi');
-    expect(cmd).toContain('mv "$HOME/fleet/projects/alpha" "$d"');
-    // Regression: MUST NOT single-quote-wrap $HOME.
-    expect(cmd).not.toContain("'$HOME");
-  });
-
-  it("Test A3b (M1 fix): REMOTE shell reports EEXIST → throws EEXIST-coded error", async () => {
-    const { conn } = buildMockConn();
-    execCommandMock.mockImplementation(() => Promise.resolve("EEXIST\n"));
-    await expect(archiveProject(conn, "alpha")).rejects.toMatchObject({ code: "EEXIST" });
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Nested projects — `parent:` read, create, and line-based set/clear
-// ---------------------------------------------------------------------------
 
 describe("listProjects — parent frontmatter (nested projects)", () => {
   function stubFiles(files: Record<string, string>) {
