@@ -35,7 +35,9 @@ import {
 } from "@/components/kit";
 import { RowGestures, RowKebabMenu, type RowKebabMenuItem } from "@/features/pretty-conversations/RowKebabMenu";
 import { roleAvatarUrl, updateRoleAvatarByName, type RoleSummary } from "@/api/identities-api";
-import { getRoleFileByName, updateRoleFileByName } from "@/api/claude-session-api";
+import { editRoleFrontmatter, getRoleFileByName, updateRoleFileByName } from "@/api/claude-session-api";
+import { ABSENT_VERSION, FileChangedError } from "@/api/file-changed-error";
+import { askReloadOrKeep, keptNote } from "@/lib/changed-file-prompt";
 import { reachLabel, reachText, removeInstanceWide, type InstanceWideItem } from "@/api/instance-wide-api";
 import { editSharedMachines, shareWithMachines } from "../SharedMachines";
 import { confirmAndArchiveRole, confirmAndDeleteRoleSkill } from "./role-actions";
@@ -61,7 +63,6 @@ import { useHasGitRepos } from "../use-has-git-repos";
 import { InstanceWideSyncStatus } from "../InstanceWideStatus";
 import {
   cleanRoleDescription,
-  mergeRoleFrontmatter,
   readRoleBorrowable,
   readRoleFrontmatterValue,
   ROLE_DESCRIPTION_MAX,
@@ -156,12 +157,18 @@ export function RoleView({
 
   // ── Role file ────────────────────────────────────────────────────────────
   const [roleFile, setRoleFile] = useState<TabState<string>>({ status: "loading" });
+  // The version the shown role file was read at: a save from its editor is written only over that.
+  const roleVersionRef = useRef<string>(ABSENT_VERSION);
   const roleFileRef = useRef(roleFile);
   roleFileRef.current = roleFile;
   useEffect(() => {
     let cancelled = false;
     getRoleFileByName({ roleName: name, hostId })
-      .then(({ markdown }) => !cancelled && setRoleFile({ status: "ready", data: markdown }))
+      .then(({ markdown, version }) => {
+        if (cancelled) return;
+        roleVersionRef.current = version;
+        setRoleFile({ status: "ready", data: markdown });
+      })
       .catch((e: unknown) => {
         if (!cancelled) setRoleFile({ status: "error", error: e instanceof Error ? e.message : "Connection failed" });
       });
@@ -172,18 +179,19 @@ export function RoleView({
   const fileReady = roleFile.status === "ready";
   const description = fileReady ? readRoleFrontmatterValue(roleFile.data, "description") : null;
 
-  /** Merge frontmatter keys into the current file and save it. Saves run one
-   *  at a time, each merging into the file the previous one wrote, so quick
-   *  successive changes (description, then colour, then voice) all land. */
+  /** Change just these frontmatter lines, on the machine, read at the change's turn —
+   *  nothing else in the file is written back. Edits run one at a time, so quick
+   *  successive changes (description, then colour, then voice) all land in order. */
   const frontmatterQueue = useRef<Promise<unknown>>(Promise.resolve());
   const [frontmatterSaving, setFrontmatterSaving] = useState(0);
   const saveFrontmatter = useCallback(
     (patch: RoleFrontmatterPatch, cleared?: string[]): Promise<string> => {
       const run = async (): Promise<string> => {
-        const current = roleFileRef.current;
-        if (current.status !== "ready") throw new Error("The role file hasn't loaded yet — try again in a moment.");
-        const merged = mergeRoleFrontmatter(current.data, patch, cleared ? new Set(cleared) : undefined);
-        const res = await updateRoleFileByName(name, hostId, merged);
+        const set = Object.fromEntries(
+          Object.entries(patch).filter((e): e is [string, string | number | boolean] => e[1] !== undefined),
+        );
+        const res = await editRoleFrontmatter(name, hostId, set, cleared ?? []);
+        roleVersionRef.current = res.version;
         const next: TabState<string> = { status: "ready", data: res.markdown };
         roleFileRef.current = next;
         setRoleFile(next);
@@ -391,7 +399,8 @@ export function RoleView({
     setSaving(true);
     setSaveError(null);
     try {
-      const res = await updateRoleFileByName(name, hostId, draft);
+      const res = await updateRoleFileByName(name, hostId, draft, roleVersionRef.current);
+      roleVersionRef.current = res.version;
       setRoleFile({ status: "ready", data: res.markdown });
       setEditing(false);
       console.info({ operation: "role_file_saved", hostId, roleName: name });
@@ -400,6 +409,27 @@ export function RoleView({
         displayName: readRoleFrontmatterValue(res.markdown, "displayName") || undefined,
       });
     } catch (e) {
+      if (e instanceof FileChangedError) {
+        // An agent (or another device) wrote in the role file since it was opened.
+        console.info({ operation: "role_file_changed_since_opened", hostId, roleName: name });
+        if ((await askReloadOrKeep(e)) === "reload") {
+          try {
+            const fresh = await getRoleFileByName({ roleName: name, hostId });
+            roleVersionRef.current = fresh.version;
+            setRoleFile({ status: "ready", data: fresh.markdown });
+            setDraft(fresh.markdown);
+            setBaseline(fresh.markdown);
+            interacted.current = false;
+          } catch (err) {
+            setSaveError(err instanceof Error ? err.message : String(err));
+          }
+          return;
+        }
+        // Kept: saving again goes over the newer version, on purpose.
+        roleVersionRef.current = e.version ?? ABSENT_VERSION;
+        setSaveError(keptNote(e));
+        return;
+      }
       setSaveError(e instanceof Error ? e.message : String(e));
     } finally {
       setSaving(false);

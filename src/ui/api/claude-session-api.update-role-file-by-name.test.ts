@@ -58,13 +58,14 @@ afterEach(() => {
 });
 
 describe("updateRoleFileByName one-shot helper", () => {
-  it("test A: sends role:update-file frame; resolves {markdown} on role:file-updated response; closes socket", async () => {
+  it("test A: sends role:update-file frame with the version opened; resolves {markdown, version} on role:file-updated; closes socket", async () => {
     const { updateRoleFileByName } = await import("./claude-session-api.js");
 
     const promise = updateRoleFileByName(
       "box-maintainer",
       3,
       "---\ntitle: Skynet\n---",
+      "a".repeat(64),
     );
     expect(lastSocket).not.toBeNull();
 
@@ -80,12 +81,14 @@ describe("updateRoleFileByName one-shot helper", () => {
       roleName: "box-maintainer",
       hostId: 3,
       contents: "---\ntitle: Skynet\n---",
+      version: "a".repeat(64),
     });
 
     // Simulate server response — server-echoed confirmed markdown post-write.
     const responsePayload = {
       type: "role:file-updated",
       markdown: "---\ntitle: Skynet\n---",
+      version: "b".repeat(64),
     };
     lastSocket!.onmessage?.call(
       lastSocket as unknown as WebSocket,
@@ -93,7 +96,7 @@ describe("updateRoleFileByName one-shot helper", () => {
     );
 
     const resolved = await promise;
-    expect(resolved).toEqual({ markdown: "---\ntitle: Skynet\n---" });
+    expect(resolved).toEqual({ markdown: "---\ntitle: Skynet\n---", version: "b".repeat(64) });
 
     // Test B (embedded): connection closed by client after single response
     // received — proves no live subscription.
@@ -103,7 +106,7 @@ describe("updateRoleFileByName one-shot helper", () => {
   it("test B: rejects with Error(env.error) when response envelope carries `error`", async () => {
     const { updateRoleFileByName } = await import("./claude-session-api.js");
 
-    const promise = updateRoleFileByName("box-maintainer", 3, "body");
+    const promise = updateRoleFileByName("box-maintainer", 3, "body", "a".repeat(64));
     lastSocket!.onopen?.call(
       lastSocket as unknown as WebSocket,
       new Event("open"),
@@ -123,5 +126,39 @@ describe("updateRoleFileByName one-shot helper", () => {
     await expect(promise).rejects.toThrow(/IDMEDIT_MAX_MARKDOWN_BYTES/);
     // Socket closed even on error (single response consumed).
     expect(lastSocket!.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("test C: changed since it was opened → rejects with FileChangedError carrying the version now", async () => {
+    const { updateRoleFileByName } = await import("./claude-session-api.js");
+    const { FileChangedError } = await import("./file-changed-error.js");
+    const promise = updateRoleFileByName("box-maintainer", 3, "stale", "a".repeat(64));
+    lastSocket!.onopen?.call(lastSocket as unknown as WebSocket, new Event("open"));
+    lastSocket!.onmessage?.call(
+      lastSocket as unknown as WebSocket,
+      new MessageEvent("message", {
+        data: JSON.stringify({ type: "role:file-updated", markdown: "", error: "it changed since you opened it", code: "changed", version: "c".repeat(64) }),
+      }),
+    );
+    const err = await promise.catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(FileChangedError);
+    expect((err as InstanceType<typeof FileChangedError>).version).toBe("c".repeat(64));
+  });
+
+  it("test D: editRoleFrontmatter sends just the lines to change and resolves the file as it now is", async () => {
+    const { editRoleFrontmatter } = await import("./claude-session-api.js");
+    const promise = editRoleFrontmatter("box-maintainer", 3, { colorHue: 40 }, ["voice"]);
+    lastSocket!.onopen?.call(lastSocket as unknown as WebSocket, new Event("open"));
+    expect(JSON.parse(lastSocket!.send.mock.calls[0][0] as string)).toEqual({
+      type: "role:edit",
+      roleName: "box-maintainer",
+      hostId: 3,
+      set: { colorHue: 40 },
+      unset: ["voice"],
+    });
+    lastSocket!.onmessage?.call(
+      lastSocket as unknown as WebSocket,
+      new MessageEvent("message", { data: JSON.stringify({ type: "role:edited", markdown: "---\ncolorHue: '40'\n---\n", version: "e".repeat(64) }) }),
+    );
+    expect(await promise).toEqual({ markdown: "---\ncolorHue: '40'\n---\n", version: "e".repeat(64) });
   });
 });

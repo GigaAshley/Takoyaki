@@ -1,4 +1,6 @@
+import axios from "axios";
 import { authApi, handleApiError } from "@/main-axios";
+import { FileChangedError } from "@/api/file-changed-error";
 import { inMachineOrder, sendMachineChange, type MachineChangeAnswer } from "@/api/machine-changes-api";
 
 // ─── Phase 117 Plan 117-06 (D-25 / D-28 / D-30) — project-list-api ──────────
@@ -218,11 +220,11 @@ export function setProjectParent(
 export async function getProjectFile(
   hostId: number,
   slug: string,
-): Promise<{ markdown: string }> {
+): Promise<{ markdown: string; version: string }> {
   try {
     const url = `/projects/${encodeURIComponent(slug)}/file?hostId=${encodeURIComponent(String(hostId))}`;
     const response = await authApi.get(url);
-    return response.data as { markdown: string };
+    return response.data as { markdown: string; version: string };
   } catch (error) {
     handleApiError(error, "read project file");
   }
@@ -240,12 +242,20 @@ export async function updateProjectFile(
   hostId: number,
   slug: string,
   contents: string,
-): Promise<{ markdown: string }> {
+  /** The version it was opened at: the machine writes it only over that. */
+  version: string,
+): Promise<{ markdown: string; version: string }> {
   try {
     const url = `/projects/${encodeURIComponent(slug)}/file`;
-    const response = await authApi.put(url, { hostId, contents });
-    return response.data as { markdown: string };
+    const response = await authApi.put(url, { hostId, contents, version });
+    // Still waiting its turn on the machine: not saved yet, so the editor keeps the draft.
+    if (response.status === 202) throw new Error((response.data as { error?: string }).error ?? "still saving");
+    return response.data as { markdown: string; version: string };
   } catch (error) {
+    const data = (axios.isAxiosError(error) ? error.response?.data : undefined) as
+      | { code?: string; version?: string | null; error?: string }
+      | undefined;
+    if (data?.code === "changed") throw new FileChangedError(data.version ?? null);
     handleApiError(error, "update project file");
   }
 }

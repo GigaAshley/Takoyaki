@@ -1,30 +1,16 @@
-// ─── role:update-file WS handler (Phase 90 Plan 90-03 Task 2) ─
+// ─── role:update-file WS handler — the role file editor's Save ─
 //
-// Byte-shape mirror of claude-session-server.role-file.test.ts covering the
-// existing identity:update-role-file handler, but keyed directly on roleName
-// (no identity two-step). Companion wire type for the RoleModal save path
-// per D-08.3 planner-pick.
+// Keyed directly on roleName (the roles window has no identity context). A save is written
+// at its turn at the machine's front door, only over the version the editor opened; then
+// the file is read back (with its new version) so the editor rehydrates from the machine.
 //
-// Test strategy mirrors the existing role-file test:
-//   - vi.mock the reader/writer helpers so we can control responses and
-//     surface throws per-test.
-//   - vi.mock connectOneShot + resolveHostById so we can steer LOCAL vs
-//     REMOTE routing without a real ssh2 pair.
-//   - Drive the handler via the exported __handleRoleUpdateFileForTests seam.
-//   - Assert on the outbound wire messages captured by the wsStub.send spy.
-//
-// Test map (7 cases per plan Task 2 <behavior>):
-//   A. LOCAL happy path: writeRoleFileByName(null, roleName, contents) then
-//      readRoleFileByName(null, roleName); response identity-echoes markdown.
-//   B. REMOTE happy path: resolves host, opens ssh conn, calls writer+reader
-//      with the conn, closes conn in finally.
-//   C. Invalid roleName: response {markdown:"", error:"invalid roleName"};
-//      no SSH open, no writer call.
-//   D. Missing host (resolveHostById → null): {error:"host not found"};
-//      no writer call.
-//   E. Contents not a string: {error:"contents must be a string"}; no writer call.
-//   F. Writer throws (oversized payload): error propagates on the envelope.
-//   G. Test seam export __handleRoleUpdateFileForTests exists.
+// Test strategy:
+//   - vi.mock the front-door save and the exact-bytes reader (file-save.js) so we control
+//     the machine's answers.
+//   - vi.mock connectOneShot + resolveHostById so we steer LOCAL vs REMOTE routing without
+//     a real ssh2 pair.
+//   - Drive the handler via the exported __handleRoleUpdateFileForTests seam and assert on
+//     the outbound wire messages captured by the wsStub.send spy.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
@@ -42,30 +28,29 @@ vi.mock("./identity-artifact-reader.js", async (importOriginal) => {
     ...actual,
     // Host 6 stands in for the co-located box (IDENTITIES_LOCAL_HOST_IDS).
     isLocalHostId: vi.fn((id: number | undefined) => id === 6),
-    readRoleFileByName: vi.fn(),
-    writeRoleFileByName: vi.fn(),
   };
 });
+vi.mock("../fleet-change/file-save.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../fleet-change/file-save.js")>()),
+  readForSave: vi.fn(),
+  saveFileAtTurn: vi.fn(),
+}));
 
 import { connectOneShot } from "../ssh/ssh-one-shot.js";
 import { resolveHostById } from "../ssh/host-resolver.js";
-import {
-  readRoleFileByName,
-  writeRoleFileByName,
-} from "./identity-artifact-reader.js";
-import {
-  __handleRoleUpdateFileForTests,
-} from "./claude-session-server.js";
-
-// ──────────────────────────────────────────────────────────────────────
-// Wire-shape types + WS stub — mirror the role-file test scaffolding
-// ──────────────────────────────────────────────────────────────────────
+import { readForSave, saveFileAtTurn } from "../fleet-change/file-save.js";
+import { __handleRoleUpdateFileForTests } from "./claude-session-server.js";
 
 type RoleFileUpdatedEvent = {
   type: "role:file-updated";
   markdown: string;
   error?: string;
+  code?: string;
+  version?: string | null;
 };
+
+const OPENED = "a".repeat(64);
+const NOW = "b".repeat(64);
 
 function makeFakeConn(label: string): { end: () => void; __label: string } {
   return { end: vi.fn(), __label: label };
@@ -77,212 +62,103 @@ const wsStub = {
     sent.push(JSON.parse(raw) as RoleFileUpdatedEvent);
   }),
 };
+const ws = wsStub as unknown as import("ws").WebSocket;
+
+function readsBack(markdown: string): void {
+  vi.mocked(readForSave).mockResolvedValue({ data: Buffer.from(markdown), text: markdown, version: NOW });
+}
 
 beforeEach(() => {
   sent = [];
   wsStub.send.mockClear();
   vi.mocked(connectOneShot).mockReset();
   vi.mocked(resolveHostById).mockReset();
-  vi.mocked(readRoleFileByName).mockReset();
-  vi.mocked(writeRoleFileByName).mockReset();
+  vi.mocked(readForSave).mockReset();
+  vi.mocked(saveFileAtTurn).mockReset();
 });
 
 afterEach(() => {
   vi.clearAllMocks();
 });
 
-// ──────────────────────────────────────────────────────────────────────
-// Test G: seam export presence (compile-time reference proves the seam
-// exists; the import at the top of this file would fail otherwise)
-// ──────────────────────────────────────────────────────────────────────
-
-describe("role:update-file WS handler — test seam", () => {
-  it("test G: exports __handleRoleUpdateFileForTests (mirrors __handleIdentityUpdateRoleFileForTests)", () => {
-    expect(__handleRoleUpdateFileForTests).toBeTypeOf("function");
-  });
-});
-
-// ──────────────────────────────────────────────────────────────────────
-// Tests A, B — happy paths (LOCAL + REMOTE)
-// ──────────────────────────────────────────────────────────────────────
-
-describe("role:update-file WS handler — happy paths", () => {
-  it("test A: LOCAL branch calls writeRoleFileByName then readRoleFileByName; response carries fresh markdown", async () => {
-    vi.mocked(writeRoleFileByName).mockResolvedValue(undefined);
-    vi.mocked(readRoleFileByName).mockResolvedValue({
-      markdown: "---\ntitle: Skynet\n---\n\nbody",
-    });
+describe("role:update-file WS handler — saving", () => {
+  it("LOCAL: saved at the front door over the version opened, then read back with its new version", async () => {
+    vi.mocked(saveFileAtTurn).mockResolvedValue({ ok: true, version: NOW, requestId: "r" });
+    readsBack("---\ntitle: Skynet\n---\n\nbody");
 
     await __handleRoleUpdateFileForTests(
-      wsStub as unknown as import("ws").WebSocket,
-      {
-        type: "role:update-file",
-        roleName: "box-maintainer",
-        contents: "---\ntitle: Skynet\n---\n\nbody",
-        hostId: 6, // local host → LOCAL branch
-      },
-      /* userId */ "1",
+      ws,
+      { type: "role:update-file", roleName: "box-maintainer", contents: "---\ntitle: Skynet\n---\n\nbody", hostId: 6, version: OPENED },
+      "1",
     );
 
-    // Write then read (order matters — server rehydrates from post-write state)
-    expect(writeRoleFileByName).toHaveBeenCalledTimes(1);
-    expect(readRoleFileByName).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(writeRoleFileByName).mock.calls[0][0]).toBeNull(); // LOCAL: null conn
-    expect(vi.mocked(writeRoleFileByName).mock.calls[0][1]).toBe("box-maintainer");
-    expect(vi.mocked(writeRoleFileByName).mock.calls[0][2]).toBe(
-      "---\ntitle: Skynet\n---\n\nbody",
-    );
-
-    // Response wire shape mirrors identity:role-file-updated but with new type
-    expect(sent).toHaveLength(1);
-    expect(sent[0].type).toBe("role:file-updated");
-    expect(sent[0].markdown).toBe("---\ntitle: Skynet\n---\n\nbody");
-    expect(sent[0].error).toBeUndefined();
-
-    // No SSH round-trip on LOCAL branch
+    expect(saveFileAtTurn).toHaveBeenCalledTimes(1);
+    const [conn, opts] = vi.mocked(saveFileAtTurn).mock.calls[0];
+    expect(conn).toBeNull();
+    expect(opts).toMatchObject({ homePath: "fleet/roles/box-maintainer/box-maintainer.md", expect: OPENED, hostId: 6, by: "1" });
+    expect(opts.data.toString()).toBe("---\ntitle: Skynet\n---\n\nbody");
+    expect(sent).toEqual([{ type: "role:file-updated", markdown: "---\ntitle: Skynet\n---\n\nbody", version: NOW }]);
     expect(connectOneShot).not.toHaveBeenCalled();
-    expect(resolveHostById).not.toHaveBeenCalled();
   });
 
-  it("test B: REMOTE branch resolves host, opens ssh conn, calls writer+reader with conn, closes conn", async () => {
+  it("REMOTE: resolves the host, saves and reads with the connection, closes it", async () => {
     const fakeConn = makeFakeConn("hostX");
-    vi.mocked(resolveHostById).mockResolvedValue({
-      ip: "1.2.3.4",
-      username: "ubuntu",
-    } as never);
+    vi.mocked(resolveHostById).mockResolvedValue({ ip: "1.2.3.4", username: "ubuntu" } as never);
     vi.mocked(connectOneShot).mockResolvedValue(fakeConn as never);
-    vi.mocked(writeRoleFileByName).mockResolvedValue(undefined);
-    vi.mocked(readRoleFileByName).mockResolvedValue({ markdown: "role body\n" });
+    vi.mocked(saveFileAtTurn).mockResolvedValue({ ok: true, version: NOW, requestId: "r" });
+    readsBack("role body\n");
 
-    await __handleRoleUpdateFileForTests(
-      wsStub as unknown as import("ws").WebSocket,
-      {
-        type: "role:update-file",
-        roleName: "box-maintainer",
-        hostId: 3,
-        contents: "role body\n",
-      },
-      /* userId */ "1",
-    );
+    await __handleRoleUpdateFileForTests(ws, { type: "role:update-file", roleName: "box-maintainer", hostId: 3, contents: "role body\n", version: OPENED }, "1");
 
-    // REMOTE flow: resolveHostById + connectOneShot each fired exactly once
-    expect(resolveHostById).toHaveBeenCalledTimes(1);
-    expect(connectOneShot).toHaveBeenCalledTimes(1);
-
-    // writer + reader got the fake conn (proves REMOTE routing)
-    expect(vi.mocked(writeRoleFileByName).mock.calls[0][0]).toBe(fakeConn);
-    expect(vi.mocked(readRoleFileByName).mock.calls[0][0]).toBe(fakeConn);
-
-    // Conn closed in finally
+    expect(vi.mocked(saveFileAtTurn).mock.calls[0][0]).toBe(fakeConn);
+    expect(vi.mocked(readForSave).mock.calls[0][0]).toBe(fakeConn);
     expect(fakeConn.end).toHaveBeenCalledTimes(1);
+    expect(sent[0]).toEqual({ type: "role:file-updated", markdown: "role body\n", version: NOW });
+  });
 
-    // Response OK
-    expect(sent[0]).toEqual({ type: "role:file-updated", markdown: "role body\n" });
+  it("changed since it was opened (an agent wrote in it): nothing read back, the refusal carries the version now", async () => {
+    vi.mocked(saveFileAtTurn).mockResolvedValue({ ok: false, status: 409, code: "changed", error: "it changed since you opened it", version: NOW });
+
+    await __handleRoleUpdateFileForTests(ws, { type: "role:update-file", roleName: "box-maintainer", hostId: 6, contents: "stale", version: OPENED }, "1");
+
+    expect(readForSave).not.toHaveBeenCalled();
+    expect(sent).toEqual([{ type: "role:file-updated", markdown: "", error: "it changed since you opened it", code: "changed", version: NOW }]);
   });
 });
 
-// ──────────────────────────────────────────────────────────────────────
-// Tests C, D, E — validation errors that fire without opening SSH
-// ──────────────────────────────────────────────────────────────────────
-
-describe("role:update-file WS handler — validation errors", () => {
-  it("test C: rejects invalid roleName (fails ROLE_NAME_PATTERN) without opening SSH or calling writer", async () => {
-    await __handleRoleUpdateFileForTests(
-      wsStub as unknown as import("ws").WebSocket,
-      {
-        type: "role:update-file",
-        roleName: "../evil",
-        contents: "x",
-      },
-      /* userId */ "1",
-    );
-
-    expect(writeRoleFileByName).not.toHaveBeenCalled();
-    expect(readRoleFileByName).not.toHaveBeenCalled();
-    expect(connectOneShot).not.toHaveBeenCalled();
-    expect(resolveHostById).not.toHaveBeenCalled();
-    expect(sent[0]).toEqual({
-      type: "role:file-updated",
-      markdown: "",
-      error: "invalid roleName",
+describe("role:update-file WS handler — refused before touching the machine", () => {
+  const cases: Array<[string, Record<string, unknown>, string]> = [
+    ["an invalid roleName", { roleName: "../evil", contents: "x", hostId: 6, version: OPENED }, "invalid roleName"],
+    ["contents that aren't a string", { roleName: "box-maintainer", contents: 42, hostId: 6, version: OPENED }, "contents must be a string"],
+    ["no version", { roleName: "box-maintainer", contents: "x", hostId: 6 }, "version is required — the one the file was opened at"],
+    ["a made-up version", { roleName: "box-maintainer", contents: "x", hostId: 6, version: "nope" }, "version is required — the one the file was opened at"],
+  ];
+  for (const [label, body, error] of cases) {
+    it(label, async () => {
+      await __handleRoleUpdateFileForTests(ws, { type: "role:update-file", ...body }, "1");
+      expect(saveFileAtTurn).not.toHaveBeenCalled();
+      expect(connectOneShot).not.toHaveBeenCalled();
+      expect(sent[0]).toMatchObject({ type: "role:file-updated", markdown: "", error });
     });
-  });
+  }
 
-  it("test D: bad hostId — resolveHostById returns null → {error:'host not found'}, no writer call", async () => {
+  it("a host that isn't found", async () => {
     vi.mocked(resolveHostById).mockResolvedValue(null as never);
-
-    await __handleRoleUpdateFileForTests(
-      wsStub as unknown as import("ws").WebSocket,
-      {
-        type: "role:update-file",
-        roleName: "box-maintainer",
-        hostId: 999,
-        contents: "body",
-      },
-      /* userId */ "1",
-    );
-
-    expect(writeRoleFileByName).not.toHaveBeenCalled();
-    expect(connectOneShot).not.toHaveBeenCalled();
-    expect(sent[0]).toEqual({
-      type: "role:file-updated",
-      markdown: "",
-      error: "host not found",
-    });
+    await __handleRoleUpdateFileForTests(ws, { type: "role:update-file", roleName: "box-maintainer", hostId: 999, contents: "body", version: OPENED }, "1");
+    expect(saveFileAtTurn).not.toHaveBeenCalled();
+    expect(sent[0]).toEqual({ type: "role:file-updated", markdown: "", error: "host not found" });
   });
 
-  it("test E: contents not a string → {error:'contents must be a string'}, no writer call", async () => {
+  it("an oversized file", async () => {
     await __handleRoleUpdateFileForTests(
-      wsStub as unknown as import("ws").WebSocket,
-      {
-        type: "role:update-file",
-        roleName: "box-maintainer",
-        contents: 42, // wrong type
-      },
-      /* userId */ "1",
+      ws,
+      { type: "role:update-file", roleName: "box-maintainer", hostId: 6, contents: "x".repeat(2_000_001), version: OPENED },
+      "1",
     );
-
-    expect(writeRoleFileByName).not.toHaveBeenCalled();
-    expect(sent[0]).toEqual({
-      type: "role:file-updated",
-      markdown: "",
-      error: "contents must be a string",
-    });
-  });
-});
-
-// ──────────────────────────────────────────────────────────────────────
-// Test F — writer throws (oversized-payload gate inside writeRoleFileByName)
-// ──────────────────────────────────────────────────────────────────────
-
-describe("role:update-file WS handler — writer throws propagate", () => {
-  it("test F: writeRoleFileByName byte-cap throw surfaces as {error} on the response envelope", async () => {
-    vi.mocked(writeRoleFileByName).mockRejectedValue(
-      new Error("markdown payload exceeds IDMEDIT_MAX_MARKDOWN_BYTES"),
-    );
-
-    await __handleRoleUpdateFileForTests(
-      wsStub as unknown as import("ws").WebSocket,
-      {
-        type: "role:update-file",
-        roleName: "box-maintainer",
-        hostId: 6,
-        contents: "oversized (simulated by mock throw)",
-      },
-      /* userId */ "1",
-    );
-
-    // Re-read did NOT happen since write threw
-    expect(readRoleFileByName).not.toHaveBeenCalled();
-
-    expect(sent).toHaveLength(1);
-    expect(sent[0].type).toBe("role:file-updated");
-    expect(sent[0].markdown).toBe("");
+    expect(saveFileAtTurn).not.toHaveBeenCalled();
     expect(sent[0].error).toContain("IDMEDIT_MAX_MARKDOWN_BYTES");
   });
-});
 
-describe("role:update-file WS handler — hostId is required (no local fallback)", () => {
   for (const [label, hostId] of [
     ["omitted", undefined],
     ["null", null],
@@ -290,16 +166,14 @@ describe("role:update-file WS handler — hostId is required (no local fallback)
     ["string", "6"],
     ["fractional", 6.5],
   ] as const) {
-    it(`rejects ${label} hostId with {error:'hostId is required'}; no writer, no SSH`, async () => {
+    it(`a hostId that's ${label}: {error:'hostId is required'}`, async () => {
       await __handleRoleUpdateFileForTests(
-        wsStub as unknown as import("ws").WebSocket,
-        { type: "role:update-file", roleName: "box-maintainer", contents: "x", ...(hostId === undefined ? {} : { hostId }) },
-        /* userId */ "1",
+        ws,
+        { type: "role:update-file", roleName: "box-maintainer", contents: "x", version: OPENED, ...(hostId === undefined ? {} : { hostId }) },
+        "1",
       );
-      expect(writeRoleFileByName).not.toHaveBeenCalled();
-      expect(readRoleFileByName).not.toHaveBeenCalled();
+      expect(saveFileAtTurn).not.toHaveBeenCalled();
       expect(resolveHostById).not.toHaveBeenCalled();
-      expect(connectOneShot).not.toHaveBeenCalled();
       expect(sent).toEqual([{ type: "role:file-updated", markdown: "", error: "hostId is required" }]);
     });
   }

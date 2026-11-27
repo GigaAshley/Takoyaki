@@ -55,6 +55,8 @@ import {
   type IdentityDeleteWakeupPayload,
   type IdentityWakeupDeletedEvent,
 } from "@/api/claude-session-api";
+import { ABSENT_VERSION, FileChangedError } from "@/api/file-changed-error";
+import { askReloadOrKeep, keptNote } from "@/lib/changed-file-prompt";
 import type { Identity } from "@/api/identities-api";
 import type { GitCommit } from "@/api/workspace-git-api";
 import { cn } from "@/lib/utils";
@@ -174,6 +176,8 @@ export function IdentityModal({
 
   // Tab data — WS one-shot fetches.
   const [identityFileState, setIdentityFileState] = useState<TabState<string>>({ status: "loading" });
+  // The version the shown agent file was read at: a save is written only over that.
+  const fileVersionRef = useRef<string>(ABSENT_VERSION);
   const [identityWakeupsState, setIdentityWakeupsState] = useState<TabState<Wakeup[]>>({ status: "loading" });
   // The open wake-up as last seen, and whether its view holds unsaved edits.
   const lastWakeup = useRef<Wakeup | undefined>(undefined);
@@ -431,7 +435,10 @@ export function IdentityModal({
     openOneShot<IdentityGetIdentityFilePayload, IdentityIdentityFileEvent>(
       { type: "identity:get-identity-file", identityKey: identity.identityKey, hostId, ...(isArchived ? { archived: true } : {}) },
       "identity:identity-file",
-      (ev) => setIdentityFileState(ev.error ? { status: "error", error: ev.error } : { status: "ready", data: ev.markdown }),
+      (ev) => {
+        if (!ev.error) fileVersionRef.current = ev.version ?? ABSENT_VERSION;
+        setIdentityFileState(ev.error ? { status: "error", error: ev.error } : { status: "ready", data: ev.markdown });
+      },
       (e) => setIdentityFileState({ status: "error", error: e }),
     );
 
@@ -657,12 +664,36 @@ export function IdentityModal({
         identityKey: identity.identityKey,
         hostId,
         contents: draft,
+        version: fileVersionRef.current,
       };
       const res = await sendIdentityMutation<IdentityUpdateIdentityFilePayload, IdentityIdentityFileUpdatedEvent>(
         payload,
         "identity:identity-file-updated",
       );
+      if (res.code === "changed") {
+        // The agent (or another device) wrote in it since it was opened.
+        const changed = new FileChangedError(res.version ?? null);
+        console.info({ operation: "identity_file_changed_since_opened", identityKey: identity.identityKey, hostId });
+        if ((await askReloadOrKeep(changed)) === "reload") {
+          const fresh = await sendIdentityMutation<IdentityGetIdentityFilePayload, IdentityIdentityFileEvent>(
+            { type: "identity:get-identity-file", identityKey: identity.identityKey, hostId },
+            "identity:identity-file",
+          );
+          if (fresh.error) throw new Error(fresh.error);
+          fileVersionRef.current = fresh.version ?? ABSENT_VERSION;
+          setIdentityFileState({ status: "ready", data: fresh.markdown });
+          setDraft(fresh.markdown);
+          setBaseline(fresh.markdown);
+          interacted.current = false;
+          return;
+        }
+        // Kept: saving again goes over the newer version, on purpose.
+        fileVersionRef.current = changed.version ?? ABSENT_VERSION;
+        setSaveError(keptNote(changed));
+        return;
+      }
       if (res.error) throw new Error(res.error);
+      fileVersionRef.current = res.version ?? fileVersionRef.current;
       setIdentityFileState({ status: "ready", data: res.markdown });
       fileDirtyRef.current = false;
       setEditing(false);

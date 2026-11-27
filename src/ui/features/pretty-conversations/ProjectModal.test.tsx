@@ -45,17 +45,17 @@ vi.mock("@/features/pretty-view/MarkdownEditor", () => ({
 
 // Mock the project-file API — spies observed per-test.
 const getProjectFileSpy = vi.fn<
-  (hostId: number, slug: string) => Promise<{ markdown: string }>
->(async () => ({ markdown: "" }));
+  (hostId: number, slug: string) => Promise<{ markdown: string; version?: string }>
+>(async () => ({ markdown: "", version: "v0" }));
 const updateProjectFileSpy = vi.fn<
-  (hostId: number, slug: string, contents: string) => Promise<{ markdown: string }>
->(async () => ({ markdown: "" }));
+  (hostId: number, slug: string, contents: string, version?: string) => Promise<{ markdown: string; version?: string }>
+>(async () => ({ markdown: "", version: "v1" }));
 
 vi.mock("@/api/project-list-api", () => ({
   getProjectFile: (hostId: number, slug: string) =>
     getProjectFileSpy(hostId, slug),
-  updateProjectFile: (hostId: number, slug: string, contents: string) =>
-    updateProjectFileSpy(hostId, slug, contents),
+  updateProjectFile: (hostId: number, slug: string, contents: string, version: string) =>
+    updateProjectFileSpy(hostId, slug, contents, version),
 }));
 
 vi.mock("@/api/workspace-api", async (importOriginal) => {
@@ -74,6 +74,7 @@ vi.mock("@/api/workspace-api", async (importOriginal) => {
 });
 
 import { ProjectModal, type ProjectContents } from "./ProjectModal";
+import { FileChangedError } from "@/api/file-changed-error";
 import { __resetKitDialogsForTests, autoAnswerKitDialogs } from "@/components/kit";
 import { listWorkspace } from "@/api/workspace-api";
 import { setProjects } from "@/state/conversation-store";
@@ -122,8 +123,8 @@ const WRITTEN = "---\ndisplayName: Alpha\nmembers:\n  - copper\n---\n\n# The tri
 describe("ProjectModal", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    getProjectFileSpy.mockResolvedValue({ markdown: WRITTEN });
-    updateProjectFileSpy.mockResolvedValue({ markdown: WRITTEN });
+    getProjectFileSpy.mockResolvedValue({ markdown: WRITTEN, version: "v0" });
+    updateProjectFileSpy.mockResolvedValue({ markdown: WRITTEN, version: "v1" });
     setProjects([]);
   });
   afterEach(() => {
@@ -205,7 +206,8 @@ describe("ProjectModal", () => {
     await editTo("# New plan\n");
     fireEvent.click(screen.getByTestId("project-modal-save"));
 
-    await waitFor(() => expect(updateProjectFileSpy).toHaveBeenCalledWith(9, "alpha", "# New plan\n"));
+    // Written only over the version it was read at.
+    await waitFor(() => expect(updateProjectFileSpy).toHaveBeenCalledWith(9, "alpha", "# New plan\n", "v0"));
     expect(await screen.findByTestId("project-modal-file")).toHaveTextContent("New plan");
     expect(screen.queryByTestId("mdxeditor")).toBeNull();
     expect(onOpenChange).not.toHaveBeenCalled();
@@ -218,6 +220,40 @@ describe("ProjectModal", () => {
     fireEvent.click(screen.getByTestId("project-modal-save"));
     expect(await screen.findByTestId("project-modal-save-error")).toHaveTextContent("disk full");
     expect((await editor()).value).toBe("changed");
+  });
+
+  it("changed since it was opened: Keep my edits keeps the draft and saving again goes over the newer version", async () => {
+    updateProjectFileSpy.mockRejectedValueOnce(new FileChangedError("v9"));
+    const dialogs = autoAnswerKitDialogs({ confirm: false });
+    renderModal();
+    await editTo("my plan");
+    fireEvent.click(screen.getByTestId("project-modal-save"));
+    expect(await screen.findByTestId("project-modal-save-error")).toHaveTextContent(/Save again to overwrite it/);
+    expect(dialogs.calls[0].opts).toMatchObject({ title: "This file changed on disk", cancelLabel: "Keep my edits" });
+    expect((await editor()).value).toBe("my plan");
+    fireEvent.click(screen.getByTestId("project-modal-save"));
+    await waitFor(() => expect(updateProjectFileSpy).toHaveBeenLastCalledWith(1, "alpha", "my plan", "v9"));
+  });
+
+  it("changed since it was opened: Reload shows the newer version in the editor", async () => {
+    updateProjectFileSpy.mockRejectedValueOnce(new FileChangedError("v9"));
+    autoAnswerKitDialogs({ confirm: true });
+    renderModal();
+    await editTo("my plan");
+    getProjectFileSpy.mockResolvedValueOnce({ markdown: "---\nparent: farm\n---\nTheir plan.\n", version: "v9" });
+    fireEvent.click(screen.getByTestId("project-modal-save"));
+    await waitFor(async () => expect((await editor()).value).toBe("---\nparent: farm\n---\nTheir plan.\n"));
+    expect(updateProjectFileSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("deleted since it was opened: says so, and saving again puts it back", async () => {
+    updateProjectFileSpy.mockRejectedValueOnce(new FileChangedError(null));
+    renderModal();
+    await editTo("my plan");
+    fireEvent.click(screen.getByTestId("project-modal-save"));
+    expect(await screen.findByTestId("project-modal-save-error")).toHaveTextContent(/deleted or moved/);
+    fireEvent.click(screen.getByTestId("project-modal-save"));
+    await waitFor(() => expect(updateProjectFileSpy).toHaveBeenLastCalledWith(1, "alpha", "my plan", "absent"));
   });
 
   it("Cancel with unsaved edits asks; Keep editing stays, Discard returns to reading", async () => {

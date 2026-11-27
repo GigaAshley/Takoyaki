@@ -52,6 +52,8 @@ import { callerIsAdmin } from "../../instance-wide/admin.js";
 import type { Readable } from "node:stream";
 import { posix } from "node:path";
 import type { Client as SSHClientType } from "ssh2";
+import { ABSENT, fileVersion, isExpect, saveFileAtTurn, type SaveAnswer } from "../../fleet-change/file-save.js";
+import { execCommand } from "../../ssh/tmux-helper.js";
 
 /* ------------------------------------------------------------------------ */
 /*  Target: identity workspace, role folder, or project folder              */
@@ -194,6 +196,93 @@ async function realpathIfExists(sftp: SftpLike, p: string): Promise<string | nul
     return null;
   }
 }
+
+/* ------------------------------------------------------------------------ */
+/*  What the machine owns                                                    */
+/* ------------------------------------------------------------------------ */
+
+/** The marker files the machine uses for pending moves and archives (and its change locks). */
+const MACHINE_MARKERS = new Set([
+  ".move-requested",
+  ".move-failed",
+  ".archive-requested",
+  ".archiving",
+  ".unarchive-requested",
+  ".unarchive-refused",
+  ".unarchive-reactivate",
+  ".unarchive-finishing",
+  ".unarchive-banner",
+  ".change-lock",
+  ".create-lock",
+]);
+/** An archived app's stashed service units. */
+const UNIT_STASH_RE = /^app-[^/]+\.archived$/;
+
+/** Where apps' folders are, relative to the home folder ("*": any one name). */
+const APP_FOLDER_PATTERNS: readonly (readonly string[])[] = [
+  ["fleet", "apps", "*"],
+  ["fleet", "apps-archive", "*"],
+  ["fleet", "projects", "*", "apps", "*"],
+  ["fleet", "projects", "archive", "*", "apps", "*"],
+  ["fleet", "identities", "*", "apps", "*"],
+  ["fleet", "identities-archive", "*", "apps", "*"],
+];
+
+function underHome(p: string, homeDir: string): string[] | null {
+  const n = posix.normalize(p).replace(/\/$/, "");
+  if (n === homeDir) return [];
+  if (!n.startsWith(homeDir + "/")) return null;
+  return n.slice(homeDir.length + 1).split("/");
+}
+
+/**
+ * Refuse (`machine_file`) touching what the machine itself runs on from a Files tab:
+ * creating, changing, renaming or removing a marker file or anything in the front door's
+ * own folder; and, for `remove` (delete, or rename/move away), an app's folder, the
+ * folder holding a project's apps, or any folder those sit in. Files inside an app can
+ * still be opened and edited.
+ */
+export function assertNotMachineOwned(op: "remove" | "create", paths: (string | null)[], homeDir: string): void {
+  for (const p of paths) {
+    if (p === null) continue;
+    const segs = underHome(p, homeDir);
+    if (segs === null) continue;
+    const name = segs[segs.length - 1] ?? "";
+    if (MACHINE_MARKERS.has(name) || UNIT_STASH_RE.test(name) || (segs[0] === "fleet" && segs[1] === ".changes")) {
+      throw new Error("machine_file");
+    }
+    if (op !== "remove") continue;
+    const holdsAnApp = APP_FOLDER_PATTERNS.some(
+      (pat) => segs.length <= pat.length && segs.every((seg, i) => pat[i] === "*" || pat[i] === seg),
+    );
+    if (holdsAnApp) throw new Error("machine_file");
+  }
+}
+
+function shellQuote(s: string): string {
+  return "'" + s.replace(/'/g, "'\\''") + "'";
+}
+
+/** A save's answer, as the Files tab's routes give it. */
+function sendSaveAnswer(res: Response, saved: SaveAnswer): void {
+  if (saved.ok === true) {
+    res.status(200).json({ ok: true, version: saved.version });
+    return;
+  }
+  const error =
+    saved.code === "changed" ? "file_changed"
+    : saved.code === "exists" ? "file_exists"
+    : saved.code === "pending" ? "still_saving"
+    : saved.code === "updating" ? "machine_updating"
+    : saved.code === "not_found" ? "not_found"
+    : saved.code === "not_a_file" ? "not_a_file"
+    : saved.code === "bad_request" ? "path_forbidden"
+    : "host_unreachable";
+  res.status(saved.status).json({ error, ...(saved.version !== undefined ? { version: saved.version } : {}) });
+}
+
+/** A save waits its turn at the machine's front door: longer than other Files-tab work. */
+const SAVE_OP_TIMEOUT_MS = 35_000;
 
 /* ------------------------------------------------------------------------ */
 /*  Constants                                                               */
@@ -469,37 +558,6 @@ function sftpRename(sftp: SftpLike, from: string, to: string): Promise<void> {
 }
 
 /**
- * Atomic write: create write stream to a .partial temp path, write buffer,
- * then sftp.rename into place. Uses "wx" flag to fail if the temp path
- * already exists.
- */
-function sftpWriteBuffer(
-  sftp: SftpLike,
-  absolutePath: string,
-  buffer: Buffer,
-): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const tempPath = `${absolutePath}.${Date.now()}.partial`;
-    const stream = sftp.createWriteStream(tempPath, { flags: "wx" });
-    stream.on("error", (err) => reject(err));
-    stream.on("close", () => {
-      // ext_openssh_rename (posix-rename@openssh.com) instead of plain
-      // rename — standard SFTP RENAME per RFC does not overwrite an
-      // existing destination; the posix-rename extension does, atomically.
-      // All fleet hosts run OpenSSH so the extension is universally
-      // available. Without this, saving over an existing file (the
-      // common case) fails with SSH_FX_FAILURE (code 4, "Failure").
-      sftp.ext_openssh_rename(tempPath, absolutePath, (err) => {
-        if (err) return reject(err);
-        resolve();
-      });
-    });
-    (stream as unknown as { write: (b: Buffer) => void }).write(buffer);
-    stream.end();
-  });
-}
-
-/**
  * Create an empty file using "wx" (fail if exists → already_exists).
  */
 function sftpCreateEmpty(sftp: SftpLike, absolutePath: string): Promise<void> {
@@ -625,6 +683,7 @@ export function classifyErrorToStatus(err: unknown): number {
   if (msg === "already_exists") return 409;
   if (msg === "not_empty") return 409;
   if (msg === "reserved_file") return 409;
+  if (msg === "machine_file") return 409;
   // SSH2 ENOTEMPTY — recognise by descriptive message text only. SSH_FX_FAILURE
   // (code 4) is a generic-failure bucket used for many unrelated errors (write
   // failures, quota, transient SFTP issues), so a bare `code === 4` match
@@ -655,7 +714,8 @@ export function classifyErrorToClass(err: unknown): string {
     msg === "too_large" ||
     msg === "already_exists" ||
     msg === "not_empty" ||
-    msg === "reserved_file"
+    msg === "reserved_file" ||
+    msg === "machine_file"
   ) {
     return msg;
   }
@@ -867,6 +927,8 @@ workspaceRoutes.post(
                 sizeBytes: data.byteLength,
                 filename,
                 extension,
+                // A save from the file window is written only over this version.
+                version: fileVersion(data),
               };
             }));
           },
@@ -877,6 +939,95 @@ workspaceRoutes.post(
       res.status(classifyErrorToStatus(err)).json({ error: classifyErrorToClass(err) });
       sshLogger.warn("workspace /read-file error", {
         operation: "workspace_read_file",
+        errorName: err instanceof Error ? err.name : "unknown",
+        userId,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  },
+);
+
+/* ---- POST /version ---- */
+// The version of a file a viewer streams for itself (a PDF opened for annotating): what its
+// save is checked against. "absent" when there's no file there.
+workspaceRoutes.post(
+  "/version",
+  express.json({ limit: "1mb" }),
+  authenticateJWT,
+  async (req: Request, res: Response) => {
+    const body = req.body as Record<string, unknown> | null;
+    if (
+      body === null ||
+      typeof body !== "object" ||
+      Array.isArray(body) ||
+      typeof body.relativePath !== "string" ||
+      (typeof body.hostId !== "number" && typeof body.hostId !== "string")
+    ) {
+      res.status(400).json({ error: "invalid_body" });
+      return;
+    }
+    const { hostId, relativePath } = body as { hostId: number | string; relativePath: string };
+    const userId = (req as Request & { userId: string }).userId;
+    const targetResult = extractTarget(body, { allowHost: true });
+    if (targetResult.ok === false) {
+      res.status(400).json({ error: targetResult.error });
+      return;
+    }
+    const target = targetResult.target;
+    if (!(await guardHostTarget(res, userId, target))) return;
+    try {
+      validateRelativePath(relativePath);
+    } catch {
+      res.status(400).json({ error: "path_traversal" });
+      return;
+    }
+    const host = await resolveHostById(Number(hostId), userId);
+    if (!host) {
+      res.status(404).json({ error: "unknown_host" });
+      return;
+    }
+    const accessInfo = await permissionManager.canAccessHost(userId, Number(hostId), "read");
+    if (!accessInfo.hasAccess) {
+      res.status(403).json({ error: "permission_denied" });
+      return;
+    }
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), SFTP_OP_TIMEOUT_MS * 2);
+    try {
+      const version = await getHostSemaphore(Number(hostId)).run(() =>
+        withConnection(
+          hostPoolKey(host),
+          () => connectOneShot(host, SSH_CONNECT_TIMEOUT_MS),
+          async (client) => {
+            return await runWithAbort(ctrl.signal, async () => {
+              const resolved = await withSftp(client, async (sftp) => {
+                const homeDir = await sftpRealpath(sftp, ".");
+                const workspaceRoot = await settleTargetRoot(sftp, homeDir, target);
+                const absolutePath = buildAbsolutePath(workspaceRoot, relativePath);
+                const dirPath = absolutePath.substring(0, absolutePath.lastIndexOf("/"));
+                const resolvedDir = await sftpRealpath(sftp, dirPath);
+                assertResolvedUnderRoot(resolvedDir, workspaceRoot);
+                if (FORBIDDEN_PATH_RE.test(resolvedDir)) throw new Error("path_forbidden");
+                return underResolvedParent(resolvedDir, absolutePath);
+              });
+              const out = await execCommand(
+                client,
+                `if [ -f ${shellQuote(resolved)} ]; then sha256sum < ${shellQuote(resolved)}; else echo absent; fi`,
+                { timeoutMs: SFTP_OP_TIMEOUT_MS * 2 },
+              );
+              const v = out.trim().split(/\s+/)[0] ?? "";
+              if (!isExpect(v)) throw new Error("host_unreachable");
+              return v;
+            });
+          },
+        ),
+      );
+      res.json({ version });
+    } catch (err) {
+      res.status(classifyErrorToStatus(err)).json({ error: classifyErrorToClass(err) });
+      sshLogger.warn("workspace /version error", {
+        operation: "workspace_version",
         errorName: err instanceof Error ? err.name : "unknown",
         userId,
       });
@@ -909,6 +1060,12 @@ workspaceRoutes.put(
       relativePath: string;
       content: string;
     };
+    // The version the file was opened at ("absent": a file being made): written only over that.
+    if (!isExpect(body.version)) {
+      res.status(400).json({ error: "invalid_body" });
+      return;
+    }
+    const expectVersion = body.version;
     const userId = (req as Request & { userId: string }).userId;
 
     const targetResult = extractTarget(body, { allowHost: true });
@@ -946,9 +1103,9 @@ workspaceRoutes.put(
 
     const poolKey = hostPoolKey(host);
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), SFTP_OP_TIMEOUT_MS);
+    const timer = setTimeout(() => ctrl.abort(), SAVE_OP_TIMEOUT_MS);
     try {
-      await getHostSemaphore(Number(hostId)).run(() =>
+      const saved = await getHostSemaphore(Number(hostId)).run(() =>
         withConnection(
           poolKey,
           () => connectOneShot(host, SSH_CONNECT_TIMEOUT_MS),
@@ -963,18 +1120,27 @@ workspaceRoutes.put(
               const resolvedDir = await sftpRealpath(sftp, dirPath);
               assertResolvedUnderRoot(resolvedDir, workspaceRoot);
               if (FORBIDDEN_PATH_RE.test(resolvedDir)) throw new Error("path_forbidden");
+              const dest = underResolvedParent(resolvedDir, absolutePath);
               assertNotReserved(
-                [absolutePath, underResolvedParent(resolvedDir, absolutePath), reservedRootFileName(target) ? await realpathIfExists(sftp, absolutePath) : null],
+                [absolutePath, dest, reservedRootFileName(target) ? await realpathIfExists(sftp, absolutePath) : null],
                 workspaceRoot,
                 target,
               );
+              assertNotMachineOwned("create", [absolutePath, dest], homeDir);
 
-              await sftpWriteBuffer(sftp, absolutePath, Buffer.from(content, "utf8"));
+              // Written at its turn at the machine's front door, only over the version opened.
+              return await saveFileAtTurn(client, {
+                homePath: posix.relative(homeDir, dest),
+                data: Buffer.from(content, "utf8"),
+                expect: expectVersion,
+                hostId: Number(hostId),
+                by: userId,
+              });
             }));
           },
         ),
       );
-      res.status(200).json({ ok: true });
+      sendSaveAnswer(res, saved);
     } catch (err) {
       res.status(classifyErrorToStatus(err)).json({ error: classifyErrorToClass(err) });
       sshLogger.warn("workspace /write-file error", {
@@ -1072,6 +1238,7 @@ workspaceRoutes.delete(
               const resolvedParent = await sftpRealpath(sftp, posix.dirname(absolutePath));
               assertResolvedUnderRoot(resolvedParent, workspaceRoot);
               const entryPath = underResolvedParent(resolvedParent, absolutePath);
+              assertNotMachineOwned("remove", [entryPath], homeDir);
               const stat = await sftpLstat(sftp, entryPath);
               if (stat.isSymbolicLink() || !stat.isDirectory()) {
                 await sftpUnlink(sftp, entryPath);
@@ -1200,6 +1367,9 @@ workspaceRoutes.post(
                 target,
               );
 
+              assertNotMachineOwned("remove", [resolvedFrom], homeDir);
+              assertNotMachineOwned("create", [toPath, underResolvedParent(resolvedToParent, toPath)], homeDir);
+
               await sftpRename(sftp, resolvedFrom, toPath);
             }));
           },
@@ -1295,6 +1465,7 @@ workspaceRoutes.post(
               assertResolvedUnderRoot(resolvedParent, workspaceRoot);
               if (FORBIDDEN_PATH_RE.test(resolvedParent)) throw new Error("path_forbidden");
               assertNotReserved([absolutePath, underResolvedParent(resolvedParent, absolutePath)], workspaceRoot, target);
+              assertNotMachineOwned("create", [absolutePath, underResolvedParent(resolvedParent, absolutePath)], homeDir);
 
               await sftpMkdir(sftp, absolutePath);
             }));
@@ -1391,6 +1562,7 @@ workspaceRoutes.post(
               assertResolvedUnderRoot(resolvedParent, workspaceRoot);
               if (FORBIDDEN_PATH_RE.test(resolvedParent)) throw new Error("path_forbidden");
               assertNotReserved([absolutePath, underResolvedParent(resolvedParent, absolutePath)], workspaceRoot, target);
+              assertNotMachineOwned("create", [absolutePath, underResolvedParent(resolvedParent, absolutePath)], homeDir);
 
               await sftpCreateEmpty(sftp, absolutePath);
             }));
@@ -1478,11 +1650,18 @@ workspaceRoutes.post(
     }
 
     const fileBuffer = req.file.buffer;
+    // No version: a new file, so one of that name already there is asked about first
+    // (file_exists, with its version, which a Replace sends back).
+    const expectVersion = body.version === undefined || body.version === "" ? ABSENT : body.version;
+    if (!isExpect(expectVersion)) {
+      res.status(400).json({ error: "invalid_body" });
+      return;
+    }
     const poolKey = hostPoolKey(host);
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), SFTP_OP_TIMEOUT_MS);
+    const timer = setTimeout(() => ctrl.abort(), SAVE_OP_TIMEOUT_MS);
     try {
-      await getHostSemaphore(Number(hostId)).run(() =>
+      const saved = await getHostSemaphore(Number(hostId)).run(() =>
         withConnection(
           poolKey,
           () => connectOneShot(host, SSH_CONNECT_TIMEOUT_MS),
@@ -1497,18 +1676,26 @@ workspaceRoutes.post(
               const resolvedParent = await sftpRealpath(sftp, parentPath);
               assertResolvedUnderRoot(resolvedParent, workspaceRoot);
               if (FORBIDDEN_PATH_RE.test(resolvedParent)) throw new Error("path_forbidden");
+              const dest = underResolvedParent(resolvedParent, absolutePath);
               assertNotReserved(
-                [absolutePath, underResolvedParent(resolvedParent, absolutePath), reservedRootFileName(target) ? await realpathIfExists(sftp, absolutePath) : null],
+                [absolutePath, dest, reservedRootFileName(target) ? await realpathIfExists(sftp, absolutePath) : null],
                 workspaceRoot,
                 target,
               );
+              assertNotMachineOwned("create", [absolutePath, dest], homeDir);
 
-              await sftpWriteBuffer(sftp, absolutePath, fileBuffer);
+              return await saveFileAtTurn(client, {
+                homePath: posix.relative(homeDir, dest),
+                data: fileBuffer,
+                expect: expectVersion,
+                hostId: Number(hostId),
+                by: userId,
+              });
             }));
           },
         ),
       );
-      res.status(200).json({ ok: true });
+      sendSaveAnswer(res, saved);
     } catch (err) {
       res.status(classifyErrorToStatus(err)).json({ error: classifyErrorToClass(err) });
       sshLogger.warn("workspace /upload error", {

@@ -820,6 +820,122 @@ m = importlib.machinery.SourceFileLoader("fc", sys.argv[1]).load_module(); m.pru
   rm -rf "$s"
 }
 
+test_role_edit_changes_only_its_lines() {
+  local s; s=$(setup)
+  mkdir -p "$s/fleet/roles/eng"
+  printf -- '---\ndisplayName: Engineer\ndescription: >-\n  Old words\n  over two lines\ncustom: keep\n---\nAn agent wrote this.\n' > "$s/fleet/roles/eng/eng.md"
+  submit "$s" role-edit '{"name":"eng","set":{"description":"Builds: things","colorHue":40,"borrowable":true}}' r1
+  serve_once "$s"
+  assert_eq done "$(field "$(fc "$s" status r1)" state)" "edited"
+  assert_eq "$(printf -- '---\ndisplayName: Engineer\ndescription: "Builds: things"\ncolorHue: '"'"'40'"'"'\nborrowable: true\ncustom: keep\n---\nAn agent wrote this.')" \
+    "$(cat "$s/fleet/roles/eng/eng.md")" "only those lines; the body an agent wrote stays"
+  submit "$s" role-edit '{"name":"eng","unset":["borrowable","description"]}' r2
+  serve_once "$s"
+  grep -q '^borrowable:\|^description:' "$s/fleet/roles/eng/eng.md" && fail "removed lines still there"
+  submit "$s" role-edit '{"name":"eng","unset":["displayName"]}' r3
+  serve_once "$s"
+  assert_eq bad_request "$(field "$(fc "$s" status r3)" code)" "the name can't be removed"
+  printf '{"id":"x"}' > "$s/fleet/roles/eng/.archiving"
+  submit "$s" role-edit '{"name":"eng","set":{"colorHue":1}}' r4
+  serve_once "$s"
+  assert_eq being_archived "$(field "$(fc "$s" status r4)" code)" "refused while being archived"
+  rm -rf "$s"
+}
+
+stage() { mkdir -p "$1/fleet/.changes/uploads"; printf '%s' "$3" > "$1/fleet/.changes/uploads/$2"; }
+sha() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
+
+test_file_save_only_over_what_the_editor_opened() {
+  local s; s=$(setup)
+  mkdir -p "$s/fleet/identities/finch/workspace"
+  local f="$s/fleet/identities/finch/workspace/notes.md"
+  printf 'v1' > "$f"; chmod 600 "$f"
+  stage "$s" save-a 'mine'
+  submit "$s" file-save "{\"path\":\"fleet/identities/finch/workspace/notes.md\",\"upload\":\"save-a\",\"expect\":\"$(sha v1)\"}" w1
+  serve_once "$s"
+  local out; out=$(fc "$s" status w1)
+  assert_eq done "$(field "$out" state)" "saved over the version it opened"
+  assert_eq mine "$(cat "$f")" "written"
+  assert_eq "$(sha mine)" "$(field "$out" result.version)" "answers with the new version"
+  assert_eq 600 "$(stat -c %a "$f")" "keeps the file's permissions"
+  assert_absent "$s/fleet/.changes/uploads/save-a" "staged file used up"
+  # An agent wrote in the meantime: the stale save is refused, and says what's there now.
+  printf 'agent' > "$f"
+  stage "$s" save-b 'stale'
+  submit "$s" file-save "{\"path\":\"fleet/identities/finch/workspace/notes.md\",\"upload\":\"save-b\",\"expect\":\"$(sha mine)\"}" w2
+  serve_once "$s"
+  out=$(fc "$s" status w2)
+  assert_eq changed "$(field "$out" code)" "refused"
+  assert_eq "$(sha agent)" "$(field "$out" result.version)" "current version given"
+  assert_eq agent "$(cat "$f")" "the agent's words stay"
+  assert_absent "$s/fleet/.changes/uploads/save-b" "refused save's staged file dropped"
+  # Saving again with that version overwrites on purpose.
+  stage "$s" save-c 'stale'
+  submit "$s" file-save "{\"path\":\"fleet/identities/finch/workspace/notes.md\",\"upload\":\"save-c\",\"expect\":\"$(sha agent)\"}" w3
+  serve_once "$s"
+  assert_eq stale "$(cat "$f")" "overwritten on purpose"
+  # A new file: "absent" only while there's none.
+  stage "$s" save-d 'new'
+  submit "$s" file-save '{"path":"fleet/identities/finch/workspace/new.txt","upload":"save-d","expect":"absent"}' w4
+  stage "$s" save-e 'other'
+  submit "$s" file-save '{"path":"fleet/identities/finch/workspace/new.txt","upload":"save-e","expect":"absent"}' w5
+  serve_once "$s"
+  assert_eq done "$(field "$(fc "$s" status w4)" state)" "new file made"
+  out=$(fc "$s" status w5)
+  assert_eq exists "$(field "$out" code)" "second one finds it there"
+  assert_eq "$(sha new)" "$(field "$out" result.version)" "and its version"
+  # Deleted since it was opened.
+  rm "$f"
+  stage "$s" save-f 'x'
+  submit "$s" file-save "{\"path\":\"fleet/identities/finch/workspace/notes.md\",\"upload\":\"save-f\",\"expect\":\"$(sha stale)\"}" w6
+  serve_once "$s"
+  out=$(fc "$s" status w6)
+  assert_eq changed "$(field "$out" code)" "gone counts as changed"
+  assert_eq None "$(field "$out" result.version)" "no version: there's no file"
+  assert_absent "$f" "not recreated"
+  rm -rf "$s"
+}
+
+test_file_save_stays_inside_the_home_folder() {
+  local s outside; s=$(setup); outside=$(mktemp -d)
+  ln -s "$outside" "$s/fleet/out"
+  for p in '../x' '/etc/x' 'fleet/../../x' 'fleet/out/x' 'fleet//x'; do
+    stage "$s" save-p 'x'
+    submit "$s" file-save "{\"path\":\"$p\",\"upload\":\"save-p\",\"expect\":\"absent\"}" "p$RANDOM"
+  done
+  serve_once "$s"
+  local n; n=$(for f in "$s"/fleet/.changes/outcomes/*.json; do field "$(cat "$f")" code; done | grep -c bad_request)
+  assert_eq 5 "$n" "every path outside the home folder refused"
+  assert_absent "$outside/x" "nothing written through the link"
+  rm -rf "$s" "$outside"
+}
+
+test_project_file_save_keeps_the_machines_member_list() {
+  local s; s=$(setup)
+  mkdir -p "$s/fleet/projects/garden"
+  local f="$s/fleet/projects/garden/project.md"
+  local opened; opened=$(printf -- '---\ndisplayName: Garden\nmembers:\n  - finch\n---\nOld notes.\n')
+  printf '%s\n' "$opened" > "$f"
+  local v; v=$(python3 -c 'import hashlib,re,sys
+t=open(sys.argv[1]).read(); t=re.sub(r"members:\n(  - .*\n)*", "", t, count=1); print(hashlib.sha256(t.encode()).hexdigest())' "$f")
+  # Agents joined since the editor opened it: not a change.
+  printf -- '---\ndisplayName: Garden\nmembers:\n  - finch\n  - wren\n---\nOld notes.\n' > "$f"
+  stage "$s" save-m "$(printf -- '---\ndisplayName: Garden\nmembers:\n  - finch\n---\nNew notes.\n')"
+  submit "$s" file-save "{\"path\":\"fleet/projects/garden/project.md\",\"upload\":\"save-m\",\"expect\":\"$v\",\"keepMembers\":true}" m1
+  serve_once "$s"
+  assert_eq done "$(field "$(fc "$s" status m1)" state)" "member list changing isn't a change"
+  assert_eq "$(printf -- '---\ndisplayName: Garden\nmembers:\n  - finch\n  - wren\n---\nNew notes.')" "$(cat "$f")" "the machine's member list stays"
+  # Moved by someone else since: refused.
+  printf -- '---\ndisplayName: Garden\nparent: farm\nmembers:\n  - finch\n  - wren\n---\nNew notes.\n' > "$f"
+  stage "$s" save-n "$(printf -- '---\ndisplayName: Garden\n---\nStale.\n')"
+  local v2; v2=$(field "$(fc "$s" status m1)" result.version)
+  submit "$s" file-save "{\"path\":\"fleet/projects/garden/project.md\",\"upload\":\"save-n\",\"expect\":\"$v2\",\"keepMembers\":true}" m2
+  serve_once "$s"
+  assert_eq changed "$(field "$(fc "$s" status m2)" code)" "a parent change counts"
+  grep -q '^parent: farm' "$f" || fail "the move stays"
+  rm -rf "$s"
+}
+
 run_test test_aither_sequence_runs_in_click_order
 run_test test_archive_first_then_move_out_is_refused
 run_test test_move_into_archived_project_is_refused
@@ -863,6 +979,10 @@ run_test test_odd_usernames_and_names_stay_strings
 run_test test_a_file_without_frontmatter_gets_one
 run_test test_move_to_a_hidden_project_answers_like_a_gone_one
 run_test test_who_asked_and_their_notices
+run_test test_role_edit_changes_only_its_lines
+run_test test_file_save_only_over_what_the_editor_opened
+run_test test_file_save_stays_inside_the_home_folder
+run_test test_project_file_save_keeps_the_machines_member_list
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 if [ "$FAIL" -gt 0 ]; then

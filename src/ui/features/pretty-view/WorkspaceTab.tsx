@@ -64,8 +64,11 @@ import {
   renameWorkspaceEntry,
   searchWorkspace,
   uploadWorkspaceFile,
+  workspaceFileVersion as fetchFileVersion,
   writeWorkspaceFile,
 } from "@/api/workspace-api";
+import { ABSENT_VERSION, FileChangedError } from "@/api/file-changed-error";
+import { askReloadOrKeep, keptNote } from "@/lib/changed-file-prompt";
 import type {
   ListResponse,
   SearchResponse,
@@ -287,6 +290,25 @@ function WorkspaceFileViewer({
   const [dirty, setDirty] = useState(false);
   const [draft, setDraft] = useState<string>("");
   const [saving, setSaving] = useState(false);
+  // The version the shown file was read at: a save is written only over that.
+  const versionRef = useRef<string>(ABSENT_VERSION);
+  // Bumped by "Reload" after a refused save: read the file (and its version) again.
+  const [reloadTick, setReloadTick] = useState(0);
+
+  // A file the viewer streams for itself (a PDF) still needs its version for a save.
+  useEffect(() => {
+    if (!neverNeedsContent || readOnly) return;
+    let cancelled = false;
+    fetchFileVersion(target, hostId, file.relativePath)
+      .then((v) => {
+        if (!cancelled) versionRef.current = v;
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [targetDepKey(target), hostId, file.relativePath, neverNeedsContent, readOnly, reloadTick]);
 
   useEffect(() => {
     if (skipFetch) return;
@@ -299,6 +321,7 @@ function WorkspaceFileViewer({
         if (cancelled) return;
         const bytes = base64ToBytes(data.contentBase64);
         const isText = isTextByName(file.name) || looksLikeText(bytes);
+        versionRef.current = data.version ?? ABSENT_VERSION;
         setDirty(false);
         setFileState({
           status: "ready",
@@ -320,20 +343,37 @@ function WorkspaceFileViewer({
       cancelled = true;
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [targetDepKey(target), hostId, file.relativePath, skipFetch]);
+  }, [targetDepKey(target), hostId, file.relativePath, skipFetch, reloadTick]);
 
-  // Save handler (last-write-wins V1 — the workspace write has no mtime check)
+  /** A save refused because the file changed since it was opened: reload, or keep the edits
+   *  (the next save then goes over the newer version). True when it was reloaded. */
+  const onChangedSinceOpened = useCallback(async (err: FileChangedError): Promise<boolean> => {
+    console.info({ operation: "workspace_file_changed_since_opened", hostId, path: file.relativePath });
+    if ((await askReloadOrKeep(err)) === "reload") {
+      setBinaryDraft(null);
+      setDirty(false);
+      setReloadTick((t) => t + 1);
+      return true;
+    }
+    versionRef.current = err.version ?? ABSENT_VERSION;
+    setSaveError(keptNote(err));
+    return false;
+  }, [hostId, file.relativePath]);
+
+  // Save handler: written at its turn on the machine, only over the version opened.
   const handleSave = useCallback(
     async (newContent: string) => {
       setSaveError(null);
       setSaving(true);
       try {
-        await writeWorkspaceFile(
+        const saved = await writeWorkspaceFile(
           target,
           hostId,
           file.relativePath,
-          newContent
+          newContent,
+          versionRef.current,
         );
+        versionRef.current = saved.version;
         // Success: the saved text is the new baseline, so the draft is clean
         // and back-nav doesn't prompt. Bytes are dropped — url modes (e.g.
         // rendered SVG) rebuild their src from the saved text.
@@ -344,6 +384,7 @@ function WorkspaceFileViewer({
         setDirty(false);
         return true;
       } catch (err) {
+        if (err instanceof FileChangedError) return await onChangedSinceOpened(err);
         const cls = err instanceof Error ? err.message : "generic";
         const copy = resolveWorkspaceErrorCopy(cls);
         setSaveError(copy.heading + ": " + copy.body);
@@ -353,7 +394,7 @@ function WorkspaceFileViewer({
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [targetDepKey(target), hostId, file.relativePath]
+    [targetDepKey(target), hostId, file.relativePath, onChangedSinceOpened]
   );
 
   // Binary edits (PDF annotations): written back through the upload route,
@@ -365,16 +406,20 @@ function WorkspaceFileViewer({
       setSaving(true);
       try {
         const bytes = await draftToSave.getBytes();
-        await uploadWorkspaceFile(
+        const saved = await uploadWorkspaceFile(
           target,
           hostId,
           file.relativePath,
           // globalThis: `File` in this module is the lucide icon.
-          new globalThis.File([bytes as BlobPart], file.name, { type: "application/octet-stream" })
+          new globalThis.File([bytes as BlobPart], file.name, { type: "application/octet-stream" }),
+          undefined,
+          versionRef.current,
         );
+        versionRef.current = saved.version;
         draftToSave.markSaved(bytes);
         return true;
       } catch (err) {
+        if (err instanceof FileChangedError) return await onChangedSinceOpened(err);
         const cls = err instanceof Error ? err.message : "generic";
         const copy = resolveWorkspaceErrorCopy(cls);
         setSaveError(copy.heading + ": " + copy.body);
@@ -384,7 +429,7 @@ function WorkspaceFileViewer({
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [targetDepKey(target), hostId, file.relativePath, file.name]
+    [targetDepKey(target), hostId, file.relativePath, file.name, onChangedSinceOpened]
   );
 
   // Close guard: confirm before discarding unsaved edits. One question at a
@@ -423,9 +468,10 @@ function WorkspaceFileViewer({
     hostId,
     file.relativePath
   );
-  const mediaUrl = downloadWorkspaceFileUrl(target, hostId, file.relativePath, {
-    inline: true,
-  });
+  const mediaUrl =
+    downloadWorkspaceFileUrl(target, hostId, file.relativePath, {
+      inline: true,
+    }) + (reloadTick > 0 ? `&reload=${reloadTick}` : "");
 
   const { host: markdownHost, formattedUnavailable } = useMarkdownSwitchHost();
   const editing = useFileEditing({ filename: file.name, dirty });
@@ -497,7 +543,7 @@ function WorkspaceFileViewer({
   } else {
     body = (
       <FileView
-        key={editing.draftKey}
+        key={`${editing.draftKey}:${reloadTick}`}
         filename={file.name}
         state={fileState}
         mediaUrl={mediaUrl}
@@ -839,26 +885,68 @@ function WorkspaceListView({
     setDragActive(false);
     const files = Array.from(e.dataTransfer?.files ?? []);
     if (files.length === 0) return;
+    await uploadAll(files);
+    clearSearch();
+    onRefresh();
+  }
+
+  /**
+   * Upload files into the folder shown. A file of the same name already there is never
+   * replaced quietly: each one is asked about ("Replace <name>?"), one at a time.
+   */
+  async function uploadAll(files: File[]): Promise<void> {
     const prefix = currentPath.length > 0 ? currentPath.join("/") + "/" : "";
     setUploadError(null);
-    try {
-      await Promise.all(
-        files.map((f) =>
-          uploadWorkspaceFile(
-            target,
-            hostId,
-            prefix + f.name,
-            f
-          )
-        )
-      );
-    } catch (err) {
+    const failures: unknown[] = [];
+    const taken: Array<{ file: File; version: string | null }> = [];
+    await Promise.all(
+      files.map(async (f) => {
+        try {
+          await uploadWorkspaceFile(target, hostId, prefix + f.name, f);
+        } catch (err) {
+          if (err instanceof FileChangedError && err.exists) taken.push({ file: f, version: err.version });
+          else failures.push(err);
+        }
+      }),
+    );
+    for (const { file: f, version: was } of taken) {
+      let version = was;
+      const replace = await kitConfirm({
+        title: `Replace ${f.name}?`,
+        body: "There's already a file with that name here. Replacing it can't be undone.",
+        confirmLabel: "Replace",
+        cancelLabel: "Cancel",
+        destructive: true,
+      });
+      if (!replace) continue;
+      // Over the version that was there when asked; changed again meanwhile, it's asked again.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          await uploadWorkspaceFile(target, hostId, prefix + f.name, f, undefined, version ?? ABSENT_VERSION);
+          break;
+        } catch (err) {
+          if (!(err instanceof FileChangedError) || attempt === 2) {
+            failures.push(err);
+            break;
+          }
+          version = err.version;
+          const again = await kitConfirm({
+            title: `Replace ${f.name}?`,
+            body: "It changed again just now. Replace it with yours anyway?",
+            confirmLabel: "Replace",
+            cancelLabel: "Cancel",
+            destructive: true,
+          });
+          if (!again) break;
+        }
+      }
+    }
+    if (failures.length > 0) {
+      const err = failures[0];
       const errorClass = err instanceof Error ? err.message : "generic";
       const copy = resolveWorkspaceErrorCopy(errorClass);
       setUploadError(copy.heading + ": " + copy.body);
     }
-    clearSearch();
-    onRefresh();
   }
 
   // Upload via file picker (D-16)
@@ -867,24 +955,7 @@ function WorkspaceListView({
   ) {
     const files = Array.from(e.target.files ?? []);
     if (files.length === 0) return;
-    const prefix = currentPath.length > 0 ? currentPath.join("/") + "/" : "";
-    setUploadError(null);
-    try {
-      await Promise.all(
-        files.map((f) =>
-          uploadWorkspaceFile(
-            target,
-            hostId,
-            prefix + f.name,
-            f
-          )
-        )
-      );
-    } catch (err) {
-      const errorClass = err instanceof Error ? err.message : "generic";
-      const copy = resolveWorkspaceErrorCopy(errorClass);
-      setUploadError(copy.heading + ": " + copy.body);
-    }
+    await uploadAll(files);
     // Reset the input so the same file can be uploaded again
     if (fileInputRef.current) fileInputRef.current.value = "";
     clearSearch();

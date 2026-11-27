@@ -99,6 +99,21 @@ Request kinds:
                     removed when the change is refused, or after an hour if it never comes.
                     Every agent change is refused with being_archived while its archive is
                     claimed.
+  role-edit         {"name", "set": {displayName|title|description|colorHue|voice|avatar: value,
+                     "borrowable": true}, "unset": [title|description|colorHue|voice|avatar|borrowable]}
+                    the roles window's one-line edits: only those lines of the role file
+                    change, read at its turn. Refused with being_archived while its archive is
+                    claimed. The result carries the file as it now is.
+  file-save         {"path": "<relative to the home folder>", "upload": "save-<id>",
+                     "expect": "<version>"|"absent", "keepMembers"?: true}
+                    a whole file saved from an editor. The new contents wait in uploads/
+                    (saved there by the server) and are written at its turn only if the file
+                    is still the version the editor opened (a version is the file's sha256;
+                    "absent": there was no file). Refused with changed (or exists, for
+                    "absent"), its result {"version"} being the file's version now (null: it's
+                    gone); saving again with that version overwrites on purpose.
+                    keepMembers (a project file): the member list is the machine's — the
+                    current one is kept, and it isn't part of the version.
 
 On disk, all under ~/fleet/.changes/:
   incoming/<ns>-<id>.json   a request as written by submit (atomic rename)
@@ -107,7 +122,8 @@ On disk, all under ~/fleet/.changes/:
   outcomes/<id>.json        the outcome, kept for OUTCOME_KEEP_S
   background/<id>.json      a request handed to the supervisor to finish
   returning/<name>.json     an agent un-archive under way: {"name","ids":[...]}
-  uploads/<file>            a new agent picture waiting for its agent-edit
+  uploads/<file>            a new agent picture waiting for its agent-edit, or a file
+                            waiting for its file-save (save-<id>)
   notices/<id>.json         a person's request that was refused or failed (or a new agent
                             left in Conversations), kept a day so their devices can tell
                             them; the machine's status report lists these
@@ -118,7 +134,9 @@ A request left running when the listener stopped is carried on when it starts
 again, from where its plan says it got to. Stdlib only; Python 3.8+.
 """
 import fcntl
+import hashlib
 import json
+import shutil
 import os
 import re
 import signal
@@ -181,9 +199,13 @@ USER_RE = re.compile(r"^[^,\s]+$")
 BY_USER_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 # Kinds that only look: never a notice, never a mark.
 READ_ONLY_KINDS = ("project-contents", "role-contents")
+# Saves from an editor that holds the draft: its answer always goes back to that editor, so a
+# refusal is never kept as a notice for the person's other devices.
+EDITOR_KINDS = ("file-save", "role-edit")
 KINDS = ("app-move", "project-contents", "project-archive", "agent-archive", "agent-unarchive",
          "role-contents", "role-archive", "role-unarchive", "app-archive", "app-unarchive",
-         "project-create", "project-rename", "project-move", "agent-project", "agent-pin", "agent-edit")
+         "project-create", "project-rename", "project-move", "agent-project", "agent-pin", "agent-edit",
+         "role-edit", "file-save")
 
 
 def log(msg):
@@ -1599,6 +1621,191 @@ def do_agent_edit(args, entry, save_plan):
     return {"name": name, "changed": sorted(changes)}
 
 
+ROLE_EDIT_KEYS = ("displayName", "title", "description", "colorHue", "voice", "avatar", "borrowable")
+ROLE_AVATAR_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]{0,90}\.(webp|png|jpg|jpeg|gif|svg)$")
+
+
+def do_role_edit(args, entry, save_plan):
+    """The roles window's one-line edits: only those lines of the role file change, read now."""
+    name = check_name(args, pattern=ROLE_RE)
+    sets = args.get("set") or {}
+    unset = args.get("unset") or []
+    if not isinstance(sets, dict) or not isinstance(unset, list):
+        raise Refused("bad_request", "set must be an object and unset a list")
+    changes = {}
+    for key, v in sets.items():
+        if key == "displayName":
+            changes[key] = ["displayName: %s" % yaml_str(check_display_name(sets))]
+        elif key in ("title", "description"):
+            limit = 500 if key == "title" else 4096
+            if not isinstance(v, str) or not v.strip() or len(v) > limit or re.search(r"[\r\n]", v):
+                raise Refused("bad_request", "%s must be one line of at most %d characters" % (key, limit))
+            changes[key] = ["%s: %s" % (key, yaml_str(v.strip()))]
+        elif key == "colorHue":
+            if not isinstance(v, int) or isinstance(v, bool) or not 0 <= v <= 359:
+                raise Refused("bad_request", "colorHue must be 0-359")
+            changes[key] = ["colorHue: '%d'" % v]
+        elif key == "voice":
+            if not isinstance(v, str) or not VOICE_RE.match(v):
+                raise Refused("bad_request", "voice must be a voice id")
+            changes[key] = ["voice: %s" % yaml_str(v, chars="._:-")]
+        elif key == "avatar":
+            if not isinstance(v, str) or not ROLE_AVATAR_RE.match(v):
+                raise Refused("bad_request", "avatar must be a picture file's name")
+            changes[key] = ["avatar: %s" % yaml_str(v, chars="._-")]
+        elif key == "borrowable":
+            if v is not True:
+                raise Refused("bad_request", "borrowable is set with true and removed with unset")
+            changes[key] = ["borrowable: true"]
+        else:
+            raise Refused("bad_request", "can't set '%s'" % key)
+    for key in unset:
+        if key not in ROLE_EDIT_KEYS or key == "displayName" or key in changes:
+            raise Refused("bad_request", "can't remove '%s'" % key)
+        changes[key] = None
+    d = os.path.join(ROLES, name)
+    if claim_of(d) is not None:
+        raise Refused("being_archived", "it's being archived")
+    path = os.path.join(d, name + ".md")
+    if not os.path.isfile(path):
+        if os.path.isdir(os.path.join(ROLES_ARCHIVE, name)):
+            raise Refused("archived", "it's archived")
+        raise Refused("not_found", "there's no role '%s' on this machine" % name)
+    text = read_text(path)
+    if text is None:
+        raise Failed("unreadable", "the role file couldn't be read")
+    new = edit_frontmatter(text, changes, after=("displayName", "description"))
+    if new is None:
+        raise Failed("unreadable", "the role file has no frontmatter to change")
+    if new != text:
+        write_text_atomic(path, new)
+    log("role '%s' edited: %s" % (name, ", ".join(sorted(changes))))
+    return {"role": name, "changed": sorted(changes), "markdown": new}
+
+
+HOME = os.path.dirname(FLEET)
+SAVE_UPLOAD_RE = re.compile(r"^save-[A-Za-z0-9._-]{1,80}$")
+VERSION_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def without_key(text, key):
+    """`text` with one top-level frontmatter key, and its continuation lines, taken out."""
+    m = FM_RE.match(text)
+    if not m:
+        return text
+    lines = re.findall(r"[^\n]*\n", m.group(2))
+    span = key_span(lines, key)
+    if span is None:
+        return text
+    del lines[span[0]:span[1]]
+    return m.group(1) + "".join(lines) + m.group(3) + text[m.end():]
+
+
+def file_version(data, keep_members=False):
+    """What a save checks against: the file's bytes hashed. For a project file, without its
+    member list — the machine keeps that up to date itself, so it changing isn't a change."""
+    if keep_members:
+        try:
+            data = without_key(data.decode("utf-8"), "members").encode("utf-8")
+        except UnicodeDecodeError:
+            pass
+    return hashlib.sha256(data).hexdigest()
+
+
+def home_path(rel):
+    """The absolute path for one relative to the home folder; nothing outside it."""
+    parts = rel.split("/") if isinstance(rel, str) and 0 < len(rel) <= 4096 and "\0" not in rel else None
+    if not parts or any(p in ("", ".", "..") for p in parts):
+        raise Refused("bad_request", "path must be relative to the home folder")
+    home = os.path.realpath(HOME)
+    parent = os.path.realpath(os.path.join(home, *parts[:-1]))
+    if parent != home and not parent.startswith(home + os.sep):
+        raise Refused("bad_request", "path must stay inside the home folder")
+    return os.path.join(parent, parts[-1])
+
+
+def drop_staged(upload):
+    if isinstance(upload, str) and SAVE_UPLOAD_RE.match(upload):
+        try:
+            os.unlink(os.path.join(UPLOADS, upload))
+        except OSError:
+            pass
+
+
+def frontmatter_lines(text, key):
+    """A frontmatter key's lines (without line ends), or None when it isn't there."""
+    m = FM_RE.match(text)
+    if not m:
+        return None
+    lines = re.findall(r"[^\n]*\n", m.group(2))
+    span = key_span(lines, key)
+    return [ln.rstrip("\r\n") for ln in lines[span[0]:span[1]]] if span else None
+
+
+def do_file_save(args, entry, save_plan):
+    """A whole file saved from an editor, written only if it's still what the editor opened."""
+    upload = args.get("upload")
+    try:
+        if not isinstance(upload, str) or not SAVE_UPLOAD_RE.match(upload):
+            raise Refused("bad_request", "upload must name a staged save")
+        path = home_path(args.get("path"))
+        expect = args.get("expect")
+        if expect != "absent" and (not isinstance(expect, str) or not VERSION_RE.match(expect)):
+            raise Refused("bad_request", "expect must be a version or \"absent\"")
+        keep = args.get("keepMembers") is True
+        staged = os.path.join(UPLOADS, upload)
+        if not os.path.isfile(staged):
+            raise Refused("upload_missing", "the file didn't arrive; try again")
+        if not os.path.isdir(os.path.dirname(path)):
+            raise Refused("not_found", "the folder it was in is gone")
+        if os.path.isdir(path):
+            raise Refused("not_a_file", "there's a folder of that name there now")
+        try:
+            with open(path, "rb") as f:
+                current = f.read()
+        except FileNotFoundError:
+            current = None
+        now = file_version(current, keep) if current is not None else None
+        if now is None and expect != "absent":
+            raise Refused("changed", "it was deleted or moved since you opened it", {"version": None})
+        if now is not None and expect == "absent":
+            raise Refused("exists", "there's already a file of that name", {"version": now})
+        if now is not None and expect != now:
+            raise Refused("changed", "it changed since you opened it", {"version": now})
+    except Refused:
+        drop_staged(upload)
+        raise
+    with open(staged, "rb") as f:
+        data = f.read()
+    if keep and current is not None:
+        # The member list is always the machine's: whatever the editor had, the current one stays.
+        try:
+            text = data.decode("utf-8")
+            merged = edit_frontmatter(text, {"members": frontmatter_lines(current.decode("utf-8"), "members")},
+                                      after=("displayName", "parent", "users"))
+            if merged is not None and merged != text:
+                data = merged.encode("utf-8")
+                with open(staged, "wb") as f:
+                    f.write(data)
+        except UnicodeDecodeError:
+            pass
+    try:
+        os.chmod(staged, os.stat(path).st_mode & 0o7777 if current is not None else 0o644)
+    except OSError:
+        pass
+    try:
+        os.replace(staged, path)
+    except OSError:
+        # Another filesystem: copied next to the file first, so it still lands whole.
+        tmp = "%s.tmp.%d" % (path, os.getpid())
+        shutil.copyfile(staged, tmp)
+        shutil.copymode(staged, tmp)
+        os.replace(tmp, path)
+        drop_staged(upload)
+    log("file saved: ~/%s (%d bytes)" % (args["path"], len(data)))
+    return {"path": args["path"], "version": file_version(data, keep)}
+
+
 HANDLERS = {
     "app-move": do_app_move,
     "project-contents": do_project_contents,
@@ -1616,6 +1823,8 @@ HANDLERS = {
     "agent-project": do_agent_project,
     "agent-pin": do_agent_pin,
     "agent-edit": do_agent_edit,
+    "role-edit": do_role_edit,
+    "file-save": do_file_save,
 }
 
 
@@ -1774,7 +1983,7 @@ def write_notice(outcome, args):
     kept for a day so whichever of their devices is open can tell them, however long ago their
     own device stopped asking. Agents' own changes have no one to tell."""
     by = outcome.get("by")
-    if not (isinstance(by, dict) and isinstance(by.get("user"), str)) or outcome.get("kind") in READ_ONLY_KINDS:
+    if not (isinstance(by, dict) and isinstance(by.get("user"), str)) or outcome.get("kind") in READ_ONLY_KINDS + EDITOR_KINDS:
         return
     state = outcome.get("state")
     res = outcome.get("result")
@@ -1809,7 +2018,7 @@ def prune():
                 os.unlink(p)
         except OSError:
             pass
-    # Pictures whose change never came (the server lost its connection mid-way).
+    # Pictures and saves whose change never came (the server lost its connection mid-way).
     try:
         names = os.listdir(UPLOADS)
     except OSError:

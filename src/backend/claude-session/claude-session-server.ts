@@ -93,6 +93,7 @@ import {
   isLocalHostId,
   getLocalIdentitiesArchiveRoot,
   getLocalIdentitiesRoot,
+  getLocalRolesRoot,
   IDENTITY_KEY_RE,
   IDENTITY_SLUG_RE,
   humanizeWakeupSchedule,
@@ -101,18 +102,35 @@ import {
   readIdentityHandoff,
   readIdentityTrappedWork,
   readRoleFile,
-  readRoleFileByName,
   writeIdentityWakeupUpdate,
   writeIdentityWakeupCreate,
   writeIdentityWakeupDelete,
-  writeIdentityFile,
   writeIdentityHandoff,
   writeRoleFile,
-  writeRoleFileByName,
+  IDMEDIT_MAX_MARKDOWN_BYTES,
   resolveRoleForIdentity,
   type WakeupSpec,
 } from "./identity-artifact-reader.js";
 import { ROLE_NAME_PATTERN } from "../database/routes/identity-birth-orchestrator.js";
+import { CHANGED_ERROR, fileVersion, isExpect, readForSave, saveFileAtTurn } from "../fleet-change/file-save.js";
+import { submitFrontDoor } from "../fleet-change/front-door.js";
+import nodePath from "node:path";
+
+/** Where a live agent's own file is, for its editor. */
+function agentFileAt(identityKey: string): { homePath: string; localPath: string } {
+  return {
+    homePath: `fleet/identities/${identityKey}/${identityKey}.md`,
+    localPath: nodePath.join(getLocalIdentitiesRoot(), identityKey, `${identityKey}.md`),
+  };
+}
+
+/** Where a role's file is, for its editor. */
+function roleFileAt(roleName: string): { homePath: string; localPath: string } {
+  return {
+    homePath: `fleet/roles/${roleName}/${roleName}.md`,
+    localPath: nodePath.join(getLocalRolesRoot(), roleName, `${roleName}.md`),
+  };
+}
 import { getHostSemaphore } from "../ssh/host-semaphore-registry.js";
 import { settleWithConcurrency } from "../utils/settle-with-concurrency.js";
 import { blockedCommandIn } from "../../types/blocked-commands.js";
@@ -1991,7 +2009,7 @@ export async function handleRoleUpdateFile(
   msg: unknown,
   userId: string | undefined,
 ): Promise<void> {
-  const m = (msg ?? {}) as { roleName?: unknown; hostId?: unknown; contents?: unknown };
+  const m = (msg ?? {}) as { roleName?: unknown; hostId?: unknown; contents?: unknown; version?: unknown };
   const rawRoleName = m.roleName;
   const rawContents = m.contents;
   if (typeof rawRoleName !== "string" || !ROLE_NAME_PATTERN.test(rawRoleName)) {
@@ -2002,6 +2020,11 @@ export async function handleRoleUpdateFile(
     try { ws.send(JSON.stringify({ type: "role:file-updated", markdown: "", error: "contents must be a string" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=role:file-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
     return;
   }
+  if (!isExpect(m.version)) {
+    try { ws.send(JSON.stringify({ type: "role:file-updated", markdown: "", error: "version is required — the one the file was opened at", code: "bad_request" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=role:file-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+    return;
+  }
+  const expectVersion = m.version;
   const roleName = rawRoleName;
   const contents = rawContents;
   const rawHostId = m.hostId;
@@ -2021,11 +2044,26 @@ export async function handleRoleUpdateFile(
     if (check.verdict === "writeBack") instanceWideWriteBack = true;
   }
   const useLocal = isLocalHostId(hostIdNum);
+  // Written at its turn, only over the version the editor opened.
+  type Refusal = { error: string; code: string; version?: string | null };
+  let refusal = null as Refusal | null;
+  let version = "";
+  const saveAndRead = async (c: Parameters<typeof readForSave>[0]): Promise<{ markdown: string }> => {
+    if (Buffer.byteLength(contents, "utf-8") > IDMEDIT_MAX_MARKDOWN_BYTES) throw new Error("markdown payload exceeds IDMEDIT_MAX_MARKDOWN_BYTES");
+    const at = roleFileAt(roleName);
+    const saved = await saveFileAtTurn(c, { homePath: at.homePath, data: Buffer.from(contents, "utf8"), expect: expectVersion, hostId: hostIdNum, by: userId });
+    if (saved.ok === false) {
+      refusal = { error: saved.code === "changed" ? CHANGED_ERROR : saved.error, code: saved.code, ...(saved.version !== undefined ? { version: saved.version } : {}) };
+      return { markdown: "" };
+    }
+    const r = await readForSave(c, at);
+    version = r.version;
+    return { markdown: r.text };
+  };
   try {
     let markdown: string;
     if (useLocal) {
-      await writeRoleFileByName(null, roleName, contents);
-      ({ markdown } = await readRoleFileByName(null, roleName));
+      ({ markdown } = await saveAndRead(null));
       sshLogger.info("role:update-file", {
         operation: "role_update_file",
         userId, roleName, hostId: hostIdNum, useLocal: true,
@@ -2040,8 +2078,7 @@ export async function handleRoleUpdateFile(
       await getHostSemaphore(hostIdNum).run(async () => {
         const conn = await connectOneShot(resolved as unknown as Parameters<typeof connectOneShot>[0], 5000);
         try {
-          await writeRoleFileByName(conn, roleName, contents);
-          ({ markdown } = await readRoleFileByName(conn, roleName));
+          ({ markdown } = await saveAndRead(conn));
           sshLogger.info("role:update-file", {
             operation: "role_update_file",
             userId, roleName, hostId: hostIdNum, useLocal: false,
@@ -2052,9 +2089,13 @@ export async function handleRoleUpdateFile(
         }
       });
     }
+    if (refusal) {
+      try { ws.send(JSON.stringify({ type: "role:file-updated", markdown: "", ...refusal })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=role:file-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+      return;
+    }
     if (instanceWideMachineId) afterAdminWrite(instanceWideMachineId, roleName);
     if (instanceWideWriteBack) afterWriteBackWrite();
-    try { ws.send(JSON.stringify({ type: "role:file-updated", markdown })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=role:file-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+    try { ws.send(JSON.stringify({ type: "role:file-updated", markdown, version })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=role:file-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
   } catch (err) {
     sshLogger.error(
       "role:update-file unexpected error",
@@ -2069,6 +2110,92 @@ export async function handleRoleUpdateFile(
 
 // Test seam — Phase 90 Plan 90-03. Same pattern as __handleIdentityUpdateRoleFileForTests.
 export const __handleRoleUpdateFileForTests = handleRoleUpdateFile;
+
+// role:edit — the roles window's one-line edits (name, description, colour, voice, picture,
+// Borrowable). Only those lines of the role file change, read on the machine at the edit's
+// turn at its front door, so nothing else in the file — an agent's edit since the window
+// loaded it, say — is put back.
+//   role:edit {roleName, hostId, set: {key: value}, unset: [key]} -> role:edited {markdown, version} | {error, code}
+export async function handleRoleEdit(ws: WebSocket, msg: unknown, userId: string | undefined): Promise<void> {
+  const m = (msg ?? {}) as { roleName?: unknown; hostId?: unknown; set?: unknown; unset?: unknown };
+  const reply = (body: Record<string, unknown>): void => {
+    try { ws.send(JSON.stringify({ type: "role:edited", ...body })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=role:edited err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+  };
+  if (typeof m.roleName !== "string" || !ROLE_NAME_PATTERN.test(m.roleName)) {
+    reply({ markdown: "", error: "invalid roleName", code: "bad_request" });
+    return;
+  }
+  const set = m.set ?? {};
+  const unset = m.unset ?? [];
+  if (typeof set !== "object" || set === null || Array.isArray(set) || !Array.isArray(unset)) {
+    reply({ markdown: "", error: "set must be an object and unset a list", code: "bad_request" });
+    return;
+  }
+  const roleName = m.roleName;
+  const hostIdNum = requireHostId(ws, m.hostId, "role:edit", { type: "role:edited", markdown: "" }, userId);
+  if (hostIdNum === null) return;
+  let instanceWideMachineId: string | null = null;
+  let instanceWideWriteBack = false;
+  if (userId) {
+    const check = await checkInstanceWideRoleWrite(userId, hostIdNum, roleName);
+    if (check.verdict === "refuse") {
+      reply({ markdown: "", error: INSTANCE_WIDE_ROLE_REFUSAL, code: "instance_wide" });
+      return;
+    }
+    if (check.verdict === "admin") instanceWideMachineId = check.machineId;
+    if (check.verdict === "writeBack") instanceWideWriteBack = true;
+  }
+  const edit = (c: Parameters<typeof submitFrontDoor>[0]) =>
+    submitFrontDoor(c, "role-edit", { name: roleName, set, unset }, { hostId: hostIdNum, by: userId });
+  try {
+    let outcome: Awaited<ReturnType<typeof edit>>;
+    if (isLocalHostId(hostIdNum)) {
+      outcome = await edit(null);
+    } else {
+      const resolved = await resolveHostById(hostIdNum, userId!);
+      if (!resolved) {
+        reply({ markdown: "", error: "host not found" });
+        return;
+      }
+      outcome = await getHostSemaphore(hostIdNum).run(async () => {
+        const conn = await connectOneShot(resolved as unknown as Parameters<typeof connectOneShot>[0], 5000);
+        try {
+          return await edit(conn);
+        } finally {
+          try { conn.end(); } catch (err) { databaseLogger.warn(`[ws-server] conn-end-failed err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_conn_end_failed" }); }
+        }
+      });
+    }
+    sshLogger.info("role:edit", {
+      operation: "role_edit",
+      userId, roleName, hostId: hostIdNum, keys: [...Object.keys(set), ...unset.map(String)], state: outcome.state,
+    });
+    switch (outcome.state) {
+      case "done": {
+        const markdown = String((outcome.result as { markdown?: unknown } | null)?.markdown ?? "");
+        if (instanceWideMachineId) afterAdminWrite(instanceWideMachineId, roleName);
+        if (instanceWideWriteBack) afterWriteBackWrite();
+        reply({ markdown, version: fileVersion(Buffer.from(markdown, "utf8")) });
+        return;
+      }
+      case "refused":
+      case "failed":
+        reply({ markdown: "", error: outcome.reason, code: outcome.code });
+        return;
+      case "pending":
+        reply({ markdown: "", error: "the machine is still working on it; it'll show once it's done", code: "pending" });
+        return;
+      case "not_installed":
+        reply({ markdown: "", error: "this machine is still updating, try again in a moment", code: "updating" });
+        return;
+    }
+  } catch (err) {
+    sshLogger.error("role:edit unexpected error", err instanceof Error ? err : new Error(String(err)), {
+      operation: "role_edit_error", userId, roleName, hostId: hostIdNum,
+    });
+    reply({ markdown: "", error: err instanceof Error ? err.message : String(err) });
+  }
+}
 
 // ─── Phase 90 Plan 90-07: role-name-keyed READ WS handlers ────────────────────
 //
@@ -2108,8 +2235,15 @@ export async function handleRoleGetFile(
 
   try {
     let markdown: string;
+    // Opened for editing: with the version a save is checked against.
+    let version = "";
+    const read = async (c: Parameters<typeof readForSave>[0]): Promise<{ markdown: string }> => {
+      const r = await readForSave(c, roleFileAt(roleName));
+      version = r.version;
+      return { markdown: r.text };
+    };
     if (useLocal) {
-      ({ markdown } = await readRoleFileByName(null, roleName));
+      ({ markdown } = await read(null));
       sshLogger.info("role:get-file", {
         operation: "role_get_file",
         userId, roleName, hostId: hostIdNum, useLocal: true, payloadSize: markdown.length,
@@ -2123,7 +2257,7 @@ export async function handleRoleGetFile(
       await getHostSemaphore(hostIdNum).run(async () => {
         const conn = await connectOneShot(resolved as unknown as Parameters<typeof connectOneShot>[0], 5000);
         try {
-          ({ markdown } = await readRoleFileByName(conn, roleName));
+          ({ markdown } = await read(conn));
           sshLogger.info("role:get-file", {
             operation: "role_get_file",
             userId, roleName, hostId: hostIdNum, useLocal: false, payloadSize: markdown.length,
@@ -2133,7 +2267,7 @@ export async function handleRoleGetFile(
         }
       });
     }
-    try { ws.send(JSON.stringify({ type: "role:file-loaded", markdown })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=role:file-loaded err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+    try { ws.send(JSON.stringify({ type: "role:file-loaded", markdown, version })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=role:file-loaded err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
   } catch (err) {
     sshLogger.error(
       "role:get-file unexpected error",
@@ -5849,8 +5983,15 @@ wss.on("connection", async (ws: WebSocket, req) => {
 
       try {
         let markdown: string;
+        // A live agent's file is opened for editing: with the version a save is checked against.
+        let version: string | undefined;
+        const readLive = async (c: Parameters<typeof readForSave>[0]): Promise<{ markdown: string }> => {
+          const r = await readForSave(c, agentFileAt(identityKey));
+          version = r.version;
+          return { markdown: r.text };
+        };
         if (useLocal) {
-          ({ markdown } = await readIdentityFile(null, identityKey, { archived }));
+          ({ markdown } = archived ? await readIdentityFile(null, identityKey, { archived }) : await readLive(null));
           sshLogger.info("identity:get-identity-file", {
             operation: "identity_get_identity_file",
             userId, identityKey, hostId: hostIdNum, useLocal: true, payloadSize: markdown.length,
@@ -5864,7 +6005,7 @@ wss.on("connection", async (ws: WebSocket, req) => {
           await getHostSemaphore(hostIdNum).run(async () => {
             const conn = await connectOneShot(resolved as unknown as Parameters<typeof connectOneShot>[0], 5000);
             try {
-              ({ markdown } = await readIdentityFile(conn, identityKey, { archived }));
+              ({ markdown } = archived ? await readIdentityFile(conn, identityKey, { archived }) : await readLive(conn));
               sshLogger.info("identity:get-identity-file", {
                 operation: "identity_get_identity_file",
                 userId, identityKey, hostId: hostIdNum, useLocal: false, payloadSize: markdown.length,
@@ -5874,7 +6015,7 @@ wss.on("connection", async (ws: WebSocket, req) => {
             }
           });
         }
-        try { ws.send(JSON.stringify({ type: "identity:identity-file", markdown })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:identity-file err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+        try { ws.send(JSON.stringify({ type: "identity:identity-file", markdown, ...(version !== undefined ? { version } : {}) })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:identity-file err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
       } catch (err: unknown) {
         sshLogger.error(
           "identity:get-identity-file error",
@@ -6126,7 +6267,7 @@ wss.on("connection", async (ws: WebSocket, req) => {
     // After write, re-reads the file via readIdentityFile so the client
     // rehydrates from server-side truth. Mirror of identity:update-wakeup.
     if (msg.type === "identity:update-identity-file") {
-      const raw = msg as { identityKey?: unknown; hostId?: unknown; contents?: unknown };
+      const raw = msg as { identityKey?: unknown; hostId?: unknown; contents?: unknown; version?: unknown };
       const rawKey = raw.identityKey;
       const rawContents = raw.contents;
       if (typeof rawKey !== "string" || !IDENTITY_KEY_RE.test(rawKey)) {
@@ -6137,17 +6278,42 @@ wss.on("connection", async (ws: WebSocket, req) => {
         try { ws.send(JSON.stringify({ type: "identity:identity-file-updated", markdown: "", error: "contents must be a string" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:identity-file-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
         return;
       }
+      if (!isExpect(raw.version)) {
+        try { ws.send(JSON.stringify({ type: "identity:identity-file-updated", markdown: "", error: "version is required — the one the file was opened at", code: "bad_request" })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:identity-file-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+        return;
+      }
+      const expectVersion = raw.version;
       const identityKey = rawKey;
       const contents = rawContents;
       const rawHostId = raw.hostId;
       const hostIdNum = requireHostId(ws, rawHostId, "identity:update-identity-file", { type: "identity:identity-file-updated", markdown: "" }, userId);
       if (hostIdNum === null) return;
       const useLocal = isLocalHostId(hostIdNum);
+      // Written at its turn, only over the version the editor opened.
+      type Refusal = { error: string; code: string; version?: string | null };
+      let refusal = null as Refusal | null;
+      let version = "";
+      const saveAndRead = async (c: Parameters<typeof readForSave>[0]): Promise<{ markdown: string }> => {
+        const at = agentFileAt(identityKey);
+        const saved = await saveFileAtTurn(c, {
+          homePath: at.homePath,
+          data: Buffer.from(contents, "utf8"),
+          expect: expectVersion,
+          hostId: hostIdNum,
+          by: userId,
+        });
+        if (saved.ok === false) {
+          refusal = { error: saved.code === "changed" ? CHANGED_ERROR : saved.error, code: saved.code, ...(saved.version !== undefined ? { version: saved.version } : {}) };
+          return { markdown: "" };
+        }
+        const r = await readForSave(c, at);
+        version = r.version;
+        return { markdown: r.text };
+      };
       try {
         let markdown: string;
         if (useLocal) {
-          await writeIdentityFile(null, identityKey, contents);
-          ({ markdown } = await readIdentityFile(null, identityKey));
+          ({ markdown } = await saveAndRead(null));
           sshLogger.info("identity:update-identity-file", {
             operation: "identity_update_identity_file",
             userId, identityKey, hostId: hostIdNum, useLocal: true,
@@ -6162,8 +6328,7 @@ wss.on("connection", async (ws: WebSocket, req) => {
           await getHostSemaphore(hostIdNum).run(async () => {
             const conn = await connectOneShot(resolved as unknown as Parameters<typeof connectOneShot>[0], 5000);
             try {
-              await writeIdentityFile(conn, identityKey, contents);
-              ({ markdown } = await readIdentityFile(conn, identityKey));
+              ({ markdown } = await saveAndRead(conn));
               sshLogger.info("identity:update-identity-file", {
                 operation: "identity_update_identity_file",
                 userId, identityKey, hostId: hostIdNum, useLocal: false,
@@ -6174,7 +6339,7 @@ wss.on("connection", async (ws: WebSocket, req) => {
             }
           });
         }
-        try { ws.send(JSON.stringify({ type: "identity:identity-file-updated", markdown })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:identity-file-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
+        try { ws.send(JSON.stringify(refusal ? { type: "identity:identity-file-updated", markdown: "", ...refusal } : { type: "identity:identity-file-updated", markdown, version })); } catch (err) { databaseLogger.warn(`[ws-server] send-failed msgType=identity:identity-file-updated err="${err instanceof Error ? err.message : String(err)}"`, { operation: "ws_send_failed" }); }
       } catch (err) {
         sshLogger.error(
           "identity:update-identity-file unexpected error",
@@ -6214,6 +6379,10 @@ wss.on("connection", async (ws: WebSocket, req) => {
     // See handler prologues at L1516+ for details.
     if (msg.type === "role:get-file") {
       await handleRoleGetFile(ws, msg, userId);
+      return;
+    }
+    if (msg.type === "role:edit") {
+      await handleRoleEdit(ws, msg, userId);
       return;
     }
     // Phase 134 Plan 134-02 retired the role-name-keyed wakeup dispatchers

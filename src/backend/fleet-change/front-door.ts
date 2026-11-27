@@ -45,7 +45,9 @@ export type FrontDoorKind =
   | "project-move"
   | "agent-project"
   | "agent-pin"
-  | "agent-edit";
+  | "agent-edit"
+  | "role-edit"
+  | "file-save";
 
 /** An archive is done once claimed; while the machine is still finishing it, what's left and
  *  (for anything failing 10 minutes or more) why. */

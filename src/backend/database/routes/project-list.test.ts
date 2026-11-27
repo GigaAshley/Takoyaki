@@ -82,7 +82,7 @@ vi.mock("../../claude-session/identity-artifact-reader.js", () => ({
   PROJECT_SLUG_RE: /^[a-z0-9-]{1,64}$/,
   listProjects: vi.fn(),
   readProjectFile: vi.fn(),
-  writeProjectFile: vi.fn(),
+  getLocalProjectsRoot: () => "/local/fleet/projects",
   // Minimal stand-in for the real parser: only the parent line matters to
   // the routes (PUT /file's parent guard).
   projectMetaFromMarkdown: (slug: string, markdown: string) => {
@@ -101,6 +101,12 @@ vi.mock("../../fleet-change/front-door.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../fleet-change/front-door.js")>()),
   submitFrontDoor: vi.fn(),
   frontDoorStatus: vi.fn(),
+}));
+// The project file editor's read (exact bytes + version) and its save at the front door.
+vi.mock("../../fleet-change/file-save.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../fleet-change/file-save.js")>()),
+  readForSave: vi.fn(),
+  saveFileAtTurn: vi.fn(),
 }));
 vi.mock("../../fleet-change/project-rooms.js", () => ({
   findProjectRooms: vi.fn(),
@@ -146,8 +152,13 @@ import {
   isLocalHostId,
   listProjects,
   readProjectFile,
-  writeProjectFile,
 } from "../../claude-session/identity-artifact-reader.js";
+import { readForSave, saveFileAtTurn } from "../../fleet-change/file-save.js";
+
+const OPENED = "a".repeat(64);
+const NOW = "b".repeat(64);
+const readsAs = (text: string, version = NOW) =>
+  (readForSave as Mock).mockResolvedValue({ data: Buffer.from(text), text, version });
 // Phase 117 M8 fix (2026-09-18): import the mocked databaseLogger so
 // null-registry tests can assert the warning is logged.
 import { databaseLogger } from "../../utils/logger.js";
@@ -277,7 +288,8 @@ beforeEach(() => {
   (findProjectRooms as Mock).mockResolvedValue([]);
   (releaseProjectRooms as Mock).mockResolvedValue([]);
   (readProjectFile as Mock).mockResolvedValue({ markdown: "" });
-  (writeProjectFile as Mock).mockResolvedValue({ markdown: "" });
+  readsAs("");
+  (saveFileAtTurn as Mock).mockResolvedValue({ ok: true, version: NOW, requestId: "r" });
   // Phase 130: reset auto-tag helpers each test — vi.clearAllMocks() clears
   // call history but preserves implementation, so a prior test's override
   // would leak into a later test's assertions.
@@ -884,10 +896,8 @@ describe("POST /projects/:slug/archive", () => {
 // ===========================================================================
 
 describe("GET /projects/:slug/file", () => {
-  it("Test F1: happy LOCAL → 200 { markdown } from readProjectFile(null, slug); no SSH", async () => {
-    (readProjectFile as Mock).mockResolvedValue({
-      markdown: "---\ndisplayName: 'Alpha'\n---\nbody",
-    });
+  it("Test F1: happy LOCAL → 200 { markdown, version } read as exact bytes; no SSH", async () => {
+    readsAs("---\ndisplayName: 'Alpha'\n---\nbody\n", OPENED);
 
     const res = await httpRequest(server, {
       method: "GET",
@@ -895,16 +905,17 @@ describe("GET /projects/:slug/file", () => {
     });
 
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({
-      markdown: "---\ndisplayName: 'Alpha'\n---\nbody",
-    });
+    expect(res.body).toEqual({ markdown: "---\ndisplayName: 'Alpha'\n---\nbody\n", version: OPENED });
     expect(connectOneShot).not.toHaveBeenCalled();
-    expect(readProjectFile).toHaveBeenCalledTimes(1);
-    expect(readProjectFile).toHaveBeenCalledWith(null, "alpha");
+    expect(readForSave).toHaveBeenCalledWith(null, {
+      homePath: "fleet/projects/alpha/project.md",
+      localPath: "/local/fleet/projects/alpha/project.md",
+      keepMembers: true,
+    });
   });
 
   it("Test F2: happy REMOTE → 200 with SSH conn passed; conn.end() in finally", async () => {
-    (readProjectFile as Mock).mockResolvedValue({ markdown: "body" });
+    readsAs("body", OPENED);
 
     const res = await httpRequest(server, {
       method: "GET",
@@ -912,9 +923,9 @@ describe("GET /projects/:slug/file", () => {
     });
 
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ markdown: "body" });
+    expect(res.body).toEqual({ markdown: "body", version: OPENED });
     expect(connectOneShot).toHaveBeenCalledTimes(1);
-    expect(readProjectFile).toHaveBeenCalledWith(stubConn, "alpha");
+    expect((readForSave as Mock).mock.calls[0][0]).toBe(stubConn);
     expect(stubConn.end).toHaveBeenCalled();
   });
 
@@ -926,7 +937,7 @@ describe("GET /projects/:slug/file", () => {
 
     expect(res.status).toBe(400);
     expect((res.body as { error: string }).error).toMatch(/slug/);
-    expect(readProjectFile).not.toHaveBeenCalled();
+    expect(readForSave).not.toHaveBeenCalled();
   });
 
   it("Test F4: missing hostId → 400 before any I/O", async () => {
@@ -937,7 +948,7 @@ describe("GET /projects/:slug/file", () => {
 
     expect(res.status).toBe(400);
     expect((res.body as { error: string }).error).toMatch(/hostId/);
-    expect(readProjectFile).not.toHaveBeenCalled();
+    expect(readForSave).not.toHaveBeenCalled();
   });
 
   it("Test F5: unknown host → 404 (cross-user probe defense T-117-04-01)", async () => {
@@ -948,11 +959,11 @@ describe("GET /projects/:slug/file", () => {
 
     expect(res.status).toBe(404);
     expect((res.body as { error: string }).error).toMatch(/Host not found/);
-    expect(readProjectFile).not.toHaveBeenCalled();
+    expect(readForSave).not.toHaveBeenCalled();
   });
 
-  it("Test F6: readProjectFile throws → 500 generic (no err.message leak)", async () => {
-    (readProjectFile as Mock).mockRejectedValue(
+  it("Test F6: the read throws → 500 generic (no err.message leak)", async () => {
+    (readForSave as Mock).mockRejectedValue(
       new Error("EACCES: /private/fs/path leaked — sensitive info to caller"),
     );
 
@@ -973,88 +984,83 @@ describe("GET /projects/:slug/file", () => {
 // ===========================================================================
 
 describe("PUT /projects/:slug/file", () => {
-  it("Test G1: happy LOCAL → 200 { markdown } from writeProjectFile(null, slug, contents)", async () => {
-    (writeProjectFile as Mock).mockResolvedValue({ markdown: "new body" });
+  it("Test G1: happy LOCAL → saved at the front door over the version opened, keeping the machine's member list; answers the file read back", async () => {
+    readsAs("new body\n", NOW);
 
     const res = await httpRequest(server, {
       method: "PUT",
       path: "/projects/alpha/file",
-      body: { hostId: 5, contents: "new body" },
+      body: { hostId: 5, contents: "new body\n", version: OPENED },
     });
 
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ markdown: "new body" });
+    expect(res.body).toEqual({ markdown: "new body\n", version: NOW });
     expect(connectOneShot).not.toHaveBeenCalled();
-    expect(writeProjectFile).toHaveBeenCalledTimes(1);
-    expect(writeProjectFile).toHaveBeenCalledWith(null, "alpha", "new body");
+    expect(saveFileAtTurn).toHaveBeenCalledTimes(1);
+    const [conn, opts] = (saveFileAtTurn as Mock).mock.calls[0];
+    expect(conn).toBeNull();
+    expect(opts).toMatchObject({ homePath: "fleet/projects/alpha/project.md", expect: OPENED, keepMembers: true, hostId: 5, by: "1" });
+    expect(opts.data.toString()).toBe("new body\n");
   });
 
   it("Test G2: happy REMOTE → 200 with SSH conn passed; conn.end() in finally", async () => {
-    (writeProjectFile as Mock).mockResolvedValue({ markdown: "body" });
+    readsAs("body");
 
     const res = await httpRequest(server, {
       method: "PUT",
       path: "/projects/alpha/file",
-      body: { hostId: 7, contents: "body" },
+      body: { hostId: 7, contents: "body", version: OPENED },
     });
 
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ markdown: "body" });
     expect(connectOneShot).toHaveBeenCalledTimes(1);
-    expect(writeProjectFile).toHaveBeenCalledWith(stubConn, "alpha", "body");
+    expect((saveFileAtTurn as Mock).mock.calls[0][0]).toBe(stubConn);
     expect(stubConn.end).toHaveBeenCalled();
   });
 
-  it("Test G3: invalid slug — 'Alpha' → 400 before any I/O", async () => {
-    const res = await httpRequest(server, {
-      method: "PUT",
-      path: "/projects/Alpha/file",
-      body: { hostId: 5, contents: "body" },
-    });
+  it("changed since it was opened (moved, or who can see it changed): 409 changed with the version now, nothing published", async () => {
+    (saveFileAtTurn as Mock).mockResolvedValue({ ok: false, status: 409, code: "changed", error: "it changed since you opened it", version: NOW });
 
-    expect(res.status).toBe(400);
-    expect((res.body as { error: string }).error).toMatch(/slug/);
-    expect(writeProjectFile).not.toHaveBeenCalled();
-  });
-
-  it("Test G4: missing contents → 400 before any I/O", async () => {
     const res = await httpRequest(server, {
       method: "PUT",
       path: "/projects/alpha/file",
-      body: { hostId: 5 },
+      body: { hostId: 5, contents: "stale", version: OPENED },
     });
 
-    expect(res.status).toBe(400);
-    expect((res.body as { error: string }).error).toMatch(/contents/);
-    expect(writeProjectFile).not.toHaveBeenCalled();
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: "it changed since you opened it", code: "changed", version: NOW });
+    expect(mockPublishProjectListChanged).not.toHaveBeenCalled();
   });
 
-  it("Test G5: non-string contents → 400 before any I/O", async () => {
-    const res = await httpRequest(server, {
-      method: "PUT",
-      path: "/projects/alpha/file",
-      body: { hostId: 5, contents: 123 },
+  for (const [label, body, match] of [
+    ["invalid slug", { hostId: 5, contents: "body", version: OPENED, path: "/projects/Alpha/file" }, /slug/],
+    ["missing contents", { hostId: 5, version: OPENED }, /contents/],
+    ["non-string contents", { hostId: 5, contents: 123, version: OPENED }, /contents/],
+    ["no version", { hostId: 5, contents: "body" }, /version/],
+    ["a made-up version", { hostId: 5, contents: "body", version: "x" }, /version/],
+  ] as const) {
+    it(`${label} → 400 before any I/O`, async () => {
+      const { path, ...rest } = body as Record<string, unknown> & { path?: string };
+      const res = await httpRequest(server, { method: "PUT", path: path ?? "/projects/alpha/file", body: rest });
+      expect(res.status).toBe(400);
+      expect((res.body as { error: string }).error).toMatch(match);
+      expect(saveFileAtTurn).not.toHaveBeenCalled();
     });
-
-    expect(res.status).toBe(400);
-    expect((res.body as { error: string }).error).toMatch(/contents/);
-    expect(writeProjectFile).not.toHaveBeenCalled();
-  });
+  }
 
   it("Test G6: unknown host → 404", async () => {
     const res = await httpRequest(server, {
       method: "PUT",
       path: "/projects/alpha/file",
-      body: { hostId: 99, contents: "body" },
+      body: { hostId: 99, contents: "body", version: OPENED },
     });
 
     expect(res.status).toBe(404);
     expect((res.body as { error: string }).error).toMatch(/Host not found/);
-    expect(writeProjectFile).not.toHaveBeenCalled();
+    expect(saveFileAtTurn).not.toHaveBeenCalled();
   });
 
   it("Test G8: happy write → publishProjectListChanged fires with re-listed enriched projects (project.md displayName edits repaint the sidebar)", async () => {
-    (writeProjectFile as Mock).mockResolvedValue({ markdown: "" });
     (listProjects as Mock).mockResolvedValue([
       { slug: "alpha", displayName: "New Name", users: null },
     ]);
@@ -1062,7 +1068,7 @@ describe("PUT /projects/:slug/file", () => {
     const res = await httpRequest(server, {
       method: "PUT",
       path: "/projects/alpha/file",
-      body: { hostId: 5, contents: "---\ndisplayName: New Name\n---\n" },
+      body: { hostId: 5, contents: "---\ndisplayName: New Name\n---\n", version: OPENED },
     });
 
     expect(res.status).toBe(200);
@@ -1083,12 +1089,11 @@ describe("PUT /projects/:slug/file", () => {
 
   it("Test G9 (null registry on write-file): publish skipped BUT a warning is logged (mirror M8 fix)", async () => {
     mockRegistryIsNull = true;
-    (writeProjectFile as Mock).mockResolvedValue({ markdown: "" });
 
     const res = await httpRequest(server, {
       method: "PUT",
       path: "/projects/alpha/file",
-      body: { hostId: 5, contents: "body" },
+      body: { hostId: 5, contents: "body", version: OPENED },
     });
 
     expect(res.status).toBe(200);
@@ -1100,15 +1105,15 @@ describe("PUT /projects/:slug/file", () => {
     );
   });
 
-  it("Test G10: writeProjectFile throws → 500 generic (no err.message leak)", async () => {
-    (writeProjectFile as Mock).mockRejectedValue(
+  it("Test G10: the save throws → 500 generic (no err.message leak)", async () => {
+    (saveFileAtTurn as Mock).mockRejectedValue(
       new Error("ENOENT: /host/private/path leaked — sensitive info"),
     );
 
     const res = await httpRequest(server, {
       method: "PUT",
       path: "/projects/alpha/file",
-      body: { hostId: 5, contents: "body" },
+      body: { hostId: 5, contents: "body", version: OPENED },
     });
 
     expect(res.status).toBe(500);
@@ -1254,23 +1259,23 @@ describe("nested projects — review fixes", () => {
     const loop = await httpRequest(server, {
       method: "PUT",
       path: "/projects/s/file",
-      body: { hostId: 5, contents: "---\ndisplayName: S\nparent: c\n---\n" },
+      body: { hostId: 5, contents: "---\ndisplayName: S\nparent: c\n---\n", version: OPENED },
     });
     expect(loop.status).toBe(409);
     const missing = await httpRequest(server, {
       method: "PUT",
       path: "/projects/s/file",
-      body: { hostId: 5, contents: "---\nparent: nope\n---\n" },
+      body: { hostId: 5, contents: "---\nparent: nope\n---\n", version: OPENED },
     });
     expect(missing.status).toBe(400);
-    expect(writeProjectFile).not.toHaveBeenCalled();
+    expect(saveFileAtTurn).not.toHaveBeenCalled();
     const ok = await httpRequest(server, {
       method: "PUT",
       path: "/projects/s/file",
-      body: { hostId: 5, contents: "---\nparent: open\n---\n" },
+      body: { hostId: 5, contents: "---\nparent: open\n---\n", version: OPENED },
     });
     expect(ok.status).toBe(200);
-    expect(writeProjectFile).toHaveBeenCalledTimes(1);
+    expect(saveFileAtTurn).toHaveBeenCalledTimes(1);
   });
 
 });

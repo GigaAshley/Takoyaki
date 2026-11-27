@@ -34,7 +34,8 @@ vi.mock("@/api/workspace-api", async (importOriginal) => {
     ...actual,
     listWorkspace: vi.fn(),
     readWorkspaceFile: vi.fn(),
-    writeWorkspaceFile: vi.fn(async () => undefined),
+    writeWorkspaceFile: vi.fn(async () => ({ version: "b".repeat(64) })),
+    uploadWorkspaceFile: vi.fn(async () => ({ version: "b".repeat(64) })),
   };
 });
 vi.mock("@mdxeditor/editor", async () => (await import("./file-window.test-mocks")).mdxEditor());
@@ -43,7 +44,8 @@ vi.mock("./CodeEditorImpl", async () => (await import("./file-window.test-mocks"
 import EditableFileModal from "./EditableFileModal";
 import WorkspaceTab from "./WorkspaceTab";
 import { fetchHostFileUrl } from "@/api/editable-file-api";
-import { listWorkspace, readWorkspaceFile, writeWorkspaceFile, type WorkspaceEntry } from "@/api/workspace-api";
+import { listWorkspace, readWorkspaceFile, uploadWorkspaceFile, writeWorkspaceFile, type WorkspaceEntry } from "@/api/workspace-api";
+import { FileChangedError } from "@/api/file-changed-error";
 import { __resetKitDialogsForTests, autoAnswerKitDialogs } from "@/components/kit";
 import { FORMATTED_UNAVAILABLE_COPY } from "./markdown-mode-switch";
 import { UNPARSEABLE } from "./file-window.test-mocks";
@@ -52,6 +54,8 @@ const mockedFetch = vi.mocked(fetchHostFileUrl);
 const mockedList = vi.mocked(listWorkspace);
 const mockedRead = vi.mocked(readWorkspaceFile);
 const mockedWrite = vi.mocked(writeWorkspaceFile);
+const mockedUpload = vi.mocked(uploadWorkspaceFile);
+const OPENED = "a".repeat(64);
 
 const ICS = [
   "BEGIN:VCALENDAR",
@@ -180,9 +184,11 @@ beforeEach(() => {
       sizeBytes: (CONTENT[name] ?? "").length,
       filename: name,
       extension: name.split(".").pop() ?? null,
+      version: OPENED,
     };
   });
-  mockedWrite.mockImplementation(async () => undefined);
+  mockedWrite.mockImplementation(async () => ({ version: "b".repeat(64) }));
+  mockedUpload.mockImplementation(async () => ({ version: "b".repeat(64) }));
   // URL-sourced views (calendar Events) read the file themselves.
   vi.stubGlobal(
     "fetch",
@@ -493,13 +499,47 @@ describe("Files-tab file window", () => {
     await waitFor(() => expect(saveButton().disabled).toBe(false));
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() =>
-      expect(mockedWrite).toHaveBeenCalledWith(expect.anything(), 1, "docs/notes.md", "saved words"),
+      expect(mockedWrite).toHaveBeenCalledWith(expect.anything(), 1, "docs/notes.md", "saved words", OPENED),
     );
     expect(await screen.findByTestId("file-window-edit")).toBeTruthy();
     const editor = await mdEditor();
     expect(editor.readOnly).toBe(true);
     expect(editor.value).toBe("saved words");
     expect(screen.queryByTestId("mdx-toolbar")).toBeNull();
+  });
+
+  it("changed since it was opened: Keep my edits keeps the draft, says so, and saving again goes over the newer version", async () => {
+    mockedWrite.mockRejectedValueOnce(new FileChangedError("c".repeat(64)));
+    const dialogs = autoAnswerKitDialogs({ confirm: false });
+    await filesTabWindow.open("notes.md");
+    await mdEditor();
+    fireEvent.click(screen.getByTestId("file-window-edit"));
+    await screen.findByTestId("mdx-toolbar");
+    fireEvent.change(await mdEditor(), { target: { value: "my words" } });
+    await waitFor(() => expect(saveButton().disabled).toBe(false));
+    fireEvent.click(saveButton());
+    expect(await screen.findByText(/changed since you started editing\. Save again to overwrite it/)).toBeTruthy();
+    expect(dialogs.calls[0].opts).toMatchObject({ title: "This file changed on disk", confirmLabel: "Reload", cancelLabel: "Keep my edits" });
+    expect((await mdEditor()).value).toBe("my words");
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(mockedWrite).toHaveBeenCalledTimes(2));
+    expect(mockedWrite.mock.calls[1][4]).toBe("c".repeat(64));
+  });
+
+  it("changed since it was opened: Reload shows the newer version", async () => {
+    mockedWrite.mockRejectedValueOnce(new FileChangedError("c".repeat(64)));
+    autoAnswerKitDialogs({ confirm: true });
+    await filesTabWindow.open("notes.md");
+    await mdEditor();
+    fireEvent.click(screen.getByTestId("file-window-edit"));
+    await screen.findByTestId("mdx-toolbar");
+    fireEvent.change(await mdEditor(), { target: { value: "my words" } });
+    await waitFor(() => expect(saveButton().disabled).toBe(false));
+    mockedRead.mockResolvedValueOnce({ contentBase64: b64("the agent's words"), sizeBytes: 17, filename: "notes.md", extension: "md", version: "c".repeat(64) });
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(mockedRead).toHaveBeenCalledTimes(2));
+    await waitFor(async () => expect((await mdEditor()).value).toBe("the agent's words"));
+    expect(mockedWrite).toHaveBeenCalledTimes(1);
   });
 
   it("a failed save keeps you editing, with your changes", async () => {
@@ -558,5 +598,41 @@ describe("Files-tab file window", () => {
     await mdEditor();
     expect(screen.queryByTestId("file-window-edit")).toBeNull();
     expect(screen.queryByTestId("file-window-save")).toBeNull();
+  });
+});
+
+describe("uploading into a Files tab", () => {
+  async function uploadInto(names: string[]): Promise<void> {
+    const { container } = render(<WorkspaceTab target={{ kind: "identity", identityKey: "ada" }} hostId={1} hue={190} />);
+    fireEvent.click(await screen.findByText("docs"));
+    await screen.findByText("notes.md");
+    const input = container.querySelector('input[type="file"]') as HTMLInputElement;
+    const files = names.map((n) => new File(["mine"], n));
+    fireEvent.change(input, { target: { files } });
+  }
+
+  it("a new file goes straight in", async () => {
+    await uploadInto(["fresh.txt"]);
+    await waitFor(() => expect(mockedUpload).toHaveBeenCalledTimes(1));
+    expect(mockedUpload.mock.calls[0][2]).toBe("docs/fresh.txt");
+    expect(mockedUpload.mock.calls[0][5]).toBeUndefined();
+  });
+
+  it("one with the same name as a file already there asks first; Replace sends it over that file's version", async () => {
+    mockedUpload.mockRejectedValueOnce(new FileChangedError("c".repeat(64), true));
+    const dialogs = autoAnswerKitDialogs({ confirm: true });
+    await uploadInto(["notes.md"]);
+    await waitFor(() => expect(mockedUpload).toHaveBeenCalledTimes(2));
+    expect(dialogs.calls[0].opts).toMatchObject({ title: "Replace notes.md?", confirmLabel: "Replace" });
+    expect(mockedUpload.mock.calls[1][5]).toBe("c".repeat(64));
+  });
+
+  it("Cancel leaves the file that's there alone", async () => {
+    mockedUpload.mockRejectedValueOnce(new FileChangedError("c".repeat(64), true));
+    const dialogs = autoAnswerKitDialogs({ confirm: false });
+    await uploadInto(["notes.md"]);
+    await waitFor(() => expect(dialogs.calls).toHaveLength(1));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(mockedUpload).toHaveBeenCalledTimes(1);
   });
 });

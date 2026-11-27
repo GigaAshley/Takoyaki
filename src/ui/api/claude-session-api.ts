@@ -22,6 +22,7 @@
 import { CLIENT_BUILD_ID } from "@/lib/client-build-id";
 import { lockSkewedSession } from "@/state/skew-lock-store";
 import type { SensorStatus } from "./sensor-status-types";
+import { ABSENT_VERSION, FileChangedError } from "./file-changed-error";
 
 // 2026-09-30 freeze-diag: registry of live sockets opened via this helper.
 // Increment on construction, decrement on close/error so the count reflects
@@ -885,7 +886,13 @@ export type IdentityGetIdentityFilePayload = {
   /** Read the archived agent's file (~/fleet/identities-archive/<key>/). */
   archived?: boolean;
 };
-export type IdentityIdentityFileEvent = { type: "identity:identity-file"; markdown: string; error?: string };
+export type IdentityIdentityFileEvent = {
+  type: "identity:identity-file";
+  markdown: string;
+  error?: string;
+  /** A live agent's file: the version a save from its editor is checked against. */
+  version?: string;
+};
 
 // Phase 22 SRIC-06 / Plan 22-06: role-file WS wire types.
 //
@@ -1063,12 +1070,17 @@ export type IdentityUpdateIdentityFilePayload = {
   hostId: number;
   /** UTF-8 markdown payload (full-overwrite). Server caps at IDMEDIT_MAX_MARKDOWN_BYTES (2MB). */
   contents: string;
+  /** The version it was opened at: the machine writes it only over that. */
+  version: string;
 };
 export type IdentityIdentityFileUpdatedEvent = {
   type: "identity:identity-file-updated";
   /** Server-echoed confirmed markdown post-write; source of truth for client rehydrate. */
   markdown: string;
   error?: string;
+  /** "changed": the file isn't what was opened any more (`version` is what's there now). */
+  code?: string;
+  version?: string | null;
 };
 
 // Phase 22 SRIC-06 / Plan 22-06: role-file update wire types. Byte-shape mirror
@@ -1103,12 +1115,17 @@ export type RoleUpdateFilePayload = {
   hostId: number;
   /** UTF-8 markdown payload (full-overwrite of ~/fleet/roles/<roleName>/<roleName>.md). */
   contents: string;
+  /** The version it was opened at: the machine writes it only over that. */
+  version: string;
 };
 export type RoleFileUpdatedEvent = {
   type: "role:file-updated";
   /** Server-echoed confirmed markdown post-write (via readRoleFileByName). */
   markdown: string;
   error?: string;
+  /** "changed": the file isn't what was opened any more (`version` is what's there now). */
+  code?: string;
+  version?: string | null;
 };
 
 /**
@@ -1296,7 +1313,9 @@ export function updateRoleFileByName(
   roleName: string,
   hostId: number,
   contents: string,
-): Promise<{ markdown: string }> {
+  /** The version it was opened at: refused with FileChangedError when it's changed since. */
+  version: string,
+): Promise<{ markdown: string; version: string }> {
   return new Promise((resolve, reject) => {
     let responded = false;
     const sock = openClaudeSessionSocket();
@@ -1306,6 +1325,7 @@ export function updateRoleFileByName(
         roleName,
         hostId,
         contents,
+        version,
       };
       try {
         sock.send(JSON.stringify(payload));
@@ -1325,13 +1345,67 @@ export function updateRoleFileByName(
         } catch {
           /* ignore */
         }
-        if (env.error) {
+        if (env.code === "changed") {
+          reject(new FileChangedError(env.version ?? null));
+        } else if (env.error) {
           reject(new Error(env.error));
         } else {
-          resolve({ markdown: env.markdown });
+          resolve({ markdown: env.markdown, version: env.version ?? "" });
         }
       } catch {
         /* ignore parse errors — wait for a valid frame */
+      }
+    };
+    const handleFail = () => {
+      if (responded) return;
+      responded = true;
+      reject(new Error("Connection failed"));
+    };
+    sock.onerror = handleFail;
+    sock.onclose = () => {
+      if (!responded) handleFail();
+    };
+  });
+}
+
+/**
+ * The roles window's one-line edits (name, description, colour, voice, picture, Borrowable):
+ * only those lines of the role file change, at the machine's front door, read at their turn.
+ * Resolves with the file as it now is.
+ *
+ *   role:edit {roleName, hostId, set, unset} -> role:edited {markdown, version} | {error, code}
+ */
+export function editRoleFrontmatter(
+  roleName: string,
+  hostId: number,
+  set: Record<string, string | number | boolean>,
+  unset: string[] = [],
+): Promise<{ markdown: string; version: string }> {
+  return new Promise((resolve, reject) => {
+    let responded = false;
+    const sock = openClaudeSessionSocket();
+    sock.onopen = () => {
+      try {
+        sock.send(JSON.stringify({ type: "role:edit", roleName, hostId, set, unset }));
+      } catch {
+        /* ws may be mid-close */
+      }
+    };
+    sock.onmessage = (event: MessageEvent<string>) => {
+      if (responded) return;
+      try {
+        const raw = JSON.parse(event.data) as { type?: string; markdown?: string; version?: string; error?: string };
+        if (raw.type !== "role:edited") return;
+        responded = true;
+        try {
+          sock.close();
+        } catch {
+          /* ignore */
+        }
+        if (raw.error) reject(new Error(raw.error));
+        else resolve({ markdown: raw.markdown ?? "", version: raw.version ?? "" });
+      } catch {
+        /* ignore parse errors */
       }
     };
     const handleFail = () => {
@@ -1372,6 +1446,8 @@ export type RoleFileLoadedEvent = {
   type: "role:file-loaded";
   markdown: string;
   error?: string;
+  /** The version a save from the role file editor is checked against. */
+  version?: string;
 };
 
 // Phase 134 Plan 134-02 retired role-scope wakeup wire types
@@ -1389,7 +1465,7 @@ export type RoleFileLoadedEvent = {
 export function getRoleFileByName(args: {
   roleName: string;
   hostId: number;
-}): Promise<{ markdown: string }> {
+}): Promise<{ markdown: string; version: string }> {
   return new Promise((resolve, reject) => {
     let responded = false;
     const sock = openClaudeSessionSocket();
@@ -1420,7 +1496,7 @@ export function getRoleFileByName(args: {
         if (env.error) {
           reject(new Error(env.error));
         } else {
-          resolve({ markdown: env.markdown });
+          resolve({ markdown: env.markdown, version: env.version ?? ABSENT_VERSION });
         }
       } catch {
         /* ignore parse errors */

@@ -480,3 +480,50 @@ describe("setRoomPinned", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("two tag changes to the same room at once", () => {
+  // A tiny Synapse: one stored blob, GETs and PUTs answered after a delay, so two writes
+  // that didn't take turns would both read the old tags.
+  function fakeSynapse(start: Record<string, unknown>) {
+    let stored = { ...start };
+    const fetchMock = vi.fn(async (_url, opts) => {
+      await new Promise((r) => setTimeout(r, 5));
+      if (((opts as RequestInit | undefined)?.method ?? "GET") === "GET") return mockFetchResponse(200, { tags: { ...stored } });
+      stored = JSON.parse((opts as RequestInit).body as string).tags;
+      return mockFetchResponse(200, {});
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    return () => stored;
+  }
+
+  it("take turns: neither drops the other's change", async () => {
+    const tags = fakeSynapse({ "m.lowpriority": {} });
+    const [filed, unpinned] = await Promise.all([
+      setRoomProjectTag(USER_MXID, ROOM_ID, "garden"),
+      setRoomPinned(USER_MXID, ROOM_ID, false),
+    ]);
+    expect(filed).toMatchObject({ ok: true, project: "garden" });
+    expect(unpinned).toMatchObject({ ok: true, project: "garden", pinned: false });
+    expect(tags()).toEqual({ "m.lowpriority": {}, "u.project.garden": {} });
+  });
+
+  it("a failed write doesn't hold up the next one", async () => {
+    let n = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url, opts) => {
+        n++;
+        if (n === 1) throw new Error("boom");
+        return ((opts as RequestInit | undefined)?.method ?? "GET") === "GET"
+          ? mockFetchResponse(200, { tags: {} })
+          : mockFetchResponse(200, {});
+      }),
+    );
+    const [a, b] = await Promise.all([
+      setRoomPinned(USER_MXID, ROOM_ID, true),
+      setRoomPinned(USER_MXID, ROOM_ID, true),
+    ]);
+    expect(a).toMatchObject({ ok: false });
+    expect(b).toMatchObject({ ok: true, pinned: true });
+  });
+});

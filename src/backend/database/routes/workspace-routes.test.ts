@@ -160,6 +160,8 @@ interface StubClient {
 /** Exit code the stub client's exec reports, and stderr it writes first. */
 let execExit = 0;
 let execStderr = "";
+/** What the stub client's exec prints. */
+let execStdout = "";
 
 let stubSftp: StubSftp;
 /** What the stub's createReadStream serves (stat reports size 5). */
@@ -288,6 +290,7 @@ function resetStubClient() {
       queueMicrotask(() => {
         cb(null, stream);
         queueMicrotask(() => {
+          if (execStdout) stream.emit("data", Buffer.from(execStdout));
           if (execStderr) stream.stderr.emit("data", Buffer.from(execStderr));
           stream.emit("close", execExit);
         });
@@ -296,6 +299,7 @@ function resetStubClient() {
   };
   execExit = 0;
   execStderr = "";
+  execStdout = "";
 }
 
 vi.mock("../../ssh/ssh-connection-pool.js", () => ({
@@ -318,6 +322,13 @@ vi.mock("../../ssh/ssh-connection-pool.js", () => ({
 /* --------------------------------------------------------------------- */
 
 let mockIsAdmin = false;
+// Saves go to the machine's front door; here it says yes unless a test says otherwise.
+const mockSaveFileAtTurn = vi.fn(async (..._a: unknown[]) => ({ ok: true as const, version: "b".repeat(64), requestId: "r" }));
+vi.mock("../../fleet-change/file-save.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../fleet-change/file-save.js")>()),
+  saveFileAtTurn: (...a: unknown[]) => mockSaveFileAtTurn(...a),
+}));
+
 vi.mock("../../instance-wide/admin.js", () => ({
   callerIsAdmin: vi.fn(async () => mockIsAdmin),
 }));
@@ -698,21 +709,7 @@ describe("POST /workspace/list", () => {
 /* --------------------------------------------------------------------- */
 
 describe("PUT /workspace/write-file", () => {
-  it("Test 9: valid body → 200; createWriteStream called with path ending '.partial', then ext_openssh_rename called", async () => {
-    let capturedTempPath = "";
-    let capturedRenameSrc = "";
-
-    stubSftp.createWriteStream.mockImplementation((p: string, _opts?: unknown) => {
-      capturedTempPath = p;
-      return makeDefaultWriteStream();
-    });
-    stubSftp.ext_openssh_rename.mockImplementation(
-      (from: string, _to: string, cb: (err: Error | null) => void) => {
-        capturedRenameSrc = from;
-        queueMicrotask(() => cb(null));
-      },
-    );
-
+  it("Test 9: valid body → saved at the machine's front door over the version it was opened at; answers the new version", async () => {
     const res = await httpRequest(server, {
       method: "PUT",
       path: "/workspace/write-file",
@@ -721,11 +718,40 @@ describe("PUT /workspace/write-file", () => {
         hostId: 42,
         relativePath: "notes.txt",
         content: "hello world",
+        version: "a".repeat(64),
       }),
     });
     expect(res.status).toBe(200);
-    expect(capturedTempPath).toContain(".partial");
-    expect(capturedRenameSrc).toContain(".partial");
+    expect(res.body).toEqual({ ok: true, version: "b".repeat(64) });
+    const [, opts] = mockSaveFileAtTurn.mock.calls[0] as [unknown, { homePath: string; expect: string; data: Buffer }];
+    expect(opts.homePath).toBe("fleet/identities/echo/workspace/notes.txt");
+    expect(opts.expect).toBe("a".repeat(64));
+    expect(opts.data.toString()).toBe("hello world");
+    // Nothing written straight over the file.
+    expect(stubSftp.createWriteStream).not.toHaveBeenCalled();
+  });
+
+  it("changed since it was opened → 409 file_changed with the version now", async () => {
+    mockSaveFileAtTurn.mockResolvedValueOnce({ ok: false, status: 409, code: "changed", error: "it changed since you opened it", version: "c".repeat(64) } as never);
+    const res = await httpRequest(server, {
+      method: "PUT",
+      path: "/workspace/write-file",
+      body: JSON.stringify({ identityKey: "echo", hostId: 42, relativePath: "notes.txt", content: "x", version: "a".repeat(64) }),
+    });
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: "file_changed", version: "c".repeat(64) });
+  });
+
+  it("no version, or a made-up one → 400 before the host is touched", async () => {
+    for (const version of [undefined, "nope"]) {
+      const res = await httpRequest(server, {
+        method: "PUT",
+        path: "/workspace/write-file",
+        body: JSON.stringify({ identityKey: "echo", hostId: 42, relativePath: "notes.txt", content: "x", ...(version ? { version } : {}) }),
+      });
+      expect(res.status).toBe(400);
+    }
+    expect(mockSaveFileAtTurn).not.toHaveBeenCalled();
   });
 
   it("Test 13b: canAccessHost called with action 'write' for write-file", async () => {
@@ -742,6 +768,7 @@ describe("PUT /workspace/write-file", () => {
         hostId: 42,
         relativePath: "notes.txt",
         content: "test",
+        version: "absent",
       }),
     });
     expect(capturedAction).toBe("write");
@@ -942,11 +969,11 @@ describe("POST /workspace/upload", () => {
     });
 
     expect(res.status).toBe(200);
-    expect(stubSftp.createWriteStream).toHaveBeenCalled();
-    // The createWriteStream call should have a path (not the .skynet-export.sqlite filter)
-    const callArg = (stubSftp.createWriteStream as Mock).mock.calls[0]?.[0] as string;
-    expect(typeof callArg).toBe("string");
-    expect(callArg).toContain(".partial");
+    // A new file: saved at the front door only while there's no file of that name.
+    const [, opts] = mockSaveFileAtTurn.mock.calls[0] as [unknown, { homePath: string; expect: string; data: Buffer }];
+    expect(opts.homePath).toBe("fleet/identities/echo/workspace/uploaded.txt");
+    expect(opts.expect).toBe("absent");
+    expect(opts.data.toString()).toBe("file contents here");
   });
 
   it("Test 12b: upload with invalid identityKey → 400 invalid_identity_key; no SFTP call", async () => {
@@ -1177,9 +1204,9 @@ describe("Multer memoryStorage (Pitfall 6)", () => {
       },
     );
 
-    // Should NOT be rejected by a .skynet-export.sqlite filter — should proceed to SFTP
+    // Should NOT be rejected by a .skynet-export.sqlite filter — should proceed to the save
     expect(res.status).toBe(200);
-    expect(stubSftp.createWriteStream).toHaveBeenCalled();
+    expect(mockSaveFileAtTurn).toHaveBeenCalled();
   });
 });
 
@@ -1252,7 +1279,7 @@ describe("project target and reserved root file", () => {
   it("write-file onto project.md at the root → 409 reserved_file, nothing written", async () => {
     stubHome();
     for (const relativePath of ["project.md", "./project.md", "/project.md"]) {
-      const res = await postJson("PUT", "/workspace/write-file", { ...project, relativePath, content: "x" });
+      const res = await postJson("PUT", "/workspace/write-file", { ...project, relativePath, content: "x", version: "absent" });
       expect(res.status).toBe(409);
       expect(res.body).toEqual({ error: "reserved_file" });
     }
@@ -1261,13 +1288,13 @@ describe("project target and reserved root file", () => {
 
   it("write-file to project.md inside a subfolder is allowed", async () => {
     stubHome();
-    const res = await postJson("PUT", "/workspace/write-file", { ...project, relativePath: "notes/project.md", content: "x" });
+    const res = await postJson("PUT", "/workspace/write-file", { ...project, relativePath: "notes/project.md", content: "x", version: "absent" });
     expect(res.status).toBe(200);
   });
 
   it("write-file through a symlink that points at project.md → 409", async () => {
     stubHome({ "/home/ubuntu/fleet/projects/launch/alias.md": "/home/ubuntu/fleet/projects/launch/project.md" });
-    const res = await postJson("PUT", "/workspace/write-file", { ...project, relativePath: "alias.md", content: "x" });
+    const res = await postJson("PUT", "/workspace/write-file", { ...project, relativePath: "alias.md", content: "x", version: "absent" });
     expect(res.status).toBe(409);
     expect(stubSftp.createWriteStream).not.toHaveBeenCalled();
   });
@@ -1309,7 +1336,7 @@ describe("project target and reserved root file", () => {
 
   it("matches the reserved name case-insensitively (case-insensitive host filesystems)", async () => {
     stubHome();
-    const res = await postJson("PUT", "/workspace/write-file", { ...project, relativePath: "PROJECT.md", content: "x" });
+    const res = await postJson("PUT", "/workspace/write-file", { ...project, relativePath: "PROJECT.md", content: "x", version: "absent" });
     expect(res.status).toBe(409);
     expect(res.body).toEqual({ error: "reserved_file" });
   });
@@ -1326,18 +1353,18 @@ describe("project target and reserved root file", () => {
   it("the role file is reserved the same way in a role folder", async () => {
     stubHome();
     const role = { kind: "role", roleSlug: "box-maintainer", hostId: 42 };
-    const write = await postJson("PUT", "/workspace/write-file", { ...role, relativePath: "box-maintainer.md", content: "x" });
+    const write = await postJson("PUT", "/workspace/write-file", { ...role, relativePath: "box-maintainer.md", content: "x", version: "absent" });
     const del = await postJson("DELETE", "/workspace/entry", { ...role, relativePath: "box-maintainer.md" });
     const up = await upload({ kind: "role", roleSlug: "box-maintainer", hostId: "42", relativePath: "box-maintainer.md" }, "box-maintainer.md");
     expect([write.status, del.status, up.status]).toEqual([409, 409, 409]);
     // project.md is an ordinary file in a role folder.
-    const other = await postJson("PUT", "/workspace/write-file", { ...role, relativePath: "project.md", content: "x" });
+    const other = await postJson("PUT", "/workspace/write-file", { ...role, relativePath: "project.md", content: "x", version: "absent" });
     expect(other.status).toBe(200);
   });
 
   it("identity workspaces reserve nothing", async () => {
     stubHome();
-    const res = await postJson("PUT", "/workspace/write-file", { identityKey: "echo", hostId: 42, relativePath: "project.md", content: "x" });
+    const res = await postJson("PUT", "/workspace/write-file", { identityKey: "echo", hostId: 42, relativePath: "project.md", content: "x", version: "absent" });
     expect(res.status).toBe(200);
   });
 
@@ -1383,7 +1410,7 @@ describe("project target and reserved root file", () => {
   it("every change to an archived agent's workspace is refused before the host is touched", async () => {
     stubHome();
     const results = [
-      await postJson("PUT", "/workspace/write-file", { ...archived, relativePath: "a.txt", content: "x" }),
+      await postJson("PUT", "/workspace/write-file", { ...archived, relativePath: "a.txt", content: "x", version: "absent" }),
       await postJson("DELETE", "/workspace/entry", { ...archived, relativePath: "a.txt" }),
       await postJson("POST", "/workspace/rename", { ...archived, from: "a.txt", to: "b.txt" }),
       await postJson("POST", "/workspace/mkdir", { ...archived, relativePath: "d" }),
@@ -1420,7 +1447,7 @@ describe("host target (admin-only home folder)", () => {
     for (const [method, path, extra] of [
       ["POST", "/workspace/list", { relativePath: "" }],
       ["POST", "/workspace/read-file", { relativePath: "a.txt" }],
-      ["PUT", "/workspace/write-file", { relativePath: "a.txt", content: "x" }],
+      ["PUT", "/workspace/write-file", { relativePath: "a.txt", content: "x", version: "absent" }],
       ["DELETE", "/workspace/entry", { relativePath: "a.txt" }],
       ["POST", "/workspace/rename", { from: "a", to: "b" }],
       ["POST", "/workspace/mkdir", { relativePath: "d" }],
@@ -1494,7 +1521,7 @@ describe("host target (admin-only home folder)", () => {
   it("lets an admin write anywhere in the home folder, no reserved file", async () => {
     mockIsAdmin = true;
     stubHome();
-    const res = await postJson("PUT", "/workspace/write-file", { ...host, relativePath: "project.md", content: "x" });
+    const res = await postJson("PUT", "/workspace/write-file", { ...host, relativePath: "project.md", content: "x", version: "absent" });
     expect(res.status).toBe(200);
   });
 });
@@ -1539,5 +1566,120 @@ describe("per-host SSH semaphore", () => {
     expect(peak).toBeLessThanOrEqual(3);
     expect(peak).toBeGreaterThan(1);
     __resetHostSemaphoreRegistryForTests();
+  });
+});
+
+describe("what the machine owns is kept out of the Files tabs", () => {
+  function stubHome() {
+    stubSftp.realpath.mockImplementation(
+      (p: string, cb: (err: Error | null, resolved: string) => void) => {
+        queueMicrotask(() => cb(null, p === "." ? "/home/ubuntu" : p));
+      },
+    );
+  }
+  function postJson(method: string, path: string, body: Record<string, unknown>) {
+    return httpRequest(server, { method, path, body: JSON.stringify(body) });
+  }
+  function upload(fields: Record<string, string>, filename: string) {
+    const boundary = "----MachineBoundary";
+    const body = buildMultipart(boundary, fields, "file", Buffer.from("x"), filename);
+    return httpRequest(server, {
+      method: "POST",
+      path: "/workspace/upload",
+      headers: { "Content-Type": `multipart/form-data; boundary=${boundary}` },
+      body: body.toString("binary"),
+    });
+  }
+  const project = { kind: "project", projectSlug: "garden", hostId: 42 };
+  const host = { kind: "host", hostId: 42 };
+  const refused = { error: "machine_file" };
+
+  it("a project's apps folder, and an app's folder in it, can't be deleted, renamed or moved", async () => {
+    stubHome();
+    expect((await postJson("DELETE", "/workspace/entry", { ...project, relativePath: "apps" })).body).toEqual(refused);
+    expect((await postJson("DELETE", "/workspace/entry", { ...project, relativePath: "apps/tally" })).body).toEqual(refused);
+    expect((await postJson("POST", "/workspace/rename", { ...project, from: "apps/tally", to: "tally" })).body).toEqual(refused);
+    expect((await postJson("POST", "/workspace/rename", { ...project, from: "apps", to: "old-apps" })).body).toEqual(refused);
+    expect(stubSftp.unlink).not.toHaveBeenCalled();
+    expect(stubSftp.rename).not.toHaveBeenCalled();
+  });
+
+  it("files inside an app can still be edited, renamed and deleted", async () => {
+    stubHome();
+    expect((await postJson("PUT", "/workspace/write-file", { ...project, relativePath: "apps/tally/data.json", content: "{}", version: "absent" })).status).toBe(200);
+    expect((await postJson("DELETE", "/workspace/entry", { ...project, relativePath: "apps/tally/old.json" })).status).toBe(200);
+    expect((await postJson("POST", "/workspace/rename", { ...project, from: "apps/tally/a.json", to: "apps/tally/b.json" })).status).toBe(200);
+  });
+
+  it("the admin's whole-machine browser can't remove an app's folder, or a folder an app sits in", async () => {
+    mockIsAdmin = true;
+    stubHome();
+    for (const relativePath of [
+      "fleet/apps/tally",
+      "fleet/apps-archive/old",
+      "fleet/projects/garden/apps/tally",
+      "fleet/projects/garden",
+      "fleet/identities/finch/apps/notes",
+      "fleet/identities/finch",
+      "fleet",
+    ]) {
+      const res = await postJson("DELETE", "/workspace/entry", { ...host, relativePath });
+      expect(res.body, relativePath).toEqual(refused);
+    }
+    expect(stubSftp.unlink).not.toHaveBeenCalled();
+    // Anything else in the project, or inside an app, is still the admin's to change.
+    expect((await postJson("DELETE", "/workspace/entry", { ...host, relativePath: "fleet/projects/garden/notes.md" })).status).toBe(200);
+    expect((await postJson("DELETE", "/workspace/entry", { ...host, relativePath: "fleet/identities/finch/workspace/x" })).status).toBe(200);
+    expect((await postJson("PUT", "/workspace/write-file", { ...host, relativePath: "fleet/apps/tally/server.js", content: "x", version: "absent" })).status).toBe(200);
+  });
+
+  it("the machine's marker files can't be made, changed, renamed or deleted", async () => {
+    mockIsAdmin = true;
+    stubHome();
+    const role = { kind: "role", roleSlug: "eng", hostId: 42 };
+    const results = [
+      await postJson("PUT", "/workspace/write-file", { ...project, relativePath: "apps/tally/.move-requested", content: "x", version: "absent" }),
+      await postJson("POST", "/workspace/create-file", { ...role, relativePath: ".archive-requested" }),
+      await postJson("DELETE", "/workspace/entry", { ...role, relativePath: ".archiving" }),
+      await postJson("POST", "/workspace/rename", { ...role, from: "notes.md", to: ".archive-requested" }),
+      await postJson("POST", "/workspace/rename", { ...host, from: "fleet/apps-archive/old/app-old.socket.archived", to: "fleet/x" }),
+      await postJson("POST", "/workspace/mkdir", { ...host, relativePath: "fleet/.changes/incoming" }),
+      await postJson("DELETE", "/workspace/entry", { ...host, relativePath: "fleet/.change-lock" }),
+      await upload({ kind: "project", projectSlug: "garden", hostId: "42", relativePath: "apps/tally/.unarchive-requested" }, ".unarchive-requested"),
+    ];
+    for (const r of results) expect(r.body).toEqual(refused);
+    expect(mockSaveFileAtTurn).not.toHaveBeenCalled();
+    expect(stubSftp.unlink).not.toHaveBeenCalled();
+    expect(stubSftp.rename).not.toHaveBeenCalled();
+  });
+
+  it("an upload over a file of the same name is refused with that file's version — sending it back replaces it", async () => {
+    stubHome();
+    mockSaveFileAtTurn.mockResolvedValueOnce({ ok: false, status: 409, code: "exists", error: "there's already a file of that name", version: "c".repeat(64) } as never);
+    const first = await upload({ ...project, hostId: "42", relativePath: "notes.md" } as Record<string, string>, "notes.md");
+    expect(first.status).toBe(409);
+    expect(first.body).toEqual({ error: "file_exists", version: "c".repeat(64) });
+    expect((mockSaveFileAtTurn.mock.calls[0][1] as { expect: string }).expect).toBe("absent");
+    const again = await upload({ ...project, hostId: "42", relativePath: "notes.md", version: "c".repeat(64) } as Record<string, string>, "notes.md");
+    expect(again.status).toBe(200);
+    expect((mockSaveFileAtTurn.mock.calls[1][1] as { expect: string }).expect).toBe("c".repeat(64));
+  });
+
+  it("the version of a file a viewer streams itself (a PDF) comes from the machine", async () => {
+    stubHome();
+    execStdout = "d".repeat(64) + "  -\n";
+    const res = await postJson("POST", "/workspace/version", { ...project, relativePath: "doc.pdf" });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ version: "d".repeat(64) });
+    execStdout = "absent\n";
+    expect((await postJson("POST", "/workspace/version", { ...project, relativePath: "gone.pdf" })).body).toEqual({ version: "absent" });
+  });
+
+  it("read-file gives the version a save is checked against", async () => {
+    stubHome();
+    const res = await postJson("POST", "/workspace/read-file", { ...project, relativePath: "notes.md" });
+    expect(res.status).toBe(200);
+    // The stub's file is "hello".
+    expect((res.body as { version: string }).version).toBe("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
   });
 });

@@ -59,7 +59,7 @@ import {
   PROJECT_SLUG_RE,
   listProjects,
   readProjectFile,
-  writeProjectFile,
+  getLocalProjectsRoot,
   projectMetaFromMarkdown,
 } from "../../claude-session/identity-artifact-reader.js";
 import { getSubscriptionRegistry } from "../../fleet-status/subscription-registry.js";
@@ -99,6 +99,17 @@ import { answerFromFrontDoor, askerFor } from "../../fleet-change/front-door-rou
 import { HttpError } from "../../sharing/host-conn.js";
 import { findProjectRooms, releaseProjectRooms } from "../../fleet-change/project-rooms.js";
 import { untellIfUndelivered } from "../../fleet-change/change-notices.js";
+import { CHANGED_ERROR, isExpect, readForSave, saveFileAtTurn } from "../../fleet-change/file-save.js";
+import path from "node:path";
+
+/** Where a project's file is, for an editor: the member list isn't part of its version. */
+function projectFileAt(slug: string): { homePath: string; localPath: string; keepMembers: true } {
+  return {
+    homePath: `fleet/projects/${slug}/project.md`,
+    localPath: path.join(getLocalProjectsRoot(), slug, "project.md"),
+    keepMembers: true,
+  };
+}
 
 /** What a project archive takes, as the machine reports it (fleet-change project-contents). */
 interface ProjectContents {
@@ -1105,8 +1116,9 @@ router.get(
       }
 
       try {
-        const { markdown } = await readProjectFile(conn, slug);
-        res.json({ markdown });
+        // The editor saves against this version; the member list isn't part of it.
+        const { text, version } = await readForSave(conn, projectFileAt(slug));
+        res.json({ markdown: text, version });
         return;
       } catch (err) {
         databaseLogger.error(
@@ -1142,6 +1154,7 @@ router.put(
     const body = (req.body ?? {}) as {
       hostId?: unknown;
       contents?: unknown;
+      version?: unknown;
     };
 
     const parsedHost = parseHostId(body.hostId);
@@ -1156,6 +1169,12 @@ router.put(
       return;
     }
     const contents = body.contents;
+    // The version the editor opened: the save is written only over that.
+    if (!isExpect(body.version)) {
+      res.status(400).json({ error: "version is required — the one the file was opened at" });
+      return;
+    }
+    const version = body.version;
 
     const host = await resolveHostById(hostId, userId);
     if (!host) {
@@ -1218,7 +1237,32 @@ router.put(
           }
         }
 
-        const { markdown } = await writeProjectFile(conn, slug, contents);
+        // Written at its turn only if the file is still what the editor opened; the member
+        // list stays the machine's.
+        const saved = await saveFileAtTurn(conn, {
+          homePath: projectFileAt(slug).homePath,
+          data: Buffer.from(contents, "utf8"),
+          expect: version,
+          keepMembers: true,
+          hostId,
+          by: userId,
+        });
+        if (saved.ok === false) {
+          databaseLogger.info("project file save refused", {
+            operation: "project_file_save",
+            userId,
+            hostId,
+            slug,
+            code: saved.code,
+          });
+          res.status(saved.status).json({
+            error: saved.code === "changed" ? CHANGED_ERROR : saved.error,
+            code: saved.code,
+            ...(saved.version !== undefined ? { version: saved.version } : {}),
+          });
+          return;
+        }
+        const { text: markdown, version: newVersion } = await readForSave(conn, projectFileAt(slug));
         databaseLogger.info(
           `project file written: userId=${userId} hostId=${hostId} slug=${slug} bytes=${contents.length}`,
         );
@@ -1248,7 +1292,7 @@ router.put(
           );
         }
 
-        res.json({ markdown });
+        res.json({ markdown, version: newVersion });
         return;
       } catch (err) {
         databaseLogger.error(

@@ -8,6 +8,7 @@
 // the module it is mocking is still pending.
 
 import { vi } from "vitest";
+import { mergeRoleFrontmatter } from "./role-frontmatter";
 
 type Orig = () => Promise<unknown>;
 const spread = async (orig: Orig): Promise<Record<string, unknown>> => (await orig()) as Record<string, unknown>;
@@ -35,6 +36,7 @@ export const m = {
   // role file
   getRoleFileByName: vi.fn(),
   updateRoleFileByName: vi.fn(),
+  editRoleFrontmatter: vi.fn(),
   // scheduled-agents-api (the role's "N scheduled tasks" count)
   listScheduledAgents: vi.fn(),
   // role-skills-api
@@ -54,6 +56,9 @@ export const m = {
   fetchVoiceCatalog: vi.fn(),
   postSpeak: vi.fn(),
 };
+
+/** The role file as the machine has it after the role window's one-line edits. */
+export const machineRoleFile: { text: string | null } = { text: null };
 
 /** The agents the identities store reports (mutate per test). */
 export const store: { identities: Array<Record<string, unknown>> } = { identities: [] };
@@ -101,8 +106,18 @@ export function resetRolesWindowMocks(): void {
       .filter((i) => i.hostId === hostId && Array.isArray(i.roles) && (i.roles as string[]).includes(name))
       .map((i) => ({ name: i.identityKey, displayName: i.displayName, task: i.task ?? "" })),
   }));
-  m.getRoleFileByName.mockResolvedValue({ markdown: DEFAULT_ROLE_FILE });
-  m.updateRoleFileByName.mockImplementation(async (_name: string, _hostId: number, markdown: string) => ({ markdown }));
+  m.getRoleFileByName.mockResolvedValue({ markdown: DEFAULT_ROLE_FILE, version: "v0" });
+  m.updateRoleFileByName.mockImplementation(async (_name: string, _hostId: number, markdown: string) => ({ markdown, version: "v1" }));
+  // The machine's side of a one-line edit: just those lines change in the file it has (what
+  // the role window read, then each edit on top of the last).
+  machineRoleFile.text = null;
+  m.editRoleFrontmatter.mockImplementation(
+    async (_name: string, _hostId: number, set: Record<string, string | number | boolean>, unset: string[] = []) => {
+      const base = machineRoleFile.text ?? ((await m.getRoleFileByName()) as { markdown: string }).markdown;
+      machineRoleFile.text = mergeRoleFrontmatter(base, set, new Set(unset));
+      return { markdown: machineRoleFile.text, version: "v2" };
+    },
+  );
   m.listRoleSkills.mockResolvedValue([]);
   m.listScheduledAgents.mockResolvedValue([]);
   m.enumerateRoleSkillFiles.mockResolvedValue([]);
@@ -171,6 +186,7 @@ export async function claudeSessionApi(orig: Orig): Promise<Record<string, unkno
     ...(await spread(orig)),
     getRoleFileByName: (...a: unknown[]) => m.getRoleFileByName(...a),
     updateRoleFileByName: (...a: unknown[]) => m.updateRoleFileByName(...a),
+    editRoleFrontmatter: (...a: unknown[]) => m.editRoleFrontmatter(...a),
   };
 }
 

@@ -40,7 +40,8 @@ export type WorkspaceErrorCopy = { heading: string; body: string };
  *   invalid_hostname, invalid_body, generic
  *
  * Workspace-specific additions:
- *   not_a_directory, already_exists, not_empty, reserved_file,
+ *   not_a_directory, already_exists, not_empty, reserved_file, machine_file,
+ *   still_saving, machine_updating, file_exists,
  *   invalid_identity_key, invalid_project_slug
  */
 export const WORKSPACE_ERROR_COPY: Record<string, WorkspaceErrorCopy> = {
@@ -114,6 +115,26 @@ export const WORKSPACE_ERROR_COPY: Record<string, WorkspaceErrorCopy> = {
   "reserved_file": {
     heading: "Edited on its own tab",
     body: "That's this folder's main file. Edit it on the Project file tab (for a project) or the Role file tab (for a role), not from Files.",
+  },
+
+  "machine_file": {
+    heading: "Kept by the machine",
+    body: "An app's folder and the machine's own marker files can't be renamed, moved or deleted from Files. Use Archive or Move to on the app instead.",
+  },
+
+  "still_saving": {
+    heading: "Still saving",
+    body: "The machine is still working on it. Open the file again before saving again.",
+  },
+
+  "machine_updating": {
+    heading: "Machine updating",
+    body: "This machine is still updating. Try again in a moment.",
+  },
+
+  "file_exists": {
+    heading: "Already there",
+    body: "There's already a file with that name here.",
   },
 
   // -------------------------------------------------------------------------

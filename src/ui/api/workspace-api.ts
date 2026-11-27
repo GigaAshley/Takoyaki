@@ -27,6 +27,23 @@
 
 import axios from "axios";
 import { authApi, handleApiError } from "@/main-axios";
+import { FileChangedError } from "@/api/file-changed-error";
+
+/** A save refused because the file isn't what was opened (or, for a new one, is already there). */
+function changedFrom(error: unknown): FileChangedError | null {
+  if (!axios.isAxiosError(error)) return null;
+  const data = error.response?.data as { error?: string; version?: string | null } | undefined;
+  if (data?.error === "file_changed") return new FileChangedError(data.version ?? null);
+  if (data?.error === "file_exists") return new FileChangedError(data.version ?? null, true);
+  return null;
+}
+
+/** Still waiting its turn on the machine: not saved yet. */
+function stillSaving(): Error {
+  const e = new Error("still_saving");
+  e.name = "WorkspaceError";
+  return e;
+}
 
 // ---------------------------------------------------------------------------
 // Wire types (exported for consumers)
@@ -50,6 +67,8 @@ export type ReadFileResponse = {
   sizeBytes: number;
   filename: string;
   extension: string | null;
+  /** What a save from the file window is checked against. */
+  version?: string;
 };
 
 /**
@@ -229,15 +248,24 @@ export async function writeWorkspaceFile(
   hostId: number,
   relativePath: string,
   content: string,
-): Promise<void> {
+  /** The version it was opened at ("absent": a new file). Refused with FileChangedError
+   *  when it isn't that any more; resolves with the new version. */
+  version: string,
+): Promise<{ version: string }> {
   try {
-    await authApi.put("/workspace/write-file", {
+    const response = await authApi.put("/workspace/write-file", {
       ...targetToWireFields(target),
       hostId,
       relativePath,
       content,
+      version,
     });
+    if (response.status === 202) throw stillSaving();
+    return { version: String((response.data as { version?: unknown }).version ?? "") };
   } catch (error) {
+    const changed = changedFrom(error);
+    if (changed) throw changed;
+    if (error instanceof Error && error.name === "WorkspaceError") throw error;
     if (axios.isAxiosError(error)) {
       const backendClass = error.response?.data?.error;
       if (typeof backendClass === "string" && backendClass.length > 0) {
@@ -249,6 +277,16 @@ export async function writeWorkspaceFile(
     handleApiError(error, "write workspace file");
     throw error;
   }
+}
+
+/** The version of a file a viewer streams itself (a PDF): what its save is checked against. */
+export async function workspaceFileVersion(
+  target: WorkspaceTarget,
+  hostId: number,
+  relativePath: string,
+): Promise<string> {
+  const response = await authApi.post("/workspace/version", { ...targetToWireFields(target), hostId, relativePath });
+  return String((response.data as { version?: unknown }).version ?? "");
 }
 
 // ---------------------------------------------------------------------------
@@ -396,17 +434,22 @@ export async function uploadWorkspaceFile(
   relativePath: string,
   file: File,
   onProgress?: (loaded: number, total: number) => void,
-): Promise<void> {
+  /** Left out: a new file — one of that name already there is refused with
+   *  FileChangedError (exists), whose version a Replace sends back. Given: written only
+   *  over that version. */
+  version?: string,
+): Promise<{ version: string }> {
   const form = new FormData();
   for (const [k, v] of Object.entries(targetToWireFields(target))) {
     form.append(k, v);
   }
   form.append("hostId", String(hostId));
   form.append("relativePath", relativePath);
+  if (version !== undefined) form.append("version", version);
   form.append("file", file);
 
   try {
-    await authApi.post("/workspace/upload", form, {
+    const response = await authApi.post("/workspace/upload", form, {
       // authApi defaults to application/json. Without an explicit
       // multipart/form-data header, axios v1's formDataToJSON transform
       // fires and drops the File field entirely, and multer returns
@@ -417,7 +460,12 @@ export async function uploadWorkspaceFile(
         ? (e) => onProgress(e.loaded, e.total ?? file.size)
         : undefined,
     });
+    if (response.status === 202) throw stillSaving();
+    return { version: String((response.data as { version?: unknown }).version ?? "") };
   } catch (error) {
+    const changed = changedFrom(error);
+    if (changed) throw changed;
+    if (error instanceof Error && error.name === "WorkspaceError") throw error;
     if (axios.isAxiosError(error)) {
       const backendClass = error.response?.data?.error;
       if (typeof backendClass === "string" && backendClass.length > 0) {

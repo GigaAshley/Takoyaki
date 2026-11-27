@@ -258,11 +258,35 @@ export async function setRoomPinned(
   });
 }
 
+/** The tag write in progress for each (person, room): the next one waits for it. */
+const roomTagTurns = new Map<string, Promise<unknown>>();
+
 /**
  * GET the room's tags as the user, apply `mutate`, PUT the result back.
- * Every tag `mutate` doesn't touch round-trips unchanged.
+ * Every tag `mutate` doesn't touch round-trips unchanged. Writes for the same person and
+ * room take turns, so two at once (two devices filing and pinning it) can't each read the
+ * old tags and have the second put back what the first took away.
  */
-async function writeRoomTags(
+function writeRoomTags(
+  userMxid: string,
+  roomId: string,
+  operation: string,
+  mutate: (current: Record<string, unknown>) => Record<string, unknown>,
+): Promise<RoomTagWriteOk | AdminErr> {
+  const key = `${userMxid}\u0000${roomId}`;
+  const before = roomTagTurns.get(key) ?? Promise.resolve();
+  const mine = before.then(
+    () => writeRoomTagsNow(userMxid, roomId, operation, mutate),
+    () => writeRoomTagsNow(userMxid, roomId, operation, mutate),
+  );
+  roomTagTurns.set(key, mine);
+  void mine.finally(() => {
+    if (roomTagTurns.get(key) === mine) roomTagTurns.delete(key);
+  }).catch(() => undefined);
+  return mine;
+}
+
+async function writeRoomTagsNow(
   userMxid: string,
   roomId: string,
   operation: string,

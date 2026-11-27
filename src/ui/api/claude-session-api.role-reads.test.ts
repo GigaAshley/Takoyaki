@@ -76,6 +76,7 @@ describe("getRoleFileByName one-shot helper", () => {
     const responsePayload = {
       type: "role:file-loaded",
       markdown: "---\ntitle: Boxes\n---\nbody",
+      version: "a".repeat(64),
     };
     lastSocket!.onmessage?.call(
       lastSocket as unknown as WebSocket,
@@ -83,7 +84,7 @@ describe("getRoleFileByName one-shot helper", () => {
     );
 
     const resolved = await promise;
-    expect(resolved).toEqual({ markdown: "---\ntitle: Boxes\n---\nbody" });
+    expect(resolved).toEqual({ markdown: "---\ntitle: Boxes\n---\nbody", version: "a".repeat(64) });
     expect(lastSocket!.close).toHaveBeenCalledTimes(1);
   });
 

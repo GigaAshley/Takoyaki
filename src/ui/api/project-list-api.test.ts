@@ -167,19 +167,37 @@ describe("Phase 117 Plan 117-06 Task 1 — project-list-api", () => {
     );
   });
 
-  it("Test 9 (updateProjectFile happy): PUT /projects/alpha/file with body {hostId, contents} returns { markdown } (server-echo)", async () => {
+  it("Test 9 (updateProjectFile happy): PUT /projects/alpha/file with body {hostId, contents, version} returns { markdown, version } (server-echo)", async () => {
     vi.mocked(authApi.put).mockResolvedValueOnce({
-      data: { markdown: "new body" },
+      status: 200,
+      data: { markdown: "new body", version: "b".repeat(64) },
     });
 
-    const result = await updateProjectFile(1, "alpha", "new body");
+    const result = await updateProjectFile(1, "alpha", "new body", "a".repeat(64));
 
     expect(authApi.put).toHaveBeenCalledTimes(1);
     expect(authApi.put).toHaveBeenCalledWith("/projects/alpha/file", {
       hostId: 1,
       contents: "new body",
+      version: "a".repeat(64),
     });
-    expect(result).toEqual({ markdown: "new body" });
+    expect(result).toEqual({ markdown: "new body", version: "b".repeat(64) });
+  });
+
+  it("changed since it was opened → FileChangedError with the version now", async () => {
+    const { AxiosError } = await import("axios");
+    const { FileChangedError } = await import("./file-changed-error");
+    const err = new AxiosError("Request failed with status code 409");
+    err.response = { status: 409, data: { code: "changed", version: "c".repeat(64), error: "it changed since you opened it" } } as never;
+    vi.mocked(authApi.put).mockRejectedValueOnce(err);
+    const thrown = await updateProjectFile(1, "alpha", "stale", "a".repeat(64)).catch((e: unknown) => e);
+    expect(thrown).toBeInstanceOf(FileChangedError);
+    expect((thrown as InstanceType<typeof FileChangedError>).version).toBe("c".repeat(64));
+  });
+
+  it("still waiting its turn on the machine (202) → not saved, so it throws", async () => {
+    vi.mocked(authApi.put).mockResolvedValueOnce({ status: 202, data: { error: "the machine is still saving it — reopen the file before saving again" } });
+    await expect(updateProjectFile(1, "alpha", "x", "a".repeat(64))).rejects.toThrow(/still saving/);
   });
 
   it("Test 10 (updateProjectFile error): non-2xx surfaces through handleApiError with the 'update project file' operation label", async () => {
@@ -187,7 +205,7 @@ describe("Phase 117 Plan 117-06 Task 1 — project-list-api", () => {
       new Error("Request failed with status code 500"),
     );
 
-    await expect(updateProjectFile(1, "alpha", "body")).rejects.toThrow(
+    await expect(updateProjectFile(1, "alpha", "body", "a".repeat(64))).rejects.toThrow(
       /update project file/i,
     );
   });

@@ -2,7 +2,8 @@
 //
 // Byte-shape mirror of claude-session-server.role-update-file.test.ts (Plan
 // 90-03), covering the READ variant surviving both retirements:
-//   - role:get-file       → readRoleFileByName
+//   - role:get-file       → readForSave (the file's exact bytes, and the version a save
+//                           from the role file editor is checked against)
 //
 // Phase 134 Plan 134-02 retired role:list-wakeups (its coverage lived here
 // in the third describe block); Phase 136 retired role:list-bounties. Both
@@ -31,15 +32,21 @@ vi.mock("./identity-artifact-reader.js", async (importOriginal) => {
     ...actual,
     // Host 6 stands in for the co-located box (IDENTITIES_LOCAL_HOST_IDS).
     isLocalHostId: vi.fn((id: number | undefined) => id === 6),
-    readRoleFileByName: vi.fn(),
   };
 });
+vi.mock("../fleet-change/file-save.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../fleet-change/file-save.js")>()),
+  readForSave: vi.fn(),
+}));
 
 import { connectOneShot } from "../ssh/ssh-one-shot.js";
 import { resolveHostById } from "../ssh/host-resolver.js";
-import {
-  readRoleFileByName,
-} from "./identity-artifact-reader.js";
+import { readForSave } from "../fleet-change/file-save.js";
+
+/** The reader, as the handler calls it: (conn, where) → text + version. */
+const readRoleFileByName = readForSave;
+const read = (markdown: string) =>
+  vi.mocked(readForSave).mockResolvedValue({ data: Buffer.from(markdown), text: markdown, version: "v".repeat(64) });
 import {
   __handleRoleGetFileForTests,
 } from "./claude-session-server.js";
@@ -84,9 +91,7 @@ afterEach(() => {
 
 describe("role:get-file WS handler", () => {
   it("LOCAL happy path: calls readRoleFileByName(null, roleName); response carries markdown", async () => {
-    vi.mocked(readRoleFileByName).mockResolvedValue({
-      markdown: "---\ntitle: Skynet\n---\n\nrole body",
-    });
+    read("---\ntitle: Skynet\n---\n\nrole body");
 
     await __handleRoleGetFileForTests(
       wsStub as unknown as import("ws").WebSocket,
@@ -96,12 +101,13 @@ describe("role:get-file WS handler", () => {
 
     expect(readRoleFileByName).toHaveBeenCalledTimes(1);
     expect(vi.mocked(readRoleFileByName).mock.calls[0][0]).toBeNull();
-    expect(vi.mocked(readRoleFileByName).mock.calls[0][1]).toBe("box-maintainer");
+    expect(vi.mocked(readRoleFileByName).mock.calls[0][1]).toMatchObject({ homePath: "fleet/roles/box-maintainer/box-maintainer.md" });
 
     expect(sent).toHaveLength(1);
     expect(sent[0].type).toBe("role:file-loaded");
     expect(sent[0].markdown).toBe("---\ntitle: Skynet\n---\n\nrole body");
     expect(sent[0].error).toBeUndefined();
+    expect((sent[0] as { version?: string }).version).toBe("v".repeat(64));
 
     expect(connectOneShot).not.toHaveBeenCalled();
     expect(resolveHostById).not.toHaveBeenCalled();
@@ -111,7 +117,7 @@ describe("role:get-file WS handler", () => {
     const fakeConn = makeFakeConn("hostX");
     vi.mocked(resolveHostById).mockResolvedValue({ ip: "1.2.3.4", username: "ubuntu" } as never);
     vi.mocked(connectOneShot).mockResolvedValue(fakeConn as never);
-    vi.mocked(readRoleFileByName).mockResolvedValue({ markdown: "remote body\n" });
+    read("remote body\n");
 
     await __handleRoleGetFileForTests(
       wsStub as unknown as import("ws").WebSocket,
@@ -123,7 +129,7 @@ describe("role:get-file WS handler", () => {
     expect(connectOneShot).toHaveBeenCalledTimes(1);
     expect(vi.mocked(readRoleFileByName).mock.calls[0][0]).toBe(fakeConn);
     expect(fakeConn.end).toHaveBeenCalledTimes(1);
-    expect(sent[0]).toEqual({ type: "role:file-loaded", markdown: "remote body\n" });
+    expect(sent[0]).toEqual({ type: "role:file-loaded", markdown: "remote body\n", version: "v".repeat(64) });
   });
 
   it("invalid roleName → {error:'invalid roleName'}, no SSH open, no reader call", async () => {

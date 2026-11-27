@@ -32,6 +32,8 @@ import { Modal, ModalHead, ModalFoot, ModalTabs, escBelongsElsewhere } from "@/c
 import { Tabs, TabsContent } from "@/components/tabs";
 import { KitBanner, KitButton, KitEmpty, KitLoading, kitConfirm } from "@/components/kit";
 import { getProjectFile, updateProjectFile } from "@/api/project-list-api";
+import { ABSENT_VERSION, FileChangedError } from "@/api/file-changed-error";
+import { askReloadOrKeep, keptNote } from "@/lib/changed-file-prompt";
 import { useProjects } from "@/state/conversation-store";
 import { projectLineage } from "@/state/project-lineage";
 import { stripFrontmatter } from "@/lib/strip-frontmatter";
@@ -102,6 +104,8 @@ export function ProjectModal({
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [loadAttempt, setLoadAttempt] = useState(0);
+  // The version the shown file was read at: a save is written only over that.
+  const versionRef = useRef<string>(ABSENT_VERSION);
 
   // project-scoped apps: the Apps tab shows only while the project has apps
   // (same conditional shape as the agent window's).
@@ -131,8 +135,11 @@ export function ProjectModal({
 
     void (async () => {
       try {
-        const { markdown } = await getProjectFile(hostId, slug);
-        if (!cancelled) setFileState({ status: "ready", data: markdown });
+        const { markdown, version } = await getProjectFile(hostId, slug);
+        if (!cancelled) {
+          versionRef.current = version;
+          setFileState({ status: "ready", data: markdown });
+        }
       } catch (e) {
         if (!cancelled) {
           setFileState({
@@ -234,12 +241,33 @@ export function ProjectModal({
     setSaving(true);
     setSaveError(null);
     try {
-      const { markdown } = await updateProjectFile(hostId, slug, draft);
+      const { markdown, version } = await updateProjectFile(hostId, slug, draft, versionRef.current);
+      versionRef.current = version;
       setFileState({ status: "ready", data: markdown });
       fileDirtyRef.current = false;
       setEditing(false);
       console.info({ operation: "project_file_saved", slug, hostId });
     } catch (e) {
+      if (e instanceof FileChangedError) {
+        console.info({ operation: "project_file_changed_since_opened", slug, hostId });
+        if ((await askReloadOrKeep(e)) === "reload") {
+          try {
+            const fresh = await getProjectFile(hostId, slug);
+            versionRef.current = fresh.version;
+            setFileState({ status: "ready", data: fresh.markdown });
+            setDraft(fresh.markdown);
+            setBaseline(fresh.markdown);
+            interacted.current = false;
+          } catch (err) {
+            setSaveError(err instanceof Error ? err.message : "Couldn't reload it");
+          }
+          return;
+        }
+        // Kept: saving again goes over the newer version, on purpose.
+        versionRef.current = e.version ?? ABSENT_VERSION;
+        setSaveError(keptNote(e));
+        return;
+      }
       setSaveError(e instanceof Error ? e.message : "Save failed");
       console.warn({
         operation: "project_modal_save_failed",

@@ -37,6 +37,12 @@ type WsStub = {
 };
 
 const sent: Array<{ type: string } & Record<string, unknown>> = [];
+/** The machine's answers to the agent file editor: what's there, and whether a save is refused. */
+const agentFileOnMachine: { text: string; version: string; refuseNextSave: boolean } = {
+  text: AGENT_FILE,
+  version: "v0",
+  refuseNextSave: false,
+};
 
 function makeFakeWs(): WsStub {
   const ws: WsStub = {
@@ -44,13 +50,23 @@ function makeFakeWs(): WsStub {
     send: (payload: string) => {
       const req = JSON.parse(payload) as { type: string; contents?: string };
       sent.push(req);
+      const saveReply = (): Record<string, unknown> => {
+        // The agent wrote in its file since the editor opened it.
+        if (agentFileOnMachine.refuseNextSave) {
+          agentFileOnMachine.refuseNextSave = false;
+          return { type: "identity:identity-file-updated", markdown: "", error: "it changed since you opened it", code: "changed", version: agentFileOnMachine.version };
+        }
+        agentFileOnMachine.text = req.contents ?? "";
+        agentFileOnMachine.version = "v-saved";
+        return { type: "identity:identity-file-updated", markdown: req.contents, version: "v-saved" };
+      };
       const reply =
         req.type === "identity:get-identity-file"
-          ? { type: "identity:identity-file", markdown: AGENT_FILE }
+          ? { type: "identity:identity-file", markdown: agentFileOnMachine.text, version: agentFileOnMachine.version }
           : req.type === "identity:list-wakeups"
             ? { type: "identity:wakeups", wakeups: [] }
             : req.type === "identity:update-identity-file"
-              ? { type: "identity:identity-file-updated", markdown: req.contents }
+              ? saveReply()
               : null;
       if (reply) queueMicrotask(() => ws.onmessage?.({ data: JSON.stringify(reply) } as MessageEvent<string>));
     },
@@ -196,6 +212,7 @@ const backLabel = () => screen.getByTestId("identity-modal-back").textContent?.t
 beforeEach(() => {
   vi.clearAllMocks();
   sent.length = 0;
+  Object.assign(agentFileOnMachine, { text: AGENT_FILE, version: "v0", refuseNextSave: false });
   projects = [];
   gitAnswer = false;
   __resetKitDialogsForTests();
@@ -310,6 +327,43 @@ describe("agent window — agent file editing", () => {
     const save = sent.find((r) => r.type === "identity:update-identity-file");
     expect(save?.contents).toBe(AGENT_FILE + "\nMore.\n");
     expect(dialogs.calls).toHaveLength(0);
+  });
+
+  it("Save sends the version the file was read at", async () => {
+    renderModal();
+    await makeFileDirty();
+    fireEvent.click(screen.getByTestId("identity-modal-save"));
+    await screen.findByTestId("identity-modal-agent-file");
+    expect(sent.find((r) => r.type === "identity:update-identity-file")?.version).toBe("v0");
+  });
+
+  it("the agent wrote in its file meanwhile: Keep my edits keeps the draft; saving again goes over the agent's version", async () => {
+    const dialogs = autoAnswerKitDialogs({ confirm: false });
+    renderModal();
+    await makeFileDirty();
+    agentFileOnMachine.text = AGENT_FILE + "\nThe agent's note.\n";
+    agentFileOnMachine.version = "v-agent";
+    agentFileOnMachine.refuseNextSave = true;
+    fireEvent.click(screen.getByTestId("identity-modal-save"));
+    expect(await screen.findByText(/Save again to overwrite it with your edits/)).toBeTruthy();
+    expect(dialogs.calls[0].opts).toMatchObject({ title: "This file changed on disk", confirmLabel: "Reload", cancelLabel: "Keep my edits" });
+    expect(screen.getByTestId("md-editor")).toBeTruthy();
+    fireEvent.click(screen.getByTestId("identity-modal-save"));
+    await screen.findByTestId("identity-modal-agent-file");
+    const saves = sent.filter((r) => r.type === "identity:update-identity-file");
+    expect(saves.map((r) => r.version)).toEqual(["v0", "v-agent"]);
+  });
+
+  it("the agent wrote in its file meanwhile: Reload shows the agent's version", async () => {
+    autoAnswerKitDialogs({ confirm: true });
+    renderModal();
+    await makeFileDirty();
+    agentFileOnMachine.text = AGENT_FILE + "\nThe agent's note.\n";
+    agentFileOnMachine.version = "v-agent";
+    agentFileOnMachine.refuseNextSave = true;
+    fireEvent.click(screen.getByTestId("identity-modal-save"));
+    await waitFor(() => expect((screen.getByTestId("md-editor") as HTMLTextAreaElement).value).toContain("The agent's note."));
+    expect(sent.filter((r) => r.type === "identity:update-identity-file")).toHaveLength(1);
   });
 
   it("switching tab with unsaved edits asks; keeping edits stays on the agent file", async () => {

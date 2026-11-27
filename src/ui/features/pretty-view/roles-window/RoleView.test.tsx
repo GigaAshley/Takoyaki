@@ -28,7 +28,8 @@ vi.mock("@mdxeditor/editor", async () => (await import("./roles-window.test-mock
 import { autoAnswerKitDialogs, __resetKitDialogsForTests } from "@/components/kit";
 import { RoleSkillAlreadyExistsError } from "@/api/role-skills-api";
 import { NEW_CONVERSATION_REQUEST_EVENT, type NewConversationRequest } from "@/lib/new-conversation-request";
-import { DEFAULT_ROLE_FILE, m, resetRolesWindowMocks, store } from "./roles-window.test-mocks";
+import { DEFAULT_ROLE_FILE, m, machineRoleFile, resetRolesWindowMocks, store } from "./roles-window.test-mocks";
+import { FileChangedError } from "@/api/file-changed-error";
 import {
   ALLY,
   BOX,
@@ -68,9 +69,16 @@ async function openRole(name = "box-maintainer"): Promise<{ onOpenChange: Return
   return r;
 }
 
+/** The role file as the machine has it after the window's one-line edits. */
 function lastSavedFile(): string {
-  const calls = m.updateRoleFileByName.mock.calls;
-  return calls[calls.length - 1][2] as string;
+  return machineRoleFile.text ?? "";
+}
+
+/** What the last one-line edit asked the machine to change: just those lines. */
+function lastEdit(): { set: Record<string, unknown>; unset: string[] } {
+  const calls = m.editRoleFrontmatter.mock.calls;
+  const [, , set, unset] = calls[calls.length - 1] as [string, number, Record<string, unknown>, string[]];
+  return { set, unset };
 }
 
 // ─── Name ───────────────────────────────────────────────────────────────────
@@ -87,11 +95,10 @@ describe("role view — name", () => {
     fireEvent.change(input, { target: { value: "  Box   Keeper " } });
     fireEvent.keyDown(input, { key: "Enter" });
 
-    await waitFor(() => expect(m.updateRoleFileByName).toHaveBeenCalledTimes(1));
-    const [name, hostId, markdown] = m.updateRoleFileByName.mock.calls[0] as [string, number, string];
-    expect(name).toBe("box-maintainer");
-    expect(hostId).toBe(HOST_ID);
-    expect(markdown).toBe("---\ndisplayName: \"Box Keeper\"\ncolorHue: '320'\n---\n\n# Box Maintainer\n\nKeeps the box healthy.\n");
+    await waitFor(() => expect(m.editRoleFrontmatter).toHaveBeenCalledTimes(1));
+    // Only the name's line is sent to the machine — never the file the window loaded.
+    expect(m.editRoleFrontmatter).toHaveBeenCalledWith("box-maintainer", HOST_ID, { displayName: "Box Keeper" }, []);
+    expect(m.updateRoleFileByName).not.toHaveBeenCalled();
     await waitFor(() => expect(screen.getByTestId("role-view-name").textContent).toBe("Box Keeper"));
     // The library row follows.
     fireEvent.click(backButton());
@@ -117,7 +124,7 @@ describe("role view — name", () => {
     fireEvent.keyDown(input, { key: "Enter" });
     await waitFor(() => expect(screen.queryByTestId("role-view-name-input")).toBeNull());
     expect(screen.getByTestId("role-view-name").textContent).toBe("Box Maintainer");
-    expect(m.updateRoleFileByName).not.toHaveBeenCalled();
+    expect(m.editRoleFrontmatter).not.toHaveBeenCalled();
   });
 
   it("Esc cancels the edit without saving and without leaving the role", async () => {
@@ -129,7 +136,7 @@ describe("role view — name", () => {
     await waitFor(() => expect(screen.queryByTestId("role-view-name-input")).toBeNull());
     expect(screen.getByTestId("role-view-name").textContent).toBe("Box Maintainer");
     expect(screen.getByTestId("role-view-facts")).toBeTruthy();
-    expect(m.updateRoleFileByName).not.toHaveBeenCalled();
+    expect(m.editRoleFrontmatter).not.toHaveBeenCalled();
   });
 });
 
@@ -148,14 +155,8 @@ describe("role view — description", () => {
     fireEvent.change(input, { target: { value: "  Keeps   the box\nhealthy  " } });
     fireEvent.keyDown(input, { key: "Enter" });
 
-    await waitFor(() => expect(m.updateRoleFileByName).toHaveBeenCalledTimes(1));
-    const [name, hostId, markdown] = m.updateRoleFileByName.mock.calls[0] as [string, number, string];
-    expect(name).toBe("box-maintainer");
-    expect(hostId).toBe(HOST_ID);
-    // Merged into the existing frontmatter; the rest of the file untouched.
-    expect(markdown).toBe(
-      "---\ndisplayName: Box Maintainer\ncolorHue: '320'\ndescription: \"Keeps the box healthy\"\n---\n\n# Box Maintainer\n\nKeeps the box healthy.\n",
-    );
+    await waitFor(() => expect(m.editRoleFrontmatter).toHaveBeenCalledTimes(1));
+    expect(m.editRoleFrontmatter).toHaveBeenCalledWith("box-maintainer", HOST_ID, { description: "Keeps the box healthy" }, []);
     await waitFor(() => expect(screen.getByTestId("role-view-description").textContent).toBe("Keeps the box healthy"));
     expect(screen.getByTestId("role-view-description").querySelector(".italic")).toBeNull();
     // The library row follows.
@@ -175,7 +176,8 @@ describe("role view — description", () => {
     expect(input.value).toBe("Old words");
     fireEvent.change(input, { target: { value: "   " } });
     fireEvent.keyDown(input, { key: "Enter" });
-    await waitFor(() => expect(m.updateRoleFileByName).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(m.editRoleFrontmatter).toHaveBeenCalledTimes(1));
+    expect(lastEdit()).toEqual({ set: {}, unset: ["description"] });
     expect(lastSavedFile()).toBe("---\ndisplayName: Box Maintainer\nowner: robin\n---\n\nBody.\n");
     await waitFor(() => expect(screen.getByTestId("role-view-description").textContent).toBe("No description"));
   });
@@ -189,7 +191,7 @@ describe("role view — description", () => {
     await waitFor(() => expect(screen.queryByTestId("role-view-description-input")).toBeNull());
     expect(screen.getByTestId("role-view-description").textContent).toBe("No description");
     expect(screen.getByTestId("role-view-facts")).toBeTruthy();
-    expect(m.updateRoleFileByName).not.toHaveBeenCalled();
+    expect(m.editRoleFrontmatter).not.toHaveBeenCalled();
   });
 
   it("a stored description longer than the editor's limit isn't cut by clicking in and out", async () => {
@@ -199,7 +201,7 @@ describe("role view — description", () => {
     fireEvent.click(await screen.findByTestId("role-view-description"));
     fireEvent.blur(await screen.findByTestId("role-view-description-input"));
     await waitFor(() => expect(screen.queryByTestId("role-view-description-input")).toBeNull());
-    expect(m.updateRoleFileByName).not.toHaveBeenCalled();
+    expect(m.editRoleFrontmatter).not.toHaveBeenCalled();
   });
 
   it("a multi-line description in the file shows as one line", async () => {
@@ -226,12 +228,12 @@ describe("role view — description", () => {
     fireEvent.click(await screen.findByTestId("role-view-description"));
     fireEvent.keyDown(await screen.findByTestId("role-view-description-input"), { key: "Enter" });
     await waitFor(() => expect(screen.queryByTestId("role-view-description-input")).toBeNull());
-    expect(m.updateRoleFileByName).not.toHaveBeenCalled();
+    expect(m.editRoleFrontmatter).not.toHaveBeenCalled();
   });
 
   it("a failed save shows the kit alert", async () => {
     const dialogs = autoAnswerKitDialogs();
-    m.updateRoleFileByName.mockRejectedValue(new Error("disk full"));
+    m.editRoleFrontmatter.mockRejectedValue(new Error("disk full"));
     await openRole();
     fireEvent.click(await screen.findByTestId("role-view-description"));
     const input = await screen.findByTestId("role-view-description-input");
@@ -321,9 +323,37 @@ describe("role view — facts line and tabs", () => {
     const next = DEFAULT_ROLE_FILE.replace("Keeps the box healthy.", "Keeps it humming.");
     typeInEditor(editor, { target: { value: next } });
     fireEvent.click(screen.getByTestId("role-view-save"));
-    await waitFor(() => expect(m.updateRoleFileByName).toHaveBeenCalledWith("box-maintainer", HOST_ID, next));
+    await waitFor(() => expect(m.updateRoleFileByName).toHaveBeenCalledWith("box-maintainer", HOST_ID, next, "v0"));
     await waitFor(() => expect(screen.getByTestId("role-view-role-file").textContent).toContain("Keeps it humming."));
     expect(screen.getByTestId("role-view-edit")).toBeTruthy();
+  });
+
+  it("an agent edited the role file meanwhile: Keep my edits keeps the draft; saving again goes over the newer version", async () => {
+    m.updateRoleFileByName.mockRejectedValueOnce(new FileChangedError("v-agent"));
+    const dialogs = autoAnswerKitDialogs({ confirm: false });
+    await openRole();
+    fireEvent.click(await screen.findByTestId("role-view-edit"));
+    const editor = (await screen.findByTestId("mdxeditor")) as HTMLTextAreaElement;
+    const next = DEFAULT_ROLE_FILE.replace("Keeps the box healthy.", "Mine.");
+    typeInEditor(editor, { target: { value: next } });
+    fireEvent.click(screen.getByTestId("role-view-save"));
+    expect(await screen.findByText(/Save again to overwrite it with your edits/)).toBeTruthy();
+    expect(dialogs.calls[0].opts).toMatchObject({ title: "This file changed on disk", cancelLabel: "Keep my edits" });
+    expect((screen.getByTestId("mdxeditor") as HTMLTextAreaElement).value).toBe(next);
+    fireEvent.click(screen.getByTestId("role-view-save"));
+    await waitFor(() => expect(m.updateRoleFileByName).toHaveBeenLastCalledWith("box-maintainer", HOST_ID, next, "v-agent"));
+  });
+
+  it("an agent edited the role file meanwhile: Reload shows its version", async () => {
+    m.updateRoleFileByName.mockRejectedValueOnce(new FileChangedError("v-agent"));
+    autoAnswerKitDialogs({ confirm: true });
+    await openRole();
+    fireEvent.click(await screen.findByTestId("role-view-edit"));
+    typeInEditor((await screen.findByTestId("mdxeditor")) as HTMLTextAreaElement, { target: { value: "mine" } });
+    m.getRoleFileByName.mockResolvedValueOnce({ markdown: DEFAULT_ROLE_FILE + "\nAn agent's line.\n", version: "v-agent" });
+    fireEvent.click(screen.getByTestId("role-view-save"));
+    await waitFor(() => expect((screen.getByTestId("mdxeditor") as HTMLTextAreaElement).value).toContain("An agent's line."));
+    expect(m.updateRoleFileByName).toHaveBeenCalledTimes(1);
   });
 
   it("the editor settling on its own after Edit (no typing) isn't an edit — Cancel leaves without asking", async () => {
@@ -358,9 +388,9 @@ describe("role view — picture, colour and voice", () => {
       order.push("avatar");
       return { filename: "box-maintainer.png", avatarUrl: "/x" };
     });
-    m.updateRoleFileByName.mockImplementation(async (_n: string, _h: number, markdown: string) => {
+    m.editRoleFrontmatter.mockImplementation(async () => {
       order.push("file");
-      return { markdown };
+      return { markdown: DEFAULT_ROLE_FILE, version: "v2" };
     });
     await openRole();
     await waitFor(() => expect((screen.getByTestId("role-view-avatar-button") as HTMLButtonElement).disabled).toBe(false));
@@ -369,8 +399,7 @@ describe("role view — picture, colour and voice", () => {
     fireEvent.change(input, { target: { files: [file] } });
     await waitFor(() => expect(order).toEqual(["avatar", "file"]));
     expect(m.updateRoleAvatarByName).toHaveBeenCalledWith(HOST_ID, "box-maintainer", file);
-    expect(lastSavedFile()).toMatch(/\navatar: "box-maintainer\.png"\n/);
-    expect(lastSavedFile()).toContain("displayName: Box Maintainer");
+    expect(lastEdit()).toEqual({ set: { avatar: "box-maintainer.png" }, unset: [] });
   });
 
   it("Voice: pick one and apply → voice: merged into the frontmatter", async () => {
@@ -381,10 +410,8 @@ describe("role view — picture, colour and voice", () => {
     await waitFor(() => expect(select.disabled).toBe(false));
     fireEvent.change(select, { target: { value: "Matthew" } });
     fireEvent.click(within(pop).getByTestId("voice-picker-apply"));
-    await waitFor(() => expect(m.updateRoleFileByName).toHaveBeenCalledTimes(1));
-    expect(lastSavedFile()).toBe(
-      "---\ndisplayName: Box Maintainer\ncolorHue: '320'\nvoice: Matthew\n---\n\n# Box Maintainer\n\nKeeps the box healthy.\n",
-    );
+    await waitFor(() => expect(m.editRoleFrontmatter).toHaveBeenCalledTimes(1));
+    expect(lastEdit()).toEqual({ set: { voice: "Matthew" }, unset: [] });
     expect(screen.getByTestId("role-view-voice").textContent).toContain("Matthew");
   });
 
@@ -396,11 +423,11 @@ describe("role view — picture, colour and voice", () => {
     const pop = await screen.findByTestId("role-view-color-popover");
     fireEvent.change(within(pop).getByRole("slider"), { target: { value: "42" } });
     await waitFor(() => expect(win.style.getPropertyValue("--pv-id-hue")).toBe("42"));
-    expect(m.updateRoleFileByName).not.toHaveBeenCalled();
+    expect(m.editRoleFrontmatter).not.toHaveBeenCalled();
     // Click away closes it and commits.
     fireEvent.mouseDown(screen.getByTestId("role-view-facts"));
-    await waitFor(() => expect(m.updateRoleFileByName).toHaveBeenCalledTimes(1));
-    expect(lastSavedFile()).toContain("colorHue: '42'\n");
+    await waitFor(() => expect(m.editRoleFrontmatter).toHaveBeenCalledTimes(1));
+    expect(lastEdit()).toEqual({ set: { colorHue: 42 }, unset: [] });
     expect(screen.queryByTestId("role-view-color-popover")).toBeNull();
   });
 
@@ -653,10 +680,8 @@ describe("role view — borrowable", () => {
     await waitFor(() => expect(borrowableSwitch().disabled).toBe(false));
     expect(borrowableSwitch().checked).toBe(false);
     fireEvent.click(borrowableSwitch());
-    await waitFor(() => expect(m.updateRoleFileByName).toHaveBeenCalledTimes(1));
-    expect(lastSavedFile()).toBe(
-      "---\ndisplayName: Box Maintainer\ncolorHue: '320'\nborrowable: true\n---\n\n# Box Maintainer\n\nKeeps the box healthy.\n",
-    );
+    await waitFor(() => expect(m.editRoleFrontmatter).toHaveBeenCalledTimes(1));
+    expect(lastEdit()).toEqual({ set: { borrowable: true }, unset: [] });
     await waitFor(() => expect(borrowableSwitch().checked).toBe(true));
     fireEvent.click(backButton());
     expect(await screen.findByTestId("roles-window-row-box-maintainer-borrowable")).toBeTruthy();
@@ -669,14 +694,14 @@ describe("role view — borrowable", () => {
     await openRole();
     await waitFor(() => expect(borrowableSwitch().checked).toBe(true));
     fireEvent.click(borrowableSwitch());
-    await waitFor(() => expect(m.updateRoleFileByName).toHaveBeenCalledTimes(1));
-    expect(lastSavedFile()).toBe("---\ndisplayName: Box Maintainer\n---\n\n# Box Maintainer\n");
+    await waitFor(() => expect(m.editRoleFrontmatter).toHaveBeenCalledTimes(1));
+    expect(lastEdit()).toEqual({ set: {}, unset: ["borrowable"] });
     await waitFor(() => expect(borrowableSwitch().checked).toBe(false));
   });
 
   it("a failed save puts the switch back and says so", async () => {
     const dialogs = autoAnswerKitDialogs();
-    m.updateRoleFileByName.mockRejectedValue(new Error("disk full"));
+    m.editRoleFrontmatter.mockRejectedValue(new Error("disk full"));
     await openRole();
     await waitFor(() => expect(borrowableSwitch().disabled).toBe(false));
     fireEvent.click(borrowableSwitch());
