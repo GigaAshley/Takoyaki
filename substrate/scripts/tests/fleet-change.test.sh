@@ -364,12 +364,16 @@ test_project_archive_tells_the_people_whose_agents_it_took() {
   agent "$s" bea shared; printf -- '---\nroles: []\nproject: shared\nusers:\n  - bob\n---\n' > "$s/fleet/identities/bea/bea.md"
   agent "$s" ann shared; printf -- '---\nroles: []\nproject: shared\nusers:\n  - ann\n---\n' > "$s/fleet/identities/ann/ann.md"
   agent "$s" all shared
-  fc "$s" submit project-archive '{"slug":"shared","asker":"ann","expected":{"projects":["shared"],"agents":["all","ann","bea"],"apps":[]}}' --id p1 --by user:u_Ann --wait 0 >/dev/null
+  # Seen only through its role (cyd's people are the role's): told too.
+  mkdir -p "$s/fleet/roles/ops"; printf -- '---\ndisplayName: Ops\nusers:\n  - cyd\n---\n' > "$s/fleet/roles/ops/ops.md"
+  agent "$s" rolo shared ops
+  fc "$s" submit project-archive '{"slug":"shared","asker":"ann","expected":{"projects":["shared"],"agents":["all","ann","bea","rolo"],"apps":[]}}' --id p1 --by user:u_Ann --wait 0 >/dev/null
   serve_once "$s"
   assert_eq done "$(field "$(fc "$s" status p1)" state)" "archived"
   local n="$s/fleet/.changes/notices"
-  assert_eq 1 "$(ls "$n" | grep -c '^p1\.')" "one notice: only bea is someone else's"
-  local f; f=$(ls "$n"/p1.* | head -1)
+  assert_eq 2 "$(ls "$n" | grep -c '^p1\.')" "two notices: bea's people and rolo's (through its role)"
+  assert_eq '["cyd"]' "$(field "$(cat "$n/p1.1.json")" audience)" "rolo's people are its role's"
+  local f="$n/p1.0.json"
   assert_eq taken "$(field "$(cat "$f")" state)" "a taken notice"
   assert_eq bea "$(field "$(cat "$f")" args.name)" "about bea"
   assert_eq '["bob"]' "$(field "$(cat "$f")" audience)" "for bob"

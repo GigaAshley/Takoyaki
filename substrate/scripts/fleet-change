@@ -797,7 +797,7 @@ def archive_by_plan(plan, save_plan, rid, slug, asker=None, by=None):
     for name in plan["agents"]:
         d = os.path.join(IDENTITIES, name)
         if os.path.isfile(os.path.join(d, name + ".md")):
-            users = fm_list(os.path.join(d, name + ".md"), "users", USERNAME_RE) or []
+            users = agent_people(os.path.join(d, name + ".md")) or []
             claim(d, rid, "project:%s" % slug)
             claimed.append(name)
             # Whose agent it is, when that isn't the person archiving: they're told.
@@ -2112,6 +2112,17 @@ def write_notice(outcome, args):
         write_json_atomic(os.path.join(NOTICES, outcome["id"] + ".json"), notice)
     except OSError as e:
         log("WARN: couldn't keep the notice for %s: %s" % (outcome["id"], e))
+
+
+def agent_people(path):
+    """Who can see an agent: its own `users` list narrowed by each of its roles' (None =
+    everyone on the machine)."""
+    people = fm_list(path, "users", USERNAME_RE) or None
+    for r in fm_roles(path) or []:
+        ru = fm_list(os.path.join(ROLES, r, r + ".md"), "users", USERNAME_RE) or None
+        if ru:
+            people = list(ru) if people is None else [u for u in people if u in ru]
+    return people
 
 
 def write_taken_notice(nid, name, audience, asker, project, by):

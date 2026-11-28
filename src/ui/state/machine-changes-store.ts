@@ -117,7 +117,8 @@ export type MachineMark =
  * ends up).
  */
 export function markFor(changes: readonly MachineChange[]): MachineMark {
-  const notice = changes.find((c) => isNotice(c));
+  // A taken notice is a pop-up only: an agent brought back is no failure on its row.
+  const notice = changes.find((c) => isNotice(c) && c.state !== "taken");
   if (notice) return { kind: "failed", change: notice };
   const archive = changes.find((c) => (c.state === "waiting" || c.state === "running") && ARCHIVE_KINDS.has(c.kind));
   if (archive) return { kind: "archiving", change: archive };

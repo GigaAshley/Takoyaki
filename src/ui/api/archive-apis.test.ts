@@ -60,6 +60,20 @@ describe("archiveIdentity", () => {
     }
   });
 
+  it("the server restarting while it holds the first request isn't a failure either: asks by id", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(authApi.post).mockRejectedValueOnce(axiosError(502, "<html>bad gateway</html>"));
+      vi.mocked(authApi.get).mockResolvedValueOnce({ status: 200, data: { ok: true } });
+      const p = archiveIdentity(42, "wren");
+      await vi.advanceTimersByTimeAsync(1_000);
+      await expect(p).resolves.toMatchObject({ done: true });
+      expect(vi.mocked(authApi.get).mock.calls[0][0]).toMatch(/^\/machine-changes\/42\//);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("the server's own 503 (the machine updating) is still an answer", async () => {
     vi.mocked(authApi.post).mockResolvedValueOnce({ status: 202, data: { pending: true, requestId: "r6" } });
     vi.mocked(authApi.get).mockRejectedValueOnce(axiosError(503, { error: "this machine is still updating", code: "not_installed" }));

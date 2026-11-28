@@ -337,6 +337,8 @@ export async function updateAppTitle(
  * app, `{}` for a sidebar app, null when it's in neither. For when the server's own list may
  * be a moment behind (just after a move).
  */
+const PROJECT_FOLDER_RE = /^[a-z0-9-]{1,64}$/;
+
 export async function findAppScope(
   slug: string,
   opts: { hostId: number; conn: SSHClientType | null },
@@ -347,7 +349,7 @@ export async function findAppScope(
     if (await exists(path.join(getLocalAppsRoot(), slug, "app.json"))) return {};
     const projects = await fs.readdir(getLocalProjectsRoot()).catch(() => [] as string[]);
     for (const project of projects) {
-      if (project === "archive") continue;
+      if (project === "archive" || !PROJECT_FOLDER_RE.test(project)) continue;
       if (await exists(path.join(getLocalProjectsRoot(), project, "apps", slug, "app.json"))) return { project };
     }
     return null;
@@ -359,7 +361,10 @@ export async function findAppScope(
     `if [ -f "$HOME/fleet/apps/${slug}/app.json" ]; then echo "@sidebar"; else ` +
       `for d in "$HOME"/fleet/projects/*/apps/${slug}; do [ -f "$d/app.json" ] && basename "$(dirname "$(dirname "$d")")"; done; fi; true`,
   );
-  const line = out.split("\n").map((l) => l.trim()).find((l) => l && l !== "archive");
+  const line = out
+    .split("\n")
+    .map((l) => l.trim())
+    .find((l) => l === "@sidebar" || (l !== "archive" && PROJECT_FOLDER_RE.test(l)));
   if (!line) return null;
   return line === "@sidebar" ? {} : { project: line };
 }

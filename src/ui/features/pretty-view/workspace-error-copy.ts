@@ -134,7 +134,7 @@ export const WORKSPACE_ERROR_COPY: Record<string, WorkspaceErrorCopy> = {
 
   "save_refused": {
     heading: "Not saved",
-    body: "The machine didn't save it. Open the file again and try once more.",
+    body: "The machine didn't save it. Your edits are still here — try saving again.",
   },
 
   "machine_updating": {
