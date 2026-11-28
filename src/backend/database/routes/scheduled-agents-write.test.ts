@@ -92,10 +92,6 @@ vi.mock("../../ssh/host-resolver.js", () => ({
 // normalizeSpecSlug + IDENTITY_SLUG_RE + isLocalHostId + getLocalScheduledAgentsRoot
 // ---------------------------------------------------------------------------
 
-vi.mock("../../spawn-requests/direct-route.js", () => ({
-  queueBirthFromServer: vi.fn(),
-}));
-
 vi.mock("../../claude-session/identity-artifact-reader.js", () => ({
   writeMarkdownFileAtomic: vi.fn(),
   normalizeSpecSlug: (name: string) =>
@@ -205,7 +201,6 @@ import { connectOneShot } from "../../ssh/ssh-one-shot.js";
 import { execCommand } from "../../ssh/tmux-helper.js";
 import { resolveHostById } from "../../ssh/host-resolver.js";
 import { parseRequestBody } from "../../spawn-requests/parse-request-body.js";
-import { queueBirthFromServer } from "../../spawn-requests/direct-route.js";
 import {
   writeMarkdownFileAtomic,
   isLocalHostId,
@@ -326,7 +321,6 @@ beforeEach(() => {
   (connectOneShot as Mock).mockResolvedValue(stubConn);
   (execCommand as Mock).mockResolvedValue("");
   (writeMarkdownFileAtomic as Mock).mockResolvedValue(undefined);
-  (queueBirthFromServer as Mock).mockResolvedValue({ ok: true });
   (isLocalHostId as Mock).mockReturnValue(false);
 
   const app = express();
@@ -1110,10 +1104,12 @@ describe("specChangedSince (helper)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// POST /:slug/run-now — manual fire goes straight into the birth queue, schedule untouched
+// POST /:slug/run-now — manual fire waits in the machine's outbox, schedule untouched
 // ---------------------------------------------------------------------------
 
 describe("POST /scheduled-agents/:slug/run-now", () => {
+  const OUTBOX_RE = /fleet\/scheduled-agents\/\.outbox\/\d{20}-[0-9a-f-]{36}\.json$/;
+  const queuedEntry = (i = 0) => JSON.parse((writeMarkdownFileAtomic as Mock).mock.calls[i][2] as string) as Record<string, unknown>;
   function mockRemoteSpec(spec: unknown): void {
     (execCommand as Mock).mockImplementation(async (_c: unknown, cmd: string) => {
       if (cmd.includes("scheduled-agent.json")) {
@@ -1123,7 +1119,7 @@ describe("POST /scheduled-agents/:slug/run-now", () => {
     });
   }
 
-  it("happy REMOTE — 202 + the request queued for the machine, nothing written there", async () => {
+  it("happy REMOTE — 202 + the request left in the machine's outbox for its scheduler", async () => {
     mockRemoteSpec({ ...validSpec, users: ["riley"] });
 
     const res = await httpRequest(server, {
@@ -1137,12 +1133,15 @@ describe("POST /scheduled-agents/:slug/run-now", () => {
     expect(out.host).toBe(7);
     expect(out.requestId).toMatch(/^[0-9a-f-]{36}$/);
 
-    expect(writeMarkdownFileAtomic).not.toHaveBeenCalled();
-    expect(queueBirthFromServer).toHaveBeenCalledTimes(1);
-    const [hostArg, idArg, body] = (queueBirthFromServer as Mock).mock.calls[0];
-    expect(hostArg).toBe(7);
-    expect(idArg).toBe(out.requestId);
-    const parsed = body as Record<string, unknown>;
+    expect((execCommand as Mock).mock.calls.some((c) => (c[1] as string) === 'mkdir -p "$HOME/fleet/scheduled-agents/.outbox"')).toBe(true);
+    expect(writeMarkdownFileAtomic).toHaveBeenCalledTimes(1);
+    const [connArg, target] = (writeMarkdownFileAtomic as Mock).mock.calls[0];
+    expect(connArg).toBe(stubConn);
+    expect(target).toMatch(OUTBOX_RE);
+    expect(target).toContain(out.requestId);
+    const entry = queuedEntry();
+    expect(entry).toMatchObject({ id: out.requestId, slug: "morning-digest", clock: false, sent: false });
+    const parsed = entry.body as Record<string, unknown>;
     expect(parsed.roles).toEqual(["box-maintainer"]);
     expect("skills" in parsed).toBe(false);
     expect(parsed.task).toBe("⏰ Morning digest");
@@ -1171,17 +1170,19 @@ describe("POST /scheduled-agents/:slug/run-now", () => {
     expect(fsReadFileMock.mock.calls[0][0]).toBe(
       "/tmp/test-fleet/scheduled-agents/morning-digest/scheduled-agent.json",
     );
-    expect(queueBirthFromServer).toHaveBeenCalledWith(1, expect.stringMatching(/^[0-9a-f-]{36}$/), expect.objectContaining({ roles: ["box-maintainer"] }));
-    expect(writeMarkdownFileAtomic).not.toHaveBeenCalled();
+    expect(fsMkdirMock.mock.calls[0][0]).toBe("/tmp/test-fleet/scheduled-agents/.outbox");
+    const [connArg, target] = (writeMarkdownFileAtomic as Mock).mock.calls[0];
+    expect(connArg).toBeNull();
+    expect(target).toMatch(OUTBOX_RE);
+    expect(queuedEntry().body).toMatchObject({ roles: ["box-maintainer"] });
     expect(connectOneShot).not.toHaveBeenCalled();
   });
 
-  it("the server can't start it → 502 with why", async () => {
+  it("the machine can't take it → 502", async () => {
     mockRemoteSpec(validSpec);
-    (queueBirthFromServer as Mock).mockResolvedValue({ ok: false, error: "the server can't reach this machine" });
+    (writeMarkdownFileAtomic as Mock).mockRejectedValueOnce(new Error("sftp down"));
     const res = await httpRequest(server, { method: "POST", path: "/scheduled-agents/morning-digest/run-now", body: { host: 7 } });
     expect(res.status).toBe(502);
-    expect(res.body).toMatchObject({ error: "the server can't reach this machine" });
   });
 
   it("disabled spec still runs (manual run is how you test a paused task)", async () => {
@@ -1192,7 +1193,7 @@ describe("POST /scheduled-agents/:slug/run-now", () => {
       body: { host: 7 },
     });
     expect(res.status).toBe(202);
-    expect(queueBirthFromServer).toHaveBeenCalledTimes(1);
+    expect(writeMarkdownFileAtomic).toHaveBeenCalledTimes(1);
   });
 
   it("missing spec → 404, nothing written", async () => {
@@ -1203,7 +1204,7 @@ describe("POST /scheduled-agents/:slug/run-now", () => {
       body: { host: 7 },
     });
     expect(res.status).toBe(404);
-    expect(queueBirthFromServer).not.toHaveBeenCalled();
+    expect(writeMarkdownFileAtomic).not.toHaveBeenCalled();
   });
 
   it("one_shot spec → 400, nothing written", async () => {
@@ -1214,7 +1215,7 @@ describe("POST /scheduled-agents/:slug/run-now", () => {
       body: { host: 7 },
     });
     expect(res.status).toBe(400);
-    expect(queueBirthFromServer).not.toHaveBeenCalled();
+    expect(writeMarkdownFileAtomic).not.toHaveBeenCalled();
   });
 
   it("invalid slug → 400; unknown host → 404; missing host → 400", async () => {
@@ -1236,7 +1237,7 @@ describe("POST /scheduled-agents/:slug/run-now", () => {
       body: {},
     });
     expect(noHost.status).toBe(400);
-    expect(queueBirthFromServer).not.toHaveBeenCalled();
+    expect(writeMarkdownFileAtomic).not.toHaveBeenCalled();
   });
 
   it("401 without JWT", async () => {
@@ -1422,7 +1423,8 @@ describe("scheduled-agents: project", () => {
   }
   const runNow = (host: number) =>
     httpRequest(server, { method: "POST", path: "/scheduled-agents/morning-digest/run-now", body: { host } });
-  const droppedBody = () => (queueBirthFromServer as Mock).mock.calls[0][2] as Record<string, unknown>;
+  const droppedBody = () =>
+    (JSON.parse((writeMarkdownFileAtomic as Mock).mock.calls[0][2] as string) as { body: Record<string, unknown> }).body;
 
   it("run-now REMOTE files the newborn in a live project", async () => {
     mockRemote({ ...validSpec, project: "skynet" }, true);
@@ -1457,7 +1459,7 @@ describe("scheduled-agents: project", () => {
       () => fsLstatMock.mockResolvedValue({ isDirectory: () => false }),
       () => fsLstatMock.mockRejectedValue(Object.assign(new Error("nope"), { code: "ENOENT" })),
     ]) {
-      (queueBirthFromServer as Mock).mockClear();
+      (writeMarkdownFileAtomic as Mock).mockClear();
       lstat();
       expect((await runNow(1)).status).toBe(202);
       expect("project" in droppedBody()).toBe(false);

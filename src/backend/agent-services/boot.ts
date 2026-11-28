@@ -29,7 +29,7 @@ import { AGENT_SERVICES } from "./registry.js";
 import { resolveActingUser } from "./user-secrets/acting-user.js";
 import { getUserSecret } from "./user-secrets/store.js";
 import identityReactivate from "../matrix/identity-reactivate.js";
-import { createDirectBirthServices, setDirectRouteDeps } from "../spawn-requests/direct-route.js";
+import { createDirectBirthServices } from "../spawn-requests/direct-route.js";
 import { enqueue as enqueueBirth } from "../spawn-requests/queue.js";
 import { getKeyStore } from "./admin/key-store.js";
 import { effectiveSettings } from "./admin/settings-store.js";
@@ -105,7 +105,6 @@ export async function startAgentServices(): Promise<void> {
       return hosts.find((h) => h.id === hostId)?._connDetails ?? null;
     },
   };
-  setDirectRouteDeps(directRouteDeps);
   const directBirth = createDirectBirthServices(directRouteDeps);
   const coreHandlers = [identityReactivate, ...directBirth];
   const engine = createAgentServiceEngine({

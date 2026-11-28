@@ -30,7 +30,6 @@ import type { ServiceContext } from "../agent-services/engine/types.js";
 import { isLocalHostId } from "../claude-session/identity-artifact-reader.js";
 import { parseRequestBody, parseRoleRequestBody } from "./parse-request-body.js";
 import type { PendingBirth } from "./types.js";
-import { systemLogger } from "../utils/logger.js";
 
 export interface DirectRouteDeps {
   /** The birth queue (queue.ts enqueue). */
@@ -80,60 +79,6 @@ async function hostFields(deps: DirectRouteDeps, ctx: ServiceContext) {
   const details = await deps.connDetailsFor(ctx.host.id);
   if (details === null) return null;
   return { hostId: ctx.host.id, hostIdNum: ctx.host.idNum, hostConnDetails: details } as const;
-}
-
-let serverDeps: DirectRouteDeps | null = null;
-
-/** Set at start (agent-services/boot.ts), for births the server itself asks for. */
-export function setDirectRouteDeps(deps: DirectRouteDeps): void {
-  serverDeps = deps;
-}
-
-/**
- * A new agent the server itself asks for on a machine (a scheduled conversation's
- * Run now): straight into the birth queue, no file on the machine. Answers once it
- * is queued; the birth's outcome is logged.
- */
-export async function queueBirthFromServer(
-  hostIdNum: number,
-  uuid: string,
-  body: Record<string, unknown>,
-): Promise<{ ok: true } | { ok: false; error: string }> {
-  const deps = serverDeps;
-  if (deps === null) return { ok: false, error: "the server isn't ready to make agents yet" };
-  const parsed = parseRequestBody(uuid, JSON.stringify(body));
-  if (parsed.ok === false) return { ok: false, error: parsed.message };
-  const hostId = String(hostIdNum);
-  let details: Record<string, unknown> | null = null;
-  if (!isLocalHostId(hostIdNum)) {
-    details = await deps.connDetailsFor(hostId);
-    if (details === null) return { ok: false, error: "the server can't reach this machine" };
-  }
-  const b = parsed.body;
-  deps.enqueue({
-    hostId,
-    hostIdNum,
-    ...(details !== null ? { hostConnDetails: details } : {}),
-    uuid,
-    roles: b.roles,
-    prompt: b.prompt,
-    task: b.task,
-    requested_at: b.requested_at,
-    ...(b.users !== undefined ? { users: b.users } : {}),
-    ...(b.name !== undefined ? { name: b.name } : {}),
-    ...(b.project !== undefined ? { project: b.project } : {}),
-    ...(b.requested_by !== undefined ? { requested_by: b.requested_by } : {}),
-    respond: (kind, answer) => {
-      systemLogger.info("server-asked birth answered", {
-        operation: "server_birth_answered",
-        uuid,
-        hostId: hostIdNum,
-        kind,
-        answer: answer.slice(0, 300),
-      });
-    },
-  });
-  return { ok: true };
 }
 
 export function createDirectBirthServices(deps: DirectRouteDeps) {

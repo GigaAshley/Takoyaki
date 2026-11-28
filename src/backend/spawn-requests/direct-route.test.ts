@@ -1,8 +1,7 @@
 /**
  * New agents and roles over the machine's direct route: the request is checked the same way
  * the request files were, goes into the birth queue with the caller's id, and the queue's one
- * answer comes back as the call's result. Births the server itself asks for (Run now) are
- * queued the same way.
+ * answer comes back as the call's result.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
@@ -15,7 +14,7 @@ vi.mock("../claude-session/identity-artifact-reader.js", () => ({
 
 import type { ServiceContext } from "../agent-services/engine/types.js";
 import type { PendingBirth } from "./types.js";
-import { createDirectBirthServices, queueBirthFromServer, setDirectRouteDeps } from "./direct-route.js";
+import { createDirectBirthServices } from "./direct-route.js";
 
 function ctx(hostIdNum: number, requestId = "11111111-2222-3333-4444-555555555555"): ServiceContext {
   return {
@@ -122,18 +121,5 @@ describe("role-create", () => {
 
   it("a malformed role request is refused", async () => {
     expect(await roleCreate.handle({ description: "no name" }, ctx(1))).toMatchObject({ ok: false, code: "malformed" });
-  });
-});
-
-describe("queueBirthFromServer (Run now)", () => {
-  it("queues the request with its answer logged; refuses a malformed one", async () => {
-    setDirectRouteDeps(deps);
-    expect(await queueBirthFromServer(7, "run-1", { roles: [], task: "⏰ X", prompt: "p", requested_at: "2026-11-27T12:00:00Z" })).toEqual({
-      ok: true,
-    });
-    expect(queued[0]).toMatchObject({ uuid: "run-1", hostIdNum: 7, hostConnDetails: { ip: "10.0.0.2" }, task: "⏰ X" });
-    expect(queued[0].direct).toBeUndefined();
-    expect(typeof queued[0].respond).toBe("function");
-    expect(await queueBirthFromServer(7, "run-2", { roles: "x" })).toMatchObject({ ok: false });
   });
 });

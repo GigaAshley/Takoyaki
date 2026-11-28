@@ -9,8 +9,8 @@
  *   PATCH  /:slug                     → UPDATE (full-spec overwrite)
  *   PATCH  /:slug/toggle-enabled      → flip only the `enabled` field
  *   DELETE /:slug                     → hard delete + .fired sentinel cleanup
- *   POST   /:slug/run-now             → fire once now (straight into the birth
- *                                        queue; schedule state untouched)
+ *   POST   /:slug/run-now             → fire once now (into the machine's
+ *                                        outbox; schedule state untouched)
  *
  * D-01: HTTP REST endpoint style (mirrors roles-create.ts).
  * D-02: `host` param on writes — each request dispatches to exactly one host.
@@ -78,7 +78,6 @@ import {
 } from "../../claude-session/identity-artifact-reader.js";
 import { isProjectSlug } from "../../claude-session/scheduled-agent-project.js";
 import { listMachinePeople } from "../../distributor/machine-people.js";
-import { queueBirthFromServer } from "../../spawn-requests/direct-route.js";
 
 const router = express.Router();
 const authManager = AuthManager.getInstance();
@@ -413,6 +412,21 @@ function requirePositiveIntegerHost(
 }
 
 /** Absolute local path for a slug's scheduled-agent.json file. LOCAL branch. */
+/**
+ * A manual fire waits in the machine's scheduled-conversation outbox, like a clock
+ * fire: the scheduler sends it to the server on its next pass and keeps it until the
+ * server answers, so a server restart never loses the run. The entry is the shape
+ * wakeup-scheduler.py's `_request_new_agent` writes (a manual fire is not a clock
+ * fire: it never stands in for one).
+ */
+function outboxEntry(slug: string, requestId: string, body: Record<string, unknown>): { name: string; text: string } {
+  const ns = (BigInt(Date.now()) * 1_000_000n).toString().padStart(20, "0");
+  return {
+    name: `${ns}-${requestId}.json`,
+    text: JSON.stringify({ id: requestId, slug, clock: false, body, queued_at: Date.now() / 1000, sent: false }),
+  };
+}
+
 function localSpecPath(slug: string): string {
   return path.join(getLocalScheduledAgentsRoot(), slug, "scheduled-agent.json");
 }
@@ -1357,8 +1371,8 @@ router.delete(
 // POST /scheduled-agents/:slug/run-now — fire once, outside the schedule
 // ---------------------------------------------------------------------------
 //
-// Reads the spec and starts the agent with the same request the scheduler sends
-// on a clock fire, straight into the server's birth queue. Deliberately does NOT touch `.state/<slug>.last`: a manual
+// Reads the spec and leaves the same request the scheduler sends on a clock fire
+// in the machine's outbox; the scheduler sends it on its next pass. Deliberately does NOT touch `.state/<slug>.last`: a manual
 // run doesn't shift the regular schedule.
 
 router.post(
@@ -1429,15 +1443,18 @@ router.post(
             responded = true;
             return;
           }
-          const queued = await queueBirthFromServer(hostId, requestId, built.body);
-          if (queued.ok === false) {
-            sshLogger.warn("scheduled-agents-run-now: couldn't start it", {
-              operation: "scheduled_agents_run_now_queue_failed",
-              hostId,
-              slug,
-              error: queued.error,
-            });
-            res.status(502).json({ error: queued.error });
+          const entry = outboxEntry(slug, requestId, built.body);
+          const dir = path.join(getLocalScheduledAgentsRoot(), ".outbox");
+          try {
+            await fs.mkdir(dir, { recursive: true });
+            await writeMarkdownFileAtomic(null, path.join(dir, entry.name), entry.text);
+          } catch (err) {
+            sshLogger.error(
+              "scheduled-agents-run-now: local write failed",
+              err instanceof Error ? err : new Error(String(err)),
+              { operation: "scheduled_agents_run_now_local_write", hostId, slug },
+            );
+            res.status(502).json({ error: "couldn't hand the run to the machine" });
             responded = true;
             return;
           }
@@ -1523,15 +1540,17 @@ router.post(
           responded = true;
           return;
         }
-        const queued = await queueBirthFromServer(hostId, requestId, built.body);
-        if (queued.ok === false) {
-          sshLogger.warn("scheduled-agents-run-now: couldn't start it", {
-            operation: "scheduled_agents_run_now_queue_failed",
-            hostId,
-            slug,
-            error: queued.error,
-          });
-          res.status(502).json({ error: queued.error });
+        const entry = outboxEntry(slug, requestId, built.body);
+        try {
+          await execWithTimeout(conn, `mkdir -p "$HOME/fleet/scheduled-agents/.outbox"`);
+          await writeMarkdownFileAtomic(conn, `$HOME/fleet/scheduled-agents/.outbox/${entry.name}`, entry.text);
+        } catch (err) {
+          sshLogger.error(
+            "scheduled-agents-run-now: SFTP write failed",
+            err instanceof Error ? err : new Error(String(err)),
+            { operation: "scheduled_agents_run_now_sftp_write", hostId, slug },
+          );
+          res.status(502).json({ error: "couldn't hand the run to the machine" });
           responded = true;
           return;
         }
