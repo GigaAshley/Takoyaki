@@ -50,13 +50,15 @@ export function MachineNoticePopups(): null {
       const notices = new Map<string, MachineChange>();
       for (const c of changes) {
         // Theirs to be told: their own change, or their agent archived by someone else.
-        if (!isNotice(c) || !(c.mine || c.state === "taken") || hasRow(hostId, c)) continue;
+        // A taken agent is archived: any row this device still has for it is on its way out.
+        if (!isNotice(c) || !(c.mine || c.state === "taken")) continue;
+        if (c.state !== "taken" && hasRow(hostId, c)) continue;
         const prev = notices.get(c.id);
         if (!prev || c.target.type === "role") notices.set(c.id, c);
       }
       // A request with a row for any of its things is shown on that row.
       for (const c of changes) {
-        if (isNotice(c) && notices.has(c.id) && hasRow(hostId, c)) notices.delete(c.id);
+        if (isNotice(c) && c.state !== "taken" && notices.has(c.id) && hasRow(hostId, c)) notices.delete(c.id);
       }
       for (const [id, c] of notices) {
         claimThen(hostId, id, () => showNoticePopup(c, thingName(c)));

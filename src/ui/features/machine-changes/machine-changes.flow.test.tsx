@@ -228,6 +228,18 @@ describe("pop-ups for notices with no row", () => {
     expect(dialogs.calls[0].opts.body).toBe('It was archived with the project "Shared" by ann.');
   });
 
+  it("a taken notice pops up even while this device still lists the agent", async () => {
+    ids.byHostKey = new Map([["1::bea", {}]]);
+    const dialogs = autoAnswerKitDialogs({});
+    render(<MachineNoticePopups />);
+    act(() =>
+      setMachineChanges("1", [
+        change({ id: "a2.0", kind: "agent-archive", state: "taken", mine: false, target: { type: "agent", name: "bea" }, reason: 'it was archived with the project "Shared" by ann' }),
+      ]),
+    );
+    await waitFor(() => expect(dialogs.calls).toHaveLength(1));
+  });
+
   it("waits for the agent list before deciding a row is missing", async () => {
     ids.loaded = false;
     render(<MachineNoticePopups />);
