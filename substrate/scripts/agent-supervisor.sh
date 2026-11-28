@@ -1940,7 +1940,7 @@ bounce_old_notes() {
   for f in "$IDENTITIES_DIR"/*/.compact-requested "$IDENTITIES_DIR"/*/.recycle-requested; do
     [ -f "$f" ] || continue; d="${f%/*}"; n="${d##*/}"
     # Its guidance, if any, carried into the command to run (quotes and control characters dropped).
-    guidance="$(head -c "$COMPACT_GUIDANCE_MAX_BYTES" "$f" 2>/dev/null | iconv -f UTF-8 -t UTF-8 -c 2>/dev/null | tr -d "\"'\\\\\000-\037\177" | sed -E 's/ +/ /g; s/^ //; s/ $//')"
+    guidance="$(head -c 1000 "$f" 2>/dev/null | tr -d "\"'\\\\\000-\037\177" | sed -E 's/ +/ /g; s/^ //; s/ $//')"
     _bounce_note "$f" "fleet-change submit agent-compact '{\"name\":\"$n\",\"guidance\":\"${guidance}\"}' --by agent:$n" "$n"
   done
   for f in "$IDENTITIES_DIR"/*/apps/*/.move-requested; do
@@ -2737,7 +2737,7 @@ _unarchive_identity() {
 
   # Step 5: clear the flag, progress state and any old refusal note BEFORE the mv, and mark
   # what's left to do after it (apps, banner) so a pass cut off after the move still does it.
-  rm -f "${d:?}/.unarchive-refused" "${d:?}/.unarchive-reactivate" "${d:?}/.unarchive-requested" "${d:?}/.compact-queued" "${d:?}/.not-carried-out"
+  rm -f "${d:?}/.unarchive-refused" "${d:?}/.unarchive-reactivate" "${d:?}/.unarchive-requested" "${d:?}/.compact-queued" "${d:?}/.compact-failed" "${d:?}/.not-carried-out"
   : > "$d/.unarchive-finishing"
 
   # Step 6: mv archive → live, as one change under the change lock.
@@ -3637,6 +3637,9 @@ COMPACT_TIMEOUT_SECONDS="${COMPACT_TIMEOUT_SECONDS:-900}"
 # A request an awake agent never comes to rest for (or one stuck behind a dialog) is dropped
 # after this long, so the app's "Condensing…" and its disabled button can't hang forever.
 COMPACT_REQUEST_TIMEOUT_SECONDS="${COMPACT_REQUEST_TIMEOUT_SECONDS:-1800}"
+# Past COMPACT_TIMEOUT_SECONDS a busy agent may still have the /compact queued behind its turn, so
+# it is only given up on once at rest — or after this long regardless.
+COMPACT_BUSY_TIMEOUT_SECONDS="${COMPACT_BUSY_TIMEOUT_SECONDS:-7200}"
 # Matches fleet-change's cap: Claude Code takes a paste over 800 characters as pasted text, not
 # the /compact command, so the compaction would never run.
 COMPACT_GUIDANCE_MAX_BYTES="${COMPACT_GUIDANCE_MAX_BYTES:-700}"
@@ -3694,6 +3697,35 @@ compaction_failed_event() {
 </task-notification>"
 }
 
+# compaction_failed <name> <session-or-empty> <why>: record that a compaction won't come, then try
+# to tell the agent. `.compact-failed` holds the why until it can be told.
+compaction_failed() {
+  local d="$IDENTITIES_DIR/$1"
+  printf '%s\n' "$3" > "$d/.compact-failed.tmp" && mv "$d/.compact-failed.tmp" "$d/.compact-failed"
+  compaction_failure_deliver "$1" "$2"
+}
+
+# compaction_failure_deliver <name> <session-or-empty>: the "didn't happen" event goes in only at
+# rest — the inbox paste's Enter would otherwise answer whatever dialog is open. A dormant agent
+# isn't waiting on anything, so it is never woken for it.
+compaction_failure_deliver() {
+  local name="$1" sess="$2" d="$IDENTITIES_DIR/$1" why
+  [ -f "$d/.compact-failed" ] || return 0
+  if [ -f "$d/.dormant" ]; then
+    rm -f "$d/.compact-failed"
+    log "'$name' compaction: 'didn't happen' event not sent — the agent is dormant"
+    return 0
+  fi
+  [ -n "$sess" ] && claude_running_cached "$sess" && agent_at_rest "$sess" || return 0
+  why="$(head -n1 "$d/.compact-failed" 2>/dev/null)"
+  if inbox_drop "$name" "$(compaction_failed_event "$name" "$why")"; then
+    rm -f "$d/.compact-failed"
+    log "'$name' compaction: 'didn't happen' event delivered via inbox"
+  else
+    log "ERROR: '$name' compaction: the 'didn't happen' event's inbox drop failed — retrying next tick"
+  fi
+}
+
 # start_compaction <name>: step 1 — deliver the compaction and mark it in flight.
 start_compaction() {
   local name="$1" d="$IDENTITIES_DIR/$1" guidance cmd since
@@ -3718,9 +3750,10 @@ start_compaction() {
   metric event=compact-start identity="$name" guidance_chars="${#guidance}"
 }
 
-# compaction_progress <name>: step 2 — once the compaction has landed, deliver the event.
+# compaction_progress <name> <session-or-empty>: step 2 — once the compaction has landed, deliver
+# the event.
 compaction_progress() {
-  local name="$1" d="$IDENTITIES_DIR/$1" since file age
+  local name="$1" sess="$2" d="$IDENTITIES_DIR/$1" since file age
   since="$(head -n1 "$d/.compacting" 2>/dev/null)"
   if [ -n "$since" ] && file="$(main_session_file "$name")" && compaction_landed "$file" "$since"; then
     if inbox_drop "$name" "$(compaction_done_event "$name")"; then
@@ -3734,21 +3767,26 @@ compaction_progress() {
   fi
   age=$(( $(date +%s) - $(stat -c %Y "$d/.compacting" 2>/dev/null || date +%s) ))
   if [ "$age" -ge "$COMPACT_TIMEOUT_SECONDS" ]; then
-    rm -f "$d/.compacting"
-    if inbox_drop "$name" "$(compaction_failed_event "$name" "/compact was delivered $(( age / 60 )) minutes ago and no compaction landed.")"; then
-      log "WARNING: '$name' compaction: nothing landed ${age}s after /compact was delivered — giving up, 'didn't happen' event delivered"
-    else
-      log "WARNING: '$name' compaction: nothing landed ${age}s after /compact was delivered — giving up; the 'didn't happen' event's inbox drop failed"
+    # Still mid-turn: the /compact may be queued behind it, so keep waiting (up to a limit).
+    if [ "$age" -lt "$COMPACT_BUSY_TIMEOUT_SECONDS" ] && [ -n "$sess" ] && claude_running_cached "$sess" \
+       && ! agent_at_rest "$sess"; then
+      return 0
     fi
+    rm -f "$d/.compacting"
+    log "WARNING: '$name' compaction: nothing landed ${age}s after /compact was delivered — giving up"
     metric event=compact-timeout identity="$name" age_s="$age"
+    compaction_failed "$name" "$sess" "/compact was delivered $(( age / 60 )) minutes ago and no compaction landed."
   fi
 }
 
 # handle_compaction <name> <session-or-empty>: called once per identity per tick.
 handle_compaction() {
   local name="$1" sess="$2" d="$IDENTITIES_DIR/$1"
+  # A new request makes an undelivered "didn't happen" moot.
+  [ -f "$d/.compact-queued" ] && rm -f "$d/.compact-failed"
+  [ "${DRY_RUN:-0}" = 1 ] || compaction_failure_deliver "$name" "$sess"
   if [ -f "$d/.compacting" ]; then
-    [ "${DRY_RUN:-0}" = 1 ] || compaction_progress "$name"
+    [ "${DRY_RUN:-0}" = 1 ] || compaction_progress "$name" "$sess"
     # A request arriving while one is in flight is the same request (e.g. a double press).
     if [ -f "$d/.compact-queued" ] && [ -f "$d/.compacting" ]; then
       rm -f "$d/.compact-queued"
@@ -3762,12 +3800,9 @@ handle_compaction() {
   req_age=$(( $(date +%s) - $(stat -c %Y "$d/.compact-queued" 2>/dev/null || date +%s) ))
   if [ "$req_age" -ge "$COMPACT_REQUEST_TIMEOUT_SECONDS" ]; then
     rm -f "$d/.compact-queued"
-    if inbox_drop "$name" "$(compaction_failed_event "$name" "the request waited $(( req_age / 60 )) minutes without you coming to rest at your prompt, so it was dropped.")"; then
-      log "WARNING: '$name' compaction: request waited ${req_age}s without the agent coming to rest — dropped, 'didn't happen' event delivered"
-    else
-      log "WARNING: '$name' compaction: request waited ${req_age}s without the agent coming to rest — dropped; the 'didn't happen' event's inbox drop failed"
-    fi
+    log "WARNING: '$name' compaction: request waited ${req_age}s without the agent coming to rest — dropped"
     metric event=compact-request-expired identity="$name" age_s="$req_age"
+    compaction_failed "$name" "$sess" "the request waited $(( req_age / 60 )) minutes without you coming to rest at your prompt, so it was dropped."
     return 0
   fi
   if [ ! -f "$d/.dormant" ]; then

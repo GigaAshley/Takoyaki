@@ -22,7 +22,11 @@
 #   C-12 — inbox file names match the inbox-watcher dropper contract
 #   C-13 — an old-style note (.compact-requested, .recycle-requested) is never carried out: it's
 #          removed and the agent is told to use the command
-#   C-14 — a request the agent never comes to rest for expires, with a "didn't happen" event
+#   C-11b — past the timeout but still mid-turn → keeps waiting; past the busy limit → given up,
+#           the event held until the agent is at rest
+#   C-14 — a request the agent never comes to rest for expires; its "didn't happen" event is held
+#          until the agent is at rest (never pasted into a dialog)
+#   C-14b — a held event is dropped for a dormant agent, and made moot by a new request
 #   C-15 — control characters are stripped from the guidance
 #   C-16 — the dormancy check holds off while a compaction is asked for / under way / queued
 #   C-17..C-20 — agent_at_rest on idle, busy, quoted-footer-text and dialog panes
@@ -174,6 +178,22 @@ if [ ! -e "$D/.compacting" ] && [ "$(inbox_count)" = 1 ] \
 else fail "marker=$([ -e "$D/.compacting" ] && echo kept) body='$(inbox_only)'"; fi
 teardown
 
+CURRENT_TEST="C-11b busy past the timeout keeps waiting; past the busy limit, held until at rest"
+setup
+printf '2026-10-25T15:00:00.000Z\n' > "$D/.compacting"
+touch -d '30 minutes ago' "$D/.compacting"; STUB_AT_REST=0
+handle_compaction "$N" "sess"
+if [ -e "$D/.compacting" ] && [ "$(inbox_count)" = 0 ]; then pass; else fail "gave up on a busy agent"; fi
+touch -d '3 hours ago' "$D/.compacting"
+handle_compaction "$N" "sess"
+if [ ! -e "$D/.compacting" ] && [ -s "$D/.compact-failed" ] && [ "$(inbox_count)" = 0 ]; then pass
+else fail "past the busy limit: marker=$([ -e "$D/.compacting" ] && echo kept) failed=$([ -e "$D/.compact-failed" ] && echo yes) inbox=$(inbox_count)"; fi
+STUB_AT_REST=1
+handle_compaction "$N" "sess"
+if [ ! -e "$D/.compact-failed" ] && [ "$(inbox_count)" = 1 ] && inbox_only | grep -q "minutes ago and no compaction landed"; then pass
+else fail "held event not delivered at rest: body='$(inbox_only)'"; fi
+teardown
+
 CURRENT_TEST="C-12 dropper contract names"
 setup
 inbox_drop "$N" "a"; inbox_drop "$N" "b"
@@ -205,10 +225,27 @@ CURRENT_TEST="C-14 stale request expires"
 setup
 : > "$D/.compact-queued"; touch -d '2 hours ago' "$D/.compact-queued"; STUB_AT_REST=0
 handle_compaction "$N" "sess"
-if [ ! -e "$D/.compact-queued" ] && [ ! -e "$D/.compacting" ] && [ "$(inbox_count)" = 1 ] \
-   && inbox_only | grep -q "Compaction didn't happen" && inbox_only | grep -q "so it was dropped" \
-   && ! inbox_only | grep -q "^/compact"; then pass
-else fail "request=$([ -e "$D/.compact-queued" ] && echo kept) body='$(inbox_only)'"; fi
+if [ ! -e "$D/.compact-queued" ] && [ ! -e "$D/.compacting" ] && [ -s "$D/.compact-failed" ] && [ "$(inbox_count)" = 0 ]; then pass
+else fail "request=$([ -e "$D/.compact-queued" ] && echo kept) inbox=$(inbox_count) (the event must wait for rest)"; fi
+handle_compaction "$N" "sess"
+if [ "$(inbox_count)" = 0 ]; then pass; else fail "pasted while not at rest"; fi
+STUB_AT_REST=1
+handle_compaction "$N" "sess"
+if [ ! -e "$D/.compact-failed" ] && [ "$(inbox_count)" = 1 ] \
+   && inbox_only | grep -q "Compaction didn't happen" && inbox_only | grep -q "so it was dropped"; then pass
+else fail "held event not delivered at rest: body='$(inbox_only)'"; fi
+teardown
+
+CURRENT_TEST="C-14b held event: dropped when dormant, moot after a new request"
+setup
+echo why > "$D/.compact-failed"; : > "$D/.dormant"; STUB_RUNNING=0
+handle_compaction "$N" ""
+if [ ! -e "$D/.compact-failed" ] && [ "$(inbox_count)" = 0 ]; then pass; else fail "dormant agent woken or event kept"; fi
+rm -f "$D/.dormant"; STUB_RUNNING=1
+echo why > "$D/.compact-failed"; : > "$D/.compact-queued"
+handle_compaction "$N" "sess"
+if [ ! -e "$D/.compact-failed" ] && [ "$(inbox_count)" = 1 ] && [ "$(inbox_only)" = "/compact" ]; then pass
+else fail "new request didn't supersede: body='$(inbox_only)'"; fi
 teardown
 
 CURRENT_TEST="C-15 control characters stripped from guidance"
