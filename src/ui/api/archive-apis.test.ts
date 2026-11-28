@@ -74,6 +74,17 @@ describe("archiveIdentity", () => {
     }
   });
 
+  it("updated while it waited (stale_client on a follow-up): stops asking, not failed", async () => {
+    vi.mocked(authApi.post).mockResolvedValueOnce({ status: 202, data: { pending: true, requestId: "r5" } });
+    vi.mocked(authApi.get).mockRejectedValueOnce(axiosError(409, { error: "stale_client" }));
+    await expect(archiveIdentity(42, "wren")).resolves.toEqual({ done: false, requestId: "r5" });
+  });
+
+  it("turned away as stale on the first request: says to reload and try again", async () => {
+    vi.mocked(authApi.post).mockRejectedValueOnce(axiosError(409, { error: "stale_client" }));
+    await expect(archiveIdentity(42, "wren")).rejects.toMatchObject({ code: "stale_client", message: "the app was just updated — reload, then try again" });
+  });
+
   it("the server's own 503 (the machine updating) is still an answer", async () => {
     vi.mocked(authApi.post).mockResolvedValueOnce({ status: 202, data: { pending: true, requestId: "r6" } });
     vi.mocked(authApi.get).mockRejectedValueOnce(axiosError(503, { error: "this machine is still updating", code: "not_installed" }));

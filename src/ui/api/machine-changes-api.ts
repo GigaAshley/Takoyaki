@@ -61,6 +61,12 @@ const FOLLOW_UPS = 3;
 /** Pauses before asking again while the server can't be reached (about a minute in all). */
 const AWAY_PAUSES_MS = [2_000, 4_000, 8_000, 15_000, 15_000, 15_000];
 
+/** The server was updated since this page loaded: it turns the old page away (and the app
+ *  asks the person to reload). */
+function staleClient(error: unknown): boolean {
+  return axios.isAxiosError(error) && error.response?.status === 409 && (error.response.data as Body | undefined)?.error === "stale_client";
+}
+
 /** No answer from the server itself: no response, or the proxy in front saying it's down. */
 function serverAway(error: unknown): boolean {
   if (!axios.isAxiosError(error)) return false;
@@ -110,6 +116,10 @@ export async function sendMachineChange<T>(
     // No answer from the server (the connection dropped, or it restarted mid-wait): the
     // change may well be under way on the machine, so ask about it by id rather than treat
     // it as failed. A read has nothing to ask about — it just failed.
+    if (staleClient(error)) {
+      // Turned away before it reached the machine: nothing happened.
+      throw new MachineChangeError("the app was just updated — reload, then try again", 409, "stale_client", null);
+    }
     if (!(serverAway(error) && request.method !== "get")) asError(error, operation);
     data = { requestId };
   }
@@ -129,6 +139,9 @@ export async function sendMachineChange<T>(
       // The server can't be reached (restarting, or the connection dropped): that says
       // nothing about the change, which the machine carries on with. Ask again after a
       // pause; past that, the machine's own status report settles it.
+      // Updated since this page loaded: it can't ask any more (it's being asked to reload);
+      // the machine carries on, and its report settles it after the reload.
+      if (staleClient(error)) break;
       if (!serverAway(error)) asError(error, operation);
       if (away >= AWAY_PAUSES_MS.length) break;
       console.info({ operation: "machine_change_follow_up_server_away", hostId, requestId: id, attempt: away + 1 });
