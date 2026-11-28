@@ -198,7 +198,10 @@ CLAIM = ".archiving"
 # An accepted compaction, holding its guidance (if any): the supervisor carries it out once the
 # agent is at rest.
 COMPACT_MARK = ".compact-queued"
-COMPACT_GUIDANCE_MAX = 2000
+# The supervisor pastes `/compact <guidance>` into the agent's prompt, and Claude Code takes a
+# paste over 800 characters as pasted text rather than a command — the compaction would never
+# run. Bytes are never fewer than Claude Code's characters, so this leaves room for "/compact ".
+COMPACT_GUIDANCE_MAX = 700
 # Touched (renamed into place) to end the supervisor's between-pass wait early.
 SUPERVISOR_WAKE = os.path.join(IDENTITIES, ".supervisor-wake")
 STUCK_AFTER_S = 600
@@ -1594,8 +1597,11 @@ def do_agent_compact(args, entry, save_plan):
         raise Refused("bad_request", "guidance must be text")
     # One line without control characters: the supervisor types it after /compact.
     guidance = re.sub(r"\s+", " ", re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", guidance or "")).strip()
-    if len(guidance.encode("utf-8")) > COMPACT_GUIDANCE_MAX:
-        raise Refused("bad_request", "guidance must be at most %d bytes" % COMPACT_GUIDANCE_MAX)
+    size = len(guidance.encode("utf-8"))
+    if size > COMPACT_GUIDANCE_MAX:
+        raise Refused("bad_request", "guidance is %d bytes; the most is %d. Nothing was compacted. "
+                      "Shorten it (point at files on disk for detail) and ask again"
+                      % (size, COMPACT_GUIDANCE_MAX))
     agent_file(name)
     d = os.path.join(IDENTITIES, name)
     if os.path.exists(os.path.join(d, ".compacting")) or os.path.exists(os.path.join(d, COMPACT_MARK)):

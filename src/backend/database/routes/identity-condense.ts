@@ -16,8 +16,8 @@
  *
  * `guidance` is whatever the user had typed in the composer — passed to the
  * compaction as what the summary should keep. Whitespace (newlines included)
- * is collapsed, control characters dropped, and it is capped at
- * GUIDANCE_MAX_CHARS; empty means none. The guidance text is never logged.
+ * is collapsed, control characters dropped, and it is cut to fit
+ * GUIDANCE_MAX_BYTES; empty means none. The guidance text is never logged.
  */
 
 import type { AuthenticatedRequest } from "../../../types/index.js";
@@ -32,8 +32,11 @@ const router = express.Router();
 const authManager = AuthManager.getInstance();
 const authenticateJWT = authManager.createAuthMiddleware();
 
-/** The machine caps it again (in bytes). */
-export const GUIDANCE_MAX_CHARS = 1000;
+/**
+ * The machine refuses more (fleet-change COMPACT_GUIDANCE_MAX): Claude Code
+ * takes a paste over 800 characters as pasted text, not the /compact command.
+ */
+export const GUIDANCE_MAX_BYTES = 700;
 
 export function normalizeGuidance(raw: unknown): string {
   if (typeof raw !== "string") return "";
@@ -41,7 +44,15 @@ export function normalizeGuidance(raw: unknown): string {
   // characters are dropped — an ESC sequence could end the supervisor's
   // bracketed paste early.
   const flat = raw.replace(/\s+/g, " ").replace(/[\u0000-\u001f\u007f]/g, "").trim();
-  return Array.from(flat).slice(0, GUIDANCE_MAX_CHARS).join("");
+  // Cut on whole characters so a multi-byte one is never split.
+  let out = "";
+  let bytes = 0;
+  for (const ch of flat) {
+    bytes += Buffer.byteLength(ch, "utf8");
+    if (bytes > GUIDANCE_MAX_BYTES) break;
+    out += ch;
+  }
+  return out.trimEnd();
 }
 
 router.post(

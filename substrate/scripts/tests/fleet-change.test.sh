@@ -772,6 +772,9 @@ test_agent_compact_is_accepted_at_its_turn() {
   submit "$s" agent-archive '{"name":"wren"}' a1
   submit "$s" agent-compact '{"name":"wren"}' c4
   submit "$s" agent-compact '{"name":"nobody"}' c5
+  agent "$s" robin ""
+  submit "$s" agent-compact "{\"name\":\"robin\",\"guidance\":\"$(printf 'k%.0s' $(seq 701))\"}" c6
+  submit "$s" agent-compact "{\"name\":\"robin\",\"guidance\":\"$(printf 'k%.0s' $(seq 700))\"}" c7
   serve_once "$s"
   assert_eq done "$(field "$(fc "$s" status c1)" state)" "accepted"
   assert_eq "keep the failing [201~ test" "$(cat "$s/fleet/identities/finch/.compact-queued")" "guidance on one line, no control characters"
@@ -779,6 +782,9 @@ test_agent_compact_is_accepted_at_its_turn() {
   assert_eq done "$(field "$(fc "$s" status c3)" state)" "before the archive: accepted"
   assert_eq being_archived "$(field "$(fc "$s" status c4)" code)" "after the archive's claim: refused"
   assert_eq not_found "$(field "$(fc "$s" status c5)" code)" "no such agent"
+  assert_eq bad_request "$(field "$(fc "$s" status c6)" code)" "guidance too long for the /compact paste: refused"
+  fc "$s" status c6 | grep -q "701 bytes; the most is 700" || fail "refusal says how long it was and the limit"
+  assert_eq done "$(field "$(fc "$s" status c7)" state)" "guidance at the limit: accepted"
   assert_exists "$s/fleet/identities/.supervisor-wake" "the supervisor is woken for it"
   rm -rf "$s"
 }

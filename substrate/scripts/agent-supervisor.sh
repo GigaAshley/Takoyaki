@@ -1940,7 +1940,7 @@ bounce_old_notes() {
   for f in "$IDENTITIES_DIR"/*/.compact-requested "$IDENTITIES_DIR"/*/.recycle-requested; do
     [ -f "$f" ] || continue; d="${f%/*}"; n="${d##*/}"
     # Its guidance, if any, carried into the command to run (quotes and control characters dropped).
-    guidance="$(head -c 1000 "$f" 2>/dev/null | tr -d "\"'\\\\\000-\037\177" | sed -E 's/ +/ /g; s/^ //; s/ $//')"
+    guidance="$(head -c "$COMPACT_GUIDANCE_MAX_BYTES" "$f" 2>/dev/null | iconv -f UTF-8 -t UTF-8 -c 2>/dev/null | tr -d "\"'\\\\\000-\037\177" | sed -E 's/ +/ /g; s/^ //; s/ $//')"
     _bounce_note "$f" "fleet-change submit agent-compact '{\"name\":\"$n\",\"guidance\":\"${guidance}\"}' --by agent:$n" "$n"
   done
   for f in "$IDENTITIES_DIR"/*/apps/*/.move-requested; do
@@ -3637,7 +3637,9 @@ COMPACT_TIMEOUT_SECONDS="${COMPACT_TIMEOUT_SECONDS:-900}"
 # A request an awake agent never comes to rest for (or one stuck behind a dialog) is dropped
 # after this long, so the app's "Condensing…" and its disabled button can't hang forever.
 COMPACT_REQUEST_TIMEOUT_SECONDS="${COMPACT_REQUEST_TIMEOUT_SECONDS:-1800}"
-COMPACT_GUIDANCE_MAX_BYTES="${COMPACT_GUIDANCE_MAX_BYTES:-2000}"
+# Matches fleet-change's cap: Claude Code takes a paste over 800 characters as pasted text, not
+# the /compact command, so the compaction would never run.
+COMPACT_GUIDANCE_MAX_BYTES="${COMPACT_GUIDANCE_MAX_BYTES:-700}"
 
 # inbox_drop <name> <payload>: one message file into the identity's inbox, per the inbox-watcher
 # dropper contract (timestamp-hex name, written aside then renamed into place). Sets
@@ -3683,6 +3685,15 @@ compaction_done_event() {
 </task-notification>"
 }
 
+# compaction_failed_event <name> <why>: the agent is told a compaction it may be waiting on won't
+# come, so it can carry on or ask again rather than wait forever.
+compaction_failed_event() {
+  printf '%s' "<task-notification>
+<summary>Compaction didn't happen ($1) — delivered by agent-supervisor</summary>
+<event>Compaction didn't happen: $2 Your conversation is as it was, and nothing is waiting on it now. This is not a message from the user. If you asked for it, ask again with fleet-change submit agent-compact (guidance at most $COMPACT_GUIDANCE_MAX_BYTES bytes; point at files on disk for detail); otherwise carry on.</event>
+</task-notification>"
+}
+
 # start_compaction <name>: step 1 — deliver the compaction and mark it in flight.
 start_compaction() {
   local name="$1" d="$IDENTITIES_DIR/$1" guidance cmd since
@@ -3724,7 +3735,11 @@ compaction_progress() {
   age=$(( $(date +%s) - $(stat -c %Y "$d/.compacting" 2>/dev/null || date +%s) ))
   if [ "$age" -ge "$COMPACT_TIMEOUT_SECONDS" ]; then
     rm -f "$d/.compacting"
-    log "WARNING: '$name' compaction: nothing landed ${age}s after /compact was delivered — giving up, no event sent"
+    if inbox_drop "$name" "$(compaction_failed_event "$name" "/compact was delivered $(( age / 60 )) minutes ago and no compaction landed.")"; then
+      log "WARNING: '$name' compaction: nothing landed ${age}s after /compact was delivered — giving up, 'didn't happen' event delivered"
+    else
+      log "WARNING: '$name' compaction: nothing landed ${age}s after /compact was delivered — giving up; the 'didn't happen' event's inbox drop failed"
+    fi
     metric event=compact-timeout identity="$name" age_s="$age"
   fi
 }
@@ -3747,7 +3762,11 @@ handle_compaction() {
   req_age=$(( $(date +%s) - $(stat -c %Y "$d/.compact-queued" 2>/dev/null || date +%s) ))
   if [ "$req_age" -ge "$COMPACT_REQUEST_TIMEOUT_SECONDS" ]; then
     rm -f "$d/.compact-queued"
-    log "WARNING: '$name' compaction: request waited ${req_age}s without the agent coming to rest — dropped"
+    if inbox_drop "$name" "$(compaction_failed_event "$name" "the request waited $(( req_age / 60 )) minutes without you coming to rest at your prompt, so it was dropped.")"; then
+      log "WARNING: '$name' compaction: request waited ${req_age}s without the agent coming to rest — dropped, 'didn't happen' event delivered"
+    else
+      log "WARNING: '$name' compaction: request waited ${req_age}s without the agent coming to rest — dropped; the 'didn't happen' event's inbox drop failed"
+    fi
     metric event=compact-request-expired identity="$name" age_s="$req_age"
     return 0
   fi

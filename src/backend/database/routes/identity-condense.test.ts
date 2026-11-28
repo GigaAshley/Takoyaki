@@ -40,7 +40,7 @@ vi.mock("../../sharing/host-conn.js", () => {
 
 import { submitFrontDoor } from "../../fleet-change/front-door.js";
 import { HttpError, withHost } from "../../sharing/host-conn.js";
-import router, { GUIDANCE_MAX_CHARS, normalizeGuidance } from "./identity-condense.js";
+import router, { GUIDANCE_MAX_BYTES, normalizeGuidance } from "./identity-condense.js";
 
 function call(server: http.Server, path: string, body?: unknown): Promise<{ status: number; body: Record<string, unknown> }> {
   return new Promise((resolve, reject) => {
@@ -133,9 +133,15 @@ describe("POST /identities/:key/condense", () => {
 });
 
 describe("normalizeGuidance", () => {
-  it("caps by characters, not bytes", () => {
-    const long = "é".repeat(GUIDANCE_MAX_CHARS + 50);
-    expect(Array.from(normalizeGuidance(long))).toHaveLength(GUIDANCE_MAX_CHARS);
+  it("cuts to fit the machine's byte cap, on whole characters", () => {
+    const out = normalizeGuidance("é".repeat(GUIDANCE_MAX_BYTES));
+    expect(Buffer.byteLength(out, "utf8")).toBe(GUIDANCE_MAX_BYTES);
+    expect(out).toBe("é".repeat(GUIDANCE_MAX_BYTES / 2));
+    expect(Buffer.byteLength(normalizeGuidance("a" + "é".repeat(GUIDANCE_MAX_BYTES)), "utf8")).toBe(GUIDANCE_MAX_BYTES - 1);
+  });
+  it("leaves guidance under the cap alone", () => {
+    const fits = "k".repeat(GUIDANCE_MAX_BYTES);
+    expect(normalizeGuidance(fits)).toBe(fits);
   });
   it("drops control characters (an ESC sequence can't end the paste early)", () => {
     expect(normalizeGuidance("keep\u001b[201~ this\u0001")).toBe("keep[201~ this");

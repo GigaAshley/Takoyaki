@@ -18,11 +18,11 @@
 #          event delivered in the supervisor envelope, marker removed
 #   C-09 — in flight, only an OLDER boundary in the file → not treated as landed
 #   C-10 — a second request while one is in flight is dropped as a duplicate
-#   C-11 — in flight past the timeout with nothing landed → marker removed, no event
+#   C-11 — in flight past the timeout with nothing landed → marker removed, "didn't happen" event
 #   C-12 — inbox file names match the inbox-watcher dropper contract
 #   C-13 — an old-style note (.compact-requested, .recycle-requested) is never carried out: it's
 #          removed and the agent is told to use the command
-#   C-14 — a request the agent never comes to rest for expires
+#   C-14 — a request the agent never comes to rest for expires, with a "didn't happen" event
 #   C-15 — control characters are stripped from the guidance
 #   C-16 — the dormancy check holds off while a compaction is asked for / under way / queued
 #   C-17..C-20 — agent_at_rest on idle, busy, quoted-footer-text and dialog panes
@@ -168,7 +168,10 @@ setup
 printf '2026-10-25T15:00:00.000Z\n' > "$D/.compacting"
 touch -d '30 minutes ago' "$D/.compacting"
 handle_compaction "$N" "sess"
-if [ ! -e "$D/.compacting" ] && [ "$(inbox_count)" = 0 ]; then pass; else fail "marker kept or event sent"; fi
+if [ ! -e "$D/.compacting" ] && [ "$(inbox_count)" = 1 ] \
+   && inbox_only | grep -q "<summary>Compaction didn't happen ($N) — delivered by agent-supervisor</summary>" \
+   && inbox_only | grep -q "no compaction landed"; then pass
+else fail "marker=$([ -e "$D/.compacting" ] && echo kept) body='$(inbox_only)'"; fi
 teardown
 
 CURRENT_TEST="C-12 dropper contract names"
@@ -202,7 +205,10 @@ CURRENT_TEST="C-14 stale request expires"
 setup
 : > "$D/.compact-queued"; touch -d '2 hours ago' "$D/.compact-queued"; STUB_AT_REST=0
 handle_compaction "$N" "sess"
-if [ ! -e "$D/.compact-queued" ] && [ "$(inbox_count)" = 0 ]; then pass; else fail "stale request kept or delivered"; fi
+if [ ! -e "$D/.compact-queued" ] && [ ! -e "$D/.compacting" ] && [ "$(inbox_count)" = 1 ] \
+   && inbox_only | grep -q "Compaction didn't happen" && inbox_only | grep -q "so it was dropped" \
+   && ! inbox_only | grep -q "^/compact"; then pass
+else fail "request=$([ -e "$D/.compact-queued" ] && echo kept) body='$(inbox_only)'"; fi
 teardown
 
 CURRENT_TEST="C-15 control characters stripped from guidance"
