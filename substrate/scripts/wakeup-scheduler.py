@@ -1758,13 +1758,19 @@ def _request_new_agent(spec, state_dir, sensor_fire=None, sensor_broken_prompt=N
                 return None
     req_id = str(_uuid.uuid4())
     body = _spawn_body(spec, sensor_fire, sensor_broken_prompt, sensor_tripped_prompt)
-    os.makedirs(out_dir, exist_ok=True)
-    write_atomic_json(os.path.join(out_dir, "%020d-%s.json" % (time.time_ns(), req_id)),
-                      {"id": req_id, "slug": slug, "clock": bool(clock), "body": body,
-                       "queued_at": time.time(), "sent": False})
+    kind = ("clock" if clock else "notice" if (sensor_broken_prompt is not None or sensor_tripped_prompt is not None)
+            else "sensor")
+    path = os.path.join(out_dir, "%020d-%s.json" % (time.time_ns(), req_id))
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        write_atomic_json(path, {"id": req_id, "slug": slug, "kind": kind, "clock": bool(clock),
+                                 "body": body, "queued_at": time.time(), "sent": False})
+    except OSError as e:
+        print("⚠️ [wakeup-scheduler: %s] couldn't keep this fire to send: %s" % (slug, e), flush=True)
+        return None
     print("wakeup-scheduler: new agent asked for: request %s for slug=%s (roles=%s)"
           % (req_id, slug, spec.get("roles", [])), file=sys.stderr, flush=True)
-    _send_outbox(state_dir)
+    _send_outbox(state_dir, only=path)
     return req_id
 
 
@@ -1822,13 +1828,22 @@ def _spawn_body(spec, sensor_fire=None, sensor_broken_prompt=None, sensor_trippe
 
 FLEET_SERVICE = os.environ.get("WAKEUP_FLEET_SERVICE") or os.path.join(
     os.path.expanduser("~"), ".local", "bin", "fleet-service")
-# How long one send waits for the server's answer before the next pass asks again by id.
-SEND_TIMEOUT_SEC = int(os.environ.get("WAKEUP_SEND_TIMEOUT_SEC", "20"))
-# The server can't be reached (or this machine has no credential yet): try again next pass.
+# How long one send waits for the server's answer; a slower one is asked for again by id
+# on a later pass, so a busy server never holds the scheduler up for long.
+SEND_TIMEOUT_SEC = int(os.environ.get("WAKEUP_SEND_TIMEOUT_SEC", "3"))
+# At most this long spent sending in one pass; the rest wait for the next pass.
+SEND_BUDGET_SEC = float(os.environ.get("WAKEUP_SEND_BUDGET_SEC", "20"))
+# The server can't be reached (or this machine has no credential yet): it's down for every
+# waiting request, so the pass stops and tries again next pass.
 _SEND_LATER = ("unreachable", "not_set_up")
 # The server no longer has it (a restart; or it waited too long or its queue was full): send
 # it again. A new agent records the request that made it, so a resend never makes two.
 _SEND_AGAIN = ("lost", "expired", "queue_full")
+# Answers that sending again can't change: the request itself is wrong. Anything else (the
+# server couldn't reach the machine or the chat server, a failed birth, a proxy's error page)
+# is tried again later, backing off up to RETRY_MAX_SEC, never given up on.
+_REFUSED_FOR_GOOD = ("malformed", "role_unknown", "visibility_unresolved")
+RETRY_MAX_SEC = 3600
 
 
 def _outbox_dir(state_dir):
@@ -1851,32 +1866,80 @@ def _outbox_entries(out_dir):
     return out
 
 
-def _send_outbox(state_dir):
-    """Send each waiting new-agent request, oldest first, and forget each one the server
-    has answered. Stops at the first one the server can't take now (it's down for all)."""
+def _still_wanted(state_dir, entry):
+    """A clock or sensor fire is only sent while its scheduled conversation still exists and is
+    switched on (deleted or switched off meanwhile: it isn't run). A manual run, and the notice
+    of a broken or tripped sensor (sent because the trip switched it off), need only the spec."""
+    slug = entry.get("slug")
+    if not isinstance(slug, str) or not re.match(r"^[A-Za-z0-9_-]{1,80}$", slug):
+        return False
+    try:
+        spec = json.load(open(os.path.join(os.path.dirname(state_dir), slug, "scheduled-agent.json")))
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return True          # unreadable for now: keep it rather than lose the run
+    kind = entry.get("kind") or ("clock" if entry.get("clock") else "sensor")
+    if kind in ("clock", "sensor"):
+        return isinstance(spec, dict) and spec.get("enabled") is not False
+    return True
+
+
+def _save_entry(path, entry):
+    try:
+        write_atomic_json(path, entry)
+        return True
+    except OSError as e:
+        print("wakeup-scheduler: couldn't update %s: %s — tried again next pass" % (path, e),
+              file=sys.stderr, flush=True)
+        return False
+
+
+def _drop_entry(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _send_outbox(state_dir, only=None):
+    """Send each waiting new-agent request, oldest first, and forget each one the server has
+    answered. `only`: just that entry (a fire just made). Stops at the first one the server
+    can't take now (it's down for all), or once SEND_BUDGET_SEC is spent. Never raises."""
     import subprocess
     out_dir = _outbox_dir(state_dir)
+    began = time.time()
     for path, entry in _outbox_entries(out_dir):
+        if only is not None and path != only:
+            continue
+        if time.time() - began >= SEND_BUDGET_SEC:
+            return
         if not isinstance(entry, dict) or not isinstance(entry.get("id"), str) \
                 or not isinstance(entry.get("body"), dict):
             print("wakeup-scheduler: unreadable outbox entry %s — dropped" % path, file=sys.stderr, flush=True)
-            try: os.unlink(path)
-            except OSError: pass
+            _drop_entry(path)
+            continue
+        rid, slug = entry["id"], entry.get("slug", "?")
+        if not _still_wanted(state_dir, entry):
+            print("wakeup-scheduler: slug=%s was deleted or switched off while %s waited — not run"
+                  % (slug, rid), file=sys.stderr, flush=True)
+            _drop_entry(path)
+            continue
+        if time.time() < float(entry.get("next_try") or 0):
             continue
         if not os.path.isfile(FLEET_SERVICE):
-            print("wakeup-scheduler: fleet-service isn't installed yet — %s waits" % entry["id"],
+            print("wakeup-scheduler: fleet-service isn't installed yet — %s waits" % rid,
                   file=sys.stderr, flush=True)
             return
-        rid, slug = entry["id"], entry.get("slug", "?")
         input_path = path + ".input"
-        if entry.get("sent"):
-            argv = [FLEET_SERVICE, "collect", rid, "--timeout", str(SEND_TIMEOUT_SEC)]
-        else:
-            with open(input_path, "w") as f:
-                json.dump(entry["body"], f)
-            argv = [FLEET_SERVICE, "call", "identity-birth", "--input-file", input_path,
-                    "--id", rid, "--timeout", str(SEND_TIMEOUT_SEC)]
         try:
+            if entry.get("sent"):
+                argv = [FLEET_SERVICE, "collect", rid, "--timeout", str(SEND_TIMEOUT_SEC)]
+            else:
+                with open(input_path, "w") as f:
+                    json.dump(entry["body"], f)
+                argv = [FLEET_SERVICE, "call", "identity-birth", "--input-file", input_path,
+                        "--id", rid, "--timeout", str(SEND_TIMEOUT_SEC)]
             p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                stdin=subprocess.DEVNULL, timeout=SEND_TIMEOUT_SEC + 60)
             lines = [ln for ln in p.stdout.decode("utf-8", "replace").splitlines() if ln.strip()]
@@ -1886,8 +1949,7 @@ def _send_outbox(state_dir):
                   % (rid, slug, e), file=sys.stderr, flush=True)
             return
         finally:
-            try: os.unlink(input_path)
-            except OSError: pass
+            _drop_entry(input_path)
         if not isinstance(resp, dict):
             print("wakeup-scheduler: no answer for %s (slug=%s, exit %d) — tried again next pass"
                   % (rid, slug, p.returncode), file=sys.stderr, flush=True)
@@ -1897,15 +1959,16 @@ def _send_outbox(state_dir):
             print("wakeup-scheduler: slug=%s request %s → new agent %s%s"
                   % (slug, rid, result.get("name"), " (already made)" if result.get("already") else ""),
                   file=sys.stderr, flush=True)
-            try: os.unlink(path)
-            except OSError: pass
+            _drop_entry(path)
             continue
         err = resp.get("error") if isinstance(resp.get("error"), dict) else {}
         code = err.get("code")
+        message = err["message"] if isinstance(err.get("message"), str) else ""
         if code == "timeout":
+            # The server has it and is still on it: asked for again by id on a later pass.
             if not entry.get("sent"):
                 entry["sent"] = True
-                write_atomic_json(path, entry)
+                _save_entry(path, entry)
             continue
         if code in _SEND_LATER:
             print("wakeup-scheduler: the server can't take %s now (%s) — tried again next pass"
@@ -1913,15 +1976,21 @@ def _send_outbox(state_dir):
             return
         if code in _SEND_AGAIN:
             entry["sent"] = False
-            write_atomic_json(path, entry)
+            _save_entry(path, entry)
             print("wakeup-scheduler: %s came back %s — sent again next pass" % (rid, code),
                   file=sys.stderr, flush=True)
             continue
-        print("⚠️ [wakeup-scheduler: %s] couldn't start its conversation: %s%s"
-              % (slug, code, (" — " + err["message"]) if isinstance(err.get("message"), str) else ""),
-              flush=True)
-        try: os.unlink(path)
-        except OSError: pass
+        if code in _REFUSED_FOR_GOOD:
+            print("⚠️ [wakeup-scheduler: %s] couldn't start its conversation: %s%s"
+                  % (slug, code, (" — " + message) if message else ""), flush=True)
+            _drop_entry(path)
+            continue
+        tries = int(entry.get("tries") or 0) + 1
+        wait = min(RETRY_MAX_SEC, 30 * 2 ** min(tries - 1, 10))
+        entry.update(tries=tries, next_try=time.time() + wait, sent=False, last_error=(code or "unknown"))
+        _save_entry(path, entry)
+        print("wakeup-scheduler: slug=%s request %s failed (%s%s) — tried again in %ds"
+              % (slug, rid, code, (": " + message) if message else "", wait), file=sys.stderr, flush=True)
 
 
 def _single_instance(state_dir, ident_dir):

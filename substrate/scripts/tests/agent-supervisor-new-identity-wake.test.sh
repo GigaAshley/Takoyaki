@@ -14,7 +14,7 @@
 #   T-06  — NEW_IDENTITY_WAKE=off → plain sleep, ignores new folders
 #   T-07  — early wake records the newborn's name for the fast path
 #   T-08..T-11 — launch_newborns: launches a plain newborn; skips one with a tmux session, a
-#           dormant / archive-requested / file-less folder, and everything under DRY_RUN
+#           dormant / archive-claimed / file-less folder, and everything under DRY_RUN
 #
 # Exits 0 on all-pass; 1 on any failure. Requires inotifywait (skips if absent).
 #
@@ -134,10 +134,10 @@ reset_dir; echo kid >"$SCRATCH/sessions"; LAUNCHED=(); newborn kid; EARLY_WAKE_N
 launch_newborns
 if [ "${#LAUNCHED[@]}" = 0 ]; then pass; else fail "launched='${LAUNCHED[*]}'"; fi
 
-CURRENT_TEST="T-10 fast path skips dormant / archive-requested / no-identity-file folders"
+CURRENT_TEST="T-10 fast path skips dormant / archive-claimed / no-identity-file folders"
 reset_dir; : >"$SCRATCH/sessions"; LAUNCHED=()
 newborn sleepy; touch "$AGENT_IDENTITIES_DIR/sleepy/.dormant"
-newborn gone; touch "$AGENT_IDENTITIES_DIR/gone/.archive-requested"
+newborn gone; touch "$AGENT_IDENTITIES_DIR/gone/.archiving"
 mkdir -p "$AGENT_IDENTITIES_DIR/halfbaked"
 EARLY_WAKE_NAMES="sleepy gone halfbaked"
 launch_newborns

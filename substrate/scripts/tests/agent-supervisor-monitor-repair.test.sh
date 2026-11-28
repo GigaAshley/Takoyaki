@@ -10,7 +10,7 @@
 #   T-02  — a monitor bound to the live harness: no repair
 #   T-03  — no monitor at all: repaired on the identity's session, marker written
 #   T-04  — a second miss within MONITOR_REPAIR_MINUTES: not repaired again
-#   T-05  — .archive-requested present: never repaired (retire owns the monitor then)
+#   T-05  — archive claimed (.archiving): never repaired (retire owns the monitor then)
 #   T-06  — only a stale monitor (its harness gone): repaired
 #   T-07  — snapshot miss, but a monitor for the current harness started since: no repair
 #   T-08  — harness PID can't be resolved: left alone
@@ -104,7 +104,7 @@ START_CALLS="$SCRATCH/start.calls"
 start_ambient_monitor() { printf '%s %s\n' "$1" "$2" >> "$START_CALLS"; }
 MARKER="$DORMANCY_STATE_DIR/alice.monitor-repaired"
 reset() {
-  rm -f "$START_CALLS" "$MARKER" "$AGENT_IDENTITIES_DIR/alice/.archive-requested"
+  rm -f "$START_CALLS" "$MARKER" "$AGENT_IDENTITIES_DIR/alice/.archiving"
   local p; for p in "${STARTED[@]}"; do [ "$p" = "$HARNESS" ] || kill -9 "$p" 2>/dev/null; done
   HARNESS_PID="$HARNESS"
   sleep 0.2
@@ -139,9 +139,9 @@ repair_ambient_monitor alice sess-a
 if [ ! -e "$START_CALLS" ] && grep -q "not repairing" "$SCRATCH/log"; then pass
 else fail "start calls='$(cat "$START_CALLS" 2>/dev/null)'"; fi
 
-CURRENT_TEST="T-05 .archive-requested: never repaired"
+CURRENT_TEST="T-05 archive claimed: never repaired"
 reset
-touch "$AGENT_IDENTITIES_DIR/alice/.archive-requested"
+touch "$AGENT_IDENTITIES_DIR/alice/.archiving"
 snapshot_ambient_monitors
 repair_ambient_monitor alice sess-a
 if [ ! -e "$START_CALLS" ] && [ ! -e "$MARKER" ]; then pass; else fail "repaired during a retire"; fi

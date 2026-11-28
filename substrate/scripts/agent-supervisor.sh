@@ -2737,7 +2737,7 @@ _unarchive_identity() {
 
   # Step 5: clear the flag, progress state and any old refusal note BEFORE the mv, and mark
   # what's left to do after it (apps, banner) so a pass cut off after the move still does it.
-  rm -f "${d:?}/.unarchive-refused" "${d:?}/.unarchive-reactivate" "${d:?}/.unarchive-requested"
+  rm -f "${d:?}/.unarchive-refused" "${d:?}/.unarchive-reactivate" "${d:?}/.unarchive-requested" "${d:?}/.compact-queued" "${d:?}/.not-carried-out"
   : > "$d/.unarchive-finishing"
 
   # Step 6: mv archive → live, as one change under the change lock.

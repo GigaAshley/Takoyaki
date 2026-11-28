@@ -211,9 +211,11 @@ everything else.
   export it. Slug must be kebab-case. Title is optional; defaults to
   a title-cased slug if omitted. Prints the app's link when done.
 
-- **Moving an app** — `fleet-change submit app-move '{"slug":"<slug>","to":"project","project":"<project>"}'`
-  or `… '{"slug":"<slug>","to":"sidebar","users":["a","b"]}'` (`"users":null`
-  for everyone). The machine's front door moves it in its turn with every
+- **Moving an app** — `fleet-change submit app-move '{"slug":"<slug>","to":"project","project":"<project>"}' --wait 120`
+  or `… '{"slug":"<slug>","to":"sidebar","users":["a","b"]}' --wait 120` (`"users":null`
+  for everyone). A move takes a little while; `--wait 120` waits for its
+  outcome (if it still says it's waiting, `fleet-change status <id> --wait 120`
+  with the id it printed). The machine's front door moves it in its turn with every
   other change and prints the outcome: stops it, moves the folder (data,
   icon, marker and all), reinstalls its units on the SAME port, checks it
   answers, rolls back on failure. The same as the user's **Move to**; see
@@ -226,7 +228,7 @@ everything else.
   supervisor call it; you rarely need it directly. `app-units.sh find <slug>`
   prints an app's folder; `app-units.sh port <slug>` its public port.
 
-- **Archiving an app** — `fleet-change submit app-archive '{"slug":"<slug>"}'`.
+- **Archiving an app** — `fleet-change submit app-archive '{"slug":"<slug>"}' --wait 120`.
   Sidebar apps only. In its turn the front door stashes the app's units
   inside its folder, stops and removes them, moves `~/fleet/apps/<slug>/` to
   `~/fleet/apps-archive/<slug>/`, and prints the outcome. This is the
@@ -234,7 +236,7 @@ everything else.
   their minds. Conversation and project apps are never archived on their
   own — they go with the conversation or the project.
 
-- **Un-archiving an app** — `fleet-change submit app-unarchive '{"slug":"<slug>"}'`:
+- **Un-archiving an app** — `fleet-change submit app-unarchive '{"slug":"<slug>"}' --wait 120`:
   the folder goes back from `apps-archive/` to `apps/`, its units are
   reinstalled from the stashed copies on its old port, and it starts.
 
@@ -772,11 +774,11 @@ the conversation (and come back if it is un-archived). Project apps are
 archived with their project. The front door refuses both; to archive one
 sooner, move it to the sidebar first.
 
-    fleet-change submit app-archive '{"slug":"<slug>"}'
+    fleet-change submit app-archive '{"slug":"<slug>"}' --wait 120
 
 If the user later says "wait, I want that back":
 
-    fleet-change submit app-unarchive '{"slug":"<slug>"}'
+    fleet-change submit app-unarchive '{"slug":"<slug>"}' --wait 120
 
 Each prints its outcome once the machine has done it (or why it refused).
 
@@ -886,7 +888,7 @@ what you're doing — surprises here are worse than a moment of confirmation.
   then `mv app.json.pending app.json` (§ Making a new app step 9).
 - **How do I see archived apps?** `ls ~/fleet/apps-archive/`.
 - **How do I recover an archived app?**
-  `fleet-change submit app-unarchive '{"slug":"<slug>"}'` — the machine
+  `fleet-change submit app-unarchive '{"slug":"<slug>"}' --wait 120` — the machine
   reverses the archive and prints the outcome.
 - **What if create-app fails partway through?** The helper is not perfectly
   transactional; if it crashes mid-way, check the app folder and

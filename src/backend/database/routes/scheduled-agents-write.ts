@@ -423,7 +423,7 @@ function outboxEntry(slug: string, requestId: string, body: Record<string, unkno
   const ns = (BigInt(Date.now()) * 1_000_000n).toString().padStart(20, "0");
   return {
     name: `${ns}-${requestId}.json`,
-    text: JSON.stringify({ id: requestId, slug, clock: false, body, queued_at: Date.now() / 1000, sent: false }),
+    text: JSON.stringify({ id: requestId, slug, kind: "manual", clock: false, body, queued_at: Date.now() / 1000, sent: false }),
   };
 }
 

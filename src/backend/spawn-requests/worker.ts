@@ -364,6 +364,11 @@ export async function writeResponseFile(
 
 const BORN_CHECK_TIMEOUT_MS = 15_000;
 
+/** Direct-route requests whose birth attempt timed out, and when: the abandoned attempt may
+ *  still land for a while, so a resend in that window doesn't start another birth. */
+const directTimedOut = new Map<string, number>();
+const DIRECT_LANDING_MS = 10 * 60 * 1000;
+
 /** The agent, live or archived, whose folder records this request as the one that made it. */
 export async function findBornByRequest(item: PendingBirth): Promise<string | null> {
   if (!/^[A-Za-z0-9._-]{1,80}$/.test(item.uuid)) return null;
@@ -572,6 +577,16 @@ const doBirth = async (item: PendingBirth, deps: WorkerDeps): Promise<void> => {
         error: err instanceof Error ? err.message : String(err),
       });
       await writeFailureFile(item, deps, { reason: "peer_host_unreachable" });
+      return;
+    }
+    for (const [id, at] of directTimedOut) if (deps.now().getTime() - at >= DIRECT_LANDING_MS) directTimedOut.delete(id);
+    const timedOut = directTimedOut.get(item.uuid);
+    if (already === null && timedOut !== undefined && deps.now().getTime() - timedOut < DIRECT_LANDING_MS) {
+      // An earlier attempt of this request timed out and may still land: never a second birth.
+      await writeFailureFile(item, deps, {
+        reason: "birth_timeout",
+        message: "an earlier attempt of this request may still land; send it again in a few minutes",
+      });
       return;
     }
     if (already !== null) {
@@ -1067,6 +1082,27 @@ const doBirth = async (item: PendingBirth, deps: WorkerDeps): Promise<void> => {
           partialName,
           timeoutMs: BIRTH_ATTEMPT_TIMEOUT_MS,
         });
+        if (item.direct) {
+          // Over the direct route the request's id finds the agent if it landed; sending the
+          // same request again later answers with it. Until the abandoned attempt can't still
+          // land, a resend waits rather than starting a second birth.
+          directTimedOut.set(item.uuid, deps.now().getTime());
+          let landed: string | null = null;
+          try {
+            landed = await (deps.findBornByRequest ?? findBornByRequest)(item);
+          } catch {
+            /* answered as still landing below */
+          }
+          if (landed !== null) {
+            await writeResponseFile(item, deps, "success", JSON.stringify({ name: landed, birthed_at: deps.now().toISOString() }));
+            return;
+          }
+          await writeFailureFile(item, deps, {
+            reason: "birth_timeout",
+            message: `Birth exceeded ${BIRTH_ATTEMPT_TIMEOUT_MS / 1000}s and may still land. Send the same request again (same id) in a few minutes: it answers with the agent if it was made, and never makes a second one.`,
+          });
+          return;
+        }
         await writeFailureFile(item, deps, {
           reason: "birth_timeout",
           message: `Birth exceeded ${BIRTH_ATTEMPT_TIMEOUT_MS / 1000}s wall-clock timeout. Identity '${partialName}' MAY have been born on the peer host — verify (fleet/identities/${partialName} + tmux session) BEFORE retrying to avoid duplicate.`,

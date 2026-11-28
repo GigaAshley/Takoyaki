@@ -1984,4 +1984,34 @@ describe("direct-route births (a fleet-service request)", () => {
     expect(respond.mock.calls[0][0]).toBe("failure");
     expect(JSON.parse(respond.mock.calls[0][1] as string)).toMatchObject({ reason: "pool_exhausted" });
   });
+
+  it("a timed-out birth answers with the agent if it landed, and a resend meanwhile never starts another", async () => {
+    vi.useFakeTimers();
+    try {
+      const respond = vi.fn();
+      const findBornByRequest = vi.fn().mockResolvedValue(null);
+      const deps = buildTestDeps({
+        findBornByRequest,
+        birthIdentity: vi.fn(() => new Promise<void>(() => {})),
+      });
+      const p = processBirth(makePendingBirth({ direct: true, respond, uuid: "slow-1" }), deps);
+      await vi.advanceTimersByTimeAsync(4 * 60 * 1000);
+      await p;
+      expect(respond.mock.calls[0][0]).toBe("failure");
+      expect(JSON.parse(respond.mock.calls[0][1] as string)).toMatchObject({ reason: "birth_timeout" });
+      // Sent again while the abandoned attempt may still land: no second birth.
+      const again = vi.fn();
+      await processBirth(makePendingBirth({ direct: true, respond: again, uuid: "slow-1" }), deps);
+      expect(deps.birthIdentity).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(again.mock.calls[0][1] as string)).toMatchObject({ reason: "birth_timeout" });
+      // Once it has landed, the resend answers with it.
+      findBornByRequest.mockResolvedValue("willow");
+      const third = vi.fn();
+      await processBirth(makePendingBirth({ direct: true, respond: third, uuid: "slow-1" }), deps);
+      expect(third.mock.calls[0][0]).toBe("success");
+      expect(deps.birthIdentity).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

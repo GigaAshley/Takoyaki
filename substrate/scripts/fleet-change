@@ -1068,7 +1068,7 @@ def do_role_unarchive(args, entry, save_plan):
         raise Refused("archive_not_found", "'%s' isn't in the archive" % name)
     if os.path.exists(live):
         raise Refused("name_collision", "a live role named '%s' already exists on this machine" % name)
-    for n in (CLAIM, ".unarchive-requested", ".unarchive-refused", ".archive-requested"):
+    for n in (CLAIM, ".unarchive-requested", ".unarchive-refused", ".archive-requested", ".not-carried-out"):
         try:
             os.unlink(os.path.join(arch, n))
         except OSError:
@@ -1186,7 +1186,7 @@ def do_app_unarchive(args, entry, save_plan):
         if ("ListenStream=127.0.0.1:%s" % port) in unit_lines("app-*.socket") or \
                 ("Environment=PORT=%s" % port) in unit_lines("app-*.service"):
             raise Refused("port_in_use", "its port %s is now used by another app on this machine" % port)
-        for n in (".unarchive-requested", ".unarchive-refused", ".archive-requested"):
+        for n in (".unarchive-requested", ".unarchive-refused", ".archive-requested", ".not-carried-out"):
             try:
                 os.unlink(os.path.join(arch, n))
             except OSError:

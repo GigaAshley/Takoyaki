@@ -1423,19 +1423,27 @@ test_SA_G29_outbox_waits_for_the_server() {
   local home_dir res
   home_dir=$(make_tmpdir)
   res=$(HOME="$home_dir" python3 - "$PY_SCRIPT" "$home_dir" <<'PY'
-import glob, importlib.util, json, os, sys
+import glob, importlib.util, json, os, sys, time
 from importlib.machinery import SourceFileLoader
 l = SourceFileLoader("eng", sys.argv[1]); m = importlib.util.module_from_spec(importlib.util.spec_from_loader(l.name, l)); l.exec_module(m)
 home = sys.argv[2]
-state = os.path.join(home, "fleet", "scheduled-agents", ".state"); os.makedirs(state)
-outbox = os.path.join(home, "fleet", "scheduled-agents", ".outbox")
+root = os.path.join(home, "fleet", "scheduled-agents")
+state = os.path.join(root, ".state"); os.makedirs(state)
+outbox = os.path.join(root, ".outbox")
 sent = os.path.join(home, "fleet", "spawn-requests")
+def spec_file(slug, enabled=True):
+    os.makedirs(os.path.join(root, slug), exist_ok=True)
+    json.dump({"name": slug, "enabled": enabled, "roles": [], "prompt": "p", "schedule": {"type": "daily", "at": "09:00"}},
+              open(os.path.join(root, slug, "scheduled-agent.json"), "w"))
 def answer(a):
     if a is None: os.environ.pop("FAKE_FLEET_SERVICE_ANSWER", None)
     else: os.environ["FAKE_FLEET_SERVICE_ANSWER"] = a
 def waiting(): return sorted(glob.glob(os.path.join(outbox, "*.json")))
 def entries(): return [json.load(open(p)) for p in waiting()]
+def clear():
+    for p in waiting(): os.unlink(p)
 spec = {"name": "box check", "roles": [], "prompt": "check the box", "_slug": "box-check"}
+spec_file("box-check")
 errs = []
 answer('{"ok":false,"error":{"code":"unreachable","message":"down"}}')
 first = m._request_new_agent(spec, state, clock=True)
@@ -1457,9 +1465,40 @@ got = sorted(os.path.basename(p)[:-5] for p in glob.glob(os.path.join(sent, "*.j
 if first not in got or len(got) != 2: errs.append("sent again under the same id: %r" % got)
 calls = open(os.path.join(home, "fake-fs-calls")).read().split("\n")
 if "collect " + first not in calls: errs.append("a timed-out send wasn't asked for again by id: %r" % calls)
+# A refusal sending again can't change is dropped.
+spec_file("other")
 answer('{"ok":false,"error":{"code":"role_unknown","message":"no such role"}}')
 m._request_new_agent(dict(spec, _slug="other"), state, clock=True)
 if waiting(): errs.append("a refusal was kept")
+# Anything else is tried again later, backing off — never given up on.
+answer('{"ok":false,"error":{"code":"peer_host_unreachable","message":"ssh hiccup"}}')
+m._request_new_agent(spec, state, clock=True)
+e = entries()
+if len(e) != 1 or e[0].get("tries") != 1 or not e[0].get("next_try", 0) > time.time():
+    errs.append("a passing failure wasn't kept to try later: %r" % e)
+n_calls = len(open(os.path.join(home, "fake-fs-calls")).read().split("\n"))
+m._send_outbox(state)
+if len(open(os.path.join(home, "fake-fs-calls")).read().split("\n")) != n_calls: errs.append("retried before its time")
+clear()
+# Deleted or switched off while it waited: a clock or sensor fire isn't run; a manual run or a
+# tripped-sensor notice only needs the scheduled conversation to still exist.
+answer('{"ok":false,"error":{"code":"unreachable","message":"down"}}')
+spec_file("paused")
+m._request_new_agent(dict(spec, _slug="paused"), state, clock=True)
+m._request_new_agent(dict(spec, _slug="paused"), state, sensor_tripped_prompt="look into it")
+spec_file("paused", enabled=False)
+answer(None)
+m._send_outbox(state)
+left = entries()
+if left: errs.append("switched off: %r still waiting" % [x.get("kind") for x in left])
+got_after = sorted(os.path.basename(p)[:-5] for p in glob.glob(os.path.join(sent, "*.json")))
+if len(got_after) != len(got) + 1: errs.append("switched off: expected only the notice sent, got %d new" % (len(got_after) - len(got)))
+answer('{"ok":false,"error":{"code":"unreachable","message":"down"}}')
+m._request_new_agent(spec, state, clock=True)
+os.unlink(os.path.join(root, "box-check", "scheduled-agent.json"))
+answer(None)
+m._send_outbox(state)
+if waiting(): errs.append("deleted: still waiting")
 print("; ".join(errs) or "OK")
 PY
 )

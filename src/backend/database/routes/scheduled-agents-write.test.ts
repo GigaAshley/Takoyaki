@@ -1140,7 +1140,7 @@ describe("POST /scheduled-agents/:slug/run-now", () => {
     expect(target).toMatch(OUTBOX_RE);
     expect(target).toContain(out.requestId);
     const entry = queuedEntry();
-    expect(entry).toMatchObject({ id: out.requestId, slug: "morning-digest", clock: false, sent: false });
+    expect(entry).toMatchObject({ id: out.requestId, slug: "morning-digest", kind: "manual", clock: false, sent: false });
     const parsed = entry.body as Record<string, unknown>;
     expect(parsed.roles).toEqual(["box-maintainer"]);
     expect("skills" in parsed).toBe(false);
