@@ -130,6 +130,10 @@ interface SubscriberEntry {
   send: SendFrame;
   userId?: string;
   pendingFrames: FrontendOutboundFrameType[] | null;
+  /** Latest-wins frames (a host's whole machine-changes list): the newest dispatch per key.
+   *  A filter that finishes after a newer one for the same key is dropped, so an older
+   *  list never lands after a newer one. */
+  latest?: Map<string, number>;
 }
 
 /**
@@ -458,15 +462,21 @@ function fanOut(
  * shape (same op tag the sync fanOut uses) so log-side observability is
  * uniform across sync and async paths.
  */
+let latestGen = 0;
+
 async function fanOutApp(
   subscribers: Set<SubscriberEntry>,
   frame: FrontendOutboundFrameType,
   filter: AppFrameFilter,
+  latestKey?: string,
 ): Promise<void> {
+  const gen = ++latestGen;
   const results = await Promise.allSettled(
     Array.from(subscribers).map(async (entry) => {
+      if (latestKey !== undefined) (entry.latest ??= new Map()).set(latestKey, gen);
       const projected = await filter(frame, entry.userId);
       if (projected === null) return;
+      if (latestKey !== undefined && entry.latest?.get(latestKey) !== gen) return;
       // Phase 118 code-review HIGH-4 (fix pass 2026-09-18): if the
       // subscribe-path app-snapshot has not yet flushed for this
       // subscriber, queue the projected frame instead of delivering it
@@ -778,7 +788,23 @@ export function createSubscriptionRegistry(
               }
             }
 
-            // Replay each host's open changes, projected per subscriber.
+            const projected = await appFrameFilter(rawSnapshot, userIdForFilter);
+            if (projected !== null) {
+              sendFrame(projected);
+            }
+          } catch (err) {
+            systemLogger.warn(
+              "Fleet-status app-snapshot filter/delivery failed",
+              {
+                operation: "fleet_status_app_snapshot_failed",
+                error: err instanceof Error ? err.message : "unknown",
+              },
+            );
+          } finally {
+            // Replay each host's open changes, projected per subscriber — after the app
+            // snapshot, so a notice about an app is judged with its row in place (a row
+            // gets a mark; only a row-less notice is a pop-up). Here so a failed app
+            // snapshot doesn't skip it (an unchanged list isn't published again).
             for (const [cachedHostId, cachedChanges] of machineChangesCache) {
               try {
                 const projectedChanges = await appFrameFilter(
@@ -795,19 +821,6 @@ export function createSubscriptionRegistry(
               }
             }
 
-            const projected = await appFrameFilter(rawSnapshot, userIdForFilter);
-            if (projected !== null) {
-              sendFrame(projected);
-            }
-          } catch (err) {
-            systemLogger.warn(
-              "Fleet-status app-snapshot filter/delivery failed",
-              {
-                operation: "fleet_status_app_snapshot_failed",
-                error: err instanceof Error ? err.message : "unknown",
-              },
-            );
-          } finally {
             // Drain-and-null runs in BOTH success and failure branches.
             // If snapshot fails, the client either resubscribes or the
             // next sweep tick re-populates state — either way, blocking
@@ -1045,7 +1058,7 @@ export function createSubscriptionRegistry(
       machineChangesCache.set(hostId, changes.slice());
       const frame = makeMachineChangesFrame(hostId, changes);
       if (appFrameFilter !== undefined) {
-        void fanOutApp(subscribers, frame, appFrameFilter);
+        void fanOutApp(subscribers, frame, appFrameFilter, `machine-changes:${hostId}`);
       } else {
         fanOut(subscribers, frame);
       }
@@ -1056,7 +1069,7 @@ export function createSubscriptionRegistry(
       if (cached === undefined) return;
       const frame = makeMachineChangesFrame(hostId, cached);
       if (appFrameFilter !== undefined) {
-        void fanOutApp(subscribers, frame, appFrameFilter);
+        void fanOutApp(subscribers, frame, appFrameFilter, `machine-changes:${hostId}`);
       } else {
         fanOut(subscribers, frame);
       }

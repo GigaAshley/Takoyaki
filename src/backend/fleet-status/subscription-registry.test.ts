@@ -1909,4 +1909,38 @@ describe("publishMachineChanges — one machine's open changes", () => {
     const got = frames(registry);
     expect(got.filter((f) => f.type === "machine-changes").map((f) => (f as { hostId: string }).hostId)).toEqual(["1", "2"]);
   });
+  it("a device that connects later gets the app list before the open changes", async () => {
+    const registry = createSubscriptionRegistry({ appFrameFilter: async (frame) => frame });
+    registry.publishMachineChanges("1", [waiting]);
+    const got: FrontendOutboundFrameType[] = [];
+    registry.subscribe((f) => got.push(f), { userId: "1" });
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    const types = got.map((f) => f.type);
+    expect(types).toContain("machine-changes");
+    expect(types.indexOf("app-snapshot")).toBeGreaterThanOrEqual(0);
+    expect(types.indexOf("app-snapshot")).toBeLessThan(types.indexOf("machine-changes"));
+  });
+
+  it("an older list whose filter finishes last never lands after the newer one", async () => {
+    const releases: Array<() => void> = [];
+    const registry = createSubscriptionRegistry({
+      appFrameFilter: (frame) =>
+        frame.type === "machine-changes"
+          ? new Promise((resolve) => releases.push(() => resolve(frame)))
+          : Promise.resolve(frame),
+    });
+    const got: FrontendOutboundFrameType[] = [];
+    registry.subscribe((f) => got.push(f), { userId: "1" });
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    got.length = 0;
+    releases.length = 0;
+    registry.publishMachineChanges("1", [waiting]);
+    registry.publishMachineChanges("1", []);
+    releases[1]();
+    releases[0]();
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    const lists = got.filter((f) => f.type === "machine-changes");
+    expect(lists).toHaveLength(1);
+    expect(lists[0]).toMatchObject({ changes: [] });
+  });
 });
