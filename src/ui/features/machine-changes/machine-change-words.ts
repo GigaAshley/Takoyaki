@@ -55,17 +55,20 @@ export function movingLabel(c: MachineChange, projectName: (slug: string) => str
 
 /** A failure mark's short label on its row. */
 export function failureLabel(c: MachineChange): string {
+  if (c.state === "taken") return "Archived";
   return c.state === "unfiled" ? "Not filed" : `Couldn't ${verbFor(c)}`;
 }
 
 function noticeTitle(c: MachineChange, thing: string): string {
   if (c.state === "unfiled") return `${thing} is in Conversations`;
+  if (c.state === "taken") return `${thing} was archived`;
   return `Couldn't ${verbFor(c)} ${thing}`;
 }
 
 function noticeBody(c: MachineChange): string {
   const why = c.reason ? reasonSentence(c.reason) : "";
   if (c.state === "unfiled") return why ? `${why} It was left in Conversations.` : "It was left in Conversations.";
+  if (c.state === "taken") return why || "It was archived with its project.";
   return why || "The machine didn't say why.";
 }
 

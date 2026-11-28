@@ -580,6 +580,8 @@ export async function filterAppFrame(
     //     server is waiting on it for them right now (their answer is on its way);
     //   - stuck: whoever archived it — or, for an archive no person asked for, everyone
     //     who can see it — until one of their devices has claimed it;
+    //   - taken (their agent archived with a project by someone else): the people it was
+    //     theirs, once;
     //   - waiting / running / returning: everyone who can see it.
     // A move's destination hidden from them is named as hidden. Gate fields are stripped.
     if (!(await canUserSee(frame.hostId))) return null;
@@ -601,6 +603,10 @@ export async function filterAppFrame(
         if (!mine || ctx.beingAsked?.(frame.hostId, raw.id) || seen(raw.id)) continue;
       } else if (raw.state === "stuck") {
         if (!(mine || raw.byUser === undefined) || seen(`${raw.id}:stuck`)) continue;
+      } else if (raw.state === "taken") {
+        // Their agent archived with a project by someone else: its people (the audience,
+        // checked above), each once.
+        if (mine || callerUsername === null || seen(raw.id)) continue;
       }
       // eslint-disable-next-line @typescript-eslint/no-unused-vars
       const { audience: _a, toAudience, cardAudience, byUser: _u, byAgent: _g, ...rest } = raw;

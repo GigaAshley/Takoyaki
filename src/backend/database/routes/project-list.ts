@@ -783,9 +783,16 @@ router.post(
 
         // The machine archives exactly what it holds now — refused when that
         // no longer matches the list the user confirmed.
+        // Who's archiving: the people an agent in it belongs to are told it went, and by whom.
+        let asker: string | null = null;
+        try {
+          asker = await getUsernameForUserId(userId);
+        } catch {
+          // Not knowing only means nobody else is told.
+        }
         let outcome: Awaited<ReturnType<typeof submitFrontDoor>>;
         try {
-          outcome = await submitFrontDoor(conn, "project-archive", { slug, expected }, { id: requestId, hostId, by: userId });
+          outcome = await submitFrontDoor(conn, "project-archive", { slug, expected, ...(asker ? { asker } : {}) }, { id: requestId, hostId, by: userId });
         } catch (err) {
           databaseLogger.error(
             `failed to archive project hostId=${hostId} slug=${slug}: ${err instanceof Error ? err.message : String(err)}`,

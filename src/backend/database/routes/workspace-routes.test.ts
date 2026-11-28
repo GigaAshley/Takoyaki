@@ -742,6 +742,24 @@ describe("PUT /workspace/write-file", () => {
     expect(res.body).toEqual({ error: "file_changed", version: "c".repeat(64) });
   });
 
+  it("refused because it's being archived → 409 being_archived, not host_unreachable", async () => {
+    mockSaveFileAtTurn.mockResolvedValueOnce({ ok: false, status: 409, code: "being_archived", error: "it's being archived" } as never);
+    const res = await httpRequest(server, {
+      method: "PUT",
+      path: "/workspace/write-file",
+      body: JSON.stringify({ identityKey: "echo", hostId: 42, relativePath: "notes.txt", content: "x", version: "a".repeat(64) }),
+    });
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: "being_archived" });
+    mockSaveFileAtTurn.mockResolvedValueOnce({ ok: false, status: 409, code: "upload_missing", error: "the upload went missing" } as never);
+    const other = await httpRequest(server, {
+      method: "PUT",
+      path: "/workspace/write-file",
+      body: JSON.stringify({ identityKey: "echo", hostId: 42, relativePath: "notes.txt", content: "x", version: "a".repeat(64) }),
+    });
+    expect(other.body).toEqual({ error: "save_refused" });
+  });
+
   it("no version, or a made-up one → 400 before the host is touched", async () => {
     for (const version of [undefined, "nope"]) {
       const res = await httpRequest(server, {
@@ -1645,6 +1663,8 @@ describe("what the machine owns is kept out of the Files tabs", () => {
       await postJson("POST", "/workspace/rename", { ...host, from: "fleet/apps-archive/old/app-old.socket.archived", to: "fleet/x" }),
       await postJson("POST", "/workspace/mkdir", { ...host, relativePath: "fleet/.changes/incoming" }),
       await postJson("DELETE", "/workspace/entry", { ...host, relativePath: "fleet/.change-lock" }),
+      await postJson("DELETE", "/workspace/entry", { ...host, relativePath: "fleet/identities/finch/.pinned" }),
+      await postJson("POST", "/workspace/create-file", { ...host, relativePath: "fleet/identities/finch/.pinned" }),
       await upload({ kind: "project", projectSlug: "garden", hostId: "42", relativePath: "apps/tally/.unarchive-requested" }, ".unarchive-requested"),
     ];
     for (const r of results) expect(r.body).toEqual(refused);

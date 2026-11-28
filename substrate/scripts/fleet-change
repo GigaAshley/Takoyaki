@@ -57,10 +57,11 @@ Request kinds:
   app-move          {"slug", "to":"sidebar", "users":[...]|null}
                     {"slug", "to":"project", "project":"<slug>"}
   project-contents  {"slug"}  what archiving it would take, as the machine sees it
-  project-archive   {"slug", "expected":{"projects":[...],"agents":[...],"apps":[...]}}
+  project-archive   {"slug", "expected":{"projects":[...],"agents":[...],"apps":[...]}, "asker"?}
                     refused with code contents_changed (and the current
                     contents as result) when the machine's contents no longer
-                    match what the user confirmed. Its agents are claimed.
+                    match what the user confirmed. Its agents are claimed; the people an
+                    agent belongs to, other than "asker" (who archived it), get a notice.
   agent-archive     {"name", "dormant"?: true, "idleFor"?: <s>, "by"?: "agent"|"scheduled"}
                     claims the agent (.archiving in its folder): from then on it's
                     gone from every list, never launched, and stopped; the
@@ -139,8 +140,9 @@ On disk, all under ~/fleet/.changes/:
   uploads/<file>            a new agent picture waiting for its agent-edit, or a file
                             waiting for its file-save (save-<id>)
   notices/<id>.json         a person's request that was refused or failed (or a new agent
-                            left in Conversations), kept a day so their devices can tell
-                            them; the machine's status report lists these
+                            left in Conversations, or someone's agent archived with a project
+                            by someone else), kept a day so their devices can tell them; the
+                            machine's status report lists these
   next-seq                  the next request number
   .serve.lock               held by the one running listener
 
@@ -741,10 +743,13 @@ def do_project_archive(args, entry, save_plan):
                 raise Failed("changed_during_restart",
                              "the archive was cut off, and since then %s appeared in it; "
                              "nothing more was archived" % ", ".join(extras[:5]))
-        return archive_by_plan(plan, save_plan, entry["id"], slug)
+        asker = args.get("asker")
+        if not (isinstance(asker, str) and USERNAME_RE.match(asker)):
+            asker = None
+        return archive_by_plan(plan, save_plan, entry["id"], slug, asker=asker, by=entry.get("by"))
 
 
-def archive_by_plan(plan, save_plan, rid, slug):
+def archive_by_plan(plan, save_plan, rid, slug, asker=None, by=None):
     # 1. Stop every app in the tree before any folder moves, so a failure here leaves the
     #    whole project as it was (the apps already stopped are started again).
     for app in plan["apps"]:
@@ -788,13 +793,21 @@ def archive_by_plan(plan, save_plan, rid, slug):
 
     # 3. Its agents are claimed, as an agent archive claims one; the supervisor finishes them.
     claimed = []
+    told = []
     for name in plan["agents"]:
         d = os.path.join(IDENTITIES, name)
         if os.path.isfile(os.path.join(d, name + ".md")):
+            users = fm_list(os.path.join(d, name + ".md"), "users", USERNAME_RE) or []
             claim(d, rid, "project:%s" % slug)
             claimed.append(name)
+            # Whose agent it is, when that isn't the person archiving: they're told.
+            others = [u for u in users if u != asker] if asker else []
+            if others:
+                told.append((name, others))
     if claimed:
         wake_supervisor()
+    for i, (name, others) in enumerate(told):
+        write_taken_notice("%s.%d" % (rid, i), name, others, asker, project_label(slug), by)
     return {
         "projects": [{"slug": p, "archivedAs": plan["archivedAs"].get(p)} for p in plan["projects"]],
         "agents": plan["agents"],
@@ -1759,7 +1772,7 @@ def file_version(data, keep_members=False):
 MACHINE_MARKERS = (".move-requested", ".move-failed", ".archive-requested", ".archiving",
                    ".unarchive-requested", ".unarchive-refused", ".unarchive-reactivate",
                    ".unarchive-finishing", ".unarchive-banner", ".change-lock", ".create-lock",
-                   ".compact-queued", ".compacting", ".not-carried-out")
+                   ".compact-queued", ".compacting", ".not-carried-out", ".pinned")
 
 
 def home_path(rel):
@@ -2099,6 +2112,19 @@ def write_notice(outcome, args):
         write_json_atomic(os.path.join(NOTICES, outcome["id"] + ".json"), notice)
     except OSError as e:
         log("WARN: couldn't keep the notice for %s: %s" % (outcome["id"], e))
+
+
+def write_taken_notice(nid, name, audience, asker, project, by):
+    """An agent archived with a project by someone other than the people it belongs to: kept
+    a day so whichever of their devices is open can tell them, and by whom."""
+    notice = {"id": nid, "state": "taken", "kind": "agent-archive", "args": {"name": name},
+              "audience": audience, "reason": "it was archived with the project \"%s\" by %s" % (project, asker),
+              "by": by if isinstance(by, dict) else {}, "at": time.time()}
+    try:
+        ensure_dirs()
+        write_json_atomic(os.path.join(NOTICES, nid + ".json"), notice)
+    except OSError as e:
+        log("WARN: couldn't keep the notice for %s: %s" % (nid, e))
 
 
 def prune():

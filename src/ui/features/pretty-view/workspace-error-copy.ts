@@ -41,7 +41,7 @@ export type WorkspaceErrorCopy = { heading: string; body: string };
  *
  * Workspace-specific additions:
  *   not_a_directory, already_exists, not_empty, reserved_file, machine_file,
- *   still_saving, machine_updating, file_exists,
+ *   still_saving, machine_updating, file_exists, being_archived, save_refused,
  *   invalid_identity_key, invalid_project_slug
  */
 export const WORKSPACE_ERROR_COPY: Record<string, WorkspaceErrorCopy> = {
@@ -125,6 +125,16 @@ export const WORKSPACE_ERROR_COPY: Record<string, WorkspaceErrorCopy> = {
   "still_saving": {
     heading: "Still saving",
     body: "The machine is still working on it. Open the file again before saving again.",
+  },
+
+  "being_archived": {
+    heading: "Being archived",
+    body: "This is being archived, so it can't be changed now.",
+  },
+
+  "save_refused": {
+    heading: "Not saved",
+    body: "The machine didn't save it. Open the file again and try once more.",
   },
 
   "machine_updating": {

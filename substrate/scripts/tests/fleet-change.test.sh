@@ -358,6 +358,30 @@ test_move_cut_off_after_the_folder_moved_is_finished() {
 
 # ---- archive and un-archive of agents, roles and apps ----
 
+test_project_archive_tells_the_people_whose_agents_it_took() {
+  local s; s=$(setup)
+  project "$s" shared "Shared"
+  agent "$s" bea shared; printf -- '---\nroles: []\nproject: shared\nusers:\n  - bob\n---\n' > "$s/fleet/identities/bea/bea.md"
+  agent "$s" ann shared; printf -- '---\nroles: []\nproject: shared\nusers:\n  - ann\n---\n' > "$s/fleet/identities/ann/ann.md"
+  agent "$s" all shared
+  fc "$s" submit project-archive '{"slug":"shared","asker":"ann","expected":{"projects":["shared"],"agents":["all","ann","bea"],"apps":[]}}' --id p1 --by user:u_Ann --wait 0 >/dev/null
+  serve_once "$s"
+  assert_eq done "$(field "$(fc "$s" status p1)" state)" "archived"
+  local n="$s/fleet/.changes/notices"
+  assert_eq 1 "$(ls "$n" | grep -c '^p1\.')" "one notice: only bea is someone else's"
+  local f; f=$(ls "$n"/p1.* | head -1)
+  assert_eq taken "$(field "$(cat "$f")" state)" "a taken notice"
+  assert_eq bea "$(field "$(cat "$f")" args.name)" "about bea"
+  assert_eq '["bob"]' "$(field "$(cat "$f")" audience)" "for bob"
+  assert_eq 'it was archived with the project "Shared" by ann' "$(field "$(cat "$f")" reason)" "which project, and who"
+  # Not knowing who archived it tells nobody.
+  project "$s" two "Two"; agent "$s" cy two; printf -- '---\nroles: []\nproject: two\nusers:\n  - bob\n---\n' > "$s/fleet/identities/cy/cy.md"
+  fc "$s" submit project-archive '{"slug":"two","expected":{"projects":["two"],"agents":["cy"],"apps":[]}}' --id p2 --wait 0 >/dev/null
+  serve_once "$s"
+  assert_eq 0 "$(ls "$n" | grep -c '^p2\.')" "no asker, no notice"
+  rm -rf "$s"
+}
+
 test_agent_archive_claims_at_once() {
   local s; s=$(setup)
   agent "$s" finch ""; mkdir -p "$s/fleet/identities/finch/apps/tally"; app "$s/fleet/identities/finch/apps/tally"
@@ -1074,6 +1098,7 @@ run_test test_odd_usernames_and_names_stay_strings
 run_test test_a_file_without_frontmatter_gets_one
 run_test test_move_to_a_hidden_project_answers_like_a_gone_one
 run_test test_who_asked_and_their_notices
+run_test test_project_archive_tells_the_people_whose_agents_it_took
 run_test test_role_edit_changes_only_its_lines
 run_test test_file_save_only_over_what_the_editor_opened
 run_test test_file_save_stays_inside_the_home_folder

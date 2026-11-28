@@ -55,6 +55,7 @@ import {
   isLocalHostId,
   writeMarkdownFileAtomic,
   getLocalAppsRoot,
+  getLocalProjectsRoot,
   appFolderRelPath,
   localAppFolderPath,
   type AppScope,
@@ -329,4 +330,36 @@ export async function updateAppTitle(
   const next = { ...(manifest as Record<string, unknown>), title: v.title };
   await writeAppFile(slug, "app.json", JSON.stringify(next, null, 2) + "\n", opts);
   return { title: v.title };
+}
+
+/**
+ * Where a sidebar or project app is on its machine right now: `{ project }` for a project
+ * app, `{}` for a sidebar app, null when it's in neither. For when the server's own list may
+ * be a moment behind (just after a move).
+ */
+export async function findAppScope(
+  slug: string,
+  opts: { hostId: number; conn: SSHClientType | null },
+): Promise<AppScope | null> {
+  assertValidAppSlug(slug);
+  if (isLocalHostId(opts.hostId)) {
+    const exists = (p: string) => fs.access(p).then(() => true, () => false);
+    if (await exists(path.join(getLocalAppsRoot(), slug, "app.json"))) return {};
+    const projects = await fs.readdir(getLocalProjectsRoot()).catch(() => [] as string[]);
+    for (const project of projects) {
+      if (project === "archive") continue;
+      if (await exists(path.join(getLocalProjectsRoot(), project, "apps", slug, "app.json"))) return { project };
+    }
+    return null;
+  }
+  if (opts.conn === null) throw new Error("conn required for remote host");
+  // Slug is APP_SLUG_RE-validated: safe inside double quotes.
+  const out = await execCommand(
+    opts.conn,
+    `if [ -f "$HOME/fleet/apps/${slug}/app.json" ]; then echo "@sidebar"; else ` +
+      `for d in "$HOME"/fleet/projects/*/apps/${slug}; do [ -f "$d/app.json" ] && basename "$(dirname "$(dirname "$d")")"; done; fi; true`,
+  );
+  const line = out.split("\n").map((l) => l.trim()).find((l) => l && l !== "archive");
+  if (!line) return null;
+  return line === "@sidebar" ? {} : { project: line };
 }

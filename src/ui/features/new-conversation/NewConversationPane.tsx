@@ -688,6 +688,9 @@ export function NewConversationPane({ tabId, picks, isVisible, onSelectPane }: N
     birthStartedRef.current = false;
     setBirthing(false);
     setFailure(BIRTH_FAILED);
+    // The name may have been taken a moment ago (two made at once): check it again, so the
+    // field says so before the next try.
+    if (name.trim() !== "") runCollisionPrecheck(name);
     if (!isVisibleRef.current) {
       void kitAlert({ title: "Couldn't create the agent", body: "Something went wrong while setting it up. Try again in a moment." });
     }

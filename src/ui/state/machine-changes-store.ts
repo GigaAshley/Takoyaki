@@ -12,6 +12,8 @@ import { useSyncExternalStore } from "react";
 //   - unfiled             a new agent of theirs left in Conversations (its project went),
 //   - stuck               an archive whose clean-up has failed for 10 minutes or more:
 //                         notices for this person; each goes once it has been seen
+//   - taken               an agent of theirs archived with a project by someone else
+//                         (`reason` says which project, and who)
 //
 // The sidebar marks what's waiting (moves, pins, archives), puts a failure mark on the
 // row it's about, and pops up the notices that have no row (machine-notices.ts).
@@ -20,7 +22,7 @@ import { useSyncExternalStore } from "react";
 // — so a change the device shows straight away stays shown until the machine says it's
 // done or refused, with no timer guessing.
 
-export type MachineChangeState = "waiting" | "running" | "returning" | "refused" | "failed" | "unfiled" | "stuck";
+export type MachineChangeState = "waiting" | "running" | "returning" | "refused" | "failed" | "unfiled" | "stuck" | "taken";
 
 export type MachineChange = {
   id: string;
@@ -38,7 +40,7 @@ export type MachineChange = {
 };
 
 const OPEN_STATES: ReadonlySet<MachineChangeState> = new Set(["waiting", "running", "returning"]);
-const NOTICE_STATES: ReadonlySet<MachineChangeState> = new Set(["refused", "failed", "unfiled"]);
+const NOTICE_STATES: ReadonlySet<MachineChangeState> = new Set(["refused", "failed", "unfiled", "taken"]);
 
 export function isOpen(c: MachineChange): boolean {
   return OPEN_STATES.has(c.state);

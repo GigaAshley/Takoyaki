@@ -395,6 +395,7 @@ export type SweepChangeState =
   | "refused"
   | "failed"
   | "unfiled"
+  | "taken"
   | "stuck";
 
 export interface SweepChangeEntry {
@@ -614,7 +615,7 @@ export function parseSweepJsonl(raw: string): SweepParseResult {
   };
 }
 
-const CHANGE_STATES = new Set(["waiting", "running", "returning", "refused", "failed", "unfiled", "stuck"]);
+const CHANGE_STATES = new Set(["waiting", "running", "returning", "refused", "failed", "unfiled", "stuck", "taken"]);
 const CHANGE_TARGETS = new Set(["agent", "app", "project", "role"]);
 
 function isStringList(v: unknown): v is string[] {

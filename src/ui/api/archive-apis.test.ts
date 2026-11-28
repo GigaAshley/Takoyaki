@@ -30,6 +30,42 @@ beforeEach(() => {
 });
 
 describe("archiveIdentity", () => {
+  it("the server going away while it waits its turn isn't a failure: asks again after a pause", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(authApi.post).mockResolvedValueOnce({ status: 202, data: { pending: true, requestId: "r7" } });
+      vi.mocked(authApi.get)
+        .mockRejectedValueOnce(axiosError(502, "<html>bad gateway</html>"))
+        .mockRejectedValueOnce(Object.assign(new axios.AxiosError("Network Error", "ERR_NETWORK")))
+        .mockResolvedValueOnce({ status: 200, data: { ok: true } });
+      const p = archiveIdentity(42, "wren");
+      await vi.advanceTimersByTimeAsync(10_000);
+      await expect(p).resolves.toMatchObject({ done: true, requestId: "r7" });
+      expect(authApi.get).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("the server away for longer than a minute: left to the machine's report, not failed", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(authApi.post).mockResolvedValueOnce({ status: 202, data: { pending: true, requestId: "r8" } });
+      vi.mocked(authApi.get).mockRejectedValue(axiosError(504, ""));
+      const p = archiveIdentity(42, "wren");
+      await vi.advanceTimersByTimeAsync(120_000);
+      await expect(p).resolves.toEqual({ done: false, requestId: "r8" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("the server's own 503 (the machine updating) is still an answer", async () => {
+    vi.mocked(authApi.post).mockResolvedValueOnce({ status: 202, data: { pending: true, requestId: "r6" } });
+    vi.mocked(authApi.get).mockRejectedValueOnce(axiosError(503, { error: "this machine is still updating", code: "not_installed" }));
+    await expect(archiveIdentity(42, "wren")).rejects.toMatchObject({ name: "MachineChangeError", code: "not_installed" });
+  });
+
   it("posts to the agent's archive route with a request id and returns the machine's answer", async () => {
     vi.mocked(authApi.post).mockResolvedValueOnce({ status: 200, data: { ok: true, requestId: "x", result: { claimed: ["wren"] } } });
     const r = await archiveIdentity(42, "wren");

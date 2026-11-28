@@ -13,7 +13,8 @@ import { showNoticePopup, showStuckPopup } from "./machine-change-words";
  *   - a refusal or failure whose thing has no row: a project that was never made, an
  *     agent, app or role that didn't come back from the archive, a role archive;
  *   - an archive whose clean-up has been stuck 10 minutes or more (one pop-up for all it
- *     took).
+ *     took);
+ *   - an agent of theirs archived with a project by someone else.
  *
  * Notices about something with a row are that row's failure mark instead
  * (MachineChangeMark). Mounted once, in AppShell; renders nothing.
@@ -48,7 +49,8 @@ export function MachineNoticePopups(): null {
       // pop-up for the request, about the role.
       const notices = new Map<string, MachineChange>();
       for (const c of changes) {
-        if (!isNotice(c) || !c.mine || hasRow(hostId, c)) continue;
+        // Theirs to be told: their own change, or their agent archived by someone else.
+        if (!isNotice(c) || !(c.mine || c.state === "taken") || hasRow(hostId, c)) continue;
         const prev = notices.get(c.id);
         if (!prev || c.target.type === "role") notices.set(c.id, c);
       }

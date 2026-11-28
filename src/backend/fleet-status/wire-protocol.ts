@@ -903,7 +903,7 @@ export const FrontendRelayRoomPlacementChangedFrameSchema = z.object({
 export const MachineChangeSchema = z.object({
   id: z.string(),
   kind: z.string(),
-  state: z.enum(["waiting", "running", "returning", "refused", "failed", "unfiled", "stuck"]),
+  state: z.enum(["waiting", "running", "returning", "refused", "failed", "unfiled", "stuck", "taken"]),
   target: z.object({
     type: z.enum(["agent", "app", "project", "role"]),
     name: z.string().nullable(),

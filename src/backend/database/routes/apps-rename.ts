@@ -44,6 +44,7 @@ import {
 } from "../../claude-session/identity-artifact-reader.js";
 import {
   AppManifestError,
+  findAppScope,
   updateAppTitle,
   validateAppTitle,
 } from "../../claude-session/per-app-file.js";
@@ -108,11 +109,21 @@ router.patch(
           getRegistry()
             ?.getAppSnapshot()
             .find((a) => a.hostId === String(hostId) && a.slug === slug && !a.owner)?.project ?? null;
-        const { title } = await updateAppTitle(slug, v.title, {
-          hostId,
-          conn,
-          ...(project !== null ? { scope: { project } } : {}),
-        });
+        let title: string;
+        try {
+          ({ title } = await updateAppTitle(slug, v.title, {
+            hostId,
+            conn,
+            ...(project !== null ? { scope: { project } } : {}),
+          }));
+        } catch (err) {
+          // Just moved: the server's list may still have it where it was. Look on the machine.
+          if (!(err instanceof AppManifestError && err.kind === "not_found")) throw err;
+          const scope = await findAppScope(slug, { hostId, conn });
+          if (scope === null || (scope.project ?? null) === project) throw err;
+          databaseLogger.info(`app rename: found where it is now, slug=${slug} project=${scope.project ?? "(sidebar)"}`);
+          ({ title } = await updateAppTitle(slug, v.title, { hostId, conn, scope }));
+        }
         databaseLogger.info(
           `app renamed: userId=${userId}, hostId=${hostId}, slug=${slug}`,
         );

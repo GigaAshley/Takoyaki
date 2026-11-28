@@ -2166,7 +2166,7 @@ def _enumerate_changes(home, projects, app_records):
     notices = []
     for n in _json_names(os.path.join(root, "notices")):
         notice = _read_json_file(os.path.join(root, "notices", n))
-        if isinstance(notice, dict) and notice.get("state") in ("refused", "failed", "unfiled"):
+        if isinstance(notice, dict) and notice.get("state") in ("refused", "failed", "unfiled", "taken"):
             notices.append(notice)
     notices.sort(key=lambda x: x.get("at") if isinstance(x.get("at"), (int, float)) else 0, reverse=True)
     for notice in notices:
@@ -2174,6 +2174,13 @@ def _enumerate_changes(home, projects, app_records):
         extra = {"reason": reason[:500]}
         if isinstance(notice.get("code"), str):
             extra["code"] = notice["code"][:64]
+        if notice["state"] == "taken":
+            # Someone's agent archived with a project by someone else: for the people it
+            # belonged to (its folder is on its way into the archive).
+            people = notice.get("audience")
+            if not (isinstance(people, list) and people and all(isinstance(u, str) for u in people)):
+                continue
+            extra["audience"] = people[:50]
         add(notice.get("id"), notice, notice["state"], notice.get("at"), extra, into=notice_entries)
 
     # Archives whose clean-up has been failing for 10 minutes or more.
@@ -2294,6 +2301,13 @@ def main():
     known_tails = _parse_known_tails(sys.argv[1:])
     for pid, identity in resolved_pids:
         if identity is None:
+            continue
+        # Its archive is claimed: gone from every list now, though its session runs
+        # until the supervisor stops it — so no pid line either (it would bring the
+        # row back for the ~10s that takes).
+        if SAFE_NAME_RE.match(identity) and os.path.exists(
+            os.path.join(home, "fleet", "identities", identity, ".archiving"),
+        ):
             continue
         line = _build_pid_line(
             pid, identity, home, identity_jsonl_paths, jsonl_tail_cache,

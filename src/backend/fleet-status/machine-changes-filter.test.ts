@@ -116,6 +116,15 @@ describe("machine-changes filter", () => {
     expect(out?.map((c) => c.id)).toEqual(["s1", "s3", "s4"]);
   });
 
+  it("an agent archived with a project by someone else: told to its people, once, never to whoever archived it", async () => {
+    const taken = change({ id: "a1.0", kind: "agent-archive", state: "taken", audience: ["ann"], byUser: "u2" });
+    expect((await view([taken]))?.map((c) => c.id)).toEqual(["a1.0"]);
+    expect(await view([taken], { username: "bob" })).toEqual([]);
+    expect(await view([taken], { seen: ["a1.0"] })).toEqual([]);
+    expect(await view([{ ...taken, byUser: "u1" }])).toEqual([]);
+    expect(await view([taken], { username: null })).toEqual([]);
+  });
+
   it("where an agent coming back lands is never named to someone who can't see that project", async () => {
     const [c] = (await view([
       change({ state: "returning", kind: "agent-unarchive", card: { displayName: "Wren", project: "secret" }, cardAudience: ["bob"] }),

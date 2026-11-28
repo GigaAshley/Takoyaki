@@ -103,6 +103,19 @@ test_notices_and_what_is_still_open() {
   rm -rf "$h"
 }
 
+test_taken_notice_is_for_the_agents_people() {
+  local h; h=$(setup)
+  project "$h" shared "ann, bob"; agent "$h" bea shared "bob"
+  fc "$h" submit project-archive '{"slug":"shared","asker":"ann","expected":{"projects":["shared"],"agents":["bea"],"apps":[]}}' --id a1 --by user:u_ann --wait 0 >/dev/null
+  serve_once "$h"
+  local c; c=$(changes "$h")
+  local e; e=$(q "$c" '[e for e in d["changes"] if e["state"] == "taken"][0]')
+  assert_eq '{"name": "bea", "type": "agent"}' "$(q "$e" 'd["target"]')" "about bea"
+  assert_eq '["bob"]' "$(q "$e" 'd["audience"]')" "for bob, not ann"
+  assert_eq 'it was archived with the project "shared" by ann' "$(q "$e" 'd["reason"]')" "which project, and who"
+  rm -rf "$h"
+}
+
 test_stuck_archive_names_who_to_tell() {
   local h; h=$(setup)
   agent "$h" finch ""
@@ -171,6 +184,7 @@ test_nothing_named_to_people_who_cant_see_it() {
 run_test test_no_front_door_no_line
 run_test test_waiting_move_says_where_and_for_whom
 run_test test_notices_and_what_is_still_open
+run_test test_taken_notice_is_for_the_agents_people
 run_test test_stuck_archive_names_who_to_tell
 run_test test_agent_coming_back_carries_its_row
 run_test test_role_archive_marks_its_agents

@@ -84,6 +84,7 @@ vi.mock("../../claude-session/per-app-file.js", async (importOriginal) => {
     AppManifestError: actual.AppManifestError,
     validateAppTitle: actual.validateAppTitle,
     updateAppTitle: vi.fn(),
+    findAppScope: vi.fn(async () => null),
   };
 });
 
@@ -103,6 +104,7 @@ import { resolveHostById } from "../../ssh/host-resolver.js";
 import { isLocalHostId } from "../../claude-session/identity-artifact-reader.js";
 import {
   updateAppTitle,
+  findAppScope,
   AppManifestError,
 } from "../../claude-session/per-app-file.js";
 import { databaseLogger } from "../../utils/logger.js";
@@ -310,6 +312,21 @@ describe("PATCH /apps/:hostId/:slug", () => {
     const res = await patch("/apps/7/my-app", { title: "New" });
     expect(res.status).toBe(504);
     expect(updateAppTitle).not.toHaveBeenCalled();
+  });
+
+  it("just moved: not where the server's list says, so it's found on the machine and renamed there", async () => {
+    mockApps = [{ hostId: "5", slug: "beds", owner: null, project: "garden" }];
+    (updateAppTitle as Mock)
+      .mockRejectedValueOnce(new AppManifestError("not_found", "app.json not found"))
+      .mockResolvedValueOnce({ title: "Seed beds" });
+    (findAppScope as Mock).mockResolvedValueOnce({ project: "orchard" });
+    try {
+      const res = await patch("/apps/5/beds", { title: "Seed beds" });
+      expect(res.status).toBe(200);
+      expect(updateAppTitle).toHaveBeenLastCalledWith("beds", "Seed beds", { hostId: 5, conn: null, scope: { project: "orchard" } });
+    } finally {
+      mockApps = [];
+    }
   });
 
   it("404 'app not found' when app.json is missing", async () => {

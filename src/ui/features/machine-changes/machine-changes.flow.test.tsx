@@ -214,6 +214,20 @@ describe("pop-ups for notices with no row", () => {
     expect(dialogs.calls[0].opts.body).toBe("Couldn't switch the chat account off. It keeps retrying on its own.");
   });
 
+  it("their agent archived with a project by someone else: one pop-up saying which project, and who", async () => {
+    const dialogs = autoAnswerKitDialogs({});
+    render(<MachineNoticePopups />);
+    act(() =>
+      setMachineChanges("1", [
+        change({ id: "a1.0", kind: "agent-archive", state: "taken", mine: false, target: { type: "agent", name: "bea" }, reason: 'it was archived with the project "Shared" by ann' }),
+      ]),
+    );
+    await waitFor(() => expect(dialogs.calls).toHaveLength(1));
+    expect(http.post).toHaveBeenCalledWith("/machine-changes/1/a1.0/seen", {});
+    expect(dialogs.calls[0].opts.title).toBe("bea was archived");
+    expect(dialogs.calls[0].opts.body).toBe('It was archived with the project "Shared" by ann.');
+  });
+
   it("waits for the agent list before deciding a row is missing", async () => {
     ids.loaded = false;
     render(<MachineNoticePopups />);

@@ -201,7 +201,7 @@ async function realpathIfExists(sftp: SftpLike, p: string): Promise<string | nul
 /*  What the machine owns                                                    */
 /* ------------------------------------------------------------------------ */
 
-/** The marker files the machine uses for pending moves and archives (and its change locks). */
+/** The marker files the machine uses for pending moves and archives, pins (and its change locks). */
 const MACHINE_MARKERS = new Set([
   ".move-requested",
   ".move-failed",
@@ -217,6 +217,7 @@ const MACHINE_MARKERS = new Set([
   ".compact-queued",
   ".compacting",
   ".not-carried-out",
+  ".pinned",
 ]);
 /** An archived app's stashed service units. */
 const UNIT_STASH_RE = /^app-[^/]+\.archived$/;
@@ -280,7 +281,13 @@ function sendSaveAnswer(res: Response, saved: SaveAnswer): void {
     : saved.code === "not_found" ? "not_found"
     : saved.code === "not_a_file" ? "not_a_file"
     : saved.code === "bad_request" ? "path_forbidden"
-    : "host_unreachable";
+    : saved.code === "being_archived" ? "being_archived"
+    : saved.code === "machine_file" ? "machine_file"
+    : saved.code === "unreadable" ? "host_unreachable"
+    : "save_refused";
+  if (error === "save_refused") {
+    sshLogger.warn("workspace save refused by the machine", { operation: "workspace_save_refused", code: saved.code, reason: saved.error });
+  }
   res.status(saved.status).json({ error, ...(saved.version !== undefined ? { version: saved.version } : {}) });
 }
 

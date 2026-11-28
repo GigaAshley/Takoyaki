@@ -58,6 +58,17 @@ export function newRequestId(): string {
 
 /** How many more times to ask about a change still under way (each waits ~15s on the server). */
 const FOLLOW_UPS = 3;
+/** Pauses before asking again while the server can't be reached (about a minute in all). */
+const AWAY_PAUSES_MS = [2_000, 4_000, 8_000, 15_000, 15_000, 15_000];
+
+/** No answer from the server itself: no response, or the proxy in front saying it's down. */
+function serverAway(error: unknown): boolean {
+  if (!axios.isAxiosError(error)) return false;
+  if (!error.response) return true;
+  const status = error.response.status;
+  const data = error.response.data as { code?: unknown } | undefined;
+  return status === 502 || status === 504 || (status === 503 && !(data && typeof data === "object" && "code" in data));
+}
 
 type Body = { ok?: boolean; pending?: boolean; requestId?: string; result?: unknown; error?: string; code?: string };
 
@@ -105,15 +116,23 @@ export async function sendMachineChange<T>(
   const id = data.requestId ?? requestId;
   opts.onStillWorking?.();
   if (opts.followUp === "none") return { done: false, requestId: id };
-  for (let i = 0; i < FOLLOW_UPS; i++) {
+  let away = 0;
+  for (let i = 0; i < FOLLOW_UPS; ) {
     try {
       const response =
         opts.followUp === "status" || request.method === "get"
           ? await authApi.get(`/machine-changes/${hostId}/${encodeURIComponent(id)}`)
           : await authApi[request.method](request.url, { ...request.body, requestId: id });
       if (response.status !== 202) return { done: true, requestId: id, result: response.data as T };
+      i++;
     } catch (error) {
-      asError(error, operation);
+      // The server can't be reached (restarting, or the connection dropped): that says
+      // nothing about the change, which the machine carries on with. Ask again after a
+      // pause; past that, the machine's own status report settles it.
+      if (!serverAway(error)) asError(error, operation);
+      if (away >= AWAY_PAUSES_MS.length) break;
+      console.info({ operation: "machine_change_follow_up_server_away", hostId, requestId: id, attempt: away + 1 });
+      await new Promise((r) => setTimeout(r, AWAY_PAUSES_MS[away++]));
     }
   }
   return { done: false, requestId: id };
