@@ -19,6 +19,16 @@ describe("voice label", () => {
     expect(stripVoiceLabel(text)).toBe(text);
   });
 
+  it("asks the agent to put questions in words, not an ask block", () => {
+    expect(VOICE_LABEL).toContain("not in an ask block");
+  });
+
+  it("still strips the older, shorter label from earlier sends", () => {
+    const old = "[sent by voice — your reply will be read aloud]";
+    expect(stripVoiceLabel(`hello\n\n${old}`)).toBe("hello");
+    expect(stripVoiceLabel(`hello\n\n${old} [they heard it]`)).toBe("hello");
+  });
+
   it("leaves unlabeled text untouched", () => {
     expect(stripVoiceLabel("typed message")).toBe("typed message");
   });
@@ -28,7 +38,7 @@ describe("voice label with a heard note", () => {
   it("puts the note in its own brackets after the unchanged label and strips both", () => {
     const sent = appendVoiceLabel("yes", 'The last of your replies the user had heard was the one starting "Ship it".');
     expect(sent).toBe(
-      'yes\n\n[sent by voice — your reply will be read aloud] [The last of your replies the user had heard was the one starting "Ship it".]',
+      `yes\n\n${VOICE_LABEL} [The last of your replies the user had heard was the one starting "Ship it".]`,
     );
     expect(stripVoiceLabel(sent)).toBe("yes");
   });

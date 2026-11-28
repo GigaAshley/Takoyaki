@@ -8,10 +8,17 @@
 // The label can be followed by a heard note (heard-note.ts) in its own
 // brackets on the same line; the label itself stays word-for-word, and the
 // note never contains square brackets, so the tail match finds both.
+//
+// The label also steers agents off ask blocks: the user may not be looking
+// at the screen, so the question tray's options would go unseen. "ask block"
+// is the id skill's own name for it. Older sends carry the shorter label
+// without that clause; the tail match still strips those.
 
-export const VOICE_LABEL = "[sent by voice — your reply will be read aloud]";
+export const VOICE_LABEL =
+  "[sent by voice — your reply will be read aloud, and I may not be looking at the screen, so ask any questions in words, not in an ask block]";
 
-const VOICE_LABEL_TAIL_RE = /\s*\[sent by voice — your reply will be read aloud\](?: \[[^[\]]*\])?\s*$/;
+const VOICE_LABEL_TAIL_RE =
+  /\s*\[sent by voice — your reply will be read aloud(?:, and I may not be looking at the screen, so ask any questions in words, not in an ask block)?\](?: \[[^[\]]*\])?\s*$/;
 
 export function appendVoiceLabel(text: string, heardNote?: string): string {
   const note = heardNote?.replace(/[[\]]/g, "").replace(/\s+/g, " ").trim();
