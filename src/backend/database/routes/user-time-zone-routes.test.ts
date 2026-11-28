@@ -37,7 +37,7 @@ function bootstrap(): void {
   sqlite.exec(`
     CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT NOT NULL, password_hash TEXT NOT NULL DEFAULT '',
       time_zone TEXT, time_zone_pinned INTEGER NOT NULL DEFAULT 0);
-    INSERT INTO users (id, username) VALUES ('ashley', 'ashley'), ('robin', 'robin');
+    INSERT INTO users (id, username) VALUES ('alice', 'alice'), ('robin', 'robin');
   `);
   drizzleDb = drizzle(sqlite);
 }
@@ -66,7 +66,7 @@ beforeEach(() => {
   forceSave.mockClear();
 });
 
-function call(method: string, path: string, body?: unknown, userId = "ashley"): Promise<{ status: number; body: any }> {
+function call(method: string, path: string, body?: unknown, userId = "alice"): Promise<{ status: number; body: any }> {
   return new Promise((resolve, reject) => {
     const { port } = server.address() as AddressInfo;
     const data = body === undefined ? "" : JSON.stringify(body);
@@ -89,7 +89,7 @@ function call(method: string, path: string, body?: unknown, userId = "ashley"): 
   });
 }
 
-const stored = (id = "ashley") =>
+const stored = (id = "alice") =>
   sqlite.prepare("SELECT time_zone AS tz, time_zone_pinned AS pinned FROM users WHERE id = ?").get(id) as {
     tz: string | null;
     pinned: number;
@@ -97,13 +97,13 @@ const stored = (id = "ashley") =>
 
 describe("the lookup", () => {
   it("says not set rather than guessing, and knows when there's no such person", async () => {
-    expect(await getPersonTimeZone("ashley")).toEqual({ status: "not_set" });
+    expect(await getPersonTimeZone("alice")).toEqual({ status: "not_set" });
     expect(await getPersonTimeZone("nobody")).toEqual({ status: "no_such_person" });
   });
 
   it("answers the zone and whether it's pinned", async () => {
-    sqlite.prepare("UPDATE users SET time_zone = 'America/Denver', time_zone_pinned = 1 WHERE id = 'ashley'").run();
-    expect(await getPersonTimeZone("ashley")).toEqual({ status: "set", timeZone: "America/Denver", pinned: true });
+    sqlite.prepare("UPDATE users SET time_zone = 'America/Denver', time_zone_pinned = 1 WHERE id = 'alice'").run();
+    expect(await getPersonTimeZone("alice")).toEqual({ status: "set", timeZone: "America/Denver", pinned: true });
   });
 
   it("knows real zones and plain UTC", () => {
@@ -127,7 +127,7 @@ describe("following the browser", () => {
     expect(res.body).toEqual({ timeZone: "America/Denver", pinned: false });
     expect(stored()).toEqual({ tz: "America/Denver", pinned: 0 });
     expect(forceSave).toHaveBeenCalledTimes(2);
-    expect(await getPersonTimeZone("ashley")).toEqual({ status: "set", timeZone: "America/Denver", pinned: false });
+    expect(await getPersonTimeZone("alice")).toEqual({ status: "set", timeZone: "America/Denver", pinned: false });
     // Only the person who reported changed.
     expect(stored("robin")).toEqual({ tz: null, pinned: 0 });
   });
