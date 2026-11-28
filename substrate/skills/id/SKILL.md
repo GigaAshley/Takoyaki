@@ -916,14 +916,11 @@ not something agents drive.
   **Pinned and in-a-project are mutually exclusive** — a conversation sits
   in exactly one place. Pinning a conversation takes it out of its project;
   moving a pinned conversation into a project unpins it.
-  *Agent-side:* pinning is controlled by an empty **sentinel file** at
-  `~/fleet/identities/<name>/.pinned` — presence = pinned, absence = not.
-  Toggle with `touch` / `rm`. If you pin yourself, also remove your
-  `project:` frontmatter key — when both are set, the app shows you in the
-  project and ignores the pin. Since the sentinel lives inside the
-  identity's own folder, you can only pin/unpin **yourself** this way;
-  peer-identity pin state isn't yours to touch. **User-gated** — same
-  reason as `.no-dormancy`, this is a UI-organization signal the user
+  *Agent-side:* pin or unpin yourself with the machine's command,
+  `fleet-change submit agent-pin '{"name":"<name>","pinned":true}' --by agent:<name>`
+  (`false` to unpin); pinning takes you out of your project in the same
+  change. Peer-identity pin state isn't yours to touch. **User-gated** —
+  same reason as `.no-dormancy`, this is a UI-organization signal the user
   owns.
 
 - **Conversation rows.** On desktop each row is one line: the agent's
@@ -968,12 +965,11 @@ not something agents drive.
     rooms still pick one) and moves the conversation into the project once
     it's created. It ends with **Unpin** when the row is pinned, or
     **Remove from project** when it's in a project.
-    *Agent-side:* pinned = the `.pinned` sentinel (Pinned section above);
-    the identity's project affiliation lives in its own frontmatter
-    (`project: <slug>` in `~/fleet/identities/<name>/<name>.md`).
-    Add / change / remove that key to move in / between / out; adding one
-    means also removing `.pinned`. UI reflects it within a few seconds.
-    **User-gated.**
+    *Agent-side:* the identity's project is the `project: <slug>` line of
+    its own identity file. Move in, between or out with
+    `fleet-change submit agent-project '{"name":"<name>","project":"<slug>"}' --by agent:<name>`
+    (`null` to take it out); moving in unpins, and a project that's gone or
+    being archived is refused. **User-gated.**
   - **Archive** — retires the identity, after a confirm, and closes every
     open copy of its conversation (splits, other windows, other devices).
     The confirm names the agent's scheduled wake-ups that can still fire — they stop
@@ -999,11 +995,11 @@ not something agents drive.
     (Enter in the name also creates). Slug is derived from the name
     (kebab-case, `/^[a-z0-9-]{1,64}$/`); a name whose slug is taken gets
     `-2`, `-3`, … added.
-    *Agent-side:* a project is just a folder on disk at
-    `~/fleet/projects/<slug>/` containing a `project.md` with `displayName:`
-    frontmatter. Direct filesystem creation works (`mkdir` + write the file);
-    open frontends pick it up on the next fleet-status sweep, within a few
-    seconds. **User-gated.**
+    *Agent-side:* a project is a folder at `~/fleet/projects/<slug>/`
+    containing a `project.md` with `displayName:` frontmatter. Make one with
+    `fleet-change submit project-create '{"baseSlug":"<slug>","displayName":"<name>"}'`
+    (add `"parent":"<slug>"` for a sub-project); the answer gives the slug it
+    got. **User-gated.**
   Each project shows as a folder with an open/close arrow before its name
   (pointing right when closed, down when open), and is expandable and
   collapsible. Drag conversations in and out to move them; a conversation dropped inside a sub-project lands in
@@ -1027,8 +1023,9 @@ not something agents drive.
   sub-project inside is hidden from the person archiving.
   *Agent-side:* nesting is one optional frontmatter line in the
   sub-project's `project.md`: `parent: <parent-slug>`. Folders stay side
-  by side under `~/fleet/projects/` — moving a project in or out is an edit
-  to that line, never a folder move. No line = top level. A project's
+  by side under `~/fleet/projects/` — moving a project in or out is
+  `fleet-change submit project-move '{"slug":"<slug>","parent":"<parent-slug>"}'`
+  (`null` for top level), never a folder move. No line = top level. A project's
   `members:` list holds only the agents directly in it, not those in its
   sub-projects.
   Each project header carries a **kebab menu** (on desktop it appears on
@@ -1056,10 +1053,8 @@ not something agents drive.
   project to move it inside that one, or on the **Projects** super-header
   to move it back to top level. On a touch screen, **Move to** is the way.
   *Agent-side:* project membership = the `project:` frontmatter (see
-  above). For spawning a fresh agent already scoped to a project, the
-  cleanest path is to include a directive in the prompt of the spawn
-  request for the spawned identity to add itself to the project
-  immediately upon wake.
+  above). To spawn a fresh agent already in a project, give the spawn
+  request its `project` (§ Spawning another agent).
 
 - **Conversations header (bottom).** Every conversation not pinned and
   not in a project shows up here — the default landing zone. When it's
@@ -1747,7 +1742,7 @@ crown, then gear.
   agent too (it's woken for it). The same pie and button sit under each
   agent's badge in a relay room. Underneath it is the harness's own
   compaction.
-  *Agent-side:* the button drops the same compact request you would
+  *Agent-side:* the button sends the same compact request you would
   (§ Compacting yourself); you're compacted, then woken with the
   supervisor's `Compaction done` event.
 
@@ -2182,8 +2177,8 @@ To request it:
 1. If anything should outlive the summary for other agents (the task
    record, a campaign pointer), write it to your identity file first. No
    save is required — the summary carries the session.
-2. `touch ~/fleet/identities/<name>/.compact-requested` — optionally with
-   one line in it saying what the summary should keep.
+2. `fleet-change submit agent-compact '{"name":"<name>","guidance":"<what the summary should keep>"}' --by agent:<name>`
+   (`guidance` is optional). It answers once the machine has accepted it.
 3. Confirm in one line:
 
    > Compaction requested — I'll carry on once it's done.
@@ -2233,9 +2228,10 @@ is told to archive itself after a smooth run (§ Scheduled conversations).
 1. **Run the full `/id save` procedure** (§ On `/id save`, steps 1–4) —
    this is your LAST chance to land anything you're carrying in context only (meaning not on disk somewhere).
 
-2. **Drop the archive sentinel** —
-   `touch ~/fleet/identities/<name>/.archive-requested`. The supervisor
-   picks it up within ~15 seconds and kills all processes related to you.
+2. **Ask the machine to archive you** —
+   `fleet-change submit agent-archive '{"name":"<name>","by":"agent"}' --by agent:<name>`.
+   Once it answers done, the supervisor stops everything related to you
+   within ~15 seconds.
 
 3. **Confirm in one line:**
    
@@ -2246,38 +2242,33 @@ is told to archive itself after a smooth run (§ Scheduled conversations).
 
 ---
 
-## Un-archiving — the sentinel-drop pattern for agents
+## Un-archiving
 
 Un-archive is the inverse of archive. There is **no slash-command for
-un-archiving** — the gesture is a sentinel-drop into the ARCHIVE folder (the
-live folder doesn't exist yet). Per-type specifics below.
+un-archiving** — it's the machine's command, run on the home host of what
+comes back, and it answers with the outcome or why it was refused.
 
 ### Role
 
-`touch ~/fleet/roles-archive/<name>/.unarchive-requested` on the role's home
-host. The supervisor's reconciler tick (~15s) picks it up and mv's the folder
+`fleet-change submit role-unarchive '{"name":"<name>"}'` — the folder goes
 back to `~/fleet/roles/<name>/`.
 
 ### App
 
-`touch ~/fleet/apps-archive/<slug>/.unarchive-requested` on the app's home host.
-Same reconciler tick picks it up; also re-registers the systemd unit so the app
-reappears in the sidebar and is servable.
+`fleet-change submit app-unarchive '{"slug":"<slug>"}'` — the app goes back
+into the sidebar on its old port, running.
 
 ### Identity
 
-`touch ~/fleet/identities-archive/<name>/.unarchive-requested` on the identity's
-home host — the same flag the frontend's **Un-archive** drops. The supervisor
-asks the backend to bring the identity's relay account back, logs it in, and
-moves the folder back to `~/fleet/identities/<name>/`; it returns dormant (or
-always-on if it was), with a "you were unarchived" note at the top of its
-identity file. This takes about a minute.
-
-If it hasn't come back after a couple of minutes and the flag is gone, read
-`~/fleet/identities-archive/<name>/.unarchive-refused` — it says why it was
-refused (a role still archived, a live identity with the same name, an
-account that can't be confirmed as an agent's, …). Fix the cause and drop the
-flag again, or tell the user.
+`fleet-change submit agent-unarchive '{"name":"<name>"}'` — the same request
+the frontend's **Un-archive** sends. The backend brings the identity's relay
+account back, and the folder moves back to `~/fleet/identities/<name>/`; it
+returns dormant (or always-on if it was), with a "you were unarchived" note
+at the top of its identity file. This takes about a minute: the command
+answers once it's accepted, and `fleet-change status <id> --wait 120` (the id
+it printed) waits for the end. A refusal says why (a role still archived, a
+live identity with the same name, an account that can't be confirmed as an
+agent's, …). Fix the cause and ask again, or tell the user.
 
 **User-initiated boundary** — same as `/id archive`, an agent doesn't spontaneously
 un-archive things on its own initiative. Un-archive when the user asks (or points to
@@ -2291,20 +2282,20 @@ See also: **§ On /id archive** for the archive-direction pattern.
 
 The agent-side counterpart to the user's new-conversation button (see
 § The app's user interface). Where the button gives the user a role
-picker, a suggested name and a first message, the file-drop mechanism
+picker, a suggested name and a first message, the request
 below lets you spawn with a full initial prompt attached — the newborn's
 own instructions, delivered with its load.
 
-⚠️ **USER-INITIATED ONLY — an agent NEVER drops a spawn request on its
+⚠️ **USER-INITIATED ONLY — an agent NEVER sends a spawn request on its
 own initiative.** Same rule as `/id archive`. If you
 think spawning a fresh agent would help, OFFER; don't self-execute.
 
 ### Mechanism
 
-Drop a single-line JSON file at `~/fleet/spawn-requests/<uuid>.json` on
-the box the new identity should live on. A backend watcher picks the
-file up within ~10 seconds, claims it by renaming `.json` →
-`.claimed.json`, and runs the identity-birth flow (~3–5 seconds more).
+Send the request straight to the app's server with `fleet-service call
+identity-birth`, from the box the new identity should live on. The server
+runs the identity-birth flow and answers on the same call, usually within
+seconds.
 
 ### Schema
 
@@ -2320,7 +2311,6 @@ Extra fields are rejected as malformed.
 - `prompt` (**required**, no length cap) — the instructions the fresh
   actor receives via `/id` load on first wake. This IS the delivery
   mechanism; there is no separate DM step after birth.
-- `requested_at` (**required**) — ISO-Z timestamp.
 - `name` (optional) — a name for the newborn, same as the
   new-conversation picker's "name it myself": free-form. Absent = auto-named. The success response carries the
   final name.
@@ -2330,37 +2320,35 @@ Extra fields are rejected as malformed.
   backend. A zero-role newborn is visible to whoever can see you when
   this names you; without it, to everyone on the box.
 
-### Write atomically, single-line
+### Send it
 
-Write to `<uuid>.json.tmp`, then `mv` to `<uuid>.json`. **Never
-pretty-print** — the watcher reads one line per file and any newline in
-the body corrupts parsing.
-
-    UUID=$(uuidgen); export TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    ID=$(uuidgen)
     export TASK='<short task pill, ≤500 chars>'
     export PROMPT='<full instructions the fresh actor receives via /id load>'
     export ROLE='<role slug>'          # or ROLE='' for a plain agent with no roles
     export ME='<your identity name>'
-    python3 -c "import json, os; r = os.environ['ROLE']; print(json.dumps({'roles': [r] if r else [], 'task': os.environ['TASK'], 'prompt': os.environ['PROMPT'], 'requested_at': os.environ['TS'], 'requested_by': os.environ['ME']}, separators=(',', ':')))" \
-      > ~/fleet/spawn-requests/$UUID.json.tmp
-    mv ~/fleet/spawn-requests/$UUID.json.tmp ~/fleet/spawn-requests/$UUID.json
+    python3 -c "import json, os; r = os.environ['ROLE']; print(json.dumps({'roles': [r] if r else [], 'task': os.environ['TASK'], 'prompt': os.environ['PROMPT'], 'requested_by': os.environ['ME']}))" \
+      | fleet-service call identity-birth --input - --id "$ID"
 
 ### Response
 
-The backend drops a response file keyed by your uuid, next to the
-request (on the target host for a cross-box spawn):
+One JSON line:
 
-- `<uuid>.success.json` — contains `{name, birthed_at}`. Read it, note
-  the name, delete the file.
-- `<uuid>.failure.json` — contains `{reason, message?}`. `reason` is one
-  of `malformed`, `role_unknown`, `birth_failed`,
-  `homeserver_unreachable`, `pool_exhausted`, `matrix_creds_missing`,
+- `{"ok": true, "result": {"name", "birthed_at"}}` — note the name.
+- `{"ok": false, "error": {"code", "message"?}}` — `code` is one of
+  `malformed`, `role_unknown`, `birth_failed`, `peer_host_unreachable`,
+  `matrix_homeserver_unreachable`, `pool_exhausted`, `matrix_creds_missing`,
   `visibility_unresolved` (a zero-role spawn whose `requested_by` couldn't
-  be read — nothing was created).
+  be read — nothing was created); or `unreachable` / `not_set_up` (the
+  server couldn't be asked; nothing was sent).
+- `timeout` — the server is still on it: `fleet-service collect "$ID"`
+  waits for the same answer. `lost` (a server restart) — send it again
+  with the same `--id`; the server finds the agent it already made rather
+  than making a second one.
 
-Safety timeout: ~90 seconds per identity. On failure, surface to the
-user. Retry ONLY if `reason == "malformed"` and you have a specific
-correctable field. Do NOT try to hand-birth the identity yourself.
+On failure, surface to the user. Retry ONLY if the code is `malformed`
+and you have a specific correctable field, or as above. Do NOT try to
+hand-birth the identity yourself.
 
 ### What the backend does for you — do NOT attempt yourself
 
@@ -2373,8 +2361,8 @@ identity folder, writing credentials, launching the tmux + claude +
 ## Creating a role
 
 The agent-side counterpart to **New role** in the roles window
-(drama masks). Same file-drop mechanism as § Spawning another agent, same
-folder, told apart by `"kind": "role"`. The backend creates the role
+(drama masks). Same mechanism as § Spawning another agent, sent as
+`fleet-service call role-create`. The backend creates the role
 folder the way the button does: role file from your description, a
 random color, and a generated avatar.
 
@@ -2384,7 +2372,6 @@ random color, and a generated avatar.
 
 All fields below; anything else is rejected as malformed.
 
-- `kind` (**required**) — the literal string `"role"`.
 - `name` (**required**) — the role's display name, as the user would type
   it in the dialog (e.g. `"Garden Keeper"`). The backend derives the slug
   (`garden-keeper`); if that slug is taken (live or archived), it adds
@@ -2392,32 +2379,28 @@ All fields below; anything else is rejected as malformed.
 - `description` (**required**, ≤4 KB) — becomes the role file's
   `## Role` section. The first agent to hold the role is prompted to
   flesh the rest out.
-- `requested_at` (**required**) — ISO-Z timestamp.
 - `requested_by` (optional) — your own identity name. Logged only.
 
-### Drop it
+### Send it
 
-Same atomic single-line write as spawning:
-
-    UUID=$(uuidgen); export TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    ID=$(uuidgen)
     export NAME='<display name>'
     export DESC='<what the role is for>'
-    python3 -c "import json, os; print(json.dumps({'kind': 'role', 'name': os.environ['NAME'], 'description': os.environ['DESC'], 'requested_at': os.environ['TS']}, separators=(',', ':')))" \
-      > ~/fleet/spawn-requests/$UUID.json.tmp
-    mv ~/fleet/spawn-requests/$UUID.json.tmp ~/fleet/spawn-requests/$UUID.json
+    python3 -c "import json, os; print(json.dumps({'name': os.environ['NAME'], 'description': os.environ['DESC']}))" \
+      | fleet-service call role-create --input - --id "$ID"
 
 ### Response
 
-- `<uuid>.success.json` — `{name, created_at}`; `name` is the role slug.
-  Read it, note the slug, delete the file.
-- `<uuid>.failure.json` — `{reason, message?}`. `reason` is one of
+- `{"ok": true, "result": {"name", "created_at"}}` — `name` is the role slug.
+- `{"ok": false, "error": {"code", "message"?}}` — `code` is one of
   `malformed`, `avatar_failed` (nothing was created — safe to retry
-  once), `role_create_failed`.
+  once), `role_create_failed`, or `unreachable` / `not_set_up` (nothing
+  was sent).
 
-Avatar generation takes a while; allow ~5 minutes before treating it as
-lost. On failure, surface to the user. Before any retry after a timeout or
-a `role_create_failed`, check `~/fleet/roles/` — the role may already
-exist, and a retry would make a second one. Do NOT hand-create the folder
+Avatar generation takes a while: on `timeout`, `fleet-service collect "$ID"`
+waits for the same answer. On failure, surface to the user. Before any
+retry after `lost` or a `role_create_failed`, check `~/fleet/roles/` — the
+role may already exist, and a retry would make a second one. Do NOT hand-create the folder
 as a fallback.
 
 ---
@@ -2701,10 +2684,10 @@ the UI uses that to say the scheduled conversation hasn't run yet.
 
 ### What happens on fire
 
-The scheduler drops a create-identity request at
-`~/fleet/spawn-requests/<uuid>.json` for the backend's identity-birthing
-pipeline (the same mechanism agents use in § Spawning another agent).
-That pipeline creates a fresh identity, sets its role to the `roles`
+The scheduler sends a new-agent request to the app's server (the same
+request agents send in § Spawning another agent). If the server can't be
+reached, the request waits on the machine and is sent again until it
+answers, so the run is late, never lost. The server creates a fresh identity, sets its role to the `roles`
 listed, and kicks it off with `prompt` as its first user turn. The newborn does the work and
 typically exits. No ⏰ line prints anywhere — there is no running harness
 to receive one.
